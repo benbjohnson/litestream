@@ -17,7 +17,6 @@ var _ fs.NodeAccesser = (*Node)(nil)
 var _ fs.NodeCreater = (*Node)(nil)
 var _ fs.NodeForgetter = (*Node)(nil)
 var _ fs.NodeFsyncer = (*Node)(nil)
-var _ fs.NodeGetattrer = (*Node)(nil)
 var _ fs.NodeGetxattrer = (*Node)(nil)
 var _ fs.NodeLinker = (*Node)(nil)
 var _ fs.NodeListxattrer = (*Node)(nil)
@@ -108,9 +107,9 @@ func (n *Node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
 //
 // If this method is not implemented, the attributes will be
 // generated based on Attr(), with zero values filled in.
-func (n *Node) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fuse.GetattrResponse) error {
-	panic("TODO")
-}
+// func (n *Node) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fuse.GetattrResponse) error {
+// 	panic("TODO")
+// }
 
 // Setattr sets the standard metadata for the receiver.
 //
@@ -121,7 +120,81 @@ func (n *Node) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fuse
 // For example, the method should not change the mode of the file
 // unless req.Valid.Mode() is true.
 func (n *Node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) error {
-	panic("TODO")
+	// Obtain current file stat.
+	srcpath := n.srcpath()
+	fi, err := os.Stat(srcpath)
+	if err != nil {
+		return err
+	}
+	statt := fi.Sys().(*syscall.Stat_t)
+
+	// Update access time, if flagged.
+	var atime time.Time
+	if req.Valid.AtimeNow() {
+		atime = time.Now()
+	} else if req.Valid.Atime() {
+		atime = req.Atime
+	}
+
+	// Update mod time, if flagged.
+	var mtime time.Time
+	if req.Valid.MtimeNow() {
+		mtime = time.Now()
+	} else if req.Valid.Mtime() {
+		mtime = req.Mtime
+	}
+
+	// Update timestamps, if specified.
+	if !atime.IsZero() || !mtime.IsZero() {
+		if atime.IsZero() {
+			atime = time.Unix(statt.Atim.Sec, statt.Atim.Nsec).UTC()
+		}
+		if mtime.IsZero() {
+			mtime = time.Unix(statt.Mtim.Sec, statt.Mtim.Nsec).UTC()
+		}
+		if err := os.Chtimes(srcpath, atime, mtime); err != nil {
+			return err
+		}
+	}
+
+	// Update group id.
+	if req.Valid.Gid() {
+		if err := syscall.Setgid(int(req.Gid)); err != nil {
+			return err
+		}
+	}
+
+	// Update user id.
+	if req.Valid.Uid() {
+		if err := syscall.Setuid(int(req.Uid)); err != nil {
+			return err
+		}
+	}
+
+	// Update file permissions.
+	if req.Valid.Mode() {
+		if err := os.Chmod(srcpath, req.Mode); err != nil {
+			return err
+		}
+	}
+
+	// Update file size.
+	if req.Valid.Size() {
+		if err := os.Truncate(srcpath, int64(req.Size)); err != nil {
+			return err
+		}
+	}
+
+	// TODO: Not sure what these are for.
+	if req.Valid.Handle() {
+		panic("TODO?")
+	}
+	if req.Valid.LockOwner() {
+		panic("TODO?")
+	}
+
+	// Update response attributes.
+	return n.Attr(ctx, &resp.Attr)
 }
 
 // Symlink creates a new symbolic link in the receiver, which must be a directory.

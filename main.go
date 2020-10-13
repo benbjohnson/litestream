@@ -61,6 +61,8 @@ func (m *Main) Run(args []string) (err error) {
 	defer fuse.Unmount(m.MountPath)
 	defer conn.Close()
 
+	m.logger.Printf("mounted")
+
 	return fs.Serve(conn, &FS{SourcePath: m.SourcePath})
 }
 
