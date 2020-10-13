@@ -40,6 +40,10 @@ type Node struct {
 	path string // path within file system
 }
 
+func NewNode(fs *FS, path string) *Node {
+	return &Node{fs: fs, path: path}
+}
+
 func (n *Node) srcpath() string {
 	return filepath.Join(n.fs.SourcePath, n.path)
 }
@@ -85,7 +89,7 @@ func (n *Node) Lookup(ctx context.Context, name string) (fs.Node, error) {
 	if _, err := os.Stat(srcpath); os.IsNotExist(err) {
 		return nil, syscall.ENOENT
 	}
-	return &Node{fs: n.fs, path: path}, nil
+	return NewNode(n.fs, path), nil
 }
 
 func (n *Node) ReadDirAll(ctx context.Context) ([]fuse.Dirent, error) {
@@ -198,9 +202,12 @@ func (n *Node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 }
 
 // Symlink creates a new symbolic link in the receiver, which must be a directory.
-//
-// TODO is the above true about directories?
-func (n *Node) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, error) { panic("TODO") }
+func (n *Node) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (fs.Node, error) {
+	if err := os.Symlink(req.Target, req.NewName); err != nil {
+		return nil, err
+	}
+	return NewNode(n.fs, req.NewName), nil
+}
 
 // Readlink reads a symbolic link.
 func (n *Node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (string, error) {
