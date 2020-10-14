@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"os"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
@@ -18,7 +19,9 @@ var _ fs.HandleReader = (*Handle)(nil)
 var _ fs.HandleReleaser = (*Handle)(nil)
 var _ fs.HandleWriter = (*Handle)(nil)
 
-type Handle struct{}
+type Handle struct {
+	f *os.File
+}
 
 // Flush is called each time the file or directory is closed.
 // Because there can be multiple file descriptors referring to a
