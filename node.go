@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"io/ioutil"
-	"log"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -50,8 +49,6 @@ func (n *Node) srcpath() string {
 }
 
 func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
-	defer func() { log.Printf("[attr] node=%q -- attr=%s err=%v", n.path, a.String(), err) }()
-
 	fi, err := os.Stat(n.srcpath())
 	if err != nil {
 		return err
@@ -87,8 +84,6 @@ func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 //
 // Lookup need not to handle the names "." and "..".
 func (n *Node) Lookup(ctx context.Context, name string) (_ fs.Node, err error) {
-	defer func() { log.Printf("[lookup] node=%q name=%q -- err=%v", n.path, name, err) }()
-
 	path := filepath.Join(n.path, name)
 	srcpath := filepath.Join(n.fs.SourcePath, path)
 	if _, err := os.Stat(srcpath); os.IsNotExist(err) {
@@ -98,8 +93,6 @@ func (n *Node) Lookup(ctx context.Context, name string) (_ fs.Node, err error) {
 }
 
 func (n *Node) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	defer func() { log.Printf("[readdirall] node=%q -- ents=%d err=%v", n.path, len(ents), err) }()
-
 	fis, err := ioutil.ReadDir(n.srcpath())
 	if err != nil {
 		return nil, err
@@ -131,8 +124,6 @@ func (n *Node) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
 // For example, the method should not change the mode of the file
 // unless req.Valid.Mode() is true.
 func (n *Node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse.SetattrResponse) (err error) {
-	defer func() { log.Printf("[setattr] node=%q req=%s -- err=%v", n.path, req.String(), err) }()
-
 	// Obtain current file stat.
 	srcpath := n.srcpath()
 	fi, err := os.Stat(srcpath)
@@ -212,9 +203,6 @@ func (n *Node) Setattr(ctx context.Context, req *fuse.SetattrRequest, resp *fuse
 
 // Symlink creates a new symbolic link in the receiver, which must be a directory.
 func (n *Node) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (_ fs.Node, err error) {
-	defer func() {
-		log.Printf("[symlink] node=%q newname=%q target=%q -- err=%v", n.path, req.NewName, req.Target, err)
-	}()
 	if err := os.Symlink(req.Target, req.NewName); err != nil {
 		return nil, err
 	}
@@ -223,7 +211,6 @@ func (n *Node) Symlink(ctx context.Context, req *fuse.SymlinkRequest) (_ fs.Node
 
 // Readlink reads a symbolic link.
 func (n *Node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (_ string, err error) {
-	defer func() { log.Printf("[readlink] node=%q -- err=%v", n.path, err) }()
 	return os.Readlink(n.srcpath())
 }
 
@@ -232,9 +219,6 @@ func (n *Node) Readlink(ctx context.Context, req *fuse.ReadlinkRequest) (_ strin
 func (n *Node) Link(ctx context.Context, req *fuse.LinkRequest, _old fs.Node) (_ fs.Node, err error) {
 	old := _old.(*Node)
 
-	defer func() {
-		log.Printf("[link] node=%q oldnode=%q name=%q -- err=%v", n.path, old.srcpath(), req.NewName, err)
-	}()
 	// assert(n.IsDir())
 
 	if err := os.Link(old.srcpath(), req.NewName); err != nil {
@@ -247,8 +231,6 @@ func (n *Node) Link(ctx context.Context, req *fuse.LinkRequest, _old fs.Node) (_
 // the receiver, which must be a directory.  The entry to be removed
 // may correspond to a file (unlink) or to a directory (rmdir).
 func (n *Node) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error) {
-	defer func() { log.Printf("[remove] node=%q name=%q dir=%v -- err=%v", n.path, req.Name, req.Dir, err) }()
-
 	if req.Dir {
 		return syscall.Rmdir(filepath.Join(n.srcpath(), req.Name))
 	}
@@ -264,8 +246,6 @@ func (n *Node) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error) 
 // implemented, the Node behaves as if it always returns nil
 // (permission granted), relying on checks in Open instead.
 func (n *Node) Access(ctx context.Context, req *fuse.AccessRequest) (err error) {
-	defer func() { log.Printf("[access] node=%q mask=%#o -- err=%v", n.path, req.Mask, err) }()
-
 	return syscall.Access(n.srcpath(), req.Mask)
 }
 
@@ -276,7 +256,6 @@ func (n *Node) Access(ctx context.Context, req *fuse.AccessRequest) (err error) 
 //}
 
 func (n *Node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (_ fs.Node, err error) {
-	defer func() { log.Printf("[mkdir] node=%q mode=%#o umask=%#o -- err=%v", n.path, req.Mode, req.Umask, err) }()
 	if err := syscall.Mkdir(filepath.Join(n.srcpath(), req.Name), uint32(req.Mode^req.Umask)); err != nil {
 		return nil, err
 	}
@@ -294,8 +273,6 @@ func (n *Node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (_ fs.Node, er
 //
 // XXX note about access.  XXX OpenFlags.
 func (n *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (_ fs.Handle, err error) {
-	defer func() { log.Printf("[open] node=%q dir=%v flags=%#o -- err=%v", n.path, req.Dir, req.Flags, err) }()
-
 	// TODO(bbj): Where does mode come from?
 	f, err := os.OpenFile(n.srcpath(), int(req.Flags), 0777)
 	if err != nil {
@@ -306,15 +283,11 @@ func (n *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 
 // Create creates a new directory entry in the receiver, which must be a directory.
 func (n *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.CreateResponse) (_ fs.Node, _ fs.Handle, err error) {
-	defer func() {
-		log.Printf("[create] node=%q name=%q flags=%#o mode=%#o umask=%#o -- err=%v", n.path, req.Name, req.Flags, req.Mode, req.Umask, err)
-	}()
-
 	f, err := os.OpenFile(filepath.Join(n.srcpath(), req.Name), int(req.Flags), req.Mode^req.Umask)
 	if err != nil {
 		return nil, nil, err
 	}
-	return NewNode(n.fs, filepath.Join(n.path, req.Name)), Handle{f: f}, nil
+	return NewNode(n.fs, filepath.Join(n.path, req.Name)), &Handle{f: f}, nil
 }
 
 // Forget about this node. This node will not receive further
@@ -326,16 +299,10 @@ func (n *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.C
 
 func (n *Node) Rename(ctx context.Context, req *fuse.RenameRequest, _newDir fs.Node) (err error) {
 	newDir := _newDir.(*Node)
-	func() {
-		log.Printf("[rename] node=%q oldname=%q newnode=%q newname=%q -- err=%v", n.path, req.NewName, newDir.path, req.OldName, err)
-	}()
 	return os.Rename(filepath.Join(n.srcpath(), req.OldName), filepath.Join(newDir.srcpath(), req.NewName))
 }
 
 func (n *Node) Mknod(ctx context.Context, req *fuse.MknodRequest) (_ fs.Node, err error) {
-	defer func() {
-		log.Printf("[mknod] node=%q name=%q mode=%#o rdev=%q newname=%q -- err=%v", n.path, req.Name, req.Mode, req.Rdev, req.Umask, err)
-	}()
 	if err := syscall.Mknod(filepath.Join(n.srcpath(), req.Name), uint32(req.Mode^req.Umask), int(req.Rdev)); err != nil {
 		return nil, err
 	}
@@ -343,8 +310,6 @@ func (n *Node) Mknod(ctx context.Context, req *fuse.MknodRequest) (_ fs.Node, er
 }
 
 func (n *Node) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
-	defer func() { log.Printf("[fsync] node=%q flags=%#o dir=%v -- err=%v", n.path, req.Flags, req.Dir, err) }()
-
 	f, err := os.Open(n.srcpath())
 	if err != nil {
 		return err
@@ -360,8 +325,6 @@ func (n *Node) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 //
 // If there is no xattr by that name, returns fuse.ErrNoXattr.
 func (n *Node) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) (err error) {
-	defer func() { log.Printf("[getxattr] node=%q name=%q -- err=%T", n.path, req.Name, err) }()
-
 	// TODO(bbj): Handle req.Size & returned syscall.Getxattr() size.
 	if _, err = syscall.Getxattr(n.srcpath(), req.Name, resp.Xattr); err == syscall.ENODATA {
 		return fuse.ErrNoXattr
@@ -371,8 +334,6 @@ func (n *Node) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fu
 
 // Listxattr lists the extended attributes recorded for the node.
 func (n *Node) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *fuse.ListxattrResponse) (err error) {
-	defer func() { log.Printf("[listxattr] node=%q -- err=%v", n.path, err) }()
-
 	// TODO(bbj): Handle req.Size & returned syscall.Getxattr() size.
 	_, err = syscall.Listxattr(n.srcpath(), resp.Xattr)
 	return err
@@ -381,9 +342,6 @@ func (n *Node) Listxattr(ctx context.Context, req *fuse.ListxattrRequest, resp *
 // Setxattr sets an extended attribute with the given name and
 // value for the node.
 func (n *Node) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) (err error) {
-	defer func() {
-		log.Printf("[setxattr] node=%q name=%q data=%q flags=%#o", n.path, req.Name, string(req.Xattr), req.Flags, err)
-	}()
 	return syscall.Setxattr(n.srcpath(), req.Name, req.Xattr, int(req.Flags))
 }
 
@@ -391,7 +349,6 @@ func (n *Node) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) (err err
 //
 // If there is no xattr by that name, returns fuse.ErrNoXattr.
 func (n *Node) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) (err error) {
-	defer func() { log.Printf("[removexattr] node=%q name=%q -- err=%v", n.path, req.Name, err) }()
 	return syscall.Removexattr(n.srcpath(), req.Name)
 }
 

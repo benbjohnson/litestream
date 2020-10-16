@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"io"
-	"log"
 	"os"
 	"sort"
 	"syscall"
@@ -32,13 +31,10 @@ type Handle struct {
 // Because there can be multiple file descriptors referring to a
 // single opened file, Flush can be called multiple times.
 func (h *Handle) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
-	defer func() { log.Printf("[flush] handle=%q -- err=%v", h.f.Name(), err) }()
 	return h.f.Sync()
 }
 
 func (h *Handle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
-	defer func() { log.Printf("[readdirall] handle=%q -- ents=%d err=%v", h.f.Name(), len(ents), err) }()
-
 	fis, err := h.f.Readdir(-1)
 	if err != nil {
 		return nil, err
@@ -65,19 +61,6 @@ func (h *Handle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error)
 // Note that reads beyond the size of the file as reported by Attr
 // are not even attempted (except in OpenDirectIO mode).
 func (h *Handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.ReadResponse) (err error) {
-	defer func() {
-		log.Printf("[read] handle=%q offset=%d size=%d flags=%#o lockowner=%d fileflags=%#o -- data=%d err=%v",
-			h.f.Name(),
-			req.Offset,
-			req.Size,
-			req.Flags,
-			req.LockOwner,
-			req.FileFlags,
-			len(resp.Data),
-			err,
-		)
-	}()
-
 	// TODO: Flags     ReadFlags
 	// TODO: LockOwner
 	// TODO: FileFlags OpenFlags
@@ -104,20 +87,6 @@ func (h *Handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 // (as seen through Attr). Note that file size changes are
 // communicated also through Setattr.
 func (h *Handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) (err error) {
-	defer func() {
-		log.Printf(
-			"[write] handle=%q offset=%d size=%d flags=%#o lockowner=%d fileflags=%#o -- data=%d err=%v",
-			h.f.Name(),
-			req.Offset,
-			len(req.Data),
-			req.Flags,
-			req.LockOwner,
-			req.FileFlags,
-			resp.Size,
-			err,
-		)
-	}()
-
 	// Offset    int64
 	// Data      []byte
 	// Flags     WriteFlags
@@ -125,11 +94,11 @@ func (h *Handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.W
 	// FileFlags OpenFlags
 
 	resp.Size, err = h.f.WriteAt(req.Data, req.Offset)
+	println("dbg/write!")
 	return err
 }
 
 func (h *Handle) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error) {
-	defer func() { log.Printf("[release] handle=%q -- err=%v", h.f.Name(), err) }()
 	return h.f.Close()
 }
 
@@ -150,8 +119,6 @@ func (h *Handle) Release(ctx context.Context, req *fuse.ReleaseRequest) (err err
 // The Go runtime uses epoll-based I/O whenever possible, even for
 // regular files.
 func (h *Handle) Poll(ctx context.Context, req *fuse.PollRequest, resp *fuse.PollResponse) error {
-	log.Printf("[poll] handle=%q flags=%#o events=%#o", h.f.Name(), req.Flags, req.Events)
-
 	//type PollRequest struct {
 	//    Header `json:"-"`
 	//    Handle HandleID
@@ -175,8 +142,6 @@ func (h *Handle) Poll(ctx context.Context, req *fuse.PollRequest, resp *fuse.Pol
 // (UnlockRequest, ReleaseRequest, FlushRequest) and also
 // in e.g. ReadRequest, WriteRequest.
 func (h *Handle) Lock(ctx context.Context, req *fuse.LockRequest) error {
-	log.Printf("[lock] handle=%q lockowner=%d lock=%#o lockflags=%#o", h.f.Name(), req.LockOwner, req.Lock, req.LockFlags)
-
 	// type LockRequest struct {
 	//     Header
 	//     Handle HandleID
@@ -192,8 +157,6 @@ func (h *Handle) Lock(ctx context.Context, req *fuse.LockRequest) error {
 // LockWait acquires a lock on a byte range of the node, waiting
 // until the lock can be obtained (or context is canceled).
 func (h *Handle) LockWait(ctx context.Context, req *fuse.LockWaitRequest) error {
-	log.Printf("[lockwait] handle=%q lockowner=%d lock=%#o lockflags=%#o", h.f.Name(), req.LockOwner, req.Lock, req.LockFlags)
-
 	// type LockWaitRequest LockRequest
 
 	panic("TODO")
@@ -203,8 +166,6 @@ func (h *Handle) LockWait(ctx context.Context, req *fuse.LockWaitRequest) error 
 // be released also implicitly, see HandleFlockLocker and
 // HandlePOSIXLocker.
 func (h *Handle) Unlock(ctx context.Context, req *fuse.UnlockRequest) error {
-	log.Printf("[unlock] handle=%q lockowner=%d lock=%#o lockflags=%#o", h.f.Name(), req.LockOwner, req.Lock, req.LockFlags)
-
 	// type UnlockRequest LockRequest
 
 	panic("TODO")
@@ -219,8 +180,6 @@ func (h *Handle) Unlock(ctx context.Context, req *fuse.UnlockRequest) error {
 // have Lock.Type F_UNLCK, and the whole struct should be
 // overwritten for in case of conflicting locks.
 func (h *Handle) QueryLock(ctx context.Context, req *fuse.QueryLockRequest, resp *fuse.QueryLockResponse) error {
-	log.Printf("[querylock] handle=%q lockowner=%d lock=%#o lockflags=%#o", h.f.Name(), req.LockOwner, req.Lock, req.LockFlags)
-
 	// type QueryLockRequest struct {
 	//     Header
 	//     Handle    HandleID
