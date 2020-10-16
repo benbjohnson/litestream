@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -63,7 +64,10 @@ func (m *Main) Run(args []string) (err error) {
 
 	m.logger.Printf("mounted")
 
-	return fs.Serve(conn, &FS{SourcePath: m.SourcePath})
+	s := fs.New(conn, &fs.Config{
+		Debug: debug,
+	})
+	return s.Serve(&FS{SourcePath: m.SourcePath})
 }
 
 func (m *Main) usage() {
@@ -80,4 +84,15 @@ Arguments:
 	    Enable verbose logging.
 
 `[1:])
+}
+
+// debug is a function that can be used for fs.Config.Debug.
+// It marshals the msg to JSON and prints to the log.
+func debug(msg interface{}) {
+	buf, err := json.Marshal(msg)
+	if err != nil {
+		println("debug: marshal error: %v", err)
+		return
+	}
+	log.Print("DEBUG ", string(buf))
 }
