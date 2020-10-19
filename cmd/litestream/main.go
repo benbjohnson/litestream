@@ -11,6 +11,7 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
+	"github.com/middlemost/litestream"
 )
 
 func main() {
@@ -43,6 +44,8 @@ func (m *Main) Run(args []string) (err error) {
 	if err := flagSet.Parse(args); err != nil {
 		return err
 	}
+
+	// Ensure src & mount paths are specified.
 	if m.SourcePath = flagSet.Arg(0); m.SourcePath == "" {
 		return errors.New("source path required")
 	} else if m.MountPath = flagSet.Arg(1); m.MountPath == "" {
@@ -50,7 +53,9 @@ func (m *Main) Run(args []string) (err error) {
 	}
 
 	// Setup logging, if verbose specified.
+	var config fs.Config
 	if *verbose {
+		config.Debug = debug
 		m.logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 
@@ -64,10 +69,8 @@ func (m *Main) Run(args []string) (err error) {
 
 	m.logger.Printf("mounted")
 
-	s := fs.New(conn, &fs.Config{
-		Debug: debug,
-	})
-	return s.Serve(&FS{SourcePath: m.SourcePath})
+	s := fs.New(conn, &config)
+	return s.Serve(&litestream.FileSystem{SourcePath: m.SourcePath})
 }
 
 func (m *Main) usage() {

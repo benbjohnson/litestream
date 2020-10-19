@@ -1,4 +1,4 @@
-package main
+package litestream
 
 import (
 	"context"
@@ -31,16 +31,13 @@ var _ fs.NodeSetxattrer = (*Node)(nil)
 var _ fs.NodeStringLookuper = (*Node)(nil)
 var _ fs.NodeSymlinker = (*Node)(nil)
 
-// var _ fs.NodeRequestLookuper = (*Node)(nil)
-// var _ fs.NodeForgetter = (*Node)(nil)
-// var _ fs.NodePoller = (*Node)(nil)
-
+// Node represents a file or directory in the file system.
 type Node struct {
-	fs   *FS    // base filesystem
-	path string // path within file system
+	fs   *FileSystem // base filesystem
+	path string      // path within file system
 }
 
-func NewNode(fs *FS, path string) *Node {
+func NewNode(fs *FileSystem, path string) *Node {
 	return &Node{fs: fs, path: path}
 }
 
@@ -105,15 +102,6 @@ func (n *Node) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
 	}
 	return ents, nil
 }
-
-// Getattr obtains the standard metadata for the receiver.
-// It should store that metadata in resp.
-//
-// If this method is not implemented, the attributes will be
-// generated based on Attr(), with zero values filled in.
-// func (n *Node) Getattr(ctx context.Context, req *fuse.GetattrRequest, resp *fuse.GetattrResponse) error {
-// 	panic("TODO")
-// }
 
 // Setattr sets the standard metadata for the receiver.
 //
@@ -249,12 +237,6 @@ func (n *Node) Access(ctx context.Context, req *fuse.AccessRequest) (err error) 
 	return syscall.Access(n.srcpath(), req.Mask)
 }
 
-//type NodeRequestLookuper interface {
-//	// Lookup looks up a specific entry in the receiver.
-//	// See NodeStringLookuper for more.
-//	Lookup(ctx context.Context, req *fuse.LookupRequest, resp *fuse.LookupResponse) (Node, error)
-//}
-
 func (n *Node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (_ fs.Node, err error) {
 	if err := syscall.Mkdir(filepath.Join(n.srcpath(), req.Name), uint32(req.Mode^req.Umask)); err != nil {
 		return nil, err
@@ -264,14 +246,6 @@ func (n *Node) Mkdir(ctx context.Context, req *fuse.MkdirRequest) (_ fs.Node, er
 
 // Open opens the receiver. After a successful open, a client
 // process has a file descriptor referring to this Handle.
-//
-// Open can also be also called on non-files. For example,
-// directories are Opened for ReadDir or fchdir(2).
-//
-// If this method is not implemented, the open will always
-// succeed, and the Node itself will be used as the Handle.
-//
-// XXX note about access.  XXX OpenFlags.
 func (n *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenResponse) (_ fs.Handle, err error) {
 	// TODO(bbj): Where does mode come from?
 	f, err := os.OpenFile(n.srcpath(), int(req.Flags), 0777)
@@ -289,13 +263,6 @@ func (n *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.C
 	}
 	return NewNode(n.fs, filepath.Join(n.path, req.Name)), &Handle{f: f}, nil
 }
-
-// Forget about this node. This node will not receive further
-// method calls.
-//
-// Forget is not necessarily seen on unmount, as all nodes are
-// implicitly forgotten as part of the unmount.
-// func (n *Node) Forget() { panic("TODO") }
 
 func (n *Node) Rename(ctx context.Context, req *fuse.RenameRequest, _newDir fs.Node) (err error) {
 	newDir := _newDir.(*Node)
@@ -320,10 +287,7 @@ func (n *Node) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
 	return f.Sync()
 }
 
-// Getxattr gets an extended attribute by the given name from the
-// node.
-//
-// If there is no xattr by that name, returns fuse.ErrNoXattr.
+// Getxattr gets an extended attribute by the given name from the node.
 func (n *Node) Getxattr(ctx context.Context, req *fuse.GetxattrRequest, resp *fuse.GetxattrResponse) (err error) {
 	// TODO(bbj): Handle req.Size & returned syscall.Getxattr() size.
 	if _, err = syscall.Getxattr(n.srcpath(), req.Name, resp.Xattr); err == syscall.ENODATA {
@@ -351,9 +315,3 @@ func (n *Node) Setxattr(ctx context.Context, req *fuse.SetxattrRequest) (err err
 func (n *Node) Removexattr(ctx context.Context, req *fuse.RemovexattrRequest) (err error) {
 	return syscall.Removexattr(n.srcpath(), req.Name)
 }
-
-// Poll checks whether the node is currently ready for I/O, and
-// may request a wakeup when it is. See HandlePoller.
-// func (n *Node) Poll(ctx context.Context, req *fuse.PollRequest, resp *fuse.PollResponse) error {
-// 	panic("TODO")
-// }
