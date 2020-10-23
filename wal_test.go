@@ -2,10 +2,29 @@ package litestream_test
 
 import (
 	"io"
+	"path/filepath"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
 )
+
+func TestWALFile_WriteHeader(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		f := MustOpenWALFile(t, "0000")
+		defer MustCloseWALFile(t, f)
+
+		if err := f.WriteHeader(litestream.WALHeader{
+			Magic:             litestream.MagicLittleEndian,
+			FileFormatVersion: 1001,
+			PageSize:          4096,
+			CheckpointSeqNo:   1003,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		t.Fatal("TODO: Ensure header written correctly")
+	})
+}
 
 func TestWALHeader_MarshalTo(t *testing.T) {
 	// Ensure the WAL header can be marshaled and unmarshaled correctly.
@@ -89,4 +108,23 @@ func TestWALFrameHeader_Unmarshal(t *testing.T) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
+}
+
+// MustOpenWALFile returns a new, open instance of WALFile written to a temp dir.
+func MustOpenWALFile(tb testing.TB, name string) *litestream.WALFile {
+	tb.Helper()
+
+	f := litestream.NewWALFile(filepath.Join(tb.TempDir(), name))
+	if err := f.Open(); err != nil {
+		tb.Fatal(err)
+	}
+	return f
+}
+
+// MustCloseWALFile closes an instance of WALFile.
+func MustCloseWALFile(tb testing.TB, f *litestream.WALFile) {
+	tb.Helper()
+	if err := f.Close(); err != nil {
+		tb.Fatal(err)
+	}
 }

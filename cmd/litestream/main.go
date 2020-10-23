@@ -11,7 +11,7 @@ import (
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
-	"github.com/middlemost/litestream"
+	"github.com/benbjohnson/litestream"
 )
 
 func main() {

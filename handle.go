@@ -53,7 +53,7 @@ func (h *Handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 
 // Write writes data at a given offset to the underlying file.
 func (h *Handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) (err error) {
-	log.Printf("write: name=%s offset=%d", h.f.Name(), req.Offset)
+	log.Printf("write: name=%s offset=%d n=%d", h.f.Name(), req.Offset, len(req.Data))
 	println(hex.Dump(req.Data))
 
 	resp.Size, err = h.f.WriteAt(req.Data, req.Offset)

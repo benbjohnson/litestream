@@ -2,8 +2,22 @@ package litestream
 
 import (
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+)
+
+var (
+	// ErrWALHeaderEmpty is returned when writing an empty header.
+	ErrWALHeaderEmpty = errors.New("wal header empty")
+
+	// ErrWALFileInitialized is returned when writing a header to a
+	// WAL file that has already has its header written.
+	ErrWALFileInitialized = errors.New("wal file already initialized")
+
+	// ErrChecksumMisaligned is returned when input byte length is not divisible by 8.
+	ErrChecksumMisaligned = errors.New("checksum input misaligned")
 )
 
 // WALFile represents a write-ahead log file.
@@ -19,17 +33,54 @@ func NewWALFile(path string) *WALFile {
 	return &WALFile{path: path}
 }
 
-func (s *WALFile) Open() error {
-	panic("TODO")
+// WALHeader returns the WAL header. The return is the zero value if unset.
+func (s *WALFile) Header() WALHeader {
+	return s.hdr
 }
 
+// Open initializes the WAL file descriptor. Creates the file if it doesn't exist.
+func (s *WALFile) Open() (err error) {
+	// TODO: Validate file contents if non-zero. Return ErrWALFileInvalidHeader if header invalid.
+	// TODO: Truncate transaction if commit record is invalid.
+
+	if s.f, err = os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0666); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Close syncs the WAL file and closes the file descriptor.
 func (s *WALFile) Close() error {
-	panic("TODO")
+	if err := s.f.Sync(); err != nil {
+		return fmt.Errorf("wal sync: %w", err)
+	}
+	return s.f.Close()
 }
 
+// Sync calls Sync() on the underlying file descriptor.
+func (s *WALFile) Sync() error {
+	return s.f.Sync()
+}
+
+// WriteHeader writes hdr to the WAL file.
+// Returns an error if hdr is empty or if the file already has a header.
 func (s *WALFile) WriteHeader(hdr WALHeader) error {
+	if hdr.IsZero() {
+		return ErrWALHeaderEmpty
+	} else if !s.hdr.IsZero() {
+		return ErrWALFileInitialized
+	}
 	s.hdr = hdr
-	panic("TODO")
+
+	// Marshal header & write to file.
+	b := make([]byte, WALHeaderSize)
+	if err := s.hdr.MarshalTo(b); err != nil {
+		return fmt.Errorf("marshal wal header: %w", err)
+	} else if _, err := s.f.Write(b); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (s *WALFile) WriteFrame(hdr WALFrameHeader, buf []byte) error {
@@ -46,6 +97,23 @@ type WALHeader struct {
 	CheckpointSeqNo   uint32
 	Salt              uint64
 	Checksum          uint64
+}
+
+// IsZero returns true if hdr is the zero value.
+func (hdr WALHeader) IsZero() bool {
+	return hdr == (WALHeader{})
+}
+
+// ByteOrder returns the byte order based on the hdr magic.
+func (hdr WALHeader) ByteOrder() binary.ByteOrder {
+	switch hdr.Magic {
+	case MagicLittleEndian:
+		return binary.LittleEndian
+	case MagicBigEndian:
+		return binary.BigEndian
+	default:
+		return nil
+	}
 }
 
 // MarshalTo encodes the header to b.
@@ -87,6 +155,11 @@ type WALFrameHeader struct {
 	PageN    uint32 // only set for commit records
 	Salt     uint64
 	Checksum uint64
+}
+
+// IsZero returns true if hdr is the zero value.
+func (hdr WALFrameHeader) IsZero() bool {
+	return hdr == (WALFrameHeader{})
 }
 
 // IsCommit returns true if the frame represents a commit header.
