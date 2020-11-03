@@ -42,7 +42,7 @@ func NewNode(fs *FileSystem, path string) *Node {
 }
 
 func (n *Node) srcpath() string {
-	return filepath.Join(n.fs.SourcePath, n.path)
+	return filepath.Join(n.fs.TargetPath, n.path)
 }
 
 func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
@@ -82,7 +82,7 @@ func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 // Lookup need not to handle the names "." and "..".
 func (n *Node) Lookup(ctx context.Context, name string) (_ fs.Node, err error) {
 	path := filepath.Join(n.path, name)
-	srcpath := filepath.Join(n.fs.SourcePath, path)
+	srcpath := filepath.Join(n.fs.TargetPath, path)
 	if _, err := os.Stat(srcpath); os.IsNotExist(err) {
 		return nil, syscall.ENOENT
 	}

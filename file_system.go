@@ -24,7 +24,7 @@ type FileSystem struct {
 	config Config         // configuration file
 
 	// Filepath to the root of the source directory.
-	SourcePath string
+	TargetPath string
 }
 
 func NewFileSystem() *FileSystem {
@@ -35,7 +35,7 @@ func NewFileSystem() *FileSystem {
 
 // ConfigPath returns the path to the file system config file.
 func (f *FileSystem) ConfigPath() string {
-	return filepath.Join(f.SourcePath, ConfigName)
+	return filepath.Join(f.TargetPath, ConfigName)
 }
 
 // Open initializes the file system and finds all managed database files.
