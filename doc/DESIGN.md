@@ -13,8 +13,8 @@ to construct a persistent write-ahead log that can be replicated.
 dir/
 	db                               # SQLite database
 	db-wal                           # SQLite WAL
-	.db-lightstream.config           # per-db configuration
-	.db-lightstream/
+	db.litestream                    # per-db configuration
+	.db-litestream/
 		log                          # recent event log
 		stat                         # per-db Prometheus statistics
 		snapshot                     # stores snapshot number (e.g. 0000000000000001)
@@ -46,7 +46,7 @@ bkt/
 File system startup:
 
 1. Load litestream.config file.
-2. Load all per-db "-lightstream.config" files.
+2. Load all per-db ".litestream" files.
 
 
 ### DB startup:

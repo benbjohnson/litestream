@@ -8,24 +8,6 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-func TestWALFile_WriteHeader(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		f := MustOpenWALFile(t, "0000")
-		defer MustCloseWALFile(t, f)
-
-		if err := f.WriteHeader(litestream.WALHeader{
-			Magic:             litestream.MagicLittleEndian,
-			FileFormatVersion: 1001,
-			PageSize:          4096,
-			CheckpointSeqNo:   1003,
-		}); err != nil {
-			t.Fatal(err)
-		}
-
-		t.Fatal("TODO: Ensure header written correctly")
-	})
-}
-
 func TestWALHeader_MarshalTo(t *testing.T) {
 	// Ensure the WAL header can be marshaled and unmarshaled correctly.
 	t.Run("OK", func(t *testing.T) {

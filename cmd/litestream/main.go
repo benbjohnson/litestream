@@ -87,8 +87,14 @@ func (m *Main) Run(args []string) (err error) {
 
 	m.logger.Printf("mounted %s; target=%s", m.Path, m.TargetPath)
 
+	fileSystem := litestream.NewFileSystem(m.TargetPath)
+	if err := fileSystem.Open(); err != nil {
+		return err
+	}
+	defer fileSystem.Close()
+
 	s := fs.New(conn, &config)
-	return s.Serve(&litestream.FileSystem{TargetPath: m.TargetPath})
+	return s.Serve(fileSystem)
 }
 
 func (m *Main) ensureTargetPath() error {

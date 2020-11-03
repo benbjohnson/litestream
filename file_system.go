@@ -1,17 +1,13 @@
 package litestream
 
 import (
-	"fmt"
-	"io/ioutil"
+	"log"
+	"os"
 	"path/filepath"
 	"sync"
 
 	"bazil.org/fuse/fs"
-	"github.com/pelletier/go-toml"
-)
-
-const (
-	ConfigName = "litestream.config"
+	// "github.com/pelletier/go-toml"
 )
 
 var _ fs.FS = (*FileSystem)(nil)
@@ -19,63 +15,73 @@ var _ fs.FS = (*FileSystem)(nil)
 // FileSystem represents the file system that is mounted.
 // It returns a root node that represents the root directory.
 type FileSystem struct {
-	mu     sync.RWMutex
-	dbs    map[string]*DB // databases by path
-	config Config         // configuration file
+	mu  sync.RWMutex
+	dbs map[string]*DB // databases by path
 
 	// Filepath to the root of the source directory.
 	TargetPath string
 }
 
-func NewFileSystem() *FileSystem {
+func NewFileSystem(target string) *FileSystem {
 	return &FileSystem{
-		config: DefaultConfig(),
+		dbs:        make(map[string]*DB),
+		TargetPath: target,
 	}
-}
-
-// ConfigPath returns the path to the file system config file.
-func (f *FileSystem) ConfigPath() string {
-	return filepath.Join(f.TargetPath, ConfigName)
 }
 
 // Open initializes the file system and finds all managed database files.
 func (f *FileSystem) Open() error {
 	f.mu.Lock()
-	defer f.mu.Lock()
-	return f.load()
-}
+	defer f.mu.Unlock()
 
-// load loads the configuration file.
-func (f *FileSystem) load() error {
-	// Read configuration file.
-	config := DefaultConfig()
-	if buf, err := ioutil.ReadFile(f.ConfigPath()); err != nil {
-		return err
-	} else if err := toml.Unmarshal(buf, &config); err != nil {
-		return fmt.Errorf("unmarshal(): cannot read config file: %w", err)
-	}
-	f.config = config
+	return filepath.Walk(f.TargetPath, func(path string, info os.FileInfo, err error) error {
+		// Log errors while traversing file system.
+		if err != nil {
+			log.Printf("walk error: %s", err)
+			return nil
+		}
 
-	// Close dbs opened under previous configuration.
-	if err := f.closeDBs(); err != nil {
-		return fmt.Errorf("load(): cannot close db: %w", err)
-	}
+		// Ignore .<db>-litestream metadata directories.
+		if IsMetaDir(path) {
+			return filepath.SkipDir
+		} else if !IsConfigPath(path) {
+			return nil
+		}
 
-	// Search for matching DB files.
-	filenames, err := filepath.Glob(config.Pattern)
-	if err != nil {
-		return fmt.Errorf("load(): cannot glob: %w", err)
-	}
-
-	// Loop over matching files and create a DB for them.
-	for _, filename := range filenames {
-		db := NewDB(filename)
-		if err := db.Open(); err != nil {
+		// Determine the DB path relative to the target path.
+		rel, err := filepath.Rel(f.TargetPath, ConfigPathToDBPath(path))
+		if err != nil {
 			return err
 		}
-		f.dbs[db.Path()] = db
-	}
 
+		// Initialize a DB object based on the config path.
+		// The database doesn't need to exist. It will be tracked when created.
+		db := NewDB(rel)
+		if err := db.Open(); err != nil {
+			log.Printf("cannot open db %q: %s", rel, err)
+			return nil
+		}
+		f.dbs[db.Path()] = db
+
+		log.Printf("[DB]: %s", rel)
+
+		return nil
+	})
+}
+
+// OpenDB initializes a DB for a given path.
+func (f *FileSystem) OpenDB(path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.openDB(path)
+}
+
+func (f *FileSystem) openDB(path string) error {
+	db := NewDB(path)
+	if err := db.Open(); err != nil {
+		return err
+	}
+	f.dbs[db.Path()] = db
 	return nil
 }
 

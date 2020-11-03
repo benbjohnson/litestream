@@ -3,32 +3,22 @@ package litestream
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
 const (
 	MetaDirSuffix = "-litestream"
+	ConfigSuffix  = ".litestream"
 
 	WALDirName  = "wal"
 	LogFilename = "log"
 )
 
-// Mode represents the journaling mode of a DB.
-type Mode int
-
-const (
-	ModeEmpty = Mode(iota + 1)
-	ModeJournal
-	ModeWAL
-)
-
 // DB represents an instance of a managed SQLite database in the file system.
 type DB struct {
 	path string
-	mode Mode // method of writing to DB
 	inTx bool // currently in transaction
-
-	walFile *WALFile // active wal segment
 
 	ctx    context.Context
 	cancel func()
@@ -66,7 +56,6 @@ func (db *DB) LogPath() string {
 // Open loads the configuration file
 func (db *DB) Open() error {
 	// TODO: Ensure sidecar directory structure exists.
-	// TODO: Read WAL segments.
 	return nil
 }
 
@@ -74,11 +63,20 @@ func (db *DB) Open() error {
 func (db *DB) Close() error {
 	db.cancel()
 	db.wg.Wait()
-	// TODO: Close WAL segments.
 	return nil
 }
 
-// ActiveWALFile returns the active WAL file.
-func (db *DB) ActiveWALFile() *WALFile {
-	return db.walFile
+// IsMetaDir returns true if base in path is hidden and ends in "-litestream".
+func IsMetaDir(path string) bool {
+	base := filepath.Base(path)
+	return strings.HasPrefix(base, ".") && strings.HasSuffix(base, MetaDirSuffix)
+}
+
+func IsConfigPath(path string) bool {
+	return strings.HasSuffix(path, ConfigSuffix)
+}
+
+// ConfigPathToDBPath returns the path to the database based on a config path.
+func ConfigPathToDBPath(path string) string {
+	return strings.TrimSuffix(path, ConfigSuffix)
 }

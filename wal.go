@@ -3,9 +3,7 @@ package litestream
 import (
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
-	"os"
 )
 
 // TODO: Pages can be written multiple times before 3.11.0 (https://sqlite.org/releaselog/3_11_0.html)
@@ -21,73 +19,6 @@ var (
 	// ErrChecksumMisaligned is returned when input byte length is not divisible by 8.
 	ErrChecksumMisaligned = errors.New("checksum input misaligned")
 )
-
-// WALFile represents a write-ahead log file.
-type WALFile struct {
-	path string
-	hdr  WALHeader
-
-	f *os.File
-}
-
-// NewWALFile returns a new instance of WALFile.
-func NewWALFile(path string) *WALFile {
-	return &WALFile{path: path}
-}
-
-// WALHeader returns the WAL header. The return is the zero value if unset.
-func (s *WALFile) Header() WALHeader {
-	return s.hdr
-}
-
-// Open initializes the WAL file descriptor. Creates the file if it doesn't exist.
-func (s *WALFile) Open() (err error) {
-	// TODO: Validate file contents if non-zero. Return ErrWALFileInvalidHeader if header invalid.
-	// TODO: Truncate transaction if commit record is invalid.
-
-	if s.f, err = os.OpenFile(s.path, os.O_RDWR|os.O_CREATE, 0666); err != nil {
-		return err
-	}
-	return nil
-}
-
-// Close syncs the WAL file and closes the file descriptor.
-func (s *WALFile) Close() error {
-	if err := s.f.Sync(); err != nil {
-		return fmt.Errorf("wal sync: %w", err)
-	}
-	return s.f.Close()
-}
-
-// Sync calls Sync() on the underlying file descriptor.
-func (s *WALFile) Sync() error {
-	return s.f.Sync()
-}
-
-// WriteHeader writes hdr to the WAL file.
-// Returns an error if hdr is empty or if the file already has a header.
-func (s *WALFile) WriteHeader(hdr WALHeader) error {
-	if hdr.IsZero() {
-		return ErrWALHeaderEmpty
-	} else if !s.hdr.IsZero() {
-		return ErrWALFileInitialized
-	}
-	s.hdr = hdr
-
-	// Marshal header & write to file.
-	b := make([]byte, WALHeaderSize)
-	if err := s.hdr.MarshalTo(b); err != nil {
-		return fmt.Errorf("marshal wal header: %w", err)
-	} else if _, err := s.f.Write(b); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *WALFile) WriteFrame(hdr WALFrameHeader, buf []byte) error {
-	panic("TODO")
-}
 
 // WALHeaderSize is the size of the WAL header, in bytes.
 const WALHeaderSize = 32
