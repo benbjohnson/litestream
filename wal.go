@@ -8,6 +8,8 @@ import (
 	"os"
 )
 
+// TODO: Pages can be written multiple times before 3.11.0 (https://sqlite.org/releaselog/3_11_0.html)
+
 var (
 	// ErrWALHeaderEmpty is returned when writing an empty header.
 	ErrWALHeaderEmpty = errors.New("wal header empty")
