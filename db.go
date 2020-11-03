@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -55,7 +56,11 @@ func (db *DB) LogPath() string {
 
 // Open loads the configuration file
 func (db *DB) Open() error {
-	// TODO: Ensure sidecar directory structure exists.
+	// Ensure meta directory exists.
+	if err := os.MkdirAll(db.MetaPath(), 0600); err != nil {
+		return err
+	}
+
 	return nil
 }
 

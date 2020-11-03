@@ -2,7 +2,6 @@ package litestream
 
 import (
 	"context"
-	"encoding/hex"
 	"io"
 	"log"
 	"os"
@@ -54,7 +53,7 @@ func (h *Handle) Read(ctx context.Context, req *fuse.ReadRequest, resp *fuse.Rea
 // Write writes data at a given offset to the underlying file.
 func (h *Handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.WriteResponse) (err error) {
 	log.Printf("write: name=%s offset=%d n=%d", h.f.Name(), req.Offset, len(req.Data))
-	println(hex.Dump(req.Data))
+	println(HexDump(req.Data))
 
 	resp.Size, err = h.f.WriteAt(req.Data, req.Offset)
 	return err
@@ -86,30 +85,39 @@ func (h *Handle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error)
 // Lock tries to acquire a lock on a byte range of the node. If a
 // conflicting lock is already held, returns syscall.EAGAIN.
 func (h *Handle) Lock(ctx context.Context, req *fuse.LockRequest) error {
-	return h.lock(ctx, req)
-}
-
-// LockWait acquires a lock on a byte range of the node, waiting
-// until the lock can be obtained (or context is canceled).
-func (h *Handle) LockWait(ctx context.Context, req *fuse.LockWaitRequest) error {
-	return h.lock(ctx, (*fuse.LockRequest)(req))
-}
-
-// Unlock releases the lock on a byte range of the node. Locks can
-// be released also implicitly, see HandleFlockLocker and
-// HandlePOSIXLocker.
-func (h *Handle) Unlock(ctx context.Context, req *fuse.UnlockRequest) error {
-	return h.lock(ctx, (*fuse.LockRequest)(req))
-
-}
-
-func (h *Handle) lock(ctx context.Context, req *fuse.LockRequest) error {
+	log.Printf("dbg/lock %s -- %#v", h.f.Name(), req.Lock)
 	return syscall.FcntlFlock(h.f.Fd(), F_OFD_SETLK, &syscall.Flock_t{
 		Type:   int16(req.Lock.Type),
 		Whence: io.SeekStart,
 		Start:  int64(req.Lock.Start),
 		Len:    int64(req.Lock.End) - int64(req.Lock.Start),
 	})
+}
+
+// LockWait acquires a lock on a byte range of the node, waiting
+// until the lock can be obtained (or context is canceled).
+func (h *Handle) LockWait(ctx context.Context, req *fuse.LockWaitRequest) error {
+	log.Printf("dbg/lockwait %s -- %#v", h.f.Name(), req.Lock)
+	return syscall.FcntlFlock(h.f.Fd(), F_OFD_SETLKW, &syscall.Flock_t{
+		Type:   int16(req.Lock.Type),
+		Whence: io.SeekStart,
+		Start:  int64(req.Lock.Start),
+		Len:    int64(req.Lock.End) - int64(req.Lock.Start),
+	})
+}
+
+// Unlock releases the lock on a byte range of the node. Locks can
+// be released also implicitly, see HandleFlockLocker and
+// HandlePOSIXLocker.
+func (h *Handle) Unlock(ctx context.Context, req *fuse.UnlockRequest) error {
+	log.Printf("dbg/unlock %s -- %#v", h.f.Name(), req.Lock)
+	return syscall.FcntlFlock(h.f.Fd(), F_OFD_SETLK, &syscall.Flock_t{
+		Type:   int16(req.Lock.Type),
+		Whence: io.SeekStart,
+		Start:  int64(req.Lock.Start),
+		Len:    int64(req.Lock.End) - int64(req.Lock.Start),
+	})
+
 }
 
 // QueryLock returns the current state of locks held for the byte
@@ -121,17 +129,21 @@ func (h *Handle) lock(ctx context.Context, req *fuse.LockRequest) error {
 // have Lock.Type F_UNLCK, and the whole struct should be
 // overwritten for in case of conflicting locks.
 func (h *Handle) QueryLock(ctx context.Context, req *fuse.QueryLockRequest, resp *fuse.QueryLockResponse) error {
-	// type QueryLockRequest struct {
-	//     Header
-	//     Handle    HandleID
-	//     LockOwner LockOwner
-	//     Lock      FileLock
-	//     LockFlags LockFlags
-	// }
+	flock_t := syscall.Flock_t{
+		Type:   int16(req.Lock.Type),
+		Whence: io.SeekStart,
+		Start:  int64(req.Lock.Start),
+		Len:    int64(req.Lock.End) - int64(req.Lock.Start),
+	}
+	if err := syscall.FcntlFlock(h.f.Fd(), F_OFD_GETLK, &flock_t); err != nil {
+		return err
+	}
 
-	// type QueryLockResponse struct {
-	//     Lock FileLock
-	// }
-
-	panic("TODO")
+	resp.Lock = fuse.FileLock{
+		Type:  fuse.LockType(flock_t.Type),
+		Start: uint64(flock_t.Start),
+		End:   uint64(flock_t.Start + flock_t.Len),
+		PID:   flock_t.Pid,
+	}
+	return nil
 }

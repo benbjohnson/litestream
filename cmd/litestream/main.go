@@ -78,7 +78,7 @@ func (m *Main) Run(args []string) (err error) {
 	}
 
 	// Mount FUSE filesystem.
-	conn, err := fuse.Mount(m.Path, fuse.FSName("litestream"), fuse.Subtype("litestreamfs"))
+	conn, err := fuse.Mount(m.Path, fuse.LockingPOSIX())
 	if err != nil {
 		return err
 	}
