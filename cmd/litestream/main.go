@@ -78,7 +78,7 @@ func (m *Main) Run(args []string) (err error) {
 	}
 
 	// Mount FUSE filesystem.
-	conn, err := fuse.Mount(m.Path, fuse.LockingPOSIX())
+	conn, err := fuse.Mount(m.Path)
 	if err != nil {
 		return err
 	}

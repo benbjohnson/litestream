@@ -12,22 +12,16 @@ import (
 	"bazil.org/fuse/fs"
 )
 
-const (
-	F_OFD_GETLK  = 0x24
-	F_OFD_SETLK  = 0x25
-	F_OFD_SETLKW = 0x26
-)
-
-var _ fs.HandleFlockLocker = (*Handle)(nil)
 var _ fs.HandleFlusher = (*Handle)(nil)
-var _ fs.HandleLocker = (*Handle)(nil)
-var _ fs.HandlePOSIXLocker = (*Handle)(nil)
 var _ fs.HandleReadDirAller = (*Handle)(nil)
 var _ fs.HandleReader = (*Handle)(nil)
 var _ fs.HandleReleaser = (*Handle)(nil)
 var _ fs.HandleWriter = (*Handle)(nil)
 
 // var _ fs.HandleReadAller = (*Handle)(nil)
+// var _ fs.HandleFlockLocker = (*Handle)(nil)
+//var _ fs.HandleLocker = (*Handle)(nil)
+//var _ fs.HandlePOSIXLocker = (*Handle)(nil)
 
 // Handle represents a FUSE file handle.
 type Handle struct {
@@ -82,23 +76,28 @@ func (h *Handle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error)
 	return ents, nil
 }
 
+/*
 // Lock tries to acquire a lock on a byte range of the node. If a
 // conflicting lock is already held, returns syscall.EAGAIN.
 func (h *Handle) Lock(ctx context.Context, req *fuse.LockRequest) error {
-	log.Printf("dbg/lock %s -- %#v", h.f.Name(), req.Lock)
-	return syscall.FcntlFlock(h.f.Fd(), F_OFD_SETLK, &syscall.Flock_t{
+	log.Printf("dbg/lock %p %s -- %#v", h, h.f.Name(), req.Lock)
+	if err := syscall.FcntlFlock(h.f.Fd(), unix.F_OFD_SETLK, &syscall.Flock_t{
 		Type:   int16(req.Lock.Type),
 		Whence: io.SeekStart,
 		Start:  int64(req.Lock.Start),
 		Len:    int64(req.Lock.End) - int64(req.Lock.Start),
-	})
+	}); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 // LockWait acquires a lock on a byte range of the node, waiting
 // until the lock can be obtained (or context is canceled).
 func (h *Handle) LockWait(ctx context.Context, req *fuse.LockWaitRequest) error {
-	log.Printf("dbg/lockwait %s -- %#v", h.f.Name(), req.Lock)
-	return syscall.FcntlFlock(h.f.Fd(), F_OFD_SETLKW, &syscall.Flock_t{
+	log.Printf("dbg/lockwait %p %s -- %#v", h, h.f.Name(), req.Lock)
+	return syscall.FcntlFlock(h.f.Fd(), unix.F_OFD_SETLKW, &syscall.Flock_t{
 		Type:   int16(req.Lock.Type),
 		Whence: io.SeekStart,
 		Start:  int64(req.Lock.Start),
@@ -110,8 +109,8 @@ func (h *Handle) LockWait(ctx context.Context, req *fuse.LockWaitRequest) error 
 // be released also implicitly, see HandleFlockLocker and
 // HandlePOSIXLocker.
 func (h *Handle) Unlock(ctx context.Context, req *fuse.UnlockRequest) error {
-	log.Printf("dbg/unlock %s -- %#v", h.f.Name(), req.Lock)
-	return syscall.FcntlFlock(h.f.Fd(), F_OFD_SETLK, &syscall.Flock_t{
+	log.Printf("dbg/unlk %p %s -- %#v", h, h.f.Name(), req.Lock)
+	return syscall.FcntlFlock(h.f.Fd(), unix.F_OFD_SETLK, &syscall.Flock_t{
 		Type:   int16(req.Lock.Type),
 		Whence: io.SeekStart,
 		Start:  int64(req.Lock.Start),
@@ -129,13 +128,15 @@ func (h *Handle) Unlock(ctx context.Context, req *fuse.UnlockRequest) error {
 // have Lock.Type F_UNLCK, and the whole struct should be
 // overwritten for in case of conflicting locks.
 func (h *Handle) QueryLock(ctx context.Context, req *fuse.QueryLockRequest, resp *fuse.QueryLockResponse) error {
+	log.Printf("dbg/querylock %p %s -- %#v", h, h.f.Name(), req.Lock)
+
 	flock_t := syscall.Flock_t{
 		Type:   int16(req.Lock.Type),
 		Whence: io.SeekStart,
 		Start:  int64(req.Lock.Start),
 		Len:    int64(req.Lock.End) - int64(req.Lock.Start),
 	}
-	if err := syscall.FcntlFlock(h.f.Fd(), F_OFD_GETLK, &flock_t); err != nil {
+	if err := syscall.FcntlFlock(h.f.Fd(), unix.F_OFD_GETLK, &flock_t); err != nil {
 		return err
 	}
 
@@ -147,3 +148,4 @@ func (h *Handle) QueryLock(ctx context.Context, req *fuse.QueryLockRequest, resp
 	}
 	return nil
 }
+*/
