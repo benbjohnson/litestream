@@ -56,7 +56,7 @@ func (f *FileSystem) Open() error {
 
 		// Initialize a DB object based on the config path.
 		// The database doesn't need to exist. It will be tracked when created.
-		db := NewDB(rel)
+		db := NewDB(f, rel)
 		if err := db.Open(); err != nil {
 			log.Printf("cannot open db %q: %s", rel, err)
 			return nil
@@ -73,7 +73,9 @@ func (f *FileSystem) Open() error {
 func (f *FileSystem) DB(path string) *DB {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.dbs[path]
+	db := f.dbs[path]
+	println("dbg/fs.db?", path, db != nil)
+	return db
 }
 
 // OpenDB initializes a DB for a given path.
@@ -84,7 +86,7 @@ func (f *FileSystem) OpenDB(path string) error {
 }
 
 func (f *FileSystem) openDB(path string) error {
-	db := NewDB(path)
+	db := NewDB(f, path)
 	if err := db.Open(); err != nil {
 		return err
 	}

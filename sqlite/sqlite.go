@@ -95,6 +95,26 @@ func (hdr WALHeader) ByteOrder() binary.ByteOrder {
 	}
 }
 
+// ReadFrom reads hdr from r.
+func (hdr *WALHeader) ReadFrom(r io.Reader) (n int64, err error) {
+	b := make([]byte, WALHeaderSize)
+	nn, err := io.ReadFull(r, b)
+	if n = int64(nn); err != nil {
+		return n, err
+	}
+	return n, hdr.Unmarshal(b)
+}
+
+// WriteTo writes hdr to r.
+func (hdr *WALHeader) WriteTo(w io.Writer) (n int64, err error) {
+	b := make([]byte, WALHeaderSize)
+	if err := hdr.MarshalTo(b); err != nil {
+		return 0, err
+	}
+	nn, err := w.Write(b)
+	return int64(nn), err
+}
+
 // MarshalTo encodes the header to b.
 // Returns io.ErrShortWrite if len(b) is less than WALHeaderSize.
 func (hdr *WALHeader) MarshalTo(b []byte) error {
@@ -144,6 +164,26 @@ func (hdr WALFrameHeader) IsZero() bool {
 // IsCommit returns true if the frame represents a commit header.
 func (hdr *WALFrameHeader) IsCommit() bool {
 	return hdr.PageN != 0
+}
+
+// ReadFrom reads hdr from r.
+func (hdr *WALFrameHeader) ReadFrom(r io.Reader) (n int64, err error) {
+	b := make([]byte, WALFrameHeaderSize)
+	nn, err := io.ReadFull(r, b)
+	if n = int64(nn); err != nil {
+		return n, err
+	}
+	return n, hdr.Unmarshal(b)
+}
+
+// WriteTo writes hdr to r.
+func (hdr *WALFrameHeader) WriteTo(w io.Writer) (n int64, err error) {
+	b := make([]byte, WALFrameHeaderSize)
+	if err := hdr.MarshalTo(b); err != nil {
+		return 0, err
+	}
+	nn, err := w.Write(b)
+	return int64(nn), err
 }
 
 // MarshalTo encodes the frame header to b.

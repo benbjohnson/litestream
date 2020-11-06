@@ -39,3 +39,9 @@ func trimPrefixN(s string, n int) string {
 	}
 	return s[n:]
 }
+
+func assert(condition bool, message string) {
+	if !condition {
+		panic("assertion failed: " + message)
+	}
+}

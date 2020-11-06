@@ -42,6 +42,8 @@ type Node struct {
 }
 
 func NewNode(fs *FileSystem, path string) *Node {
+	assert(fs != nil, "node file system required")
+	assert(path != "", "node path required")
 	return &Node{fs: fs, path: path}
 }
 
@@ -57,6 +59,7 @@ func (n *Node) srcpath() string {
 // DB returns the DB object associated with the node, if any.
 // If node points to a "-wal" file then the associated DB is returned.
 func (n *Node) DB() *DB {
+	println("dbg/node.db", n.path, n.fs != nil, n.path == "")
 	if strings.HasPrefix(n.path, sqlite.WALSuffix) {
 		return n.fs.DB(strings.TrimSuffix(n.path, sqlite.WALSuffix))
 	}
@@ -100,6 +103,12 @@ func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 // Lookup need not to handle the names "." and "..".
 func (n *Node) Lookup(ctx context.Context, name string) (_ fs.Node, err error) {
 	path := filepath.Join(n.path, name)
+
+	// Meta directories should not be visible.
+	if IsMetaDir(path) {
+		return nil, syscall.ENOENT
+	}
+
 	srcpath := filepath.Join(n.fs.TargetPath, path)
 	if _, err := os.Stat(srcpath); os.IsNotExist(err) {
 		return nil, syscall.ENOENT
@@ -113,11 +122,17 @@ func (n *Node) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error) {
 		return nil, err
 	}
 
-	ents = make([]fuse.Dirent, len(fis))
-	for i, fi := range fis {
+	ents = make([]fuse.Dirent, 0, len(fis))
+	for _, fi := range fis {
+		// Skip any meta directories.
+		if IsMetaDir(fi.Name()) {
+			continue
+		}
+
 		statt := fi.Sys().(*syscall.Stat_t)
-		ents[i] = fuse.Dirent{Inode: statt.Ino, Name: fi.Name()}
+		ents = append(ents, fuse.Dirent{Inode: statt.Ino, Name: fi.Name()})
 	}
+
 	return ents, nil
 }
 
@@ -237,10 +252,18 @@ func (n *Node) Link(ctx context.Context, req *fuse.LinkRequest, _old fs.Node) (_
 // the receiver, which must be a directory.  The entry to be removed
 // may correspond to a file (unlink) or to a directory (rmdir).
 func (n *Node) Remove(ctx context.Context, req *fuse.RemoveRequest) (err error) {
-	if req.Dir {
-		return syscall.Rmdir(filepath.Join(n.srcpath(), req.Name))
+	path := filepath.Join(n.srcpath(), req.Name)
+	if IsMetaDir(path) {
+		return syscall.ENOENT
 	}
-	return syscall.Unlink(filepath.Join(n.srcpath(), req.Name))
+
+	if req.Dir {
+		return syscall.Rmdir(path)
+	}
+
+	// TODO: Clear db header.
+
+	return syscall.Unlink(path)
 }
 
 // Access checks whether the calling context has permission for
@@ -270,6 +293,7 @@ func (n *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if err != nil {
 		return nil, err
 	}
+	println("dbg/open")
 	return NewHandle(n, f), nil
 }
 
@@ -279,7 +303,8 @@ func (n *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.C
 	if err != nil {
 		return nil, nil, err
 	}
-	return NewNode(n.fs, filepath.Join(n.path, req.Name)), NewHandle(n, f), nil
+	nn := NewNode(n.fs, filepath.Join(n.path, req.Name))
+	return nn, NewHandle(nn, f), nil
 }
 
 func (n *Node) Rename(ctx context.Context, req *fuse.RenameRequest, _newDir fs.Node) (err error) {

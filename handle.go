@@ -101,10 +101,15 @@ func (h *Handle) ReadDirAll(ctx context.Context) (ents []fuse.Dirent, err error)
 	}
 
 	// Convert FileInfo objects to FUSE directory entries.
-	ents = make([]fuse.Dirent, len(fis))
-	for i, fi := range fis {
+	ents = make([]fuse.Dirent, 0, len(fis))
+	for _, fi := range fis {
+		// Skip any meta directories.
+		if IsMetaDir(fi.Name()) {
+			continue
+		}
+
 		statt := fi.Sys().(*syscall.Stat_t)
-		ents[i] = fuse.Dirent{Inode: statt.Ino, Name: fi.Name()}
+		ents = append(ents, fuse.Dirent{Inode: statt.Ino, Name: fi.Name()})
 	}
 
 	sort.Slice(ents, func(i, j int) bool { return ents[i].Name < ents[j].Name })
