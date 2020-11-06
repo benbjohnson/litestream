@@ -11,31 +11,40 @@ to construct a persistent write-ahead log that can be replicated.
 
 ```
 dir/
-	db                               # SQLite database
-	db-wal                           # SQLite WAL
-	db.litestream                    # per-db configuration
+	db                              # SQLite database
+	db-wal                          # SQLite WAL
+	db.litestream                   # per-db configuration
 	.db-litestream/
-		log                          # recent event log
-		stat                         # per-db Prometheus statistics
-		snapshot                     # stores snapshot number (e.g. 0000000000000001)
-		wal/                         # each WAL file contains pages in flush interval
-			active                   # active WAL file exists until flush; renamed
-			0000000000000001.wal.gz  # flushed, compressed WAL files
-			0000000000000002.wal.gz
+		log                         # recent event log
+		stat                        # per-db Prometheus statistics
+		generation                  # current generation number
+		wal/                        # each WAL file contains pages in flush interval
+			active.wal              # active WAL file exists until flush; renamed
+			000000000000001.wal.gz  # flushed, compressed WAL files
+			000000000000002.wal.gz
 ```
 
 ### Remote (S3)
 
 ```
 bkt/
-	db/                                                # database path
-		0000000000000001/                              # snapshot directory
-			snapshot                                   # full db snapshot
-			0000000000000001.wal.gz                    # compressed WAL file
-			0000000000000002.wal.gz
-		0000000000000002/
-			snapshot
-			0000000000000001-0000000000000003.tar.gz
+	db/                                   # database path
+		00000001/                         # snapshot directory
+			snapshot                      # full db snapshot
+			000000000000001.wal.gz        # compressed WAL file
+			000000000000002.wal.gz
+		00000002/
+			snapshot/
+				000000000000000.snapshot
+				scheduled/
+					daily/
+						20000101T000000Z-000000000000023.snapshot
+						20000102T000000Z-000000000000036.snapshot
+					monthly/
+						20000101T000000Z-000000000000023.snapshot
+
+			wal/
+				000000000000001.wal.gz
 ```
 
 

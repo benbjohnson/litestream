@@ -1,9 +1,11 @@
-package litestream
+package sqlite
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"io"
+	"strings"
 )
 
 // TODO: Pages can be written multiple times before 3.11.0 (https://sqlite.org/releaselog/3_11_0.html)
@@ -19,6 +21,50 @@ var (
 	// ErrChecksumMisaligned is returned when input byte length is not divisible by 8.
 	ErrChecksumMisaligned = errors.New("checksum input misaligned")
 )
+
+// HeaderSize is the size of a SQLite 3 database header, in bytes.
+const HeaderSize = 100
+
+// WALSuffix is the suffix appended to the end of SQLite WAL path names.
+const WALSuffix = "-wal"
+
+// Magic number specified at the beginning of WAL files.
+const (
+	MagicLittleEndian = 0x377f0682
+	MagicBigEndian    = 0x377f0683
+)
+
+// IsWALPath returns true if path ends with WALSuffix.
+func IsWALPath(path string) bool {
+	return strings.HasSuffix(path, WALSuffix)
+}
+
+// IsValidHeader returns true if page contains the standard SQLITE3 header.
+func IsValidHeader(page []byte) bool {
+	return bytes.HasPrefix(page, []byte("SQLite format 3\x00"))
+}
+
+// IsWALEnabled returns true if header page has the file format read & write
+// version set to 2 (which indicates WAL).
+func IsWALEnabled(page []byte) bool {
+	return len(page) >= 19 && page[18] == 2 && page[19] == 2
+}
+
+// Checksum computes a running checksum over a byte slice.
+func Checksum(bo binary.ByteOrder, s uint64, b []byte) (_ uint64, err error) {
+	// Ensure byte slice length is divisible by 8.
+	if len(b)%8 != 0 {
+		return 0, ErrChecksumMisaligned
+	}
+
+	// Iterate over 8-byte units and compute checksum.
+	s0, s1 := uint32(s>>32), uint32(s&0xFFFFFFFF)
+	for i := 0; i < len(b); i += 8 {
+		s0 += bo.Uint32(b[i:]) + s1
+		s1 += bo.Uint32(b[i+4:]) + s0
+	}
+	return uint64(s0)<<32 | uint64(s1), nil
+}
 
 // WALHeaderSize is the size of the WAL header, in bytes.
 const WALHeaderSize = 32

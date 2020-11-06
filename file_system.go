@@ -69,6 +69,13 @@ func (f *FileSystem) Open() error {
 	})
 }
 
+// DB returns the DB object associated with path.
+func (f *FileSystem) DB(path string) *DB {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.dbs[path]
+}
+
 // OpenDB initializes a DB for a given path.
 func (f *FileSystem) OpenDB(path string) error {
 	f.mu.Lock()

@@ -1,11 +1,11 @@
-package litestream_test
+package sqlite_test
 
 import (
 	"io"
 	"path/filepath"
 	"testing"
 
-	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/sqlite"
 )
 
 func TestWALHeader_MarshalTo(t *testing.T) {

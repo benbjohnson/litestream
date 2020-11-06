@@ -5,11 +5,14 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	"bazil.org/fuse"
 	"bazil.org/fuse/fs"
+	"github.com/benbjohnson/litestream/sqlite"
 )
 
 var _ fs.Node = (*Node)(nil)
@@ -33,6 +36,7 @@ var _ fs.NodeSymlinker = (*Node)(nil)
 
 // Node represents a file or directory in the file system.
 type Node struct {
+	mu   sync.RWMutex
 	fs   *FileSystem // base filesystem
 	path string      // path within file system
 }
@@ -41,8 +45,22 @@ func NewNode(fs *FileSystem, path string) *Node {
 	return &Node{fs: fs, path: path}
 }
 
+// Path returns the path the node was initialized with.
+func (n *Node) Path() string {
+	return n.path
+}
+
 func (n *Node) srcpath() string {
 	return filepath.Join(n.fs.TargetPath, n.path)
+}
+
+// DB returns the DB object associated with the node, if any.
+// If node points to a "-wal" file then the associated DB is returned.
+func (n *Node) DB() *DB {
+	if strings.HasPrefix(n.path, sqlite.WALSuffix) {
+		return n.fs.DB(strings.TrimSuffix(n.path, sqlite.WALSuffix))
+	}
+	return n.fs.DB(n.path)
 }
 
 func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
@@ -252,7 +270,7 @@ func (n *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if err != nil {
 		return nil, err
 	}
-	return &Handle{f: f}, nil
+	return NewHandle(n, f), nil
 }
 
 // Create creates a new directory entry in the receiver, which must be a directory.
@@ -261,7 +279,7 @@ func (n *Node) Create(ctx context.Context, req *fuse.CreateRequest, resp *fuse.C
 	if err != nil {
 		return nil, nil, err
 	}
-	return NewNode(n.fs, filepath.Join(n.path, req.Name)), &Handle{f: f}, nil
+	return NewNode(n.fs, filepath.Join(n.path, req.Name)), NewHandle(n, f), nil
 }
 
 func (n *Node) Rename(ctx context.Context, req *fuse.RenameRequest, _newDir fs.Node) (err error) {
