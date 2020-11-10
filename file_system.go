@@ -74,7 +74,6 @@ func (f *FileSystem) DB(path string) *DB {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	db := f.dbs[path]
-	println("dbg/fs.db?", path, db != nil)
 	return db
 }
 

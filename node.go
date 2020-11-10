@@ -59,7 +59,6 @@ func (n *Node) srcpath() string {
 // DB returns the DB object associated with the node, if any.
 // If node points to a "-wal" file then the associated DB is returned.
 func (n *Node) DB() *DB {
-	println("dbg/node.db", n.path, n.fs != nil, n.path == "")
 	if strings.HasPrefix(n.path, sqlite.WALSuffix) {
 		return n.fs.DB(strings.TrimSuffix(n.path, sqlite.WALSuffix))
 	}
@@ -103,12 +102,6 @@ func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
 // Lookup need not to handle the names "." and "..".
 func (n *Node) Lookup(ctx context.Context, name string) (_ fs.Node, err error) {
 	path := filepath.Join(n.path, name)
-
-	// Meta directories should not be visible.
-	if IsMetaDir(path) {
-		return nil, syscall.ENOENT
-	}
-
 	srcpath := filepath.Join(n.fs.TargetPath, path)
 	if _, err := os.Stat(srcpath); os.IsNotExist(err) {
 		return nil, syscall.ENOENT
@@ -293,7 +286,6 @@ func (n *Node) Open(ctx context.Context, req *fuse.OpenRequest, resp *fuse.OpenR
 	if err != nil {
 		return nil, err
 	}
-	println("dbg/open")
 	return NewHandle(n, f), nil
 }
 

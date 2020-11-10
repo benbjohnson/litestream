@@ -58,6 +58,11 @@ func (db *DB) Path() string {
 	return db.path
 }
 
+// AbsPath returns the full path to the database.
+func (db *DB) AbsPath() string {
+	return filepath.Join(db.fs.TargetPath, db.path)
+}
+
 // WALPath returns the full path to the real WAL.
 func (db *DB) WALPath() string {
 	return filepath.Join(db.fs.TargetPath, db.path+"-wal")
@@ -101,28 +106,34 @@ func (db *DB) Open() (err error) {
 		return err
 	}
 	db.logger = log.New(db.logFile, "", log.LstdFlags)
-
-	db.logger.Printf("open: %s", db.path)
+	db.logger.Printf("opening: path=%s", db.path)
 
 	// If database file exists, read & set the header.
 	if err := db.readHeader(); os.IsNotExist(err) {
+		db.logger.Printf("opening: db not found")
 		db.setHeader(nil) // invalidate header for missing file
 	} else if err != nil {
+		db.logger.Printf("opening: cannot read db header: %s", err)
 		db.setHeader(nil) // invalidate header
-		db.logger.Printf("cannot read db header: %s", err)
 	}
 
 	// If WAL is enabled & WAL file exists, attempt to recover.
-	if db.isWALEnabled {
-		if err := db.recoverWAL(); err != nil {
-			return fmt.Errorf("recover wal: %w", err)
-		}
+	if err := db.recover(); err != nil {
+		return fmt.Errorf("recover wal: %w", err)
 	}
+
+	db.logger.Printf("open: %s", db.path)
 
 	return nil
 }
 
-func (db *DB) recoverWAL() error {
+func (db *DB) recover() error {
+	// Ignore if the DB is invalid.
+	if !db.valid() {
+		db.logger.Printf("recovering: invalid db, skipping; valid-header:%v wal-enabled=%v", db.isHeaderValid, db.isWALEnabled)
+		return nil
+	}
+
 	// Check for the existence of the real & shadow WAL.
 	// We need to sync up between the two.
 	hasShadowWAL, err := db.shadowWALExists()
@@ -132,13 +143,6 @@ func (db *DB) recoverWAL() error {
 	hasRealWAL, err := db.walExists()
 	if err != nil {
 		return fmt.Errorf("check real wal: %w", err)
-	}
-
-	// Neither the real WAL or shadow WAL exist so no pages have been written
-	// since the DB's journal mode has been set to "wal". In this case, do
-	// nothing and wait for the first WAL write to occur.
-	if !hasShadowWAL && !hasRealWAL {
-		return nil
 	}
 
 	if hasRealWAL {
@@ -151,11 +155,15 @@ func (db *DB) recoverWAL() error {
 	if hasShadowWAL {
 		return db.recoverShadowWALOnly()
 	}
+
+	db.logger.Printf("recovering: no WALs available, skipping")
 	return nil // no-op, wait for first WAL write
 }
 
 // recoverRealWALOnly copies the real WAL to the active shadow WAL.
 func (db *DB) recoverRealWALOnly() error {
+	db.logger.Printf("recovering: real WAL only")
+
 	// Open real WAL to read from.
 	r, err := os.Open(db.WALPath())
 	if err != nil {
@@ -259,11 +267,13 @@ func (db *DB) createActiveShadowWAL(hdr sqlite.WALHeader) (f *os.File, err error
 // recoverShadowWALOnly verifies the last page in the shadow WAL matches the
 // contents of the database page.
 func (db *DB) recoverShadowWALOnly() error {
+	db.logger.Printf("recovering: shadow WAL only")
 	panic("TODO")
 }
 
 // recoverRealAndShadowWALs verifies the last page of the real & shadow WALs match.
 func (db *DB) recoverRealAndShadowWALs() error {
+	db.logger.Printf("recovering: real & shadow WAL")
 	panic("TODO")
 }
 
@@ -281,7 +291,7 @@ func (db *DB) Close() (err error) {
 
 // readHeader reads the SQLite header and sets the initial DB flags.
 func (db *DB) readHeader() error {
-	f, err := os.Open(db.path)
+	f, err := os.Open(db.AbsPath())
 	if err != nil {
 		return err
 	}
