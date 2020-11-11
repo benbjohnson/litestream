@@ -56,6 +56,11 @@ func (n *Node) srcpath() string {
 	return filepath.Join(n.fs.TargetPath, n.path)
 }
 
+// IsWAL returns true if node path has a "-wal" suffix.
+func (n *Node) IsWAL() bool {
+	return strings.HasSuffix(n.path, sqlite.WALSuffix)
+}
+
 // DB returns the DB object associated with the node, if any.
 // If node points to a "-wal" file then the associated DB is returned.
 func (n *Node) DB() *DB {
@@ -63,6 +68,25 @@ func (n *Node) DB() *DB {
 		return n.fs.DB(strings.TrimSuffix(n.path, sqlite.WALSuffix))
 	}
 	return n.fs.DB(n.path)
+}
+
+// Sync synchronizes the data to the shadow WAL if this node is the WAL.
+func (n *Node) Sync() (err error) {
+	println("dbg/node.sync")
+	// Ignore if this is not the WAL.
+	if !n.IsWAL() {
+		println("dbg/node.sync.notwal", n.path)
+		return nil
+	}
+
+	// Ignore if the node is not a managed db.
+	db := n.DB()
+	if db == nil {
+		println("dbg/node.sync.notmanaged", n.path)
+		return nil
+	}
+
+	return db.Sync()
 }
 
 func (n *Node) Attr(ctx context.Context, a *fuse.Attr) (err error) {
@@ -312,6 +336,11 @@ func (n *Node) Mknod(ctx context.Context, req *fuse.MknodRequest) (_ fs.Node, er
 }
 
 func (n *Node) Fsync(ctx context.Context, req *fuse.FsyncRequest) (err error) {
+	// Synchronize to shadow WAL.
+	if err := n.Sync(); err != nil {
+		return err
+	}
+
 	f, err := os.Open(n.srcpath())
 	if err != nil {
 		return err

@@ -37,6 +37,9 @@ func NewHandle(n *Node, f *os.File) *Handle {
 
 // Release closes the underlying file descriptor.
 func (h *Handle) Release(ctx context.Context, req *fuse.ReleaseRequest) (err error) {
+	if err := h.node.Sync(); err != nil {
+		return err
+	}
 	return h.f.Close()
 }
 
@@ -90,6 +93,9 @@ func (h *Handle) Write(ctx context.Context, req *fuse.WriteRequest, resp *fuse.W
 
 // Flush is called when a file handle is synced to disk. Implements fs.HandleFlusher.
 func (h *Handle) Flush(ctx context.Context, req *fuse.FlushRequest) (err error) {
+	if err := h.node.Sync(); err != nil {
+		return err
+	}
 	return h.f.Sync()
 }
 
