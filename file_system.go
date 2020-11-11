@@ -1,9 +1,11 @@
 package litestream
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 
 	"bazil.org/fuse/fs"
@@ -71,10 +73,22 @@ func (f *FileSystem) Open() error {
 
 // DB returns the DB object associated with path.
 func (f *FileSystem) DB(path string) *DB {
+	fmt.Println("dbg/dbs", path, "--", f.DBPaths())
+
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 	db := f.dbs[path]
 	return db
+}
+
+// DBPaths returns a sorted list of all paths managed by the file system.
+func (f *FileSystem) DBPaths() []string {
+	a := make([]string, 0, len(f.dbs))
+	for k := range f.dbs {
+		a = append(a, k)
+	}
+	sort.Strings(a)
+	return a
 }
 
 // OpenDB initializes a DB for a given path.

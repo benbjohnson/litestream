@@ -244,7 +244,13 @@ func (db *DB) shadowWALExists() (bool, error) {
 // contents of the database page.
 func (db *DB) recoverShadowWALOnly() error {
 	db.logger.Printf("recovering: shadow WAL only")
-	panic("TODO")
+
+	// TODO: Verify last page in shadow WAL matches data in DB.
+
+	db.processedWALByteN = 0
+	db.pendingWALByteN = 0
+
+	return nil
 }
 
 // recoverRealAndShadowWALs verifies the last page of the real & shadow WALs match.

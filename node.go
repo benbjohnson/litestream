@@ -64,9 +64,12 @@ func (n *Node) IsWAL() bool {
 // DB returns the DB object associated with the node, if any.
 // If node points to a "-wal" file then the associated DB is returned.
 func (n *Node) DB() *DB {
-	if strings.HasPrefix(n.path, sqlite.WALSuffix) {
+	println("dbg/node.db", n.path, strings.HasPrefix(n.path, sqlite.WALSuffix))
+	if strings.HasSuffix(n.path, sqlite.WALSuffix) {
+		println("dbg/node.db.trim", n.path, strings.TrimSuffix(n.path, sqlite.WALSuffix))
 		return n.fs.DB(strings.TrimSuffix(n.path, sqlite.WALSuffix))
 	}
+	println("dbg/node.db.other", n.path)
 	return n.fs.DB(n.path)
 }
 
