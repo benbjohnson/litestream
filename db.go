@@ -27,7 +27,6 @@ const (
 // DB represents an instance of a managed SQLite database in the file system.
 type DB struct {
 	mu   sync.Mutex
-	fs   *FileSystem
 	path string
 
 	isHeaderValid bool // true if meta page contains SQLITE3 header
@@ -49,8 +48,8 @@ type DB struct {
 }
 
 // NewDB returns a new instance of DB for a given path.
-func NewDB(fs *FileSystem, path string) *DB {
-	db := &DB{fs: fs, path: path}
+func NewDB() *DB {
+	db := &DB{}
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 	return db
 }
