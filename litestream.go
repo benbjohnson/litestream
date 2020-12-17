@@ -3,6 +3,8 @@ package litestream
 import (
 	"encoding/hex"
 	"strings"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // HexDump returns hexdump output but with duplicate lines removed.
