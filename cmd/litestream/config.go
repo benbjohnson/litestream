@@ -1,16 +1,19 @@
 package main
 
 import (
+	"fmt"
 	"io/ioutil"
 	"os"
+	"os/user"
+	"path/filepath"
 	"strings"
 
-	"github.com/pelletier/go-toml"
+	"gopkg.in/yaml.v2"
 )
 
 // Config represents a configuration file for the litestream CLI.
 type Config struct {
-	DBs []DBConfig `toml:"db"`
+	DBs []*DBConfig `yaml:"databases"`
 }
 
 // DefaultConfig returns a new instance of Config with defaults set.
@@ -38,12 +41,18 @@ func ReadConfigFile(filename string) (Config, error) {
 		return config, fmt.Errorf("config file not found: %s", filename)
 	} else if err != nil {
 		return config, err
-	} else if err := toml.Unmarshal(buf, &config); err != nil {
+	} else if err := yaml.Unmarshal(buf, &config); err != nil {
 		return config, err
 	}
 	return config, nil
 }
 
 type DBConfig struct {
-	Path string `toml:"path"`
+	Path        string              `yaml:"path"`
+	Replicators []*ReplicatorConfig `yaml:"replicators`
+}
+
+type ReplicatorConfig struct {
+	Type string `yaml:"type"` // "file", "s3"
+	Path string `yaml:"path"` // used for file replicators
 }

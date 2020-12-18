@@ -1,16 +1,14 @@
 package litestream
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"time"
 )
 
 const (
@@ -33,6 +31,10 @@ type DB struct {
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
+
+	// List of replicators for the database.
+	// Must be set before calling Open().
+	Replicators []Replicator
 
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
