@@ -54,5 +54,6 @@ type DBConfig struct {
 
 type ReplicatorConfig struct {
 	Type string `yaml:"type"` // "file", "s3"
+	Name string `yaml:"name"` // name of replicator, optional.
 	Path string `yaml:"path"` // used for file replicators
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"os/signal"
 
@@ -82,6 +83,9 @@ func (m *Main) ParseFlags(ctx context.Context, args []string) (err error) {
 		return err
 	}
 
+	// Initialize log.
+	log.SetFlags(0)
+
 	// Load configuration.
 	if m.ConfigPath == "" {
 		return errors.New("-config required")
@@ -145,13 +149,13 @@ func (m *Main) createFileReplicator(db *litestream.DB, config *ReplicatorConfig)
 	if config.Path == "" {
 		return nil, fmt.Errorf("file replicator path require for db %q", db.Path())
 	}
-	return litestream.NewFileReplicator(db, config.Path), nil
+	return litestream.NewFileReplicator(db, config.Name, config.Path), nil
 }
 
 // Close closes all open databases.
 func (m *Main) Close() (err error) {
 	for _, db := range m.DBs {
-		if e := db.Close(); e != nil {
+		if e := db.SoftClose(); e != nil {
 			fmt.Printf("error closing db: path=%s err=%s\n", db.Path(), e)
 			if err == nil {
 				err = e
