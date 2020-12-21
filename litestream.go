@@ -1,11 +1,24 @@
 package litestream
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
 )
+
+// Checksum computes a running SQLite checksum over a byte slice.
+func Checksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
+	assert(len(b)%8 == 0, "misaligned checksum byte slice")
+
+	// Iterate over 8-byte units and compute checksum.
+	for i := 0; i < len(b); i += 8 {
+		s0 += bo.Uint32(b[i:]) + s1
+		s1 += bo.Uint32(b[i+4:]) + s0
+	}
+	return s0, s1
+}
 
 // HexDump returns hexdump output but with duplicate lines removed.
 func HexDump(b []byte) string {
