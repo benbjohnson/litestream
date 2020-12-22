@@ -11,7 +11,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
-// Config represents a configuration file for the litestream CLI.
+// Config represents a configuration file for the litestream daemon.
 type Config struct {
 	DBs []*DBConfig `yaml:"databases"`
 }

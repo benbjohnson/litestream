@@ -19,7 +19,7 @@ var (
 
 // Default settings.
 const (
-	DefaultConfigPath = "~/litestream.yml"
+	DefaultConfigPath = "~/litestreamd.yml"
 )
 
 func main() {
@@ -39,7 +39,7 @@ func main() {
 	}
 
 	// Display version information.
-	fmt.Printf("Litestream %s\n", Version)
+	fmt.Printf("litestreamd %s\n", Version)
 
 	// Start monitoring databases.
 	if err := m.Run(ctx); err != nil {
@@ -76,7 +76,7 @@ func NewMain() *Main {
 
 // ParseFlags parses the flag set from args & loads the configuration.
 func (m *Main) ParseFlags(ctx context.Context, args []string) (err error) {
-	fs := flag.NewFlagSet("litestream", flag.ContinueOnError)
+	fs := flag.NewFlagSet("litestreamd", flag.ContinueOnError)
 	fs.StringVar(&m.ConfigPath, "config", DefaultConfigPath, "configuration path")
 	fs.Usage = m.Usage
 	if err := fs.Parse(args); err != nil {
@@ -167,11 +167,11 @@ func (m *Main) Close() (err error) {
 
 func (m *Main) Usage() {
 	fmt.Println(`
-Litestream is a daemon for replicating SQLite databases.
+litestreamd is a daemon for replicating SQLite databases.
 
 Usage:
 
-	litestream [arguments]
+	litestreamd [arguments]
 
 Arguments:
 
