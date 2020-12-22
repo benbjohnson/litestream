@@ -1,11 +1,25 @@
 package litestream
 
 import (
+	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"fmt"
+	"io"
+	"os"
+	"strconv"
 	"strings"
 
 	_ "github.com/mattn/go-sqlite3"
+)
+
+const (
+	MetaDirSuffix = "-litestream"
+
+	WALDirName = "wal"
+	WALExt     = ".wal"
+
+	GenerationNameLen = 16
 )
 
 // Checksum computes a running SQLite checksum over a byte slice.
@@ -18,6 +32,70 @@ func Checksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
 		s1 += bo.Uint32(b[i+4:]) + s0
 	}
 	return s0, s1
+}
+
+const (
+	// WALHeaderSize is the size of the WAL header, in bytes.
+	WALHeaderSize = 32
+
+	// WALFrameHeaderSize is the size of the WAL frame header, in bytes.
+	WALFrameHeaderSize = 24
+)
+
+// calcWALSize returns the size of the WAL, in bytes, for a given number of pages.
+func calcWALSize(pageSize int, n int) int64 {
+	return int64(WALHeaderSize + ((WALFrameHeaderSize + pageSize) * n))
+}
+
+// rollback rolls back tx. Ignores already-rolled-back errors.
+func rollback(tx *sql.Tx) error {
+	if err := tx.Rollback(); err != nil && !strings.Contains(err.Error(), `transaction has already been committed or rolled back`) {
+		return err
+	}
+	return nil
+}
+
+// readWALHeader returns the header read from a WAL file.
+func readWALHeader(filename string) ([]byte, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, WALHeaderSize)
+	n, err := io.ReadFull(f, buf)
+	return buf[:n], err
+}
+
+// readFileAt reads a slice from a file.
+func readFileAt(filename string, offset, n int64) ([]byte, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, n)
+	if n, err := f.ReadAt(buf, offset); err != nil {
+		return buf[:n], err
+	} else if n < len(buf) {
+		return buf[:n], io.ErrUnexpectedEOF
+	}
+	return buf, nil
+}
+
+func ParseWALFilename(name string) (index int, err error) {
+	v, err := strconv.ParseInt(strings.TrimSuffix(name, WALExt), 16, 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid wal filename: %q", name)
+	}
+	return int(v), nil
+}
+
+func FormatWALFilename(index int) string {
+	assert(index >= 0, "wal index must be non-negative")
+	return fmt.Sprintf("%016d%s", index, WALExt)
 }
 
 // HexDump returns hexdump output but with duplicate lines removed.
