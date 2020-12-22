@@ -49,7 +49,7 @@ func main() {
 	}
 
 	// Notify user that initialization is done.
-	fmt.Printf("Initialized with %d databases; replication initialized.\n", len(m.DBs))
+	fmt.Printf("Initialized with %d databases.\n", len(m.DBs))
 
 	// Wait for signal to stop program.
 	<-ctx.Done()
