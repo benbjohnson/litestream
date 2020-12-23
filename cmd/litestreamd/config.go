@@ -48,11 +48,11 @@ func ReadConfigFile(filename string) (Config, error) {
 }
 
 type DBConfig struct {
-	Path        string              `yaml:"path"`
-	Replicators []*ReplicatorConfig `yaml:"replicators`
+	Path     string           `yaml:"path"`
+	Replicas []*ReplicaConfig `yaml:"replicas"`
 }
 
-type ReplicatorConfig struct {
+type ReplicaConfig struct {
 	Type string `yaml:"type"` // "file", "s3"
 	Name string `yaml:"name"` // name of replicator, optional.
 	Path string `yaml:"path"` // used for file replicators

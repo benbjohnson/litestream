@@ -117,7 +117,7 @@ func (m *Main) openDB(config *DBConfig) error {
 	db := litestream.NewDB(config.Path)
 
 	// Instantiate and attach replicators.
-	for _, rconfig := range config.Replicators {
+	for _, rconfig := range config.Replicas {
 		r, err := m.createReplicator(db, rconfig)
 		if err != nil {
 			return err
@@ -135,7 +135,7 @@ func (m *Main) openDB(config *DBConfig) error {
 }
 
 // createReplicator instantiates a replicator for a DB based on a config.
-func (m *Main) createReplicator(db *litestream.DB, config *ReplicatorConfig) (litestream.Replicator, error) {
+func (m *Main) createReplicator(db *litestream.DB, config *ReplicaConfig) (litestream.Replicator, error) {
 	switch config.Type {
 	case "", "file":
 		return m.createFileReplicator(db, config)
@@ -145,7 +145,7 @@ func (m *Main) createReplicator(db *litestream.DB, config *ReplicatorConfig) (li
 }
 
 // createFileReplicator returns a new instance of FileReplicator build from config.
-func (m *Main) createFileReplicator(db *litestream.DB, config *ReplicatorConfig) (*litestream.FileReplicator, error) {
+func (m *Main) createFileReplicator(db *litestream.DB, config *ReplicaConfig) (*litestream.FileReplicator, error) {
 	if config.Path == "" {
 		return nil, fmt.Errorf("file replicator path require for db %q", db.Path())
 	}
