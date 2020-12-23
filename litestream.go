@@ -68,6 +68,10 @@ func readWALHeader(filename string) ([]byte, error) {
 	return buf[:n], err
 }
 
+func readCheckpointSeqNo(hdr []byte) uint32 {
+	return binary.BigEndian.Uint32(hdr[12:])
+}
+
 // readFileAt reads a slice from a file.
 func readFileAt(filename string, offset, n int64) ([]byte, error) {
 	f, err := os.Open(filename)
