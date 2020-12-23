@@ -99,7 +99,7 @@ func ParseWALFilename(name string) (index int, err error) {
 
 func FormatWALFilename(index int) string {
 	assert(index >= 0, "wal index must be non-negative")
-	return fmt.Sprintf("%016d%s", index, WALExt)
+	return fmt.Sprintf("%016x%s", index, WALExt)
 }
 
 // HexDump returns hexdump output but with duplicate lines removed.
