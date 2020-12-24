@@ -16,8 +16,9 @@ import (
 const (
 	MetaDirSuffix = "-litestream"
 
-	WALDirName = "wal"
-	WALExt     = ".wal"
+	WALDirName  = "wal"
+	WALExt      = ".wal"
+	SnapshotExt = ".snapshot"
 
 	GenerationNameLen = 16
 )

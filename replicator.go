@@ -67,8 +67,8 @@ func (r *FileReplicator) SnapshotPath(generation string, index int) string {
 }
 
 // WALPath returns the path to a WAL file.
-func (r *FileReplicator) WALPath(pos Pos) string {
-	return filepath.Join(r.dst, "generations", pos.Generation, "wal", fmt.Sprintf("%016x.wal", pos.Index))
+func (r *FileReplicator) WALPath(generation string, index int) string {
+	return filepath.Join(r.dst, "generations", generation, "wal", fmt.Sprintf("%016x.wal", index))
 }
 
 // Snapshotting returns true if replicator is current snapshotting.
@@ -133,9 +133,17 @@ func (r *FileReplicator) monitor(ctx context.Context) {
 			}
 		}
 
+		// If we have no replicated WALs, start from last index in shadow WAL.
+		if pos.Index == 0 && pos.Offset == 0 {
+			if pos.Index, err = r.db.CurrentShadowWALIndex(pos.Generation); err != nil {
+				log.Printf("%s(%s): cannot determine latest shadow wal index: %s", r.db.Path(), r.Name(), err)
+				continue
+			}
+		}
+
 		// Synchronize the shadow wal into the replication directory.
 		if pos, err = r.sync(ctx, pos); err != nil {
-			log.Printf("%s(%s): sync error: %w", r.db.Path(), r.Name(), err)
+			log.Printf("%s(%s): sync error: %s", r.db.Path(), r.Name(), err)
 			continue
 		}
 	}
@@ -164,7 +172,7 @@ func (r *FileReplicator) pos() (pos Pos, err error) {
 
 	index := -1
 	for _, fi := range fis {
-		if !strings.HasSuffix(fi.Name(), ".wal") {
+		if !strings.HasSuffix(fi.Name(), WALExt) {
 			continue
 		}
 
@@ -190,19 +198,36 @@ func (r *FileReplicator) pos() (pos Pos, err error) {
 }
 
 // snapshot copies the entire database to the replica path.
-func (r *FileReplicator) snapshot(ctx context.Context, pos Pos) error {
+func (r *FileReplicator) snapshot(ctx context.Context, generation string, index int) error {
+	// Mark replicator as snapshotting to prevent checkpoints by the DB.
+	r.mu.Lock()
+	r.snapshotting = true
+	r.mu.Unlock()
+
+	// Ensure we release the snapshot flag when we leave the function.
+	defer func() {
+		r.mu.Lock()
+		r.snapshotting = false
+		r.mu.Unlock()
+	}()
+
+	// Ignore if we already have a snapshot for the given WAL index.
+	snapshotPath := r.SnapshotPath(generation, index)
+	if _, err := os.Stat(snapshotPath); err == nil {
+		return nil
+	}
+
 	rd, err := os.Open(r.db.Path())
 	if err != nil {
 		return err
 	}
 	defer rd.Close()
 
-	snapshotPath := r.SnapshotPath(pos.Generation, pos.Index)
-	if err := os.MkdirAll(snapshotPath, 0700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(snapshotPath), 0700); err != nil {
 		return err
 	}
 
-	w, err := os.Create(snapshotPath)
+	w, err := os.Create(snapshotPath + ".tmp")
 	if err != nil {
 		return err
 	}
@@ -214,16 +239,33 @@ func (r *FileReplicator) snapshot(ctx context.Context, pos Pos) error {
 		return err
 	} else if err := w.Close(); err != nil {
 		return err
+	} else if err := os.Rename(snapshotPath+".tmp", snapshotPath); err != nil {
+		return err
 	}
-
-	r.mu.Lock()
-	r.snapshotting = false
-	r.mu.Unlock()
 
 	return nil
 }
 
+// snapshotN returns the number of snapshots for a generation.
+func (r *FileReplicator) snapshotN(generation string) (int, error) {
+	fis, err := ioutil.ReadDir(filepath.Join(r.dst, "generations", generation, "snapshots"))
+	if os.IsNotExist(err) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+
+	var n int
+	for _, fi := range fis {
+		if strings.HasSuffix(fi.Name(), SnapshotExt) {
+			n++
+		}
+	}
+	return n, nil
+}
+
 func (r *FileReplicator) sync(ctx context.Context, pos Pos) (_ Pos, err error) {
+	// Read all WAL files since the last position.
 	for {
 		if pos, err = r.syncNext(ctx, pos); err == io.EOF {
 			return pos, nil
@@ -242,8 +284,17 @@ func (r *FileReplicator) syncNext(ctx context.Context, pos Pos) (_ Pos, err erro
 	}
 	defer rd.Close()
 
+	// Create snapshot if no snapshots exist.
+	if n, err := r.snapshotN(rd.Pos().Generation); err != nil {
+		return pos, err
+	} else if n == 0 {
+		if err := r.snapshot(ctx, rd.Pos().Generation, rd.Pos().Index); err != nil {
+			return pos, err
+		}
+	}
+
 	// Ensure parent directory exists for WAL file.
-	filename := r.WALPath(rd.Pos())
+	filename := r.WALPath(rd.Pos().Generation, rd.Pos().Index)
 	if err := os.MkdirAll(filepath.Dir(filename), 0700); err != nil {
 		return pos, err
 	}

@@ -102,34 +102,40 @@ func (db *DB) GenerationPath(generation string) string {
 // ShadowWALPath returns the path of a single shadow WAL file.
 func (db *DB) ShadowWALPath(generation string, index int) string {
 	assert(index >= 0, "shadow wal index cannot be negative")
-	return filepath.Join(db.GenerationPath(generation), "wal", fmt.Sprintf("%016x", index)+".wal")
+	return filepath.Join(db.GenerationPath(generation), "wal", fmt.Sprintf("%016x", index)+WALExt)
 }
 
 // CurrentShadowWALPath returns the path to the last shadow WAL in a generation.
 func (db *DB) CurrentShadowWALPath(generation string) (string, error) {
-	// TODO: Cache current shadow WAL path.
-	dir := filepath.Join(db.GenerationPath(generation), "wal")
-	fis, err := ioutil.ReadDir(dir)
+	index, err := db.CurrentShadowWALIndex(generation)
 	if err != nil {
 		return "", err
 	}
+	return db.ShadowWALPath(generation, index), nil
+}
 
-	// Find highest wal file.
-	var max string
+// CurrentShadowWALIndex returns the current WAL index for a given generation.
+func (db *DB) CurrentShadowWALIndex(generation string) (int, error) {
+	fis, err := ioutil.ReadDir(filepath.Join(db.GenerationPath(generation), "wal"))
+	if os.IsNotExist(err) {
+		return 0, nil // no wal files written for generation
+	} else if err != nil {
+		return 0, err
+	}
+
+	// Find highest wal index.
+	var index int
 	for _, fi := range fis {
 		if !strings.HasSuffix(fi.Name(), WALExt) {
 			continue
 		}
-		if max == "" || fi.Name() > max {
-			max = fi.Name()
+		if v, err := ParseWALFilename(filepath.Base(fi.Name())); err != nil {
+			continue // invalid wal filename
+		} else if v > index {
+			index = v
 		}
 	}
-
-	// Return error if we found no WAL files.
-	if max == "" {
-		return "", fmt.Errorf("no wal files found in %q", dir)
-	}
-	return filepath.Join(dir, max), nil
+	return index, nil
 }
 
 // Notify returns a channel that closes when the shadow WAL changes.
