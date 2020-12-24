@@ -154,6 +154,15 @@ func (db *DB) PageSize() int {
 }
 
 func (db *DB) Open() (err error) {
+	// Validate that all replicator names are unique.
+	m := make(map[string]struct{})
+	for _, r := range db.Replicators {
+		if _, ok := m[r.Name()]; ok {
+			return fmt.Errorf("duplicate replicator name: %q", r.Name())
+		}
+		m[r.Name()] = struct{}{}
+	}
+
 	// Start monitoring SQLite database in a separate goroutine.
 	db.wg.Add(1)
 	go func() { defer db.wg.Done(); db.monitor() }()
