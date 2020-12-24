@@ -163,6 +163,11 @@ func (db *DB) Open() (err error) {
 		m[r.Name()] = struct{}{}
 	}
 
+	// Clear old temporary files that my have been left from a crash.
+	if err := removeTmpFiles(db.MetaPath()); err != nil {
+		return fmt.Errorf("cannot remove tmp files: %w", err)
+	}
+
 	// Start monitoring SQLite database in a separate goroutine.
 	db.wg.Add(1)
 	go func() { defer db.wg.Done(); db.monitor() }()

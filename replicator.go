@@ -92,6 +92,11 @@ func (r *FileReplicator) Stop() {
 
 // monitor runs in a separate goroutine and continuously replicates the DB.
 func (r *FileReplicator) monitor(ctx context.Context) {
+	// Clear old temporary files that my have been left from a crash.
+	if err := removeTmpFiles(r.dst); err != nil {
+		log.Printf("%s(%s): cannot remove tmp files: %w", r.db.Path(), r.Name(), err)
+	}
+
 	// Continuously check for new data to replicate.
 	ch := make(chan struct{})
 	close(ch)

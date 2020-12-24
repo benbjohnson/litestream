@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -121,6 +122,20 @@ func ParseWALFilename(name string) (index int, err error) {
 func FormatWALFilename(index int) string {
 	assert(index >= 0, "wal index must be non-negative")
 	return fmt.Sprintf("%016x%s", index, WALExt)
+}
+
+// removeTmpFiles recursively finds and removes .tmp files.
+func removeTmpFiles(root string) error {
+	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip errored files
+		} else if info.IsDir() {
+			return nil // skip directories
+		} else if !strings.HasSuffix(path, ".tmp") {
+			return nil // skip non-temp files
+		}
+		return os.Remove(path)
+	})
 }
 
 // HexDump returns hexdump output but with duplicate lines removed.
