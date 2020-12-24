@@ -22,6 +22,26 @@ const (
 	GenerationNameLen = 16
 )
 
+// Pos is a position in the WAL for a generation.
+type Pos struct {
+	Generation string // generation name
+	Index      int    // wal file index
+	Offset     int64  // offset within wal file
+}
+
+// String returns a string representation.
+func (p Pos) String() string {
+	if p.IsZero() {
+		return "<>"
+	}
+	return fmt.Sprintf("<%s,%d,%d>", p.Generation, p.Index, p.Offset)
+}
+
+// IsZero returns true if p is the zero value.
+func (p Pos) IsZero() bool {
+	return p == (Pos{})
+}
+
 // Checksum computes a running SQLite checksum over a byte slice.
 func Checksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
 	assert(len(b)%8 == 0, "misaligned checksum byte slice")
