@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"os"
@@ -9,6 +10,11 @@ import (
 	"strings"
 
 	"gopkg.in/yaml.v2"
+)
+
+// Default settings.
+const (
+	DefaultConfigPath = "~/litestream.yml"
 )
 
 // Config represents a configuration file for the litestream daemon.
@@ -56,4 +62,8 @@ type ReplicaConfig struct {
 	Type string `yaml:"type"` // "file", "s3"
 	Name string `yaml:"name"` // name of replicator, optional.
 	Path string `yaml:"path"` // used for file replicators
+}
+
+func registerConfigFlag(fs *flag.FlagSet, p *string) {
+	fs.StringVar(p, "config", DefaultConfigPath, "config path")
 }
