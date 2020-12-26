@@ -190,6 +190,26 @@ func (db *DB) Close() (err error) {
 	return err
 }
 
+// UpdatedAt returns the last modified time of the database or WAL file.
+func (db *DB) UpdatedAt() (time.Time, error) {
+	// Determine database modified time.
+	fi, err := os.Stat(db.Path())
+	if err != nil {
+		return time.Time{}, err
+	}
+	t := fi.ModTime().UTC()
+
+	// Use WAL modified time, if available & later.
+	if fi, err := os.Stat(db.WALPath()); os.IsNotExist(err) {
+		return t, nil
+	} else if err != nil {
+		return t, err
+	} else if fi.ModTime().After(t) {
+		t = fi.ModTime().UTC()
+	}
+	return t, nil
+}
+
 // Init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
 func (db *DB) Init() (err error) {

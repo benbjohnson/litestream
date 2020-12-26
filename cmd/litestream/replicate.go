@@ -54,10 +54,17 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 		return errors.New("configuration must specify at least one database")
 	}
 
-	for _, dbc := range config.DBs {
-		if err := c.openDB(dbc); err != nil {
+	for _, dbConfig := range config.DBs {
+		db, err := newDBFromConfig(dbConfig)
+		if err != nil {
 			return err
 		}
+
+		// Open database & attach to program.
+		if err := db.Open(); err != nil {
+			return err
+		}
+		c.DBs = append(c.DBs, db)
 	}
 
 	// Notify user that initialization is done.
@@ -76,47 +83,6 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
-// openDB instantiates and initializes a DB based on a configuration.
-func (c *ReplicateCommand) openDB(config *DBConfig) error {
-	// Initialize database with given path.
-	db := litestream.NewDB(config.Path)
-
-	// Instantiate and attach replicators.
-	for _, rconfig := range config.Replicas {
-		r, err := c.createReplicator(db, rconfig)
-		if err != nil {
-			return err
-		}
-		db.Replicators = append(db.Replicators, r)
-	}
-
-	// Open database & attach to program.
-	if err := db.Open(); err != nil {
-		return err
-	}
-	c.DBs = append(c.DBs, db)
-
-	return nil
-}
-
-// createReplicator instantiates a replicator for a DB based on a config.
-func (c *ReplicateCommand) createReplicator(db *litestream.DB, config *ReplicaConfig) (litestream.Replicator, error) {
-	switch config.Type {
-	case "", "file":
-		return c.createFileReplicator(db, config)
-	default:
-		return nil, fmt.Errorf("unknown replicator type in config: %q", config.Type)
-	}
-}
-
-// createFileReplicator returns a new instance of FileReplicator build from config.
-func (c *ReplicateCommand) createFileReplicator(db *litestream.DB, config *ReplicaConfig) (*litestream.FileReplicator, error) {
-	if config.Path == "" {
-		return nil, fmt.Errorf("file replicator path require for db %q", db.Path())
-	}
-	return litestream.NewFileReplicator(db, config.Name, config.Path), nil
-}
-
 // Close closes all open databases.
 func (c *ReplicateCommand) Close() (err error) {
 	for _, db := range c.DBs {
@@ -131,7 +97,7 @@ func (c *ReplicateCommand) Close() (err error) {
 }
 
 func (c *ReplicateCommand) Usage() {
-	fmt.Println(`
+	fmt.Printf(`
 The replicate command starts a server to monitor & replicate databases 
 specified in your configuration file.
 
@@ -142,7 +108,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file. Defaults to ~/litestream.yml
+	    Specifies the configuration file. Defaults to %s
 
-`[1:])
+`[1:], DefaultConfigPath)
 }

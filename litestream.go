@@ -138,6 +138,34 @@ func removeTmpFiles(root string) error {
 	})
 }
 
+// IsGenerationName returns true if s is the correct length and is only lowercase hex characters.
+func IsGenerationName(s string) bool {
+	if len(s) != GenerationNameLen {
+		return false
+	}
+	for _, ch := range s {
+		if !isHexChar(ch) {
+			return false
+		}
+	}
+	return true
+}
+
+// IsSnapshotPath returns true if s is a path to a snapshot file.
+func IsSnapshotPath(s string) bool {
+	return strings.HasSuffix(s, SnapshotExt) || strings.HasSuffix(s, SnapshotExt+".gz")
+}
+
+// IsWALPath returns true if s is a path to a WAL file.
+func IsWALPath(s string) bool {
+	return strings.HasSuffix(s, WALExt) || strings.HasSuffix(s, WALExt+".gz")
+}
+
+// isHexChar returns true if ch is a lowercase hex character.
+func isHexChar(ch rune) bool {
+	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
+}
+
 // HexDump returns hexdump output but with duplicate lines removed.
 func HexDump(b []byte) string {
 	const prefixN = len("00000000")
