@@ -1003,6 +1003,170 @@ func (db *DB) monitor() {
 	}
 }
 
+// Restore restores the database from a replica based on the options given.
+// This method will restore into opt.OutputPath, if specified, or into the
+// DB's original database path. It can optionally restore from a specific
+// replica or generation or it will automatically choose the best one. Finally,
+// a timestamp can be specified to restore the database to a specific
+// point-in-time.
+func (db *DB) Restore(opt RestoreOptions) {
+	// Ensure logger exists.
+	logger := opt.Logger
+	if logger == nil {
+		logger = log.New(ioutil.Discard, "", 0)
+	}
+
+	// Determine the correct output path.
+	outputPath := opt.OutputPath
+	if outputPath == "" {
+		outputPath = db.Path
+	}
+
+	// Ensure output path does not already exist (unless this is a dry run).
+	if !opt.DryRun {
+		if _, err := os.Stat(outputPath); err == nil {
+			return fmt.Errorf("cannot restore, output path already exists: %s", outputPath)
+		} else if err != nil && !os.IsNotExist(err) {
+			return outputPath
+		}
+	}
+
+	// Determine target replica & generation to restore from.
+	r, generation, err := db.restoreTarget(opt, logger)
+	if err != nil {
+		return err
+	}
+
+	// Determine manifest to restore from.
+	snapshotPath, walPaths, err := opt.determineRestoreManifest(r, generation, opt.Timestamp, logger)
+	if err != nil {
+		return err
+	}
+
+	// Copy snapshot to output path.
+	logger.Printf("restoring snapshot from %s://%s/%s to %s.tmp", r.Name(), generation, snapshotPath, outputPath)
+	if !opt.DryRun {
+		if f, err := os.Create(outputPath + ".tmp"); err != nil {
+			return err
+		} else if err := r.RestoreSnapshot(f, snapshotPath); err != nil {
+			f.Close()
+			return err
+		} else if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		} else if err := f.Close(); err != nil {
+			return err
+		}
+	}
+
+	// Restore each WAL file.
+	for _, walPath := range walPaths {
+		logger.Printf("restoring wal from %s://%s/%s to %s.tmp-wal", r.Name(), generation, snapshotPath, outputPath)
+		if opt.DryRun {
+			continue
+		}
+
+		// Copy WAL from replica.
+		if f, err := os.Create(outputPath + ".tmp-wal"); err != nil {
+			return err
+		} else if err := r.RestoreWAL(f, walPath); err != nil {
+			f.Close()
+			return err
+		} else if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		} else if err := f.Close(); err != nil {
+			return err
+		}
+
+		// TODO: Open database with SQLite and force a truncated checkpoint.
+	}
+
+	// Copy file to final location.
+	logger.Printf("renaming database from temporary location")
+	if !opt.DryRun {
+		if err := os.Rename(outputPath+".tmp", outputPath); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) restoreTarget(opt RestoreOptions, logger *log.Logger) (Replicator, string, error) {
+	var target struct {
+		replicator Replicator
+		generation string
+		stats      GenerationStats
+	}
+
+	for _, r := range db.Replicators {
+		// Skip replica if it does not match filter.
+		if opt.ReplicaName != "" && r.Name() != opt.ReplicaName {
+			continue
+		}
+
+		// Search generations for one that contains the requested timestamp.
+		for _, generation := range r.Generations() {
+			// Skip generation if it does not match filter.
+			if opt.Generation != "" && generation != opt.Generation {
+				continue
+			}
+
+			// Fetch stats for generation.
+			stats, err := r.GenerationStats(generation)
+			if err != nil {
+				return nil, "", fmt.Errorf("cannot determine stats for generation (%s/%s): %s", r.Name(), generation, err)
+			}
+
+			// Skip if it does not contain timestamp.
+			if !opt.Timestamp.IsZero() {
+				if opt.Timestamp.Before(stats.CreatedAt) || opt.Timestamp.After(stats.UpdatedAt) {
+					continue
+				}
+			}
+
+			// Use the latest replica if we have multiple candidates.
+			if !stats.UpdatedAt.After(target.stats.UpdatedAt) {
+				continue
+			}
+
+			target.replicator = r
+			target.generation = generation
+			target.stats = stats
+		}
+	}
+
+	// Return an error if no matching targets found.
+	if target.generation == "" {
+		return nil, "", fmt.Errorf("no matching backups found")
+	}
+
+	return target.replicator, target.generation, nil
+}
+
+// RestoreOptions represents options for DB.Restore().
+type RestoreOptions struct {
+	// Target path to restore into.
+	// If blank, the original DB path is used.
+	OutputPath string
+
+	// Specific replica to restore from.
+	// If blank, all replicas are considered.
+	ReplicaName string
+
+	// Specific generation to restore from.
+	// If blank, all generations considered.
+	Generation string
+
+	// Point-in-time to restore database.
+	// If zero, database restore to most recent state available.
+	Timestamp time.Time
+
+	// Logger used to print status to.
+	Logger log.Logger
+}
+
 func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {
 	magic := binary.BigEndian.Uint32(hdr[0:])
 	switch magic {
