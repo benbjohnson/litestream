@@ -24,18 +24,32 @@ type Replicator interface {
 	// String identifier for the type of replicator ("file", "s3", etc).
 	Type() string
 
-	// Returns a list of generation names for the replicator.
-	Generations() ([]string, error)
-
-	// Returns basic information about a generation including the number of
-	// snapshot & WAL files as well as the time range covered.
-	GenerationStats(generation string) (GenerationStats, error)
-
 	// Starts replicating in a background goroutine.
 	Start(ctx context.Context)
 
 	// Stops all replication processing. Blocks until processing stopped.
 	Stop()
+
+	// Returns a list of generation names for the replicator.
+	Generations(ctx context.Context) ([]string, error)
+
+	// Returns basic information about a generation including the number of
+	// snapshot & WAL files as well as the time range covered.
+	GenerationStats(ctx context.Context, generation string) (GenerationStats, error)
+
+	// Returns the highest index for a snapshot within a generation that occurs
+	// before timestamp. If timestamp is zero, returns the latest snapshot.
+	SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error)
+
+	// Returns the highest index for a WAL file that occurs before timestamp.
+	// If timestamp is zero, returns the highest WAL index.
+	WALIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error)
+
+	// Returns a reader for snapshot data at the given generation/index.
+	SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+
+	// Returns a reader for WAL data at the given position.
+	WALReader(ctx context.Context, generation string, index int) (io.ReadCloser, error)
 }
 
 var _ Replicator = (*FileReplicator)(nil)
@@ -76,18 +90,28 @@ func (r *FileReplicator) Type() string {
 	return "file"
 }
 
+// SnapshotDir returns the path to a generation's snapshot directory.
+func (r *FileReplicator) SnapshotDir(generation string) string {
+	return filepath.Join(r.dst, "generations", generation, "snapshots")
+}
+
 // SnapshotPath returns the path to a snapshot file.
 func (r *FileReplicator) SnapshotPath(generation string, index int) string {
-	return filepath.Join(r.dst, "generations", generation, "snapshots", fmt.Sprintf("%016x.snapshot.gz", index))
+	return filepath.Join(r.SnapshotDir(generation), fmt.Sprintf("%016x.snapshot.gz", index))
+}
+
+// WALDir returns the path to a generation's WAL directory
+func (r *FileReplicator) WALDir(generation string) string {
+	return filepath.Join(r.dst, "generations", generation, "wal")
 }
 
 // WALPath returns the path to a WAL file.
 func (r *FileReplicator) WALPath(generation string, index int) string {
-	return filepath.Join(r.dst, "generations", generation, "wal", fmt.Sprintf("%016x.wal", index))
+	return filepath.Join(r.WALDir(generation), fmt.Sprintf("%016x.wal", index))
 }
 
 // Generations returns a list of available generation names.
-func (r *FileReplicator) Generations() ([]string, error) {
+func (r *FileReplicator) Generations(ctx context.Context) ([]string, error) {
 	fis, err := ioutil.ReadDir(filepath.Join(r.dst, "generations"))
 	if os.IsNotExist(err) {
 		return nil, nil
@@ -108,7 +132,7 @@ func (r *FileReplicator) Generations() ([]string, error) {
 }
 
 // GenerationStats returns stats for a generation.
-func (r *FileReplicator) GenerationStats(generation string) (stats GenerationStats, err error) {
+func (r *FileReplicator) GenerationStats(ctx context.Context, generation string) (stats GenerationStats, err error) {
 	// Determine stats for all snapshots.
 	n, min, max, err := r.snapshotStats(generation)
 	if err != nil {
@@ -136,7 +160,7 @@ func (r *FileReplicator) GenerationStats(generation string) (stats GenerationSta
 }
 
 func (r *FileReplicator) snapshotStats(generation string) (n int, min, max time.Time, err error) {
-	fis, err := ioutil.ReadDir(filepath.Join(r.dst, "generations", generation, "snapshots"))
+	fis, err := ioutil.ReadDir(r.SnapshotDir(generation))
 	if os.IsNotExist(err) {
 		return n, min, max, nil
 	} else if err != nil {
@@ -161,7 +185,7 @@ func (r *FileReplicator) snapshotStats(generation string) (n int, min, max time.
 }
 
 func (r *FileReplicator) walStats(generation string) (n int, min, max time.Time, err error) {
-	fis, err := ioutil.ReadDir(filepath.Join(r.dst, "generations", generation, "wal"))
+	fis, err := ioutil.ReadDir(r.WALDir(generation))
 	if os.IsNotExist(err) {
 		return n, min, max, nil
 	} else if err != nil {
@@ -283,8 +307,8 @@ func (r *FileReplicator) pos() (pos Pos, err error) {
 	pos.Generation = generation
 
 	// Find the max WAL file.
-	walDir := filepath.Join(r.dst, "generations", generation, "wal")
-	fis, err := ioutil.ReadDir(walDir)
+	dir := r.WALDir(generation)
+	fis, err := ioutil.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return pos, nil // no replicated wal, start at beginning of generation
 	} else if err != nil {
@@ -312,7 +336,7 @@ func (r *FileReplicator) pos() (pos Pos, err error) {
 	pos.Index = index
 
 	// Determine current offset.
-	fi, err := os.Stat(filepath.Join(walDir, FormatWALFilename(pos.Index)))
+	fi, err := os.Stat(filepath.Join(dir, FormatWALFilename(pos.Index)))
 	if err != nil {
 		return pos, err
 	}
@@ -348,7 +372,7 @@ func (r *FileReplicator) snapshot(ctx context.Context, generation string, index 
 
 // snapshotN returns the number of snapshots for a generation.
 func (r *FileReplicator) snapshotN(generation string) (int, error) {
-	fis, err := ioutil.ReadDir(filepath.Join(r.dst, "generations", generation, "snapshots"))
+	fis, err := ioutil.ReadDir(r.SnapshotDir(generation))
 	if os.IsNotExist(err) {
 		return 0, nil
 	} else if err != nil {
@@ -357,10 +381,7 @@ func (r *FileReplicator) snapshotN(generation string) (int, error) {
 
 	var n int
 	for _, fi := range fis {
-		name := fi.Name()
-		name = strings.TrimSuffix(name, ".gz")
-
-		if strings.HasSuffix(name, SnapshotExt) {
+		if _, _, _, err := ParseSnapshotPath(fi.Name()); err == nil {
 			n++
 		}
 	}
@@ -379,7 +400,7 @@ func (r *FileReplicator) sync(ctx context.Context, pos Pos) (_ Pos, err error) {
 }
 
 func (r *FileReplicator) syncNext(ctx context.Context, pos Pos) (_ Pos, err error) {
-	rd, err := r.db.WALReader(pos)
+	rd, err := r.db.ShadowWALReader(pos)
 	if err == io.EOF {
 		return pos, err
 	} else if err != nil {
@@ -426,7 +447,7 @@ func (r *FileReplicator) syncNext(ctx context.Context, pos Pos) (_ Pos, err erro
 
 // compress gzips all WAL files before the current one.
 func (r *FileReplicator) compress(ctx context.Context, generation string) error {
-	dir := filepath.Join(r.dst, "generations", generation, "wal")
+	dir := r.WALDir(generation)
 	filenames, err := filepath.Glob(filepath.Join(dir, "*.wal"))
 	if err != nil {
 		return err
@@ -455,6 +476,136 @@ func (r *FileReplicator) compress(ctx context.Context, generation string) error 
 	}
 
 	return nil
+}
+
+// SnapsotIndexAt returns the highest index for a snapshot within a generation
+// that occurs before timestamp. If timestamp is zero, returns the latest snapshot.
+func (r *FileReplicator) SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error) {
+	fis, err := ioutil.ReadDir(r.SnapshotDir(generation))
+	if os.IsNotExist(err) {
+		return 0, ErrNoSnapshots
+	} else if err != nil {
+		return 0, err
+	}
+
+	index := -1
+	var max time.Time
+	for _, fi := range fis {
+		// Read index from snapshot filename.
+		idx, _, _, err := ParseSnapshotPath(fi.Name())
+		if err != nil {
+			continue // not a snapshot, skip
+		} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
+			continue // after timestamp, skip
+		}
+
+		// Use snapshot if it newer.
+		if max.IsZero() || fi.ModTime().After(max) {
+			index, max = idx, fi.ModTime()
+		}
+	}
+
+	if index == -1 {
+		return 0, ErrNoSnapshots
+	}
+	return index, nil
+}
+
+// Returns the highest index for a WAL file that occurs before timestamp.
+// If timestamp is zero, returns the highest WAL index.
+func (r *FileReplicator) WALIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error) {
+	fis, err := ioutil.ReadDir(r.WALDir(generation))
+	if os.IsNotExist(err) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+
+	index := -1
+	for _, fi := range fis {
+		// Read index from snapshot filename.
+		idx, _, _, err := ParseWALPath(fi.Name())
+		if err != nil {
+			continue // not a snapshot, skip
+		} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
+			continue // after timestamp, skip
+		} else if idx < index {
+			continue // earlier index, skip
+		}
+
+		index = idx
+	}
+
+	if index == -1 {
+		return 0, nil
+	}
+	return index, nil
+}
+
+// SnapshotReader returns a reader for snapshot data at the given generation/index.
+// Returns os.ErrNotExist if no matching index is found.
+func (r *FileReplicator) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	dir := r.SnapshotDir(generation)
+	fis, err := ioutil.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, fi := range fis {
+		// Parse index from snapshot filename. Skip if no match.
+		idx, _, ext, err := ParseSnapshotPath(fi.Name())
+		if err != nil || index != idx {
+			continue
+		}
+
+		// Open & return the file handle if uncompressed.
+		f, err := os.Open(filepath.Join(dir, fi.Name()))
+		if err != nil {
+			return nil, err
+		} else if ext == ".snapshot" {
+			return f, nil // not compressed, return as-is.
+		}
+		assert(ext == ".snapshot.gz", "invalid snapshot extension")
+
+		// If compressed, wrap in a gzip reader and return with wrapper to
+		// ensure that the underlying file is closed.
+		r, err := gzip.NewReader(f)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		return &gzipReadCloser{r: r, closer: f}, nil
+	}
+	return nil, os.ErrNotExist
+}
+
+// WALReader returns a reader for WAL data at the given index.
+// Returns os.ErrNotExist if no matching index is found.
+func (r *FileReplicator) WALReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	filename := r.WALPath(generation, index)
+
+	// Attempt to read uncompressed file first.
+	f, err := os.Open(filename)
+	if err == nil {
+		return f, nil // file exist, return
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, err
+	}
+
+	// Otherwise read the compressed file. Return error if file doesn't exist.
+	f, err = os.Open(filename + ".gz")
+	if err != nil {
+		return nil, err
+	}
+
+	// If compressed, wrap in a gzip reader and return with wrapper to
+	// ensure that the underlying file is closed.
+	rd, err := gzip.NewReader(f)
+	if err != nil {
+		f.Close()
+		return nil, err
+	}
+	return &gzipReadCloser{r: rd, closer: f}, nil
 }
 
 // compressFile compresses a file and replaces it with a new file with a .gz extension.

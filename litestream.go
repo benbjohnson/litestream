@@ -1,13 +1,16 @@
 package litestream
 
 import (
+	"compress/gzip"
 	"database/sql"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -22,6 +25,11 @@ const (
 	SnapshotExt = ".snapshot"
 
 	GenerationNameLen = 16
+)
+
+// Litestream errors.
+var (
+	ErrNoSnapshots = errors.New("no snapshots available")
 )
 
 // Pos is a position in the WAL for a generation.
@@ -153,17 +161,64 @@ func IsGenerationName(s string) bool {
 
 // IsSnapshotPath returns true if s is a path to a snapshot file.
 func IsSnapshotPath(s string) bool {
-	return strings.HasSuffix(s, SnapshotExt) || strings.HasSuffix(s, SnapshotExt+".gz")
+	return snapshotPathRegex.MatchString(s)
 }
+
+// ParseSnapshotPath returns the index for the snapshot.
+// Returns an error if the path is not a valid snapshot path.
+func ParseSnapshotPath(s string) (index int, typ, ext string, err error) {
+	a := snapshotPathRegex.FindStringSubmatch(s)
+	if a == nil {
+		return 0, "", "", fmt.Errorf("invalid snapshot path: %s", s)
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	return int(i64), a[2], a[3], nil
+}
+
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:-(\w+))?(.snapshot(?:.gz)?)$`)
 
 // IsWALPath returns true if s is a path to a WAL file.
 func IsWALPath(s string) bool {
-	return strings.HasSuffix(s, WALExt) || strings.HasSuffix(s, WALExt+".gz")
+	return walPathRegex.MatchString(s)
 }
+
+// ParseWALPath returns the index & offset for the WAL file.
+// Returns an error if the path is not a valid snapshot path.
+func ParseWALPath(s string) (index int, offset int64, ext string, err error) {
+	a := walPathRegex.FindStringSubmatch(s)
+	if a == nil {
+		return 0, 0, "", fmt.Errorf("invalid wal path: %s", s)
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	off64, _ := strconv.ParseUint(a[2], 16, 64)
+	return int(i64), int64(off64), a[3], nil
+}
+
+var walPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:_([0-9a-f]{16}))?(.wal(?:.gz)?)$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
+}
+
+// gzipReadCloser wraps gzip.Reader to also close the underlying reader on close.
+type gzipReadCloser struct {
+	r      *gzip.Reader
+	closer io.ReadCloser
+}
+
+func (r *gzipReadCloser) Read(p []byte) (n int, err error) {
+	return r.r.Read(p)
+}
+
+func (r *gzipReadCloser) Close() error {
+	if err := r.r.Close(); err != nil {
+		r.closer.Close()
+		return err
+	}
+	return r.closer.Close()
 }
 
 // HexDump returns hexdump output but with duplicate lines removed.

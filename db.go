@@ -777,13 +777,13 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 	return newSize, nil
 }
 
-// WALReader opens a reader for a shadow WAL file at a given position.
+// ShadowWALReader opens a reader for a shadow WAL file at a given position.
 // If the reader is at the end of the file, it attempts to return the next file.
 //
 // The caller should check Pos() & Size() on the returned reader to check offset.
-func (db *DB) WALReader(pos Pos) (r *WALReader, err error) {
+func (db *DB) ShadowWALReader(pos Pos) (r *ShadowWALReader, err error) {
 	// Fetch reader for the requested position. Return if it has data.
-	r, err = db.walReader(pos)
+	r, err = db.shadowWALReader(pos)
 	if err != nil {
 		return nil, err
 	} else if r.N() > 0 {
@@ -793,15 +793,15 @@ func (db *DB) WALReader(pos Pos) (r *WALReader, err error) {
 	// Otherwise attempt to read the start of the next WAL file.
 	pos.Index, pos.Offset = pos.Index+1, 0
 
-	r, err = db.walReader(pos)
+	r, err = db.shadowWALReader(pos)
 	if os.IsNotExist(err) {
 		return nil, io.EOF
 	}
 	return r, err
 }
 
-// walReader opens a file reader for a shadow WAL file at a given position.
-func (db *DB) walReader(pos Pos) (r *WALReader, err error) {
+// shadowWALReader opens a file reader for a shadow WAL file at a given position.
+func (db *DB) shadowWALReader(pos Pos) (r *ShadowWALReader, err error) {
 	filename := db.ShadowWALPath(pos.Generation, pos.Index)
 
 	f, err := os.Open(filename)
@@ -832,7 +832,7 @@ func (db *DB) walReader(pos Pos) (r *WALReader, err error) {
 		return nil, err
 	}
 
-	return &WALReader{
+	return &ShadowWALReader{
 		f:   f,
 		n:   fileSize - pos.Offset,
 		pos: pos,
@@ -854,25 +854,25 @@ func frameAlign(offset int64, pageSize int) int64 {
 	return (frameN * frameSize) + WALHeaderSize
 }
 
-// WALReader represents a reader for a WAL file that tracks WAL position.
-type WALReader struct {
+// ShadowWALReader represents a reader for a shadow WAL file that tracks WAL position.
+type ShadowWALReader struct {
 	f   *os.File
 	n   int64
 	pos Pos
 }
 
 // Close closes the underlying WAL file handle.
-func (r *WALReader) Close() error { return r.f.Close() }
+func (r *ShadowWALReader) Close() error { return r.f.Close() }
 
 // N returns the remaining bytes in the reader.
-func (r *WALReader) N() int64 { return r.n }
+func (r *ShadowWALReader) N() int64 { return r.n }
 
 // Pos returns the current WAL position.
-func (r *WALReader) Pos() Pos { return r.pos }
+func (r *ShadowWALReader) Pos() Pos { return r.pos }
 
 // Read reads bytes into p, updates the position, and returns the bytes read.
 // Returns io.EOF at the end of the available section of the WAL.
-func (r *WALReader) Read(p []byte) (n int, err error) {
+func (r *ShadowWALReader) Read(p []byte) (n int, err error) {
 	if r.n <= 0 {
 		return 0, io.EOF
 	}
@@ -1009,7 +1009,7 @@ func (db *DB) monitor() {
 // replica or generation or it will automatically choose the best one. Finally,
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
-func (db *DB) Restore(opt RestoreOptions) {
+func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	// Ensure logger exists.
 	logger := opt.Logger
 	if logger == nil {
@@ -1019,7 +1019,7 @@ func (db *DB) Restore(opt RestoreOptions) {
 	// Determine the correct output path.
 	outputPath := opt.OutputPath
 	if outputPath == "" {
-		outputPath = db.Path
+		outputPath = db.Path()
 	}
 
 	// Ensure output path does not already exist (unless this is a dry run).
@@ -1027,65 +1027,56 @@ func (db *DB) Restore(opt RestoreOptions) {
 		if _, err := os.Stat(outputPath); err == nil {
 			return fmt.Errorf("cannot restore, output path already exists: %s", outputPath)
 		} else if err != nil && !os.IsNotExist(err) {
-			return outputPath
+			return err
 		}
 	}
 
 	// Determine target replica & generation to restore from.
-	r, generation, err := db.restoreTarget(opt, logger)
+	r, generation, err := db.restoreTarget(ctx, opt, logger)
 	if err != nil {
 		return err
 	}
 
-	// Determine manifest to restore from.
-	snapshotPath, walPaths, err := opt.determineRestoreManifest(r, generation, opt.Timestamp, logger)
+	// Find lastest snapshot that occurs before timestamp.
+	minWALIndex, err := r.SnapshotIndexAt(ctx, generation, opt.Timestamp)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot find snapshot index for restore: %w", err)
 	}
+
+	// Find the maximum WAL index that occurs before timestamp.
+	maxWALIndex, err := r.WALIndexAt(ctx, generation, opt.Timestamp)
+	if err != nil {
+		return fmt.Errorf("cannot find max wal index for restore: %w", err)
+	}
+
+	// Initialize starting position.
+	pos := Pos{Generation: generation, Index: minWALIndex}
+	tmpPath := outputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	logger.Printf("restoring snapshot from %s://%s/%s to %s.tmp", r.Name(), generation, snapshotPath, outputPath)
+	logger.Printf("restoring snapshot from %s://%s/%s to %s", r.Name(), generation, minWALIndex, tmpPath)
 	if !opt.DryRun {
-		if f, err := os.Create(outputPath + ".tmp"); err != nil {
-			return err
-		} else if err := r.RestoreSnapshot(f, snapshotPath); err != nil {
-			f.Close()
-			return err
-		} else if err := f.Sync(); err != nil {
-			f.Close()
-			return err
-		} else if err := f.Close(); err != nil {
-			return err
+		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
+			return fmt.Errorf("cannot restore snapshot: %w", err)
 		}
 	}
 
-	// Restore each WAL file.
-	for _, walPath := range walPaths {
-		logger.Printf("restoring wal from %s://%s/%s to %s.tmp-wal", r.Name(), generation, snapshotPath, outputPath)
+	// Restore each WAL file until we reach our maximum index.
+	for index := minWALIndex; index <= maxWALIndex; index++ {
+		logger.Printf("restoring wal from %s://%s/%016x to %s-wal", r.Name(), generation, index, tmpPath)
 		if opt.DryRun {
 			continue
 		}
 
-		// Copy WAL from replica.
-		if f, err := os.Create(outputPath + ".tmp-wal"); err != nil {
-			return err
-		} else if err := r.RestoreWAL(f, walPath); err != nil {
-			f.Close()
-			return err
-		} else if err := f.Sync(); err != nil {
-			f.Close()
-			return err
-		} else if err := f.Close(); err != nil {
-			return err
+		if err := db.restoreWAL(ctx, r, generation, index, tmpPath); err != nil {
+			return fmt.Errorf("cannot restore wal: %w", err)
 		}
-
-		// TODO: Open database with SQLite and force a truncated checkpoint.
 	}
 
 	// Copy file to final location.
 	logger.Printf("renaming database from temporary location")
 	if !opt.DryRun {
-		if err := os.Rename(outputPath+".tmp", outputPath); err != nil {
+		if err := os.Rename(tmpPath, outputPath); err != nil {
 			return err
 		}
 	}
@@ -1093,7 +1084,7 @@ func (db *DB) Restore(opt RestoreOptions) {
 	return nil
 }
 
-func (db *DB) restoreTarget(opt RestoreOptions, logger *log.Logger) (Replicator, string, error) {
+func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log.Logger) (Replicator, string, error) {
 	var target struct {
 		replicator Replicator
 		generation string
@@ -1106,15 +1097,20 @@ func (db *DB) restoreTarget(opt RestoreOptions, logger *log.Logger) (Replicator,
 			continue
 		}
 
+		generations, err := r.Generations(ctx)
+		if err != nil {
+			return nil, "", fmt.Errorf("cannot fetch generations: %w", err)
+		}
+
 		// Search generations for one that contains the requested timestamp.
-		for _, generation := range r.Generations() {
+		for _, generation := range generations {
 			// Skip generation if it does not match filter.
 			if opt.Generation != "" && generation != opt.Generation {
 				continue
 			}
 
 			// Fetch stats for generation.
-			stats, err := r.GenerationStats(generation)
+			stats, err := r.GenerationStats(ctx, generation)
 			if err != nil {
 				return nil, "", fmt.Errorf("cannot determine stats for generation (%s/%s): %s", r.Name(), generation, err)
 			}
@@ -1145,6 +1141,72 @@ func (db *DB) restoreTarget(opt RestoreOptions, logger *log.Logger) (Replicator,
 	return target.replicator, target.generation, nil
 }
 
+// restoreSnapshot copies a snapshot from the replica to a file.
+func (db *DB) restoreSnapshot(ctx context.Context, r Replicator, generation string, index int, filename string) error {
+	if err := os.MkdirAll(filepath.Dir(filename), 0700); err != nil {
+		return err
+	}
+
+	f, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	rd, err := r.SnapshotReader(ctx, generation, index)
+	if err != nil {
+		return err
+	}
+	defer rd.Close()
+
+	if _, err := io.Copy(f, rd); err != nil {
+		return err
+	}
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// restoreWAL copies a WAL file from the replica to the local WAL and forces checkpoint.
+func (db *DB) restoreWAL(ctx context.Context, r Replicator, generation string, index int, dbPath string) error {
+	// Open handle to destination WAL path.
+	f, err := os.Create(dbPath + "-wal")
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	rd, err := r.WALReader(ctx, generation, index)
+	if err != nil {
+		return err
+	}
+	defer rd.Close()
+
+	//
+	if _, err := io.Copy(f, rd); err != nil {
+		return err
+	} else if err := f.Close(); err != nil {
+		return err
+	}
+
+	// Open SQLite database and force a truncating checkpoint.
+	d, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+
+	if _, err := d.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		return err
+	} else if err := d.Close(); err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // RestoreOptions represents options for DB.Restore().
 type RestoreOptions struct {
 	// Target path to restore into.
@@ -1163,8 +1225,12 @@ type RestoreOptions struct {
 	// If zero, database restore to most recent state available.
 	Timestamp time.Time
 
+	// If true, no actual restore is performed.
+	// Only equivalent log output for a regular restore.
+	DryRun bool
+
 	// Logger used to print status to.
-	Logger log.Logger
+	Logger *log.Logger
 }
 
 func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {

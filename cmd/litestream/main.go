@@ -92,6 +92,15 @@ func DefaultConfig() Config {
 	return Config{}
 }
 
+func (c *Config) DBConfig(path string) *DBConfig {
+	for _, dbConfig := range c.DBs {
+		if dbConfig.Path == path {
+			return dbConfig
+		}
+	}
+	return nil
+}
+
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
 func ReadConfigFile(filename string) (Config, error) {
 	config := DefaultConfig()

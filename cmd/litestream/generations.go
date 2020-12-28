@@ -72,7 +72,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 
 		// Iterate over each replicator in the database.
 		for _, r := range db.Replicators {
-			generations, err := r.Generations()
+			generations, err := r.Generations(ctx)
 			if err != nil {
 				log.Printf("%s: cannot list generations", r.Name(), err)
 				continue
@@ -80,7 +80,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 
 			// Iterate over each generation for the replicator.
 			for _, generation := range generations {
-				stats, err := r.GenerationStats(generation)
+				stats, err := r.GenerationStats(ctx, generation)
 				if err != nil {
 					log.Printf("%s: cannot find generation stats: %s", r.Name(), err)
 					continue

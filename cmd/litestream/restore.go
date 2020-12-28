@@ -8,8 +8,9 @@ import (
 	"log"
 	"os"
 	"path/filepath"
-	"text/tabwriter"
 	"time"
+
+	"github.com/benbjohnson/litestream"
 )
 
 type RestoreCommand struct {
@@ -26,9 +27,9 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
 	registerConfigFlag(fs, &configPath)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
-	fs.StringVar(&opt.Replica, "replica", "", "replica name")
+	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
-	fs.StringVar(&opt.DryRun, "dry-run", "", "dry run")
+	fs.BoolVar(&opt.DryRun, "dry-run", false, "dry run")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
 	fs.Usage = c.Usage
@@ -51,7 +52,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Parse timestamp, if specified.
 	if *timestampStr != "" {
-		if opts.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
+		if opt.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
 			return errors.New("invalid -timestamp, must specify in ISO 8601 format (e.g. 2000-01-01T00:00:00Z)")
 		}
 	}
@@ -81,7 +82,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return err
 	}
 
-	return db.Restore(opt)
+	return db.Restore(ctx, opt)
 }
 
 func (c *RestoreCommand) Usage() {
@@ -95,7 +96,8 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file. Defaults to %s
+	    Specifies the configuration file.
+	    Defaults to %s
 
 	-replica NAME
 	    Restore from a specific replica.
@@ -137,6 +139,7 @@ Examples:
 
 	# Restore database from specific generation on S3.
 	$ litestream restore -replica s3 -generation xxxxxxxx /path/to/db
+
 `[1:],
 		DefaultConfigPath,
 	)
