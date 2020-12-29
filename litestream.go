@@ -119,19 +119,6 @@ func readFileAt(filename string, offset, n int64) ([]byte, error) {
 	return buf, nil
 }
 
-func ParseWALFilename(name string) (index int, err error) {
-	v, err := strconv.ParseInt(strings.TrimSuffix(name, WALExt), 16, 64)
-	if err != nil {
-		return 0, fmt.Errorf("invalid wal filename: %q", name)
-	}
-	return int(v), nil
-}
-
-func FormatWALFilename(index int) string {
-	assert(index >= 0, "wal index must be non-negative")
-	return fmt.Sprintf("%016x%s", index, WALExt)
-}
-
 // removeTmpFiles recursively finds and removes .tmp files.
 func removeTmpFiles(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -167,6 +154,8 @@ func IsSnapshotPath(s string) bool {
 // ParseSnapshotPath returns the index for the snapshot.
 // Returns an error if the path is not a valid snapshot path.
 func ParseSnapshotPath(s string) (index int, typ, ext string, err error) {
+	s = filepath.Base(s)
+
 	a := snapshotPathRegex.FindStringSubmatch(s)
 	if a == nil {
 		return 0, "", "", fmt.Errorf("invalid snapshot path: %s", s)
@@ -186,6 +175,8 @@ func IsWALPath(s string) bool {
 // ParseWALPath returns the index & offset for the WAL file.
 // Returns an error if the path is not a valid snapshot path.
 func ParseWALPath(s string) (index int, offset int64, ext string, err error) {
+	s = filepath.Base(s)
+
 	a := walPathRegex.FindStringSubmatch(s)
 	if a == nil {
 		return 0, 0, "", fmt.Errorf("invalid wal path: %s", s)
@@ -194,6 +185,19 @@ func ParseWALPath(s string) (index int, offset int64, ext string, err error) {
 	i64, _ := strconv.ParseUint(a[1], 16, 64)
 	off64, _ := strconv.ParseUint(a[2], 16, 64)
 	return int(i64), int64(off64), a[3], nil
+}
+
+// FormatWALPath formats a WAL filename with a given index.
+func FormatWALPath(index int) string {
+	assert(index >= 0, "wal index must be non-negative")
+	return fmt.Sprintf("%016x%s", index, WALExt)
+}
+
+// FormatWALPathWithOffset formats a WAL filename with a given index & offset.
+func FormatWALPathWithOffset(index int, offset int64) string {
+	assert(index >= 0, "wal index must be non-negative")
+	assert(offset >= 0, "wal offset must be non-negative")
+	return fmt.Sprintf("%016x_%016x%s", index, offset, WALExt)
 }
 
 var walPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:_([0-9a-f]{16}))?(.wal(?:.gz)?)$`)

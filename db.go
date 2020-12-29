@@ -129,7 +129,7 @@ func (db *DB) CurrentShadowWALIndex(generation string) (int, error) {
 		if !strings.HasSuffix(fi.Name(), WALExt) {
 			continue
 		}
-		if v, err := ParseWALFilename(filepath.Base(fi.Name())); err != nil {
+		if v, _, _, err := ParseWALPath(fi.Name()); err != nil {
 			continue // invalid wal filename
 		} else if v > index {
 			index = v
@@ -640,13 +640,13 @@ func (db *DB) syncWAL(info syncInfo) (newSize int64, err error) {
 
 	// Parse index of current shadow WAL file.
 	dir, base := filepath.Split(info.shadowWALPath)
-	index, err := ParseWALFilename(base)
+	index, _, _, err := ParseWALPath(base)
 	if err != nil {
 		return 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
 	}
 
 	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(dir, FormatWALFilename(index+1))
+	newShadowWALPath := filepath.Join(dir, FormatWALPath(index+1))
 	if err := db.initShadowWALFile(newShadowWALPath); err != nil {
 		return 0, fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
 	}
@@ -962,14 +962,13 @@ func (db *DB) checkpoint(info syncInfo, force bool) error {
 	}
 
 	// Parse index of current shadow WAL file.
-	dir, base := filepath.Split(info.shadowWALPath)
-	index, err := ParseWALFilename(base)
+	index, _, _, err := ParseWALPath(info.shadowWALPath)
 	if err != nil {
-		return fmt.Errorf("cannot parse shadow wal filename: %s", base)
+		return fmt.Errorf("cannot parse shadow wal filename: %s", info.shadowWALPath)
 	}
 
 	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(dir, FormatWALFilename(index+1))
+	newShadowWALPath := filepath.Join(filepath.Dir(info.shadowWALPath), FormatWALPath(index+1))
 	if err := db.initShadowWALFile(newShadowWALPath); err != nil {
 		return fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
 	}
