@@ -15,7 +15,7 @@ func (c *VersionCommand) Run(ctx context.Context, args []string) (err error) {
 		return err
 	}
 
-	fmt.Println("litestream", Version)
+	fmt.Println(Version)
 
 	return nil
 }

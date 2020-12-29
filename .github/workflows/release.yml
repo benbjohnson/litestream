@@ -1,0 +1,32 @@
+on:
+  release:
+    types:
+      - created
+
+name: release
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+
+      - id: release
+        uses: bruceadams/get-release@v1.2.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Build litestream
+        run: |
+          go build -ldflags "-X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o litestream ./cmd/litestream
+          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz litestream
+
+      - name: Upload release binary
+        uses: actions/upload-release-asset@v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: ./litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
+          asset_content_type: application/gzip
