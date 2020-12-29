@@ -70,15 +70,15 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 			return err
 		}
 
-		// Iterate over each replicator in the database.
-		for _, r := range db.Replicators {
+		// Iterate over each replica in the database.
+		for _, r := range db.Replicas {
 			generations, err := r.Generations(ctx)
 			if err != nil {
 				log.Printf("%s: cannot list generations", r.Name(), err)
 				continue
 			}
 
-			// Iterate over each generation for the replicator.
+			// Iterate over each generation for the replica.
 			for _, generation := range generations {
 				stats, err := r.GenerationStats(ctx, generation)
 				if err != nil {

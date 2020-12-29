@@ -52,9 +52,9 @@ type DB struct {
 	// unbounded if there are always read transactions occurring.
 	MaxCheckpointPageN int
 
-	// List of replicators for the database.
+	// List of replicas for the database.
 	// Must be set before calling Open().
-	Replicators []Replicator
+	Replicas []Replica
 
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
@@ -154,11 +154,11 @@ func (db *DB) PageSize() int {
 }
 
 func (db *DB) Open() (err error) {
-	// Validate that all replicator names are unique.
+	// Validate that all replica names are unique.
 	m := make(map[string]struct{})
-	for _, r := range db.Replicators {
+	for _, r := range db.Replicas {
 		if _, ok := m[r.Name()]; ok {
-			return fmt.Errorf("duplicate replicator name: %q", r.Name())
+			return fmt.Errorf("duplicate replica name: %q", r.Name())
 		}
 		m[r.Name()] = struct{}{}
 	}
@@ -276,7 +276,7 @@ func (db *DB) Init() (err error) {
 	}
 
 	// Start replication.
-	for _, r := range db.Replicators {
+	for _, r := range db.Replicas {
 		r.Start(db.ctx)
 	}
 
@@ -318,8 +318,8 @@ func (db *DB) SoftClose() (err error) {
 	db.cancel()
 	db.wg.Wait()
 
-	// Ensure replicators all stop replicating.
-	for _, r := range db.Replicators {
+	// Ensure replicas all stop replicating.
+	for _, r := range db.Replicas {
 		r.Stop()
 	}
 
@@ -387,7 +387,7 @@ func (db *DB) CurrentGeneration() (string, error) {
 }
 
 // createGeneration starts a new generation by creating the generation
-// directory, snapshotting to each replicator, and updating the current
+// directory, snapshotting to each replica, and updating the current
 // generation name.
 func (db *DB) createGeneration() (string, error) {
 	// Generate random generation hex name.
@@ -516,7 +516,7 @@ func (db *DB) Sync() (err error) {
 		}
 	}
 
-	// Notify replicators of WAL changes.
+	// Notify replicas of WAL changes.
 	if changed {
 		close(db.notify)
 		db.notify = make(chan struct{})
@@ -1084,14 +1084,14 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	return nil
 }
 
-func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log.Logger) (Replicator, string, error) {
+func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log.Logger) (Replica, string, error) {
 	var target struct {
-		replicator Replicator
+		replica    Replica
 		generation string
 		stats      GenerationStats
 	}
 
-	for _, r := range db.Replicators {
+	for _, r := range db.Replicas {
 		// Skip replica if it does not match filter.
 		if opt.ReplicaName != "" && r.Name() != opt.ReplicaName {
 			continue
@@ -1127,7 +1127,7 @@ func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log
 				continue
 			}
 
-			target.replicator = r
+			target.replica = r
 			target.generation = generation
 			target.stats = stats
 		}
@@ -1138,11 +1138,11 @@ func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log
 		return nil, "", fmt.Errorf("no matching backups found")
 	}
 
-	return target.replicator, target.generation, nil
+	return target.replica, target.generation, nil
 }
 
 // restoreSnapshot copies a snapshot from the replica to a file.
-func (db *DB) restoreSnapshot(ctx context.Context, r Replicator, generation string, index int, filename string) error {
+func (db *DB) restoreSnapshot(ctx context.Context, r Replica, generation string, index int, filename string) error {
 	if err := os.MkdirAll(filepath.Dir(filename), 0700); err != nil {
 		return err
 	}
@@ -1170,7 +1170,7 @@ func (db *DB) restoreSnapshot(ctx context.Context, r Replicator, generation stri
 }
 
 // restoreWAL copies a WAL file from the replica to the local WAL and forces checkpoint.
-func (db *DB) restoreWAL(ctx context.Context, r Replicator, generation string, index int, dbPath string) error {
+func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, index int, dbPath string) error {
 	// Open handle to destination WAL path.
 	f, err := os.Create(dbPath + "-wal")
 	if err != nil {

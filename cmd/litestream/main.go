@@ -134,8 +134,8 @@ type DBConfig struct {
 
 type ReplicaConfig struct {
 	Type string `yaml:"type"` // "file", "s3"
-	Name string `yaml:"name"` // name of replicator, optional.
-	Path string `yaml:"path"` // used for file replicators
+	Name string `yaml:"name"` // name of replica, optional.
+	Path string `yaml:"path"` // used for file replicas
 }
 
 func registerConfigFlag(fs *flag.FlagSet, p *string) {
@@ -147,32 +147,32 @@ func newDBFromConfig(config *DBConfig) (*litestream.DB, error) {
 	// Initialize database with given path.
 	db := litestream.NewDB(config.Path)
 
-	// Instantiate and attach replicators.
+	// Instantiate and attach replicas.
 	for _, rconfig := range config.Replicas {
-		r, err := newReplicatorFromConfig(db, rconfig)
+		r, err := newReplicaFromConfig(db, rconfig)
 		if err != nil {
 			return nil, err
 		}
-		db.Replicators = append(db.Replicators, r)
+		db.Replicas = append(db.Replicas, r)
 	}
 
 	return db, nil
 }
 
-// newReplicatorFromConfig instantiates a replicator for a DB based on a config.
-func newReplicatorFromConfig(db *litestream.DB, config *ReplicaConfig) (litestream.Replicator, error) {
+// newReplicaFromConfig instantiates a replica for a DB based on a config.
+func newReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (litestream.Replica, error) {
 	switch config.Type {
 	case "", "file":
-		return newFileReplicatorFromConfig(db, config)
+		return newFileReplicaFromConfig(db, config)
 	default:
-		return nil, fmt.Errorf("unknown replicator type in config: %q", config.Type)
+		return nil, fmt.Errorf("unknown replica type in config: %q", config.Type)
 	}
 }
 
-// newFileReplicatorFromConfig returns a new instance of FileReplicator build from config.
-func newFileReplicatorFromConfig(db *litestream.DB, config *ReplicaConfig) (*litestream.FileReplicator, error) {
+// newFileReplicaFromConfig returns a new instance of FileReplica build from config.
+func newFileReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*litestream.FileReplica, error) {
 	if config.Path == "" {
-		return nil, fmt.Errorf("file replicator path require for db %q", db.Path())
+		return nil, fmt.Errorf("file replica path require for db %q", db.Path())
 	}
-	return litestream.NewFileReplicator(db, config.Name, config.Path), nil
+	return litestream.NewFileReplica(db, config.Name, config.Path), nil
 }
