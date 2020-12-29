@@ -512,7 +512,7 @@ func (db *DB) Sync() (err error) {
 		changed = true
 
 		if err := db.checkpoint(info, forceCheckpoint); err != nil {
-			return fmt.Errorf("checkpoint: force=%v err=%w", err)
+			return fmt.Errorf("checkpoint: force=%v err=%w", forceCheckpoint, err)
 		}
 	}
 
@@ -1054,7 +1054,7 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	tmpPath := outputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	logger.Printf("restoring snapshot from %s://%s/%s to %s", r.Name(), generation, minWALIndex, tmpPath)
+	logger.Printf("restoring snapshot from %s://%s/%016x to %s", r.Name(), generation, minWALIndex, tmpPath)
 	if !opt.DryRun {
 		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)

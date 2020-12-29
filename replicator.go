@@ -238,7 +238,7 @@ func (r *FileReplica) Stop() {
 func (r *FileReplica) monitor(ctx context.Context) {
 	// Clear old temporary files that my have been left from a crash.
 	if err := removeTmpFiles(r.dst); err != nil {
-		log.Printf("%s(%s): cannot remove tmp files: %w", r.db.Path(), r.Name(), err)
+		log.Printf("%s(%s): cannot remove tmp files: %s", r.db.Path(), r.Name(), err)
 	}
 
 	// Continuously check for new data to replicate.
@@ -261,7 +261,7 @@ func (r *FileReplica) monitor(ctx context.Context) {
 		// Determine position, if necessary.
 		if pos.IsZero() {
 			if pos, err = r.pos(); err != nil {
-				log.Printf("%s(%s): cannot determine position: %w", r.db.Path(), r.Name(), err)
+				log.Printf("%s(%s): cannot determine position: %s", r.db.Path(), r.Name(), err)
 				continue
 			} else if pos.IsZero() {
 				log.Printf("%s(%s): no generation, waiting for data", r.db.Path(), r.Name())

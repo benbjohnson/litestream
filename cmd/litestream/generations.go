@@ -74,7 +74,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 		for _, r := range db.Replicas {
 			generations, err := r.Generations(ctx)
 			if err != nil {
-				log.Printf("%s: cannot list generations", r.Name(), err)
+				log.Printf("%s: cannot list generations: %s", r.Name(), err)
 				continue
 			}
 
