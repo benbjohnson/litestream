@@ -42,6 +42,9 @@ type Replica interface {
 	// Returns a list of available snapshots in the replica.
 	Snapshots(ctx context.Context) ([]*SnapshotInfo, error)
 
+	// Returns a list of available WAL files in the replica.
+	WALs(ctx context.Context) ([]*WALInfo, error)
+
 	// Returns the highest index for a snapshot within a generation that occurs
 	// before timestamp. If timestamp is zero, returns the latest snapshot.
 	SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error)
@@ -333,8 +336,64 @@ func (r *FileReplica) Snapshots(ctx context.Context) ([]*SnapshotInfo, error) {
 				Replica:    r.Name(),
 				Generation: generation,
 				Index:      index,
+				Size:       fi.Size(),
 				CreatedAt:  fi.ModTime().UTC(),
 			})
+		}
+	}
+
+	return infos, nil
+}
+
+// WALs returns a list of available WAL files in the replica.
+func (r *FileReplica) WALs(ctx context.Context) ([]*WALInfo, error) {
+	generations, err := r.Generations(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var infos []*WALInfo
+	for _, generation := range generations {
+		// Find a list of all directory groups.
+		dir := r.WALDir(generation)
+		subfis, err := ioutil.ReadDir(dir)
+		if os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+
+		// Iterate over WAL group subdirectories.
+		for _, subfi := range subfis {
+			if !subfi.IsDir() {
+				continue
+			}
+
+			// Find a list of all WAL files in the group.
+			fis, err := ioutil.ReadDir(filepath.Join(dir, subfi.Name()))
+			if os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+
+			// Iterate over each WAL file.
+			for _, fi := range fis {
+				index, offset, _, err := ParseWALPath(fi.Name())
+				if err != nil {
+					continue
+				}
+
+				infos = append(infos, &WALInfo{
+					Name:       fi.Name(),
+					Replica:    r.Name(),
+					Generation: generation,
+					Index:      index,
+					Offset:     offset,
+					Size:       fi.Size(),
+					CreatedAt:  fi.ModTime().UTC(),
+				})
+			}
 		}
 	}
 

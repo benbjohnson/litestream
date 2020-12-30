@@ -47,6 +47,18 @@ type SnapshotInfo struct {
 	Replica    string
 	Generation string
 	Index      int
+	Size       int64
+	CreatedAt  time.Time
+}
+
+// WALInfo represents file information about a WAL file.
+type WALInfo struct {
+	Name       string
+	Replica    string
+	Generation string
+	Index      int
+	Offset     int64
+	Size       int64
 	CreatedAt  time.Time
 }
 

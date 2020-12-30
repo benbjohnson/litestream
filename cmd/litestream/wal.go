@@ -13,17 +13,18 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-type SnapshotsCommand struct{}
+type WALCommand struct{}
 
-func NewSnapshotsCommand() *SnapshotsCommand {
-	return &SnapshotsCommand{}
+func NewWALCommand() *WALCommand {
+	return &WALCommand{}
 }
 
-func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
+func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
-	fs := flag.NewFlagSet("litestream-snapshots", flag.ContinueOnError)
+	fs := flag.NewFlagSet("litestream-wal", flag.ContinueOnError)
 	registerConfigFlag(fs, &configPath)
 	replicaName := fs.String("replica", "", "replica name")
+	generation := fs.String("generation", "", "generation name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -59,27 +60,32 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Find snapshots by db or replica.
-	var infos []*litestream.SnapshotInfo
+	var infos []*litestream.WALInfo
 	if *replicaName != "" {
 		if r := db.Replica(*replicaName); r == nil {
 			return fmt.Errorf("replica %q not found for database %q", *replicaName, dbPath)
-		} else if infos, err = r.Snapshots(ctx); err != nil {
+		} else if infos, err = r.WALs(ctx); err != nil {
 			return err
 		}
 	} else {
-		if infos, err = db.Snapshots(ctx); err != nil {
+		if infos, err = db.WALs(ctx); err != nil {
 			return err
 		}
 	}
 
-	// List all snapshots.
+	// List all WAL files.
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
-	fmt.Fprintln(w, "replica\tgeneration\tindex\tsize\tcreated")
+	fmt.Fprintln(w, "replica\tgeneration\tindex\toffset\tsize\tcreated")
 	for _, info := range infos {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
+		if *generation != "" && info.Generation != *generation {
+			continue
+		}
+
+		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\n",
 			info.Replica,
 			info.Generation,
 			info.Index,
+			info.Offset,
 			info.Size,
 			info.CreatedAt.Format(time.RFC3339),
 		)
@@ -89,13 +95,13 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
-func (c *SnapshotsCommand) Usage() {
+func (c *WALCommand) Usage() {
 	fmt.Printf(`
-The snapshots command lists all snapshots available for a database.
+The wal command lists all wal files available for a database.
 
 Usage:
 
-	litestream snapshots [arguments] DB
+	litestream wal [arguments] DB
 
 Arguments:
 
@@ -106,14 +112,17 @@ Arguments:
 	-replica NAME
 	    Optional, filter by a specific replica.
 
+	-generation NAME
+	    Optional, filter by a specific generation.
+
 
 Examples:
 
-	# List all snapshots for a database.
-	$ litestream snapshots /path/to/db
+	# List all WAL files for a database.
+	$ litestream wal /path/to/db
 
-	# List all snapshots on S3.
-	$ litestream snapshots -replica s3 /path/to/db
+	# List all WAL files on S3 for a specific generation.
+	$ litestream snapshots -replica s3 -generation xxxxxxxx /path/to/db
 
 `[1:],
 		DefaultConfigPath,

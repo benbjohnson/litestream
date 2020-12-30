@@ -277,6 +277,24 @@ func (db *DB) Snapshots(ctx context.Context) ([]*SnapshotInfo, error) {
 	return infos, nil
 }
 
+// WALs returns a list of all WAL files across all replicas.
+func (db *DB) WALs(ctx context.Context) ([]*WALInfo, error) {
+	var infos []*WALInfo
+	for _, r := range db.Replicas {
+		a, err := r.WALs(ctx)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, a...)
+	}
+
+	// Sort in order by time.
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].CreatedAt.Before(infos[j].CreatedAt)
+	})
+	return infos, nil
+}
+
 // Init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
 func (db *DB) Init() (err error) {

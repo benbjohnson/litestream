@@ -58,6 +58,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&SnapshotsCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
+	case "wal":
+		return (&WALCommand{}).Run(ctx, args)
 	default:
 		if cmd == "" || cmd == "help" || strings.HasPrefix(cmd, "-") {
 			m.Usage()
@@ -82,6 +84,7 @@ The commands are:
 	restore      recovers database backup from a replica
 	snapshots    list available snapshots for a database
 	version      prints the version
+	wal          list available WAL files for a database
 `[1:])
 }
 
