@@ -27,6 +27,14 @@ const (
 	GenerationNameLen = 16
 )
 
+// SQLite checkpoint modes.
+const (
+	CheckpointModePassive  = "PASSIVE"
+	CheckpointModeFull     = "FULL"
+	CheckpointModeRestart  = "RESTART"
+	CheckpointModeTruncate = "TRUNCATE"
+)
+
 // Litestream errors.
 var (
 	ErrNoSnapshots = errors.New("no snapshots available")
