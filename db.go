@@ -22,6 +22,7 @@ import (
 // Default DB settings.
 const (
 	DefaultMonitorInterval    = 1 * time.Second
+	DefaultCheckpointInterval = 5 * time.Second // 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
 )
 
@@ -39,6 +40,8 @@ type DB struct {
 	cancel func()
 	wg     sync.WaitGroup
 
+	lastCheckpointAt time.Time // last checkpoint time
+
 	// Minimum threshold of WAL size, in pages, before a passive checkpoint.
 	// A passive checkpoint will attempt a checkpoint but fail if there are
 	// active transactions occurring at the same time.
@@ -51,6 +54,11 @@ type DB struct {
 	// If zero, no checkpoints are forced. This can cause the WAL to grow
 	// unbounded if there are always read transactions occurring.
 	MaxCheckpointPageN int
+
+	// Time between automatic checkpoints in the WAL. This is done to allow
+	// more fine-grained WAL files so that restores can be performed with
+	// better precision.
+	CheckpointInterval time.Duration
 
 	// List of replicas for the database.
 	// Must be set before calling Open().
@@ -67,6 +75,7 @@ func NewDB(path string) *DB {
 		notify: make(chan struct{}),
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
+		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
 	}
 	db.ctx, db.cancel = context.WithCancel(context.Background())
@@ -501,6 +510,8 @@ func (db *DB) Sync() (err error) {
 		checkpoint = true
 	} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
 		checkpoint, checkpointMode = true, CheckpointModeRestart
+	} else if db.CheckpointInterval > 0 && time.Since(db.lastCheckpointAt) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
+		checkpoint = true
 	}
 
 	// Release write lock before checkpointing & exiting.
@@ -558,6 +569,7 @@ func (db *DB) verify() (info syncInfo, err error) {
 		return info, err
 	}
 	info.walSize = fi.Size()
+	info.walModTime = fi.ModTime()
 
 	// Open shadow WAL to copy append to.
 	info.shadowWALPath, err = db.CurrentShadowWALPath(info.generation)
@@ -621,12 +633,13 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 type syncInfo struct {
-	generation    string // generation name
-	walSize       int64  // size of real WAL file
-	shadowWALPath string // name of last shadow WAL file
-	shadowWALSize int64  // size of last shadow WAL file
-	restart       bool   // if true, real WAL header does not match shadow WAL
-	reason        string // if non-blank, reason for sync failure
+	generation    string    // generation name
+	walSize       int64     // size of real WAL file
+	walModTime    time.Time // last modified date of real WAL file
+	shadowWALPath string    // name of last shadow WAL file
+	shadowWALSize int64     // size of last shadow WAL file
+	restart       bool      // if true, real WAL header does not match shadow WAL
+	reason        string    // if non-blank, reason for sync failure
 }
 
 // syncWAL copies pending bytes from the real WAL to the shadow WAL.
@@ -936,6 +949,9 @@ func (db *DB) checkpoint(mode string) error {
 	if err := db.acquireReadLock(); err != nil {
 		return fmt.Errorf("release read lock: %w", err)
 	}
+
+	db.lastCheckpointAt = time.Now()
+
 	return nil
 }
 
