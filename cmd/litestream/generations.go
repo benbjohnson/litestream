@@ -14,10 +14,6 @@ import (
 
 type GenerationsCommand struct{}
 
-func NewGenerationsCommand() *GenerationsCommand {
-	return &GenerationsCommand{}
-}
-
 func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-generations", flag.ContinueOnError)

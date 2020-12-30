@@ -15,10 +15,6 @@ import (
 
 type SnapshotsCommand struct{}
 
-func NewSnapshotsCommand() *SnapshotsCommand {
-	return &SnapshotsCommand{}
-}
-
 func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-snapshots", flag.ContinueOnError)

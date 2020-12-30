@@ -17,10 +17,6 @@ type RestoreCommand struct {
 	DBPath string
 }
 
-func NewRestoreCommand() *RestoreCommand {
-	return &RestoreCommand{}
-}
-
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	var opt litestream.RestoreOptions

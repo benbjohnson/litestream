@@ -19,10 +19,6 @@ type ReplicateCommand struct {
 	DBs []*litestream.DB
 }
 
-func NewReplicateCommand() *ReplicateCommand {
-	return &ReplicateCommand{}
-}
-
 // Run loads all databases specified in the configuration.
 func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)

@@ -15,10 +15,6 @@ import (
 
 type WALCommand struct{}
 
-func NewWALCommand() *WALCommand {
-	return &WALCommand{}
-}
-
 func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-wal", flag.ContinueOnError)
