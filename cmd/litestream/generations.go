@@ -12,89 +12,86 @@ import (
 	"time"
 )
 
-type GenerationsCommand struct {
-	ConfigPath string
-	Config     Config
-
-	DBPath string
-}
+type GenerationsCommand struct{}
 
 func NewGenerationsCommand() *GenerationsCommand {
 	return &GenerationsCommand{}
 }
 
 func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error) {
+	var configPath string
 	fs := flag.NewFlagSet("litestream-generations", flag.ContinueOnError)
-	registerConfigFlag(fs, &c.ConfigPath)
+	registerConfigFlag(fs, &configPath)
+	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
+	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
+		return fmt.Errorf("database path required")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
 
 	// Load configuration.
-	if c.ConfigPath == "" {
+	if configPath == "" {
 		return errors.New("-config required")
 	}
-	config, err := ReadConfigFile(c.ConfigPath)
+	config, err := ReadConfigFile(configPath)
 	if err != nil {
 		return err
 	}
 
-	// Determine absolute path for database, if specified.
-	if c.DBPath = fs.Arg(0); c.DBPath != "" {
-		if c.DBPath, err = filepath.Abs(c.DBPath); err != nil {
-			return err
-		}
+	// Determine absolute path for database.
+	dbPath, err := filepath.Abs(fs.Arg(0))
+	if err != nil {
+		return err
+	}
+
+	// Instantiate DB from from configuration.
+	dbConfig := config.DBConfig(dbPath)
+	if dbConfig == nil {
+		return fmt.Errorf("database not found in config: %s", dbPath)
+	}
+	db, err := newDBFromConfig(dbConfig)
+	if err != nil {
+		return err
+	}
+
+	// Determine last time database or WAL was updated.
+	updatedAt, err := db.UpdatedAt()
+	if err != nil {
+		return err
 	}
 
 	// List each generation.
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
-	fmt.Fprintln(w, "db\tname\tgeneration\tlag\tstart\tend")
-	for _, dbConfig := range config.DBs {
-		// Filter database, if specified in the arguments.
-		if c.DBPath != "" && dbConfig.Path != c.DBPath {
+	fmt.Fprintln(w, "name\tgeneration\tlag\tstart\tend")
+	for _, r := range db.Replicas {
+		if *replicaName != "" && r.Name() != *replicaName {
 			continue
 		}
 
-		// Instantiate DB from from configuration.
-		db, err := newDBFromConfig(dbConfig)
+		generations, err := r.Generations(ctx)
 		if err != nil {
-			return err
+			log.Printf("%s: cannot list generations: %s", r.Name(), err)
+			continue
 		}
 
-		// Determine last time database or WAL was updated.
-		updatedAt, err := db.UpdatedAt()
-		if err != nil {
-			return err
-		}
-
-		// Iterate over each replica in the database.
-		for _, r := range db.Replicas {
-			generations, err := r.Generations(ctx)
+		// Iterate over each generation for the replica.
+		for _, generation := range generations {
+			stats, err := r.GenerationStats(ctx, generation)
 			if err != nil {
-				log.Printf("%s: cannot list generations: %s", r.Name(), err)
+				log.Printf("%s: cannot find generation stats: %s", r.Name(), err)
 				continue
 			}
 
-			// Iterate over each generation for the replica.
-			for _, generation := range generations {
-				stats, err := r.GenerationStats(ctx, generation)
-				if err != nil {
-					log.Printf("%s: cannot find generation stats: %s", r.Name(), err)
-					continue
-				}
-
-				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n",
-					db.Path(),
-					r.Name(),
-					generation,
-					truncateDuration(stats.UpdatedAt.Sub(updatedAt)).String(),
-					stats.CreatedAt.Format(time.RFC3339),
-					stats.UpdatedAt.Format(time.RFC3339),
-				)
-			}
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+				r.Name(),
+				generation,
+				truncateDuration(stats.UpdatedAt.Sub(updatedAt)).String(),
+				stats.CreatedAt.Format(time.RFC3339),
+				stats.UpdatedAt.Format(time.RFC3339),
+			)
 		}
 	}
 	w.Flush()
@@ -104,7 +101,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 
 func (c *GenerationsCommand) Usage() {
 	fmt.Printf(`
-The generations command lists all generations across all replicas along with
+The generations command lists all generations for a database. It also lists
 stats about their lag behind the primary database and the time range they cover.
 
 Usage:
@@ -115,6 +112,9 @@ Arguments:
 
 	-config PATH
 	    Specifies the configuration file. Defaults to %s
+
+	-replica NAME
+	    Optional, filters by replica.
 
 `[1:],
 		DefaultConfigPath,
