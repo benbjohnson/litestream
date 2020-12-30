@@ -14,6 +14,7 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -152,6 +153,16 @@ func (db *DB) CurrentShadowWALIndex(generation string) (int, error) {
 	return index, nil
 }
 
+// Replica returns a replica by name.
+func (db *DB) Replica(name string) Replica {
+	for _, r := range db.Replicas {
+		if r.Name() == name {
+			return r
+		}
+	}
+	return nil
+}
+
 // Pos returns the current position of the database.
 func (db *DB) Pos() (Pos, error) {
 	generation, err := db.CurrentGeneration()
@@ -246,6 +257,24 @@ func (db *DB) UpdatedAt() (time.Time, error) {
 		t = fi.ModTime().UTC()
 	}
 	return t, nil
+}
+
+// Snapshots returns a list of all snapshots across all replicas.
+func (db *DB) Snapshots(ctx context.Context) ([]*SnapshotInfo, error) {
+	var infos []*SnapshotInfo
+	for _, r := range db.Replicas {
+		a, err := r.Snapshots(ctx)
+		if err != nil {
+			return nil, err
+		}
+		infos = append(infos, a...)
+	}
+
+	// Sort in order by time.
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].CreatedAt.Before(infos[j].CreatedAt)
+	})
+	return infos, nil
 }
 
 // Init initializes the connection to the database.

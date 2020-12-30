@@ -29,6 +29,9 @@ type Replica interface {
 	// Stops all replication processing. Blocks until processing stopped.
 	Stop()
 
+	// Returns the last replication position.
+	Pos() Pos
+
 	// Returns a list of generation names for the replica.
 	Generations(ctx context.Context) ([]string, error)
 
@@ -36,8 +39,8 @@ type Replica interface {
 	// snapshot & WAL files as well as the time range covered.
 	GenerationStats(ctx context.Context, generation string) (GenerationStats, error)
 
-	// Returns the last replication position.
-	Pos() Pos
+	// Returns a list of available snapshots in the replica.
+	Snapshots(ctx context.Context) ([]*SnapshotInfo, error)
 
 	// Returns the highest index for a snapshot within a generation that occurs
 	// before timestamp. If timestamp is zero, returns the latest snapshot.
@@ -301,6 +304,43 @@ func (r *FileReplica) walStats(generation string) (n int, min, max time.Time, er
 	return n, min, max, nil
 }
 
+// Snapshots returns a list of available snapshots in the replica.
+func (r *FileReplica) Snapshots(ctx context.Context) ([]*SnapshotInfo, error) {
+	generations, err := r.Generations(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	var infos []*SnapshotInfo
+	for _, generation := range generations {
+		fis, err := ioutil.ReadDir(r.SnapshotDir(generation))
+		if os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return nil, err
+		}
+
+		for _, fi := range fis {
+			index, _, _, err := ParseSnapshotPath(fi.Name())
+			if err != nil {
+				continue
+			}
+
+			// TODO: Add schedule name to snapshot info.
+
+			infos = append(infos, &SnapshotInfo{
+				Name:       fi.Name(),
+				Replica:    r.Name(),
+				Generation: generation,
+				Index:      index,
+				CreatedAt:  fi.ModTime().UTC(),
+			})
+		}
+	}
+
+	return infos, nil
+}
+
 // Start starts replication for a given generation.
 func (r *FileReplica) Start(ctx context.Context) {
 	// Stop previous replication.
@@ -465,7 +505,7 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 	if r.Pos().IsZero() {
 		pos, err := r.calcPos(generation)
 		if err != nil {
-			return fmt.Errorf("cannot determine replica position: %s", r.db.Path(), r.Name(), err)
+			return fmt.Errorf("cannot determine replica position: %s", err)
 		}
 
 		r.mu.Lock()

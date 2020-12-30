@@ -54,6 +54,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&ReplicateCommand{}).Run(ctx, args)
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
+	case "snapshots":
+		return (&SnapshotsCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	default:
@@ -75,9 +77,10 @@ Usage:
 
 The commands are:
 
-	generations  list available generations across all dbs & replicas
+	generations  list available generations for a database
 	replicate    runs a server to replicate databases
 	restore      recovers database backup from a replica
+	snapshots    list available snapshots for a database
 	version      prints the version
 `[1:])
 }

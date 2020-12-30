@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -39,6 +40,15 @@ const (
 var (
 	ErrNoSnapshots = errors.New("no snapshots available")
 )
+
+// SnapshotInfo represents file information about a snapshot.
+type SnapshotInfo struct {
+	Name       string
+	Replica    string
+	Generation string
+	Index      int
+	CreatedAt  time.Time
+}
 
 // Pos is a position in the WAL for a generation.
 type Pos struct {
