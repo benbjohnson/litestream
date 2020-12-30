@@ -22,7 +22,7 @@ import (
 // Default DB settings.
 const (
 	DefaultMonitorInterval    = 1 * time.Second
-	DefaultCheckpointInterval = 5 * time.Second // 1 * time.Minute
+	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
 )
 
@@ -108,10 +108,15 @@ func (db *DB) GenerationPath(generation string) string {
 	return filepath.Join(db.MetaPath(), "generations", generation)
 }
 
+// ShadowWALDir returns the path of the shadow wal directory.
+func (db *DB) ShadowWALDir(generation string) string {
+	return filepath.Join(db.GenerationPath(generation), "wal")
+}
+
 // ShadowWALPath returns the path of a single shadow WAL file.
 func (db *DB) ShadowWALPath(generation string, index int) string {
 	assert(index >= 0, "shadow wal index cannot be negative")
-	return filepath.Join(db.GenerationPath(generation), "wal", fmt.Sprintf("%016x", index)+WALExt)
+	return filepath.Join(db.ShadowWALDir(generation), FormatWALPath(index))
 }
 
 // CurrentShadowWALPath returns the path to the last shadow WAL in a generation.
@@ -145,6 +150,30 @@ func (db *DB) CurrentShadowWALIndex(generation string) (int, error) {
 		}
 	}
 	return index, nil
+}
+
+// Pos returns the current position of the database.
+func (db *DB) Pos() (Pos, error) {
+	generation, err := db.CurrentGeneration()
+	if err != nil {
+		return Pos{}, err
+	} else if generation == "" {
+		return Pos{}, nil
+	}
+
+	index, err := db.CurrentShadowWALIndex(generation)
+	if err != nil {
+		return Pos{}, err
+	}
+
+	fi, err := os.Stat(db.ShadowWALPath(generation, index))
+	if os.IsNotExist(err) {
+		return Pos{Generation: generation, Index: index}, nil
+	} else if err != nil {
+		return Pos{}, err
+	}
+
+	return Pos{Generation: generation, Index: index, Offset: fi.Size()}, nil
 }
 
 // Notify returns a channel that closes when the shadow WAL changes.
@@ -292,8 +321,16 @@ func (db *DB) Init() (err error) {
 	return nil
 }
 
-// clean removes old generations.
+// clean removes old generations & WAL files.
 func (db *DB) clean() error {
+	if err := db.cleanGenerations(); err != nil {
+		return err
+	}
+	return db.cleanWAL()
+}
+
+// cleanGenerations removes old generations.
+func (db *DB) cleanGenerations() error {
 	generation, err := db.CurrentGeneration()
 	if err != nil {
 		return err
@@ -314,6 +351,50 @@ func (db *DB) clean() error {
 
 		// Delete all other generations.
 		if err := os.RemoveAll(filepath.Join(dir, fi.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// cleanWAL removes WAL files that have been replicated.
+func (db *DB) cleanWAL() error {
+	generation, err := db.CurrentGeneration()
+	if err != nil {
+		return err
+	}
+
+	// Determine lowest index that's been replicated to all replicas.
+	min := -1
+	for _, r := range db.Replicas {
+		pos := r.Pos()
+		if pos.Generation != generation {
+			pos = Pos{} // different generation, reset index to zero
+		}
+		if min == -1 || pos.Index < min {
+			min = pos.Index
+		}
+	}
+
+	// Skip if our lowest index is too small.
+	if min <= 0 {
+		return nil
+	}
+	min-- // Keep an extra WAL file.
+
+	// Remove all WAL files for the generation before the lowest index.
+	dir := db.ShadowWALDir(generation)
+	fis, err := ioutil.ReadDir(dir)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	for _, fi := range fis {
+		if idx, _, _, err := ParseWALPath(fi.Name()); err != nil || idx >= min {
+			continue
+		}
+		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
 			return err
 		}
 	}
@@ -526,6 +607,11 @@ func (db *DB) Sync() (err error) {
 		if err := db.checkpointAndInit(info, checkpointMode); err != nil {
 			return fmt.Errorf("checkpoint: mode=%v err=%w", checkpointMode, err)
 		}
+	}
+
+	// Clean up any old files.
+	if err := db.clean(); err != nil {
+		return fmt.Errorf("cannot clean: %w", err)
 	}
 
 	// Notify replicas of WAL changes.
