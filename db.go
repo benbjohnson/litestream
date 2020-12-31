@@ -1477,7 +1477,7 @@ func (db *DB) waitForReplica(ctx context.Context, r Replica, pos Pos, logger *lo
 		// Obtain current position of replica, check if past target position.
 		curr, err := r.CalcPos(pos.Generation)
 		if err != nil {
-			logger.Printf("cannot obtain replica position: %w", err)
+			logger.Printf("cannot obtain replica position: %s", err)
 			continue
 		}
 
