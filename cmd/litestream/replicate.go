@@ -5,10 +5,13 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 type ReplicateCommand struct {
@@ -38,7 +41,7 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Setup signal handler.
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(ctx)
 	ch := make(chan os.Signal, 1)
 	signal.Notify(ch, os.Interrupt)
 	go func() { <-ch; cancel() }()
@@ -65,6 +68,16 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Notify user that initialization is done.
 	fmt.Printf("Initialized with %d databases.\n", len(c.DBs))
+
+	// Serve metrics over HTTP if enabled.
+	if config.Addr != "" {
+		_, port, _ := net.SplitHostPort(config.Addr)
+		fmt.Printf("Serving metrics on http://localhost:%s/metrics\n", port)
+		go func() {
+			http.Handle("/metrics", promhttp.Handler())
+			http.ListenAndServe(config.Addr, nil)
+		}()
+	}
 
 	// Wait for signal to stop program.
 	<-ctx.Done()

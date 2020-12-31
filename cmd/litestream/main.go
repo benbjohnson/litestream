@@ -93,14 +93,25 @@ The commands are:
 `[1:])
 }
 
+// Default configuration settings.
+const (
+	DefaultAddr = ":9090"
+)
+
 // Config represents a configuration file for the litestream daemon.
 type Config struct {
+	// Bind address for serving metrics.
+	Addr string `yaml:"addr"`
+
+	// List of databases to manage.
 	DBs []*DBConfig `yaml:"databases"`
 }
 
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
-	return Config{}
+	return Config{
+		Addr: DefaultAddr,
+	}
 }
 
 func (c *Config) DBConfig(path string) *DBConfig {
