@@ -38,7 +38,8 @@ const (
 
 // Litestream errors.
 var (
-	ErrNoSnapshots = errors.New("no snapshots available")
+	ErrNoSnapshots      = errors.New("no snapshots available")
+	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
 // SnapshotInfo represents file information about a snapshot.

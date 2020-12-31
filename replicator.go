@@ -7,6 +7,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -30,7 +31,10 @@ type Replica interface {
 	Stop()
 
 	// Returns the last replication position.
-	Pos() Pos
+	LastPos() Pos
+
+	// Returns the computed position of the replica for a given generation.
+	CalcPos(generation string) (Pos, error)
 
 	// Returns a list of generation names for the replica.
 	Generations(ctx context.Context) ([]string, error)
@@ -51,7 +55,7 @@ type Replica interface {
 
 	// Returns the highest index for a WAL file that occurs before timestamp.
 	// If timestamp is zero, returns the highest WAL index.
-	WALIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error)
+	WALIndexAt(ctx context.Context, generation string, maxIndex int, timestamp time.Time) (int, error)
 
 	// Returns a reader for snapshot data at the given generation/index.
 	SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error)
@@ -110,8 +114,8 @@ func (r *FileReplica) Type() string {
 	return "file"
 }
 
-// Pos returns the last successfully replicated position.
-func (r *FileReplica) Pos() Pos {
+// LastPos returns the last successfully replicated position.
+func (r *FileReplica) LastPos() Pos {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.pos
@@ -449,9 +453,9 @@ func (r *FileReplica) monitor(ctx context.Context) {
 	}
 }
 
-// calcPos returns the position for the replica for the current generation.
+// CalcPos returns the position for the replica for the current generation.
 // Returns a zero value if there is no active generation.
-func (r *FileReplica) calcPos(generation string) (pos Pos, err error) {
+func (r *FileReplica) CalcPos(generation string) (pos Pos, err error) {
 	pos.Generation = generation
 
 	// Find maximum snapshot index.
@@ -561,8 +565,8 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 	}
 
 	// Determine position, if necessary.
-	if r.Pos().IsZero() {
-		pos, err := r.calcPos(generation)
+	if r.LastPos().IsZero() {
+		pos, err := r.CalcPos(generation)
 		if err != nil {
 			return fmt.Errorf("cannot determine replica position: %s", err)
 		}
@@ -592,7 +596,7 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 }
 
 func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
-	rd, err := r.db.ShadowWALReader(r.Pos())
+	rd, err := r.db.ShadowWALReader(r.LastPos())
 	if err == io.EOF {
 		return err
 	} else if err != nil {
@@ -697,9 +701,9 @@ func (r *FileReplica) SnapshotIndexAt(ctx context.Context, generation string, ti
 	return index, nil
 }
 
-// Returns the highest index for a WAL file that occurs before timestamp.
+// Returns the highest index for a WAL file that occurs before maxIndex & timestamp.
 // If timestamp is zero, returns the highest WAL index.
-func (r *FileReplica) WALIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error) {
+func (r *FileReplica) WALIndexAt(ctx context.Context, generation string, maxIndex int, timestamp time.Time) (int, error) {
 	names, err := r.WALSubdirNames(generation)
 	if err != nil {
 		return 0, err
@@ -724,12 +728,19 @@ func (r *FileReplica) WALIndexAt(ctx context.Context, generation string, timesta
 				continue // not a snapshot, skip
 			} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
 				continue // after timestamp, skip
+			} else if idx > maxIndex {
+				continue // after timestamp, skip
 			} else if idx < index {
 				continue // earlier index, skip
 			}
 
 			index = idx
 		}
+	}
+
+	// If max index is specified but not found, return an error.
+	if maxIndex != math.MaxInt64 && index != maxIndex {
+		return index, fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", maxIndex, generation, index)
 	}
 
 	return index, nil

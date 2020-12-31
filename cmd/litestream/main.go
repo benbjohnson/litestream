@@ -58,6 +58,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "snapshots":
 		return (&SnapshotsCommand{}).Run(ctx, args)
+	case "validate":
+		return (&ValidateCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	case "wal":
@@ -85,6 +87,7 @@ The commands are:
 	replicate    runs a server to replicate databases
 	restore      recovers database backup from a replica
 	snapshots    list available snapshots for a database
+	validate     checks replica to ensure a consistent state with primary
 	version      prints the version
 	wal          list available WAL files for a database
 `[1:])

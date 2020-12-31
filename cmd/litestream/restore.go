@@ -14,17 +14,17 @@ import (
 )
 
 type RestoreCommand struct {
-	DBPath string
 }
 
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
-	var opt litestream.RestoreOptions
+	opt := litestream.NewRestoreOptions()
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
 	registerConfigFlag(fs, &configPath)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
+	fs.IntVar(&opt.Index, "index", opt.Index, "wal index")
 	fs.BoolVar(&opt.DryRun, "dry-run", false, "dry run")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
@@ -63,15 +63,16 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		opt.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 
-	// Determine absolute path for database, if specified.
-	if c.DBPath, err = filepath.Abs(fs.Arg(0)); err != nil {
+	// Determine absolute path for database.
+	dbPath, err := filepath.Abs(fs.Arg(0))
+	if err != nil {
 		return err
 	}
 
 	// Instantiate DB.
-	dbConfig := config.DBConfig(c.DBPath)
+	dbConfig := config.DBConfig(dbPath)
 	if dbConfig == nil {
-		return fmt.Errorf("database not found in config: %s", c.DBPath)
+		return fmt.Errorf("database not found in config: %s", dbPath)
 	}
 	db, err := newDBFromConfig(dbConfig)
 	if err != nil {
@@ -102,6 +103,10 @@ Arguments:
 	-generation NAME
 	    Restore from a specific generation.
 	    Defaults to generation with latest data.
+
+	-index NUM
+	    Restore up to a specific WAL index (inclusive).
+	    Defaults to use the highest available index.
 
 	-timestamp TIMESTAMP
 	    Restore to a specific point-in-time.
