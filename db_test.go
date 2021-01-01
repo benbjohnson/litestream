@@ -109,6 +109,47 @@ func TestDB_UpdatedAt(t *testing.T) {
 	})
 }
 
+// Ensure we can compute a checksum on the real database.
+func TestDB_CRC64(t *testing.T) {
+	t.Run("ErrNotExist", func(t *testing.T) {
+		db := MustOpenDB(t)
+		defer MustCloseDB(t, db)
+		if _, _, err := db.CRC64(); !os.IsNotExist(err) {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("DB", func(t *testing.T) {
+		db, sqldb := MustOpenDBs(t)
+		defer MustCloseDBs(t, db, sqldb)
+
+		chksum0, _, err := db.CRC64()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Issue change that is applied to the WAL. Checksum should not change.
+		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		} else if chksum1, _, err := db.CRC64(); err != nil {
+			t.Fatal(err)
+		} else if chksum0 != chksum1 {
+			t.Fatal("expected equal checksum after WAL change")
+		}
+
+		// Checkpoint change into database. Checksum should change.
+		if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+			t.Fatal(err)
+		}
+
+		if chksum2, _, err := db.CRC64(); err != nil {
+			t.Fatal(err)
+		} else if chksum0 == chksum2 {
+			t.Fatal("expected different checksums after checkpoint")
+		}
+	})
+}
+
 // MustOpenDBs returns a new instance of a DB & associated SQL DB.
 func MustOpenDBs(tb testing.TB) (*litestream.DB, *sql.DB) {
 	db := MustOpenDB(tb)
@@ -127,6 +168,7 @@ func MustOpenDB(tb testing.TB) *litestream.DB {
 
 	dir := tb.TempDir()
 	db := litestream.NewDB(filepath.Join(dir, "db"))
+	db.MonitorInterval = 0 // disable background goroutine
 	if err := db.Open(); err != nil {
 		tb.Fatal(err)
 	}

@@ -77,12 +77,12 @@ type DB struct {
 	// better precision.
 	CheckpointInterval time.Duration
 
+	// Frequency at which to perform db sync.
+	MonitorInterval time.Duration
+
 	// List of replicas for the database.
 	// Must be set before calling Open().
 	Replicas []Replica
-
-	// Frequency at which to perform db sync.
-	MonitorInterval time.Duration
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -253,8 +253,10 @@ func (db *DB) Open() (err error) {
 	}
 
 	// Start monitoring SQLite database in a separate goroutine.
-	db.wg.Add(1)
-	go func() { defer db.wg.Done(); db.monitor() }()
+	if db.MonitorInterval > 0 {
+		db.wg.Add(1)
+		go func() { defer db.wg.Done(); db.monitor() }()
+	}
 
 	return nil
 }
