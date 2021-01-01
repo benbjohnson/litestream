@@ -8,7 +8,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/crc32"
+	"hash/crc64"
 	"io"
 	"io/ioutil"
 	"log"
@@ -1463,7 +1463,7 @@ func (db *DB) Validate(ctx context.Context, replicaName string, opt RestoreOptio
 
 	// Compute checksum of primary database under read lock. This prevents a
 	// sync from occurring and the database will not be written.
-	chksum0, pos, err := db.CRC32C()
+	chksum0, pos, err := db.CRC64()
 	if err != nil {
 		return fmt.Errorf("cannot compute checksum: %w", err)
 	}
@@ -1510,11 +1510,11 @@ func (db *DB) Validate(ctx context.Context, replicaName string, opt RestoreOptio
 	defer f.Close()
 
 	// Compute checksum.
-	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	h := crc64.New(crc64.MakeTable(crc64.ISO))
 	if _, err := io.Copy(h, f); err != nil {
 		return err
 	}
-	chksum1 := h.Sum32()
+	chksum1 := h.Sum64()
 
 	logger.Printf("replica checksum computed: %08x", chksum1)
 
@@ -1569,12 +1569,12 @@ func (db *DB) waitForReplica(ctx context.Context, r Replica, pos Pos, logger *lo
 	}
 }
 
-// CRC32C returns a CRC-32C checksum of the database and its current position.
+// CRC64 returns a CRC-64 ISO checksum of the database and its current position.
 //
 // This function obtains a read lock so it prevents syncs from occuring until
 // the operation is complete. The database will still be usable but it will be
 // unable to checkpoint during this time.
-func (db *DB) CRC32C() (uint32, Pos, error) {
+func (db *DB) CRC64() (uint64, Pos, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 
@@ -1594,11 +1594,11 @@ func (db *DB) CRC32C() (uint32, Pos, error) {
 	defer f.Close()
 
 	// Compute checksum.
-	h := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	h := crc64.New(crc64.MakeTable(crc64.ISO))
 	if _, err := io.Copy(h, f); err != nil {
 		return 0, pos, err
 	}
-	return h.Sum32(), pos, nil
+	return h.Sum64(), pos, nil
 }
 
 // RestoreOptions represents options for DB.Restore().
