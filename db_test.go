@@ -150,6 +150,100 @@ func TestDB_CRC64(t *testing.T) {
 	})
 }
 
+// Ensure we can sync the real WAL to the shadow WAL.
+func TestDB_Sync(t *testing.T) {
+	// Ensure sync is skipped if no database exists.
+	t.Run("NoDB", func(t *testing.T) {
+		db := MustOpenDB(t)
+		defer MustCloseDB(t, db)
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// Ensure sync can successfully run on the initial sync.
+	t.Run("Initial", func(t *testing.T) {
+		db, sqldb := MustOpenDBs(t)
+		defer MustCloseDBs(t, db, sqldb)
+
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify page size if now available.
+		if db.PageSize() == 0 {
+			t.Fatal("expected page size after initial sync")
+		}
+
+		// Obtain real WAL size.
+		fi, err := os.Stat(db.WALPath())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Ensure position now available.
+		if pos, err := db.Pos(); err != nil {
+			t.Fatal(err)
+		} else if pos.Generation == "" {
+			t.Fatal("expected generation")
+		} else if got, want := pos.Index, 0; got != want {
+			t.Fatalf("pos.Index=%v, want %v", got, want)
+		} else if got, want := pos.Offset, fi.Size(); got != want {
+			t.Fatalf("pos.Offset=%v, want %v", got, want)
+		}
+	})
+
+	// Ensure a WAL file is created if one does not already exist.
+	t.Run("NoWAL", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB can keep in sync across multiple Sync() invocations.
+	t.Run("MultiSync", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB can start new generation if it detects it cannot verify last position.
+	t.Run("NewGeneration", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB can handle partial shadow WAL header write.
+	t.Run("PartialShadowWALHeader", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB can handle partial shadow WAL writes.
+	t.Run("PartialShadowWALFrame", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB can handle a generation directory with a missing shadow WAL.
+	t.Run("NoShadowWAL", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB can handle a mismatched header-only and start new generation.
+	t.Run("MismatchHeaderOnly", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB checkpoints after minimum number of pages.
+	t.Run("MinCheckpointPageN", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB forces checkpoint after maximum number of pages.
+	t.Run("MaxCheckpointPageN", func(t *testing.T) {
+		t.Skip()
+	})
+
+	// Ensure DB checkpoints after interval.
+	t.Run("CheckpointInterval", func(t *testing.T) {
+		t.Skip()
+	})
+}
+
 // MustOpenDBs returns a new instance of a DB & associated SQL DB.
 func MustOpenDBs(tb testing.TB) (*litestream.DB, *sql.DB) {
 	db := MustOpenDB(tb)

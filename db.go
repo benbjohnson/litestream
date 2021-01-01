@@ -332,12 +332,9 @@ func (db *DB) WALs(ctx context.Context) ([]*WALInfo, error) {
 	return infos, nil
 }
 
-// Init initializes the connection to the database.
+// init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
-func (db *DB) Init() (err error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
+func (db *DB) init() (err error) {
 	// Exit if already initialized.
 	if db.db != nil {
 		return nil
@@ -357,7 +354,7 @@ func (db *DB) Init() (err error) {
 		return fmt.Errorf("enable wal: %w", err)
 	}
 
-	// Disable autocheckpoint.
+	// Disable autocheckpoint for litestream's connection.
 	if _, err := db.db.ExecContext(db.ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
 		return fmt.Errorf("disable autocheckpoint: %w", err)
 	}
@@ -601,8 +598,10 @@ func (db *DB) Sync() (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// No database exists, exit.
-	if db.db == nil {
+	// Initialize database, if necessary. Exit if no DB exists.
+	if err := db.init(); err != nil {
+		return err
+	} else if db.db == nil {
 		return nil
 	}
 
@@ -615,8 +614,6 @@ func (db *DB) Sync() (err error) {
 		}
 		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
 	}()
-
-	// TODO: Force "-wal" file if it doesn't exist.
 
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(); err != nil {
@@ -685,7 +682,7 @@ func (db *DB) Sync() (err error) {
 		checkpoint = true
 	} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
 		checkpoint, checkpointMode = true, CheckpointModeRestart
-	} else if db.CheckpointInterval > 0 && time.Since(db.lastCheckpointAt) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
+	} else if db.CheckpointInterval > 0 && !db.lastCheckpointAt.IsZero() && time.Since(db.lastCheckpointAt) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
 		checkpoint = true
 	}
 
@@ -1219,12 +1216,6 @@ func (db *DB) monitor() {
 		case <-db.ctx.Done():
 			return
 		case <-ticker.C:
-		}
-
-		// Ensure the database is initialized.
-		if err := db.Init(); err != nil {
-			log.Printf("%s: init error: %s", db.path, err)
-			continue
 		}
 
 		// Sync the database to the shadow WAL.
