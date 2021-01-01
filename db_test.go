@@ -10,6 +10,63 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
+func TestDB_Path(t *testing.T) {
+	db := litestream.NewDB("/tmp/db")
+	if got, want := db.Path(), `/tmp/db`; got != want {
+		t.Fatalf("Path()=%v, want %v", got, want)
+	}
+}
+
+func TestDB_WALPath(t *testing.T) {
+	db := litestream.NewDB("/tmp/db")
+	if got, want := db.WALPath(), `/tmp/db-wal`; got != want {
+		t.Fatalf("WALPath()=%v, want %v", got, want)
+	}
+}
+
+func TestDB_MetaPath(t *testing.T) {
+	t.Run("Absolute", func(t *testing.T) {
+		db := litestream.NewDB("/tmp/db")
+		if got, want := db.MetaPath(), `/tmp/.db-litestream`; got != want {
+			t.Fatalf("MetaPath()=%v, want %v", got, want)
+		}
+	})
+	t.Run("Relative", func(t *testing.T) {
+		db := litestream.NewDB("db")
+		if got, want := db.MetaPath(), `.db-litestream`; got != want {
+			t.Fatalf("MetaPath()=%v, want %v", got, want)
+		}
+	})
+}
+
+func TestDB_GenerationNamePath(t *testing.T) {
+	db := litestream.NewDB("/tmp/db")
+	if got, want := db.GenerationNamePath(), `/tmp/.db-litestream/generation`; got != want {
+		t.Fatalf("GenerationNamePath()=%v, want %v", got, want)
+	}
+}
+
+func TestDB_GenerationPath(t *testing.T) {
+	db := litestream.NewDB("/tmp/db")
+	if got, want := db.GenerationPath("xxxx"), `/tmp/.db-litestream/generations/xxxx`; got != want {
+		t.Fatalf("GenerationPath()=%v, want %v", got, want)
+	}
+}
+
+func TestDB_ShadowWALDir(t *testing.T) {
+	db := litestream.NewDB("/tmp/db")
+	if got, want := db.ShadowWALDir("xxxx"), `/tmp/.db-litestream/generations/xxxx/wal`; got != want {
+		t.Fatalf("ShadowWALDir()=%v, want %v", got, want)
+	}
+}
+
+func TestDB_ShadowWALPath(t *testing.T) {
+	db := litestream.NewDB("/tmp/db")
+	if got, want := db.ShadowWALPath("xxxx", 1000), `/tmp/.db-litestream/generations/xxxx/wal/00000000000003e8.wal`; got != want {
+		t.Fatalf("ShadowWALPath()=%v, want %v", got, want)
+	}
+}
+
 // Ensure we can check the last modified time of the real database and its WAL.
 func TestDB_UpdatedAt(t *testing.T) {
 	t.Run("ErrNotExist", func(t *testing.T) {

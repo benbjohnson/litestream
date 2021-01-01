@@ -135,16 +135,20 @@ func (db *DB) GenerationNamePath() string {
 }
 
 // GenerationPath returns the path of a single generation.
+// Panics if generation is blank.
 func (db *DB) GenerationPath(generation string) string {
+	assert(generation != "", "generation name required")
 	return filepath.Join(db.MetaPath(), "generations", generation)
 }
 
 // ShadowWALDir returns the path of the shadow wal directory.
+// Panics if generation is blank.
 func (db *DB) ShadowWALDir(generation string) string {
 	return filepath.Join(db.GenerationPath(generation), "wal")
 }
 
 // ShadowWALPath returns the path of a single shadow WAL file.
+// Panics if generation is blank or index is negative.
 func (db *DB) ShadowWALPath(generation string, index int) string {
 	assert(index >= 0, "shadow wal index cannot be negative")
 	return filepath.Join(db.ShadowWALDir(generation), FormatWALPath(index))
