@@ -98,6 +98,7 @@ func TestDB_UpdatedAt(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		time.Sleep(1 * time.Millisecond)
 		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
