@@ -89,6 +89,10 @@ type FileReplica struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel func()
+
+	// If true, replica monitors database for changes automatically.
+	// Set to false if replica is being used synchronously (such as in tests).
+	MonitorEnabled bool
 }
 
 // NewFileReplica returns a new instance of FileReplica.
@@ -98,6 +102,8 @@ func NewFileReplica(db *DB, name, dst string) *FileReplica {
 		name:   name,
 		dst:    dst,
 		cancel: func() {},
+
+		MonitorEnabled: true,
 	}
 }
 
@@ -406,6 +412,11 @@ func (r *FileReplica) WALs(ctx context.Context) ([]*WALInfo, error) {
 
 // Start starts replication for a given generation.
 func (r *FileReplica) Start(ctx context.Context) {
+	// Ignore if replica is being used sychronously.
+	if !r.MonitorEnabled {
+		return
+	}
+
 	// Stop previous replication.
 	r.Stop()
 
