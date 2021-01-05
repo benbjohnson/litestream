@@ -519,17 +519,64 @@ func TestDB_Sync(t *testing.T) {
 
 	// Ensure DB checkpoints after minimum number of pages.
 	t.Run("MinCheckpointPageN", func(t *testing.T) {
-		t.Skip()
-	})
+		db, sqldb := MustOpenDBs(t)
+		defer MustCloseDBs(t, db, sqldb)
 
-	// Ensure DB forces checkpoint after maximum number of pages.
-	t.Run("MaxCheckpointPageN", func(t *testing.T) {
-		t.Skip()
+		// Execute a query to force a write to the WAL and then sync.
+		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write at least minimum number of pages to trigger rollover.
+		for i := 0; i < db.MinCheckpointPageN; i++ {
+			if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Sync to shadow WAL.
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Ensure position is now on the second index.
+		if pos, err := db.Pos(); err != nil {
+			t.Fatal(err)
+		} else if got, want := pos.Index, 1; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		}
 	})
 
 	// Ensure DB checkpoints after interval.
 	t.Run("CheckpointInterval", func(t *testing.T) {
-		t.Skip()
+		db, sqldb := MustOpenDBs(t)
+		defer MustCloseDBs(t, db, sqldb)
+
+		// Execute a query to force a write to the WAL and then sync.
+		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Reduce checkpoint interval to ensure a rollover is triggered.
+		db.CheckpointInterval = 1 * time.Nanosecond
+
+		// Write to WAL & sync.
+		if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Ensure position is now on the second index.
+		if pos, err := db.Pos(); err != nil {
+			t.Fatal(err)
+		} else if got, want := pos.Index, 1; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		}
 	})
 }
 

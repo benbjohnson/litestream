@@ -34,13 +34,12 @@ const (
 
 // DB represents a managed instance of a SQLite database in the file system.
 type DB struct {
-	mu               sync.RWMutex
-	path             string        // part to database
-	db               *sql.DB       // target database
-	rtx              *sql.Tx       // long running read transaction
-	pageSize         int           // page size, in bytes
-	notify           chan struct{} // closes on WAL change
-	lastCheckpointAt time.Time     // last checkpoint time
+	mu       sync.RWMutex
+	path     string        // part to database
+	db       *sql.DB       // target database
+	rtx      *sql.Tx       // long running read transaction
+	pageSize int           // page size, in bytes
+	notify   chan struct{} // closes on WAL change
 
 	ctx    context.Context
 	cancel func()
@@ -682,7 +681,7 @@ func (db *DB) Sync() (err error) {
 		checkpoint = true
 	} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
 		checkpoint, checkpointMode = true, CheckpointModeRestart
-	} else if db.CheckpointInterval > 0 && !db.lastCheckpointAt.IsZero() && time.Since(db.lastCheckpointAt) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
+	} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
 		checkpoint = true
 	}
 
@@ -750,6 +749,7 @@ func (db *DB) verify() (info syncInfo, err error) {
 	if fi, err := os.Stat(db.Path()); err != nil {
 		return info, err
 	} else {
+		info.dbModTime = fi.ModTime()
 		db.dbSizeGauge.Set(float64(fi.Size()))
 	}
 
@@ -826,6 +826,7 @@ func (db *DB) verify() (info syncInfo, err error) {
 
 type syncInfo struct {
 	generation    string    // generation name
+	dbModTime     time.Time // last modified date of real DB file
 	walSize       int64     // size of real WAL file
 	walModTime    time.Time // last modified date of real WAL file
 	shadowWALPath string    // name of last shadow WAL file
@@ -1165,8 +1166,6 @@ func (db *DB) checkpoint(mode string) (err error) {
 	if err := db.acquireReadLock(); err != nil {
 		return fmt.Errorf("release read lock: %w", err)
 	}
-
-	db.lastCheckpointAt = time.Now()
 
 	return nil
 }
