@@ -118,8 +118,23 @@ Arguments:
 }
 
 func truncateDuration(d time.Duration) time.Duration {
-	if d > time.Second {
+	if d < 0 {
+		if d < -10*time.Second {
+			return d.Truncate(time.Second)
+		} else if d < -time.Second {
+			return d.Truncate(time.Second / 10)
+		} else if d < -time.Millisecond {
+			return d.Truncate(time.Millisecond)
+		} else if d < -time.Microsecond {
+			return d.Truncate(time.Microsecond)
+		}
+		return d
+	}
+
+	if d > 10*time.Second {
 		return d.Truncate(time.Second)
+	} else if d > time.Second {
+		return d.Truncate(time.Second / 10)
 	} else if d > time.Millisecond {
 		return d.Truncate(time.Millisecond)
 	} else if d > time.Microsecond {
