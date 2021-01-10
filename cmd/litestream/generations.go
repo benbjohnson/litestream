@@ -84,7 +84,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 				r.Name(),
 				generation,
-				truncateDuration(stats.UpdatedAt.Sub(updatedAt)).String(),
+				truncateDuration(updatedAt.Sub(stats.UpdatedAt)).String(),
 				stats.CreatedAt.Format(time.RFC3339),
 				stats.UpdatedAt.Format(time.RFC3339),
 			)
