@@ -118,11 +118,7 @@ Arguments:
 }
 
 func truncateDuration(d time.Duration) time.Duration {
-	if d > time.Hour {
-		return d.Truncate(time.Hour)
-	} else if d > time.Minute {
-		return d.Truncate(time.Minute)
-	} else if d > time.Second {
+	if d > time.Second {
 		return d.Truncate(time.Second)
 	} else if d > time.Millisecond {
 		return d.Truncate(time.Millisecond)
