@@ -30,6 +30,7 @@ const (
 	DefaultMonitorInterval    = 1 * time.Second
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
+	DefaultMaxCheckpointPageN = 10000
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -91,6 +92,7 @@ func NewDB(path string) *DB {
 		notify: make(chan struct{}),
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
+		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
 	}
