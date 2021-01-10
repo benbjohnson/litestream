@@ -22,7 +22,7 @@ and the destination path (`/path/to/replica`) to where you want to replicate
 from and to.
 
 ```yaml
-databases:
+dbs:
   - path: "/path/to/db"
     replicas:
       - type: file

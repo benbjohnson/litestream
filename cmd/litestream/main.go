@@ -104,7 +104,7 @@ type Config struct {
 	Addr string `yaml:"addr"`
 
 	// List of databases to manage.
-	DBs []*DBConfig `yaml:"databases"`
+	DBs []*DBConfig `yaml:"dbs"`
 }
 
 // DefaultConfig returns a new instance of Config with defaults set.
