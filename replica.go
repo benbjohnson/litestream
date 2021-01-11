@@ -531,11 +531,11 @@ func (r *FileReplica) snapshot(ctx context.Context, generation string, index int
 		return nil
 	}
 
-	if err := os.MkdirAll(filepath.Dir(snapshotPath), 0700); err != nil {
+	if err := mkdirAll(filepath.Dir(snapshotPath), 0700, r.db.uid, r.db.gid); err != nil {
 		return err
 	}
 
-	return compressFile(r.db.Path(), snapshotPath)
+	return compressFile(r.db.Path(), snapshotPath, r.db.uid, r.db.gid)
 }
 
 // snapshotN returns the number of snapshots for a generation.
@@ -617,7 +617,7 @@ func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
 
 	// Ensure parent directory exists for WAL file.
 	filename := r.WALPath(rd.Pos().Generation, rd.Pos().Index)
-	if err := os.MkdirAll(filepath.Dir(filename), 0700); err != nil {
+	if err := mkdirAll(filepath.Dir(filename), 0700, r.db.uid, r.db.gid); err != nil {
 		return err
 	}
 
@@ -669,7 +669,7 @@ func (r *FileReplica) compress(ctx context.Context, generation string) error {
 		}
 
 		dst := filename + ".gz"
-		if err := compressFile(filename, dst); err != nil {
+		if err := compressFile(filename, dst, r.db.uid, r.db.gid); err != nil {
 			return err
 		} else if err := os.Remove(filename); err != nil {
 			return err
@@ -824,14 +824,14 @@ func (r *FileReplica) WALReader(ctx context.Context, generation string, index in
 }
 
 // compressFile compresses a file and replaces it with a new file with a .gz extension.
-func compressFile(src, dst string) error {
+func compressFile(src, dst string, uid, gid int) error {
 	r, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer r.Close()
 
-	w, err := os.Create(dst + ".tmp")
+	w, err := createFile(dst+".tmp", uid, gid)
 	if err != nil {
 		return err
 	}

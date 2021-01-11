@@ -41,6 +41,7 @@ type DB struct {
 	rtx      *sql.Tx       // long running read transaction
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
+	uid, gid int           // db user/group obtained on init
 
 	ctx    context.Context
 	cancel func()
@@ -342,11 +343,13 @@ func (db *DB) init() (err error) {
 	}
 
 	// Exit if no database file exists.
-	if _, err := os.Stat(db.path); os.IsNotExist(err) {
+	fi, err := os.Stat(db.path)
+	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
 		return err
 	}
+	db.uid, db.gid = fileinfo(fi)
 
 	// Connect to SQLite database & enable WAL.
 	if db.db, err = sql.Open("sqlite3", db.path); err != nil {
@@ -386,7 +389,7 @@ func (db *DB) init() (err error) {
 	}
 
 	// Ensure meta directory structure exists.
-	if err := os.MkdirAll(db.MetaPath(), 0700); err != nil {
+	if err := mkdirAll(db.MetaPath(), 0700, db.uid, db.gid); err != nil {
 		return err
 	}
 
@@ -569,7 +572,7 @@ func (db *DB) createGeneration() (string, error) {
 
 	// Generate new directory.
 	dir := filepath.Join(db.MetaPath(), "generations", generation)
-	if err := os.MkdirAll(dir, 0700); err != nil {
+	if err := mkdirAll(dir, 0700, db.uid, db.gid); err != nil {
 		return "", err
 	}
 
@@ -888,7 +891,7 @@ func (db *DB) initShadowWALFile(filename string) error {
 	}
 
 	// Write header to new WAL shadow file.
-	if err := os.MkdirAll(filepath.Dir(filename), 0700); err != nil {
+	if err := mkdirAll(filepath.Dir(filename), 0700, db.uid, db.gid); err != nil {
 		return err
 	}
 	return ioutil.WriteFile(filename, hdr, 0600)
@@ -1383,11 +1386,11 @@ func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log
 
 // restoreSnapshot copies a snapshot from the replica to a file.
 func (db *DB) restoreSnapshot(ctx context.Context, r Replica, generation string, index int, filename string) error {
-	if err := os.MkdirAll(filepath.Dir(filename), 0700); err != nil {
+	if err := mkdirAll(filepath.Dir(filename), 0700, db.uid, db.gid); err != nil {
 		return err
 	}
 
-	f, err := os.Create(filename)
+	f, err := createFile(filename, db.uid, db.gid)
 	if err != nil {
 		return err
 	}
@@ -1419,7 +1422,7 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 	defer rd.Close()
 
 	// Open handle to destination WAL path.
-	f, err := os.Create(dbPath + "-wal")
+	f, err := createFile(dbPath+"-wal", db.uid, db.gid)
 	if err != nil {
 		return err
 	}
