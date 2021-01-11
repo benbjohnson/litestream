@@ -5,8 +5,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 
@@ -25,6 +27,7 @@ type ReplicateCommand struct {
 // Run loads all databases specified in the configuration.
 func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
+	verbose := fs.Bool("v", false, "verbose logging")
 	registerConfigFlag(fs, &c.ConfigPath)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -38,6 +41,11 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	config, err := ReadConfigFile(c.ConfigPath)
 	if err != nil {
 		return err
+	}
+
+	// Enable trace logging.
+	if *verbose {
+		litestream.Tracef = log.Printf
 	}
 
 	// Setup signal handler.
@@ -118,6 +126,9 @@ Arguments:
 
 	-config PATH
 	    Specifies the configuration file. Defaults to %s
+
+	-v
+	    Enable verbose logging output.
 
 `[1:], DefaultConfigPath)
 }

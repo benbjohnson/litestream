@@ -606,6 +606,7 @@ func (db *DB) Sync() (err error) {
 	if err := db.init(); err != nil {
 		return err
 	} else if db.db == nil {
+		Tracef("%s: sync: no database found", db.path)
 		return nil
 	}
 
@@ -652,6 +653,7 @@ func (db *DB) Sync() (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot verify wal state: %w", err)
 	}
+	Tracef("%s: sync: info=%#v", db.path, info)
 
 	// Track if anything in the shadow WAL changes and then notify at the end.
 	changed := info.walSize != info.shadowWALSize || info.restart || info.reason != ""
@@ -720,6 +722,8 @@ func (db *DB) Sync() (err error) {
 		close(db.notify)
 		db.notify = make(chan struct{})
 	}
+
+	Tracef("%s: sync: ok", db.path)
 
 	return nil
 }
@@ -898,6 +902,8 @@ func (db *DB) initShadowWALFile(filename string) error {
 }
 
 func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
+	Tracef("%s: copy-shadow: %s", db.path, filename)
+
 	r, err := os.Open(db.WALPath())
 	if err != nil {
 		return 0, err
@@ -946,8 +952,11 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 	newSize = origSize
 	buf := make([]byte, db.pageSize+WALFrameHeaderSize)
 	for {
+		Tracef("%s: copy-shadow: %s @ %d", db.path, filename, newSize)
+
 		// Read next page from WAL file.
 		if _, err := io.ReadFull(r, buf); err == io.EOF || err == io.ErrUnexpectedEOF {
+			Tracef("%s: copy-shadow: break %s", db.path, err)
 			break // end of file or partial page
 		} else if err != nil {
 			return newSize, fmt.Errorf("read wal: %w", err)
@@ -957,6 +966,7 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 		salt0 := binary.BigEndian.Uint32(buf[8:])
 		salt1 := binary.BigEndian.Uint32(buf[12:])
 		if salt0 != hsalt0 || salt1 != hsalt1 {
+			Tracef("%s: copy-shadow: break: salt mismatch", db.path)
 			break
 		}
 

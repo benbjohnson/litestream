@@ -313,6 +313,9 @@ func mkdirAll(path string, perm os.FileMode, uid, gid int) error {
 	return nil
 }
 
+// Tracef is used for low-level tracing.
+var Tracef = func(format string, a ...interface{}) {}
+
 func assert(condition bool, message string) {
 	if !condition {
 		panic("assertion failed: " + message)
