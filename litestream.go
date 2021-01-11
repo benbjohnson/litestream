@@ -52,6 +52,30 @@ type SnapshotInfo struct {
 	CreatedAt  time.Time
 }
 
+// filterSnapshotsAfter returns all snapshots that were created on or after t.
+func filterSnapshotsAfter(a []*SnapshotInfo, t time.Time) []*SnapshotInfo {
+	other := make([]*SnapshotInfo, 0, len(a))
+	for _, snapshot := range a {
+		if !snapshot.CreatedAt.Before(t) {
+			other = append(other, snapshot)
+		}
+	}
+	return other
+}
+
+// findMinSnapshotByGeneration finds the snapshot with the lowest index in a generation.
+func findMinSnapshotByGeneration(a []*SnapshotInfo, generation string) *SnapshotInfo {
+	var min *SnapshotInfo
+	for _, snapshot := range a {
+		if snapshot.Generation != generation {
+			continue
+		} else if min == nil || snapshot.Index < min.Index {
+			min = snapshot
+		}
+	}
+	return min
+}
+
 // WALInfo represents file information about a WAL file.
 type WALInfo struct {
 	Name       string
@@ -184,19 +208,19 @@ func IsSnapshotPath(s string) bool {
 
 // ParseSnapshotPath returns the index for the snapshot.
 // Returns an error if the path is not a valid snapshot path.
-func ParseSnapshotPath(s string) (index int, typ, ext string, err error) {
+func ParseSnapshotPath(s string) (index int, ext string, err error) {
 	s = filepath.Base(s)
 
 	a := snapshotPathRegex.FindStringSubmatch(s)
 	if a == nil {
-		return 0, "", "", fmt.Errorf("invalid snapshot path: %s", s)
+		return 0, "", fmt.Errorf("invalid snapshot path: %s", s)
 	}
 
 	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	return int(i64), a[2], a[3], nil
+	return int(i64), a[2], nil
 }
 
-var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:-(\w+))?(.snapshot(?:.gz)?)$`)
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(.snapshot(?:.gz)?)$`)
 
 // IsWALPath returns true if s is a path to a WAL file.
 func IsWALPath(s string) bool {

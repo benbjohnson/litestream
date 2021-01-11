@@ -31,6 +31,7 @@ const (
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
 	DefaultMaxCheckpointPageN = 10000
+	DefaultRetentionInterval  = 24 * time.Hour
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -41,7 +42,8 @@ type DB struct {
 	rtx      *sql.Tx       // long running read transaction
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
-	uid, gid int           // db user/group obtained on init
+
+	uid, gid int // db user/group obtained on init
 
 	ctx    context.Context
 	cancel func()

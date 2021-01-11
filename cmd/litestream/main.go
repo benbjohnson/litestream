@@ -10,6 +10,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	"gopkg.in/yaml.v2"
@@ -155,9 +156,10 @@ type DBConfig struct {
 }
 
 type ReplicaConfig struct {
-	Type string `yaml:"type"` // "file", "s3"
-	Name string `yaml:"name"` // name of replica, optional.
-	Path string `yaml:"path"` // used for file replicas
+	Type      string        `yaml:"type"` // "file", "s3"
+	Name      string        `yaml:"name"` // name of replica, optional.
+	Path      string        `yaml:"path"`
+	Retention time.Duration `yaml:"retention"`
 }
 
 func registerConfigFlag(fs *flag.FlagSet, p *string) {
@@ -196,5 +198,9 @@ func newFileReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*litest
 	if config.Path == "" {
 		return nil, fmt.Errorf("file replica path require for db %q", db.Path())
 	}
-	return litestream.NewFileReplica(db, config.Name, config.Path), nil
+	r := litestream.NewFileReplica(db, config.Name, config.Path)
+	if v := config.Retention; v > 0 {
+		r.RetentionInterval = v
+	}
+	return r, nil
 }
