@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/s3"
 	"gopkg.in/yaml.v2"
 )
 
@@ -160,6 +161,11 @@ type ReplicaConfig struct {
 	Name      string        `yaml:"name"` // name of replica, optional.
 	Path      string        `yaml:"path"`
 	Retention time.Duration `yaml:"retention"`
+
+	// S3 settings
+	AccessKeyID     string `yaml:"access-key-id"`
+	SecretAccessKey string `yaml:"secret-access-key"`
+	Bucket          string `yaml:"bucket"`
 }
 
 func registerConfigFlag(fs *flag.FlagSet, p *string) {
@@ -188,6 +194,8 @@ func newReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (litestream.
 	switch config.Type {
 	case "", "file":
 		return newFileReplicaFromConfig(db, config)
+	case "s3":
+		return newS3ReplicaFromConfig(db, config)
 	default:
 		return nil, fmt.Errorf("unknown replica type in config: %q", config.Type)
 	}
@@ -196,9 +204,35 @@ func newReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (litestream.
 // newFileReplicaFromConfig returns a new instance of FileReplica build from config.
 func newFileReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*litestream.FileReplica, error) {
 	if config.Path == "" {
-		return nil, fmt.Errorf("file replica path require for db %q", db.Path())
+		return nil, fmt.Errorf("%s: file replica path required", db.Path())
 	}
+
 	r := litestream.NewFileReplica(db, config.Name, config.Path)
+	if v := config.Retention; v > 0 {
+		r.RetentionInterval = v
+	}
+	return r, nil
+}
+
+// newS3ReplicaFromConfig returns a new instance of S3Replica build from config.
+func newS3ReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*s3.Replica, error) {
+	if config.AccessKeyID == "" {
+		return nil, fmt.Errorf("%s: s3 access key id required", db.Path())
+	} else if config.SecretAccessKey == "" {
+		return nil, fmt.Errorf("%s: s3 secret access key required", db.Path())
+	} else if config.Region == "" {
+		return nil, fmt.Errorf("%s: s3 region required", db.Path())
+	} else if config.Bucket == "" {
+		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
+	}
+
+	r := aws.NewS3Replica(db, config.Name)
+	r.AccessKeyID = config.AccessKeyID
+	r.SecretAccessKey = config.SecretAccessKey
+	r.Region = config.Region
+	r.Bucket = config.Bucket
+	r.Path = config.Path
+
 	if v := config.Retention; v > 0 {
 		r.RetentionInterval = v
 	}

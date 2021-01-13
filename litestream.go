@@ -52,8 +52,8 @@ type SnapshotInfo struct {
 	CreatedAt  time.Time
 }
 
-// filterSnapshotsAfter returns all snapshots that were created on or after t.
-func filterSnapshotsAfter(a []*SnapshotInfo, t time.Time) []*SnapshotInfo {
+// FilterSnapshotsAfter returns all snapshots that were created on or after t.
+func FilterSnapshotsAfter(a []*SnapshotInfo, t time.Time) []*SnapshotInfo {
 	other := make([]*SnapshotInfo, 0, len(a))
 	for _, snapshot := range a {
 		if !snapshot.CreatedAt.Before(t) {
@@ -63,8 +63,8 @@ func filterSnapshotsAfter(a []*SnapshotInfo, t time.Time) []*SnapshotInfo {
 	return other
 }
 
-// findMinSnapshotByGeneration finds the snapshot with the lowest index in a generation.
-func findMinSnapshotByGeneration(a []*SnapshotInfo, generation string) *SnapshotInfo {
+// FindMinSnapshotByGeneration finds the snapshot with the lowest index in a generation.
+func FindMinSnapshotByGeneration(a []*SnapshotInfo, generation string) *SnapshotInfo {
 	var min *SnapshotInfo
 	for _, snapshot := range a {
 		if snapshot.Generation != generation {
@@ -229,17 +229,18 @@ func IsWALPath(s string) bool {
 
 // ParseWALPath returns the index & offset for the WAL file.
 // Returns an error if the path is not a valid snapshot path.
-func ParseWALPath(s string) (index int, offset int64, ext string, err error) {
+func ParseWALPath(s string) (index int, offset, sz int64, ext string, err error) {
 	s = filepath.Base(s)
 
 	a := walPathRegex.FindStringSubmatch(s)
 	if a == nil {
-		return 0, 0, "", fmt.Errorf("invalid wal path: %s", s)
+		return 0, 0, 0, "", fmt.Errorf("invalid wal path: %s", s)
 	}
 
 	i64, _ := strconv.ParseUint(a[1], 16, 64)
 	off64, _ := strconv.ParseUint(a[2], 16, 64)
-	return int(i64), int64(off64), a[3], nil
+	sz64, _ := strconv.ParseUint(a[3], 16, 64)
+	return int(i64), int64(off64), int64(sz64), a[4], nil
 }
 
 // FormatWALPath formats a WAL filename with a given index.
@@ -248,14 +249,15 @@ func FormatWALPath(index int) string {
 	return fmt.Sprintf("%016x%s", index, WALExt)
 }
 
-// FormatWALPathWithOffset formats a WAL filename with a given index & offset.
-func FormatWALPathWithOffset(index int, offset int64) string {
+// FormatWALPathWithOffsetSize formats a WAL filename with a given index, offset & size.
+func FormatWALPathWithOffsetSize(index int, offset, sz int64) string {
 	assert(index >= 0, "wal index must be non-negative")
 	assert(offset >= 0, "wal offset must be non-negative")
-	return fmt.Sprintf("%016x_%016x%s", index, offset, WALExt)
+	assert(sz >= 0, "wal size must be non-negative")
+	return fmt.Sprintf("%016x_%016x_%016x%s", index, offset, sz, WALExt)
 }
 
-var walPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:_([0-9a-f]{16}))?(.wal(?:.gz)?)$`)
+var walPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:_([0-9a-f]{16})_([0-9a-f]{16}))?(.wal(?:.gz)?)$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {
