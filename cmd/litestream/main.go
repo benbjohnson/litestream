@@ -22,9 +22,6 @@ var (
 	Version = "(development build)"
 )
 
-// DefaultConfigPath is the default configuration path.
-const DefaultConfigPath = "/etc/litestream.yml"
-
 func main() {
 	log.SetFlags(0)
 
@@ -165,11 +162,20 @@ type ReplicaConfig struct {
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
+	Region          string `yaml:"region"`
 	Bucket          string `yaml:"bucket"`
 }
 
+// DefaultConfigPath returns the default config path.
+func DefaultConfigPath() string {
+	if v := os.Getenv("LITESTREAM_CONFIG"); v != "" {
+		return v
+	}
+	return "/etc/litestream.yml"
+}
+
 func registerConfigFlag(fs *flag.FlagSet, p *string) {
-	fs.StringVar(p, "config", DefaultConfigPath, "config path")
+	fs.StringVar(p, "config", DefaultConfigPath(), "config path")
 }
 
 // newDBFromConfig instantiates a DB based on a configuration.
@@ -226,7 +232,7 @@ func newS3ReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*s3.Repli
 		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
 	}
 
-	r := aws.NewS3Replica(db, config.Name)
+	r := s3.NewReplica(db, config.Name)
 	r.AccessKeyID = config.AccessKeyID
 	r.SecretAccessKey = config.SecretAccessKey
 	r.Region = config.Region

@@ -1298,13 +1298,13 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	// Find lastest snapshot that occurs before timestamp.
-	minWALIndex, err := r.SnapshotIndexAt(ctx, generation, opt.Timestamp)
+	minWALIndex, err := SnapshotIndexAt(ctx, r, generation, opt.Timestamp)
 	if err != nil {
 		return fmt.Errorf("cannot find snapshot index for restore: %w", err)
 	}
 
 	// Find the maximum WAL index that occurs before timestamp.
-	maxWALIndex, err := r.WALIndexAt(ctx, generation, opt.Index, opt.Timestamp)
+	maxWALIndex, err := WALIndexAt(ctx, r, generation, opt.Index, opt.Timestamp)
 	if err != nil {
 		return fmt.Errorf("cannot find max wal index for restore: %w", err)
 	}

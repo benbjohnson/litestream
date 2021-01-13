@@ -13,6 +13,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // Replica represents a remote destination to replicate the database & WAL.
@@ -47,14 +49,6 @@ type Replica interface {
 
 	// Returns a list of available WAL files in the replica.
 	WALs(ctx context.Context) ([]*WALInfo, error)
-
-	// Returns the highest index for a snapshot within a generation that occurs
-	// before timestamp. If timestamp is zero, returns the latest snapshot.
-	SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error)
-
-	// Returns the highest index for a WAL file that occurs before timestamp.
-	// If timestamp is zero, returns the highest WAL index.
-	WALIndexAt(ctx context.Context, generation string, maxIndex int, timestamp time.Time) (int, error)
 
 	// Returns a reader for snapshot data at the given generation/index.
 	SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error)
@@ -633,74 +627,6 @@ func (r *FileReplica) compress(ctx context.Context, generation string) error {
 	return nil
 }
 
-// SnapsotIndexAt returns the highest index for a snapshot within a generation
-// that occurs before timestamp. If timestamp is zero, returns the latest snapshot.
-func (r *FileReplica) SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error) {
-	fis, err := ioutil.ReadDir(r.SnapshotDir(generation))
-	if os.IsNotExist(err) {
-		return 0, ErrNoSnapshots
-	} else if err != nil {
-		return 0, err
-	}
-
-	index := -1
-	var max time.Time
-	for _, fi := range fis {
-		// Read index from snapshot filename.
-		idx, _, err := ParseSnapshotPath(fi.Name())
-		if err != nil {
-			continue // not a snapshot, skip
-		} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
-			continue // after timestamp, skip
-		}
-
-		// Use snapshot if it newer.
-		if max.IsZero() || fi.ModTime().After(max) {
-			index, max = idx, fi.ModTime()
-		}
-	}
-
-	if index == -1 {
-		return 0, ErrNoSnapshots
-	}
-	return index, nil
-}
-
-// Returns the highest index for a WAL file that occurs before maxIndex & timestamp.
-// If timestamp is zero, returns the highest WAL index.
-func (r *FileReplica) WALIndexAt(ctx context.Context, generation string, maxIndex int, timestamp time.Time) (int, error) {
-	var index int
-	fis, err := ioutil.ReadDir(r.WALDir(generation))
-	if os.IsNotExist(err) {
-		return 0, nil
-	} else if err != nil {
-		return 0, err
-	}
-
-	for _, fi := range fis {
-		// Read index from snapshot filename.
-		idx, _, _, _, err := ParseWALPath(fi.Name())
-		if err != nil {
-			continue // not a snapshot, skip
-		} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
-			continue // after timestamp, skip
-		} else if idx > maxIndex {
-			continue // after timestamp, skip
-		} else if idx < index {
-			continue // earlier index, skip
-		}
-
-		index = idx
-	}
-
-	// If max index is specified but not found, return an error.
-	if maxIndex != math.MaxInt64 && index != maxIndex {
-		return index, fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", maxIndex, generation, index)
-	}
-
-	return index, nil
-}
-
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
 // Returns os.ErrNotExist if no matching index is found.
 func (r *FileReplica) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
@@ -733,7 +659,7 @@ func (r *FileReplica) SnapshotReader(ctx context.Context, generation string, ind
 			f.Close()
 			return nil, err
 		}
-		return &gzipReadCloser{r: r, closer: f}, nil
+		return internal.NewReadCloser(r, f), nil
 	}
 	return nil, os.ErrNotExist
 }
@@ -764,7 +690,7 @@ func (r *FileReplica) WALReader(ctx context.Context, generation string, index in
 		f.Close()
 		return nil, err
 	}
-	return &gzipReadCloser{r: rd, closer: f}, nil
+	return internal.NewReadCloser(rd, f), nil
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
@@ -877,6 +803,63 @@ func (r *FileReplica) deleteGenerationWALBefore(ctx context.Context, generation 
 	}
 
 	return nil
+}
+
+// SnapsotIndexAt returns the highest index for a snapshot within a generation
+// that occurs before timestamp. If timestamp is zero, returns the latest snapshot.
+func SnapshotIndexAt(ctx context.Context, r Replica, generation string, timestamp time.Time) (int, error) {
+	snapshots, err := r.Snapshots(ctx)
+	if err != nil {
+		return 0, err
+	} else if len(snapshots) == 0 {
+		return 0, ErrNoSnapshots
+	}
+
+	index := -1
+	var max time.Time
+	for _, snapshot := range snapshots {
+		if !timestamp.IsZero() && snapshot.CreatedAt.After(timestamp) {
+			continue // after timestamp, skip
+		}
+
+		// Use snapshot if it newer.
+		if max.IsZero() || snapshot.CreatedAt.After(max) {
+			index, max = snapshot.Index, snapshot.CreatedAt
+		}
+	}
+
+	if index == -1 {
+		return 0, ErrNoSnapshots
+	}
+	return index, nil
+}
+
+// WALIndexAt returns the highest index for a WAL file that occurs before maxIndex & timestamp.
+// If timestamp is zero, returns the highest WAL index.
+func WALIndexAt(ctx context.Context, r Replica, generation string, maxIndex int, timestamp time.Time) (int, error) {
+	wals, err := r.WALs(ctx)
+	if err != nil {
+		return 0, err
+	}
+
+	var index int
+	for _, wal := range wals {
+		if !timestamp.IsZero() && wal.CreatedAt.After(timestamp) {
+			continue // after timestamp, skip
+		} else if wal.Index > maxIndex {
+			continue // after max index, skip
+		} else if wal.Index < index {
+			continue // earlier index, skip
+		}
+
+		index = wal.Index
+	}
+
+	// If max index is specified but not found, return an error.
+	if maxIndex != math.MaxInt64 && index != maxIndex {
+		return index, fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", maxIndex, generation, index)
+	}
+	return index, nil
 }
 
 // compressFile compresses a file and replaces it with a new file with a .gz extension.

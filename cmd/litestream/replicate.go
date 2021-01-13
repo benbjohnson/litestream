@@ -130,5 +130,5 @@ Arguments:
 	-v
 	    Enable verbose logging output.
 
-`[1:], DefaultConfigPath)
+`[1:], DefaultConfigPath())
 }

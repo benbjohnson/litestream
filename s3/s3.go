@@ -1,4 +1,4 @@
-package aws
+package s3
 
 import (
 	"compress/gzip"
@@ -7,7 +7,6 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"math"
 	"os"
 	"path"
 	"sync"
@@ -18,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 const (
@@ -196,7 +196,6 @@ func (r *Replica) GenerationStats(ctx context.Context, generation string) (stats
 }
 
 func (r *Replica) snapshotStats(generation string) (n int, min, max time.Time, err error) {
-	var generations []string
 	if err := r.s3.ListObjectsPages(&s3.ListObjectsInput{
 		Bucket:    aws.String(r.Bucket),
 		Prefix:    aws.String(r.SnapshotDir(generation)),
@@ -224,7 +223,6 @@ func (r *Replica) snapshotStats(generation string) (n int, min, max time.Time, e
 }
 
 func (r *Replica) walStats(generation string) (n int, min, max time.Time, err error) {
-	var generations []string
 	if err := r.s3.ListObjectsPages(&s3.ListObjectsInput{
 		Bucket:    aws.String(r.Bucket),
 		Prefix:    aws.String(r.WALDir(generation)),
@@ -623,74 +621,6 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	return nil
 }
 
-// SnapsotIndexAt returns the highest index for a snapshot within a generation
-// that occurs before timestamp. If timestamp is zero, returns the latest snapshot.
-func (r *Replica) SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error) {
-	fis, err := ioutil.ReadDir(r.SnapshotDir(generation))
-	if os.IsNotExist(err) {
-		return 0, litestream.ErrNoSnapshots
-	} else if err != nil {
-		return 0, err
-	}
-
-	index := -1
-	var max time.Time
-	for _, fi := range fis {
-		// Read index from snapshot filename.
-		idx, _, err := litestream.ParseSnapshotPath(fi.Name())
-		if err != nil {
-			continue // not a snapshot, skip
-		} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
-			continue // after timestamp, skip
-		}
-
-		// Use snapshot if it newer.
-		if max.IsZero() || fi.ModTime().After(max) {
-			index, max = idx, fi.ModTime()
-		}
-	}
-
-	if index == -1 {
-		return 0, litestream.ErrNoSnapshots
-	}
-	return index, nil
-}
-
-// Returns the highest index for a WAL file that occurs before maxIndex & timestamp.
-// If timestamp is zero, returns the highest WAL index.
-func (r *Replica) WALIndexAt(ctx context.Context, generation string, maxIndex int, timestamp time.Time) (int, error) {
-	var index int
-	fis, err := ioutil.ReadDir(r.WALDir(generation))
-	if os.IsNotExist(err) {
-		return 0, nil
-	} else if err != nil {
-		return 0, err
-	}
-
-	for _, fi := range fis {
-		// Read index from snapshot filename.
-		idx, _, _, _, err := litestream.ParseWALPath(fi.Name())
-		if err != nil {
-			continue // not a snapshot, skip
-		} else if !timestamp.IsZero() && fi.ModTime().After(timestamp) {
-			continue // after timestamp, skip
-		} else if idx > maxIndex {
-			continue // after timestamp, skip
-		} else if idx < index {
-			continue // earlier index, skip
-		}
-
-		index = idx
-	}
-
-	// If max index is specified but not found, return an error.
-	if maxIndex != math.MaxInt64 && index != maxIndex {
-		return index, fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", maxIndex, generation, index)
-	}
-
-	return index, nil
-}
-
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
 // Returns os.ErrNotExist if no matching index is found.
 func (r *Replica) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
@@ -723,7 +653,7 @@ func (r *Replica) SnapshotReader(ctx context.Context, generation string, index i
 			f.Close()
 			return nil, err
 		}
-		return &gzipReadCloser{r: r, closer: f}, nil
+		return internal.NewReadCloser(r, f), nil
 	}
 	return nil, os.ErrNotExist
 }
@@ -754,7 +684,7 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		f.Close()
 		return nil, err
 	}
-	return &gzipReadCloser{r: rd, closer: f}, nil
+	return internal.NewReadCloser(rd, f), nil
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.

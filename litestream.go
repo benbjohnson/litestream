@@ -1,7 +1,6 @@
 package litestream
 
 import (
-	"compress/gzip"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -262,24 +261,6 @@ var walPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:_([0-9a-f]{16})_([0-9a-
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
-}
-
-// gzipReadCloser wraps gzip.Reader to also close the underlying reader on close.
-type gzipReadCloser struct {
-	r      *gzip.Reader
-	closer io.ReadCloser
-}
-
-func (r *gzipReadCloser) Read(p []byte) (n int, err error) {
-	return r.r.Read(p)
-}
-
-func (r *gzipReadCloser) Close() error {
-	if err := r.r.Close(); err != nil {
-		r.closer.Close()
-		return err
-	}
-	return r.closer.Close()
 }
 
 // createFile creates the file and attempts to set the UID/GID.

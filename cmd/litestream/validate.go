@@ -131,6 +131,6 @@ Examples:
 	$ litestream restore -replica s3 /path/to/db
 
 `[1:],
-		DefaultConfigPath,
+		DefaultConfigPath(),
 	)
 }

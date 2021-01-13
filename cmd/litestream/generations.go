@@ -113,7 +113,7 @@ Arguments:
 	    Optional, filters by replica.
 
 `[1:],
-		DefaultConfigPath,
+		DefaultConfigPath(),
 	)
 }
 

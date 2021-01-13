@@ -112,6 +112,6 @@ Examples:
 	$ litestream snapshots -replica s3 /path/to/db
 
 `[1:],
-		DefaultConfigPath,
+		DefaultConfigPath(),
 	)
 }

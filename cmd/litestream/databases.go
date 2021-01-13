@@ -71,6 +71,6 @@ Arguments:
 	    Defaults to %s
 
 `[1:],
-		DefaultConfigPath,
+		DefaultConfigPath(),
 	)
 }
