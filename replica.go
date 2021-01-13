@@ -569,7 +569,7 @@ func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
 		return err
 	}
 
-	// Create a temporary file to write into so we don't have partial writes.
+	// TODO: Create a temporary file to write into so we don't have partial writes.
 	w, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return err
