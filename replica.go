@@ -35,7 +35,7 @@ type Replica interface {
 	LastPos() Pos
 
 	// Returns the computed position of the replica for a given generation.
-	CalcPos(generation string) (Pos, error)
+	CalcPos(ctx context.Context, generation string) (Pos, error)
 
 	// Returns a list of generation names for the replica.
 	Generations(ctx context.Context) ([]string, error)
@@ -422,7 +422,7 @@ func (r *FileReplica) retainer(ctx context.Context) {
 
 // CalcPos returns the position for the replica for the current generation.
 // Returns a zero value if there is no active generation.
-func (r *FileReplica) CalcPos(generation string) (pos Pos, err error) {
+func (r *FileReplica) CalcPos(ctx context.Context, generation string) (pos Pos, err error) {
 	pos.Generation = generation
 
 	// Find maximum snapshot index.
