@@ -16,7 +16,6 @@ import (
 
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // Replica represents a remote destination to replicate the database & WAL.
@@ -121,10 +120,10 @@ func NewFileReplica(db *DB, name, dst string) *FileReplica {
 		MonitorEnabled:         true,
 	}
 
-	r.snapshotTotalGauge = fileReplicaSnapshotTotalGaugeVec.WithLabelValues(db.path, r.Name())
-	r.walBytesCounter = fileReplicaWALBytesCounterVec.WithLabelValues(db.path, r.Name())
-	r.walIndexGauge = fileReplicaWALIndexGaugeVec.WithLabelValues(db.path, r.Name())
-	r.walOffsetGauge = fileReplicaWALOffsetGaugeVec.WithLabelValues(db.path, r.Name())
+	r.snapshotTotalGauge = internal.ReplicaSnapshotTotalGaugeVec.WithLabelValues(db.path, r.Name())
+	r.walBytesCounter = internal.ReplicaWALBytesCounterVec.WithLabelValues(db.path, r.Name())
+	r.walIndexGauge = internal.ReplicaWALIndexGaugeVec.WithLabelValues(db.path, r.Name())
+	r.walOffsetGauge = internal.ReplicaWALOffsetGaugeVec.WithLabelValues(db.path, r.Name())
 
 	return r
 }
@@ -928,34 +927,3 @@ func compressFile(src, dst string, uid, gid int) error {
 	// Move compressed file to final location.
 	return os.Rename(dst+".tmp", dst)
 }
-
-// Database metrics.
-var (
-	fileReplicaSnapshotTotalGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "file_replica",
-		Name:      "snapshot_total",
-		Help:      "The current number of snapshots",
-	}, []string{"db", "name"})
-
-	fileReplicaWALBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "litestream",
-		Subsystem: "file_replica",
-		Name:      "wal_bytes",
-		Help:      "The number wal bytes written",
-	}, []string{"db", "name"})
-
-	fileReplicaWALIndexGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "file_replica",
-		Name:      "wal_index",
-		Help:      "The current WAL index",
-	}, []string{"db", "name"})
-
-	fileReplicaWALOffsetGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "file_replica",
-		Name:      "wal_offset",
-		Help:      "The current WAL offset",
-	}, []string{"db", "name"})
-)
