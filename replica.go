@@ -70,7 +70,8 @@ type GenerationStats struct {
 
 // Default file replica settings.
 const (
-	DefaultRetention = 24 * time.Hour
+	DefaultRetention              = 24 * time.Hour
+	DefaultRetentionCheckInterval = 1 * time.Hour
 )
 
 var _ Replica = (*FileReplica)(nil)
@@ -108,8 +109,9 @@ func NewFileReplica(db *DB, name, dst string) *FileReplica {
 		dst:    dst,
 		cancel: func() {},
 
-		Retention:      DefaultRetention,
-		MonitorEnabled: true,
+		Retention:              DefaultRetention,
+		RetentionCheckInterval: DefaultRetentionCheckInterval,
+		MonitorEnabled:         true,
 	}
 }
 
@@ -145,7 +147,7 @@ func (r *FileReplica) SnapshotDir(generation string) string {
 
 // SnapshotPath returns the path to a snapshot file.
 func (r *FileReplica) SnapshotPath(generation string, index int) string {
-	return filepath.Join(r.SnapshotDir(generation), fmt.Sprintf("%016x.snapshot.gz", index))
+	return filepath.Join(r.SnapshotDir(generation), fmt.Sprintf("%08x.snapshot.gz", index))
 }
 
 // MaxSnapshotIndex returns the highest index for the snapshots.
@@ -176,7 +178,7 @@ func (r *FileReplica) WALDir(generation string) string {
 
 // WALPath returns the path to a WAL file.
 func (r *FileReplica) WALPath(generation string, index int) string {
-	return filepath.Join(r.WALDir(generation), fmt.Sprintf("%016x.wal", index))
+	return filepath.Join(r.WALDir(generation), fmt.Sprintf("%08x.wal", index))
 }
 
 // Generations returns a list of available generation names.
@@ -776,7 +778,7 @@ func (r *FileReplica) deleteGenerationSnapshotsBefore(ctx context.Context, gener
 			continue
 		}
 
-		log.Printf("%s(%s): generation %q snapshot no longer retained, deleting %s", r.db.Path(), r.Name(), generation, fi.Name())
+		log.Printf("%s(%s): retention exceeded, deleting from generation %q: %s", r.db.Path(), r.Name(), generation, fi.Name())
 		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
 			return err
 		}

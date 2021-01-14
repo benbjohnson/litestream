@@ -219,7 +219,7 @@ func ParseSnapshotPath(s string) (index int, ext string, err error) {
 	return int(i64), a[2], nil
 }
 
-var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(.snapshot(?:.gz)?)$`)
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(.snapshot(?:.gz)?)$`)
 
 // IsWALPath returns true if s is a path to a WAL file.
 func IsWALPath(s string) bool {
@@ -245,7 +245,7 @@ func ParseWALPath(s string) (index int, offset, sz int64, ext string, err error)
 // FormatWALPath formats a WAL filename with a given index.
 func FormatWALPath(index int) string {
 	assert(index >= 0, "wal index must be non-negative")
-	return fmt.Sprintf("%016x%s", index, WALExt)
+	return fmt.Sprintf("%08x%s", index, WALExt)
 }
 
 // FormatWALPathWithOffsetSize formats a WAL filename with a given index, offset & size.
@@ -253,10 +253,10 @@ func FormatWALPathWithOffsetSize(index int, offset, sz int64) string {
 	assert(index >= 0, "wal index must be non-negative")
 	assert(offset >= 0, "wal offset must be non-negative")
 	assert(sz >= 0, "wal size must be non-negative")
-	return fmt.Sprintf("%016x_%016x_%016x%s", index, offset, sz, WALExt)
+	return fmt.Sprintf("%08x_%08x_%08x%s", index, offset, sz, WALExt)
 }
 
-var walPathRegex = regexp.MustCompile(`^([0-9a-f]{16})(?:_([0-9a-f]{16})_([0-9a-f]{16}))?(.wal(?:.gz)?)$`)
+var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8})_([0-9a-f]{8}))?(.wal(?:.gz)?)$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {

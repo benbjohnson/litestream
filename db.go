@@ -1313,7 +1313,7 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	tmpPath := outputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	logger.Printf("restoring snapshot from %s://%s/%016x to %s", r.Name(), generation, minWALIndex, tmpPath)
+	logger.Printf("restoring snapshot from replica %q, generation %q, index %08x to %s", r.Name(), generation, minWALIndex, tmpPath)
 	if !opt.DryRun {
 		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
@@ -1322,7 +1322,7 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
-		logger.Printf("restoring wal from %s://%s/%016x to %s-wal", r.Name(), generation, index, tmpPath)
+		logger.Printf("restoring wal from replica %q, generation %q, index %08x to %s-wal", r.Name(), generation, index, tmpPath)
 		if opt.DryRun {
 			continue
 		}

@@ -88,6 +88,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 				stats.CreatedAt.Format(time.RFC3339),
 				stats.UpdatedAt.Format(time.RFC3339),
 			)
+			w.Flush()
 		}
 	}
 	w.Flush()
