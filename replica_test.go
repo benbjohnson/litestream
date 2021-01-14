@@ -60,7 +60,7 @@ func TestFileReplica_Sync(t *testing.T) {
 			t.Fatal(err)
 		} else if got, want := pos.Index, 2; got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
-		} else if calcPos, err := r.CalcPos(pos.Generation); err != nil {
+		} else if calcPos, err := r.CalcPos(context.Background(), pos.Generation); err != nil {
 			t.Fatal(err)
 		} else if got, want := calcPos, pos; got != want {
 			t.Fatalf("CalcPos()=%v, want %v", got, want)

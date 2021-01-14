@@ -63,7 +63,7 @@ func TestDB_ShadowWALDir(t *testing.T) {
 
 func TestDB_ShadowWALPath(t *testing.T) {
 	db := litestream.NewDB("/tmp/db")
-	if got, want := db.ShadowWALPath("xxxx", 1000), `/tmp/.db-litestream/generations/xxxx/wal/00000000000003e8.wal`; got != want {
+	if got, want := db.ShadowWALPath("xxxx", 1000), `/tmp/.db-litestream/generations/xxxx/wal/000003e8.wal`; got != want {
 		t.Fatalf("ShadowWALPath()=%v, want %v", got, want)
 	}
 }
@@ -98,7 +98,9 @@ func TestDB_UpdatedAt(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		time.Sleep(1 * time.Millisecond)
+		if os.Getenv("CI") != "" {
+			time.Sleep(1 * time.Second)
+		}
 		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
