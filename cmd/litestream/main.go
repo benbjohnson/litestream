@@ -154,10 +154,12 @@ type DBConfig struct {
 }
 
 type ReplicaConfig struct {
-	Type      string        `yaml:"type"` // "file", "s3"
-	Name      string        `yaml:"name"` // name of replica, optional.
-	Path      string        `yaml:"path"`
-	Retention time.Duration `yaml:"retention"`
+	Type                   string        `yaml:"type"` // "file", "s3"
+	Name                   string        `yaml:"name"` // name of replica, optional.
+	Path                   string        `yaml:"path"`
+	Retention              time.Duration `yaml:"retention"`
+	RetentionCheckInterval time.Duration `yaml:"retention-check-interval"`
+	SyncInterval           time.Duration `yaml:"sync-interval"` // s3 only
 
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
@@ -215,7 +217,10 @@ func newFileReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*litest
 
 	r := litestream.NewFileReplica(db, config.Name, config.Path)
 	if v := config.Retention; v > 0 {
-		r.RetentionInterval = v
+		r.Retention = v
+	}
+	if v := config.RetentionCheckInterval; v > 0 {
+		r.RetentionCheckInterval = v
 	}
 	return r, nil
 }
@@ -240,7 +245,13 @@ func newS3ReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*s3.Repli
 	r.Path = config.Path
 
 	if v := config.Retention; v > 0 {
-		r.RetentionInterval = v
+		r.Retention = v
+	}
+	if v := config.RetentionCheckInterval; v > 0 {
+		r.RetentionCheckInterval = v
+	}
+	if v := config.SyncInterval; v > 0 {
+		r.SyncInterval = v
 	}
 	return r, nil
 }

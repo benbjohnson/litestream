@@ -68,6 +68,11 @@ type GenerationStats struct {
 	UpdatedAt time.Time
 }
 
+// Default file replica settings.
+const (
+	DefaultRetention = 24 * time.Hour
+)
+
 var _ Replica = (*FileReplica)(nil)
 
 // FileReplica is a replica that replicates a DB to a local file path.
@@ -85,7 +90,10 @@ type FileReplica struct {
 
 	// Time to keep snapshots and related WAL files.
 	// Database is snapshotted after interval and older WAL files are discarded.
-	RetentionInterval time.Duration
+	Retention time.Duration
+
+	// Time between checks for retention.
+	RetentionCheckInterval time.Duration
 
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
@@ -100,8 +108,8 @@ func NewFileReplica(db *DB, name, dst string) *FileReplica {
 		dst:    dst,
 		cancel: func() {},
 
-		RetentionInterval: DefaultRetentionInterval,
-		MonitorEnabled:    true,
+		Retention:      DefaultRetention,
+		MonitorEnabled: true,
 	}
 }
 
@@ -404,7 +412,7 @@ func (r *FileReplica) monitor(ctx context.Context) {
 
 // retainer runs in a separate goroutine and handles retention.
 func (r *FileReplica) retainer(ctx context.Context) {
-	ticker := time.NewTicker(1 * time.Minute)
+	ticker := time.NewTicker(r.RetentionCheckInterval)
 	defer ticker.Stop()
 
 	for {
@@ -525,7 +533,7 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 
 	// Determine position, if necessary.
 	if r.LastPos().IsZero() {
-		pos, err := r.CalcPos(generation)
+		pos, err := r.CalcPos(ctx, generation)
 		if err != nil {
 			return fmt.Errorf("cannot determine replica position: %s", err)
 		}
@@ -709,7 +717,7 @@ func (r *FileReplica) EnforceRetention(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot obtain snapshot list: %w", err)
 	}
-	snapshots = FilterSnapshotsAfter(snapshots, time.Now().Add(-r.RetentionInterval))
+	snapshots = FilterSnapshotsAfter(snapshots, time.Now().Add(-r.Retention))
 
 	// If no retained snapshots exist, create a new snapshot.
 	if len(snapshots) == 0 {
@@ -876,7 +884,7 @@ func compressFile(src, dst string, uid, gid int) error {
 	}
 	defer w.Close()
 
-	gz := gzip.NewWriter(w)
+	gz, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
 	defer gz.Close()
 
 	// Copy & compress file contents to temporary file.

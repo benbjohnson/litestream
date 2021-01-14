@@ -31,7 +31,6 @@ const (
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
 	DefaultMaxCheckpointPageN = 10000
-	DefaultRetentionInterval  = 24 * time.Hour
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -1571,7 +1570,7 @@ func (db *DB) waitForReplica(ctx context.Context, r Replica, pos Pos, logger *lo
 		}
 
 		// Obtain current position of replica, check if past target position.
-		curr, err := r.CalcPos(pos.Generation)
+		curr, err := r.CalcPos(ctx, pos.Generation)
 		if err != nil {
 			logger.Printf("cannot obtain replica position: %s", err)
 			continue
