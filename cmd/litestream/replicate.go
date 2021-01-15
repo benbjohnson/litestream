@@ -63,7 +63,7 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	for _, dbConfig := range config.DBs {
-		db, err := newDBFromConfig(dbConfig)
+		db, err := newDBFromConfig(&config, dbConfig)
 		if err != nil {
 			return err
 		}

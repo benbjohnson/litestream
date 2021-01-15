@@ -36,7 +36,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
 	fmt.Fprintln(w, "path\treplicas")
 	for _, dbConfig := range config.DBs {
-		db, err := newDBFromConfig(dbConfig)
+		db, err := newDBFromConfig(&config, dbConfig)
 		if err != nil {
 			return err
 		}

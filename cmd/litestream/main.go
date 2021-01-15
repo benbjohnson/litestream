@@ -106,6 +106,12 @@ type Config struct {
 
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
+
+	// Global S3 settings
+	AccessKeyID     string `yaml:"access-key-id"`
+	SecretAccessKey string `yaml:"secret-access-key"`
+	Region          string `yaml:"region"`
+	Bucket          string `yaml:"bucket"`
 }
 
 func (c *Config) Normalize() error {
@@ -245,13 +251,13 @@ func registerConfigFlag(fs *flag.FlagSet, p *string) {
 }
 
 // newDBFromConfig instantiates a DB based on a configuration.
-func newDBFromConfig(config *DBConfig) (*litestream.DB, error) {
+func newDBFromConfig(c *Config, dbc *DBConfig) (*litestream.DB, error) {
 	// Initialize database with given path.
-	db := litestream.NewDB(config.Path)
+	db := litestream.NewDB(dbc.Path)
 
 	// Instantiate and attach replicas.
-	for _, rconfig := range config.Replicas {
-		r, err := newReplicaFromConfig(db, rconfig)
+	for _, rc := range dbc.Replicas {
+		r, err := newReplicaFromConfig(db, c, dbc, rc)
 		if err != nil {
 			return nil, err
 		}
@@ -262,57 +268,77 @@ func newDBFromConfig(config *DBConfig) (*litestream.DB, error) {
 }
 
 // newReplicaFromConfig instantiates a replica for a DB based on a config.
-func newReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (litestream.Replica, error) {
-	switch config.Type {
+func newReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (litestream.Replica, error) {
+	switch rc.Type {
 	case "", "file":
-		return newFileReplicaFromConfig(db, config)
+		return newFileReplicaFromConfig(db, c, dbc, rc)
 	case "s3":
-		return newS3ReplicaFromConfig(db, config)
+		return newS3ReplicaFromConfig(db, c, dbc, rc)
 	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", config.Type)
+		return nil, fmt.Errorf("unknown replica type in config: %q", rc.Type)
 	}
 }
 
 // newFileReplicaFromConfig returns a new instance of FileReplica build from config.
-func newFileReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*litestream.FileReplica, error) {
-	if config.Path == "" {
+func newFileReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (*litestream.FileReplica, error) {
+	if rc.Path == "" {
 		return nil, fmt.Errorf("%s: file replica path required", db.Path())
 	}
 
-	r := litestream.NewFileReplica(db, config.Name, config.Path)
-	if v := config.Retention; v > 0 {
+	r := litestream.NewFileReplica(db, rc.Name, rc.Path)
+	if v := rc.Retention; v > 0 {
 		r.Retention = v
 	}
-	if v := config.RetentionCheckInterval; v > 0 {
+	if v := rc.RetentionCheckInterval; v > 0 {
 		r.RetentionCheckInterval = v
 	}
 	return r, nil
 }
 
 // newS3ReplicaFromConfig returns a new instance of S3Replica build from config.
-func newS3ReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*s3.Replica, error) {
-	if config.AccessKeyID == "" {
+func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (*s3.Replica, error) {
+	// Use global or replica-specific S3 settings.
+	accessKeyID := c.AccessKeyID
+	if v := rc.AccessKeyID; v != "" {
+		accessKeyID = v
+	}
+	secretAccessKey := c.SecretAccessKey
+	if v := rc.SecretAccessKey; v != "" {
+		secretAccessKey = v
+	}
+	bucket := c.Bucket
+	if v := rc.Bucket; v != "" {
+		bucket = v
+	}
+	region := c.Region
+	if v := rc.Region; v != "" {
+		region = v
+	}
+
+	// Ensure required settings are set.
+	if accessKeyID == "" {
 		return nil, fmt.Errorf("%s: s3 access key id required", db.Path())
-	} else if config.SecretAccessKey == "" {
+	} else if secretAccessKey == "" {
 		return nil, fmt.Errorf("%s: s3 secret access key required", db.Path())
-	} else if config.Bucket == "" {
+	} else if bucket == "" {
 		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
 	}
 
-	r := s3.NewReplica(db, config.Name)
-	r.AccessKeyID = config.AccessKeyID
-	r.SecretAccessKey = config.SecretAccessKey
-	r.Region = config.Region
-	r.Bucket = config.Bucket
-	r.Path = config.Path
+	// Build replica.
+	r := s3.NewReplica(db, rc.Name)
+	r.AccessKeyID = accessKeyID
+	r.SecretAccessKey = secretAccessKey
+	r.Region = region
+	r.Bucket = bucket
+	r.Path = rc.Path
 
-	if v := config.Retention; v > 0 {
+	if v := rc.Retention; v > 0 {
 		r.Retention = v
 	}
-	if v := config.RetentionCheckInterval; v > 0 {
+	if v := rc.RetentionCheckInterval; v > 0 {
 		r.RetentionCheckInterval = v
 	}
-	if v := config.SyncInterval; v > 0 {
+	if v := rc.SyncInterval; v > 0 {
 		r.SyncInterval = v
 	}
 	return r, nil

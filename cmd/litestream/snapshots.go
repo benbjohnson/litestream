@@ -49,7 +49,7 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	if dbConfig == nil {
 		return fmt.Errorf("database not found in config: %s", dbPath)
 	}
-	db, err := newDBFromConfig(dbConfig)
+	db, err := newDBFromConfig(&config, dbConfig)
 	if err != nil {
 		return err
 	}
