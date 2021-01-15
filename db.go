@@ -1327,7 +1327,10 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 			continue
 		}
 
-		if err := db.restoreWAL(ctx, r, generation, index, tmpPath); err != nil {
+		if err := db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
+			logger.Printf("no wal available, snapshot only")
+			break // snapshot file only, ignore error
+		} else if err != nil {
 			return fmt.Errorf("cannot restore wal: %w", err)
 		}
 	}
