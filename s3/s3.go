@@ -552,7 +552,7 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	}
 
 	pr, pw := io.Pipe()
-	gw, _ := gzip.NewWriterLevel(pw, gzip.BestSpeed)
+	gw := gzip.NewWriter(pw)
 	go func() {
 		if _, err := io.Copy(gw, f); err != nil {
 			_ = pw.CloseWithError(err)
@@ -723,8 +723,10 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	}
 
 	var buf bytes.Buffer
-	gw, _ := gzip.NewWriterLevel(&buf, gzip.BestSpeed)
+	gw := gzip.NewWriter(&buf)
 	if _, err := gw.Write(b); err != nil {
+		return err
+	} else if err := gw.Close(); err != nil {
 		return err
 	}
 
@@ -823,7 +825,7 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 	}
 
 	// Open each file and concatenate into a multi-reader.
-	var mrc multiReadCloser
+	var buf bytes.Buffer
 	for _, key := range keys {
 		// Pipe download to return an io.Reader.
 		out, err := r.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
@@ -831,24 +833,25 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 			Key:    aws.String(key),
 		})
 		if err != nil {
-			mrc.Close()
 			return nil, err
 		}
+		defer out.Body.Close()
+
 		r.getOperationTotalCounter.Inc()
 		r.getOperationTotalCounter.Add(float64(*out.ContentLength))
 
-		// Decompress the snapshot file.
 		gr, err := gzip.NewReader(out.Body)
 		if err != nil {
-			out.Body.Close()
-			mrc.Close()
 			return nil, err
 		}
+		defer gr.Close()
 
-		mrc.readers = append(mrc.readers, internal.NewReadCloser(gr, out.Body))
+		if _, err := io.Copy(&buf, gr); err != nil {
+			return nil, err
+		}
 	}
 
-	return &mrc, nil
+	return ioutil.NopCloser(&buf), nil
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.

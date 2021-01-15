@@ -915,7 +915,7 @@ func compressFile(src, dst string, uid, gid int) error {
 	}
 	defer w.Close()
 
-	gz, _ := gzip.NewWriterLevel(w, gzip.BestSpeed)
+	gz := gzip.NewWriter(w)
 	defer gz.Close()
 
 	// Copy & compress file contents to temporary file.
