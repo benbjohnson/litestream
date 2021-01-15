@@ -82,6 +82,9 @@ type Replica struct {
 	// Time between retention checks.
 	RetentionCheckInterval time.Duration
 
+	// Time between validation checks.
+	ValidationInterval time.Duration
+
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
@@ -126,6 +129,11 @@ func (r *Replica) Name() string {
 // Type returns the type of replica.
 func (r *Replica) Type() string {
 	return "s3"
+}
+
+// DB returns the parent database reference.
+func (r *Replica) DB() *litestream.DB {
+	return r.db
 }
 
 // LastPos returns the last successfully replicated position.
@@ -410,9 +418,10 @@ func (r *Replica) Start(ctx context.Context) {
 	ctx, r.cancel = context.WithCancel(ctx)
 
 	// Start goroutines to manage replica data.
-	r.wg.Add(2)
+	r.wg.Add(3)
 	go func() { defer r.wg.Done(); r.monitor(ctx) }()
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
+	go func() { defer r.wg.Done(); r.validator(ctx) }()
 }
 
 // Stop cancels any outstanding replication and blocks until finished.
@@ -471,6 +480,28 @@ func (r *Replica) retainer(ctx context.Context) {
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
 				log.Printf("%s(%s): retain error: %s", r.db.Path(), r.Name(), err)
+				continue
+			}
+		}
+	}
+}
+
+// validator runs in a separate goroutine and handles periodic validation.
+func (r *Replica) validator(ctx context.Context) {
+	if r.ValidationInterval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(r.ValidationInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := litestream.ValidateReplica(ctx, r); err != nil {
+				log.Printf("%s(%s): validation error: %s", r.db.Path(), r.Name(), err)
 				continue
 			}
 		}

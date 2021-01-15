@@ -4,6 +4,7 @@ import (
 	"compress/gzip"
 	"context"
 	"fmt"
+	"hash/crc64"
 	"io"
 	"io/ioutil"
 	"log"
@@ -25,6 +26,9 @@ type Replica interface {
 
 	// String identifier for the type of replica ("file", "s3", etc).
 	Type() string
+
+	// The parent database.
+	DB() *DB
 
 	// Starts replicating in a background goroutine.
 	Start(ctx context.Context)
@@ -102,6 +106,9 @@ type FileReplica struct {
 	// Time between checks for retention.
 	RetentionCheckInterval time.Duration
 
+	// Time between validation checks.
+	ValidationInterval time.Duration
+
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
@@ -139,6 +146,11 @@ func (r *FileReplica) Name() string {
 // Type returns the type of replica.
 func (r *FileReplica) Type() string {
 	return "file"
+}
+
+// DB returns the parent database reference.
+func (r *FileReplica) DB() *DB {
+	return r.db
 }
 
 // Path returns the path the replica was initialized with.
@@ -387,9 +399,10 @@ func (r *FileReplica) Start(ctx context.Context) {
 	ctx, r.cancel = context.WithCancel(ctx)
 
 	// Start goroutine to replicate data.
-	r.wg.Add(2)
+	r.wg.Add(3)
 	go func() { defer r.wg.Done(); r.monitor(ctx) }()
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
+	go func() { defer r.wg.Done(); r.validator(ctx) }()
 }
 
 // Stop cancels any outstanding replication and blocks until finished.
@@ -440,6 +453,28 @@ func (r *FileReplica) retainer(ctx context.Context) {
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
 				log.Printf("%s(%s): retain error: %s", r.db.Path(), r.Name(), err)
+				continue
+			}
+		}
+	}
+}
+
+// validator runs in a separate goroutine and handles periodic validation.
+func (r *FileReplica) validator(ctx context.Context) {
+	if r.ValidationInterval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(r.ValidationInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := ValidateReplica(ctx, r); err != nil {
+				log.Printf("%s(%s): validation error: %s", r.db.Path(), r.Name(), err)
 				continue
 			}
 		}
@@ -931,4 +966,119 @@ func compressFile(src, dst string, uid, gid int) error {
 
 	// Move compressed file to final location.
 	return os.Rename(dst+".tmp", dst)
+}
+
+// ValidateReplica restores the most recent data from a replica and validates
+// that the resulting database matches the current database.
+func ValidateReplica(ctx context.Context, r Replica) error {
+	db := r.DB()
+
+	log.Printf("%s(%s): computing primary checksum", db.Path(), r.Name())
+
+	// Compute checksum of primary database under lock. This prevents a
+	// sync from occurring and the database will not be written.
+	chksum0, pos, err := db.CRC64()
+	if err != nil {
+		return fmt.Errorf("cannot compute checksum: %w", err)
+	}
+	log.Printf("%s(%s): primary checksum computed: %08x", db.Path(), r.Name(), chksum0)
+
+	// Wait until replica catches up to position.
+	log.Printf("%s(%s): waiting for replica", db.Path(), r.Name())
+	if err := waitForReplica(ctx, r, pos); err != nil {
+		return fmt.Errorf("cannot wait for replica: %w", err)
+	}
+	log.Printf("%s(%s): replica ready, restoring", db.Path(), r.Name())
+
+	// Restore replica to a temporary directory.
+	tmpdir, err := ioutil.TempDir("", "*-litestream")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpdir)
+
+	restorePath := filepath.Join(tmpdir, "db")
+	if err := db.Restore(ctx, RestoreOptions{
+		OutputPath:  restorePath,
+		ReplicaName: r.Name(),
+		Generation:  pos.Generation,
+		Index:       pos.Index - 1,
+		Logger:      log.New(os.Stderr, "", 0),
+	}); err != nil {
+		return fmt.Errorf("cannot restore: %w", err)
+	}
+
+	log.Printf("%s(%s): restore complete, computing checksum", db.Path(), r.Name())
+
+	// Open file handle for restored database.
+	f, err := os.Open(db.Path())
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Compute checksum.
+	h := crc64.New(crc64.MakeTable(crc64.ISO))
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	chksum1 := h.Sum64()
+
+	log.Printf("%s(%s): replica checksum computed: %08x", db.Path(), r.Name(), chksum1)
+
+	// Validate checksums match.
+	if chksum0 != chksum1 {
+		internal.ReplicaValidationTotalCounterVec.WithLabelValues(db.Path(), r.Name(), "error").Inc()
+		return ErrChecksumMismatch
+	}
+
+	internal.ReplicaValidationTotalCounterVec.WithLabelValues(db.Path(), r.Name(), "ok").Inc()
+	log.Printf("%s(%s): replica ok", db.Path(), r.Name())
+
+	return nil
+}
+
+// waitForReplica blocks until replica reaches at least the given position.
+func waitForReplica(ctx context.Context, r Replica, pos Pos) error {
+	db := r.DB()
+
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	once := make(chan struct{}, 1)
+	once <- struct{}{}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		case <-once: // immediate on first check
+		}
+
+		// Obtain current position of replica, check if past target position.
+		curr, err := r.CalcPos(ctx, pos.Generation)
+		if err != nil {
+			log.Printf("%s(%s): cannot obtain replica position: %s", db.Path(), r.Name(), err)
+			continue
+		}
+
+		ready := true
+		if curr.Generation != pos.Generation {
+			ready = false
+		} else if curr.Index < pos.Index {
+			ready = false
+		} else if curr.Index == pos.Index && curr.Offset < pos.Offset {
+			ready = false
+		}
+
+		// If not ready, restart loop.
+		if !ready {
+			log.Printf("%s(%s): replica at %s, waiting for %s", db.Path(), r.Name(), curr, pos)
+			continue
+		}
+
+		// Current position at or after target position.
+		return nil
+	}
 }

@@ -59,8 +59,6 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "snapshots":
 		return (&SnapshotsCommand{}).Run(ctx, args)
-	case "validate":
-		return (&ValidateCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	case "wal":
@@ -190,6 +188,7 @@ type ReplicaConfig struct {
 	Retention              time.Duration `yaml:"retention"`
 	RetentionCheckInterval time.Duration `yaml:"retention-check-interval"`
 	SyncInterval           time.Duration `yaml:"sync-interval"` // s3 only
+	ValidationInterval     time.Duration `yaml:"validation-interval"`
 
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
@@ -292,6 +291,9 @@ func newFileReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *R
 	if v := rc.RetentionCheckInterval; v > 0 {
 		r.RetentionCheckInterval = v
 	}
+	if v := rc.ValidationInterval; v > 0 {
+		r.ValidationInterval = v
+	}
 	return r, nil
 }
 
@@ -340,6 +342,9 @@ func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Rep
 	}
 	if v := rc.SyncInterval; v > 0 {
 		r.SyncInterval = v
+	}
+	if v := rc.ValidationInterval; v > 0 {
+		r.ValidationInterval = v
 	}
 	return r, nil
 }

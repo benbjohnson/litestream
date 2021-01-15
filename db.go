@@ -1470,143 +1470,19 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 	return nil
 }
 
-// Validate restores the most recent data from a replica and validates
-// that the resulting database matches the current database.
-func (db *DB) Validate(ctx context.Context, replicaName string, opt RestoreOptions) error {
-	if replicaName == "" {
-		return fmt.Errorf("replica name required")
-	}
-
-	// Look up replica by name.
-	r := db.Replica(replicaName)
-	if r == nil {
-		return fmt.Errorf("replica not found: %q", replicaName)
-	}
-
-	// Ensure logger exists.
-	logger := opt.Logger
-	if logger == nil {
-		logger = log.New(ioutil.Discard, "", 0)
-	}
-
-	logger.Printf("computing primary checksum")
-
-	// Compute checksum of primary database under read lock. This prevents a
-	// sync from occurring and the database will not be written.
-	chksum0, pos, err := db.CRC64()
-	if err != nil {
-		return fmt.Errorf("cannot compute checksum: %w", err)
-	}
-	logger.Printf("primary checksum computed: %08x", chksum0)
-
-	// Wait until replica catches up to position.
-	logger.Printf("waiting for replica")
-	if err := db.waitForReplica(ctx, r, pos, logger); err != nil {
-		return fmt.Errorf("cannot wait for replica: %w", err)
-	}
-	logger.Printf("replica ready, restoring")
-
-	// Restore replica to a temporary directory.
-	tmpdir, err := ioutil.TempDir("", "*-litestream")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpdir)
-
-	restorePath := filepath.Join(tmpdir, "db")
-	if err := db.Restore(ctx, RestoreOptions{
-		OutputPath:  restorePath,
-		ReplicaName: replicaName,
-		Generation:  pos.Generation,
-		Index:       pos.Index - 1,
-		DryRun:      opt.DryRun,
-		Logger:      opt.Logger,
-	}); err != nil {
-		return fmt.Errorf("cannot restore: %w", err)
-	}
-
-	// Skip remaining validation if this is just a dry run.
-	if opt.DryRun {
-		return fmt.Errorf("validation stopped, dry run only")
-	}
-
-	logger.Printf("restore complete, computing checksum")
-
-	// Open file handle for restored database.
-	f, err := os.Open(db.Path())
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Compute checksum.
-	h := crc64.New(crc64.MakeTable(crc64.ISO))
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	chksum1 := h.Sum64()
-
-	logger.Printf("replica checksum computed: %08x", chksum1)
-
-	// Validate checksums match.
-	if chksum0 != chksum1 {
-		return ErrChecksumMismatch
-	}
-
-	return nil
-}
-
-// waitForReplica blocks until replica reaches at least the given position.
-func (db *DB) waitForReplica(ctx context.Context, r Replica, pos Pos, logger *log.Logger) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	once := make(chan struct{}, 1)
-	once <- struct{}{}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-		case <-once: // immediate on first check
-		}
-
-		// Obtain current position of replica, check if past target position.
-		curr, err := r.CalcPos(ctx, pos.Generation)
-		if err != nil {
-			logger.Printf("cannot obtain replica position: %s", err)
-			continue
-		}
-
-		ready := true
-		if curr.Generation != pos.Generation {
-			ready = false
-		} else if curr.Index < pos.Index {
-			ready = false
-		} else if curr.Index == pos.Index && curr.Offset < pos.Offset {
-			ready = false
-		}
-
-		// If not ready, restart loop.
-		if !ready {
-			logger.Printf("replica at %s, waiting for %s", curr, pos)
-			continue
-		}
-
-		// Current position at or after target position.
-		return nil
-	}
-}
-
 // CRC64 returns a CRC-64 ISO checksum of the database and its current position.
 //
 // This function obtains a read lock so it prevents syncs from occuring until
 // the operation is complete. The database will still be usable but it will be
 // unable to checkpoint during this time.
 func (db *DB) CRC64() (uint64, Pos, error) {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	// Force a RESTART checkpoint to ensure the database is at the start of the WAL.
+	if err := db.checkpoint(CheckpointModeRestart); err != nil {
+		return 0, Pos{}, err
+	}
 
 	// Obtain current position. Clear the offset since we are only reading the
 	// DB and not applying the current WAL.

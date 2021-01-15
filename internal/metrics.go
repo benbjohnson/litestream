@@ -34,4 +34,11 @@ var (
 		Name:      "wal_offset",
 		Help:      "The current WAL offset",
 	}, []string{"db", "name"})
+
+	ReplicaValidationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "litestream",
+		Subsystem: "replica",
+		Name:      "validation_total",
+		Help:      "The number of validations performed",
+	}, []string{"db", "name", "status"})
 )
