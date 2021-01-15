@@ -295,8 +295,6 @@ func newS3ReplicaFromConfig(db *litestream.DB, config *ReplicaConfig) (*s3.Repli
 		return nil, fmt.Errorf("%s: s3 access key id required", db.Path())
 	} else if config.SecretAccessKey == "" {
 		return nil, fmt.Errorf("%s: s3 secret access key required", db.Path())
-	} else if config.Region == "" {
-		return nil, fmt.Errorf("%s: s3 region required", db.Path())
 	} else if config.Bucket == "" {
 		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
 	}

@@ -602,9 +602,19 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
+	// Look up region if not specified.
+	region := r.Region
+	if region == "" {
+		if region, err = r.findBucketRegion(ctx, r.Bucket); err != nil {
+			return fmt.Errorf("cannot lookup bucket region: %w", err)
+		}
+		log.Printf("%s(%s): s3 bucket region found: %q", r.db.Path(), r.Name(), region)
+	}
+
+	// Create new AWS session.
 	sess, err := session.NewSession(&aws.Config{
 		Credentials: credentials.NewStaticCredentials(r.AccessKeyID, r.SecretAccessKey, ""),
-		Region:      aws.String(r.Region),
+		Region:      aws.String(region),
 	})
 	if err != nil {
 		return fmt.Errorf("cannot create aws session: %w", err)
@@ -612,6 +622,28 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 	r.s3 = s3.New(sess)
 	r.uploader = s3manager.NewUploader(sess)
 	return nil
+}
+
+func (r *Replica) findBucketRegion(ctx context.Context, bucket string) (string, error) {
+	// Connect to US standard region to fetch info.
+	sess, err := session.NewSession(&aws.Config{
+		Credentials: credentials.NewStaticCredentials(r.AccessKeyID, r.SecretAccessKey, ""),
+		Region:      aws.String("us-east-1"),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// Fetch bucket location, if possible. Must be bucket owner.
+	// This call can return a nil location which means it's in us-east-1.
+	if out, err := s3.New(sess).GetBucketLocation(&s3.GetBucketLocationInput{
+		Bucket: aws.String(bucket),
+	}); err != nil {
+		return "", err
+	} else if out.LocationConstraint != nil {
+		return *out.LocationConstraint, nil
+	}
+	return "us-east-1", nil
 }
 
 func (r *Replica) Sync(ctx context.Context) (err error) {
