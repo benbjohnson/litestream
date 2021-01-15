@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"net/url"
 	"os"
 	"os/user"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -106,6 +108,15 @@ type Config struct {
 	DBs []*DBConfig `yaml:"dbs"`
 }
 
+func (c *Config) Normalize() error {
+	for i := range c.DBs {
+		if err := c.DBs[i].Normalize(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
 	return Config{
@@ -145,12 +156,25 @@ func ReadConfigFile(filename string) (Config, error) {
 	} else if err := yaml.Unmarshal(buf, &config); err != nil {
 		return config, err
 	}
+
+	if err := config.Normalize(); err != nil {
+		return config, err
+	}
 	return config, nil
 }
 
 type DBConfig struct {
 	Path     string           `yaml:"path"`
 	Replicas []*ReplicaConfig `yaml:"replicas"`
+}
+
+func (c *DBConfig) Normalize() error {
+	for i := range c.Replicas {
+		if err := c.Replicas[i].Normalize(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 type ReplicaConfig struct {
@@ -166,6 +190,46 @@ type ReplicaConfig struct {
 	SecretAccessKey string `yaml:"secret-access-key"`
 	Region          string `yaml:"region"`
 	Bucket          string `yaml:"bucket"`
+}
+
+func (c *ReplicaConfig) Normalize() error {
+	// Expand path filename, if necessary.
+	if prefix := "~" + string(os.PathSeparator); strings.HasPrefix(c.Path, prefix) {
+		u, err := user.Current()
+		if err != nil {
+			return err
+		} else if u.HomeDir == "" {
+			return fmt.Errorf("cannot expand replica path, no home directory available")
+		}
+		c.Path = filepath.Join(u.HomeDir, strings.TrimPrefix(c.Path, prefix))
+	}
+
+	// Attempt to parse as URL. Ignore if it is not a URL or if there is no scheme.
+	u, err := url.Parse(c.Path)
+	if err != nil || u.Scheme == "" {
+		return nil
+	}
+
+	switch u.Scheme {
+	case "file":
+		u.Scheme = ""
+		c.Type = u.Scheme
+		c.Path = path.Clean(u.String())
+		return nil
+
+	case "s3":
+		c.Type = u.Scheme
+		c.Path = strings.TrimPrefix(path.Clean(u.Path), "/")
+		c.Bucket = u.Host
+		if u := u.User; u != nil {
+			c.AccessKeyID = u.Username()
+			c.SecretAccessKey, _ = u.Password()
+		}
+		return nil
+
+	default:
+		return fmt.Errorf("unrecognized replica type in path scheme: %s", c.Path)
+	}
 }
 
 // DefaultConfigPath returns the default config path.

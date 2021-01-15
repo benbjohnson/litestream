@@ -141,6 +141,11 @@ func (r *FileReplica) Type() string {
 	return "file"
 }
 
+// Path returns the path the replica was initialized with.
+func (r *FileReplica) Path() string {
+	return r.dst
+}
+
 // LastPos returns the last successfully replicated position.
 func (r *FileReplica) LastPos() Pos {
 	r.mu.RLock()

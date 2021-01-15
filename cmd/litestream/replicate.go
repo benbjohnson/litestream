@@ -13,6 +13,7 @@ import (
 	"os/signal"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/s3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
@@ -75,12 +76,24 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Notify user that initialization is done.
-	fmt.Printf("Initialized with %d databases.\n", len(c.DBs))
+	for _, db := range c.DBs {
+		fmt.Printf("initialized db: %s\n", db.Path())
+		for _, r := range db.Replicas {
+			switch r := r.(type) {
+			case *litestream.FileReplica:
+				fmt.Printf("replicating to: name=%q type=%q path=%q\n", r.Name(), r.Type(), r.Path())
+			case *s3.Replica:
+				fmt.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q\n", r.Name(), r.Type(), r.Bucket, r.Path, r.Region)
+			default:
+				fmt.Printf("replicating to: name=%q type=%q\n", r.Name(), r.Type())
+			}
+		}
+	}
 
 	// Serve metrics over HTTP if enabled.
 	if config.Addr != "" {
 		_, port, _ := net.SplitHostPort(config.Addr)
-		fmt.Printf("Serving metrics on http://localhost:%s/metrics\n", port)
+		fmt.Printf("serving metrics on http://localhost:%s/metrics\n", port)
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
 			http.ListenAndServe(config.Addr, nil)
