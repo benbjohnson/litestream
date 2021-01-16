@@ -59,7 +59,7 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	fmt.Printf("litestream %s\n", Version)
 
 	if len(config.DBs) == 0 {
-		return errors.New("configuration must specify at least one database")
+		fmt.Println("no databases specified in configuration")
 	}
 
 	for _, dbConfig := range config.DBs {
