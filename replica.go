@@ -1072,10 +1072,14 @@ func waitForReplica(ctx context.Context, r Replica, pos Pos) error {
 			continue
 		}
 
-		ready := true
+		// Exit if the generation has changed while waiting as there will be
+		// no further progress on the old generation.
 		if curr.Generation != pos.Generation {
-			ready = false
-		} else if curr.Index < pos.Index {
+			return fmt.Errorf("generation changed")
+		}
+
+		ready := true
+		if curr.Index < pos.Index {
 			ready = false
 		} else if curr.Index == pos.Index && curr.Offset < pos.Offset {
 			ready = false
