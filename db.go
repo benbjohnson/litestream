@@ -33,6 +33,9 @@ const (
 	DefaultMaxCheckpointPageN = 10000
 )
 
+// BusyTimeout is the timeout to wait for EBUSY from SQLite.
+const BusyTimeout = 1 * time.Second
+
 // DB represents a managed instance of a SQLite database in the file system.
 type DB struct {
 	mu       sync.RWMutex
@@ -357,8 +360,11 @@ func (db *DB) init() (err error) {
 	}
 	db.uid, db.gid = fileinfo(fi)
 
+	dsn := db.path
+	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
+
 	// Connect to SQLite database & enable WAL.
-	if db.db, err = sql.Open("sqlite3", db.path); err != nil {
+	if db.db, err = sql.Open("sqlite3", dsn); err != nil {
 		return err
 	} else if _, err := db.db.Exec(`PRAGMA journal_mode = wal;`); err != nil {
 		return fmt.Errorf("enable wal: %w", err)
