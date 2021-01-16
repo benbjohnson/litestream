@@ -818,7 +818,7 @@ func (r *Replica) SnapshotReader(ctx context.Context, generation string, index i
 		return nil, err
 	}
 	r.getOperationTotalCounter.Inc()
-	r.getOperationTotalCounter.Add(float64(*out.ContentLength))
+	r.getOperationBytesCounter.Add(float64(*out.ContentLength))
 
 	// Decompress the snapshot file.
 	gr, err := gzip.NewReader(out.Body)
