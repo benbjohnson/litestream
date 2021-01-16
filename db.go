@@ -1485,6 +1485,12 @@ func (db *DB) CRC64() (uint64, Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	if err := db.init(); err != nil {
+		return 0, Pos{}, err
+	} else if db.db == nil {
+		return 0, Pos{}, os.ErrNotExist
+	}
+
 	// Force a RESTART checkpoint to ensure the database is at the start of the WAL.
 	if err := db.checkpoint(CheckpointModeRestart); err != nil {
 		return 0, Pos{}, err

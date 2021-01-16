@@ -137,8 +137,8 @@ func TestDB_CRC64(t *testing.T) {
 			t.Fatal(err)
 		} else if chksum1, _, err := db.CRC64(); err != nil {
 			t.Fatal(err)
-		} else if chksum0 != chksum1 {
-			t.Fatal("expected equal checksum after WAL change")
+		} else if chksum0 == chksum1 {
+			t.Fatal("expected different checksum event after WAL change")
 		}
 
 		// Checkpoint change into database. Checksum should change.
