@@ -1,0 +1,10 @@
+# AWS credentials
+# access-key-id:     AKIAxxxxxxxxxxxxxxxx
+# secret-access-key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
+
+# dbs:
+#  - path: /path/to/primary/db            # Database to replicate from
+#    replicas:
+#      - path: /path/to/replica           # File-based replication
+#      - path: s3://my.bucket.com/db      # S3-based replication
+

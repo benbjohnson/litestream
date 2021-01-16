@@ -1,0 +1,19 @@
+name: litestream
+arch: amd64
+platform: linux
+version: "${LITESTREAM_VERSION}"
+section: "default"
+priority: "extra"
+maintainer: "Ben Johnson <benbjohnson@yahoo.com>"
+description: Litestream is a tool for real-time replication of SQLite databases.
+homepage: "https://github.com/benbjohnson/litestream"
+license: "GPLv3"
+contents:
+- src: ./dist/litestream
+  dst: /usr/bin/litestream
+- src: ./etc/litestream.yml
+  dst: /etc/litestream.yml
+  type: config
+- src: ./etc/litestream.service
+  dst: /usr/lib/systemd/system/litestream.service
+  type: config

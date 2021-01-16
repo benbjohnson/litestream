@@ -1,0 +1,9 @@
+[Unit]
+Description=Litestream
+
+[Service]
+Restart=always
+ExecStart=/usr/bin/litestream replicate
+
+[Install]
+WantedBy=multi-user.target
