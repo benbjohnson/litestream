@@ -566,6 +566,15 @@ func (r *FileReplica) snapshotN(generation string) (int, error) {
 }
 
 func (r *FileReplica) Sync(ctx context.Context) (err error) {
+	// Clear last position if if an error occurs during sync.
+	defer func() {
+		if err != nil {
+			r.mu.Lock()
+			r.pos = Pos{}
+			r.mu.Unlock()
+		}
+	}()
+
 	// Find current position of database.
 	dpos, err := r.db.Pos()
 	if err != nil {
@@ -588,7 +597,7 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 	}
 
 	// Determine position, if necessary.
-	if r.LastPos().IsZero() {
+	if r.LastPos().Generation != generation {
 		pos, err := r.CalcPos(ctx, generation)
 		if err != nil {
 			return fmt.Errorf("cannot determine replica position: %s", err)

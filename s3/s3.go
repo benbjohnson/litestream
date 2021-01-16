@@ -678,6 +678,16 @@ func (r *Replica) findBucketRegion(ctx context.Context, bucket string) (string, 
 }
 
 func (r *Replica) Sync(ctx context.Context) (err error) {
+	// Clear last position if if an error occurs during sync.
+	defer func() {
+		if err != nil {
+			r.mu.Lock()
+			r.pos = litestream.Pos{}
+			r.mu.Unlock()
+		}
+	}()
+
+	// Connect to S3, if necessary.
 	if err := r.Init(ctx); err != nil {
 		return err
 	}
