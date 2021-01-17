@@ -988,8 +988,6 @@ func compressFile(src, dst string, uid, gid int) error {
 func ValidateReplica(ctx context.Context, r Replica) error {
 	db := r.DB()
 
-	log.Printf("%s(%s): computing primary checksum", db.Path(), r.Name())
-
 	// Compute checksum of primary database under lock. This prevents a
 	// sync from occurring and the database will not be written.
 	chksum0, pos, err := db.CRC64()
@@ -1003,7 +1001,6 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	if err := waitForReplica(ctx, r, pos); err != nil {
 		return fmt.Errorf("cannot wait for replica: %w", err)
 	}
-	log.Printf("%s(%s): replica ready, restoring", db.Path(), r.Name())
 
 	// Restore replica to a temporary directory.
 	tmpdir, err := ioutil.TempDir("", "*-litestream")
@@ -1023,8 +1020,6 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
 
-	log.Printf("%s(%s): restore complete, computing checksum", db.Path(), r.Name())
-
 	// Open file handle for restored database.
 	f, err := os.Open(db.Path())
 	if err != nil {
@@ -1039,7 +1034,7 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	}
 	chksum1 := h.Sum64()
 
-	log.Printf("%s(%s): replica checksum computed: %016x", db.Path(), r.Name(), chksum1)
+	log.Printf("%s(%s): restore complete, replica checksum=%016x", db.Path(), r.Name(), chksum1)
 
 	// Validate checksums match.
 	if chksum0 != chksum1 {
