@@ -1324,6 +1324,13 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
 		}
+
+		chksum, err := checksumFile(tmpPath)
+		if err != nil {
+			log.Printf("%s(%s): cannot checksum snapshot: %s", db.path, r.Name(), err)
+		} else {
+			log.Printf("%s(%s): restored snapshot checksum: %016x", db.path, r.Name(), chksum)
+		}
 	}
 
 	// Restore each WAL file until we reach our maximum index.
@@ -1350,6 +1357,20 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	return nil
+}
+
+func checksumFile(filename string) (uint64, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	h := crc64.New(crc64.MakeTable(crc64.ISO))
+	if _, err := io.Copy(h, f); err != nil {
+		return 0, err
+	}
+	return h.Sum64(), nil
 }
 
 func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log.Logger) (Replica, string, error) {
@@ -1458,6 +1479,13 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 		return err
 	} else if err := f.Close(); err != nil {
 		return err
+	}
+
+	chksum, err := checksumFile(dbPath + "-wal")
+	if err != nil {
+		log.Printf("%s(%s): cannot checksum wal: %s", db.path, r.Name(), err)
+	} else {
+		log.Printf("%s(%s): restored wal checksum: %016x", db.path, r.Name(), chksum)
 	}
 
 	// Open SQLite database and force a truncating checkpoint.

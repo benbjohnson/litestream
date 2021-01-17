@@ -996,7 +996,7 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	if err != nil {
 		return fmt.Errorf("cannot compute checksum: %w", err)
 	}
-	log.Printf("%s(%s): primary checksum computed: %08x @ %s", db.Path(), r.Name(), chksum0, pos)
+	log.Printf("%s(%s): primary checksum computed: %016x @ %s", db.Path(), r.Name(), chksum0, pos)
 
 	// Wait until replica catches up to position.
 	log.Printf("%s(%s): waiting for replica", db.Path(), r.Name())
@@ -1039,7 +1039,7 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	}
 	chksum1 := h.Sum64()
 
-	log.Printf("%s(%s): replica checksum computed: %08x", db.Path(), r.Name(), chksum1)
+	log.Printf("%s(%s): replica checksum computed: %016x", db.Path(), r.Name(), chksum1)
 
 	// Validate checksums match.
 	if chksum0 != chksum1 {
