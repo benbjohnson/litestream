@@ -488,6 +488,11 @@ func (r *Replica) retainer(ctx context.Context) {
 
 // validator runs in a separate goroutine and handles periodic validation.
 func (r *Replica) validator(ctx context.Context) {
+	// Initialize counters since validation occurs infrequently.
+	for _, status := range []string{"ok", "error"} {
+		internal.ReplicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), r.Name(), status).Add(0)
+	}
+
 	if r.ValidationInterval <= 0 {
 		return
 	}

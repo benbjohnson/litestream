@@ -461,6 +461,12 @@ func (r *FileReplica) retainer(ctx context.Context) {
 
 // validator runs in a separate goroutine and handles periodic validation.
 func (r *FileReplica) validator(ctx context.Context) {
+	// Initialize counters since validation occurs infrequently.
+	for _, status := range []string{"ok", "error"} {
+		internal.ReplicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), r.Name(), status).Add(0)
+	}
+
+	// Exit validation if interval is not set.
 	if r.ValidationInterval <= 0 {
 		return
 	}
@@ -990,7 +996,7 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	if err != nil {
 		return fmt.Errorf("cannot compute checksum: %w", err)
 	}
-	log.Printf("%s(%s): primary checksum computed: %08x", db.Path(), r.Name(), chksum0)
+	log.Printf("%s(%s): primary checksum computed: %08x @ %s", db.Path(), r.Name(), chksum0, pos)
 
 	// Wait until replica catches up to position.
 	log.Printf("%s(%s): waiting for replica", db.Path(), r.Name())

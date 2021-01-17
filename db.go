@@ -1319,7 +1319,7 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	tmpPath := outputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	logger.Printf("restoring snapshot from replica %q, generation %q, index %08x to %s", r.Name(), generation, minWALIndex, tmpPath)
+	log.Printf("%s(%s): restoring snapshot %s/%08x to %s", db.path, r.Name(), generation, minWALIndex, tmpPath)
 	if !opt.DryRun {
 		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
@@ -1328,13 +1328,13 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
-		logger.Printf("restoring wal from replica %q, generation %q, index %08x to %s-wal", r.Name(), generation, index, tmpPath)
+		log.Printf("%s(%s): restoring wal %s/%08x", db.path, r.Name(), generation, index)
 		if opt.DryRun {
 			continue
 		}
 
 		if err := db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
-			logger.Printf("no wal available, snapshot only")
+			log.Printf("%s(%s): no wal available, snapshot only", db.path, r.Name())
 			break // snapshot file only, ignore error
 		} else if err != nil {
 			return fmt.Errorf("cannot restore wal: %w", err)
@@ -1342,7 +1342,7 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	// Copy file to final location.
-	logger.Printf("renaming database from temporary location")
+	log.Printf("%s(%s): renaming database from temporary location", db.path, r.Name())
 	if !opt.DryRun {
 		if err := os.Rename(tmpPath, outputPath); err != nil {
 			return err
