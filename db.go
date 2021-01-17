@@ -188,7 +188,7 @@ func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, e
 		if !strings.HasSuffix(fi.Name(), WALExt) {
 			continue
 		}
-		if v, _, _, _, err := ParseWALPath(fi.Name()); err != nil {
+		if v, _, _, err := ParseWALPath(fi.Name()); err != nil {
 			continue // invalid wal filename
 		} else if v > index {
 			index = v
@@ -488,7 +488,7 @@ func (db *DB) cleanWAL() error {
 		return err
 	}
 	for _, fi := range fis {
-		if idx, _, _, _, err := ParseWALPath(fi.Name()); err != nil || idx >= min {
+		if idx, _, _, err := ParseWALPath(fi.Name()); err != nil || idx >= min {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
@@ -868,7 +868,7 @@ func (db *DB) syncWAL(info syncInfo) (newSize int64, err error) {
 
 	// Parse index of current shadow WAL file.
 	dir, base := filepath.Split(info.shadowWALPath)
-	index, _, _, _, err := ParseWALPath(base)
+	index, _, _, err := ParseWALPath(base)
 	if err != nil {
 		return 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
 	}
@@ -1227,7 +1227,7 @@ func (db *DB) checkpointAndInit(shadowWALPath string, mode string) error {
 	}
 
 	// Parse index of current shadow WAL file.
-	index, _, _, _, err := ParseWALPath(shadowWALPath)
+	index, _, _, err := ParseWALPath(shadowWALPath)
 	if err != nil {
 		return fmt.Errorf("cannot parse shadow wal filename: %s", shadowWALPath)
 	}

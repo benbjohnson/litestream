@@ -370,7 +370,7 @@ func (r *Replica) WALs(ctx context.Context) ([]*litestream.WALInfo, error) {
 			for _, obj := range page.Contents {
 				key := path.Base(*obj.Key)
 
-				index, offset, _, _, err := litestream.ParseWALPath(key)
+				index, offset, _, err := litestream.ParseWALPath(key)
 				if err != nil {
 					continue
 				}
@@ -539,15 +539,15 @@ func (r *Replica) CalcPos(ctx context.Context, generation string) (pos litestrea
 		for _, obj := range page.Contents {
 			key := path.Base(*obj.Key)
 
-			idx, offset, sz, _, err := litestream.ParseWALPath(key)
+			idx, off, _, err := litestream.ParseWALPath(key)
 			if err != nil {
 				continue // invalid wal filename
 			}
 
 			if index == -1 || idx > index {
 				index, offset = idx, 0 // start tracking new wal
-			} else if idx == index {
-				offset += sz // append additional size to wal
+			} else if idx == index && off > offset {
+				offset = off // update offset
 			}
 		}
 		return true
@@ -782,7 +782,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	// that files are contiguous without having to decompress.
 	walPath := path.Join(
 		r.WALDir(rd.Pos().Generation),
-		litestream.FormatWALPathWithOffsetSize(pos.Index, pos.Offset, int64(len(b)))+".gz",
+		litestream.FormatWALPathWithOffset(pos.Index, pos.Offset)+".gz",
 	)
 
 	if _, err := r.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
@@ -843,8 +843,6 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 
 	// Collect all files for the index.
 	var keys []string
-	var offset int64
-	var innerErr error
 	if err := r.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
 		Bucket: aws.String(r.Bucket),
 		Prefix: aws.String(path.Join(r.WALDir(generation), fmt.Sprintf("%08x_", index))),
@@ -852,29 +850,27 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		r.listOperationTotalCounter.Inc()
 
 		for _, obj := range page.Contents {
-			// Read the offset & size from the filename. We need to check this
-			// against a running offset to ensure there are no gaps.
-			_, off, sz, _, err := litestream.ParseWALPath(path.Base(*obj.Key))
+			_, _, _, err := litestream.ParseWALPath(path.Base(*obj.Key))
 			if err != nil {
 				continue
-			} else if off != offset {
-				innerErr = fmt.Errorf("out of sequence wal segments: %s/%08x", generation, index)
-				return false
 			}
-
 			keys = append(keys, *obj.Key)
-			offset += sz
 		}
 		return true
 	}); err != nil {
 		return nil, err
-	} else if innerErr != nil {
-		return nil, innerErr
 	}
 
 	// Open each file and concatenate into a multi-reader.
 	var buf bytes.Buffer
+	var offset int64
 	for _, key := range keys {
+		// Ensure offset is correct as we copy segments into buffer.
+		_, off, _, _ := litestream.ParseWALPath(path.Base(key))
+		if off != offset {
+			return nil, fmt.Errorf("out of sequence wal segments: %s/%08x at remote offset %d, expected offset %d", generation, index, off, offset)
+		}
+
 		// Pipe download to return an io.Reader.
 		out, err := r.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 			Bucket: aws.String(r.Bucket),
@@ -894,9 +890,11 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		}
 		defer gr.Close()
 
-		if _, err := io.Copy(&buf, gr); err != nil {
+		n, err := io.Copy(&buf, gr)
+		if err != nil {
 			return nil, err
 		}
+		offset = int64(n)
 	}
 
 	return ioutil.NopCloser(&buf), nil
@@ -984,7 +982,7 @@ func (r *Replica) deleteGenerationBefore(ctx context.Context, generation string,
 			if index != -1 {
 				if idx, _, err := litestream.ParseSnapshotPath(path.Base(*obj.Key)); err == nil && idx >= index {
 					continue
-				} else if idx, _, _, _, err := litestream.ParseWALPath(path.Base(*obj.Key)); err == nil && idx >= index {
+				} else if idx, _, _, err := litestream.ParseWALPath(path.Base(*obj.Key)); err == nil && idx >= index {
 					continue
 				}
 			}

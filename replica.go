@@ -365,7 +365,7 @@ func (r *FileReplica) WALs(ctx context.Context) ([]*WALInfo, error) {
 
 		// Iterate over each WAL file.
 		for _, fi := range fis {
-			index, offset, _, _, err := ParseWALPath(fi.Name())
+			index, offset, _, err := ParseWALPath(fi.Name())
 			if err != nil {
 				continue
 			}
@@ -507,7 +507,7 @@ func (r *FileReplica) CalcPos(ctx context.Context, generation string) (pos Pos, 
 
 	index := -1
 	for _, fi := range fis {
-		if idx, _, _, _, err := ParseWALPath(fi.Name()); err != nil {
+		if idx, _, _, err := ParseWALPath(fi.Name()); err != nil {
 			continue // invalid wal filename
 		} else if index == -1 || idx > index {
 			index = idx
@@ -878,7 +878,7 @@ func (r *FileReplica) deleteGenerationWALBefore(ctx context.Context, generation 
 	}
 
 	for _, fi := range fis {
-		idx, _, _, _, err := ParseWALPath(fi.Name())
+		idx, _, _, err := ParseWALPath(fi.Name())
 		if err != nil {
 			continue
 		} else if idx >= index {
