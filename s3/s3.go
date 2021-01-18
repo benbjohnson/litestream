@@ -859,6 +859,8 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		return true
 	}); err != nil {
 		return nil, err
+	} else if len(keys) == 0 {
+		return nil, os.ErrNotExist
 	}
 
 	// Open each file and concatenate into a multi-reader.
