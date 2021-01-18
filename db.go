@@ -1327,36 +1327,24 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	tmpPath := outputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	var dbChksum, dbChksumAlt uint64
 	if !opt.DryRun {
 		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
 		}
-		if dbChksum, err = checksumFile(tmpPath); err != nil {
-			return fmt.Errorf("cannot compute db checksum: %w", err)
-		}
-		if dbChksumAlt, err = checksumFileAt(tmpPath, int64(db.pageSize)); err != nil {
-			return fmt.Errorf("cannot compute alternate db checksum: %w", err)
-		}
 	}
-	log.Printf("%s(%s): restoring snapshot %s/%08x to %s, checksum=%016x alt=%016x", db.path, r.Name(), generation, minWALIndex, tmpPath, dbChksum, dbChksumAlt)
+	log.Printf("%s(%s): restoring snapshot %s/%08x to %s", db.path, r.Name(), generation, minWALIndex, tmpPath)
 
 	// Restore each WAL file until we reach our maximum index.
-	var walChksum uint64
 	for index := minWALIndex; index <= maxWALIndex; index++ {
 		if !opt.DryRun {
-			if walChksum, err = db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
+			if err = db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
 				log.Printf("%s(%s): no wal available, snapshot only", db.path, r.Name())
 				break // snapshot file only, ignore error
 			} else if err != nil {
 				return fmt.Errorf("cannot restore wal: %w", err)
 			}
-
-			if dbChksum, err = checksumFile(tmpPath); err != nil {
-				return fmt.Errorf("cannot compute db checksum after wal restore: %w", err)
-			}
 		}
-		log.Printf("%s(%s): restored wal %s/%08x, checksum=%016x (db=%016x)", db.path, r.Name(), generation, index, walChksum, dbChksum)
+		log.Printf("%s(%s): restored wal %s/%08x", db.path, r.Name(), generation, index)
 	}
 
 	// Copy file to final location.
@@ -1488,47 +1476,42 @@ func (db *DB) restoreSnapshot(ctx context.Context, r Replica, generation string,
 }
 
 // restoreWAL copies a WAL file from the replica to the local WAL and forces checkpoint.
-func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, index int, dbPath string) (uint64, error) {
+func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, index int, dbPath string) error {
 	// Open WAL file from replica.
 	rd, err := r.WALReader(ctx, generation, index)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer rd.Close()
 
 	// Open handle to destination WAL path.
 	f, err := createFile(dbPath+"-wal", db.uid, db.gid)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer f.Close()
 
 	// Copy WAL to target path.
 	if _, err := io.Copy(f, rd); err != nil {
-		return 0, err
+		return err
 	} else if err := f.Close(); err != nil {
-		return 0, err
-	}
-
-	chksum, err := checksumFile(dbPath + "-wal")
-	if err != nil {
-		return 0, fmt.Errorf("cannot checksum wal: %w", err)
+		return err
 	}
 
 	// Open SQLite database and force a truncating checkpoint.
 	d, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer d.Close()
 
 	if _, err := d.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
-		return 0, err
+		return err
 	} else if err := d.Close(); err != nil {
-		return 0, err
+		return err
 	}
 
-	return chksum, nil
+	return nil
 }
 
 // CRC64 returns a CRC-64 ISO checksum of the database and its current position.
@@ -1536,61 +1519,41 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 // This function obtains a read lock so it prevents syncs from occuring until
 // the operation is complete. The database will still be usable but it will be
 // unable to checkpoint during this time.
-func (db *DB) CRC64() (uint64, uint64, Pos, error) {
+func (db *DB) CRC64() (uint64, Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	if err := db.init(); err != nil {
-		return 0, 0, Pos{}, err
+		return 0, Pos{}, err
 	} else if db.db == nil {
-		return 0, 0, Pos{}, os.ErrNotExist
+		return 0, Pos{}, os.ErrNotExist
 	}
 
 	generation, err := db.CurrentGeneration()
 	if err != nil {
-		return 0, 0, Pos{}, fmt.Errorf("cannot find current generation: %w", err)
+		return 0, Pos{}, fmt.Errorf("cannot find current generation: %w", err)
 	} else if generation == "" {
-		return 0, 0, Pos{}, fmt.Errorf("no current generation")
+		return 0, Pos{}, fmt.Errorf("no current generation")
 	}
 
 	// Force a RESTART checkpoint to ensure the database is at the start of the WAL.
 	if err := db.checkpointAndInit(generation, CheckpointModeRestart); err != nil {
-		return 0, 0, Pos{}, err
+		return 0, Pos{}, err
 	}
 
 	// Obtain current position. Clear the offset since we are only reading the
 	// DB and not applying the current WAL.
 	pos, err := db.Pos()
 	if err != nil {
-		return 0, 0, pos, err
+		return 0, pos, err
 	}
 	pos.Offset = 0
 
-	var tmpfile string
-	if src, err := os.Open(db.Path()); err != nil {
-		return 0, 0, pos, err
-	} else if dst, err := ioutil.TempFile("", "*-litestream.db"); err != nil {
-		return 0, 0, pos, err
-	} else if _, err := io.Copy(dst, src); err != nil {
-		return 0, 0, pos, err
-	} else if err := src.Close(); err != nil {
-		return 0, 0, pos, err
-	} else if err := dst.Close(); err != nil {
-		return 0, 0, pos, err
-	} else {
-		tmpfile = dst.Name()
-	}
-	log.Printf("db.crc64: copied database to temporary location: %s", tmpfile)
-
-	chksum, err := checksumFile(tmpfile)
+	chksum, err := checksumFile(db.Path())
 	if err != nil {
-		return 0, 0, pos, err
+		return 0, pos, err
 	}
-	chksumAlt, err := checksumFileAt(tmpfile, int64(db.pageSize))
-	if err != nil {
-		return 0, 0, pos, err
-	}
-	return chksum, chksumAlt, pos, nil
+	return chksum, pos, nil
 }
 
 // RestoreOptions represents options for DB.Restore().

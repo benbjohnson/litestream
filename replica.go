@@ -989,11 +989,11 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 
 	// Compute checksum of primary database under lock. This prevents a
 	// sync from occurring and the database will not be written.
-	chksum0, chksum0alt, pos, err := db.CRC64()
+	chksum0, pos, err := db.CRC64()
 	if err != nil {
 		return fmt.Errorf("cannot compute checksum: %w", err)
 	}
-	log.Printf("%s(%s): primary checksum computed: %016x @ %s (alt=%016x)", db.Path(), r.Name(), chksum0, pos, chksum0alt)
+	log.Printf("%s(%s): primary checksum computed: %016x @ %s", db.Path(), r.Name(), chksum0, pos)
 
 	// Wait until replica catches up to position.
 	log.Printf("%s(%s): waiting for replica", db.Path(), r.Name())
@@ -1024,12 +1024,8 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	if err != nil {
 		return err
 	}
-	chksum1alt, err := checksumFileAt(restorePath, int64(db.pageSize))
-	if err != nil {
-		return err
-	}
 
-	log.Printf("%s(%s): restore complete, replica checksum=%016x (alt=%016x)", db.Path(), r.Name(), chksum1, chksum1alt)
+	log.Printf("%s(%s): restore complete, replica checksum=%016x", db.Path(), r.Name(), chksum1)
 
 	// Validate checksums match.
 	if chksum0 != chksum1 {

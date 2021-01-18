@@ -127,6 +127,10 @@ func TestDB_CRC64(t *testing.T) {
 		db, sqldb := MustOpenDBs(t)
 		defer MustCloseDBs(t, db, sqldb)
 
+		if err := db.Sync(); err != nil {
+			t.Fatal(err)
+		}
+
 		chksum0, _, err := db.CRC64()
 		if err != nil {
 			t.Fatal(err)
