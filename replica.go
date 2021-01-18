@@ -545,7 +545,7 @@ func (r *FileReplica) snapshot(ctx context.Context, generation string, index int
 		return nil
 	}
 
-	if err := mkdirAll(filepath.Dir(snapshotPath), 0700, r.db.uid, r.db.gid); err != nil {
+	if err := mkdirAll(filepath.Dir(snapshotPath), r.db.dirmode, r.db.diruid, r.db.dirgid); err != nil {
 		return err
 	}
 
@@ -643,16 +643,17 @@ func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
 
 	// Ensure parent directory exists for WAL file.
 	filename := r.WALPath(rd.Pos().Generation, rd.Pos().Index)
-	if err := mkdirAll(filepath.Dir(filename), 0700, r.db.uid, r.db.gid); err != nil {
+	if err := mkdirAll(filepath.Dir(filename), r.db.dirmode, r.db.diruid, r.db.dirgid); err != nil {
 		return err
 	}
 
-	// TODO: Create a temporary file to write into so we don't have partial writes.
-	w, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, 0600)
+	w, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE, r.db.mode)
 	if err != nil {
 		return err
 	}
 	defer w.Close()
+
+	_ = os.Chown(filename, r.db.uid, r.db.gid)
 
 	// Seek, copy & sync WAL contents.
 	if _, err := w.Seek(rd.Pos().Offset, io.SeekStart); err != nil {

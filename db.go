@@ -45,7 +45,10 @@ type DB struct {
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
 
-	uid, gid int // db user/group obtained on init
+	uid, gid       int // db user/group obtained on init
+	mode           os.FileMode
+	diruid, dirgid int // db parent user/group obtained on init
+	dirmode        os.FileMode
 
 	ctx    context.Context
 	cancel func()
@@ -95,6 +98,8 @@ func NewDB(path string) *DB {
 	db := &DB{
 		path:   path,
 		notify: make(chan struct{}),
+		uid:    -1, gid: -1, mode: 0600,
+		diruid: -1, dirgid: -1, dirmode: 0700,
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
@@ -359,6 +364,14 @@ func (db *DB) init() (err error) {
 		return err
 	}
 	db.uid, db.gid = fileinfo(fi)
+	db.mode = fi.Mode()
+
+	// Obtain permissions for parent directory.
+	if fi, err = os.Stat(filepath.Dir(db.path)); err != nil {
+		return err
+	}
+	db.diruid, db.dirgid = fileinfo(fi)
+	db.dirmode = fi.Mode()
 
 	dsn := db.path
 	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
@@ -401,7 +414,7 @@ func (db *DB) init() (err error) {
 	}
 
 	// Ensure meta directory structure exists.
-	if err := mkdirAll(db.MetaPath(), 0700, db.uid, db.gid); err != nil {
+	if err := mkdirAll(db.MetaPath(), db.dirmode, db.diruid, db.dirgid); err != nil {
 		return err
 	}
 
@@ -584,7 +597,7 @@ func (db *DB) createGeneration() (string, error) {
 
 	// Generate new directory.
 	dir := filepath.Join(db.MetaPath(), "generations", generation)
-	if err := mkdirAll(dir, 0700, db.uid, db.gid); err != nil {
+	if err := mkdirAll(dir, db.dirmode, db.diruid, db.dirgid); err != nil {
 		return "", err
 	}
 
@@ -595,9 +608,11 @@ func (db *DB) createGeneration() (string, error) {
 
 	// Atomically write generation name as current generation.
 	generationNamePath := db.GenerationNamePath()
-	if err := ioutil.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), 0600); err != nil {
+	if err := ioutil.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), db.mode); err != nil {
 		return "", fmt.Errorf("write generation temp file: %w", err)
-	} else if err := os.Rename(generationNamePath+".tmp", generationNamePath); err != nil {
+	}
+	_ = os.Chown(generationNamePath+".tmp", db.uid, db.gid)
+	if err := os.Rename(generationNamePath+".tmp", generationNamePath); err != nil {
 		return "", fmt.Errorf("rename generation file: %w", err)
 	}
 
@@ -902,11 +917,12 @@ func (db *DB) initShadowWALFile(filename string) (int64, error) {
 	}
 
 	// Write header to new WAL shadow file.
-	if err := mkdirAll(filepath.Dir(filename), 0700, db.uid, db.gid); err != nil {
+	if err := mkdirAll(filepath.Dir(filename), db.dirmode, db.diruid, db.dirgid); err != nil {
 		return 0, err
-	} else if err := ioutil.WriteFile(filename, hdr, 0600); err != nil {
+	} else if err := ioutil.WriteFile(filename, hdr, db.mode); err != nil {
 		return 0, err
 	}
+	_ = os.Chown(filename, db.uid, db.gid)
 
 	// Copy as much shadow WAL as available.
 	newSize, err := db.copyToShadowWAL(filename)
@@ -925,7 +941,7 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 	}
 	defer r.Close()
 
-	w, err := os.OpenFile(filename, os.O_RDWR, 0600)
+	w, err := os.OpenFile(filename, os.O_RDWR, 0666)
 	if err != nil {
 		return 0, err
 	}
@@ -1449,7 +1465,7 @@ func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log
 
 // restoreSnapshot copies a snapshot from the replica to a file.
 func (db *DB) restoreSnapshot(ctx context.Context, r Replica, generation string, index int, filename string) error {
-	if err := mkdirAll(filepath.Dir(filename), 0700, db.uid, db.gid); err != nil {
+	if err := mkdirAll(filepath.Dir(filename), db.dirmode, db.diruid, db.dirgid); err != nil {
 		return err
 	}
 
