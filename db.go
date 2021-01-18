@@ -1522,17 +1522,6 @@ func (db *DB) CRC64() (uint64, Pos, error) {
 		return 0, Pos{}, err
 	}
 
-	// Start a transaction to obtain a write lock on the database.
-	tx, err := db.db.Begin()
-	if err != nil {
-		return 0, Pos{}, fmt.Errorf("begin: %w", err)
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(db.ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		return 0, Pos{}, fmt.Errorf("_litestream_lock: %w", err)
-	}
-
 	// Obtain current position. Clear the offset since we are only reading the
 	// DB and not applying the current WAL.
 	pos, err := db.Pos()
