@@ -644,7 +644,6 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 		if region, err = r.findBucketRegion(ctx, r.Bucket); err != nil {
 			return fmt.Errorf("cannot lookup bucket region: %w", err)
 		}
-		log.Printf("%s(%s): s3 bucket region found: %q", r.db.Path(), r.Name(), region)
 	}
 
 	// Create new AWS session.
