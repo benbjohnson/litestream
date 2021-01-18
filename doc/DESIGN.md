@@ -68,9 +68,9 @@ bkt/
 				snapshots/                    # snapshots w/ timestamp+offset
 					20000101T000000Z-000000000000023.snapshot
 				wal/                          # compressed WAL files
-					000000000000001-0.wal.gz    
-					000000000000001-<offset>.wal.gz
-					000000000000002-0.wal.gz
+					000000000000001-0.wal.lz4    
+					000000000000001-<offset>.wal.lz4
+					000000000000002-0.wal.lz4
 		00000002/
 			snapshot/
 				000000000000000.snapshot
@@ -82,7 +82,7 @@ bkt/
 						20000101T000000Z-000000000000023.snapshot
 
 			wal/
-				000000000000001.wal.gz
+				000000000000001.wal.lz4
 ```
 
 

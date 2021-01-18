@@ -219,7 +219,7 @@ func ParseSnapshotPath(s string) (index int, ext string, err error) {
 	return int(i64), a[2], nil
 }
 
-var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(.snapshot(?:.gz)?)$`)
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(.snapshot(?:.lz4)?)$`)
 
 // IsWALPath returns true if s is a path to a WAL file.
 func IsWALPath(s string) bool {
@@ -254,7 +254,7 @@ func FormatWALPathWithOffset(index int, offset int64) string {
 	return fmt.Sprintf("%08x_%08x%s", index, offset, WALExt)
 }
 
-var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))?(.wal(?:.gz)?)$`)
+var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))?(.wal(?:.lz4)?)$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {

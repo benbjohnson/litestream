@@ -2,7 +2,6 @@ package s3
 
 import (
 	"bytes"
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -20,6 +19,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -155,7 +155,7 @@ func (r *Replica) SnapshotDir(generation string) string {
 
 // SnapshotPath returns the path to a snapshot file.
 func (r *Replica) SnapshotPath(generation string, index int) string {
-	return path.Join(r.SnapshotDir(generation), fmt.Sprintf("%08x.snapshot.gz", index))
+	return path.Join(r.SnapshotDir(generation), fmt.Sprintf("%08x.snapshot.lz4", index))
 }
 
 // MaxSnapshotIndex returns the highest index for the snapshots.
@@ -588,13 +588,13 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	}
 
 	pr, pw := io.Pipe()
-	gw := gzip.NewWriter(pw)
+	zw := lz4.NewWriter(pw)
 	go func() {
-		if _, err := io.Copy(gw, f); err != nil {
+		if _, err := io.Copy(zw, f); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
-		_ = pw.CloseWithError(gw.Close())
+		_ = pw.CloseWithError(zw.Close())
 	}()
 
 	snapshotPath := r.SnapshotPath(generation, index)
@@ -770,11 +770,11 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	}
 
 	var buf bytes.Buffer
-	gw := gzip.NewWriter(&buf)
-	n, err := gw.Write(b)
+	zw := lz4.NewWriter(&buf)
+	n, err := zw.Write(b)
 	if err != nil {
 		return err
-	} else if err := gw.Close(); err != nil {
+	} else if err := zw.Close(); err != nil {
 		return err
 	}
 
@@ -782,7 +782,7 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	// that files are contiguous without having to decompress.
 	walPath := path.Join(
 		r.WALDir(rd.Pos().Generation),
-		litestream.FormatWALPathWithOffset(pos.Index, pos.Offset)+".gz",
+		litestream.FormatWALPathWithOffset(pos.Index, pos.Offset)+".lz4",
 	)
 
 	if _, err := r.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
@@ -826,12 +826,7 @@ func (r *Replica) SnapshotReader(ctx context.Context, generation string, index i
 	r.getOperationBytesCounter.Add(float64(*out.ContentLength))
 
 	// Decompress the snapshot file.
-	gr, err := gzip.NewReader(out.Body)
-	if err != nil {
-		out.Body.Close()
-		return nil, err
-	}
-	return internal.NewReadCloser(gr, out.Body), nil
+	return internal.NewReadCloser(lz4.NewReader(out.Body), out.Body), nil
 }
 
 // WALReader returns a reader for WAL data at the given index.
@@ -886,13 +881,9 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		r.getOperationTotalCounter.Inc()
 		r.getOperationTotalCounter.Add(float64(*out.ContentLength))
 
-		gr, err := gzip.NewReader(out.Body)
-		if err != nil {
-			return nil, err
-		}
-		defer gr.Close()
+		zr := lz4.NewReader(out.Body)
 
-		n, err := io.Copy(&buf, gr)
+		n, err := io.Copy(&buf, zr)
 		if err != nil {
 			return nil, err
 		}

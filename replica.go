@@ -1,7 +1,6 @@
 package litestream
 
 import (
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -15,6 +14,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -176,7 +176,7 @@ func (r *FileReplica) SnapshotDir(generation string) string {
 
 // SnapshotPath returns the path to a snapshot file.
 func (r *FileReplica) SnapshotPath(generation string, index int) string {
-	return filepath.Join(r.SnapshotDir(generation), fmt.Sprintf("%08x.snapshot.gz", index))
+	return filepath.Join(r.SnapshotDir(generation), fmt.Sprintf("%08x.snapshot.lz4", index))
 }
 
 // MaxSnapshotIndex returns the highest index for the snapshots.
@@ -622,7 +622,7 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 		}
 	}
 
-	// Gzip any old WAL files.
+	// Compress any old WAL files.
 	if generation != "" {
 		if err := r.compress(ctx, generation); err != nil {
 			return fmt.Errorf("cannot compress: %s", err)
@@ -683,7 +683,7 @@ func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
 	return nil
 }
 
-// compress gzips all WAL files before the current one.
+// compress compresses all WAL files before the current one.
 func (r *FileReplica) compress(ctx context.Context, generation string) error {
 	filenames, err := filepath.Glob(filepath.Join(r.WALDir(generation), "**/*.wal"))
 	if err != nil {
@@ -704,7 +704,7 @@ func (r *FileReplica) compress(ctx context.Context, generation string) error {
 		default:
 		}
 
-		dst := filename + ".gz"
+		dst := filename + ".lz4"
 		if err := compressFile(filename, dst, r.db.uid, r.db.gid); err != nil {
 			return err
 		} else if err := os.Remove(filename); err != nil {
@@ -738,16 +738,11 @@ func (r *FileReplica) SnapshotReader(ctx context.Context, generation string, ind
 		} else if ext == ".snapshot" {
 			return f, nil // not compressed, return as-is.
 		}
-		assert(ext == ".snapshot.gz", "invalid snapshot extension")
+		assert(ext == ".snapshot.lz4", "invalid snapshot extension")
 
-		// If compressed, wrap in a gzip reader and return with wrapper to
+		// If compressed, wrap in an lz4 reader and return with wrapper to
 		// ensure that the underlying file is closed.
-		r, err := gzip.NewReader(f)
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
-		return internal.NewReadCloser(r, f), nil
+		return internal.NewReadCloser(lz4.NewReader(f), f), nil
 	}
 	return nil, os.ErrNotExist
 }
@@ -766,19 +761,14 @@ func (r *FileReplica) WALReader(ctx context.Context, generation string, index in
 	}
 
 	// Otherwise read the compressed file. Return error if file doesn't exist.
-	f, err = os.Open(filename + ".gz")
+	f, err = os.Open(filename + ".lz4")
 	if err != nil {
 		return nil, err
 	}
 
-	// If compressed, wrap in a gzip reader and return with wrapper to
+	// If compressed, wrap in an lz4 reader and return with wrapper to
 	// ensure that the underlying file is closed.
-	rd, err := gzip.NewReader(f)
-	if err != nil {
-		f.Close()
-		return nil, err
-	}
-	return internal.NewReadCloser(rd, f), nil
+	return internal.NewReadCloser(lz4.NewReader(f), f), nil
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
@@ -950,7 +940,7 @@ func WALIndexAt(ctx context.Context, r Replica, generation string, maxIndex int,
 	return index, nil
 }
 
-// compressFile compresses a file and replaces it with a new file with a .gz extension.
+// compressFile compresses a file and replaces it with a new file with a .lz4 extension.
 func compressFile(src, dst string, uid, gid int) error {
 	r, err := os.Open(src)
 	if err != nil {
@@ -964,13 +954,13 @@ func compressFile(src, dst string, uid, gid int) error {
 	}
 	defer w.Close()
 
-	gz := gzip.NewWriter(w)
-	defer gz.Close()
+	zr := lz4.NewWriter(w)
+	defer zr.Close()
 
 	// Copy & compress file contents to temporary file.
-	if _, err := io.Copy(gz, r); err != nil {
+	if _, err := io.Copy(zr, r); err != nil {
 		return err
-	} else if err := gz.Close(); err != nil {
+	} else if err := zr.Close(); err != nil {
 		return err
 	} else if err := w.Sync(); err != nil {
 		return err
