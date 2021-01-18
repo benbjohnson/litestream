@@ -253,6 +253,7 @@ func (db *DB) PageSize() int {
 	return db.pageSize
 }
 
+// Open initializes the background monitoring goroutine.
 func (db *DB) Open() (err error) {
 	// Validate that all replica names are unique.
 	m := make(map[string]struct{})
@@ -545,7 +546,7 @@ func (db *DB) acquireReadLock() error {
 
 	// Execute read query to obtain read lock.
 	if _, err := tx.ExecContext(db.ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
 
@@ -782,15 +783,15 @@ func (db *DB) verify() (info syncInfo, err error) {
 	info.generation = generation
 
 	// Determine total bytes of real DB for metrics.
-	if fi, err := os.Stat(db.Path()); err != nil {
+	fi, err := os.Stat(db.Path())
+	if err != nil {
 		return info, err
-	} else {
-		info.dbModTime = fi.ModTime()
-		db.dbSizeGauge.Set(float64(fi.Size()))
 	}
+	info.dbModTime = fi.ModTime()
+	db.dbSizeGauge.Set(float64(fi.Size()))
 
 	// Determine total bytes of real WAL.
-	fi, err := os.Stat(db.WALPath())
+	fi, err = os.Stat(db.WALPath())
 	if err != nil {
 		return info, err
 	}
@@ -1140,8 +1141,11 @@ func (r *ShadowWALReader) Read(p []byte) (n int, err error) {
 	return n, err
 }
 
-const WALHeaderChecksumOffset = 24
-const WALFrameHeaderChecksumOffset = 16
+// SQLite WAL constants
+const (
+	WALHeaderChecksumOffset      = 24
+	WALFrameHeaderChecksumOffset = 16
+)
 
 func readLastChecksumFrom(f *os.File, pageSize int) (uint32, uint32, error) {
 	// Determine the byte offset of the checksum for the header (if no pages
@@ -1192,7 +1196,7 @@ func (db *DB) checkpoint(mode string) (err error) {
 	if err := db.releaseReadLock(); err != nil {
 		return fmt.Errorf("release read lock: %w", err)
 	}
-	defer db.acquireReadLock()
+	defer func() { _ = db.acquireReadLock() }()
 
 	// A non-forced checkpoint is issued as "PASSIVE". This will only checkpoint
 	// if there are not pending transactions. A forced checkpoint ("RESTART")
@@ -1388,24 +1392,6 @@ func checksumFile(filename string) (uint64, error) {
 	return h.Sum64(), nil
 }
 
-func checksumFileAt(filename string, offset int64) (uint64, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	if _, err := f.Seek(offset, io.SeekStart); err != nil {
-		return 0, err
-	}
-
-	h := crc64.New(crc64.MakeTable(crc64.ISO))
-	if _, err := io.Copy(h, f); err != nil {
-		return 0, err
-	}
-	return h.Sum64(), nil
-}
-
 func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log.Logger) (Replica, string, error) {
 	var target struct {
 		replica    Replica
@@ -1532,7 +1518,7 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 
 // CRC64 returns a CRC-64 ISO checksum of the database and its current position.
 //
-// This function obtains a read lock so it prevents syncs from occuring until
+// This function obtains a read lock so it prevents syncs from occurring until
 // the operation is complete. The database will still be usable but it will be
 // unable to checkpoint during this time.
 func (db *DB) CRC64() (uint64, Pos, error) {
@@ -1602,6 +1588,7 @@ type RestoreOptions struct {
 	Logger *log.Logger
 }
 
+// NewRestoreOptions returns a new instance of RestoreOptions with defaults.
 func NewRestoreOptions() RestoreOptions {
 	return RestoreOptions{
 		Index: math.MaxInt64,

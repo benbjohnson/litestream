@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+// ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
 	ConfigPath string
 	Config     Config
@@ -96,7 +97,9 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 		fmt.Printf("serving metrics on http://localhost:%s/metrics\n", port)
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
-			http.ListenAndServe(config.Addr, nil)
+			if err := http.ListenAndServe(config.Addr, nil); err != nil {
+				log.Printf("cannot start metrics server: %s", err)
+			}
 		}()
 	}
 
@@ -126,6 +129,7 @@ func (c *ReplicateCommand) Close() (err error) {
 	return err
 }
 
+// Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
 	fmt.Printf(`
 The replicate command starts a server to monitor & replicate databases 

@@ -13,8 +13,10 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
+// WALCommand represents a command to list WAL files for a database.
 type WALCommand struct{}
 
+// Run executes the command.
 func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-wal", flag.ContinueOnError)
@@ -91,6 +93,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
+// Usage prints the help screen to STDOUT.
 func (c *WALCommand) Usage() {
 	fmt.Printf(`
 The wal command lists all wal files available for a database.

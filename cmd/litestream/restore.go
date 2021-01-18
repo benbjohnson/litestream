@@ -13,9 +13,10 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-type RestoreCommand struct {
-}
+// RestoreCommand represents a command to restore a database from a backup.
+type RestoreCommand struct{}
 
+// Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	opt := litestream.NewRestoreOptions()
@@ -82,6 +83,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	return db.Restore(ctx, opt)
 }
 
+// Usage prints the help screen to STDOUT.
 func (c *RestoreCommand) Usage() {
 	fmt.Printf(`
 The restore command recovers a database from a previous snapshot and WAL.

@@ -90,7 +90,6 @@ type FileReplica struct {
 	pos Pos // last position
 
 	wg     sync.WaitGroup
-	ctx    context.Context
 	cancel func()
 
 	snapshotTotalGauge prometheus.Gauge
@@ -534,10 +533,10 @@ func (r *FileReplica) snapshot(ctx context.Context, generation string, index int
 	if err != nil {
 		return err
 	} else if _, err := tx.ExecContext(ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
-		tx.Rollback()
+		_ = tx.Rollback()
 		return err
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Ignore if we already have a snapshot for the given WAL index.
 	snapshotPath := r.SnapshotPath(generation, index)
@@ -570,6 +569,7 @@ func (r *FileReplica) snapshotN(generation string) (int, error) {
 	return n, nil
 }
 
+// Sync replays data from the shadow WAL into the file replica.
 func (r *FileReplica) Sync(ctx context.Context) (err error) {
 	// Clear last position if if an error occurs during sync.
 	defer func() {
@@ -884,7 +884,7 @@ func (r *FileReplica) deleteGenerationWALBefore(ctx context.Context, generation 
 	return nil
 }
 
-// SnapsotIndexAt returns the highest index for a snapshot within a generation
+// SnapshotIndexAt returns the highest index for a snapshot within a generation
 // that occurs before timestamp. If timestamp is zero, returns the latest snapshot.
 func SnapshotIndexAt(ctx context.Context, r Replica, generation string, timestamp time.Time) (int, error) {
 	snapshots, err := r.Snapshots(ctx)

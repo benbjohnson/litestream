@@ -16,6 +16,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/s3"
+	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
 )
 
@@ -36,12 +37,15 @@ func main() {
 	}
 }
 
+// Main represents the main program execution.
 type Main struct{}
 
+// NewMain returns a new instance of Main.
 func NewMain() *Main {
 	return &Main{}
 }
 
+// Run executes the program.
 func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	var cmd string
 	if len(args) > 0 {
@@ -72,6 +76,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	}
 }
 
+// Usage prints the help screen to STDOUT.
 func (m *Main) Usage() {
 	fmt.Println(`
 litestream is a tool for replicating SQLite databases.
@@ -112,6 +117,7 @@ type Config struct {
 	Bucket          string `yaml:"bucket"`
 }
 
+// Normalize expands paths and parses URL-specified replicas.
 func (c *Config) Normalize() error {
 	for i := range c.DBs {
 		if err := c.DBs[i].Normalize(); err != nil {
@@ -128,6 +134,7 @@ func DefaultConfig() Config {
 	}
 }
 
+// DBConfig returns database configuration by path.
 func (c *Config) DBConfig(path string) *DBConfig {
 	for _, dbConfig := range c.DBs {
 		if dbConfig.Path == path {
@@ -167,11 +174,13 @@ func ReadConfigFile(filename string) (Config, error) {
 	return config, nil
 }
 
+// DBConfig represents the configuration for a single database.
 type DBConfig struct {
 	Path     string           `yaml:"path"`
 	Replicas []*ReplicaConfig `yaml:"replicas"`
 }
 
+// Normalize expands paths and parses URL-specified replicas.
 func (c *DBConfig) Normalize() error {
 	for i := range c.Replicas {
 		if err := c.Replicas[i].Normalize(); err != nil {
@@ -181,6 +190,7 @@ func (c *DBConfig) Normalize() error {
 	return nil
 }
 
+// ReplicaConfig represents the configuration for a single replica in a database.
 type ReplicaConfig struct {
 	Type                   string        `yaml:"type"` // "file", "s3"
 	Name                   string        `yaml:"name"` // name of replica, optional.
@@ -197,6 +207,7 @@ type ReplicaConfig struct {
 	Bucket          string `yaml:"bucket"`
 }
 
+// Normalize expands paths and parses URL-specified replicas.
 func (c *ReplicaConfig) Normalize() error {
 	// Expand path filename, if necessary.
 	if prefix := "~" + string(os.PathSeparator); strings.HasPrefix(c.Path, prefix) {

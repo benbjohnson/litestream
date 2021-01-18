@@ -13,10 +13,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
-	_ "github.com/mattn/go-sqlite3"
 )
 
+// Naming constants.
 const (
 	MetaDirSuffix = "-litestream"
 
@@ -150,10 +149,6 @@ func readWALHeader(filename string) ([]byte, error) {
 	buf := make([]byte, WALHeaderSize)
 	n, err := io.ReadFull(f, buf)
 	return buf[:n], err
-}
-
-func readCheckpointSeqNo(hdr []byte) uint32 {
-	return binary.BigEndian.Uint32(hdr[12:])
 }
 
 // readFileAt reads a slice from a file.

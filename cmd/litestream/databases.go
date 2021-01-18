@@ -10,8 +10,10 @@ import (
 	"text/tabwriter"
 )
 
+// DatabasesCommand is a command for listing managed databases.
 type DatabasesCommand struct{}
 
+// Run executes the command.
 func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-databases", flag.ContinueOnError)
@@ -56,6 +58,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
+// Usage prints the help screen to STDOUT.
 func (c *DatabasesCommand) Usage() {
 	fmt.Printf(`
 The databases command lists all databases in the configuration file.

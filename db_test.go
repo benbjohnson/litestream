@@ -371,7 +371,7 @@ func TestDB_Sync(t *testing.T) {
 		shadowWALPath := db.ShadowWALPath(pos0.Generation, pos0.Index)
 		if buf, err := ioutil.ReadFile(shadowWALPath); err != nil {
 			t.Fatal(err)
-		} else if ioutil.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0600); err != nil {
+		} else if err := ioutil.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0600); err != nil {
 			t.Fatal(err)
 		}
 

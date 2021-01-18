@@ -12,8 +12,10 @@ import (
 	"time"
 )
 
+// GenerationsCommand represents a command to list all generations for a database.
 type GenerationsCommand struct{}
 
+// Run executes the command.
 func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-generations", flag.ContinueOnError)
@@ -96,6 +98,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 	return nil
 }
 
+// Usage prints the help message to STDOUT.
 func (c *GenerationsCommand) Usage() {
 	fmt.Printf(`
 The generations command lists all generations for a database. It also lists

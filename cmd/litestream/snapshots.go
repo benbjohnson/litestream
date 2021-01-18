@@ -13,8 +13,10 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
+// SnapshotsCommand represents a command to list snapshots for a command.
 type SnapshotsCommand struct{}
 
+// Run executes the command.
 func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	fs := flag.NewFlagSet("litestream-snapshots", flag.ContinueOnError)
@@ -85,6 +87,7 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
+// Usage prints the help screen to STDOUT.
 func (c *SnapshotsCommand) Usage() {
 	fmt.Printf(`
 The snapshots command lists all snapshots available for a database.
