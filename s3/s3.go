@@ -894,7 +894,7 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		if err != nil {
 			return nil, err
 		}
-		offset = int64(n)
+		offset += int64(n)
 	}
 
 	return ioutil.NopCloser(&buf), nil

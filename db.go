@@ -1319,26 +1319,33 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 	tmpPath := outputPath + ".tmp"
 
 	// Copy snapshot to output path.
-	var chksum uint64
+	var dbChksum uint64
 	if !opt.DryRun {
 		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
 		}
-		chksum, _ = checksumFile(tmpPath)
+		if dbChksum, err = checksumFile(tmpPath); err != nil {
+			return fmt.Errorf("cannot compute db checksum: %w", err)
+		}
 	}
-	log.Printf("%s(%s): restoring snapshot %s/%08x to %s, checksum=%016x", db.path, r.Name(), generation, minWALIndex, tmpPath, chksum)
+	log.Printf("%s(%s): restoring snapshot %s/%08x to %s, checksum=%016x", db.path, r.Name(), generation, minWALIndex, tmpPath, dbChksum)
 
 	// Restore each WAL file until we reach our maximum index.
+	var walChksum uint64
 	for index := minWALIndex; index <= maxWALIndex; index++ {
 		if !opt.DryRun {
-			if chksum, err = db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
+			if walChksum, err = db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
 				log.Printf("%s(%s): no wal available, snapshot only", db.path, r.Name())
 				break // snapshot file only, ignore error
 			} else if err != nil {
 				return fmt.Errorf("cannot restore wal: %w", err)
 			}
+
+			if dbChksum, err = checksumFile(tmpPath); err != nil {
+				return fmt.Errorf("cannot compute db checksum after wal restore: %w", err)
+			}
 		}
-		log.Printf("%s(%s): restored wal %s/%08x, checksum=%016x", db.path, r.Name(), generation, index, chksum)
+		log.Printf("%s(%s): restored wal %s/%08x, checksum=%016x (db=%016x)", db.path, r.Name(), generation, index, walChksum, dbChksum)
 	}
 
 	// Copy file to final location.
@@ -1474,8 +1481,10 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 		return 0, err
 	}
 
-	chksum, _ := checksumFile(dbPath + "-wal")
-	log.Printf("%s(%s): restored wal checksum: %016x", db.path, r.Name(), chksum)
+	chksum, err := checksumFile(dbPath + "-wal")
+	if err != nil {
+		return 0, fmt.Errorf("cannot checksum wal: %w", err)
+	}
 
 	// Open SQLite database and force a truncating checkpoint.
 	d, err := sql.Open("sqlite3", dbPath)
