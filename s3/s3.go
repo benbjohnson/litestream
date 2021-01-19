@@ -879,7 +879,7 @@ func (r *Replica) WALReader(ctx context.Context, generation string, index int) (
 		defer out.Body.Close()
 
 		r.getOperationTotalCounter.Inc()
-		r.getOperationTotalCounter.Add(float64(*out.ContentLength))
+		r.getOperationBytesCounter.Add(float64(*out.ContentLength))
 
 		zr := lz4.NewReader(out.Body)
 
