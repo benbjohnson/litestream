@@ -686,7 +686,7 @@ func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
 
 // compress compresses all WAL files before the current one.
 func (r *FileReplica) compress(ctx context.Context, generation string) error {
-	filenames, err := filepath.Glob(filepath.Join(r.WALDir(generation), "**/*.wal"))
+	filenames, err := filepath.Glob(filepath.Join(r.WALDir(generation), "*.wal"))
 	if err != nil {
 		return err
 	} else if len(filenames) <= 1 {
