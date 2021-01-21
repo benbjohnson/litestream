@@ -23,7 +23,7 @@ You can download the `.deb` file from the [Releases page][releases] page and
 then run the following:
 
 ```sh
-$ sudo dpkg -i litestream-v0.3.0.deb
+$ sudo dpkg -i litestream-v0.3.0-linux-amd64.deb
 ```
 
 Once installed, you'll need to enable & start the service:

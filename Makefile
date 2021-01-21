@@ -7,8 +7,8 @@ dist:
 	tar -cz -f dist/litestream-linux-amd64.tar.gz -C dist litestream
 
 deb: dist
-ifndef VERSION
-	$(error VERSION is undefined)
+ifndef LITESTREAM_VERSION
+	$(error LITESTREAM_VERSION is undefined)
 endif
 	cat etc/nfpm.yml | envsubst > dist/nfpm.yml
 	nfpm pkg --config dist/nfpm.yml --packager deb --target dist/litestream.deb 

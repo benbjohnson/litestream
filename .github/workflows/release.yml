@@ -5,7 +5,7 @@ on:
 
 name: release
 jobs:
-  release:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v2
@@ -18,8 +18,13 @@ jobs:
 
       - name: Build litestream
         run: |
-          go build -ldflags "-X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o litestream ./cmd/litestream
+          mkdir -p dist
+          cp etc/litestream.yml etc/litestream.service dist
+          cat etc/nfpm.yml | LITESTREAM_VERSION=${{ steps.release.outputs.tag_name }} envsubst > dist/nfpm.yml
+          go build -ldflags "-X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
+          cd dist
           tar -czvf litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz litestream
+          nfpm pkg --config nfpm.yml --packager deb --target litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.deb 
 
       - name: Upload release binary
         uses: actions/upload-release-asset@v1.0.2
@@ -27,6 +32,16 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: ./litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
+          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
           asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
           asset_content_type: application/gzip
+
+      - name: Upload debian package
+        uses: actions/upload-release-asset@v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.deb
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.deb
+          asset_content_type: application/octet-stream
