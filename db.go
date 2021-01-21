@@ -420,10 +420,8 @@ func (db *DB) init() (err error) {
 	}
 
 	// If we have an existing shadow WAL, ensure the headers match.
-	if ok, err := db.checkHeadersMatch(); err != nil {
-		return err
-	} else if !ok {
-		log.Printf("%s: cannot determine last wal position, clearing generation", db.path)
+	if err := db.verifyHeadersMatch(); err != nil {
+		log.Printf("%s: cannot determine last wal position, clearing generation (%s)", db.path, err)
 		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove generation name: %w", err)
 		}
@@ -442,37 +440,40 @@ func (db *DB) init() (err error) {
 	return nil
 }
 
-// checkHeadersMatch returns true if the primary WAL and last shadow WAL header match.
-func (db *DB) checkHeadersMatch() (bool, error) {
+// verifyHeadersMatch returns true if the primary WAL and last shadow WAL header match.
+func (db *DB) verifyHeadersMatch() error {
 	// Determine current generation.
 	generation, err := db.CurrentGeneration()
 	if err != nil {
-		return false, err
+		return err
 	} else if generation == "" {
-		return false, nil // no generation
+		return nil
 	}
 
 	// Find current generation & latest shadow WAL.
 	shadowWALPath, err := db.CurrentShadowWALPath(generation)
 	if err != nil {
-		return false, fmt.Errorf("cannot determine current shadow wal path: %w", err)
+		return fmt.Errorf("cannot determine current shadow wal path: %w", err)
 	}
 
 	hdr0, err := readWALHeader(db.WALPath())
 	if os.IsNotExist(err) {
-		return false, nil // no primary wal
+		return fmt.Errorf("no primary wal: %w", err)
 	} else if err != nil {
-		return false, fmt.Errorf("cannot read wal header: %w", err)
+		return fmt.Errorf("primary wal header: %w", err)
 	}
 
 	hdr1, err := readWALHeader(shadowWALPath)
 	if os.IsNotExist(err) {
-		return false, nil // no shadow wal
+		return fmt.Errorf("no shadow wal")
 	} else if err != nil {
-		return false, fmt.Errorf("cannot read shadow wal header: %w", err)
+		return fmt.Errorf("shadow wal header: %w", err)
 	}
 
-	return bytes.Equal(hdr0, hdr1), nil
+	if !bytes.Equal(hdr0, hdr1) {
+		return fmt.Errorf("wal header mismatch")
+	}
+	return nil
 }
 
 // clean removes old generations & WAL files.
