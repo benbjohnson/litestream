@@ -10,16 +10,15 @@ background process and safely replicates changes incrementally to another file
 or S3. Litestream only communicates with SQLite through the SQLite API so it
 will not corrupt your database.
 
+If you need support or have ideas for improving Litestream, please visit the
+[GitHub Discussions](https://github.com/benbjohnson/litestream/discussions) to
+chat. 
+
 If you find this project interesting, please consider starring the project on
 GitHub.
 
 
 ## Installation
-
-### Homebrew
-
-TODO
-
 
 ### Linux (Debian)
 
@@ -42,6 +41,17 @@ $ sudo systemctl start litestream
 
 You can also download the release binary for your system from the
 [Releases page][releases] and run it as a standalone application.
+
+
+### Building from source
+
+First, download and install the [Go toolchain](https://golang.org/). Then run:
+
+```sh
+$ go install ./cmd/litestream
+```
+
+The `litestream` binary should be in your `$GOPATH/bin` folder.
 
 
 ## Configuration
