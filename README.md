@@ -1,4 +1,4 @@
-litestream
+Litestream ![test](https://github.com/benbjohnson/litestream/workflows/test/badge.svg)
 ==========
 
 Litestream is a standalone streaming replication tool for SQLite. It runs as a
