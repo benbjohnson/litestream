@@ -2,37 +2,111 @@ litestream
 ==========
 
 Litestream is a standalone streaming replication tool for SQLite. It runs as a
-background process and safely replicates changes incrementally from one or more
-SQLite databases. Litestream only communicates with SQLite through the SQLite
-API so it will not corrupt your database.
+background process and safely replicates changes incrementally to another file
+or S3. Litestream only communicates with SQLite through the SQLite API so it
+will not corrupt your database.
+
+If you find this project interesting, please consider starring the project on
+GitHub.
 
 
-## Usage
+## Installation
 
-### Installation & configuration
+### Homebrew
 
-You can download the binary from the [Releases page](https://github.com/benbjohnson/litestream/releases).
+TODO
+
+
+### Linux (Debian)
+
+You can download the `.deb` file from the [Releases page][releases] page and
+then run the following:
+
+```sh
+$ sudo dpkg -i litestream-v0.3.0.deb
+```
+
+Once installed, you'll need to enable & start the service:
+
+```sh
+$ sudo systemctl enable litestream
+$ sudo systemctl start litestream
+```
+
+
+### Release binaries
+
+You can also download the release binary for your system from the
+[Releases page][releases] and run it as a standalone application.
+
+
+## Configuration
 
 Once installed locally, you'll need to create a config file. By default, the
 config file lives at `/etc/litestream.yml` but you can pass in a different
 path to any `litestream` command using the `-config PATH` flag.
 
-You can copy this configuration below and update the source path (`/path/to/db`)
-and the destination path (`/path/to/replica`) to where you want to replicate
-from and to.
+The configuration specifies one or more `dbs` and a list of one or more replica
+locations for each db. Below are some common configurations:
+
+### Replicate to S3
+
+This will replicate the database at `/path/to/db` to the `"/db"` path inside
+the S3 bucket named `"mybkt"`.
+
+```yaml
+access-key-id:     AKIAxxxxxxxxxxxxxxxx
+secret-access-key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
+
+dbs:
+  - path: /path/to/db
+    replicas:
+      - path: s3://mybkt/db
+```
+
+### Replicate to another file path
+
+This will replicate the database at `/path/to/db` to a directory named
+`/path/to/replica`.
 
 ```yaml
 dbs:
-  - path: "/path/to/db"
+  - path: /path/to/db
     replicas:
-      - type: file
-        path: /path/to/replica
+      - path: /path/to/replica
 ```
 
 
+### Other configuration options
+
+These are some additional configuration options available on replicas:
+
+- `type`—Specify the type of replica (`"file"` or `"s3"`). Derived from `"path"`.
+- `name`—Specify an optional name for the replica if you are using multiple replicas.
+- `path`—File path or URL to the replica location.
+- `retention`—Length of time to keep replicated WAL files. Defaults to `24h`.
+- `retention-check-interval`—Time between retention enforcement checks. Defaults to `1h`.
+- `validation-interval`—Interval between periodic checks to ensure restored backup matches current database. Disabled by default.
+
+These replica options are only available for S3 replicas:
+
+- `bucket`—S3 bucket name. Derived from `"path"`.
+- `region`—S3 bucket region. Looked up on startup if unspecified.
+- `sync-interval`—Replication sync frequency.
+
+
+## Usage
+
 ### Replication
 
-Once your configuration is saved, run the `litestream replicate` command:
+Once your configuration is saved, you'll need to begin replication. If you
+installed the `.deb` file then run:
+
+```sh
+$ sudo systemctl restart litestream
+```
+
+To run litestream on its own, run:
 
 ```sh
 # Replicate using the /etc/litestream.yml configuration.
@@ -45,7 +119,7 @@ $ litestream replicate -config /path/to/litestream.yml
 The `litestream` command will initialize and then wait indefinitely for changes.
 You should see your destination replica path is now populated with a
 `generations` directory. Inside there should be a 16-character hex generation
-directory and inside there should be snapshots & wal files. As you make changes
+directory and inside there should be snapshots & WAL files. As you make changes
 to your source database, changes will be copied over to your replica incrementally.
 
 
@@ -74,22 +148,6 @@ itself. By default, litestream will start a new WAL file every minute so
 point-in-time restores are only accurate to the minute.
 
 
-### Validating a backup
-
-Litestream can perform a consistency check of backups. It does this by computing
-a checksum of the current database file and then computing a checksum of
-a restored a backup. Litestream performs physical replication so backed up
-databases should be the same byte-for-byte. Be aware that this can incur some
-cost if you are validating from an external replica such as S3.
-
-```sh
-$ litestream validate /path/to/db
-```
-
-Note that computing the checksum of your original database does obtain a read
-lock to prevent checkpointing but this will not affect your read/write access
-to the database.
-
 
 ## How it works
 
@@ -108,7 +166,9 @@ The SQLite WAL file is copied to a separate location called the shadow WAL which
 ensures that it will not be overwritten by SQLite. This shadow WAL acts as a
 temporary buffer so that replicas can replicate to their destination (e.g.
 another file path or to S3). The shadow WAL files are removed once they have
-been fully replicated.
+been fully replicated. You can find the shadow directory as a hidden directory
+next to your database file. If you database file is named `/var/lib/my.db` then
+the shadow directory will be `/var/lib/.my.db-litestream`.
 
 Litestream groups a snapshot and all subsequent WAL changes into "generations".
 A generation is started on initial replication of a database and a new
@@ -118,7 +178,7 @@ another process is allowed to checkpoint the WAL.
 
 
 
-## Open-Source, not Open-Contribution
+## Open-source, not open-contribution
 
 [Similar to SQLite](https://www.sqlite.org/copyright.html), litestream is open
 source but closed to contributions. This keeps the code base free of proprietary
@@ -126,12 +186,15 @@ or licensed code but it also helps me continue to maintain and build litestream.
 
 As the author of [BoltDB](https://github.com/boltdb/bolt), I found that
 accepting and maintaining third party patches contributed to my burn out and
-eventual archival of the project. Writing databases & low-level replication
+I eventually archived the project. Writing databases & low-level replication
 tools involves nuance and simple one line changes can have profound and
-unexpected changes in correctness and performance. Even small contributions
+unexpected changes in correctness and performance. Small contributions
 typically required hours of my time to properly test and validate them.
 
-I am grateful for community involvement and when folks report bugs or suggest
-features. I do not wish to come off as anything but welcoming, however, I've
-made the decision to keep this project closed to contribution for my own
+I am grateful for community involvement, bug reports, & feature requests. I do
+not wish to come off as anything but welcoming, however, I've
+made the decision to keep this project closed to contributions for my own
 mental health and long term viability of the project.
+
+
+[releases]: https://github.com/benbjohnson/litestream/releases
