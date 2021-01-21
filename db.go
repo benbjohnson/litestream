@@ -419,6 +419,16 @@ func (db *DB) init() (err error) {
 		return err
 	}
 
+	// If we have an existing shadow WAL, ensure the headers match.
+	if ok, err := db.checkHeadersMatch(); err != nil {
+		return err
+	} else if !ok {
+		log.Printf("%s: cannot determine last wal position, clearing generation", db.path)
+		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove generation name: %w", err)
+		}
+	}
+
 	// Clean up previous generations.
 	if err := db.clean(); err != nil {
 		return fmt.Errorf("clean: %w", err)
@@ -430,6 +440,39 @@ func (db *DB) init() (err error) {
 	}
 
 	return nil
+}
+
+// checkHeadersMatch returns true if the primary WAL and last shadow WAL header match.
+func (db *DB) checkHeadersMatch() (bool, error) {
+	// Determine current generation.
+	generation, err := db.CurrentGeneration()
+	if err != nil {
+		return false, err
+	} else if generation == "" {
+		return false, nil // no generation
+	}
+
+	// Find current generation & latest shadow WAL.
+	shadowWALPath, err := db.CurrentShadowWALPath(generation)
+	if err != nil {
+		return false, fmt.Errorf("cannot determine current shadow wal path: %w", err)
+	}
+
+	hdr0, err := readWALHeader(db.WALPath())
+	if os.IsNotExist(err) {
+		return false, nil // no primary wal
+	} else if err != nil {
+		return false, fmt.Errorf("cannot read wal header: %w", err)
+	}
+
+	hdr1, err := readWALHeader(shadowWALPath)
+	if os.IsNotExist(err) {
+		return false, nil // no shadow wal
+	} else if err != nil {
+		return false, fmt.Errorf("cannot read shadow wal header: %w", err)
+	}
+
+	return bytes.Equal(hdr0, hdr1), nil
 }
 
 // clean removes old generations & WAL files.
