@@ -138,18 +138,13 @@ func (c *Config) DBConfig(path string) *DBConfig {
 }
 
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
-func ReadConfigFile(filename string) (Config, error) {
+func ReadConfigFile(filename string) (_ Config, err error) {
 	config := DefaultConfig()
 
 	// Expand filename, if necessary.
-	if prefix := "~" + string(os.PathSeparator); strings.HasPrefix(filename, prefix) {
-		u, err := user.Current()
-		if err != nil {
-			return config, err
-		} else if u.HomeDir == "" {
-			return config, fmt.Errorf("home directory unset")
-		}
-		filename = filepath.Join(u.HomeDir, strings.TrimPrefix(filename, prefix))
+	filename, err = expand(filename)
+	if err != nil {
+		return config, err
 	}
 
 	// Read & deserialize configuration.
@@ -174,7 +169,12 @@ type DBConfig struct {
 }
 
 // Normalize expands paths and parses URL-specified replicas.
-func (c *DBConfig) Normalize() error {
+func (c *DBConfig) Normalize() (err error) {
+	c.Path, err = expand(c.Path)
+	if err != nil {
+		return err
+	}
+
 	for i := range c.Replicas {
 		if err := c.Replicas[i].Normalize(); err != nil {
 			return err
@@ -202,27 +202,19 @@ type ReplicaConfig struct {
 
 // Normalize expands paths and parses URL-specified replicas.
 func (c *ReplicaConfig) Normalize() error {
-	// Expand path filename, if necessary.
-	if prefix := "~" + string(os.PathSeparator); strings.HasPrefix(c.Path, prefix) {
-		u, err := user.Current()
-		if err != nil {
-			return err
-		} else if u.HomeDir == "" {
-			return fmt.Errorf("cannot expand replica path, no home directory available")
-		}
-		c.Path = filepath.Join(u.HomeDir, strings.TrimPrefix(c.Path, prefix))
-	}
-
 	// Attempt to parse as URL. Ignore if it is not a URL or if there is no scheme.
 	u, err := url.Parse(c.Path)
 	if err != nil || u.Scheme == "" {
+		if c.Type == "" || c.Type == "file" {
+			c.Path, err = expand(c.Path)
+			return err
+		}
 		return nil
 	}
 
 	switch u.Scheme {
 	case "file":
-		u.Scheme = ""
-		c.Type = u.Scheme
+		c.Type, u.Scheme = u.Scheme, ""
 		c.Path = path.Clean(u.String())
 		return nil
 
@@ -230,10 +222,6 @@ func (c *ReplicaConfig) Normalize() error {
 		c.Type = u.Scheme
 		c.Path = strings.TrimPrefix(path.Clean(u.Path), "/")
 		c.Bucket = u.Host
-		if u := u.User; u != nil {
-			c.AccessKeyID = u.Username()
-			c.SecretAccessKey, _ = u.Password()
-		}
 		return nil
 
 	default:
@@ -322,11 +310,7 @@ func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Rep
 	}
 
 	// Ensure required settings are set.
-	if accessKeyID == "" {
-		return nil, fmt.Errorf("%s: s3 access key id required", db.Path())
-	} else if secretAccessKey == "" {
-		return nil, fmt.Errorf("%s: s3 secret access key required", db.Path())
-	} else if bucket == "" {
+	if bucket == "" {
 		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
 	}
 
@@ -351,4 +335,27 @@ func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Rep
 		r.ValidationInterval = v
 	}
 	return r, nil
+}
+
+// expand returns an absolute path for s.
+func expand(s string) (string, error) {
+	// Just expand to absolute path if there is no home directory prefix.
+	prefix := "~" + string(os.PathSeparator)
+	if s != "~" && !strings.HasPrefix(s, prefix) {
+		return filepath.Abs(s)
+	}
+
+	// Look up home directory.
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	} else if u.HomeDir == "" {
+		return "", fmt.Errorf("cannot expand path %s, no home directory available", s)
+	}
+
+	// Return path with tilde replaced by the home directory.
+	if s == "~" {
+		return u.HomeDir, nil
+	}
+	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
 }

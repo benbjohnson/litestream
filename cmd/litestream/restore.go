@@ -33,7 +33,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("database path required")
+		return fmt.Errorf("database path or replica URL required")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
@@ -90,7 +90,9 @@ The restore command recovers a database from a previous snapshot and WAL.
 
 Usage:
 
-	litestream restore [arguments] DB
+	litestream restore [arguments] DB_PATH
+
+	litestream restore [arguments] REPLICA_URL
 
 Arguments:
 
