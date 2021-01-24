@@ -20,6 +20,16 @@ GitHub.
 
 ## Installation
 
+### Mac OS (Homebrew)
+
+To install from homebrew, first add the Litestream tap and then install:
+
+```sh
+$ brew tap benbjohnson/litestream
+$ brew install litestream
+```
+
+
 ### Linux (Debian)
 
 You can download the `.deb` file from the [Releases page][releases] page and
