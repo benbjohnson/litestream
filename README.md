@@ -100,6 +100,27 @@ dbs:
       - path: /path/to/replica
 ```
 
+### Retention period
+
+By default, replicas will retain a snapshot & subsequent WAL changes for 24
+hours. When the snapshot age exceeds the retention threshold, a new snapshot
+is taken and uploaded and the previous snapshot and WAL files are removed.
+
+You can configure this setting per-replica. Times are parsed using [Go's
+duration](https://golang.org/pkg/time/#ParseDuration) so time units of hours
+(`h`), minutes (`m`), and seconds (`s`) are allowed but days, weeks, months, and
+years are not.
+
+
+```yaml
+db:
+  - path: /path/to/db
+    replicas:
+      - path: s3://mybkt/db
+        retention: 1h          # 1 hour retention
+```
+
+
 ### Monitoring replication
 
 You can also enable a Prometheus metrics endpoint to monitor replication by
@@ -119,7 +140,6 @@ These are some additional configuration options available on replicas:
 - `type`—Specify the type of replica (`"file"` or `"s3"`). Derived from `"path"`.
 - `name`—Specify an optional name for the replica if you are using multiple replicas.
 - `path`—File path or URL to the replica location.
-- `retention`—Length of time to keep replicated WAL files. Defaults to `24h`.
 - `retention-check-interval`—Time between retention enforcement checks. Defaults to `1h`.
 - `validation-interval`—Interval between periodic checks to ensure restored backup matches current database. Disabled by default.
 
