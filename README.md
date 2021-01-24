@@ -100,6 +100,17 @@ dbs:
       - path: /path/to/replica
 ```
 
+### Monitoring replication
+
+You can also enable a Prometheus metrics endpoint to monitor replication by
+specifying a bind address with the `addr` field:
+
+```yml
+addr: ":9090"
+```
+
+This will make metrics available at: http://localhost:9090/metrics
+
 
 ### Other configuration options
 
@@ -117,6 +128,7 @@ These replica options are only available for S3 replicas:
 - `bucket`—S3 bucket name. Derived from `"path"`.
 - `region`—S3 bucket region. Looked up on startup if unspecified.
 - `sync-interval`—Replication sync frequency.
+
 
 
 ## Usage
