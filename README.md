@@ -25,8 +25,7 @@ GitHub.
 To install from homebrew, first add the Litestream tap and then install:
 
 ```sh
-$ brew tap benbjohnson/litestream
-$ brew install litestream
+$ brew install benbjohnson/litestream/litestream
 ```
 
 
