@@ -43,7 +43,7 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	} else if fs.NArg() > 1 {
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
-			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{Path: u})
+			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{URL: u})
 		}
 		config.DBs = []*DBConfig{dbConfig}
 	} else if c.ConfigPath != "" {
@@ -53,11 +53,6 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	} else {
 		return errors.New("-config flag or database/replica arguments required")
-	}
-
-	// Normalize configuration paths.
-	if err := config.Normalize(); err != nil {
-		return err
 	}
 
 	// Enable trace logging.

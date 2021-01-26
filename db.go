@@ -622,7 +622,7 @@ func (db *DB) CurrentGeneration() (string, error) {
 		return "", err
 	}
 
-	// TODO: Verify if generation directory exists. If not, delete.
+	// TODO: Verify if generation directory exists. If not, delete name file.
 
 	generation := strings.TrimSpace(string(buf))
 	if len(generation) != GenerationNameLen {
@@ -1343,15 +1343,17 @@ func (db *DB) monitor() {
 	}
 }
 
-// Restore restores the database from a replica based on the options given.
+// RestoreReplica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
 // replica or generation or it will automatically choose the best one. Finally,
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
-func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
+func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 	// Validate options.
-	if opt.Generation == "" && opt.Index != math.MaxInt64 {
+	if opt.OutputPath == "" {
+		return fmt.Errorf("output path required")
+	} else if opt.Generation == "" && opt.Index != math.MaxInt64 {
 		return fmt.Errorf("must specify generation when restoring to index")
 	} else if opt.Index != math.MaxInt64 && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot specify index & timestamp to restore")
@@ -1363,69 +1365,62 @@ func (db *DB) Restore(ctx context.Context, opt RestoreOptions) error {
 		logger = log.New(ioutil.Discard, "", 0)
 	}
 
-	// Determine the correct output path.
-	outputPath := opt.OutputPath
-	if outputPath == "" {
-		outputPath = db.Path()
+	logPrefix := r.Name()
+	if db := r.DB(); db != nil {
+		logPrefix = fmt.Sprintf("%s(%s)", db.Path(), r.Name())
 	}
 
 	// Ensure output path does not already exist (unless this is a dry run).
 	if !opt.DryRun {
-		if _, err := os.Stat(outputPath); err == nil {
-			return fmt.Errorf("cannot restore, output path already exists: %s", outputPath)
+		if _, err := os.Stat(opt.OutputPath); err == nil {
+			return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
 		} else if err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
 
-	// Determine target replica & generation to restore from.
-	r, generation, err := db.restoreTarget(ctx, opt, logger)
-	if err != nil {
-		return err
-	}
-
 	// Find lastest snapshot that occurs before timestamp.
-	minWALIndex, err := SnapshotIndexAt(ctx, r, generation, opt.Timestamp)
+	minWALIndex, err := SnapshotIndexAt(ctx, r, opt.Generation, opt.Timestamp)
 	if err != nil {
 		return fmt.Errorf("cannot find snapshot index for restore: %w", err)
 	}
 
 	// Find the maximum WAL index that occurs before timestamp.
-	maxWALIndex, err := WALIndexAt(ctx, r, generation, opt.Index, opt.Timestamp)
+	maxWALIndex, err := WALIndexAt(ctx, r, opt.Generation, opt.Index, opt.Timestamp)
 	if err != nil {
 		return fmt.Errorf("cannot find max wal index for restore: %w", err)
 	}
-	log.Printf("%s(%s): starting restore: generation %08x, index %08x-%08x", db.path, r.Name(), generation, minWALIndex, maxWALIndex)
+	logger.Printf("%s: starting restore: generation %08x, index %08x-%08x", logPrefix, opt.Generation, minWALIndex, maxWALIndex)
 
 	// Initialize starting position.
-	pos := Pos{Generation: generation, Index: minWALIndex}
-	tmpPath := outputPath + ".tmp"
+	pos := Pos{Generation: opt.Generation, Index: minWALIndex}
+	tmpPath := opt.OutputPath + ".tmp"
 
 	// Copy snapshot to output path.
 	if !opt.DryRun {
-		if err := db.restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
+		if err := restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
 		}
 	}
-	log.Printf("%s(%s): restoring snapshot %s/%08x to %s", db.path, r.Name(), generation, minWALIndex, tmpPath)
+	logger.Printf("%s: restoring snapshot %s/%08x to %s", logPrefix, opt.Generation, minWALIndex, tmpPath)
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
 		if !opt.DryRun {
-			if err = db.restoreWAL(ctx, r, generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
-				log.Printf("%s(%s): no wal available, snapshot only", db.path, r.Name())
+			if err = restoreWAL(ctx, r, opt.Generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
+				logger.Printf("%s: no wal available, snapshot only", logPrefix)
 				break // snapshot file only, ignore error
 			} else if err != nil {
 				return fmt.Errorf("cannot restore wal: %w", err)
 			}
 		}
-		log.Printf("%s(%s): restored wal %s/%08x", db.path, r.Name(), generation, index)
+		logger.Printf("%s: restored wal %s/%08x", logPrefix, opt.Generation, index)
 	}
 
 	// Copy file to final location.
-	log.Printf("%s(%s): renaming database from temporary location", db.path, r.Name())
+	logger.Printf("%s: renaming database from temporary location", logPrefix)
 	if !opt.DryRun {
-		if err := os.Rename(tmpPath, outputPath); err != nil {
+		if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
 			return err
 		}
 	}
@@ -1447,7 +1442,8 @@ func checksumFile(filename string) (uint64, error) {
 	return h.Sum64(), nil
 }
 
-func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log.Logger) (Replica, string, error) {
+// CalcRestoreTarget returns a replica & generation to restore from based on opt criteria.
+func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (Replica, string, error) {
 	var target struct {
 		replica    Replica
 		generation string
@@ -1460,57 +1456,80 @@ func (db *DB) restoreTarget(ctx context.Context, opt RestoreOptions, logger *log
 			continue
 		}
 
-		generations, err := r.Generations(ctx)
+		generation, stats, err := CalcReplicaRestoreTarget(ctx, r, opt)
 		if err != nil {
-			return nil, "", fmt.Errorf("cannot fetch generations: %w", err)
+			return nil, "", err
 		}
 
-		// Search generations for one that contains the requested timestamp.
-		for _, generation := range generations {
-			// Skip generation if it does not match filter.
-			if opt.Generation != "" && generation != opt.Generation {
-				continue
-			}
-
-			// Fetch stats for generation.
-			stats, err := r.GenerationStats(ctx, generation)
-			if err != nil {
-				return nil, "", fmt.Errorf("cannot determine stats for generation (%s/%s): %s", r.Name(), generation, err)
-			}
-
-			// Skip if it does not contain timestamp.
-			if !opt.Timestamp.IsZero() {
-				if opt.Timestamp.Before(stats.CreatedAt) || opt.Timestamp.After(stats.UpdatedAt) {
-					continue
-				}
-			}
-
-			// Use the latest replica if we have multiple candidates.
-			if !stats.UpdatedAt.After(target.stats.UpdatedAt) {
-				continue
-			}
-
-			target.replica = r
-			target.generation = generation
-			target.stats = stats
+		// Use the latest replica if we have multiple candidates.
+		if !stats.UpdatedAt.After(target.stats.UpdatedAt) {
+			continue
 		}
-	}
 
-	// Return an error if no matching targets found.
-	if target.generation == "" {
-		return nil, "", fmt.Errorf("no matching backups found")
+		target.replica, target.generation, target.stats = r, generation, stats
 	}
-
 	return target.replica, target.generation, nil
 }
 
+// CalcReplicaRestoreTarget returns a generation to restore from.
+func CalcReplicaRestoreTarget(ctx context.Context, r Replica, opt RestoreOptions) (generation string, stats GenerationStats, err error) {
+	var target struct {
+		generation string
+		stats      GenerationStats
+	}
+
+	generations, err := r.Generations(ctx)
+	if err != nil {
+		return "", stats, fmt.Errorf("cannot fetch generations: %w", err)
+	}
+
+	// Search generations for one that contains the requested timestamp.
+	for _, generation := range generations {
+		// Skip generation if it does not match filter.
+		if opt.Generation != "" && generation != opt.Generation {
+			continue
+		}
+
+		// Fetch stats for generation.
+		stats, err := r.GenerationStats(ctx, generation)
+		if err != nil {
+			return "", stats, fmt.Errorf("cannot determine stats for generation (%s/%s): %s", r.Name(), generation, err)
+		}
+
+		// Skip if it does not contain timestamp.
+		if !opt.Timestamp.IsZero() {
+			if opt.Timestamp.Before(stats.CreatedAt) || opt.Timestamp.After(stats.UpdatedAt) {
+				continue
+			}
+		}
+
+		// Use the latest replica if we have multiple candidates.
+		if !stats.UpdatedAt.After(target.stats.UpdatedAt) {
+			continue
+		}
+
+		target.generation = generation
+		target.stats = stats
+	}
+
+	return target.generation, target.stats, nil
+}
+
 // restoreSnapshot copies a snapshot from the replica to a file.
-func (db *DB) restoreSnapshot(ctx context.Context, r Replica, generation string, index int, filename string) error {
-	if err := mkdirAll(filepath.Dir(filename), db.dirmode, db.diruid, db.dirgid); err != nil {
+func restoreSnapshot(ctx context.Context, r Replica, generation string, index int, filename string) error {
+	// Determine the user/group & mode based on the DB, if available.
+	uid, gid, mode := -1, -1, os.FileMode(0600)
+	diruid, dirgid, dirmode := -1, -1, os.FileMode(0700)
+	if db := r.DB(); db != nil {
+		uid, gid, mode = db.uid, db.gid, db.mode
+		diruid, dirgid, dirmode = db.diruid, db.dirgid, db.dirmode
+	}
+
+	if err := mkdirAll(filepath.Dir(filename), dirmode, diruid, dirgid); err != nil {
 		return err
 	}
 
-	f, err := createFile(filename, db.uid, db.gid)
+	f, err := createFile(filename, mode, uid, gid)
 	if err != nil {
 		return err
 	}
@@ -1533,7 +1552,13 @@ func (db *DB) restoreSnapshot(ctx context.Context, r Replica, generation string,
 }
 
 // restoreWAL copies a WAL file from the replica to the local WAL and forces checkpoint.
-func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, index int, dbPath string) error {
+func restoreWAL(ctx context.Context, r Replica, generation string, index int, dbPath string) error {
+	// Determine the user/group & mode based on the DB, if available.
+	uid, gid, mode := -1, -1, os.FileMode(0600)
+	if db := r.DB(); db != nil {
+		uid, gid, mode = db.uid, db.gid, db.mode
+	}
+
 	// Open WAL file from replica.
 	rd, err := r.WALReader(ctx, generation, index)
 	if err != nil {
@@ -1542,7 +1567,7 @@ func (db *DB) restoreWAL(ctx context.Context, r Replica, generation string, inde
 	defer rd.Close()
 
 	// Open handle to destination WAL path.
-	f, err := createFile(dbPath+"-wal", db.uid, db.gid)
+	f, err := createFile(dbPath+"-wal", mode, uid, gid)
 	if err != nil {
 		return err
 	}

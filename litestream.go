@@ -257,8 +257,8 @@ func isHexChar(ch rune) bool {
 }
 
 // createFile creates the file and attempts to set the UID/GID.
-func createFile(filename string, uid, gid int) (*os.File, error) {
-	f, err := os.Create(filename)
+func createFile(filename string, perm os.FileMode, uid, gid int) (*os.File, error) {
+	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
 	if err != nil {
 		return nil, err
 	}

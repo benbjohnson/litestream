@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"text/tabwriter"
 	"time"
 
@@ -31,37 +30,42 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("too many arguments")
 	}
 
-	// Load configuration.
-	if configPath == "" {
-		return errors.New("-config required")
-	}
-	config, err := ReadConfigFile(configPath)
-	if err != nil {
-		return err
-	}
+	var db *litestream.DB
+	var r litestream.Replica
+	if isURL(fs.Arg(0)) {
+		if r, err = NewReplicaFromURL(fs.Arg(0)); err != nil {
+			return err
+		}
+	} else if configPath != "" {
+		// Load configuration.
+		config, err := ReadConfigFile(configPath)
+		if err != nil {
+			return err
+		}
 
-	// Determine absolute path for database.
-	dbPath, err := filepath.Abs(fs.Arg(0))
-	if err != nil {
-		return err
-	}
+		// Lookup database from configuration file by path.
+		if path, err := expand(fs.Arg(0)); err != nil {
+			return err
+		} else if dbc := config.DBConfig(path); dbc == nil {
+			return fmt.Errorf("database not found in config: %s", path)
+		} else if db, err = newDBFromConfig(&config, dbc); err != nil {
+			return err
+		}
 
-	// Instantiate DB.
-	dbConfig := config.DBConfig(dbPath)
-	if dbConfig == nil {
-		return fmt.Errorf("database not found in config: %s", dbPath)
-	}
-	db, err := newDBFromConfig(&config, dbConfig)
-	if err != nil {
-		return err
+		// Filter by replica, if specified.
+		if *replicaName != "" {
+			if r = db.Replica(*replicaName); r == nil {
+				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
+			}
+		}
+	} else {
+		return errors.New("config path or replica URL required")
 	}
 
 	// Find snapshots by db or replica.
 	var infos []*litestream.SnapshotInfo
-	if *replicaName != "" {
-		if r := db.Replica(*replicaName); r == nil {
-			return fmt.Errorf("replica %q not found for database %q", *replicaName, dbPath)
-		} else if infos, err = r.Snapshots(ctx); err != nil {
+	if r != nil {
+		if infos, err = r.Snapshots(ctx); err != nil {
 			return err
 		}
 	} else {
@@ -90,11 +94,13 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 // Usage prints the help screen to STDOUT.
 func (c *SnapshotsCommand) Usage() {
 	fmt.Printf(`
-The snapshots command lists all snapshots available for a database.
+The snapshots command lists all snapshots available for a database or replica.
 
 Usage:
 
-	litestream snapshots [arguments] DB
+	litestream snapshots [arguments] DB_PATH
+
+	litestream snapshots [arguments] REPLICA_URL
 
 Arguments:
 
@@ -105,7 +111,6 @@ Arguments:
 	-replica NAME
 	    Optional, filter by a specific replica.
 
-
 Examples:
 
 	# List all snapshots for a database.
@@ -113,6 +118,9 @@ Examples:
 
 	# List all snapshots on S3.
 	$ litestream snapshots -replica s3 /path/to/db
+
+	# List all snapshots by replica URL.
+	$ litestream snapshots s3://mybkt/db
 
 `[1:],
 		DefaultConfigPath(),
