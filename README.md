@@ -49,12 +49,12 @@ $ sudo systemctl start litestream
 ### Release binaries
 
 You can also download the release binary for your system from the
-[Releases page][releases] and run it as a standalone application.
+[releases page][releases] and run it as a standalone application.
 
 
 ### Building from source
 
-First, download and install the [Go toolchain](https://golang.org/). Then run:
+Download and install the [Go toolchain](https://golang.org/) and then run:
 
 ```sh
 $ go install ./cmd/litestream
@@ -63,11 +63,48 @@ $ go install ./cmd/litestream
 The `litestream` binary should be in your `$GOPATH/bin` folder.
 
 
+## Quick Start
+
+Litestream provides a configuration file that can be used for production
+deployments but you can also specify a single database and replica on the
+command line for testing.
+
+First, you'll need to create an S3 bucket that we'll call `"mybkt"` in this
+example. You'll also need to set your AWS credentials:
+
+```sh
+$ export AWS_ACCESS_KEY_ID=AKIAxxxxxxxxxxxxxxxx
+$ export AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
+```
+
+Next you can run the `litestream replicate` command with the path to the
+database you want to backup and the URL of your replica destination:
+
+```sh
+$ litestream replicate /path/to/db s3://mybkt/db
+```
+
+If you make changes to your local database, those changes will be replicated
+to S3 every 10 seconds. From another terminal window, you can restore your
+database from your S3 replica:
+
+```
+$ litestream restore -v -o /path/to/restored/db s3://mybkt/db
+```
+
+Voila! 🎉
+
+Your database should be restored to the last replicated state that
+was sent to S3. You can adjust your replication frequency and other options by
+using a configuration-based approach specified below.
+
+
 ## Configuration
 
-Once installed locally, you'll need to create a config file. By default, the
-config file lives at `/etc/litestream.yml` but you can pass in a different
-path to any `litestream` command using the `-config PATH` flag.
+A configuration-based install gives you more replication options. By default,
+the config file lives at `/etc/litestream.yml` but you can pass in a different
+path to any `litestream` command using the `-config PATH` flag. You can also 
+set the `LITESTREAM_CONFIG` environment variable to specify a new path.
 
 The configuration specifies one or more `dbs` and a list of one or more replica
 locations for each db. Below are some common configurations:
@@ -84,7 +121,7 @@ secret-access-key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
 dbs:
   - path: /path/to/db
     replicas:
-      - path: s3://mybkt/db
+      - url: s3://mybkt/db
 ```
 
 ### Replicate to another file path
@@ -115,7 +152,7 @@ years are not.
 db:
   - path: /path/to/db
     replicas:
-      - path: s3://mybkt/db
+      - url: s3://mybkt/db
         retention: 1h          # 1 hour retention
 ```
 
@@ -138,7 +175,8 @@ These are some additional configuration options available on replicas:
 
 - `type`—Specify the type of replica (`"file"` or `"s3"`). Derived from `"path"`.
 - `name`—Specify an optional name for the replica if you are using multiple replicas.
-- `path`—File path or URL to the replica location.
+- `path`—File path to the replica location.
+- `url`—URL to the replica location.
 - `retention-check-interval`—Time between retention enforcement checks. Defaults to `1h`.
 - `validation-interval`—Interval between periodic checks to ensure restored backup matches current database. Disabled by default.
 
@@ -192,7 +230,10 @@ to worry about accidentally overwriting your current database.
 $ litestream restore /path/to/db
 
 # Restore database to a new location.
-$ litestream restore -o /tmp/mynewdb /path/to/db
+$ litestream restore -o /path/to/restored/db /path/to/db
+
+# Restore from a replica URL.
+$ litestream restore -o /path/to/restored/db s3://mybkt/db
 
 # Restore database to a specific point-in-time.
 $ litestream restore -timestamp 2020-01-01T00:00:00Z /path/to/db

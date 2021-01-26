@@ -36,13 +36,23 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 		return err
 	}
 
-	// Load configuration.
-	if c.ConfigPath == "" {
-		return errors.New("-config required")
-	}
-	config, err := ReadConfigFile(c.ConfigPath)
-	if err != nil {
-		return err
+	// Load configuration or use CLI args to build db/replica.
+	var config Config
+	if fs.NArg() == 1 {
+		return fmt.Errorf("must specify at least one replica URL for %s", fs.Arg(0))
+	} else if fs.NArg() > 1 {
+		dbConfig := &DBConfig{Path: fs.Arg(0)}
+		for _, u := range fs.Args()[1:] {
+			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{URL: u})
+		}
+		config.DBs = []*DBConfig{dbConfig}
+	} else if c.ConfigPath != "" {
+		config, err = ReadConfigFile(c.ConfigPath)
+		if err != nil {
+			return err
+		}
+	} else {
+		return errors.New("-config flag or database/replica arguments required")
 	}
 
 	// Enable trace logging.
@@ -132,12 +142,16 @@ func (c *ReplicateCommand) Close() (err error) {
 // Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
 	fmt.Printf(`
-The replicate command starts a server to monitor & replicate databases 
-specified in your configuration file.
+The replicate command starts a server to monitor & replicate databases. 
+You can specify your database & replicas in a configuration file or you can
+replicate a single database file by specifying its path and its replicas in the
+command line arguments.
 
 Usage:
 
 	litestream replicate [arguments]
+
+	litestream replicate [arguments] DB_PATH REPLICA_URL [REPLICA_URL...]
 
 Arguments:
 

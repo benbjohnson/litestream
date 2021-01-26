@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"text/tabwriter"
 	"time"
 
@@ -32,37 +31,42 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("too many arguments")
 	}
 
-	// Load configuration.
-	if configPath == "" {
-		return errors.New("-config required")
-	}
-	config, err := ReadConfigFile(configPath)
-	if err != nil {
-		return err
+	var db *litestream.DB
+	var r litestream.Replica
+	if isURL(fs.Arg(0)) {
+		if r, err = NewReplicaFromURL(fs.Arg(0)); err != nil {
+			return err
+		}
+	} else if configPath != "" {
+		// Load configuration.
+		config, err := ReadConfigFile(configPath)
+		if err != nil {
+			return err
+		}
+
+		// Lookup database from configuration file by path.
+		if path, err := expand(fs.Arg(0)); err != nil {
+			return err
+		} else if dbc := config.DBConfig(path); dbc == nil {
+			return fmt.Errorf("database not found in config: %s", path)
+		} else if db, err = newDBFromConfig(&config, dbc); err != nil {
+			return err
+		}
+
+		// Filter by replica, if specified.
+		if *replicaName != "" {
+			if r = db.Replica(*replicaName); r == nil {
+				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
+			}
+		}
+	} else {
+		return errors.New("config path or replica URL required")
 	}
 
-	// Determine absolute path for database.
-	dbPath, err := filepath.Abs(fs.Arg(0))
-	if err != nil {
-		return err
-	}
-
-	// Instantiate DB.
-	dbConfig := config.DBConfig(dbPath)
-	if dbConfig == nil {
-		return fmt.Errorf("database not found in config: %s", dbPath)
-	}
-	db, err := newDBFromConfig(&config, dbConfig)
-	if err != nil {
-		return err
-	}
-
-	// Find snapshots by db or replica.
+	// Find WAL files by db or replica.
 	var infos []*litestream.WALInfo
-	if *replicaName != "" {
-		if r := db.Replica(*replicaName); r == nil {
-			return fmt.Errorf("replica %q not found for database %q", *replicaName, dbPath)
-		} else if infos, err = r.WALs(ctx); err != nil {
+	if r != nil {
+		if infos, err = r.WALs(ctx); err != nil {
 			return err
 		}
 	} else {
@@ -100,7 +104,9 @@ The wal command lists all wal files available for a database.
 
 Usage:
 
-	litestream wal [arguments] DB
+	litestream wal [arguments] DB_PATH
+
+	litestream wal [arguments] REPLICA_URL
 
 Arguments:
 
@@ -114,14 +120,16 @@ Arguments:
 	-generation NAME
 	    Optional, filter by a specific generation.
 
-
 Examples:
 
 	# List all WAL files for a database.
 	$ litestream wal /path/to/db
 
 	# List all WAL files on S3 for a specific generation.
-	$ litestream snapshots -replica s3 -generation xxxxxxxx /path/to/db
+	$ litestream wal -replica s3 -generation xxxxxxxx /path/to/db
+
+	# List all WAL files for replica URL.
+	$ litestream wal s3://mybkt/db
 
 `[1:],
 		DefaultConfigPath(),

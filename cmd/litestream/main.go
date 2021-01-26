@@ -87,12 +87,12 @@ Usage:
 
 The commands are:
 
+	databases    list databases specified in config file
 	generations  list available generations for a database
 	replicate    runs a server to replicate databases
 	restore      recovers database backup from a replica
 	snapshots    list available snapshots for a database
-	validate     checks replica to ensure a consistent state with primary
-	version      prints the version
+	version      prints the binary version
 	wal          list available WAL files for a database
 `[1:])
 }
@@ -112,16 +112,6 @@ type Config struct {
 	Bucket          string `yaml:"bucket"`
 }
 
-// Normalize expands paths and parses URL-specified replicas.
-func (c *Config) Normalize() error {
-	for i := range c.DBs {
-		if err := c.DBs[i].Normalize(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
 	return Config{}
@@ -138,18 +128,13 @@ func (c *Config) DBConfig(path string) *DBConfig {
 }
 
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
-func ReadConfigFile(filename string) (Config, error) {
+func ReadConfigFile(filename string) (_ Config, err error) {
 	config := DefaultConfig()
 
 	// Expand filename, if necessary.
-	if prefix := "~" + string(os.PathSeparator); strings.HasPrefix(filename, prefix) {
-		u, err := user.Current()
-		if err != nil {
-			return config, err
-		} else if u.HomeDir == "" {
-			return config, fmt.Errorf("home directory unset")
-		}
-		filename = filepath.Join(u.HomeDir, strings.TrimPrefix(filename, prefix))
+	filename, err = expand(filename)
+	if err != nil {
+		return config, err
 	}
 
 	// Read & deserialize configuration.
@@ -161,9 +146,13 @@ func ReadConfigFile(filename string) (Config, error) {
 		return config, err
 	}
 
-	if err := config.Normalize(); err != nil {
-		return config, err
+	// Normalize paths.
+	for _, dbConfig := range config.DBs {
+		if dbConfig.Path, err = expand(dbConfig.Path); err != nil {
+			return config, err
+		}
 	}
+
 	return config, nil
 }
 
@@ -173,21 +162,12 @@ type DBConfig struct {
 	Replicas []*ReplicaConfig `yaml:"replicas"`
 }
 
-// Normalize expands paths and parses URL-specified replicas.
-func (c *DBConfig) Normalize() error {
-	for i := range c.Replicas {
-		if err := c.Replicas[i].Normalize(); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
 // ReplicaConfig represents the configuration for a single replica in a database.
 type ReplicaConfig struct {
 	Type                   string        `yaml:"type"` // "file", "s3"
 	Name                   string        `yaml:"name"` // name of replica, optional.
 	Path                   string        `yaml:"path"`
+	URL                    string        `yaml:"url"`
 	Retention              time.Duration `yaml:"retention"`
 	RetentionCheckInterval time.Duration `yaml:"retention-check-interval"`
 	SyncInterval           time.Duration `yaml:"sync-interval"` // s3 only
@@ -200,45 +180,61 @@ type ReplicaConfig struct {
 	Bucket          string `yaml:"bucket"`
 }
 
-// Normalize expands paths and parses URL-specified replicas.
-func (c *ReplicaConfig) Normalize() error {
-	// Expand path filename, if necessary.
-	if prefix := "~" + string(os.PathSeparator); strings.HasPrefix(c.Path, prefix) {
-		u, err := user.Current()
-		if err != nil {
-			return err
-		} else if u.HomeDir == "" {
-			return fmt.Errorf("cannot expand replica path, no home directory available")
-		}
-		c.Path = filepath.Join(u.HomeDir, strings.TrimPrefix(c.Path, prefix))
+// NewReplicaFromURL returns a new Replica instance configured from a URL.
+// The replica's database is not set.
+func NewReplicaFromURL(s string) (litestream.Replica, error) {
+	scheme, host, path, err := ParseReplicaURL(s)
+	if err != nil {
+		return nil, err
 	}
 
-	// Attempt to parse as URL. Ignore if it is not a URL or if there is no scheme.
-	u, err := url.Parse(c.Path)
-	if err != nil || u.Scheme == "" {
-		return nil
+	switch scheme {
+	case "file":
+		return litestream.NewFileReplica(nil, "", path), nil
+	case "s3":
+		r := s3.NewReplica(nil, "")
+		r.Bucket, r.Path = host, path
+		return r, nil
+	default:
+		return nil, fmt.Errorf("invalid replica url type: %s", s)
+	}
+}
+
+// ParseReplicaURL parses a replica URL.
+func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", "", "", err
 	}
 
 	switch u.Scheme {
 	case "file":
-		u.Scheme = ""
-		c.Type = u.Scheme
-		c.Path = path.Clean(u.String())
-		return nil
+		scheme, u.Scheme = u.Scheme, ""
+		return scheme, "", path.Clean(u.String()), nil
 
-	case "s3":
-		c.Type = u.Scheme
-		c.Path = strings.TrimPrefix(path.Clean(u.Path), "/")
-		c.Bucket = u.Host
-		if u := u.User; u != nil {
-			c.AccessKeyID = u.Username()
-			c.SecretAccessKey, _ = u.Password()
-		}
-		return nil
+	case "":
+		return u.Scheme, u.Host, u.Path, fmt.Errorf("replica url scheme required: %s", s)
 
 	default:
-		return fmt.Errorf("unrecognized replica type in path scheme: %s", c.Path)
+		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), nil
 	}
+}
+
+// isURL returns true if s can be parsed and has a scheme.
+func isURL(s string) bool {
+	u, err := url.Parse(s)
+	return err == nil && u.Scheme != ""
+}
+
+// ReplicaType returns the type based on the type field or extracted from the URL.
+func (c *ReplicaConfig) ReplicaType() string {
+	typ, _, _, _ := ParseReplicaURL(c.URL)
+	if typ != "" {
+		return typ
+	} else if c.Type != "" {
+		return c.Type
+	}
+	return "file"
 }
 
 // DefaultConfigPath returns the default config path.
@@ -255,8 +251,13 @@ func registerConfigFlag(fs *flag.FlagSet, p *string) {
 
 // newDBFromConfig instantiates a DB based on a configuration.
 func newDBFromConfig(c *Config, dbc *DBConfig) (*litestream.DB, error) {
+	path, err := expand(dbc.Path)
+	if err != nil {
+		return nil, err
+	}
+
 	// Initialize database with given path.
-	db := litestream.NewDB(dbc.Path)
+	db := litestream.NewDB(path)
 
 	// Instantiate and attach replicas.
 	for _, rc := range dbc.Replicas {
@@ -272,8 +273,13 @@ func newDBFromConfig(c *Config, dbc *DBConfig) (*litestream.DB, error) {
 
 // newReplicaFromConfig instantiates a replica for a DB based on a config.
 func newReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (litestream.Replica, error) {
-	switch rc.Type {
-	case "", "file":
+	// Ensure user did not specify URL in path.
+	if isURL(rc.Path) {
+		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", rc.Path)
+	}
+
+	switch rc.ReplicaType() {
+	case "file":
 		return newFileReplicaFromConfig(db, c, dbc, rc)
 	case "s3":
 		return newS3ReplicaFromConfig(db, c, dbc, rc)
@@ -283,12 +289,24 @@ func newReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Repli
 }
 
 // newFileReplicaFromConfig returns a new instance of FileReplica build from config.
-func newFileReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (*litestream.FileReplica, error) {
-	if rc.Path == "" {
+func newFileReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (_ *litestream.FileReplica, err error) {
+	path := rc.Path
+	if rc.URL != "" {
+		_, _, path, err = ParseReplicaURL(rc.URL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if path == "" {
 		return nil, fmt.Errorf("%s: file replica path required", db.Path())
 	}
 
-	r := litestream.NewFileReplica(db, rc.Name, rc.Path)
+	if path, err = expand(path); err != nil {
+		return nil, err
+	}
+
+	r := litestream.NewFileReplica(db, rc.Name, path)
 	if v := rc.Retention; v > 0 {
 		r.Retention = v
 	}
@@ -302,7 +320,20 @@ func newFileReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *R
 }
 
 // newS3ReplicaFromConfig returns a new instance of S3Replica build from config.
-func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (*s3.Replica, error) {
+func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (_ *s3.Replica, err error) {
+	bucket := c.Bucket
+	if v := rc.Bucket; v != "" {
+		bucket = v
+	}
+
+	path := rc.Path
+	if rc.URL != "" {
+		_, bucket, path, err = ParseReplicaURL(rc.URL)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	// Use global or replica-specific S3 settings.
 	accessKeyID := c.AccessKeyID
 	if v := rc.AccessKeyID; v != "" {
@@ -312,21 +343,13 @@ func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Rep
 	if v := rc.SecretAccessKey; v != "" {
 		secretAccessKey = v
 	}
-	bucket := c.Bucket
-	if v := rc.Bucket; v != "" {
-		bucket = v
-	}
 	region := c.Region
 	if v := rc.Region; v != "" {
 		region = v
 	}
 
 	// Ensure required settings are set.
-	if accessKeyID == "" {
-		return nil, fmt.Errorf("%s: s3 access key id required", db.Path())
-	} else if secretAccessKey == "" {
-		return nil, fmt.Errorf("%s: s3 secret access key required", db.Path())
-	} else if bucket == "" {
+	if bucket == "" {
 		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
 	}
 
@@ -336,7 +359,7 @@ func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Rep
 	r.SecretAccessKey = secretAccessKey
 	r.Region = region
 	r.Bucket = bucket
-	r.Path = rc.Path
+	r.Path = path
 
 	if v := rc.Retention; v > 0 {
 		r.Retention = v
@@ -351,4 +374,27 @@ func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *Rep
 		r.ValidationInterval = v
 	}
 	return r, nil
+}
+
+// expand returns an absolute path for s.
+func expand(s string) (string, error) {
+	// Just expand to absolute path if there is no home directory prefix.
+	prefix := "~" + string(os.PathSeparator)
+	if s != "~" && !strings.HasPrefix(s, prefix) {
+		return filepath.Abs(s)
+	}
+
+	// Look up home directory.
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	} else if u.HomeDir == "" {
+		return "", fmt.Errorf("cannot expand path %s, no home directory available", s)
+	}
+
+	// Return path with tilde replaced by the home directory.
+	if s == "~" {
+		return u.HomeDir, nil
+	}
+	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
 }

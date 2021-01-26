@@ -14,6 +14,7 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
+	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -104,16 +105,20 @@ func NewReplica(db *litestream.DB, name string) *Replica {
 		MonitorEnabled: true,
 	}
 
-	r.snapshotTotalGauge = internal.ReplicaSnapshotTotalGaugeVec.WithLabelValues(db.Path(), r.Name())
-	r.walBytesCounter = internal.ReplicaWALBytesCounterVec.WithLabelValues(db.Path(), r.Name())
-	r.walIndexGauge = internal.ReplicaWALIndexGaugeVec.WithLabelValues(db.Path(), r.Name())
-	r.walOffsetGauge = internal.ReplicaWALOffsetGaugeVec.WithLabelValues(db.Path(), r.Name())
-	r.putOperationTotalCounter = operationTotalCounterVec.WithLabelValues(db.Path(), r.Name(), "PUT")
-	r.putOperationBytesCounter = operationBytesCounterVec.WithLabelValues(db.Path(), r.Name(), "PUT")
-	r.getOperationTotalCounter = operationTotalCounterVec.WithLabelValues(db.Path(), r.Name(), "GET")
-	r.getOperationBytesCounter = operationBytesCounterVec.WithLabelValues(db.Path(), r.Name(), "GET")
-	r.listOperationTotalCounter = operationTotalCounterVec.WithLabelValues(db.Path(), r.Name(), "LIST")
-	r.deleteOperationTotalCounter = operationTotalCounterVec.WithLabelValues(db.Path(), r.Name(), "DELETE")
+	var dbPath string
+	if db != nil {
+		dbPath = db.Path()
+	}
+	r.snapshotTotalGauge = internal.ReplicaSnapshotTotalGaugeVec.WithLabelValues(dbPath, r.Name())
+	r.walBytesCounter = internal.ReplicaWALBytesCounterVec.WithLabelValues(dbPath, r.Name())
+	r.walIndexGauge = internal.ReplicaWALIndexGaugeVec.WithLabelValues(dbPath, r.Name())
+	r.walOffsetGauge = internal.ReplicaWALOffsetGaugeVec.WithLabelValues(dbPath, r.Name())
+	r.putOperationTotalCounter = operationTotalCounterVec.WithLabelValues(dbPath, r.Name(), "PUT")
+	r.putOperationBytesCounter = operationBytesCounterVec.WithLabelValues(dbPath, r.Name(), "PUT")
+	r.getOperationTotalCounter = operationTotalCounterVec.WithLabelValues(dbPath, r.Name(), "GET")
+	r.getOperationBytesCounter = operationBytesCounterVec.WithLabelValues(dbPath, r.Name(), "GET")
+	r.listOperationTotalCounter = operationTotalCounterVec.WithLabelValues(dbPath, r.Name(), "LIST")
+	r.deleteOperationTotalCounter = operationTotalCounterVec.WithLabelValues(dbPath, r.Name(), "DELETE")
 
 	return r
 }
@@ -647,10 +652,9 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 	}
 
 	// Create new AWS session.
-	sess, err := session.NewSession(&aws.Config{
-		Credentials: credentials.NewStaticCredentials(r.AccessKeyID, r.SecretAccessKey, ""),
-		Region:      aws.String(region),
-	})
+	config := r.config()
+	config.Region = aws.String(region)
+	sess, err := session.NewSession(config)
 	if err != nil {
 		return fmt.Errorf("cannot create aws session: %w", err)
 	}
@@ -659,12 +663,21 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 	return nil
 }
 
+// config returns the AWS configuration. Uses the default credential chain
+// unless a key/secret are explicitly set.
+func (r *Replica) config() *aws.Config {
+	config := defaults.Get().Config
+	if r.AccessKeyID != "" || r.SecretAccessKey != "" {
+		config.Credentials = credentials.NewStaticCredentials(r.AccessKeyID, r.SecretAccessKey, "")
+	}
+	return config
+}
+
 func (r *Replica) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Connect to US standard region to fetch info.
-	sess, err := session.NewSession(&aws.Config{
-		Credentials: credentials.NewStaticCredentials(r.AccessKeyID, r.SecretAccessKey, ""),
-		Region:      aws.String("us-east-1"),
-	})
+	config := r.config()
+	config.Region = aws.String("us-east-1")
+	sess, err := session.NewSession(config)
 	if err != nil {
 		return "", err
 	}

@@ -101,12 +101,15 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 // Usage prints the help message to STDOUT.
 func (c *GenerationsCommand) Usage() {
 	fmt.Printf(`
-The generations command lists all generations for a database. It also lists
-stats about their lag behind the primary database and the time range they cover.
+The generations command lists all generations for a database or replica. It also
+lists stats about their lag behind the primary database and the time range they
+cover.
 
 Usage:
 
-	litestream generations [arguments] DB
+	litestream generations [arguments] DB_PATH
+	
+	litestream generations [arguments] REPLICA_URL
 
 Arguments:
 

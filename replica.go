@@ -125,10 +125,14 @@ func NewFileReplica(db *DB, name, dst string) *FileReplica {
 		MonitorEnabled:         true,
 	}
 
-	r.snapshotTotalGauge = internal.ReplicaSnapshotTotalGaugeVec.WithLabelValues(db.path, r.Name())
-	r.walBytesCounter = internal.ReplicaWALBytesCounterVec.WithLabelValues(db.path, r.Name())
-	r.walIndexGauge = internal.ReplicaWALIndexGaugeVec.WithLabelValues(db.path, r.Name())
-	r.walOffsetGauge = internal.ReplicaWALOffsetGaugeVec.WithLabelValues(db.path, r.Name())
+	var dbPath string
+	if db != nil {
+		dbPath = db.Path()
+	}
+	r.snapshotTotalGauge = internal.ReplicaSnapshotTotalGaugeVec.WithLabelValues(dbPath, r.Name())
+	r.walBytesCounter = internal.ReplicaWALBytesCounterVec.WithLabelValues(dbPath, r.Name())
+	r.walIndexGauge = internal.ReplicaWALIndexGaugeVec.WithLabelValues(dbPath, r.Name())
+	r.walOffsetGauge = internal.ReplicaWALOffsetGaugeVec.WithLabelValues(dbPath, r.Name())
 
 	return r
 }
@@ -923,6 +927,10 @@ func WALIndexAt(ctx context.Context, r Replica, generation string, maxIndex int,
 
 	var index int
 	for _, wal := range wals {
+		if wal.Generation != generation {
+			continue
+		}
+
 		if !timestamp.IsZero() && wal.CreatedAt.After(timestamp) {
 			continue // after timestamp, skip
 		} else if wal.Index > maxIndex {
@@ -949,7 +957,12 @@ func compressFile(src, dst string, uid, gid int) error {
 	}
 	defer r.Close()
 
-	w, err := createFile(dst+".tmp", uid, gid)
+	fi, err := r.Stat()
+	if err != nil {
+		return err
+	}
+
+	w, err := createFile(dst+".tmp", fi.Mode(), uid, gid)
 	if err != nil {
 		return err
 	}
@@ -1000,7 +1013,7 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	defer os.RemoveAll(tmpdir)
 
 	restorePath := filepath.Join(tmpdir, "db")
-	if err := db.Restore(ctx, RestoreOptions{
+	if err := RestoreReplica(ctx, r, RestoreOptions{
 		OutputPath:  restorePath,
 		ReplicaName: r.Name(),
 		Generation:  pos.Generation,

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -33,18 +32,9 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("database path required")
+		return fmt.Errorf("database path or replica URL required")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
-	}
-
-	// Load configuration.
-	if configPath == "" {
-		return errors.New("-config required")
-	}
-	config, err := ReadConfigFile(configPath)
-	if err != nil {
-		return err
 	}
 
 	// Parse timestamp, if specified.
@@ -64,23 +54,72 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		opt.Logger = log.New(os.Stderr, "", log.LstdFlags)
 	}
 
-	// Determine absolute path for database.
-	dbPath, err := filepath.Abs(fs.Arg(0))
-	if err != nil {
-		return err
+	// Determine replica & generation to restore from.
+	var r litestream.Replica
+	if isURL(fs.Arg(0)) {
+		if r, err = c.loadFromURL(ctx, fs.Arg(0), &opt); err != nil {
+			return err
+		}
+	} else if configPath != "" {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), configPath, &opt); err != nil {
+			return err
+		}
+	} else {
+		return errors.New("config path or replica URL required")
 	}
 
-	// Instantiate DB.
+	// Return an error if no matching targets found.
+	if opt.Generation == "" {
+		return fmt.Errorf("no matching backups found")
+	}
+
+	return litestream.RestoreReplica(ctx, r, opt)
+}
+
+// loadFromURL creates a replica & updates the restore options from a replica URL.
+func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt *litestream.RestoreOptions) (litestream.Replica, error) {
+	r, err := NewReplicaFromURL(replicaURL)
+	if err != nil {
+		return nil, err
+	}
+	opt.Generation, _, err = litestream.CalcReplicaRestoreTarget(ctx, r, *opt)
+	return r, err
+}
+
+// loadFromConfig returns a replica & updates the restore options from a DB reference.
+func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, opt *litestream.RestoreOptions) (litestream.Replica, error) {
+	// Load configuration.
+	config, err := ReadConfigFile(configPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Lookup database from configuration file by path.
+	if dbPath, err = expand(dbPath); err != nil {
+		return nil, err
+	}
 	dbConfig := config.DBConfig(dbPath)
 	if dbConfig == nil {
-		return fmt.Errorf("database not found in config: %s", dbPath)
+		return nil, fmt.Errorf("database not found in config: %s", dbPath)
 	}
 	db, err := newDBFromConfig(&config, dbConfig)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	return db.Restore(ctx, opt)
+	// Restore into original database path if not specified.
+	if opt.OutputPath == "" {
+		opt.OutputPath = dbPath
+	}
+
+	// Determine the appropriate replica & generation to restore from,
+	r, generation, err := db.CalcRestoreTarget(ctx, *opt)
+	if err != nil {
+		return nil, err
+	}
+	opt.Generation = generation
+
+	return r, nil
 }
 
 // Usage prints the help screen to STDOUT.
@@ -90,7 +129,9 @@ The restore command recovers a database from a previous snapshot and WAL.
 
 Usage:
 
-	litestream restore [arguments] DB
+	litestream restore [arguments] DB_PATH
+
+	litestream restore [arguments] REPLICA_URL
 
 Arguments:
 
