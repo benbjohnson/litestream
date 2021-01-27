@@ -156,7 +156,8 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file. Defaults to %s
+	    Specifies the configuration file.
+	    Defaults to %s
 
 	-v
 	    Enable verbose logging output.
