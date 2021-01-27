@@ -7,9 +7,10 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"path/filepath"
 	"text/tabwriter"
 	"time"
+
+	"github.com/benbjohnson/litestream"
 )
 
 // GenerationsCommand represents a command to list all generations for a database.
@@ -25,50 +26,60 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("database path required")
+		return fmt.Errorf("database path or replica URL required")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
 
-	// Load configuration.
-	if configPath == "" {
-		return errors.New("-config required")
-	}
-	config, err := ReadConfigFile(configPath)
-	if err != nil {
-		return err
+	var db *litestream.DB
+	var r litestream.Replica
+	updatedAt := time.Now()
+	if isURL(fs.Arg(0)) {
+		if r, err = NewReplicaFromURL(fs.Arg(0)); err != nil {
+			return err
+		}
+	} else if configPath != "" {
+		// Load configuration.
+		config, err := ReadConfigFile(configPath)
+		if err != nil {
+			return err
+		}
+
+		// Lookup database from configuration file by path.
+		if path, err := expand(fs.Arg(0)); err != nil {
+			return err
+		} else if dbc := config.DBConfig(path); dbc == nil {
+			return fmt.Errorf("database not found in config: %s", path)
+		} else if db, err = newDBFromConfig(&config, dbc); err != nil {
+			return err
+		}
+
+		// Filter by replica, if specified.
+		if *replicaName != "" {
+			if r = db.Replica(*replicaName); r == nil {
+				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
+			}
+		}
+
+		// Determine last time database or WAL was updated.
+		if updatedAt, err = db.UpdatedAt(); err != nil {
+			return err
+		}
+	} else {
+		return errors.New("config path or replica URL required")
 	}
 
-	// Determine absolute path for database.
-	dbPath, err := filepath.Abs(fs.Arg(0))
-	if err != nil {
-		return err
-	}
-
-	// Instantiate DB from from configuration.
-	dbConfig := config.DBConfig(dbPath)
-	if dbConfig == nil {
-		return fmt.Errorf("database not found in config: %s", dbPath)
-	}
-	db, err := newDBFromConfig(&config, dbConfig)
-	if err != nil {
-		return err
-	}
-
-	// Determine last time database or WAL was updated.
-	updatedAt, err := db.UpdatedAt()
-	if err != nil {
-		return err
+	var replicas []litestream.Replica
+	if r != nil {
+		replicas = []litestream.Replica{r}
+	} else {
+		replicas = db.Replicas
 	}
 
 	// List each generation.
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
 	fmt.Fprintln(w, "name\tgeneration\tlag\tstart\tend")
-	for _, r := range db.Replicas {
-		if *replicaName != "" && r.Name() != *replicaName {
-			continue
-		}
-
+	for _, r := range replicas {
 		generations, err := r.Generations(ctx)
 		if err != nil {
 			log.Printf("%s: cannot list generations: %s", r.Name(), err)
@@ -114,7 +125,8 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file. Defaults to %s
+	    Specifies the configuration file.
+	    Defaults to %s
 
 	-replica NAME
 	    Optional, filters by replica.
