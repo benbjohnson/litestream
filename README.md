@@ -67,7 +67,7 @@ The `litestream` binary should be in your `$GOPATH/bin` folder.
 
 Litestream provides a configuration file that can be used for production
 deployments but you can also specify a single database and replica on the
-command line for testing.
+command line when trying it out.
 
 First, you'll need to create an S3 bucket that we'll call `"mybkt"` in this
 example. You'll also need to set your AWS credentials:
@@ -77,7 +77,7 @@ $ export AWS_ACCESS_KEY_ID=AKIAxxxxxxxxxxxxxxxx
 $ export AWS_SECRET_ACCESS_KEY=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
 ```
 
-Next you can run the `litestream replicate` command with the path to the
+Next, you can run the `litestream replicate` command with the path to the
 database you want to backup and the URL of your replica destination:
 
 ```sh
@@ -89,7 +89,7 @@ to S3 every 10 seconds. From another terminal window, you can restore your
 database from your S3 replica:
 
 ```
-$ litestream restore -v -o /path/to/restored/db s3://mybkt/db
+$ litestream restore -o /path/to/restored/db s3://mybkt/db
 ```
 
 Voila! 🎉
