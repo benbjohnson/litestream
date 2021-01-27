@@ -1390,19 +1390,19 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 	if err != nil {
 		return fmt.Errorf("cannot find max wal index for restore: %w", err)
 	}
-	logger.Printf("%s: starting restore: generation %08x, index %08x-%08x", logPrefix, opt.Generation, minWALIndex, maxWALIndex)
+	logger.Printf("%s: starting restore: generation %s, index %08x-%08x", logPrefix, opt.Generation, minWALIndex, maxWALIndex)
 
 	// Initialize starting position.
 	pos := Pos{Generation: opt.Generation, Index: minWALIndex}
 	tmpPath := opt.OutputPath + ".tmp"
 
 	// Copy snapshot to output path.
+	logger.Printf("%s: restoring snapshot %s/%08x to %s", logPrefix, opt.Generation, minWALIndex, tmpPath)
 	if !opt.DryRun {
 		if err := restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
 			return fmt.Errorf("cannot restore snapshot: %w", err)
 		}
 	}
-	logger.Printf("%s: restoring snapshot %s/%08x to %s", logPrefix, opt.Generation, minWALIndex, tmpPath)
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
