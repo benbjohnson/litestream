@@ -22,7 +22,7 @@ GitHub.
 
 ### Mac OS (Homebrew)
 
-To install from homebrew, first add the Litestream tap and then install:
+To install from homebrew, run the following command:
 
 ```sh
 $ brew install benbjohnson/litestream/litestream
