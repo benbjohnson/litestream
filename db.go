@@ -1604,7 +1604,9 @@ func restoreWAL(ctx context.Context, r Replica, generation string, index int, db
 // This function obtains a read lock so it prevents syncs from occurring until
 // the operation is complete. The database will still be usable but it will be
 // unable to checkpoint during this time.
-func (db *DB) CRC64() (uint64, Pos, error) {
+//
+// If dst is set, the database file is copied to that location before checksum.
+func (db *DB) CRC64(dst string) (uint64, Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1634,7 +1636,16 @@ func (db *DB) CRC64() (uint64, Pos, error) {
 	}
 	pos.Offset = 0
 
-	chksum, err := checksumFile(db.Path())
+	// Copy file, if dst specified.
+	checksumPath := db.Path()
+	if dst != "" {
+		if err := copyFile(dst, db.Path()); err != nil {
+			return 0, Pos{}, err
+		}
+		checksumPath = dst
+	}
+
+	chksum, err := checksumFile(checksumPath)
 	if err != nil {
 		return 0, pos, err
 	}
@@ -1769,4 +1780,25 @@ func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {
 	default:
 		return nil, fmt.Errorf("invalid wal header magic: %x", magic)
 	}
+}
+
+func copyFile(dst, src string) error {
+	r, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	w, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer w.Close()
+
+	if _, err := io.Copy(w, r); err != nil {
+		return err
+	} else if err := w.Sync(); err != nil {
+		return err
+	}
+	return nil
 }
