@@ -1052,7 +1052,8 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, buf[:8])  // frame header
 		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, buf[24:]) // frame data
 		if chksum0 != fchksum0 || chksum1 != fchksum1 {
-			return 0, fmt.Errorf("checksum mismatch: offset=%d (%x,%x) != (%x,%x)", tmpSz, chksum0, chksum1, fchksum0, fchksum1)
+			log.Printf("copy shadow: checksum mismatch, skipping: offset=%d (%x,%x) != (%x,%x)", tmpSz, chksum0, chksum1, fchksum0, fchksum1)
+			break
 		}
 
 		// Add page to the new size of the shadow WAL.
