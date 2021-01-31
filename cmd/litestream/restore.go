@@ -19,6 +19,8 @@ type RestoreCommand struct{}
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	var configPath string
 	opt := litestream.NewRestoreOptions()
+	opt.Verbose = true
+
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
 	registerConfigFlag(fs, &configPath)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")

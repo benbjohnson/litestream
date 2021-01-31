@@ -421,7 +421,7 @@ func (db *DB) init() (err error) {
 
 	// If we have an existing shadow WAL, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		log.Printf("%s: cannot determine last wal position, clearing generation (%s)", db.path, err)
+		log.Printf("%s: init: cannot determine last wal position, clearing generation (%s)", db.path, err)
 		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove generation name: %w", err)
 		}
@@ -736,7 +736,7 @@ func (db *DB) Sync() (err error) {
 		if info.generation, err = db.createGeneration(); err != nil {
 			return fmt.Errorf("create generation: %w", err)
 		}
-		log.Printf("%s: new generation %q, %s", db.path, info.generation, info.reason)
+		log.Printf("%s: sync: new generation %q, %s", db.path, info.generation, info.reason)
 
 		// Clear shadow wal info.
 		info.shadowWALPath = db.ShadowWALPath(info.generation, 0)
@@ -1264,7 +1264,7 @@ func (db *DB) checkpoint(mode string) (err error) {
 	if err := db.db.QueryRow(rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
 		return err
 	}
-	log.Printf("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
+	Tracef("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(); err != nil {
@@ -1414,7 +1414,10 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 				return fmt.Errorf("cannot restore wal: %w", err)
 			}
 		}
-		logger.Printf("%s: restored wal %s/%08x", logPrefix, opt.Generation, index)
+
+		if opt.Verbose {
+			logger.Printf("%s: restored wal %s/%08x", logPrefix, opt.Generation, index)
+		}
 	}
 
 	// Copy file to final location.
@@ -1664,8 +1667,9 @@ type RestoreOptions struct {
 	// Only equivalent log output for a regular restore.
 	DryRun bool
 
-	// Logger used to print status to.
-	Logger *log.Logger
+	// Logging settings.
+	Logger  *log.Logger
+	Verbose bool
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.

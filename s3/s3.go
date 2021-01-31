@@ -467,7 +467,7 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
-			log.Printf("%s(%s): sync error: %s", r.db.Path(), r.Name(), err)
+			log.Printf("%s(%s): monitor error: %s", r.db.Path(), r.Name(), err)
 			continue
 		}
 	}
@@ -603,6 +603,7 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	}()
 
 	snapshotPath := r.SnapshotPath(generation, index)
+	startTime := time.Now()
 
 	if _, err := r.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
 		Bucket: aws.String(r.Bucket),
@@ -614,6 +615,8 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 
 	r.putOperationTotalCounter.Inc()
 	r.putOperationBytesCounter.Add(float64(fi.Size()))
+
+	log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime))
 
 	return nil
 }
@@ -935,7 +938,6 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 
 		// If no retained snapshots exist, create a new snapshot.
 		if len(snapshots) == 0 {
-			log.Printf("%s(%s): snapshots exceeds retention, creating new snapshot", r.db.Path(), r.Name())
 			if err := r.snapshot(ctx, pos.Generation, pos.Index); err != nil {
 				return fmt.Errorf("cannot snapshot: %w", err)
 			}
@@ -958,7 +960,6 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 
 		// Delete generations if it has no snapshots being retained.
 		if snapshot == nil {
-			log.Printf("%s(%s): generation %q has no retained snapshots, deleting", r.db.Path(), r.Name(), generation)
 			if err := r.deleteGenerationBefore(ctx, generation, -1); err != nil {
 				return fmt.Errorf("cannot delete generation %q dir: %w", generation, err)
 			}
@@ -1001,14 +1002,11 @@ func (r *Replica) deleteGenerationBefore(ctx context.Context, generation string,
 	}
 
 	// Delete all files in batches.
+	var n int
 	for i := 0; i < len(objIDs); i += MaxKeys {
 		j := i + MaxKeys
 		if j > len(objIDs) {
 			j = len(objIDs)
-		}
-
-		for _, objID := range objIDs[i:j] {
-			log.Printf("%s(%s): retention exceeded, deleting from generation %q: %s", r.db.Path(), r.Name(), generation, path.Base(*objID.Key))
 		}
 
 		if _, err := r.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
@@ -1020,8 +1018,11 @@ func (r *Replica) deleteGenerationBefore(ctx context.Context, generation string,
 		}); err != nil {
 			return err
 		}
+		n += len(objIDs[i:j])
 		r.deleteOperationTotalCounter.Inc()
 	}
+
+	log.Printf("%s(%s): retainer: deleting wal files before %s/%08x n=%d", r.db.Path(), r.Name(), generation, index, n)
 
 	return nil
 }
