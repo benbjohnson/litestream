@@ -33,6 +33,10 @@ const (
 	DefaultMaxCheckpointPageN = 10000
 )
 
+// MaxIndex is the maximum possible WAL index.
+// If this index is reached then a new generation will be started.
+const MaxIndex = 0x7FFFFFFF
+
 // BusyTimeout is the timeout to wait for EBUSY from SQLite.
 const BusyTimeout = 1 * time.Second
 
@@ -844,10 +848,14 @@ func (db *DB) verify() (info syncInfo, err error) {
 	db.walSizeGauge.Set(float64(fi.Size()))
 
 	// Open shadow WAL to copy append to.
-	info.shadowWALPath, err = db.CurrentShadowWALPath(info.generation)
+	index, _, err := db.CurrentShadowWALIndex(info.generation)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine shadow WAL: %w", err)
+		return info, fmt.Errorf("cannot determine shadow WAL index: %w", err)
+	} else if index >= MaxIndex {
+		info.reason = "max index exceeded"
+		return info, nil
 	}
+	info.shadowWALPath = db.ShadowWALPath(generation, index)
 
 	// Determine shadow WAL current size.
 	fi, err = os.Stat(info.shadowWALPath)
