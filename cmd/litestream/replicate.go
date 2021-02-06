@@ -29,7 +29,7 @@ type ReplicateCommand struct {
 // Run loads all databases specified in the configuration.
 func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
-	verbose := fs.Bool("v", false, "verbose logging")
+	tracePath := fs.String("trace", "", "trace path")
 	registerConfigFlag(fs, &c.ConfigPath)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -56,8 +56,13 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Enable trace logging.
-	if *verbose {
-		litestream.Tracef = log.Printf
+	if *tracePath != "" {
+		f, err := os.Create(*tracePath)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		litestream.Tracef = log.New(f, "", log.LstdFlags|log.LUTC|log.Lshortfile).Printf
 	}
 
 	// Setup signal handler.
@@ -159,8 +164,8 @@ Arguments:
 	    Specifies the configuration file.
 	    Defaults to %s
 
-	-v
-	    Enable verbose logging output.
+	-trace PATH
+	    Write verbose trace logging to PATH.
 
 `[1:], DefaultConfigPath())
 }
