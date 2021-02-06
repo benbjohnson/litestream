@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -598,6 +599,8 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 	}
 	generation := dpos.Generation
 
+	Tracef("%s(%s): replica sync: db.pos=%s", r.db.Path(), r.Name(), dpos)
+
 	// Create snapshot if no snapshots exist for generation.
 	if n, err := r.snapshotN(generation); err != nil {
 		return err
@@ -617,6 +620,7 @@ func (r *FileReplica) Sync(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot determine replica position: %s", err)
 		}
 
+		Tracef("%s(%s): replica sync: calc new pos: %s", r.db.Path(), r.Name(), pos)
 		r.mu.Lock()
 		r.pos = pos
 		r.mu.Unlock()
@@ -669,10 +673,47 @@ func (r *FileReplica) syncWAL(ctx context.Context) (err error) {
 		return err
 	}
 
-	n, err := io.Copy(w, rd)
-	r.walBytesCounter.Add(float64(n))
-	if err != nil {
-		return err
+	// Copy header if at offset zero.
+	var psalt uint64 // previous salt value
+	if pos := rd.Pos(); pos.Offset == 0 {
+		buf := make([]byte, WALHeaderSize)
+		if _, err := io.ReadFull(rd, buf); err != nil {
+			return err
+		}
+
+		psalt = binary.BigEndian.Uint64(buf[16:24])
+
+		n, err := w.Write(buf)
+		if err != nil {
+			return err
+		}
+		r.walBytesCounter.Add(float64(n))
+	}
+
+	// Copy frames.
+	for {
+		pos := rd.Pos()
+		assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
+
+		buf := make([]byte, WALFrameHeaderSize+r.db.pageSize)
+		if _, err := io.ReadFull(rd, buf); err == io.EOF {
+			break
+		} else if err != nil {
+			return err
+		}
+
+		// Verify salt matches the previous frame/header read.
+		salt := binary.BigEndian.Uint64(buf[8:16])
+		if psalt != 0 && psalt != salt {
+			return fmt.Errorf("replica salt mismatch: %s", filepath.Base(filename))
+		}
+		psalt = salt
+
+		n, err := w.Write(buf)
+		if err != nil {
+			return err
+		}
+		r.walBytesCounter.Add(float64(n))
 	}
 
 	if err := w.Sync(); err != nil {
