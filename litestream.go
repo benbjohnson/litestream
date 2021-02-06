@@ -95,9 +95,9 @@ type Pos struct {
 // String returns a string representation.
 func (p Pos) String() string {
 	if p.IsZero() {
-		return "<>"
+		return ""
 	}
-	return fmt.Sprintf("<%s,%08x,%d>", p.Generation, p.Index, p.Offset)
+	return fmt.Sprintf("%s/%08x:%d", p.Generation, p.Index, p.Offset)
 }
 
 // IsZero returns true if p is the zero value.
