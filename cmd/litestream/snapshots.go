@@ -75,7 +75,9 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// List all snapshots.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	defer w.Flush()
+
 	fmt.Fprintln(w, "replica\tgeneration\tindex\tsize\tcreated")
 	for _, info := range infos {
 		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
@@ -86,7 +88,6 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 			info.CreatedAt.Format(time.RFC3339),
 		)
 	}
-	w.Flush()
 
 	return nil
 }

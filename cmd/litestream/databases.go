@@ -35,7 +35,9 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// List all databases.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	defer w.Flush()
+
 	fmt.Fprintln(w, "path\treplicas")
 	for _, dbConfig := range config.DBs {
 		db, err := newDBFromConfig(&config, dbConfig)
@@ -53,7 +55,6 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 			strings.Join(replicaNames, ","),
 		)
 	}
-	w.Flush()
 
 	return nil
 }

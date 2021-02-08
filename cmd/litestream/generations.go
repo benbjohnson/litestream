@@ -77,7 +77,9 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 	}
 
 	// List each generation.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	defer w.Flush()
+
 	fmt.Fprintln(w, "name\tgeneration\tlag\tstart\tend")
 	for _, r := range replicas {
 		generations, err := r.Generations(ctx)
@@ -101,10 +103,8 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 				stats.CreatedAt.Format(time.RFC3339),
 				stats.UpdatedAt.Format(time.RFC3339),
 			)
-			w.Flush()
 		}
 	}
-	w.Flush()
 
 	return nil
 }

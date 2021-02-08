@@ -76,7 +76,9 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// List all WAL files.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 1, '\t', 0)
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	defer w.Flush()
+
 	fmt.Fprintln(w, "replica\tgeneration\tindex\toffset\tsize\tcreated")
 	for _, info := range infos {
 		if *generation != "" && info.Generation != *generation {
@@ -92,7 +94,6 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 			info.CreatedAt.Format(time.RFC3339),
 		)
 	}
-	w.Flush()
 
 	return nil
 }
