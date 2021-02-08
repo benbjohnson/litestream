@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/s3"
@@ -43,7 +44,10 @@ func (c *ReplicateCommand) Run(ctx context.Context, args []string) (err error) {
 	} else if fs.NArg() > 1 {
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
-			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{URL: u})
+			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
+				URL:          u,
+				SyncInterval: 1 * time.Second,
+			})
 		}
 		config.DBs = []*DBConfig{dbConfig}
 	} else if c.ConfigPath != "" {
