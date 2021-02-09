@@ -1049,11 +1049,12 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 	if err != nil {
 		return err
 	}
+	defer os.RemoveAll(tmpdir)
 
 	// Compute checksum of primary database under lock. This prevents a
 	// sync from occurring and the database will not be written.
 	primaryPath := filepath.Join(tmpdir, "primary")
-	chksum0, pos, err := db.CRC64(primaryPath)
+	chksum0, pos, err := db.CRC64()
 	if err != nil {
 		return fmt.Errorf("cannot compute checksum: %w", err)
 	}

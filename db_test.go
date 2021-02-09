@@ -118,7 +118,7 @@ func TestDB_CRC64(t *testing.T) {
 	t.Run("ErrNotExist", func(t *testing.T) {
 		db := MustOpenDB(t)
 		defer MustCloseDB(t, db)
-		if _, _, err := db.CRC64(""); !os.IsNotExist(err) {
+		if _, _, err := db.CRC64(); !os.IsNotExist(err) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -131,7 +131,7 @@ func TestDB_CRC64(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		chksum0, _, err := db.CRC64("")
+		chksum0, _, err := db.CRC64()
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,7 +139,7 @@ func TestDB_CRC64(t *testing.T) {
 		// Issue change that is applied to the WAL. Checksum should not change.
 		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
-		} else if chksum1, _, err := db.CRC64(""); err != nil {
+		} else if chksum1, _, err := db.CRC64(); err != nil {
 			t.Fatal(err)
 		} else if chksum0 == chksum1 {
 			t.Fatal("expected different checksum event after WAL change")
@@ -150,7 +150,7 @@ func TestDB_CRC64(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if chksum2, _, err := db.CRC64(""); err != nil {
+		if chksum2, _, err := db.CRC64(); err != nil {
 			t.Fatal(err)
 		} else if chksum0 == chksum2 {
 			t.Fatal("expected different checksums after checkpoint")

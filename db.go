@@ -1625,7 +1625,7 @@ func restoreWAL(ctx context.Context, r Replica, generation string, index int, db
 // unable to checkpoint during this time.
 //
 // If dst is set, the database file is copied to that location before checksum.
-func (db *DB) CRC64(dst string) (uint64, Pos, error) {
+func (db *DB) CRC64() (uint64, Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1655,16 +1655,7 @@ func (db *DB) CRC64(dst string) (uint64, Pos, error) {
 	}
 	pos.Offset = 0
 
-	// Copy file, if dst specified.
-	checksumPath := db.Path()
-	if dst != "" {
-		if err := copyFile(dst, db.Path()); err != nil {
-			return 0, Pos{}, err
-		}
-		checksumPath = dst
-	}
-
-	chksum, err := checksumFile(checksumPath)
+	chksum, err := checksumFile(db.Path())
 	if err != nil {
 		return 0, pos, err
 	}
