@@ -40,5 +40,8 @@ not wish to come off as anything but welcoming, however, I've
 made the decision to keep this project closed to contributions for my own
 mental health and long term viability of the project.
 
+The [documentation repository][docs] is MIT licensed and pull requests are welcome there.
 
 [releases]: https://github.com/benbjohnson/litestream/releases
+[docs]: https://github.com/benbjohnson/litestream.io
+
