@@ -132,7 +132,7 @@ func calcWALSize(pageSize int, n int) int64 {
 
 // rollback rolls back tx. Ignores already-rolled-back errors.
 func rollback(tx *sql.Tx) error {
-	if err := tx.Rollback(); err != nil && !strings.Contains(err.Error(), `transaction has already been committed or rolled back`) {
+	if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
 		return err
 	}
 	return nil
