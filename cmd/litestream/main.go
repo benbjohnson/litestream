@@ -2,15 +2,18 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
+	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,14 +28,17 @@ var (
 	Version = "(development build)"
 )
 
+// errStop is a terminal error for indicating program should quit.
+var errStop = errors.New("stop")
+
 func main() {
 	log.SetFlags(0)
 
 	m := NewMain()
-	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp {
+	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
 		os.Exit(1)
 	} else if err != nil {
-		fmt.Fprintln(os.Stderr, err)
+		log.Println(err)
 		os.Exit(1)
 	}
 }
@@ -47,6 +53,14 @@ func NewMain() *Main {
 
 // Run executes the program.
 func (m *Main) Run(ctx context.Context, args []string) (err error) {
+	// Execute replication command if running as a Windows service.
+	if isService, err := isWindowsService(); err != nil {
+		return err
+	} else if isService {
+		return runWindowsService(ctx)
+	}
+
+	// Extract command name.
 	var cmd string
 	if len(args) > 0 {
 		cmd, args = args[0], args[1:]
@@ -58,7 +72,28 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case "generations":
 		return (&GenerationsCommand{}).Run(ctx, args)
 	case "replicate":
-		return (&ReplicateCommand{}).Run(ctx, args)
+		c := NewReplicateCommand()
+		if err := c.ParseFlags(ctx, args); err != nil {
+			return err
+		}
+
+		// Setup signal handler.
+		ctx, cancel := context.WithCancel(ctx)
+		ch := make(chan os.Signal, 1)
+		signal.Notify(ch, os.Interrupt)
+		go func() { <-ch; cancel() }()
+
+		if err := c.Run(ctx); err != nil {
+			return err
+		}
+
+		// Wait for signal to stop program.
+		<-ctx.Done()
+		signal.Reset()
+
+		// Gracefully close.
+		return c.Close()
+
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "snapshots":
@@ -222,8 +257,7 @@ func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
 
 // isURL returns true if s can be parsed and has a scheme.
 func isURL(s string) bool {
-	u, err := url.Parse(s)
-	return err == nil && u.Scheme != ""
+	return regexp.MustCompile(`^\w+:\/\/`).MatchString(s)
 }
 
 // ReplicaType returns the type based on the type field or extracted from the URL.
@@ -242,7 +276,7 @@ func DefaultConfigPath() string {
 	if v := os.Getenv("LITESTREAM_CONFIG"); v != "" {
 		return v
 	}
-	return "/etc/litestream.yml"
+	return defaultConfigPath
 }
 
 func registerConfigFlag(fs *flag.FlagSet, p *string) {
