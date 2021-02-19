@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix
+	xmlns="http://schemas.microsoft.com/wix/2006/wi"
+	xmlns:util="http://schemas.microsoft.com/wix/UtilExtension"
+>
+	<?if $(sys.BUILDARCH)=x64 ?>
+		<?define PlatformProgramFiles = "ProgramFiles64Folder" ?>
+	<?else ?>
+		<?define PlatformProgramFiles = "ProgramFilesFolder" ?>
+	<?endif ?>
+
+	<Product
+		Id="*"
+		UpgradeCode="5371367e-58b3-4e52-be0d-46945eb71ce6"
+		Name="Litestream"
+		Version="$(var.Version)"
+		Manufacturer="Litestream"
+		Language="1033"
+		Codepage="1252"
+	>
+		<Package
+			Id="*"
+			Manufacturer="Litestream"
+			InstallScope="perMachine"
+			InstallerVersion="500"
+			Description="Litestream $(var.Version) installer"
+			Compressed="yes"
+		/>
+		
+		<Media Id="1" Cabinet="litestream.cab" EmbedCab="yes"/>
+		
+		<MajorUpgrade
+			Schedule="afterInstallInitialize"
+			DowngradeErrorMessage="A later version of [ProductName] is already installed. Setup will now exit."
+		/>
+
+		<Directory Id="TARGETDIR" Name="SourceDir">
+			<Directory Id="$(var.PlatformProgramFiles)">
+				<Directory Id="APPLICATIONROOTDIRECTORY" Name="Litestream"/>
+			</Directory>
+		</Directory>
+
+		<ComponentGroup Id="Files">
+			<Component Directory="APPLICATIONROOTDIRECTORY">
+				<File
+					Id="litestream.exe"
+					Name="litestream.exe"
+					Source="litestream.exe"
+					KeyPath="yes"
+				/>
+
+				<ServiceInstall
+					Id="InstallService"
+					Name="Litestream"
+					DisplayName="Litestream"
+					Description="Replicates SQLite databases"
+					ErrorControl="normal"
+					Start="auto"
+					Type="ownProcess"
+				>
+					<util:ServiceConfig
+						FirstFailureActionType="restart"
+						SecondFailureActionType="restart"
+						ThirdFailureActionType="restart"
+						RestartServiceDelayInSeconds="60"
+					/>
+					<ServiceDependency Id="wmiApSrv" />
+				</ServiceInstall>
+
+				<ServiceControl
+					Id="ServiceStateControl"
+					Name="Litestream"
+					Remove="uninstall"
+					Start="install"
+					Stop="both"
+				/>
+				<util:EventSource
+					Log="Application"
+					Name="Litestream"
+					EventMessageFile="%SystemRoot%\System32\EventCreate.exe"
+				/>
+			</Component>
+		</ComponentGroup>
+
+		<Feature Id="DefaultFeature" Level="1">
+			<ComponentGroupRef Id="Files" />
+		</Feature>
+	</Product>
+</Wix>
