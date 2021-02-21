@@ -34,7 +34,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	var db *litestream.DB
 	var r litestream.Replica
 	if isURL(fs.Arg(0)) {
-		if r, err = NewReplicaFromURL(fs.Arg(0)); err != nil {
+		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
 	} else if configPath != "" {
@@ -49,7 +49,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 			return err
 		} else if dbc := config.DBConfig(path); dbc == nil {
 			return fmt.Errorf("database not found in config: %s", path)
-		} else if db, err = newDBFromConfig(&config, dbc); err != nil {
+		} else if db, err = NewDBFromConfig(dbc); err != nil {
 			return err
 		}
 

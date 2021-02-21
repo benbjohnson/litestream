@@ -143,8 +143,20 @@ type Config struct {
 	// Global S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
-	Region          string `yaml:"region"`
-	Bucket          string `yaml:"bucket"`
+}
+
+// propagateGlobalSettings copies global S3 settings to replica configs.
+func (c *Config) propagateGlobalSettings() {
+	for _, dbc := range c.DBs {
+		for _, rc := range dbc.Replicas {
+			if rc.AccessKeyID != "" {
+				rc.AccessKeyID = c.AccessKeyID
+			}
+			if rc.SecretAccessKey != "" {
+				rc.SecretAccessKey = c.SecretAccessKey
+			}
+		}
+	}
 }
 
 // DefaultConfig returns a new instance of Config with defaults set.
@@ -188,6 +200,9 @@ func ReadConfigFile(filename string) (_ Config, err error) {
 		}
 	}
 
+	// Propage settings from global config to replica configs.
+	config.propagateGlobalSettings()
+
 	return config, nil
 }
 
@@ -195,6 +210,28 @@ func ReadConfigFile(filename string) (_ Config, err error) {
 type DBConfig struct {
 	Path     string           `yaml:"path"`
 	Replicas []*ReplicaConfig `yaml:"replicas"`
+}
+
+// NewDBFromConfig instantiates a DB based on a configuration.
+func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
+	path, err := expand(dbc.Path)
+	if err != nil {
+		return nil, err
+	}
+
+	// Initialize database with given path.
+	db := litestream.NewDB(path)
+
+	// Instantiate and attach replicas.
+	for _, rc := range dbc.Replicas {
+		r, err := NewReplicaFromConfig(rc, db)
+		if err != nil {
+			return nil, err
+		}
+		db.Replicas = append(db.Replicas, r)
+	}
+
+	return db, nil
 }
 
 // ReplicaConfig represents the configuration for a single replica in a database.
@@ -213,26 +250,132 @@ type ReplicaConfig struct {
 	SecretAccessKey string `yaml:"secret-access-key"`
 	Region          string `yaml:"region"`
 	Bucket          string `yaml:"bucket"`
+	Endpoint        string `yaml:"endpoint"`
+	ForcePathStyle  bool   `yaml:"force-path-style"`
 }
 
-// NewReplicaFromURL returns a new Replica instance configured from a URL.
-// The replica's database is not set.
-func NewReplicaFromURL(s string) (litestream.Replica, error) {
-	scheme, host, path, err := ParseReplicaURL(s)
-	if err != nil {
+// NewReplicaFromConfig instantiates a replica for a DB based on a config.
+func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (litestream.Replica, error) {
+	// Ensure user did not specify URL in path.
+	if isURL(c.Path) {
+		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", c.Path)
+	}
+
+	switch c.ReplicaType() {
+	case "file":
+		return newFileReplicaFromConfig(c, db)
+	case "s3":
+		return newS3ReplicaFromConfig(c, db)
+	default:
+		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
+	}
+}
+
+// newFileReplicaFromConfig returns a new instance of FileReplica build from config.
+func newFileReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.FileReplica, err error) {
+	// Ensure URL & path are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for file replica")
+	}
+
+	// Parse path from URL, if specified.
+	path := c.Path
+	if c.URL != "" {
+		if _, _, path, err = ParseReplicaURL(c.URL); err != nil {
+			return nil, err
+		}
+	}
+
+	// Ensure path is set explicitly or derived from URL field.
+	if path == "" {
+		return nil, fmt.Errorf("file replica path required")
+	}
+
+	// Expand home prefix and return absolute path.
+	if path, err = expand(path); err != nil {
 		return nil, err
 	}
 
-	switch scheme {
-	case "file":
-		return litestream.NewFileReplica(nil, "", path), nil
-	case "s3":
-		r := s3.NewReplica(nil, "")
-		r.Bucket, r.Path = host, path
-		return r, nil
-	default:
-		return nil, fmt.Errorf("invalid replica url type: %s", s)
+	// Instantiate replica and apply time fields, if set.
+	r := litestream.NewFileReplica(db, c.Name, path)
+	if v := c.Retention; v > 0 {
+		r.Retention = v
 	}
+	if v := c.RetentionCheckInterval; v > 0 {
+		r.RetentionCheckInterval = v
+	}
+	if v := c.ValidationInterval; v > 0 {
+		r.ValidationInterval = v
+	}
+	return r, nil
+}
+
+// newS3ReplicaFromConfig returns a new instance of S3Replica build from config.
+func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for s3 replica")
+	} else if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for s3 replica")
+	}
+
+	bucket, path := c.Bucket, c.Path
+	region, endpoint, forcePathStyle := c.Region, c.Endpoint, c.ForcePathStyle
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		_, host, upath, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, err
+		}
+		ubucket, uregion, uendpoint, uforcePathStyle := s3.ParseHost(host)
+
+		// Only apply URL parts to field that have not been overridden.
+		if path == "" {
+			path = upath
+		}
+		if bucket == "" {
+			bucket = ubucket
+		}
+		if region == "" {
+			region = uregion
+		}
+		if endpoint == "" {
+			endpoint = uendpoint
+		}
+		if !forcePathStyle {
+			forcePathStyle = uforcePathStyle
+		}
+	}
+
+	// Ensure required settings are set.
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for s3 replica")
+	}
+
+	// Build replica.
+	r := s3.NewReplica(db, c.Name)
+	r.AccessKeyID = c.AccessKeyID
+	r.SecretAccessKey = c.SecretAccessKey
+	r.Bucket = bucket
+	r.Path = path
+	r.Region = region
+	r.Endpoint = endpoint
+	r.ForcePathStyle = forcePathStyle
+
+	if v := c.Retention; v > 0 {
+		r.Retention = v
+	}
+	if v := c.RetentionCheckInterval; v > 0 {
+		r.RetentionCheckInterval = v
+	}
+	if v := c.SyncInterval; v > 0 {
+		r.SyncInterval = v
+	}
+	if v := c.ValidationInterval; v > 0 {
+		r.ValidationInterval = v
+	}
+	return r, nil
 }
 
 // ParseReplicaURL parses a replica URL.
@@ -262,9 +405,9 @@ func isURL(s string) bool {
 
 // ReplicaType returns the type based on the type field or extracted from the URL.
 func (c *ReplicaConfig) ReplicaType() string {
-	typ, _, _, _ := ParseReplicaURL(c.URL)
-	if typ != "" {
-		return typ
+	scheme, _, _, _ := ParseReplicaURL(c.URL)
+	if scheme != "" {
+		return scheme
 	} else if c.Type != "" {
 		return c.Type
 	}
@@ -281,133 +424,6 @@ func DefaultConfigPath() string {
 
 func registerConfigFlag(fs *flag.FlagSet, p *string) {
 	fs.StringVar(p, "config", DefaultConfigPath(), "config path")
-}
-
-// newDBFromConfig instantiates a DB based on a configuration.
-func newDBFromConfig(c *Config, dbc *DBConfig) (*litestream.DB, error) {
-	path, err := expand(dbc.Path)
-	if err != nil {
-		return nil, err
-	}
-
-	// Initialize database with given path.
-	db := litestream.NewDB(path)
-
-	// Instantiate and attach replicas.
-	for _, rc := range dbc.Replicas {
-		r, err := newReplicaFromConfig(db, c, dbc, rc)
-		if err != nil {
-			return nil, err
-		}
-		db.Replicas = append(db.Replicas, r)
-	}
-
-	return db, nil
-}
-
-// newReplicaFromConfig instantiates a replica for a DB based on a config.
-func newReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (litestream.Replica, error) {
-	// Ensure user did not specify URL in path.
-	if isURL(rc.Path) {
-		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", rc.Path)
-	}
-
-	switch rc.ReplicaType() {
-	case "file":
-		return newFileReplicaFromConfig(db, c, dbc, rc)
-	case "s3":
-		return newS3ReplicaFromConfig(db, c, dbc, rc)
-	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", rc.Type)
-	}
-}
-
-// newFileReplicaFromConfig returns a new instance of FileReplica build from config.
-func newFileReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (_ *litestream.FileReplica, err error) {
-	path := rc.Path
-	if rc.URL != "" {
-		_, _, path, err = ParseReplicaURL(rc.URL)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	if path == "" {
-		return nil, fmt.Errorf("%s: file replica path required", db.Path())
-	}
-
-	if path, err = expand(path); err != nil {
-		return nil, err
-	}
-
-	r := litestream.NewFileReplica(db, rc.Name, path)
-	if v := rc.Retention; v > 0 {
-		r.Retention = v
-	}
-	if v := rc.RetentionCheckInterval; v > 0 {
-		r.RetentionCheckInterval = v
-	}
-	if v := rc.ValidationInterval; v > 0 {
-		r.ValidationInterval = v
-	}
-	return r, nil
-}
-
-// newS3ReplicaFromConfig returns a new instance of S3Replica build from config.
-func newS3ReplicaFromConfig(db *litestream.DB, c *Config, dbc *DBConfig, rc *ReplicaConfig) (_ *s3.Replica, err error) {
-	bucket := c.Bucket
-	if v := rc.Bucket; v != "" {
-		bucket = v
-	}
-
-	path := rc.Path
-	if rc.URL != "" {
-		_, bucket, path, err = ParseReplicaURL(rc.URL)
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	// Use global or replica-specific S3 settings.
-	accessKeyID := c.AccessKeyID
-	if v := rc.AccessKeyID; v != "" {
-		accessKeyID = v
-	}
-	secretAccessKey := c.SecretAccessKey
-	if v := rc.SecretAccessKey; v != "" {
-		secretAccessKey = v
-	}
-	region := c.Region
-	if v := rc.Region; v != "" {
-		region = v
-	}
-
-	// Ensure required settings are set.
-	if bucket == "" {
-		return nil, fmt.Errorf("%s: s3 bucket required", db.Path())
-	}
-
-	// Build replica.
-	r := s3.NewReplica(db, rc.Name)
-	r.AccessKeyID = accessKeyID
-	r.SecretAccessKey = secretAccessKey
-	r.Region = region
-	r.Bucket = bucket
-	r.Path = path
-
-	if v := rc.Retention; v > 0 {
-		r.Retention = v
-	}
-	if v := rc.RetentionCheckInterval; v > 0 {
-		r.RetentionCheckInterval = v
-	}
-	if v := rc.SyncInterval; v > 0 {
-		r.SyncInterval = v
-	}
-	if v := rc.ValidationInterval; v > 0 {
-		r.ValidationInterval = v
-	}
-	return r, nil
 }
 
 // expand returns an absolute path for s.

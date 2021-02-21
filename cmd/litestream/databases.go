@@ -22,7 +22,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() != 0 {
-		return fmt.Errorf("too many argument")
+		return fmt.Errorf("too many arguments")
 	}
 
 	// Load configuration.
@@ -40,7 +40,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 
 	fmt.Fprintln(w, "path\treplicas")
 	for _, dbConfig := range config.DBs {
-		db, err := newDBFromConfig(&config, dbConfig)
+		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {
 			return err
 		}

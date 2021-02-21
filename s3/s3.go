@@ -7,8 +7,10 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"net"
 	"os"
 	"path"
+	"regexp"
 	"sync"
 	"time"
 
@@ -69,9 +71,11 @@ type Replica struct {
 	SecretAccessKey string
 
 	// S3 bucket information
-	Region string
-	Bucket string
-	Path   string
+	Region         string
+	Bucket         string
+	Path           string
+	Endpoint       string
+	ForcePathStyle bool
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
@@ -646,9 +650,11 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// Look up region if not specified.
+	// Look up region if not specified and no endpoint is used.
+	// Endpoints are typically used for non-S3 object stores and do not
+	// necessarily require a region.
 	region := r.Region
-	if region == "" {
+	if region == "" && r.Endpoint == "" {
 		if region, err = r.findBucketRegion(ctx, r.Bucket); err != nil {
 			return fmt.Errorf("cannot lookup bucket region: %w", err)
 		}
@@ -656,7 +662,9 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 
 	// Create new AWS session.
 	config := r.config()
-	config.Region = aws.String(region)
+	if region != "" {
+		config.Region = aws.String(region)
+	}
 	sess, err := session.NewSession(config)
 	if err != nil {
 		return fmt.Errorf("cannot create aws session: %w", err)
@@ -672,6 +680,12 @@ func (r *Replica) config() *aws.Config {
 	config := defaults.Get().Config
 	if r.AccessKeyID != "" || r.SecretAccessKey != "" {
 		config.Credentials = credentials.NewStaticCredentials(r.AccessKeyID, r.SecretAccessKey, "")
+	}
+	if r.Endpoint != "" {
+		config.Endpoint = aws.String(r.Endpoint)
+	}
+	if r.ForcePathStyle {
+		config.S3ForcePathStyle = aws.Bool(r.ForcePathStyle)
 	}
 	return config
 }
@@ -1026,6 +1040,53 @@ func (r *Replica) deleteGenerationBefore(ctx context.Context, generation string,
 
 	return nil
 }
+
+// ParseHost extracts data from a hostname depending on the service provider.
+func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) {
+	// Extract port if one is specified.
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		host = s
+	}
+
+	// Default to path-based URLs, except for with AWS S3 itself.
+	forcePathStyle = true
+
+	// Extract fields from provider-specific host formats.
+	scheme := "https"
+	if a := localhostRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], "us-east-1"
+		scheme, endpoint = "http", "localhost"
+	} else if a := gcsRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], "us-east-1"
+		endpoint = "storage.googleapis.com"
+	} else if a := backblazeRegex.FindStringSubmatch(host); a != nil {
+		bucket = a[1]
+		region = a[2]
+		endpoint = fmt.Sprintf("s3.%s.backblazeb2.com", a[2])
+	} else {
+		bucket = host
+		forcePathStyle = false
+	}
+
+	// Add port back to endpoint, if available.
+	if endpoint != "" && port != "" {
+		endpoint = net.JoinHostPort(endpoint, port)
+	}
+
+	// Prepend scheme to endpoint.
+	if endpoint != "" {
+		endpoint = scheme + "://" + endpoint
+	}
+
+	return bucket, region, endpoint, forcePathStyle
+}
+
+var (
+	localhostRegex = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
+	backblazeRegex = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
+	gcsRegex       = regexp.MustCompile(`^(?:(.+)\.)?storage.googleapis.com$`)
+)
 
 // S3 metrics.
 var (

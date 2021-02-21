@@ -83,7 +83,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	for _, dbConfig := range c.Config.DBs {
-		db, err := newDBFromConfig(&c.Config, dbConfig)
+		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {
 			return err
 		}
@@ -103,7 +103,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			case *litestream.FileReplica:
 				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), r.Type(), r.Path())
 			case *s3.Replica:
-				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q", r.Name(), r.Type(), r.Bucket, r.Path, r.Region)
+				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q endpoint=%q sync-interval=%s", r.Name(), r.Type(), r.Bucket, r.Path, r.Region, r.Endpoint, r.SyncInterval)
 			default:
 				log.Printf("replicating to: name=%q type=%q", r.Name(), r.Type())
 			}

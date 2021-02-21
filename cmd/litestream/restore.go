@@ -80,7 +80,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
 func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt *litestream.RestoreOptions) (litestream.Replica, error) {
-	r, err := NewReplicaFromURL(replicaURL)
+	r, err := NewReplicaFromConfig(&ReplicaConfig{URL: replicaURL}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -104,7 +104,7 @@ func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath 
 	if dbConfig == nil {
 		return nil, fmt.Errorf("database not found in config: %s", dbPath)
 	}
-	db, err := newDBFromConfig(&config, dbConfig)
+	db, err := NewDBFromConfig(dbConfig)
 	if err != nil {
 		return nil, err
 	}
