@@ -149,10 +149,10 @@ type Config struct {
 func (c *Config) propagateGlobalSettings() {
 	for _, dbc := range c.DBs {
 		for _, rc := range dbc.Replicas {
-			if rc.AccessKeyID != "" {
+			if rc.AccessKeyID == "" {
 				rc.AccessKeyID = c.AccessKeyID
 			}
-			if rc.SecretAccessKey != "" {
+			if rc.SecretAccessKey == "" {
 				rc.SecretAccessKey = c.SecretAccessKey
 			}
 		}
