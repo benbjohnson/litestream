@@ -381,11 +381,28 @@ func (db *DB) init() (err error) {
 	dsn := db.path
 	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
 
-	// Connect to SQLite database & enable WAL.
+	// Connect to SQLite database.
 	if db.db, err = sql.Open("sqlite3", dsn); err != nil {
 		return err
-	} else if _, err := db.db.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+	}
+
+	// Ensure database is closed if init fails.
+	// Initialization can retry on next sync.
+	defer func() {
+		if err != nil {
+			db.releaseReadLock()
+			db.db.Close()
+			db.db = nil
+		}
+	}()
+
+	// Enable WAL and ensure it is set. New mode should be returned on success:
+	// https://www.sqlite.org/pragma.html#pragma_journal_mode
+	var mode string
+	if err := db.db.QueryRow(`PRAGMA journal_mode = wal;`).Scan(&mode); err != nil {
 		return fmt.Errorf("enable wal: %w", err)
+	} else if mode != "wal" {
+		return fmt.Errorf("enable wal failed, mode=%q", mode)
 	}
 
 	// Disable autocheckpoint for litestream's connection.
