@@ -80,6 +80,9 @@ type Replica struct {
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
 
+	// Frequency to create new snapshots.
+	SnapshotInterval time.Duration
+
 	// Time to keep snapshots and related WAL files.
 	// Database is snapshotted after interval and older WAL files are discarded.
 	Retention time.Duration
@@ -427,9 +430,10 @@ func (r *Replica) Start(ctx context.Context) {
 	ctx, r.cancel = context.WithCancel(ctx)
 
 	// Start goroutines to manage replica data.
-	r.wg.Add(3)
+	r.wg.Add(4)
 	go func() { defer r.wg.Done(); r.monitor(ctx) }()
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
+	go func() { defer r.wg.Done(); r.snapshotter(ctx) }()
 	go func() { defer r.wg.Done(); r.validator(ctx) }()
 }
 
@@ -479,7 +483,18 @@ func (r *Replica) monitor(ctx context.Context) {
 
 // retainer runs in a separate goroutine and handles retention.
 func (r *Replica) retainer(ctx context.Context) {
-	ticker := time.NewTicker(r.RetentionCheckInterval)
+	// Disable retention enforcement if retention period is non-positive.
+	if r.Retention <= 0 {
+		return
+	}
+
+	// Ensure check interval is not longer than retention period.
+	checkInterval := r.RetentionCheckInterval
+	if checkInterval > r.Retention {
+		checkInterval = r.Retention
+	}
+
+	ticker := time.NewTicker(checkInterval)
 	defer ticker.Stop()
 
 	for {
@@ -489,6 +504,28 @@ func (r *Replica) retainer(ctx context.Context) {
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
 				log.Printf("%s(%s): retain error: %s", r.db.Path(), r.Name(), err)
+				continue
+			}
+		}
+	}
+}
+
+// snapshotter runs in a separate goroutine and handles snapshotting.
+func (r *Replica) snapshotter(ctx context.Context) {
+	if r.SnapshotInterval <= 0 {
+		return
+	}
+
+	ticker := time.NewTicker(r.SnapshotInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := r.Snapshot(ctx); err != nil && err != litestream.ErrNoGeneration {
+				log.Printf("%s(%s): snapshotter error: %s", r.db.Path(), r.Name(), err)
 				continue
 			}
 		}
@@ -572,6 +609,18 @@ func (r *Replica) CalcPos(ctx context.Context, generation string) (pos litestrea
 	return pos, nil
 }
 
+// Snapshot copies the entire database to the replica path.
+func (r *Replica) Snapshot(ctx context.Context) error {
+	// Find current position of database.
+	pos, err := r.db.Pos()
+	if err != nil {
+		return fmt.Errorf("cannot determine current db generation: %w", err)
+	} else if pos.IsZero() {
+		return litestream.ErrNoGeneration
+	}
+	return r.snapshot(ctx, pos.Generation, pos.Index)
+}
+
 // snapshot copies the entire database to the replica path.
 func (r *Replica) snapshot(ctx context.Context, generation string, index int) error {
 	// Acquire a read lock on the database during snapshot to prevent checkpoints.
@@ -620,7 +669,7 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	r.putOperationTotalCounter.Inc()
 	r.putOperationBytesCounter.Add(float64(fi.Size()))
 
-	log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime))
+	log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
 	return nil
 }
