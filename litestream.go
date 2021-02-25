@@ -36,6 +36,7 @@ const (
 
 // Litestream errors.
 var (
+	ErrNoGeneration     = errors.New("no generation available")
 	ErrNoSnapshots      = errors.New("no snapshots available")
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )

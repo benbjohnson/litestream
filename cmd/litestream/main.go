@@ -243,6 +243,7 @@ type ReplicaConfig struct {
 	Retention              time.Duration `yaml:"retention"`
 	RetentionCheckInterval time.Duration `yaml:"retention-check-interval"`
 	SyncInterval           time.Duration `yaml:"sync-interval"` // s3 only
+	SnapshotInterval       time.Duration `yaml:"snapshot-interval"`
 	ValidationInterval     time.Duration `yaml:"validation-interval"`
 
 	// S3 settings
@@ -303,6 +304,9 @@ func newFileReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestrea
 	}
 	if v := c.RetentionCheckInterval; v > 0 {
 		r.RetentionCheckInterval = v
+	}
+	if v := c.SnapshotInterval; v > 0 {
+		r.SnapshotInterval = v
 	}
 	if v := c.ValidationInterval; v > 0 {
 		r.ValidationInterval = v
@@ -371,6 +375,9 @@ func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica,
 	}
 	if v := c.SyncInterval; v > 0 {
 		r.SyncInterval = v
+	}
+	if v := c.SnapshotInterval; v > 0 {
+		r.SnapshotInterval = v
 	}
 	if v := c.ValidationInterval; v > 0 {
 		r.ValidationInterval = v
