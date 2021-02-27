@@ -152,8 +152,9 @@ func readWALHeader(filename string) ([]byte, error) {
 	return buf[:n], err
 }
 
-// readFileAt reads a slice from a file.
-func readFileAt(filename string, offset, n int64) ([]byte, error) {
+// readWALFileAt reads a slice from a file. Do not use this with database files
+// as it causes problems with non-OFD locks.
+func readWALFileAt(filename string, offset, n int64) ([]byte, error) {
 	f, err := os.Open(filename)
 	if err != nil {
 		return nil, err
