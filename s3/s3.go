@@ -52,6 +52,9 @@ type Replica struct {
 	snapshotMu sync.Mutex
 	pos        litestream.Pos // last position
 
+	muf sync.Mutex
+	f   *os.File // long-lived read-only db file descriptor
+
 	wg     sync.WaitGroup
 	cancel func()
 
@@ -417,14 +420,14 @@ func (r *Replica) WALs(ctx context.Context) ([]*litestream.WALInfo, error) {
 }
 
 // Start starts replication for a given generation.
-func (r *Replica) Start(ctx context.Context) {
+func (r *Replica) Start(ctx context.Context) (err error) {
 	// Ignore if replica is being used sychronously.
 	if !r.MonitorEnabled {
-		return
+		return nil
 	}
 
 	// Stop previous replication.
-	r.Stop()
+	r.Stop(false)
 
 	// Wrap context with cancelation.
 	ctx, r.cancel = context.WithCancel(ctx)
@@ -435,12 +438,29 @@ func (r *Replica) Start(ctx context.Context) {
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
 	go func() { defer r.wg.Done(); r.snapshotter(ctx) }()
 	go func() { defer r.wg.Done(); r.validator(ctx) }()
+
+	return nil
 }
 
 // Stop cancels any outstanding replication and blocks until finished.
-func (r *Replica) Stop() {
+//
+// Performing a hard stop will close the DB file descriptor which could release
+// locks on per-process locks. Hard stops should only be performed when
+// stopping the entire process.
+func (r *Replica) Stop(hard bool) (err error) {
 	r.cancel()
 	r.wg.Wait()
+
+	r.muf.Lock()
+	defer r.muf.Unlock()
+
+	if hard && r.f != nil {
+		if e := r.f.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	return err
 }
 
 // monitor runs in a separate goroutine and continuously replicates the DB.
@@ -623,6 +643,9 @@ func (r *Replica) Snapshot(ctx context.Context) error {
 
 // snapshot copies the entire database to the replica path.
 func (r *Replica) snapshot(ctx context.Context, generation string, index int) error {
+	r.muf.Lock()
+	defer r.muf.Unlock()
+
 	// Acquire a read lock on the database during snapshot to prevent checkpoints.
 	tx, err := r.db.SQLDB().Begin()
 	if err != nil {
@@ -633,14 +656,21 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	// Open database file handle.
-	f, err := os.Open(r.db.Path())
-	if err != nil {
+	// Open long-lived file descriptor on database.
+	if r.f == nil {
+		if r.f, err = os.Open(r.db.Path()); err != nil {
+			return err
+		}
+	}
+
+	// Move the file descriptor to the beginning. We only use one long lived
+	// file descriptor because some operating systems will remove the database
+	// lock when closing a separate file descriptor on the DB.
+	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	defer f.Close()
 
-	fi, err := f.Stat()
+	fi, err := r.f.Stat()
 	if err != nil {
 		return err
 	}
@@ -648,7 +678,7 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	pr, pw := io.Pipe()
 	zw := lz4.NewWriter(pw)
 	go func() {
-		if _, err := io.Copy(zw, f); err != nil {
+		if _, err := io.Copy(zw, r.f); err != nil {
 			_ = pw.CloseWithError(err)
 			return
 		}
@@ -670,7 +700,6 @@ func (r *Replica) snapshot(ctx context.Context, generation string, index int) er
 	r.putOperationBytesCounter.Add(float64(fi.Size()))
 
 	log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
-
 	return nil
 }
 

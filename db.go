@@ -45,6 +45,7 @@ type DB struct {
 	mu       sync.RWMutex
 	path     string        // part to database
 	db       *sql.DB       // target database
+	f        *os.File      // long-running db file descriptor
 	rtx      *sql.Tx       // long running read transaction
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
@@ -285,8 +286,15 @@ func (db *DB) Open() (err error) {
 // Close releases the read lock & closes the database. This method should only
 // be called by tests as it causes the underlying database to be checkpointed.
 func (db *DB) Close() (err error) {
-	if e := db.SoftClose(); e != nil && err == nil {
-		err = e
+	// Ensure replicas all stop replicating.
+	for _, r := range db.Replicas {
+		r.Stop(true)
+	}
+
+	if db.rtx != nil {
+		if e := db.releaseReadLock(); e != nil && err == nil {
+			err = e
+		}
 	}
 
 	if db.db != nil {
@@ -294,6 +302,7 @@ func (db *DB) Close() (err error) {
 			err = e
 		}
 	}
+
 	return err
 }
 
@@ -386,13 +395,19 @@ func (db *DB) init() (err error) {
 		return err
 	}
 
+	// Open long-running database file descriptor. Required for non-OFD locks.
+	if db.f, err = os.Open(db.path); err != nil {
+		return fmt.Errorf("open db file descriptor: %w", err)
+	}
+
 	// Ensure database is closed if init fails.
 	// Initialization can retry on next sync.
 	defer func() {
 		if err != nil {
-			db.releaseReadLock()
+			_ = db.releaseReadLock()
 			db.db.Close()
-			db.db = nil
+			db.f.Close()
+			db.db, db.f = nil, nil
 		}
 	}()
 
@@ -586,7 +601,7 @@ func (db *DB) SoftClose() (err error) {
 
 	// Ensure replicas all stop replicating.
 	for _, r := range db.Replicas {
-		r.Stop()
+		r.Stop(false)
 	}
 
 	if db.rtx != nil {
@@ -917,9 +932,9 @@ func (db *DB) verify() (info syncInfo, err error) {
 	// Verify last page synced still matches.
 	if info.shadowWALSize > WALHeaderSize {
 		offset := info.shadowWALSize - int64(db.pageSize+WALFrameHeaderSize)
-		if buf0, err := readFileAt(db.WALPath(), offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
+		if buf0, err := readWALFileAt(db.WALPath(), offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
 			return info, fmt.Errorf("cannot read last synced wal page: %w", err)
-		} else if buf1, err := readFileAt(info.shadowWALPath, offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
+		} else if buf1, err := readWALFileAt(info.shadowWALPath, offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
 			return info, fmt.Errorf("cannot read last synced shadow wal page: %w", err)
 		} else if !bytes.Equal(buf0, buf1) {
 			info.reason = "wal overwritten by another process"
@@ -1466,20 +1481,6 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 	return nil
 }
 
-func checksumFile(filename string) (uint64, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return 0, err
-	}
-	defer f.Close()
-
-	h := crc64.New(crc64.MakeTable(crc64.ISO))
-	if _, err := io.Copy(h, f); err != nil {
-		return 0, err
-	}
-	return h.Sum64(), nil
-}
-
 // CalcRestoreTarget returns a replica & generation to restore from based on opt criteria.
 func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (Replica, string, error) {
 	var target struct {
@@ -1672,11 +1673,14 @@ func (db *DB) CRC64() (uint64, Pos, error) {
 	}
 	pos.Offset = 0
 
-	chksum, err := checksumFile(db.Path())
-	if err != nil {
+	// Seek to the beginning of the db file descriptor and checksum whole file.
+	h := crc64.New(crc64.MakeTable(crc64.ISO))
+	if _, err := db.f.Seek(0, io.SeekStart); err != nil {
+		return 0, pos, err
+	} else if _, err := io.Copy(h, db.f); err != nil {
 		return 0, pos, err
 	}
-	return chksum, pos, nil
+	return h.Sum64(), pos, nil
 }
 
 // RestoreOptions represents options for DB.Restore().
@@ -1807,25 +1811,4 @@ func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {
 	default:
 		return nil, fmt.Errorf("invalid wal header magic: %x", magic)
 	}
-}
-
-func copyFile(dst, src string) error {
-	r, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer r.Close()
-
-	w, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer w.Close()
-
-	if _, err := io.Copy(w, r); err != nil {
-		return err
-	} else if err := w.Sync(); err != nil {
-		return err
-	}
-	return nil
 }
