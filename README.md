@@ -21,12 +21,24 @@ Please visit the [Litestream web site](https://litestream.io) for installation
 instructions and documentation.
 
 
+## Acknowledgements
+
+While the Litestream project does not accept external code patches, many
+of the most valuable contributions are in the forms of testing, feedback, and
+documentation. These help harden software and streamline usage for other users.
+
+I want to give special thanks to individuals who invest much of their time and 
+energy into the project to help make it better. Shout out to [Michael
+Lynch](https://github.com/mtlynch) for digging into issues and contributing to
+the documentation.
+
 
 ## Open-source, not open-contribution
 
 [Similar to SQLite](https://www.sqlite.org/copyright.html), Litestream is open
-source but closed to contributions. This keeps the code base free of proprietary
-or licensed code but it also helps me continue to maintain and build Litestream.
+source but closed to code contributions. This keeps the code base free of
+proprietary or licensed code but it also helps me continue to maintain and build
+Litestream.
 
 As the author of [BoltDB](https://github.com/boltdb/bolt), I found that
 accepting and maintaining third party patches contributed to my burn out and
