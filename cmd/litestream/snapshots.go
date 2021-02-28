@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,9 +16,8 @@ type SnapshotsCommand struct{}
 
 // Run executes the command.
 func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
-	var configPath string
 	fs := flag.NewFlagSet("litestream-snapshots", flag.ContinueOnError)
-	registerConfigFlag(fs, &configPath)
+	configPath := registerConfigFlag(fs)
 	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -33,12 +31,19 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	var db *litestream.DB
 	var r litestream.Replica
 	if isURL(fs.Arg(0)) {
+		if *configPath != "" {
+			return fmt.Errorf("cannot specify a replica URL and the -config flag")
+		}
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
-	} else if configPath != "" {
+	} else {
+		if *configPath == "" {
+			*configPath = DefaultConfigPath()
+		}
+
 		// Load configuration.
-		config, err := ReadConfigFile(configPath)
+		config, err := ReadConfigFile(*configPath)
 		if err != nil {
 			return err
 		}
@@ -58,8 +63,6 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
 			}
 		}
-	} else {
-		return errors.New("config path or replica URL required")
 	}
 
 	// Find snapshots by db or replica.

@@ -17,12 +17,11 @@ type RestoreCommand struct{}
 
 // Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
-	var configPath string
 	opt := litestream.NewRestoreOptions()
 	opt.Verbose = true
 
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
-	registerConfigFlag(fs, &configPath)
+	configPath := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
@@ -59,15 +58,19 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	// Determine replica & generation to restore from.
 	var r litestream.Replica
 	if isURL(fs.Arg(0)) {
+		if *configPath != "" {
+			return fmt.Errorf("cannot specify a replica URL and the -config flag")
+		}
 		if r, err = c.loadFromURL(ctx, fs.Arg(0), &opt); err != nil {
 			return err
 		}
-	} else if configPath != "" {
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), configPath, &opt); err != nil {
+	} else {
+		if *configPath == "" {
+			*configPath = DefaultConfigPath()
+		}
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, &opt); err != nil {
 			return err
 		}
-	} else {
-		return errors.New("config path or replica URL required")
 	}
 
 	// Return an error if no matching targets found.

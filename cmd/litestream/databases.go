@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -15,9 +14,8 @@ type DatabasesCommand struct{}
 
 // Run executes the command.
 func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
-	var configPath string
 	fs := flag.NewFlagSet("litestream-databases", flag.ContinueOnError)
-	registerConfigFlag(fs, &configPath)
+	configPath := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -26,10 +24,10 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	if configPath == "" {
-		return errors.New("-config required")
+	if *configPath == "" {
+		*configPath = DefaultConfigPath()
 	}
-	config, err := ReadConfigFile(configPath)
+	config, err := ReadConfigFile(*configPath)
 	if err != nil {
 		return err
 	}
