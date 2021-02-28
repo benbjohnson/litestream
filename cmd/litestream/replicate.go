@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -19,8 +18,7 @@ import (
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
-	ConfigPath string
-	Config     Config
+	Config Config
 
 	// List of managed databases specified in the config.
 	DBs []*litestream.DB
@@ -34,7 +32,7 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	tracePath := fs.String("trace", "", "trace path")
-	registerConfigFlag(fs, &c.ConfigPath)
+	configPath := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -44,6 +42,10 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	if fs.NArg() == 1 {
 		return fmt.Errorf("must specify at least one replica URL for %s", fs.Arg(0))
 	} else if fs.NArg() > 1 {
+		if *configPath != "" {
+			return fmt.Errorf("cannot specify a replica URL and the -config flag")
+		}
+
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
 			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
@@ -52,12 +54,13 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			})
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
-	} else if c.ConfigPath != "" {
-		if c.Config, err = ReadConfigFile(c.ConfigPath); err != nil {
+	} else {
+		if *configPath == "" {
+			*configPath = DefaultConfigPath()
+		}
+		if c.Config, err = ReadConfigFile(*configPath); err != nil {
 			return err
 		}
-	} else {
-		return errors.New("-config flag or database/replica arguments required")
 	}
 
 	// Enable trace logging.

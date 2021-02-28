@@ -429,8 +429,8 @@ func DefaultConfigPath() string {
 	return defaultConfigPath
 }
 
-func registerConfigFlag(fs *flag.FlagSet, p *string) {
-	fs.StringVar(p, "config", DefaultConfigPath(), "config path")
+func registerConfigFlag(fs *flag.FlagSet) *string {
+	return fs.String("config", "", "config path")
 }
 
 // expand returns an absolute path for s.

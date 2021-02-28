@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -18,9 +17,8 @@ type GenerationsCommand struct{}
 
 // Run executes the command.
 func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error) {
-	var configPath string
 	fs := flag.NewFlagSet("litestream-generations", flag.ContinueOnError)
-	registerConfigFlag(fs, &configPath)
+	configPath := registerConfigFlag(fs)
 	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -35,12 +33,19 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 	var r litestream.Replica
 	updatedAt := time.Now()
 	if isURL(fs.Arg(0)) {
+		if *configPath != "" {
+			return fmt.Errorf("cannot specify a replica URL and the -config flag")
+		}
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
-	} else if configPath != "" {
+	} else {
+		if *configPath == "" {
+			*configPath = DefaultConfigPath()
+		}
+
 		// Load configuration.
-		config, err := ReadConfigFile(configPath)
+		config, err := ReadConfigFile(*configPath)
 		if err != nil {
 			return err
 		}
@@ -65,8 +70,6 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 		if updatedAt, err = db.UpdatedAt(); err != nil {
 			return err
 		}
-	} else {
-		return errors.New("config path or replica URL required")
 	}
 
 	var replicas []litestream.Replica
