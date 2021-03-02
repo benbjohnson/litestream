@@ -10,15 +10,15 @@ background process and safely replicates changes incrementally to another file
 or S3. Litestream only communicates with SQLite through the SQLite API so it
 will not corrupt your database.
 
-If you need support or have ideas for improving Litestream, please visit the
-[GitHub Discussions](https://github.com/benbjohnson/litestream/discussions) to
-chat. 
+If you need support or have ideas for improving Litestream, please join the
+[Litestream Slack][slack] or visit the [GitHub Discussions](https://github.com/benbjohnson/litestream/discussions).
+Please visit the [Litestream web site](https://litestream.io) for installation
+instructions and documentation.
 
 If you find this project interesting, please consider starring the project on
 GitHub.
 
-Please visit the [Litestream web site](https://litestream.io) for installation
-instructions and documentation.
+[slack]: https://join.slack.com/t/litestream/shared_invite/zt-n0j4s3ci-lx1JziR3bV6L2NMF723H3Q
 
 
 ## Acknowledgements
