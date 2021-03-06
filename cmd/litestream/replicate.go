@@ -115,8 +115,14 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 	// Serve metrics over HTTP if enabled.
 	if c.Config.Addr != "" {
-		_, port, _ := net.SplitHostPort(c.Config.Addr)
-		log.Printf("serving metrics on http://localhost:%s/metrics", port)
+		hostport := c.Config.Addr
+		if host, port, _ := net.SplitHostPort(c.Config.Addr); port == "" {
+			return fmt.Errorf("must specify port for bind address: %q", c.Config.Addr)
+		} else if host == "" {
+			hostport = net.JoinHostPort("localhost", port)
+		}
+
+		log.Printf("serving metrics on http://%s/metrics", hostport)
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
 			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
