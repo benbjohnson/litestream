@@ -260,6 +260,11 @@ func (db *DB) PageSize() int {
 
 // Open initializes the background monitoring goroutine.
 func (db *DB) Open() (err error) {
+	// Validate fields on database.
+	if db.MinCheckpointPageN <= 0 {
+		return fmt.Errorf("minimum checkpoint page count required")
+	}
+
 	// Validate that all replica names are unique.
 	m := make(map[string]struct{})
 	for _, r := range db.Replicas {
