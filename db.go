@@ -462,7 +462,7 @@ func (db *DB) init() (err error) {
 
 	// If we have an existing shadow WAL, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		log.Printf("%s: init: cannot determine last wal position, clearing generation (%s)", db.path, err)
+		log.Printf("%s: init: cannot determine last wal position, clearing generation; %s", db.path, err)
 		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove generation name: %w", err)
 		}
@@ -512,7 +512,7 @@ func (db *DB) verifyHeadersMatch() error {
 	}
 
 	if !bytes.Equal(hdr0, hdr1) {
-		return fmt.Errorf("wal header mismatch")
+		return fmt.Errorf("wal header mismatch %x <> %x on %s", hdr0, hdr1, shadowWALPath)
 	}
 	return nil
 }
