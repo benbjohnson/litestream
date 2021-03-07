@@ -1138,6 +1138,10 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 	} else if a := gcsRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], "us-east-1"
 		endpoint = "storage.googleapis.com"
+	} else if a := digitalOceanRegex.FindStringSubmatch(host); a != nil {
+		bucket = a[1]
+		region = a[2]
+		endpoint = fmt.Sprintf("%s.digitaloceanspaces.com", a[2])
 	} else if a := backblazeRegex.FindStringSubmatch(host); a != nil {
 		bucket = a[1]
 		region = a[2]
@@ -1161,9 +1165,10 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 }
 
 var (
-	localhostRegex = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
-	backblazeRegex = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
-	gcsRegex       = regexp.MustCompile(`^(?:(.+)\.)?storage.googleapis.com$`)
+	localhostRegex    = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
+	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
+	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
+	gcsRegex          = regexp.MustCompile(`^(?:(.+)\.)?storage.googleapis.com$`)
 )
 
 // S3 metrics.
