@@ -732,9 +732,13 @@ func (r *Replica) Init(ctx context.Context) (err error) {
 	// Endpoints are typically used for non-S3 object stores and do not
 	// necessarily require a region.
 	region := r.Region
-	if region == "" && r.Endpoint == "" {
-		if region, err = r.findBucketRegion(ctx, r.Bucket); err != nil {
-			return fmt.Errorf("cannot lookup bucket region: %w", err)
+	if region == "" {
+		if r.Endpoint == "" {
+			if region, err = r.findBucketRegion(ctx, r.Bucket); err != nil {
+				return fmt.Errorf("cannot lookup bucket region: %w", err)
+			}
+		} else {
+			region = "us-east-1" // default for non-S3 object stores
 		}
 	}
 
