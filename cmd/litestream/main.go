@@ -271,7 +271,7 @@ type ReplicaConfig struct {
 	Region          string `yaml:"region"`
 	Bucket          string `yaml:"bucket"`
 	Endpoint        string `yaml:"endpoint"`
-	ForcePathStyle  bool   `yaml:"force-path-style"`
+	ForcePathStyle  *bool  `yaml:"force-path-style"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
@@ -343,7 +343,14 @@ func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica,
 	}
 
 	bucket, path := c.Bucket, c.Path
-	region, endpoint, forcePathStyle := c.Region, c.Endpoint, c.ForcePathStyle
+	region, endpoint := c.Region, c.Endpoint
+
+	// Use path style if an endpoint is explicitly set. This works because the
+	// only service to not use path style is AWS which does not use an endpoint.
+	forcePathStyle := (endpoint != "")
+	if v := c.ForcePathStyle; v != nil {
+		forcePathStyle = *v
+	}
 
 	// Apply settings from URL, if specified.
 	if c.URL != "" {
