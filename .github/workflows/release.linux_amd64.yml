@@ -3,7 +3,7 @@ on:
     types:
       - created
 
-name: release (linux/amd64-static)
+name: release (linux/amd64)
 jobs:
   linux:
     runs-on: ubuntu-latest
@@ -26,10 +26,11 @@ jobs:
           mkdir -p dist
           cp etc/litestream.yml etc/litestream.service dist
           cat etc/nfpm.yml | LITESTREAM_VERSION=${{ steps.release.outputs.tag_name }} envsubst > dist/nfpm.yml
-          go build -ldflags "-w -extldflags "-static" -X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
+          go build -ldflags "-X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
+          
           cd dist
-          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-linux-amd64-static.tar.gz litestream
-          ../nfpm pkg --config nfpm.yml --packager deb --target litestream-${{ steps.release.outputs.tag_name }}-linux-amd64-static.deb 
+          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz litestream
+          ../nfpm pkg --config nfpm.yml --packager deb --target litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.deb 
 
       - name: Upload release binary
         uses: actions/upload-release-asset@v1.0.2
@@ -37,8 +38,18 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-linux-amd64-static.tar.gz
-          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64-static.tar.gz
+          asset_path: ./dist/litestream
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64
+          asset_content_type: application/octet-stream
+
+      - name: Upload release tarball
+        uses: actions/upload-release-asset@v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.tar.gz
           asset_content_type: application/gzip
 
       - name: Upload debian package
@@ -47,6 +58,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-linux-amd64-static.deb
-          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64-static.deb
+          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.deb
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-linux-amd64.deb
           asset_content_type: application/octet-stream
