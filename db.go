@@ -291,18 +291,50 @@ func (db *DB) Open() (err error) {
 // Close releases the read lock & closes the database. This method should only
 // be called by tests as it causes the underlying database to be checkpointed.
 func (db *DB) Close() (err error) {
-	// Ensure replicas all stop replicating.
-	for _, r := range db.Replicas {
-		r.Stop(true)
+	return db.close(false)
+}
+
+// SoftClose closes everything but the underlying db connection. This method
+// is available because the binary needs to avoid closing the database on exit
+// to prevent autocheckpointing.
+func (db *DB) SoftClose() (err error) {
+	return db.close(true)
+}
+
+func (db *DB) close(soft bool) (err error) {
+	db.cancel()
+	db.wg.Wait()
+
+	// Start a new context for shutdown since we canceled the DB context.
+	ctx := context.Background()
+
+	// Perform a final db sync, if initialized.
+	if db.db != nil {
+		if e := db.Sync(ctx); e != nil && err == nil {
+			err = e
+		}
 	}
 
+	// Ensure replicas perform a final sync and stop replicating.
+	for _, r := range db.Replicas {
+		if db.db != nil {
+			if e := r.Sync(ctx); e != nil && err == nil {
+				err = e
+			}
+		}
+		r.Stop(!soft)
+	}
+
+	// Release the read lock to allow other applications to handle checkpointing.
 	if db.rtx != nil {
 		if e := db.releaseReadLock(); e != nil && err == nil {
 			err = e
 		}
 	}
 
-	if db.db != nil {
+	// Only perform full close if this is not a soft close.
+	// This closes the underlying database connection which can clean up the WAL.
+	if !soft && db.db != nil {
 		if e := db.db.Close(); e != nil && err == nil {
 			err = e
 		}
@@ -597,26 +629,6 @@ func (db *DB) cleanWAL() error {
 	return nil
 }
 
-// SoftClose closes everything but the underlying db connection. This method
-// is available because the binary needs to avoid closing the database on exit
-// to prevent autocheckpointing.
-func (db *DB) SoftClose() (err error) {
-	db.cancel()
-	db.wg.Wait()
-
-	// Ensure replicas all stop replicating.
-	for _, r := range db.Replicas {
-		r.Stop(false)
-	}
-
-	if db.rtx != nil {
-		if e := db.releaseReadLock(); e != nil && err == nil {
-			err = e
-		}
-	}
-	return err
-}
-
 // acquireReadLock begins a read transaction on the database to prevent checkpointing.
 func (db *DB) acquireReadLock() error {
 	if db.rtx != nil {
@@ -711,7 +723,7 @@ func (db *DB) createGeneration() (string, error) {
 }
 
 // Sync copies pending data from the WAL to the shadow WAL.
-func (db *DB) Sync() (err error) {
+func (db *DB) Sync(ctx context.Context) (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -755,7 +767,7 @@ func (db *DB) Sync() (err error) {
 	// insert will never actually occur because our tx will be rolled back,
 	// however, it will ensure our tx grabs the write lock. Unfortunately,
 	// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
-	if _, err := tx.ExecContext(db.ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
 		return fmt.Errorf("_litestream_lock: %w", err)
 	}
 
@@ -814,7 +826,7 @@ func (db *DB) Sync() (err error) {
 	if checkpoint {
 		changed = true
 
-		if err := db.checkpointAndInit(info.generation, checkpointMode); err != nil {
+		if err := db.checkpointAndInit(ctx, info.generation, checkpointMode); err != nil {
 			return fmt.Errorf("checkpoint: mode=%v err=%w", checkpointMode, err)
 		}
 	}
@@ -1325,7 +1337,7 @@ func (db *DB) checkpoint(mode string) (err error) {
 
 // checkpointAndInit performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
-func (db *DB) checkpointAndInit(generation, mode string) error {
+func (db *DB) checkpointAndInit(ctx context.Context, generation, mode string) error {
 	shadowWALPath, err := db.CurrentShadowWALPath(generation)
 	if err != nil {
 		return err
@@ -1368,7 +1380,7 @@ func (db *DB) checkpointAndInit(generation, mode string) error {
 	// insert will never actually occur because our tx will be rolled back,
 	// however, it will ensure our tx grabs the write lock. Unfortunately,
 	// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
-	if _, err := tx.ExecContext(db.ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
 		return fmt.Errorf("_litestream_lock: %w", err)
 	}
 
@@ -1410,7 +1422,7 @@ func (db *DB) monitor() {
 		}
 
 		// Sync the database to the shadow WAL.
-		if err := db.Sync(); err != nil && !errors.Is(err, context.Canceled) {
+		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			log.Printf("%s: sync error: %s", db.path, err)
 		}
 	}
@@ -1666,7 +1678,7 @@ func restoreWAL(ctx context.Context, r Replica, generation string, index int, db
 // unable to checkpoint during this time.
 //
 // If dst is set, the database file is copied to that location before checksum.
-func (db *DB) CRC64() (uint64, Pos, error) {
+func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -1684,7 +1696,7 @@ func (db *DB) CRC64() (uint64, Pos, error) {
 	}
 
 	// Force a RESTART checkpoint to ensure the database is at the start of the WAL.
-	if err := db.checkpointAndInit(generation, CheckpointModeRestart); err != nil {
+	if err := db.checkpointAndInit(ctx, generation, CheckpointModeRestart); err != nil {
 		return 0, Pos{}, err
 	}
 

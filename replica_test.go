@@ -15,7 +15,7 @@ func TestFileReplica_Sync(t *testing.T) {
 		r := NewTestFileReplica(t, db)
 
 		// Sync database & then sync replica.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := r.Sync(context.Background()); err != nil {
 			t.Fatal(err)
@@ -47,7 +47,7 @@ func TestFileReplica_Sync(t *testing.T) {
 
 			// Sync periodically.
 			if i%100 == 0 || i == n-1 {
-				if err := db.Sync(); err != nil {
+				if err := db.Sync(context.Background()); err != nil {
 					t.Fatal(err)
 				} else if err := r.Sync(context.Background()); err != nil {
 					t.Fatal(err)

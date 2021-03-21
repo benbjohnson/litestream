@@ -37,6 +37,9 @@ type Replica interface {
 	// Stops all replication processing. Blocks until processing stopped.
 	Stop(hard bool) error
 
+	// Performs a backup of outstanding WAL frames to the replica.
+	Sync(ctx context.Context) error
+
 	// Returns the last replication position.
 	LastPos() Pos
 
@@ -1164,7 +1167,7 @@ func ValidateReplica(ctx context.Context, r Replica) error {
 
 	// Compute checksum of primary database under lock. This prevents a
 	// sync from occurring and the database will not be written.
-	chksum0, pos, err := db.CRC64()
+	chksum0, pos, err := db.CRC64(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot compute checksum: %w", err)
 	}
