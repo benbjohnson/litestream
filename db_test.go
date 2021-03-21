@@ -1,10 +1,12 @@
 package litestream_test
 
 import (
+	"context"
 	"database/sql"
 	"io/ioutil"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,7 +120,7 @@ func TestDB_CRC64(t *testing.T) {
 	t.Run("ErrNotExist", func(t *testing.T) {
 		db := MustOpenDB(t)
 		defer MustCloseDB(t, db)
-		if _, _, err := db.CRC64(); !os.IsNotExist(err) {
+		if _, _, err := db.CRC64(context.Background()); !os.IsNotExist(err) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -127,11 +129,11 @@ func TestDB_CRC64(t *testing.T) {
 		db, sqldb := MustOpenDBs(t)
 		defer MustCloseDBs(t, db, sqldb)
 
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
-		chksum0, _, err := db.CRC64()
+		chksum0, _, err := db.CRC64(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -139,7 +141,7 @@ func TestDB_CRC64(t *testing.T) {
 		// Issue change that is applied to the WAL. Checksum should not change.
 		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
-		} else if chksum1, _, err := db.CRC64(); err != nil {
+		} else if chksum1, _, err := db.CRC64(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if chksum0 == chksum1 {
 			t.Fatal("expected different checksum event after WAL change")
@@ -150,7 +152,7 @@ func TestDB_CRC64(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if chksum2, _, err := db.CRC64(); err != nil {
+		if chksum2, _, err := db.CRC64(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if chksum0 == chksum2 {
 			t.Fatal("expected different checksums after checkpoint")
@@ -164,7 +166,7 @@ func TestDB_Sync(t *testing.T) {
 	t.Run("NoDB", func(t *testing.T) {
 		db := MustOpenDB(t)
 		defer MustCloseDB(t, db)
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -174,7 +176,7 @@ func TestDB_Sync(t *testing.T) {
 		db, sqldb := MustOpenDBs(t)
 		defer MustCloseDBs(t, db, sqldb)
 
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -212,7 +214,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Perform initial sync & grab initial position.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -227,7 +229,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Sync to ensure position moves forward one page.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if pos1, err := db.Pos(); err != nil {
 			t.Fatal(err)
@@ -246,7 +248,7 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDBs(t, db, sqldb)
 
 		// Issue initial sync and truncate WAL.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -275,7 +277,7 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDB(t, db)
 
 		// Re-sync and ensure new generation has been created.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -298,7 +300,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Issue initial sync and truncate WAL.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -334,7 +336,7 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDB(t, db)
 
 		// Re-sync and ensure new generation has been created.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -354,7 +356,7 @@ func TestDB_Sync(t *testing.T) {
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -378,7 +380,7 @@ func TestDB_Sync(t *testing.T) {
 		// Reopen managed database & ensure sync will still work.
 		db = MustOpenDBAt(t, db.Path())
 		defer MustCloseDB(t, db)
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -398,7 +400,7 @@ func TestDB_Sync(t *testing.T) {
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -417,7 +419,7 @@ func TestDB_Sync(t *testing.T) {
 		// Reopen managed database & ensure sync will still work.
 		db = MustOpenDBAt(t, db.Path())
 		defer MustCloseDB(t, db)
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -437,7 +439,7 @@ func TestDB_Sync(t *testing.T) {
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -462,7 +464,7 @@ func TestDB_Sync(t *testing.T) {
 		// Reopen managed database & ensure sync will still work.
 		db = MustOpenDBAt(t, db.Path())
 		defer MustCloseDB(t, db)
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -489,7 +491,7 @@ func TestDB_Sync(t *testing.T) {
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -508,7 +510,7 @@ func TestDB_Sync(t *testing.T) {
 		// Reopen managed database & ensure sync will still work.
 		db = MustOpenDBAt(t, db.Path())
 		defer MustCloseDB(t, db)
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -532,7 +534,7 @@ func TestDB_Sync(t *testing.T) {
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -544,7 +546,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Sync to shadow WAL.
-		if err := db.Sync(); err != nil {
+		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -564,7 +566,7 @@ func TestDB_Sync(t *testing.T) {
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -574,7 +576,7 @@ func TestDB_Sync(t *testing.T) {
 		// Write to WAL & sync.
 		if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(); err != nil {
+		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -589,12 +591,14 @@ func TestDB_Sync(t *testing.T) {
 
 // MustOpenDBs returns a new instance of a DB & associated SQL DB.
 func MustOpenDBs(tb testing.TB) (*litestream.DB, *sql.DB) {
+	tb.Helper()
 	db := MustOpenDB(tb)
 	return db, MustOpenSQLDB(tb, db.Path())
 }
 
 // MustCloseDBs closes db & sqldb and removes the parent directory.
 func MustCloseDBs(tb testing.TB, db *litestream.DB, sqldb *sql.DB) {
+	tb.Helper()
 	MustCloseDB(tb, db)
 	MustCloseSQLDB(tb, sqldb)
 }
@@ -619,7 +623,7 @@ func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 // MustCloseDB closes db and removes its parent directory.
 func MustCloseDB(tb testing.TB, db *litestream.DB) {
 	tb.Helper()
-	if err := db.Close(); err != nil {
+	if err := db.Close(); err != nil && !strings.Contains(err.Error(), `database is closed`) {
 		tb.Fatal(err)
 	} else if err := os.RemoveAll(filepath.Dir(db.Path())); err != nil {
 		tb.Fatal(err)
