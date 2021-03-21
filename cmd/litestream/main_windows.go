@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/svc"
@@ -102,4 +103,10 @@ type eventlogWriter eventlog.Log
 func (w *eventlogWriter) Write(p []byte) (n int, err error) {
 	elog := (*eventlog.Log)(w)
 	return 0, elog.Info(1, string(p))
+}
+
+func signalChan() <-chan os.Signal {
+	ch := make(chan os.Signal, 1)
+	signal.Notify(ch, os.Interrupt)
+	return ch
 }

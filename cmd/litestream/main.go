@@ -79,8 +79,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 		// Setup signal handler.
 		ctx, cancel := context.WithCancel(ctx)
-		ch := make(chan os.Signal, 1)
-		signal.Notify(ch, os.Interrupt)
+		ch := signalChan()
 		go func() { <-ch; cancel() }()
 
 		if err := c.Run(ctx); err != nil {
@@ -90,9 +89,14 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Wait for signal to stop program.
 		<-ctx.Done()
 		signal.Reset()
+		fmt.Println("signal received, litestream shutting down")
 
 		// Gracefully close.
-		return c.Close()
+		if err := c.Close(); err != nil {
+			return err
+		}
+		fmt.Println("litestream shut down")
+		return nil
 
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
