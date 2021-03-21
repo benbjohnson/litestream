@@ -27,6 +27,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
 	fs.IntVar(&opt.Index, "index", opt.Index, "wal index")
 	fs.BoolVar(&opt.DryRun, "dry-run", false, "dry run")
+	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
 	fs.Usage = c.Usage
@@ -74,7 +75,12 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Return an error if no matching targets found.
+	// If optional flag set, return success. Useful for automated recovery.
 	if opt.Generation == "" {
+		if *ifReplicaExists {
+			fmt.Println("no matching backups found")
+			return nil
+		}
 		return fmt.Errorf("no matching backups found")
 	}
 
@@ -167,6 +173,9 @@ Arguments:
 	-dry-run
 	    Prints all log output as if it were running but does
 	    not perform actual restore.
+
+	-if-replica-exists
+	    Returns exit code of 0 if no backups found.
 
 	-v
 	    Verbose output.
