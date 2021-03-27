@@ -276,6 +276,7 @@ type ReplicaConfig struct {
 	Bucket          string `yaml:"bucket"`
 	Endpoint        string `yaml:"endpoint"`
 	ForcePathStyle  *bool  `yaml:"force-path-style"`
+	SkipVerify      bool   `yaml:"skip-verify"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
@@ -347,7 +348,7 @@ func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica,
 	}
 
 	bucket, path := c.Bucket, c.Path
-	region, endpoint := c.Region, c.Endpoint
+	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
 
 	// Use path style if an endpoint is explicitly set. This works because the
 	// only service to not use path style is AWS which does not use an endpoint.
@@ -396,6 +397,7 @@ func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica,
 	r.Region = region
 	r.Endpoint = endpoint
 	r.ForcePathStyle = forcePathStyle
+	r.SkipVerify = skipVerify
 
 	if v := c.Retention; v > 0 {
 		r.Retention = v
