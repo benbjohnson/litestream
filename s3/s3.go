@@ -3,11 +3,13 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"io/ioutil"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"path"
 	"regexp"
@@ -79,6 +81,7 @@ type Replica struct {
 	Path           string
 	Endpoint       string
 	ForcePathStyle bool
+	SkipVerify     bool
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
@@ -769,6 +772,12 @@ func (r *Replica) config() *aws.Config {
 	if r.ForcePathStyle {
 		config.S3ForcePathStyle = aws.Bool(r.ForcePathStyle)
 	}
+	if r.SkipVerify {
+		config.HTTPClient = &http.Client{Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		}}
+	}
+
 	return config
 }
 
