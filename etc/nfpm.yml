@@ -1,6 +1,6 @@
 name: litestream
-arch: amd64
-platform: linux
+arch: "${GOARCH}"
+platform: "${GOOS}"
 version: "${LITESTREAM_VERSION}"
 section: "default"
 priority: "extra"

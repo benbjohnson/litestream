@@ -1109,7 +1109,7 @@ func WALIndexAt(ctx context.Context, r Replica, generation string, maxIndex int,
 	}
 
 	// If max index is specified but not found, return an error.
-	if maxIndex != math.MaxInt64 && index != maxIndex {
+	if maxIndex != math.MaxInt32 && index != maxIndex {
 		return index, fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", maxIndex, generation, index)
 	}
 	return index, nil
