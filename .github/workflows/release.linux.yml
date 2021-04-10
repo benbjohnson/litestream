@@ -47,7 +47,7 @@ jobs:
           mkdir -p dist
           cp etc/litestream.yml etc/litestream.service dist
           cat etc/nfpm.yml | LITESTREAM_VERSION=${{ steps.release.outputs.tag_name }} envsubst > dist/nfpm.yml
-          go build -ldflags "-X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
+          CGO_ENABLED=1 go build -ldflags "-X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
           
           cd dist
           tar -czvf litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}.tar.gz litestream
