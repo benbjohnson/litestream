@@ -1438,9 +1438,9 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 	// Validate options.
 	if opt.OutputPath == "" {
 		return fmt.Errorf("output path required")
-	} else if opt.Generation == "" && opt.Index != math.MaxInt64 {
+	} else if opt.Generation == "" && opt.Index != math.MaxInt32 {
 		return fmt.Errorf("must specify generation when restoring to index")
-	} else if opt.Index != math.MaxInt64 && !opt.Timestamp.IsZero() {
+	} else if opt.Index != math.MaxInt32 && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot specify index & timestamp to restore")
 	}
 
@@ -1733,7 +1733,7 @@ type RestoreOptions struct {
 	Generation string
 
 	// Specific index to restore from.
-	// Set to math.MaxInt64 to ignore index.
+	// Set to math.MaxInt32 to ignore index.
 	Index int
 
 	// Point-in-time to restore database.
@@ -1752,7 +1752,7 @@ type RestoreOptions struct {
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.
 func NewRestoreOptions() RestoreOptions {
 	return RestoreOptions{
-		Index: math.MaxInt64,
+		Index: math.MaxInt32,
 	}
 }
 

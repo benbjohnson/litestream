@@ -1,0 +1,65 @@
+on:
+  release:
+    types:
+      - created
+
+name: release (linux/static)
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            cc:   gcc
+          - arch: arm64
+            cc:   aarch64-linux-gnu-gcc
+          - arch: arm
+            cc:   arm-linux-gnueabihf-gcc
+
+    env:
+      GOOS:   linux
+      GOARCH: ${{ matrix.arch }}
+      CC:     ${{ matrix.cc }}
+
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+
+      - id: release
+        uses: bruceadams/get-release@v1.2.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update 
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+
+      - name: Build litestream
+        run: |
+          rm -rf dist
+          mkdir -p dist
+          go build -ldflags "-w -extldflags "-static" -X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
+          cd dist
+          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static.tar.gz litestream
+
+      - name: Upload release binary
+        uses: actions/upload-release-asset@v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: ./dist/litestream
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static
+          asset_content_type: application/octet-stream
+
+      - name: Upload release tarball
+        uses: actions/upload-release-asset@v1.0.2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          upload_url: ${{ steps.release.outputs.upload_url }}
+          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static.tar.gz
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static.tar.gz
+          asset_content_type: application/gzip
