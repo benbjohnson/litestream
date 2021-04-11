@@ -15,11 +15,16 @@ jobs:
           - arch: arm64
             cc:   aarch64-linux-gnu-gcc
           - arch: arm
+            arm:  6
+            cc:   arm-linux-gnueabi-gcc
+          - arch: arm
+            arm:  7
             cc:   arm-linux-gnueabihf-gcc
 
     env:
       GOOS:   linux
       GOARCH: ${{ matrix.arch }}
+      GOARM:  ${{ matrix.arm }}
       CC:     ${{ matrix.cc }}
 
     steps:
@@ -34,7 +39,7 @@ jobs:
       - name: Install cross-compilers
         run: |
           sudo apt-get update 
-          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-arm-linux-gnueabi
 
       - name: Build litestream
         run: |
@@ -42,7 +47,7 @@ jobs:
           mkdir -p dist
           CGO_ENABLED=1 go build -ldflags "-w -extldflags "-static" -X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
           cd dist
-          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static.tar.gz litestream
+          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}-static.tar.gz litestream
 
       - name: Upload release binary
         uses: actions/upload-release-asset@v1.0.2
@@ -51,7 +56,7 @@ jobs:
         with:
           upload_url: ${{ steps.release.outputs.upload_url }}
           asset_path: ./dist/litestream
-          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}-static
           asset_content_type: application/octet-stream
 
       - name: Upload release tarball
@@ -60,6 +65,6 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
         with:
           upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static.tar.gz
-          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}-static.tar.gz
+          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}-static.tar.gz
+          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}-static.tar.gz
           asset_content_type: application/gzip
