@@ -452,7 +452,7 @@ func (db *DB) init() (err error) {
 	// https://www.sqlite.org/pragma.html#pragma_journal_mode
 	var mode string
 	if err := db.db.QueryRow(`PRAGMA journal_mode = wal;`).Scan(&mode); err != nil {
-		return fmt.Errorf("enable wal: %w", err)
+		return err
 	} else if mode != "wal" {
 		return fmt.Errorf("enable wal failed, mode=%q", mode)
 	}
