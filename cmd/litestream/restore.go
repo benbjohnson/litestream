@@ -21,7 +21,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	opt.Verbose = true
 
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
-	configPath := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
@@ -69,7 +69,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, &opt); err != nil {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, &opt); err != nil {
 			return err
 		}
 	}
@@ -98,9 +98,9 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, opt *litestream.RestoreOptions) (litestream.Replica, error) {
+func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv bool, opt *litestream.RestoreOptions) (litestream.Replica, error) {
 	// Load configuration.
-	config, err := ReadConfigFile(configPath)
+	config, err := ReadConfigFile(configPath, expandEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -149,6 +149,9 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-no-expand-env
+	    Disables environment variable expansion in configuration file.
 
 	-replica NAME
 	    Restore from a specific replica.

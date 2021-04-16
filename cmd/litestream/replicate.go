@@ -32,7 +32,7 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	tracePath := fs.String("trace", "", "trace path")
-	configPath := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -58,7 +58,7 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if c.Config, err = ReadConfigFile(*configPath); err != nil {
+		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
 			return err
 		}
 	}
@@ -167,6 +167,9 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-no-expand-env
+	    Disables environment variable expansion in configuration file.
 
 	-trace PATH
 	    Write verbose trace logging to PATH.
