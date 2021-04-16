@@ -1,5 +1,8 @@
 default:
 
+docker:
+	docker build -t litestream .
+
 dist-linux:
 	mkdir -p dist
 	cp etc/litestream.yml dist/litestream.yml
