@@ -179,7 +179,8 @@ func (c *Config) DBConfig(path string) *DBConfig {
 }
 
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
-func ReadConfigFile(filename string) (_ Config, err error) {
+// If expandEnv is true then environment variables are expanded in the config.
+func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	config := DefaultConfig()
 
 	// Expand filename, if necessary.
@@ -188,12 +189,20 @@ func ReadConfigFile(filename string) (_ Config, err error) {
 		return config, err
 	}
 
-	// Read & deserialize configuration.
-	if buf, err := ioutil.ReadFile(filename); os.IsNotExist(err) {
+	// Read configuration.
+	buf, err := ioutil.ReadFile(filename)
+	if os.IsNotExist(err) {
 		return config, fmt.Errorf("config file not found: %s", filename)
 	} else if err != nil {
 		return config, err
-	} else if err := yaml.Unmarshal(buf, &config); err != nil {
+	}
+
+	// Expand environment variables, if enabled.
+	if expandEnv {
+		buf = []byte(os.ExpandEnv(string(buf)))
+	}
+
+	if err := yaml.Unmarshal(buf, &config); err != nil {
 		return config, err
 	}
 
@@ -461,8 +470,9 @@ func DefaultConfigPath() string {
 	return defaultConfigPath
 }
 
-func registerConfigFlag(fs *flag.FlagSet) *string {
-	return fs.String("config", "", "config path")
+func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
+	return fs.String("config", "", "config path"),
+		fs.Bool("no-expand-env", false, "do not expand env vars in config")
 }
 
 // expand returns an absolute path for s.

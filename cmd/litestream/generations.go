@@ -18,7 +18,7 @@ type GenerationsCommand struct{}
 // Run executes the command.
 func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-generations", flag.ContinueOnError)
-	configPath := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -45,7 +45,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 		}
 
 		// Load configuration.
-		config, err := ReadConfigFile(*configPath)
+		config, err := ReadConfigFile(*configPath, !*noExpandEnv)
 		if err != nil {
 			return err
 		}
@@ -130,6 +130,9 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-no-expand-env
+	    Disables environment variable expansion in configuration file.
 
 	-replica NAME
 	    Optional, filters by replica.

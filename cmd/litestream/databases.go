@@ -15,7 +15,7 @@ type DatabasesCommand struct{}
 // Run executes the command.
 func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-databases", flag.ContinueOnError)
-	configPath := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -27,7 +27,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	if *configPath == "" {
 		*configPath = DefaultConfigPath()
 	}
-	config, err := ReadConfigFile(*configPath)
+	config, err := ReadConfigFile(*configPath, !*noExpandEnv)
 	if err != nil {
 		return err
 	}
@@ -71,6 +71,9 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-no-expand-env
+	    Disables environment variable expansion in configuration file.
 
 `[1:],
 		DefaultConfigPath(),

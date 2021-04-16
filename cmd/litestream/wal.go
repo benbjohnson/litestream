@@ -17,7 +17,7 @@ type WALCommand struct{}
 // Run executes the command.
 func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-wal", flag.ContinueOnError)
-	configPath := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	replicaName := fs.String("replica", "", "replica name")
 	generation := fs.String("generation", "", "generation name")
 	fs.Usage = c.Usage
@@ -44,7 +44,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Load configuration.
-		config, err := ReadConfigFile(*configPath)
+		config, err := ReadConfigFile(*configPath, !*noExpandEnv)
 		if err != nil {
 			return err
 		}
@@ -117,6 +117,9 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-no-expand-env
+	    Disables environment variable expansion in configuration file.
 
 	-replica NAME
 	    Optional, filter by a specific replica.

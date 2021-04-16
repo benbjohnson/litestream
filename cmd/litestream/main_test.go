@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"io/ioutil"
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -26,7 +27,7 @@ dbs:
 			t.Fatal(err)
 		}
 
-		config, err := main.ReadConfigFile(filename)
+		config, err := main.ReadConfigFile(filename, true)
 		if err != nil {
 			t.Fatal(err)
 		} else if got, want := config.AccessKeyID, `XXX`; got != want {
@@ -37,6 +38,56 @@ dbs:
 			t.Fatalf("Replica.AccessKeyID=%v, want %v", got, want)
 		} else if got, want := config.DBs[0].Replicas[0].SecretAccessKey, `YYY`; got != want {
 			t.Fatalf("Replica.SecretAccessKey=%v, want %v", got, want)
+		}
+	})
+
+	// Ensure environment variables are expanded.
+	t.Run("ExpandEnv", func(t *testing.T) {
+		os.Setenv("LITESTREAM_TEST_0129380", "/path/to/db")
+		os.Setenv("LITESTREAM_TEST_1872363", "s3://foo/bar")
+
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := ioutil.WriteFile(filename, []byte(`
+dbs:
+  - path: $LITESTREAM_TEST_0129380
+    replicas:
+      - url: ${LITESTREAM_TEST_1872363}
+      - url: ${LITESTREAM_TEST_NO_SUCH_ENV}
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, true)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := config.DBs[0].Path, `/path/to/db`; got != want {
+			t.Fatalf("DB.Path=%v, want %v", got, want)
+		} else if got, want := config.DBs[0].Replicas[0].URL, `s3://foo/bar`; got != want {
+			t.Fatalf("Replica[0].URL=%v, want %v", got, want)
+		} else if got, want := config.DBs[0].Replicas[1].URL, ``; got != want {
+			t.Fatalf("Replica[1].URL=%v, want %v", got, want)
+		}
+	})
+
+	// Ensure environment variables are not expanded.
+	t.Run("NoExpandEnv", func(t *testing.T) {
+		os.Setenv("LITESTREAM_TEST_9847533", "s3://foo/bar")
+
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := ioutil.WriteFile(filename, []byte(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - url: ${LITESTREAM_TEST_9847533}
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := config.DBs[0].Replicas[0].URL, `${LITESTREAM_TEST_9847533}`; got != want {
+			t.Fatalf("Replica.URL=%v, want %v", got, want)
 		}
 	})
 }
