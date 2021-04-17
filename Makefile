@@ -20,7 +20,7 @@ ifndef LITESTREAM_VERSION
 	$(error LITESTREAM_VERSION is undefined)
 endif
 	mkdir -p dist
-	go build -v -ldflags "-X 'main.Version=${LITESTREAM_VERSION}'"  -o dist/litestream ./cmd/litestream
+	go build -v -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}'"  -o dist/litestream ./cmd/litestream
 	gon etc/gon.hcl
 	mv dist/litestream.zip dist/litestream-${LITESTREAM_VERSION}-darwin-amd64.zip
 	openssl dgst -sha256 dist/litestream-${LITESTREAM_VERSION}-darwin-amd64.zip
