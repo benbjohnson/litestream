@@ -45,7 +45,7 @@ jobs:
         run: |
           rm -rf dist
           mkdir -p dist
-          CGO_ENABLED=1 go build -ldflags "-w -extldflags "-static" -X 'main.Version=${{ steps.release.outputs.tag_name }}'" -o dist/litestream ./cmd/litestream
+          CGO_ENABLED=1 go build -ldflags "-w -extldflags "-static" -X 'main.Version=${{ steps.release.outputs.tag_name }}'" -tags sqlite_omit_load_extension -o dist/litestream ./cmd/litestream
           cd dist
           tar -czvf litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}-static.tar.gz litestream
 
