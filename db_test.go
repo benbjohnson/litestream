@@ -100,9 +100,12 @@ func TestDB_UpdatedAt(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		sleepTime := 100 * time.Millisecond
 		if os.Getenv("CI") != "" {
-			time.Sleep(1 * time.Second)
+			sleepTime = 1 * time.Second
 		}
+		time.Sleep(sleepTime)
+
 		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
