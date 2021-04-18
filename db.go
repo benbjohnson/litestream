@@ -1455,13 +1455,11 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 		logPrefix = fmt.Sprintf("%s(%s)", db.Path(), r.Name())
 	}
 
-	// Ensure output path does not already exist (unless this is a dry run).
-	if !opt.DryRun {
-		if _, err := os.Stat(opt.OutputPath); err == nil {
-			return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
-		} else if err != nil && !os.IsNotExist(err) {
-			return err
-		}
+	// Ensure output path does not already exist.
+	if _, err := os.Stat(opt.OutputPath); err == nil {
+		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
 	}
 
 	// Find lastest snapshot that occurs before timestamp.
@@ -1483,21 +1481,17 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 
 	// Copy snapshot to output path.
 	logger.Printf("%s: restoring snapshot %s/%08x to %s", logPrefix, opt.Generation, minWALIndex, tmpPath)
-	if !opt.DryRun {
-		if err := restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
-			return fmt.Errorf("cannot restore snapshot: %w", err)
-		}
+	if err := restoreSnapshot(ctx, r, pos.Generation, pos.Index, tmpPath); err != nil {
+		return fmt.Errorf("cannot restore snapshot: %w", err)
 	}
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
-		if !opt.DryRun {
-			if err = restoreWAL(ctx, r, opt.Generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
-				logger.Printf("%s: no wal available, snapshot only", logPrefix)
-				break // snapshot file only, ignore error
-			} else if err != nil {
-				return fmt.Errorf("cannot restore wal: %w", err)
-			}
+		if err = restoreWAL(ctx, r, opt.Generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
+			logger.Printf("%s: no wal available, snapshot only", logPrefix)
+			break // snapshot file only, ignore error
+		} else if err != nil {
+			return fmt.Errorf("cannot restore wal: %w", err)
 		}
 
 		if opt.Verbose {
@@ -1507,10 +1501,8 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 
 	// Copy file to final location.
 	logger.Printf("%s: renaming database from temporary location", logPrefix)
-	if !opt.DryRun {
-		if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
-			return err
-		}
+	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
+		return err
 	}
 
 	return nil
@@ -1739,10 +1731,6 @@ type RestoreOptions struct {
 	// Point-in-time to restore database.
 	// If zero, database restore to most recent state available.
 	Timestamp time.Time
-
-	// If true, no actual restore is performed.
-	// Only equivalent log output for a regular restore.
-	DryRun bool
 
 	// Logging settings.
 	Logger  *log.Logger

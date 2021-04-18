@@ -26,7 +26,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
 	fs.IntVar(&opt.Index, "index", opt.Index, "wal index")
-	fs.BoolVar(&opt.DryRun, "dry-run", false, "dry run")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
@@ -44,11 +43,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if opt.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
 			return errors.New("invalid -timestamp, must specify in ISO 8601 format (e.g. 2000-01-01T00:00:00Z)")
 		}
-	}
-
-	// Verbose output is automatically enabled if dry run is specified.
-	if opt.DryRun {
-		*verbose = true
 	}
 
 	// Instantiate logger if verbose output is enabled.
@@ -172,10 +166,6 @@ Arguments:
 	-o PATH
 	    Output path of the restored database.
 	    Defaults to original DB path.
-
-	-dry-run
-	    Prints all log output as if it were running but does
-	    not perform actual restore.
 
 	-if-replica-exists
 	    Returns exit code of 0 if no backups found.
