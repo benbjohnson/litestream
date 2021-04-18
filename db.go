@@ -1487,6 +1487,7 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
+		logger.Printf("%s: restoring wal %s/%08x", logPrefix, opt.Generation, index)
 		if err = restoreWAL(ctx, r, opt.Generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
 			logger.Printf("%s: no wal available, snapshot only", logPrefix)
 			break // snapshot file only, ignore error
@@ -1494,8 +1495,9 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 			return fmt.Errorf("cannot restore wal: %w", err)
 		}
 
-		if opt.Verbose {
-			logger.Printf("%s: restored wal %s/%08x", logPrefix, opt.Generation, index)
+		logger.Printf("%s: applying wal %s/%08x", logPrefix, opt.Generation, index)
+		if err = applyWAL(ctx, tmpPath); err != nil {
+			return fmt.Errorf("cannot apply wal: %w", err)
 		}
 	}
 
@@ -1645,7 +1647,11 @@ func restoreWAL(ctx context.Context, r Replica, generation string, index int, db
 	} else if err := f.Close(); err != nil {
 		return err
 	}
+	return nil
+}
 
+// applyWAL performs a truncating checkpoint on the given database.
+func applyWAL(ctx context.Context, dbPath string) error {
 	// Open SQLite database and force a truncating checkpoint.
 	d, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
@@ -1659,7 +1665,6 @@ func restoreWAL(ctx context.Context, r Replica, generation string, index int, db
 	} else if row[0] != 0 {
 		return fmt.Errorf("truncation checkpoint failed during restore (%d,%d,%d)", row[0], row[1], row[2])
 	}
-
 	return d.Close()
 }
 
