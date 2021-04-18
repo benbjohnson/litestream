@@ -70,7 +70,7 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			return err
 		}
 		defer f.Close()
-		litestream.Tracef = log.New(f, "", log.LstdFlags|log.LUTC|log.Lshortfile).Printf
+		litestream.Tracef = log.New(f, "", log.LstdFlags|log.Lmicroseconds|log.LUTC|log.Lshortfile).Printf
 	}
 
 	return nil
