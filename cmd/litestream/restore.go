@@ -53,7 +53,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Instantiate logger if verbose output is enabled.
 	if *verbose {
-		opt.Logger = log.New(os.Stderr, "", log.LstdFlags)
+		opt.Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	}
 
 	// Determine replica & generation to restore from.
