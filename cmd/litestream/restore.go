@@ -25,7 +25,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
-	fs.IntVar(&opt.Index, "index", opt.Index, "wal index")
+	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
@@ -156,7 +156,7 @@ Arguments:
 	    Defaults to generation with latest data.
 
 	-index NUM
-	    Restore up to a specific WAL index (inclusive).
+	    Restore up to a specific hex-encoded WAL index (inclusive).
 	    Defaults to use the highest available index.
 
 	-timestamp TIMESTAMP
