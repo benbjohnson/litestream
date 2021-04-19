@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -496,4 +497,25 @@ func expand(s string) (string, error) {
 		return u.HomeDir, nil
 	}
 	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
+}
+
+// indexVar allows the flag package to parse index flags as 4-byte hexadecimal values.
+type indexVar int
+
+// Ensure type implements interface.
+var _ flag.Value = (*indexVar)(nil)
+
+// String returns an 8-character hexadecimal value.
+func (v *indexVar) String() string {
+	return fmt.Sprintf("%08x", int(*v))
+}
+
+// Set parses s into an integer from a hexadecimal value.
+func (v *indexVar) Set(s string) error {
+	i, err := strconv.ParseInt(s, 16, 32)
+	if err != nil {
+		return fmt.Errorf("invalid hexadecimal format")
+	}
+	*v = indexVar(i)
+	return nil
 }
