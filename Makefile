@@ -6,7 +6,7 @@ docker:
 dist-linux:
 	mkdir -p dist
 	cp etc/litestream.yml dist/litestream.yml
-	docker run --rm -v "${PWD}":/usr/src/litestream -w /usr/src/litestream -e GOOS=linux -e GOARCH=amd64 golang:1.16 go build -v -o dist/litestream ./cmd/litestream
+	docker run --rm -v "${PWD}":/usr/src/litestream -w /usr/src/litestream -e GOOS=linux -e GOARCH=amd64 golang:1.16 go build -v -ldflags "-s -w" -o dist/litestream ./cmd/litestream
 	tar -cz -f dist/litestream-linux-amd64.tar.gz -C dist litestream
 
 dist-linux-arm:
