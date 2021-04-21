@@ -1434,7 +1434,7 @@ func (db *DB) monitor() {
 // replica or generation or it will automatically choose the best one. Finally,
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
-func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
+func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
 		return fmt.Errorf("output path required")
@@ -1462,10 +1462,16 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 		return err
 	}
 
-	// Find lastest snapshot that occurs before timestamp.
-	minWALIndex, err := SnapshotIndexAt(ctx, r, opt.Generation, opt.Timestamp)
-	if err != nil {
-		return fmt.Errorf("cannot find snapshot index for restore: %w", err)
+	// Find lastest snapshot that occurs before timestamp or index.
+	var minWALIndex int
+	if opt.Index < math.MaxInt32 {
+		if minWALIndex, err = SnapshotIndexByIndex(ctx, r, opt.Generation, opt.Index); err != nil {
+			return fmt.Errorf("cannot find snapshot index: %w", err)
+		}
+	} else {
+		if minWALIndex, err = SnapshotIndexAt(ctx, r, opt.Generation, opt.Timestamp); err != nil {
+			return fmt.Errorf("cannot find snapshot index by timestamp: %w", err)
+		}
 	}
 
 	// Find the maximum WAL index that occurs before timestamp.
@@ -1487,7 +1493,7 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 
 	// Restore each WAL file until we reach our maximum index.
 	for index := minWALIndex; index <= maxWALIndex; index++ {
-		logger.Printf("%s: restoring wal %s/%08x", logPrefix, opt.Generation, index)
+		restoreStartTime := time.Now()
 		if err = restoreWAL(ctx, r, opt.Generation, index, tmpPath); os.IsNotExist(err) && index == minWALIndex && index == maxWALIndex {
 			logger.Printf("%s: no wal available, snapshot only", logPrefix)
 			break // snapshot file only, ignore error
@@ -1495,10 +1501,21 @@ func RestoreReplica(ctx context.Context, r Replica, opt RestoreOptions) error {
 			return fmt.Errorf("cannot restore wal: %w", err)
 		}
 
-		logger.Printf("%s: applying wal %s/%08x", logPrefix, opt.Generation, index)
+		fi, err := os.Stat(tmpPath + "-wal")
+		if err != nil {
+			return fmt.Errorf("cannot stat restored wal: %w", err)
+		}
+
+		applyStartTime := time.Now()
 		if err = applyWAL(ctx, tmpPath); err != nil {
 			return fmt.Errorf("cannot apply wal: %w", err)
 		}
+		logger.Printf("%s: restored wal %s/%08x (sz=%d restore=%s apply=%s)",
+			logPrefix, opt.Generation, index,
+			fi.Size(),
+			applyStartTime.Sub(restoreStartTime).String(),
+			time.Since(applyStartTime).String(),
+		)
 	}
 
 	// Copy file to final location.
