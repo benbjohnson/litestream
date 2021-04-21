@@ -7,7 +7,7 @@ priority: "extra"
 maintainer: "Ben Johnson <benbjohnson@yahoo.com>"
 description: Litestream is a tool for real-time replication of SQLite databases.
 homepage: "https://github.com/benbjohnson/litestream"
-license: "GPLv3"
+license: "Apache 2"
 contents:
 - src: ./litestream
   dst: /usr/bin/litestream
