@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -26,6 +27,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
 	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
+	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
@@ -169,6 +171,10 @@ Arguments:
 
 	-if-replica-exists
 	    Returns exit code of 0 if no backups found.
+
+	-parallelism NUM
+	    Determines the number of WAL files downloaded in parallel.
+	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
 
 	-v
 	    Verbose output.
