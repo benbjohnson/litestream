@@ -751,27 +751,6 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
-	// Start a transaction. This will be promoted immediately after.
-	tx, err := db.db.Begin()
-	if err != nil {
-		return fmt.Errorf("begin: %w", err)
-	}
-
-	// Ensure write transaction rolls back before returning.
-	defer func() {
-		if e := rollback(tx); e != nil && err == nil {
-			err = e
-		}
-	}()
-
-	// Insert into the lock table to promote to a write tx. The lock table
-	// insert will never actually occur because our tx will be rolled back,
-	// however, it will ensure our tx grabs the write lock. Unfortunately,
-	// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
-	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		return fmt.Errorf("_litestream_lock: %w", err)
-	}
-
 	// Verify our last sync matches the current state of the WAL.
 	// This ensures that we have an existing generation & that the last sync
 	// position of the real WAL hasn't been overwritten by another process.
@@ -816,11 +795,6 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		checkpoint = true
 	} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
 		checkpoint = true
-	}
-
-	// Release write lock before checkpointing & exiting.
-	if err := tx.Rollback(); err != nil {
-		return fmt.Errorf("rollback write tx: %w", err)
 	}
 
 	// Issue the checkpoint.

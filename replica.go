@@ -607,6 +607,11 @@ func (r *FileReplica) snapshot(ctx context.Context, generation string, index int
 	r.muf.Lock()
 	defer r.muf.Unlock()
 
+	// Issue a passive checkpoint to flush any pages to disk before snapshotting.
+	if _, err := r.db.db.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE);`); err != nil {
+		return fmt.Errorf("pre-snapshot checkpoint: %w", err)
+	}
+
 	// Acquire a read lock on the database during snapshot to prevent checkpoints.
 	tx, err := r.db.db.Begin()
 	if err != nil {
