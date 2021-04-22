@@ -61,6 +61,9 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return runWindowsService(ctx)
 	}
 
+	// Copy "LITESTEAM" environment credentials.
+	applyLitestreamEnv()
+
 	// Extract command name.
 	var cmd string
 	if len(args) > 0 {
@@ -425,6 +428,22 @@ func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica,
 		r.ValidationInterval = v
 	}
 	return r, nil
+}
+
+// applyLitestreamEnv copies "LITESTREAM" prefixed environment variables to
+// their AWS counterparts as the "AWS" prefix can be confusing when using a
+// non-AWS S3-compatible service.
+func applyLitestreamEnv() {
+	if v, ok := os.LookupEnv("LITESTREAM_ACCESS_KEY_ID"); ok {
+		if _, ok := os.LookupEnv("AWS_ACCESS_KEY_ID"); !ok {
+			os.Setenv("AWS_ACCESS_KEY_ID", v)
+		}
+	}
+	if v, ok := os.LookupEnv("LITESTREAM_SECRET_ACCESS_KEY"); ok {
+		if _, ok := os.LookupEnv("AWS_SECRET_ACCESS_KEY"); !ok {
+			os.Setenv("AWS_SECRET_ACCESS_KEY", v)
+		}
+	}
 }
 
 // ParseReplicaURL parses a replica URL.
