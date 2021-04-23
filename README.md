@@ -2,6 +2,7 @@ Litestream
 ![GitHub release (latest by date)](https://img.shields.io/github/v/release/benbjohnson/litestream)
 ![Status](https://img.shields.io/badge/status-beta-blue)
 ![GitHub](https://img.shields.io/github/license/benbjohnson/litestream)
+[![Docker Pulls](https://img.shields.io/docker/pulls/litestream/litestream.svg?maxAge=604800)](https://hub.docker.com/r/litestream/litestream/)
 ![test](https://github.com/benbjohnson/litestream/workflows/test/badge.svg)
 ==========
 
