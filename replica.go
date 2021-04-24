@@ -1072,7 +1072,9 @@ func SnapshotIndexAt(ctx context.Context, r Replica, generation string, timestam
 	snapshotIndex := -1
 	var max time.Time
 	for _, snapshot := range snapshots {
-		if !timestamp.IsZero() && snapshot.CreatedAt.After(timestamp) {
+		if snapshot.Generation != generation {
+			continue // generation mismatch, skip
+		} else if !timestamp.IsZero() && snapshot.CreatedAt.After(timestamp) {
 			continue // after timestamp, skip
 		}
 
@@ -1116,15 +1118,16 @@ func SnapshotIndexByIndex(ctx context.Context, r Replica, generation string, ind
 	return snapshotIndex, nil
 }
 
-// WALIndexAt returns the highest index for a WAL file that occurs before maxIndex & timestamp.
-// If timestamp is zero, returns the highest WAL index.
+// WALIndexAt returns the highest index for a WAL file that occurs before
+// maxIndex & timestamp. If timestamp is zero, returns the highest WAL index.
+// Returns -1 if no WAL found and MaxInt32 specified.
 func WALIndexAt(ctx context.Context, r Replica, generation string, maxIndex int, timestamp time.Time) (int, error) {
 	wals, err := r.WALs(ctx)
 	if err != nil {
 		return 0, err
 	}
 
-	var index int
+	index := -1
 	for _, wal := range wals {
 		if wal.Generation != generation {
 			continue
