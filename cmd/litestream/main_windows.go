@@ -62,7 +62,7 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 
 	// Instantiate replication command and load configuration.
 	c := NewReplicateCommand()
-	if c.Config, err = ReadConfigFile(DefaultConfigPath()); err != nil {
+	if c.Config, err = ReadConfigFile(DefaultConfigPath(), true); err != nil {
 		log.Printf("cannot load configuration: %s", err)
 		return true, 1
 	}
