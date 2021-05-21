@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -19,9 +18,10 @@ import (
 const (
 	MetaDirSuffix = "-litestream"
 
-	WALDirName  = "wal"
-	WALExt      = ".wal"
-	SnapshotExt = ".snapshot"
+	WALDirName    = "wal"
+	WALExt        = ".wal"
+	WALSegmentExt = ".wal.lz4"
+	SnapshotExt   = ".snapshot.lz4"
 
 	GenerationNameLen = 16
 )
@@ -41,19 +41,160 @@ var (
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
+// SnapshotIterator represents an iterator over a collection of snapshot metadata.
+type SnapshotIterator interface {
+	io.Closer
+
+	// Prepares the the next snapshot for reading with the Snapshot() method.
+	// Returns true if another snapshot is available. Returns false if no more
+	// snapshots are available or if an error occured.
+	Next() bool
+
+	// Returns an error that occurred during iteration.
+	Err() error
+
+	// Returns metadata for the currently positioned snapshot.
+	Snapshot() SnapshotInfo
+}
+
+// SliceSnapshotIterator returns all snapshots from an iterator as a slice.
+func SliceSnapshotIterator(itr SnapshotIterator) ([]SnapshotInfo, error) {
+	var a []SnapshotInfo
+	for itr.Next() {
+		a = append(a, itr.Snapshot())
+	}
+	return a, itr.Close()
+}
+
+var _ SnapshotIterator = (*SnapshotInfoSliceIterator)(nil)
+
+// SnapshotInfoSliceIterator represents an iterator for iterating over a slice of snapshots.
+type SnapshotInfoSliceIterator struct {
+	init bool
+	a    []SnapshotInfo
+}
+
+// NewSnapshotInfoSliceIterator returns a new instance of SnapshotInfoSliceIterator.
+func NewSnapshotInfoSliceIterator(a []SnapshotInfo) *SnapshotInfoSliceIterator {
+	return &SnapshotInfoSliceIterator{a: a}
+}
+
+// Close always returns nil.
+func (itr *SnapshotInfoSliceIterator) Close() error { return nil }
+
+// Next moves to the next snapshot. Returns true if another snapshot is available.
+func (itr *SnapshotInfoSliceIterator) Next() bool {
+	if !itr.init {
+		itr.init = true
+		return len(itr.a) > 0
+	}
+	itr.a = itr.a[1:]
+	return len(itr.a) > 0
+}
+
+// Err always returns nil.
+func (itr *SnapshotInfoSliceIterator) Err() error { return nil }
+
+// Snapshot returns the metadata from the currently positioned snapshot.
+func (itr *SnapshotInfoSliceIterator) Snapshot() SnapshotInfo {
+	if len(itr.a) == 0 {
+		return SnapshotInfo{}
+	}
+	return itr.a[0]
+}
+
+// WALSegmentIterator represents an iterator over a collection of WAL segments.
+type WALSegmentIterator interface {
+	io.Closer
+
+	// Prepares the the next WAL for reading with the WAL() method.
+	// Returns true if another WAL is available. Returns false if no more
+	// WAL files are available or if an error occured.
+	Next() bool
+
+	// Returns an error that occurred during iteration.
+	Err() error
+
+	// Returns metadata for the currently positioned WAL segment file.
+	WALSegment() WALSegmentInfo
+}
+
+// SliceWALSegmentIterator returns all WAL segment files from an iterator as a slice.
+func SliceWALSegmentIterator(itr WALSegmentIterator) ([]WALSegmentInfo, error) {
+	var a []WALSegmentInfo
+	for itr.Next() {
+		a = append(a, itr.WALSegment())
+	}
+	return a, itr.Close()
+}
+
+var _ WALSegmentIterator = (*WALSegmentInfoSliceIterator)(nil)
+
+// WALSegmentInfoSliceIterator represents an iterator for iterating over a slice of wal segments.
+type WALSegmentInfoSliceIterator struct {
+	init bool
+	a    []WALSegmentInfo
+}
+
+// NewWALSegmentInfoSliceIterator returns a new instance of WALSegmentInfoSliceIterator.
+func NewWALSegmentInfoSliceIterator(a []WALSegmentInfo) *WALSegmentInfoSliceIterator {
+	return &WALSegmentInfoSliceIterator{a: a}
+}
+
+// Close always returns nil.
+func (itr *WALSegmentInfoSliceIterator) Close() error { return nil }
+
+// Next moves to the next wal segment. Returns true if another segment is available.
+func (itr *WALSegmentInfoSliceIterator) Next() bool {
+	if !itr.init {
+		itr.init = true
+		return len(itr.a) > 0
+	}
+	itr.a = itr.a[1:]
+	return len(itr.a) > 0
+}
+
+// Err always returns nil.
+func (itr *WALSegmentInfoSliceIterator) Err() error { return nil }
+
+// WALSegment returns the metadata from the currently positioned wal segment.
+func (itr *WALSegmentInfoSliceIterator) WALSegment() WALSegmentInfo {
+	if len(itr.a) == 0 {
+		return WALSegmentInfo{}
+	}
+	return itr.a[0]
+}
+
 // SnapshotInfo represents file information about a snapshot.
 type SnapshotInfo struct {
-	Name       string
-	Replica    string
 	Generation string
 	Index      int
 	Size       int64
 	CreatedAt  time.Time
 }
 
+// Pos returns the WAL position when the snapshot was made.
+func (info *SnapshotInfo) Pos() Pos {
+	return Pos{Generation: info.Generation, Index: info.Index}
+}
+
+// SnapshotInfoSlice represents a slice of snapshot metadata.
+type SnapshotInfoSlice []SnapshotInfo
+
+func (a SnapshotInfoSlice) Len() int { return len(a) }
+
+func (a SnapshotInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
+func (a SnapshotInfoSlice) Less(i, j int) bool {
+	if a[i].Generation != a[j].Generation {
+		return a[i].Generation < a[j].Generation
+	}
+	return a[i].Index < a[j].Index
+}
+
 // FilterSnapshotsAfter returns all snapshots that were created on or after t.
-func FilterSnapshotsAfter(a []*SnapshotInfo, t time.Time) []*SnapshotInfo {
-	other := make([]*SnapshotInfo, 0, len(a))
+func FilterSnapshotsAfter(a []SnapshotInfo, t time.Time) []SnapshotInfo {
+	other := make([]SnapshotInfo, 0, len(a))
 	for _, snapshot := range a {
 		if !snapshot.CreatedAt.Before(t) {
 			other = append(other, snapshot)
@@ -63,13 +204,13 @@ func FilterSnapshotsAfter(a []*SnapshotInfo, t time.Time) []*SnapshotInfo {
 }
 
 // FindMinSnapshotByGeneration finds the snapshot with the lowest index in a generation.
-func FindMinSnapshotByGeneration(a []*SnapshotInfo, generation string) *SnapshotInfo {
+func FindMinSnapshotByGeneration(a []SnapshotInfo, generation string) *SnapshotInfo {
 	var min *SnapshotInfo
 	for _, snapshot := range a {
 		if snapshot.Generation != generation {
 			continue
 		} else if min == nil || snapshot.Index < min.Index {
-			min = snapshot
+			min = &snapshot
 		}
 	}
 	return min
@@ -77,13 +218,53 @@ func FindMinSnapshotByGeneration(a []*SnapshotInfo, generation string) *Snapshot
 
 // WALInfo represents file information about a WAL file.
 type WALInfo struct {
-	Name       string
-	Replica    string
+	Generation string
+	Index      int
+	CreatedAt  time.Time
+}
+
+// WALInfoSlice represents a slice of WAL metadata.
+type WALInfoSlice []WALInfo
+
+func (a WALInfoSlice) Len() int { return len(a) }
+
+func (a WALInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
+func (a WALInfoSlice) Less(i, j int) bool {
+	if a[i].Generation != a[j].Generation {
+		return a[i].Generation < a[j].Generation
+	}
+	return a[i].Index < a[j].Index
+}
+
+// WALSegmentInfo represents file information about a WAL segment file.
+type WALSegmentInfo struct {
 	Generation string
 	Index      int
 	Offset     int64
 	Size       int64
 	CreatedAt  time.Time
+}
+
+// Pos returns the WAL position when the segment was made.
+func (info *WALSegmentInfo) Pos() Pos {
+	return Pos{Generation: info.Generation, Index: info.Index, Offset: info.Offset}
+}
+
+// WALSegmentInfoSlice represents a slice of WAL segment metadata.
+type WALSegmentInfoSlice []WALSegmentInfo
+
+func (a WALSegmentInfoSlice) Len() int { return len(a) }
+
+func (a WALSegmentInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+
+func (a WALSegmentInfoSlice) Less(i, j int) bool {
+	if a[i].Generation != a[j].Generation {
+		return a[i].Generation < a[j].Generation
+	} else if a[i].Index != a[j].Index {
+		return a[i].Index < a[j].Index
+	}
+	return a[i].Offset < a[j].Offset
 }
 
 // Pos is a position in the WAL for a generation.
@@ -104,6 +285,11 @@ func (p Pos) String() string {
 // IsZero returns true if p is the zero value.
 func (p Pos) IsZero() bool {
 	return p == (Pos{})
+}
+
+// Truncate returns p with the offset truncated to zero.
+func (p Pos) Truncate() Pos {
+	return Pos{Generation: p.Generation, Index: p.Index}
 }
 
 // Checksum computes a running SQLite checksum over a byte slice.
@@ -204,38 +390,43 @@ func IsSnapshotPath(s string) bool {
 
 // ParseSnapshotPath returns the index for the snapshot.
 // Returns an error if the path is not a valid snapshot path.
-func ParseSnapshotPath(s string) (index int, ext string, err error) {
+func ParseSnapshotPath(s string) (index int, err error) {
 	s = filepath.Base(s)
 
 	a := snapshotPathRegex.FindStringSubmatch(s)
 	if a == nil {
-		return 0, "", fmt.Errorf("invalid snapshot path: %s", s)
+		return 0, fmt.Errorf("invalid snapshot path: %s", s)
 	}
 
 	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	return int(i64), a[2], nil
+	return int(i64), nil
 }
 
-var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(.snapshot(?:.lz4)?)$`)
+// FormatSnapshotPath formats a snapshot filename with a given index.
+func FormatSnapshotPath(index int) string {
+	assert(index >= 0, "snapshot index must be non-negative")
+	return fmt.Sprintf("%08x%s", index, SnapshotExt)
+}
+
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot\.lz4$`)
 
 // IsWALPath returns true if s is a path to a WAL file.
 func IsWALPath(s string) bool {
 	return walPathRegex.MatchString(s)
 }
 
-// ParseWALPath returns the index & offset for the WAL file.
-// Returns an error if the path is not a valid snapshot path.
-func ParseWALPath(s string) (index int, offset int64, ext string, err error) {
+// ParseWALPath returns the index for the WAL file.
+// Returns an error if the path is not a valid WAL path.
+func ParseWALPath(s string) (index int, err error) {
 	s = filepath.Base(s)
 
 	a := walPathRegex.FindStringSubmatch(s)
 	if a == nil {
-		return 0, 0, "", fmt.Errorf("invalid wal path: %s", s)
+		return 0, fmt.Errorf("invalid wal path: %s", s)
 	}
 
 	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	off64, _ := strconv.ParseUint(a[2], 16, 64)
-	return int(i64), int64(off64), a[3], nil
+	return int(i64), nil
 }
 
 // FormatWALPath formats a WAL filename with a given index.
@@ -244,75 +435,35 @@ func FormatWALPath(index int) string {
 	return fmt.Sprintf("%08x%s", index, WALExt)
 }
 
-// FormatWALPathWithOffset formats a WAL filename with a given index & offset.
-func FormatWALPathWithOffset(index int, offset int64) string {
-	assert(index >= 0, "wal index must be non-negative")
-	assert(offset >= 0, "wal offset must be non-negative")
-	return fmt.Sprintf("%08x_%08x%s", index, offset, WALExt)
+var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.wal$`)
+
+// ParseWALSegmentPath returns the index & offset for the WAL segment file.
+// Returns an error if the path is not a valid wal segment path.
+func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
+	s = filepath.Base(s)
+
+	a := walSegmentPathRegex.FindStringSubmatch(s)
+	if a == nil {
+		return 0, 0, fmt.Errorf("invalid wal segment path: %s", s)
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	off64, _ := strconv.ParseUint(a[2], 16, 64)
+	return int(i64), int64(off64), nil
 }
 
-var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))?(.wal(?:.lz4)?)$`)
+// FormatWALSegmentPath formats a WAL segment filename with a given index & offset.
+func FormatWALSegmentPath(index int, offset int64) string {
+	assert(index >= 0, "wal index must be non-negative")
+	assert(offset >= 0, "wal offset must be non-negative")
+	return fmt.Sprintf("%08x_%08x%s", index, offset, WALSegmentExt)
+}
+
+var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))\.wal\.lz4$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
-}
-
-// createFile creates the file and attempts to set the UID/GID.
-func createFile(filename string, perm os.FileMode, uid, gid int) (*os.File, error) {
-	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, perm)
-	if err != nil {
-		return nil, err
-	}
-	_ = f.Chown(uid, gid)
-	return f, nil
-}
-
-// mkdirAll is a copy of os.MkdirAll() except that it attempts to set the
-// uid/gid for each created directory.
-func mkdirAll(path string, perm os.FileMode, uid, gid int) error {
-	// Fast path: if we can tell whether path is a directory or file, stop with success or error.
-	dir, err := os.Stat(path)
-	if err == nil {
-		if dir.IsDir() {
-			return nil
-		}
-		return &os.PathError{Op: "mkdir", Path: path, Err: syscall.ENOTDIR}
-	}
-
-	// Slow path: make sure parent exists and then call Mkdir for path.
-	i := len(path)
-	for i > 0 && os.IsPathSeparator(path[i-1]) { // Skip trailing path separator.
-		i--
-	}
-
-	j := i
-	for j > 0 && !os.IsPathSeparator(path[j-1]) { // Scan backward over element.
-		j--
-	}
-
-	if j > 1 {
-		// Create parent.
-		err = mkdirAll(fixRootDirectory(path[:j-1]), perm, uid, gid)
-		if err != nil {
-			return err
-		}
-	}
-
-	// Parent now exists; invoke Mkdir and use its result.
-	err = os.Mkdir(path, perm)
-	if err != nil {
-		// Handle arguments like "foo/." by
-		// double-checking that directory doesn't exist.
-		dir, err1 := os.Lstat(path)
-		if err1 == nil && dir.IsDir() {
-			_ = os.Chown(path, uid, gid)
-			return nil
-		}
-		return err
-	}
-	_ = os.Chown(path, uid, gid)
-	return nil
 }
 
 // Tracef is used for low-level tracing.

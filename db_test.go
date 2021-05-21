@@ -151,7 +151,7 @@ func TestDB_CRC64(t *testing.T) {
 		}
 
 		// Checkpoint change into database. Checksum should change.
-		if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
 			t.Fatal(err)
 		}
 
@@ -262,7 +262,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Checkpoint & fully close which should close WAL file.
-		if err := db.Checkpoint(litestream.CheckpointModeTruncate); err != nil {
+		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
 			t.Fatal(err)
 		} else if err := db.Close(); err != nil {
 			t.Fatal(err)

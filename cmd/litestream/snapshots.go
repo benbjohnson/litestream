@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -29,7 +30,7 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	var db *litestream.DB
-	var r litestream.Replica
+	var r *litestream.Replica
 	if isURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
@@ -66,15 +67,11 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Find snapshots by db or replica.
-	var infos []*litestream.SnapshotInfo
+	var replicas []*litestream.Replica
 	if r != nil {
-		if infos, err = r.Snapshots(ctx); err != nil {
-			return err
-		}
+		replicas = []*litestream.Replica{r}
 	} else {
-		if infos, err = db.Snapshots(ctx); err != nil {
-			return err
-		}
+		replicas = db.Replicas
 	}
 
 	// List all snapshots.
@@ -82,14 +79,21 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	defer w.Flush()
 
 	fmt.Fprintln(w, "replica\tgeneration\tindex\tsize\tcreated")
-	for _, info := range infos {
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
-			info.Replica,
-			info.Generation,
-			info.Index,
-			info.Size,
-			info.CreatedAt.Format(time.RFC3339),
-		)
+	for _, r := range replicas {
+		infos, err := r.Snapshots(ctx)
+		if err != nil {
+			log.Printf("cannot determine snapshots: %s", err)
+			continue
+		}
+		for _, info := range infos {
+			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
+				r.Name(),
+				info.Generation,
+				info.Index,
+				info.Size,
+				info.CreatedAt.Format(time.RFC3339),
+			)
+		}
 	}
 
 	return nil

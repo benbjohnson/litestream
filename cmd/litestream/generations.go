@@ -30,8 +30,8 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 	}
 
 	var db *litestream.DB
-	var r litestream.Replica
-	updatedAt := time.Now()
+	var r *litestream.Replica
+	dbUpdatedAt := time.Now()
 	if isURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
@@ -67,14 +67,14 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 		}
 
 		// Determine last time database or WAL was updated.
-		if updatedAt, err = db.UpdatedAt(); err != nil {
+		if dbUpdatedAt, err = db.UpdatedAt(); err != nil {
 			return err
 		}
 	}
 
-	var replicas []litestream.Replica
+	var replicas []*litestream.Replica
 	if r != nil {
-		replicas = []litestream.Replica{r}
+		replicas = []*litestream.Replica{r}
 	} else {
 		replicas = db.Replicas
 	}
@@ -85,7 +85,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 
 	fmt.Fprintln(w, "name\tgeneration\tlag\tstart\tend")
 	for _, r := range replicas {
-		generations, err := r.Generations(ctx)
+		generations, err := r.Client.Generations(ctx)
 		if err != nil {
 			log.Printf("%s: cannot list generations: %s", r.Name(), err)
 			continue
@@ -93,18 +93,18 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 
 		// Iterate over each generation for the replica.
 		for _, generation := range generations {
-			stats, err := r.GenerationStats(ctx, generation)
+			createdAt, updatedAt, err := r.GenerationTimeBounds(ctx, generation)
 			if err != nil {
-				log.Printf("%s: cannot find generation stats: %s", r.Name(), err)
+				log.Printf("%s: cannot determine generation time bounds: %s", r.Name(), err)
 				continue
 			}
 
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 				r.Name(),
 				generation,
-				truncateDuration(updatedAt.Sub(stats.UpdatedAt)).String(),
-				stats.CreatedAt.Format(time.RFC3339),
-				stats.UpdatedAt.Format(time.RFC3339),
+				truncateDuration(dbUpdatedAt.Sub(updatedAt)).String(),
+				createdAt.Format(time.RFC3339),
+				updatedAt.Format(time.RFC3339),
 			)
 		}
 	}
