@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -381,6 +382,56 @@ func IsGenerationName(s string) bool {
 		}
 	}
 	return true
+}
+
+// GenerationsPath returns the path to a generation root directory.
+func GenerationsPath(root string) string {
+	return path.Join(root, "generations")
+}
+
+// GenerationPath returns the path to a generation's root directory.
+func GenerationPath(root, generation string) (string, error) {
+	dir := GenerationsPath(root)
+	if generation == "" {
+		return "", fmt.Errorf("generation required")
+	}
+	return path.Join(dir, generation), nil
+}
+
+// SnapshotsPath returns the path to a generation's snapshot directory.
+func SnapshotsPath(root, generation string) (string, error) {
+	dir, err := GenerationPath(root, generation)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(dir, "snapshots"), nil
+}
+
+// SnapshotPath returns the path to an uncompressed snapshot file.
+func SnapshotPath(root, generation string, index int) (string, error) {
+	dir, err := SnapshotsPath(root, generation)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(dir, FormatSnapshotPath(index)), nil
+}
+
+// WALPath returns the path to a generation's WAL directory
+func WALPath(root, generation string) (string, error) {
+	dir, err := GenerationPath(root, generation)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(dir, "wal"), nil
+}
+
+// WALSegmentPath returns the path to a WAL segment file.
+func WALSegmentPath(root, generation string, index int, offset int64) (string, error) {
+	dir, err := WALPath(root, generation)
+	if err != nil {
+		return "", err
+	}
+	return path.Join(dir, FormatWALSegmentPath(index, offset)), nil
 }
 
 // IsSnapshotPath returns true if s is a path to a snapshot file.
