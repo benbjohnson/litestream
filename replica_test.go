@@ -1,90 +1,144 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"os"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/mock"
+	"github.com/pierrec/lz4/v4"
 )
 
-func TestFileReplica_Sync(t *testing.T) {
-	// Ensure replica can successfully sync after DB has sync'd.
-	t.Run("InitialSync", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-		r := NewTestFileReplica(t, db)
-
-		// Sync database & then sync replica.
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if err := r.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		// Ensure posistions match.
-		if pos, err := db.Pos(); err != nil {
-			t.Fatal(err)
-		} else if got, want := r.LastPos(), pos; got != want {
-			t.Fatalf("LastPos()=%v, want %v", got, want)
+func TestReplica_Name(t *testing.T) {
+	t.Run("WithName", func(t *testing.T) {
+		if got, want := litestream.NewReplica(nil, "NAME").Name(), "NAME"; got != want {
+			t.Fatalf("Name()=%v, want %v", got, want)
 		}
 	})
-
-	// Ensure replica can successfully sync multiple times.
-	t.Run("MultiSync", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-		r := NewTestFileReplica(t, db)
-
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
-			t.Fatal(err)
-		}
-
-		// Write to the database multiple times and sync after each write.
-		for i, n := 0, db.MinCheckpointPageN*2; i < n; i++ {
-			if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz')`); err != nil {
-				t.Fatal(err)
-			}
-
-			// Sync periodically.
-			if i%100 == 0 || i == n-1 {
-				if err := db.Sync(context.Background()); err != nil {
-					t.Fatal(err)
-				} else if err := r.Sync(context.Background()); err != nil {
-					t.Fatal(err)
-				}
-			}
-		}
-
-		// Ensure posistions match.
-		if pos, err := db.Pos(); err != nil {
-			t.Fatal(err)
-		} else if got, want := pos.Index, 2; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if calcPos, err := r.CalcPos(context.Background(), pos.Generation); err != nil {
-			t.Fatal(err)
-		} else if got, want := calcPos, pos; got != want {
-			t.Fatalf("CalcPos()=%v, want %v", got, want)
-		} else if got, want := r.LastPos(), pos; got != want {
-			t.Fatalf("LastPos()=%v, want %v", got, want)
-		}
-	})
-
-	// Ensure replica returns an error if there is no generation available from the DB.
-	t.Run("ErrNoGeneration", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-		r := NewTestFileReplica(t, db)
-
-		if err := r.Sync(context.Background()); err == nil || err.Error() != `no generation, waiting for data` {
-			t.Fatal(err)
+	t.Run("WithoutName", func(t *testing.T) {
+		r := litestream.NewReplica(nil, "")
+		r.Client = &mock.ReplicaClient{}
+		if got, want := r.Name(), "mock"; got != want {
+			t.Fatalf("Name()=%v, want %v", got, want)
 		}
 	})
 }
 
-// NewTestFileReplica returns a new replica using a temp directory & with monitoring disabled.
-func NewTestFileReplica(tb testing.TB, db *litestream.DB) *litestream.FileReplica {
-	r := litestream.NewFileReplica(db, "", tb.TempDir())
-	r.MonitorEnabled = false
-	db.Replicas = []litestream.Replica{r}
-	return r
+func TestReplica_Sync(t *testing.T) {
+	db, sqldb := MustOpenDBs(t)
+	defer MustCloseDBs(t, db, sqldb)
+
+	// Execute a query to force a write to the WAL.
+	if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Issue initial database sync to setup generation.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch current database position.
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplica(db, "")
+	c.Replica, r.Client = r, c
+
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify client generation matches database.
+	generations, err := c.Generations(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	} else if got, want := len(generations), 1; got != want {
+		t.Fatalf("len(generations)=%v, want %v", got, want)
+	} else if got, want := generations[0], dpos.Generation; got != want {
+		t.Fatalf("generations[0]=%v, want %v", got, want)
+	}
+
+	// Verify WAL matches replica WAL.
+	if b0, err := os.ReadFile(db.Path() + "-wal"); err != nil {
+		t.Fatal(err)
+	} else if r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: generations[0], Index: 0, Offset: 0}); err != nil {
+		t.Fatal(err)
+	} else if b1, err := io.ReadAll(lz4.NewReader(r)); err != nil {
+		t.Fatal(err)
+	} else if err := r.Close(); err != nil {
+		t.Fatal(err)
+	} else if !bytes.Equal(b0, b1) {
+		t.Fatalf("wal mismatch: len(%d), len(%d)", len(b0), len(b1))
+	}
+}
+
+func TestReplica_Snapshot(t *testing.T) {
+	db, sqldb := MustOpenDBs(t)
+	defer MustCloseDBs(t, db, sqldb)
+
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplica(db, "")
+	r.Client = c
+
+	// Execute a query to force a write to the WAL.
+	if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch current database position & snapshot.
+	pos0, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	} else if info, err := r.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Pos(), pos0.Truncate(); got != want {
+		t.Fatalf("pos=%s, want %s", got, want)
+	}
+
+	// Sync database and then replica.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Execute a query to force a write to the WAL & truncate to start new index.
+	if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch current database position & snapshot.
+	pos1, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	} else if info, err := r.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if got, want := info.Pos(), pos1.Truncate(); got != want {
+		t.Fatalf("pos=%v, want %v", got, want)
+	}
+
+	// Verify two snapshots exist.
+	if infos, err := r.Snapshots(context.Background()); err != nil {
+		t.Fatal(err)
+	} else if got, want := len(infos), 2; got != want {
+		t.Fatalf("len=%v, want %v", got, want)
+	} else if got, want := infos[0].Pos(), pos0.Truncate(); got != want {
+		t.Fatalf("info[0]=%s, want %s", got, want)
+	} else if got, want := infos[1].Pos(), pos1.Truncate(); got != want {
+		t.Fatalf("info[1]=%s, want %s", got, want)
+	}
 }

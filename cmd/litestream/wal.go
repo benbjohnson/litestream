@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -30,7 +31,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	var db *litestream.DB
-	var r litestream.Replica
+	var r *litestream.Replica
 	if isURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
@@ -67,15 +68,11 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Find WAL files by db or replica.
-	var infos []*litestream.WALInfo
+	var replicas []*litestream.Replica
 	if r != nil {
-		if infos, err = r.WALs(ctx); err != nil {
-			return err
-		}
+		replicas = []*litestream.Replica{r}
 	} else {
-		if infos, err = db.WALs(ctx); err != nil {
-			return err
-		}
+		replicas = db.Replicas
 	}
 
 	// List all WAL files.
@@ -83,19 +80,43 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	defer w.Flush()
 
 	fmt.Fprintln(w, "replica\tgeneration\tindex\toffset\tsize\tcreated")
-	for _, info := range infos {
-		if *generation != "" && info.Generation != *generation {
-			continue
+	for _, r := range replicas {
+		var generations []string
+		if *generation != "" {
+			generations = []string{*generation}
+		} else {
+			if generations, err = r.Client.Generations(ctx); err != nil {
+				log.Printf("%s: cannot determine generations: %s", r.Name(), err)
+				continue
+			}
 		}
 
-		fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\n",
-			info.Replica,
-			info.Generation,
-			info.Index,
-			info.Offset,
-			info.Size,
-			info.CreatedAt.Format(time.RFC3339),
-		)
+		for _, generation := range generations {
+			if err := func() error {
+				itr, err := r.Client.WALSegments(ctx, generation)
+				if err != nil {
+					return err
+				}
+				defer itr.Close()
+
+				for itr.Next() {
+					info := itr.WALSegment()
+
+					fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\n",
+						r.Name(),
+						info.Generation,
+						info.Index,
+						info.Offset,
+						info.Size,
+						info.CreatedAt.Format(time.RFC3339),
+					)
+				}
+				return itr.Close()
+			}(); err != nil {
+				log.Printf("%s: cannot fetch wal segments: %s", r.Name(), err)
+				continue
+			}
+		}
 	}
 
 	return nil
@@ -104,7 +125,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 // Usage prints the help screen to STDOUT.
 func (c *WALCommand) Usage() {
 	fmt.Printf(`
-The wal command lists all wal files available for a database.
+The wal command lists all wal segments available for a database.
 
 Usage:
 
@@ -129,13 +150,13 @@ Arguments:
 
 Examples:
 
-	# List all WAL files for a database.
+	# List all WAL segments for a database.
 	$ litestream wal /path/to/db
 
-	# List all WAL files on S3 for a specific generation.
+	# List all WAL segments on S3 for a specific generation.
 	$ litestream wal -replica s3 -generation xxxxxxxx /path/to/db
 
-	# List all WAL files for replica URL.
+	# List all WAL segments for replica URL.
 	$ litestream wal s3://mybkt/db
 
 `[1:],

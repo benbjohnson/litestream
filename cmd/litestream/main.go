@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/s3"
 	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
@@ -272,15 +273,15 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 
 // ReplicaConfig represents the configuration for a single replica in a database.
 type ReplicaConfig struct {
-	Type                   string        `yaml:"type"` // "file", "s3"
-	Name                   string        `yaml:"name"` // name of replica, optional.
-	Path                   string        `yaml:"path"`
-	URL                    string        `yaml:"url"`
-	Retention              time.Duration `yaml:"retention"`
-	RetentionCheckInterval time.Duration `yaml:"retention-check-interval"`
-	SyncInterval           time.Duration `yaml:"sync-interval"` // s3 only
-	SnapshotInterval       time.Duration `yaml:"snapshot-interval"`
-	ValidationInterval     time.Duration `yaml:"validation-interval"`
+	Type                   string         `yaml:"type"` // "file", "s3"
+	Name                   string         `yaml:"name"` // name of replica, optional.
+	Path                   string         `yaml:"path"`
+	URL                    string         `yaml:"url"`
+	Retention              *time.Duration `yaml:"retention"`
+	RetentionCheckInterval *time.Duration `yaml:"retention-check-interval"`
+	SyncInterval           *time.Duration `yaml:"sync-interval"`
+	SnapshotInterval       *time.Duration `yaml:"snapshot-interval"`
+	ValidationInterval     *time.Duration `yaml:"validation-interval"`
 
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
@@ -293,24 +294,51 @@ type ReplicaConfig struct {
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
-func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (litestream.Replica, error) {
+func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Replica, err error) {
 	// Ensure user did not specify URL in path.
 	if isURL(c.Path) {
 		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", c.Path)
 	}
 
+	// Build replica.
+	r := litestream.NewReplica(db, c.Name)
+	if v := c.Retention; v != nil {
+		r.Retention = *v
+	}
+	if v := c.RetentionCheckInterval; v != nil {
+		r.RetentionCheckInterval = *v
+	}
+	if v := c.SyncInterval; v != nil {
+		r.SyncInterval = *v
+	} else if c.ReplicaType() == "s3" {
+		r.SyncInterval = 10 * time.Second // default s3 to 10s for configs
+	}
+	if v := c.SnapshotInterval; v != nil {
+		r.SnapshotInterval = *v
+	}
+	if v := c.ValidationInterval; v != nil {
+		r.ValidationInterval = *v
+	}
+
+	// Build and set client on replica.
 	switch c.ReplicaType() {
 	case "file":
-		return newFileReplicaFromConfig(c, db)
+		if r.Client, err = newFileReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
 	case "s3":
-		return newS3ReplicaFromConfig(c, db)
+		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
 	}
+
+	return r, nil
 }
 
-// newFileReplicaFromConfig returns a new instance of FileReplica build from config.
-func newFileReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.FileReplica, err error) {
+// newFileReplicaClientFromConfig returns a new instance of file.ReplicaClient built from config.
+func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *file.ReplicaClient, err error) {
 	// Ensure URL & path are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for file replica")
@@ -335,24 +363,13 @@ func newFileReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestrea
 	}
 
 	// Instantiate replica and apply time fields, if set.
-	r := litestream.NewFileReplica(db, c.Name, path)
-	if v := c.Retention; v > 0 {
-		r.Retention = v
-	}
-	if v := c.RetentionCheckInterval; v > 0 {
-		r.RetentionCheckInterval = v
-	}
-	if v := c.SnapshotInterval; v > 0 {
-		r.SnapshotInterval = v
-	}
-	if v := c.ValidationInterval; v > 0 {
-		r.ValidationInterval = v
-	}
-	return r, nil
+	client := file.NewReplicaClient(path)
+	client.Replica = r
+	return client, nil
 }
 
-// newS3ReplicaFromConfig returns a new instance of S3Replica build from config.
-func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica, err error) {
+// newS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
+func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s3.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for s3 replica")
@@ -402,32 +419,16 @@ func newS3ReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *s3.Replica,
 	}
 
 	// Build replica.
-	r := s3.NewReplica(db, c.Name)
-	r.AccessKeyID = c.AccessKeyID
-	r.SecretAccessKey = c.SecretAccessKey
-	r.Bucket = bucket
-	r.Path = path
-	r.Region = region
-	r.Endpoint = endpoint
-	r.ForcePathStyle = forcePathStyle
-	r.SkipVerify = skipVerify
-
-	if v := c.Retention; v > 0 {
-		r.Retention = v
-	}
-	if v := c.RetentionCheckInterval; v > 0 {
-		r.RetentionCheckInterval = v
-	}
-	if v := c.SyncInterval; v > 0 {
-		r.SyncInterval = v
-	}
-	if v := c.SnapshotInterval; v > 0 {
-		r.SnapshotInterval = v
-	}
-	if v := c.ValidationInterval; v > 0 {
-		r.ValidationInterval = v
-	}
-	return r, nil
+	client := s3.NewReplicaClient()
+	client.AccessKeyID = c.AccessKeyID
+	client.SecretAccessKey = c.SecretAccessKey
+	client.Bucket = bucket
+	client.Path = path
+	client.Region = region
+	client.Endpoint = endpoint
+	client.ForcePathStyle = forcePathStyle
+	client.SkipVerify = skipVerify
+	return client, nil
 }
 
 // applyLitestreamEnv copies "LITESTREAM" prefixed environment variables to

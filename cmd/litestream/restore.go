@@ -53,7 +53,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Determine replica & generation to restore from.
-	var r litestream.Replica
+	var r *litestream.Replica
 	if isURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
@@ -80,21 +80,25 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("no matching backups found")
 	}
 
-	return litestream.RestoreReplica(ctx, r, opt)
+	return r.Restore(ctx, opt)
 }
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
-func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt *litestream.RestoreOptions) (litestream.Replica, error) {
-	r, err := NewReplicaFromConfig(&ReplicaConfig{URL: replicaURL}, nil)
+func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+	syncInterval := litestream.DefaultSyncInterval
+	r, err := NewReplicaFromConfig(&ReplicaConfig{
+		URL:          replicaURL,
+		SyncInterval: &syncInterval,
+	}, nil)
 	if err != nil {
 		return nil, err
 	}
-	opt.Generation, _, err = litestream.CalcReplicaRestoreTarget(ctx, r, *opt)
+	opt.Generation, _, err = r.CalcRestoreTarget(ctx, *opt)
 	return r, err
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv bool, opt *litestream.RestoreOptions) (litestream.Replica, error) {
+func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	// Load configuration.
 	config, err := ReadConfigFile(configPath, expandEnv)
 	if err != nil {

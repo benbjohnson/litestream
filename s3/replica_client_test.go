@@ -1,0 +1,605 @@
+package s3_test
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"os"
+	"path"
+	"reflect"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/s3"
+)
+
+var (
+	// Enables integration tests.
+	integration = flag.Bool("integration", false, "")
+
+	// Replica client settings
+	accessKeyID     = flag.String("access-key-id", os.Getenv("LITESTREAM_S3_ACCESS_KEY_ID"), "")
+	secretAccessKey = flag.String("secret-access-key", os.Getenv("LITESTREAM_S3_SECRET_ACCESS_KEY"), "")
+	region          = flag.String("region", os.Getenv("LITESTREAM_S3_REGION"), "")
+	bucket          = flag.String("bucket", os.Getenv("LITESTREAM_S3_BUCKET"), "")
+	pathFlag        = flag.String("path", os.Getenv("LITESTREAM_S3_PATH"), "")
+	endpoint        = flag.String("endpoint", os.Getenv("LITESTREAM_S3_ENDPOINT"), "")
+	forcePathStyle  = flag.Bool("force-path-style", os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE") == "true", "")
+	skipVerify      = flag.Bool("skip-verify", os.Getenv("LITESTREAM_S3_SKIP_VERIFY") == "true", "")
+)
+
+func TestReplicaClient_Type(t *testing.T) {
+	if got, want := s3.NewReplicaClient().Type(), "s3"; got != want {
+		t.Fatalf("Type()=%v, want %v", got, want)
+	}
+}
+
+func TestReplicaClient_GenerationsDir(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		c := s3.NewReplicaClient()
+		c.Path = "foo"
+		if got, want := c.GenerationsDir(), "foo/generations"; got != want {
+			t.Fatalf("GenerationsDir()=%v, want %v", got, want)
+		}
+	})
+	t.Run("NoPath", func(t *testing.T) {
+		if got, want := s3.NewReplicaClient().GenerationsDir(), "generations"; got != want {
+			t.Fatalf("GenerationsDir()=%v, want %v", got, want)
+		}
+	})
+}
+
+func TestReplicaClient_GenerationDir(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		c := s3.NewReplicaClient()
+		c.Path = "foo"
+		if got, err := c.GenerationDir("0123456701234567"); err != nil {
+			t.Fatal(err)
+		} else if want := "foo/generations/0123456701234567"; got != want {
+			t.Fatalf("GenerationDir()=%v, want %v", got, want)
+		}
+	})
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		if _, err := s3.NewReplicaClient().GenerationDir(""); err == nil || err.Error() != `generation required` {
+			t.Fatalf("expected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_SnapshotsDir(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		c := s3.NewReplicaClient()
+		c.Path = "foo"
+		if got, err := c.SnapshotsDir("0123456701234567"); err != nil {
+			t.Fatal(err)
+		} else if want := "foo/generations/0123456701234567/snapshots"; got != want {
+			t.Fatalf("SnapshotsDir()=%v, want %v", got, want)
+		}
+	})
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		if _, err := s3.NewReplicaClient().SnapshotsDir(""); err == nil || err.Error() != `generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_SnapshotPath(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		c := s3.NewReplicaClient()
+		c.Path = "foo"
+		if got, err := c.SnapshotPath("0123456701234567", 1000); err != nil {
+			t.Fatal(err)
+		} else if want := "foo/generations/0123456701234567/snapshots/000003e8.snapshot.lz4"; got != want {
+			t.Fatalf("SnapshotPath()=%v, want %v", got, want)
+		}
+	})
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		if _, err := s3.NewReplicaClient().SnapshotPath("", 1000); err == nil || err.Error() != `generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_WALDir(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		c := s3.NewReplicaClient()
+		c.Path = "foo"
+		if got, err := c.WALDir("0123456701234567"); err != nil {
+			t.Fatal(err)
+		} else if want := "foo/generations/0123456701234567/wal"; got != want {
+			t.Fatalf("WALDir()=%v, want %v", got, want)
+		}
+	})
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		if _, err := s3.NewReplicaClient().WALDir(""); err == nil || err.Error() != `generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_WALSegmentPath(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		c := s3.NewReplicaClient()
+		c.Path = "foo"
+		if got, err := c.WALSegmentPath("0123456701234567", 1000, 1001); err != nil {
+			t.Fatal(err)
+		} else if want := "foo/generations/0123456701234567/wal/000003e8_000003e9.wal.lz4"; got != want {
+			t.Fatalf("WALPath()=%v, want %v", got, want)
+		}
+	})
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		if _, err := s3.NewReplicaClient().WALSegmentPath("", 1000, 0); err == nil || err.Error() != `generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_Generations(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		// Write snapshots.
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 0, strings.NewReader(`bar`)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteSnapshot(context.Background(), "155fe292f8333c72", 0, strings.NewReader(`baz`)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify returned generations.
+		if got, err := c.Generations(context.Background()); err != nil {
+			t.Fatal(err)
+		} else if want := []string{"155fe292f8333c72", "5efbd8d042012dca", "b16ddcf5c697540f"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("Generations()=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("NoGenerationsDir", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+		if generations, err := c.Generations(context.Background()); err != nil {
+			t.Fatal(err)
+		} else if got, want := len(generations), 0; got != want {
+			t.Fatalf("len(Generations())=%v, want %v", got, want)
+		}
+	})
+}
+
+func TestReplicaClient_Snapshots(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		// Write snapshots.
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 1, strings.NewReader(``)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 5, strings.NewReader(`x`)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 10, strings.NewReader(`xyz`)); err != nil {
+			t.Fatal(err)
+		}
+
+		// Fetch all snapshots by generation.
+		itr, err := c.Snapshots(context.Background(), "b16ddcf5c697540f")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		// Read all snapshots into a slice so they can be sorted.
+		a, err := litestream.SliceSnapshotIterator(itr)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := len(a), 2; got != want {
+			t.Fatalf("len=%v, want %v", got, want)
+		}
+		sort.Sort(litestream.SnapshotInfoSlice(a))
+
+		// Verify first snapshot metadata.
+		if got, want := a[0].Generation, "b16ddcf5c697540f"; got != want {
+			t.Fatalf("Generation=%v, want %v", got, want)
+		} else if got, want := a[0].Index, 5; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		} else if got, want := a[0].Size, int64(1); got != want {
+			t.Fatalf("Size=%v, want %v", got, want)
+		} else if a[0].CreatedAt.IsZero() {
+			t.Fatalf("expected CreatedAt")
+		}
+
+		// Verify second snapshot metadata.
+		if got, want := a[1].Generation, "b16ddcf5c697540f"; got != want {
+			t.Fatalf("Generation=%v, want %v", got, want)
+		} else if got, want := a[1].Index, 0xA; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		} else if got, want := a[1].Size, int64(3); got != want {
+			t.Fatalf("Size=%v, want %v", got, want)
+		} else if a[1].CreatedAt.IsZero() {
+			t.Fatalf("expected CreatedAt")
+		}
+
+		// Ensure close is clean.
+		if err := itr.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("NoGenerationDir", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		itr, err := c.Snapshots(context.Background(), "5efbd8d042012dca")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		if itr.Next() {
+			t.Fatal("expected no snapshots")
+		}
+	})
+
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if itr, err := c.Snapshots(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Close(); err == nil || err.Error() != `cannot determine snapshot directory path: generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_WriteSnapshot(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 1000, strings.NewReader(`foobar`)); err != nil {
+			t.Fatal(err)
+		}
+
+		if r, err := c.SnapshotReader(context.Background(), "b16ddcf5c697540f", 1000); err != nil {
+			t.Fatal(err)
+		} else if buf, err := ioutil.ReadAll(r); err != nil {
+			t.Fatal(err)
+		} else if err := r.Close(); err != nil {
+			t.Fatal(err)
+		} else if got, want := string(buf), `foobar`; got != want {
+			t.Fatalf("data=%q, want %q", got, want)
+		}
+	})
+
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		t.Parallel()
+		if _, err := NewIntegrationReplicaClient(t).WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_SnapshotReader(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(`foo`)); err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 10)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		if buf, err := ioutil.ReadAll(r); err != nil {
+			t.Fatal(err)
+		} else if got, want := string(buf), "foo"; got != want {
+			t.Fatalf("ReadAll=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("ErrNotFound", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1); !os.IsNotExist(err) {
+			t.Fatalf("expected not exist, got %#v", err)
+		}
+	})
+
+	t.Run("ErrGeneration", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_WALs(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}, strings.NewReader(``)); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 0}, strings.NewReader(`12345`)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 5}, strings.NewReader(`67`)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 3, Offset: 0}, strings.NewReader(`xyz`)); err != nil {
+			t.Fatal(err)
+		}
+
+		itr, err := c.WALSegments(context.Background(), "b16ddcf5c697540f")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		// Read all WAL segment files into a slice so they can be sorted.
+		a, err := litestream.SliceWALSegmentIterator(itr)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := len(a), 3; got != want {
+			t.Fatalf("len=%v, want %v", got, want)
+		}
+		sort.Sort(litestream.WALSegmentInfoSlice(a))
+
+		// Verify first WAL segment metadata.
+		if got, want := a[0].Generation, "b16ddcf5c697540f"; got != want {
+			t.Fatalf("Generation=%v, want %v", got, want)
+		} else if got, want := a[0].Index, 2; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		} else if got, want := a[0].Offset, int64(0); got != want {
+			t.Fatalf("Offset=%v, want %v", got, want)
+		} else if got, want := a[0].Size, int64(5); got != want {
+			t.Fatalf("Size=%v, want %v", got, want)
+		} else if a[0].CreatedAt.IsZero() {
+			t.Fatalf("expected CreatedAt")
+		}
+
+		// Verify first WAL segment metadata.
+		if got, want := a[1].Generation, "b16ddcf5c697540f"; got != want {
+			t.Fatalf("Generation=%v, want %v", got, want)
+		} else if got, want := a[1].Index, 2; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		} else if got, want := a[1].Offset, int64(5); got != want {
+			t.Fatalf("Offset=%v, want %v", got, want)
+		} else if got, want := a[1].Size, int64(2); got != want {
+			t.Fatalf("Size=%v, want %v", got, want)
+		} else if a[1].CreatedAt.IsZero() {
+			t.Fatalf("expected CreatedAt")
+		}
+
+		// Verify third WAL segment metadata.
+		if got, want := a[2].Generation, "b16ddcf5c697540f"; got != want {
+			t.Fatalf("Generation=%v, want %v", got, want)
+		} else if got, want := a[2].Index, 3; got != want {
+			t.Fatalf("Index=%v, want %v", got, want)
+		} else if got, want := a[2].Offset, int64(0); got != want {
+			t.Fatalf("Offset=%v, want %v", got, want)
+		} else if got, want := a[2].Size, int64(3); got != want {
+			t.Fatalf("Size=%v, want %v", got, want)
+		} else if a[1].CreatedAt.IsZero() {
+			t.Fatalf("expected CreatedAt")
+		}
+
+		// Ensure close is clean.
+		if err := itr.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("NoGenerationDir", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		itr, err := c.WALSegments(context.Background(), "5efbd8d042012dca")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		if itr.Next() {
+			t.Fatal("expected no wal files")
+		}
+	})
+
+	t.Run("NoWALs", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
+			t.Fatal(err)
+		}
+
+		itr, err := c.WALSegments(context.Background(), "5efbd8d042012dca")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		if itr.Next() {
+			t.Fatal("expected no wal files")
+		}
+	})
+
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if itr, err := c.WALSegments(context.Background(), ""); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Close(); err == nil || err.Error() != `cannot determine wal directory path: generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_WriteWALSegment(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}, strings.NewReader(`foobar`)); err != nil {
+			t.Fatal(err)
+		}
+
+		if r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}); err != nil {
+			t.Fatal(err)
+		} else if buf, err := ioutil.ReadAll(r); err != nil {
+			t.Fatal(err)
+		} else if err := r.Close(); err != nil {
+			t.Fatal(err)
+		} else if got, want := string(buf), `foobar`; got != want {
+			t.Fatalf("data=%q, want %q", got, want)
+		}
+	})
+
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		t.Parallel()
+		if _, err := NewIntegrationReplicaClient(t).WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestReplicaClient_WALReader(t *testing.T) {
+	t.Parallel()
+
+	c := NewIntegrationReplicaClient(t)
+	defer MustDeleteAll(t, c)
+
+	if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5}, strings.NewReader(`foobar`)); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("OK", func(t *testing.T) {
+		r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		if buf, err := ioutil.ReadAll(r); err != nil {
+			t.Fatal(err)
+		} else if got, want := string(buf), "foobar"; got != want {
+			t.Fatalf("ReadAll=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("ErrNotFound", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}); !os.IsNotExist(err) {
+			t.Fatalf("expected not exist, got %#v", err)
+		}
+	})
+}
+
+func TestReplicaClient_DeleteWALSegments(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		t.Parallel()
+
+		c := NewIntegrationReplicaClient(t)
+		defer MustDeleteAll(t, c)
+
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}, strings.NewReader(`foo`)); err != nil {
+			t.Fatal(err)
+		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}, strings.NewReader(`bar`)); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{
+			{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2},
+			{Generation: "5efbd8d042012dca", Index: 3, Offset: 4},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}); !os.IsNotExist(err) {
+			t.Fatalf("expected not exist, got %#v", err)
+		} else if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}); !os.IsNotExist(err) {
+			t.Fatalf("expected not exist, got %#v", err)
+		}
+	})
+
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		t.Parallel()
+		if err := NewIntegrationReplicaClient(t).DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+// NewIntegrationReplicaClient returns a new client for integration testing.
+// If integration flag is not set then test/benchmark is skipped.
+func NewIntegrationReplicaClient(tb testing.TB) *s3.ReplicaClient {
+	tb.Helper()
+
+	if !*integration {
+		tb.Skip("integration tests disabled")
+	}
+
+	c := s3.NewReplicaClient()
+	c.AccessKeyID = *accessKeyID
+	c.SecretAccessKey = *secretAccessKey
+	c.Region = *region
+	c.Bucket = *bucket
+	c.Path = path.Join(*pathFlag, fmt.Sprintf("%016x", rand.Uint64()))
+	c.Endpoint = *endpoint
+	c.ForcePathStyle = *forcePathStyle
+	c.SkipVerify = *skipVerify
+
+	return c
+}
+
+// MustDeleteAll deletes all objects under the client's path.
+func MustDeleteAll(tb testing.TB, c *s3.ReplicaClient) {
+	tb.Helper()
+	if err := c.DeleteAll(context.Background()); err != nil {
+		tb.Fatal(err)
+	}
+}

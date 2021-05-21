@@ -9,9 +9,9 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
-	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -48,9 +48,10 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
+			syncInterval := litestream.DefaultSyncInterval
 			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
 				URL:          u,
-				SyncInterval: 1 * time.Second,
+				SyncInterval: &syncInterval,
 			})
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
@@ -102,13 +103,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	for _, db := range c.DBs {
 		log.Printf("initialized db: %s", db.Path())
 		for _, r := range db.Replicas {
-			switch r := r.(type) {
-			case *litestream.FileReplica:
-				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), r.Type(), r.Path())
-			case *s3.Replica:
-				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q endpoint=%q sync-interval=%s", r.Name(), r.Type(), r.Bucket, r.Path, r.Region, r.Endpoint, r.SyncInterval)
+			switch client := r.Client.(type) {
+			case *file.ReplicaClient:
+				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), client.Type(), client.Path())
+			case *s3.ReplicaClient:
+				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q endpoint=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, client.Region, client.Endpoint, r.SyncInterval)
 			default:
-				log.Printf("replicating to: name=%q type=%q", r.Name(), r.Type())
+				log.Printf("replicating to: name=%q type=%q", r.Name(), client.Type())
 			}
 		}
 	}
