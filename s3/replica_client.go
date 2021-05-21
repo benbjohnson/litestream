@@ -5,9 +5,11 @@ import (
 	"crypto/tls"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"sync"
 	"time"
 
@@ -60,56 +62,6 @@ func NewReplicaClient() *ReplicaClient {
 // Type returns "s3" as the client type.
 func (c *ReplicaClient) Type() string {
 	return "s3"
-}
-
-// GenerationsDir returns the path to a generation root directory.
-func (c *ReplicaClient) GenerationsDir() string {
-	return path.Join(c.Path, "generations")
-}
-
-// GenerationDir returns the path to a generation's root directory.
-func (c *ReplicaClient) GenerationDir(generation string) (string, error) {
-	dir := c.GenerationsDir()
-	if generation == "" {
-		return "", fmt.Errorf("generation required")
-	}
-	return path.Join(dir, generation), nil
-}
-
-// SnapshotsDir returns the path to a generation's snapshot directory.
-func (c *ReplicaClient) SnapshotsDir(generation string) (string, error) {
-	dir, err := c.GenerationDir(generation)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(dir, "snapshots"), nil
-}
-
-// SnapshotPath returns the path to an uncompressed snapshot file.
-func (c *ReplicaClient) SnapshotPath(generation string, index int) (string, error) {
-	dir, err := c.SnapshotsDir(generation)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(dir, litestream.FormatSnapshotPath(index)), nil
-}
-
-// WALDir returns the path to a generation's WAL directory
-func (c *ReplicaClient) WALDir(generation string) (string, error) {
-	dir, err := c.GenerationDir(generation)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(dir, "wal"), nil
-}
-
-// WALSegmentPath returns the path to a WAL segment file.
-func (c *ReplicaClient) WALSegmentPath(generation string, index int, offset int64) (string, error) {
-	dir, err := c.WALDir(generation)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(dir, litestream.FormatWALSegmentPath(index, offset)), nil
 }
 
 // Init initializes the connection to S3. No-op if already initialized.
@@ -201,7 +153,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	var generations []string
 	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
 		Bucket:    aws.String(c.Bucket),
-		Prefix:    aws.String(c.GenerationsDir() + "/"),
+		Prefix:    aws.String(litestream.GenerationsPath(c.Path) + "/"),
 		Delimiter: aws.String("/"),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
 		operationTotalCounterVec.WithLabelValues("LIST").Inc()
@@ -227,7 +179,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		return err
 	}
 
-	dir, err := c.GenerationDir(generation)
+	dir, err := litestream.GenerationPath(c.Path, generation)
 	if err != nil {
 		return fmt.Errorf("cannot determine generation directory path: %w", err)
 	}
@@ -285,7 +237,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		return info, err
 	}
 
-	key, err := c.SnapshotPath(generation, index)
+	key, err := litestream.SnapshotPath(c.Path, generation, index)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -319,7 +271,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, err
 	}
 
-	key, err := c.SnapshotPath(generation, index)
+	key, err := litestream.SnapshotPath(c.Path, generation, index)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -345,7 +297,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return err
 	}
 
-	key, err := c.SnapshotPath(generation, index)
+	key, err := litestream.SnapshotPath(c.Path, generation, index)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -375,7 +327,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	key, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -409,7 +361,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 
-	key, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -444,7 +396,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 
 		// Generate a batch of object IDs for deleting the WAL segments.
 		for i, pos := range a[:n] {
-			key, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
+			key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
 			if err != nil {
 				return fmt.Errorf("cannot determine wal segment path: %w", err)
 			}
@@ -545,7 +497,7 @@ func newSnapshotIterator(ctx context.Context, client *ReplicaClient, generation 
 func (itr *snapshotIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := itr.client.SnapshotsDir(itr.generation)
+	dir, err := litestream.SnapshotsPath(itr.client.Path, itr.generation)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot directory path: %w", err)
 	}
@@ -648,7 +600,7 @@ func newWALSegmentIterator(ctx context.Context, client *ReplicaClient, generatio
 func (itr *walSegmentIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := itr.client.WALDir(itr.generation)
+	dir, err := litestream.WALPath(itr.client.Path, itr.generation)
 	if err != nil {
 		return fmt.Errorf("cannot determine wal directory path: %w", err)
 	}
@@ -722,6 +674,60 @@ func (itr *walSegmentIterator) Err() error { return itr.err }
 func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
 	return itr.info
 }
+
+// ParseHost extracts data from a hostname depending on the service provider.
+func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) {
+	// Extract port if one is specified.
+	host, port, err := net.SplitHostPort(s)
+	if err != nil {
+		host = s
+	}
+
+	// Default to path-based URLs, except for with AWS S3 itself.
+	forcePathStyle = true
+
+	// Extract fields from provider-specific host formats.
+	scheme := "https"
+	if a := localhostRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], "us-east-1"
+		scheme, endpoint = "http", "localhost"
+	} else if a := gcsRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], "us-east-1"
+		endpoint = "storage.googleapis.com"
+	} else if a := digitalOceanRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], a[2]
+		endpoint = fmt.Sprintf("%s.digitaloceanspaces.com", region)
+	} else if a := linodeRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], a[2]
+		endpoint = fmt.Sprintf("%s.linodeobjects.com", region)
+	} else if a := backblazeRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], a[2]
+		endpoint = fmt.Sprintf("s3.%s.backblazeb2.com", region)
+	} else {
+		bucket = host
+		forcePathStyle = false
+	}
+
+	// Add port back to endpoint, if available.
+	if endpoint != "" && port != "" {
+		endpoint = net.JoinHostPort(endpoint, port)
+	}
+
+	// Prepend scheme to endpoint.
+	if endpoint != "" {
+		endpoint = scheme + "://" + endpoint
+	}
+
+	return bucket, region, endpoint, forcePathStyle
+}
+
+var (
+	localhostRegex    = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
+	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
+	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects.com$`)
+	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
+	gcsRegex          = regexp.MustCompile(`^(?:(.+)\.)?storage.googleapis.com$`)
+)
 
 func isNotExists(err error) bool {
 	switch err := err.(type) {

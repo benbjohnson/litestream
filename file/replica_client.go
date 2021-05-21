@@ -30,7 +30,7 @@ func NewReplicaClient(path string) *ReplicaClient {
 }
 
 // db returns the database, if available.
-func (c *ReplicaClient) db() *litestream.DB{
+func (c *ReplicaClient) db() *litestream.DB {
 	if c.Replica == nil {
 		return nil
 	}
@@ -191,10 +191,9 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 	}
 
 	var fileInfo, dirInfo os.FileInfo
- 	if db := c.db(); db != nil {
- 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
- 	}
-
+	if db := c.db(); db != nil {
+		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
+	}
 
 	// Ensure parent directory exists.
 	if err := internal.MkdirAll(filepath.Dir(filename), dirInfo); err != nil {
@@ -309,9 +308,9 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	}
 
 	var fileInfo, dirInfo os.FileInfo
- 	if db := c.db(); db != nil {
- 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
- 	}
+	if db := c.db(); db != nil {
+		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
+	}
 
 	// Ensure parent directory exists.
 	if err := internal.MkdirAll(filepath.Dir(filename), dirInfo); err != nil {
@@ -377,4 +376,3 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	}
 	return nil
 }
-

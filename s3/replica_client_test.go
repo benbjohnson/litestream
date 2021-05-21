@@ -38,106 +38,6 @@ func TestReplicaClient_Type(t *testing.T) {
 	}
 }
 
-func TestReplicaClient_GenerationsDir(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		c := s3.NewReplicaClient()
-		c.Path = "foo"
-		if got, want := c.GenerationsDir(), "foo/generations"; got != want {
-			t.Fatalf("GenerationsDir()=%v, want %v", got, want)
-		}
-	})
-	t.Run("NoPath", func(t *testing.T) {
-		if got, want := s3.NewReplicaClient().GenerationsDir(), "generations"; got != want {
-			t.Fatalf("GenerationsDir()=%v, want %v", got, want)
-		}
-	})
-}
-
-func TestReplicaClient_GenerationDir(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		c := s3.NewReplicaClient()
-		c.Path = "foo"
-		if got, err := c.GenerationDir("0123456701234567"); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/generations/0123456701234567"; got != want {
-			t.Fatalf("GenerationDir()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := s3.NewReplicaClient().GenerationDir(""); err == nil || err.Error() != `generation required` {
-			t.Fatalf("expected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_SnapshotsDir(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		c := s3.NewReplicaClient()
-		c.Path = "foo"
-		if got, err := c.SnapshotsDir("0123456701234567"); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/generations/0123456701234567/snapshots"; got != want {
-			t.Fatalf("SnapshotsDir()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := s3.NewReplicaClient().SnapshotsDir(""); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_SnapshotPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		c := s3.NewReplicaClient()
-		c.Path = "foo"
-		if got, err := c.SnapshotPath("0123456701234567", 1000); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/generations/0123456701234567/snapshots/000003e8.snapshot.lz4"; got != want {
-			t.Fatalf("SnapshotPath()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := s3.NewReplicaClient().SnapshotPath("", 1000); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_WALDir(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		c := s3.NewReplicaClient()
-		c.Path = "foo"
-		if got, err := c.WALDir("0123456701234567"); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/generations/0123456701234567/wal"; got != want {
-			t.Fatalf("WALDir()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := s3.NewReplicaClient().WALDir(""); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_WALSegmentPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		c := s3.NewReplicaClient()
-		c.Path = "foo"
-		if got, err := c.WALSegmentPath("0123456701234567", 1000, 1001); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/generations/0123456701234567/wal/000003e8_000003e9.wal.lz4"; got != want {
-			t.Fatalf("WALPath()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := s3.NewReplicaClient().WALSegmentPath("", 1000, 0); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
 func TestReplicaClient_Generations(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		t.Parallel()
@@ -570,6 +470,79 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 		t.Parallel()
 		if err := NewIntegrationReplicaClient(t).DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestParseHost(t *testing.T) {
+	// Ensure non-specific hosts return as buckets.
+	t.Run("S3", func(t *testing.T) {
+		bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test.litestream.io`)
+		if got, want := bucket, `test.litestream.io`; got != want {
+			t.Fatalf("bucket=%q, want %q", got, want)
+		} else if got, want := region, ``; got != want {
+			t.Fatalf("region=%q, want %q", got, want)
+		} else if got, want := endpoint, ``; got != want {
+			t.Fatalf("endpoint=%q, want %q", got, want)
+		} else if got, want := forcePathStyle, false; got != want {
+			t.Fatalf("forcePathStyle=%v, want %v", got, want)
+		}
+	})
+
+	// Ensure localhosts use an HTTP endpoint and extract the bucket name.
+	t.Run("Localhost", func(t *testing.T) {
+		t.Run("WithPort", func(t *testing.T) {
+			bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test.localhost:9000`)
+			if got, want := bucket, `test`; got != want {
+				t.Fatalf("bucket=%q, want %q", got, want)
+			} else if got, want := region, `us-east-1`; got != want {
+				t.Fatalf("region=%q, want %q", got, want)
+			} else if got, want := endpoint, `http://localhost:9000`; got != want {
+				t.Fatalf("endpoint=%q, want %q", got, want)
+			} else if got, want := forcePathStyle, true; got != want {
+				t.Fatalf("forcePathStyle=%v, want %v", got, want)
+			}
+		})
+
+		t.Run("WithoutPort", func(t *testing.T) {
+			bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test.localhost`)
+			if got, want := bucket, `test`; got != want {
+				t.Fatalf("bucket=%q, want %q", got, want)
+			} else if got, want := region, `us-east-1`; got != want {
+				t.Fatalf("region=%q, want %q", got, want)
+			} else if got, want := endpoint, `http://localhost`; got != want {
+				t.Fatalf("endpoint=%q, want %q", got, want)
+			} else if got, want := forcePathStyle, true; got != want {
+				t.Fatalf("forcePathStyle=%v, want %v", got, want)
+			}
+		})
+	})
+
+	// Ensure backblaze B2 URLs extract bucket, region, & endpoint from host.
+	t.Run("Backblaze", func(t *testing.T) {
+		bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test-123.s3.us-west-000.backblazeb2.com`)
+		if got, want := bucket, `test-123`; got != want {
+			t.Fatalf("bucket=%q, want %q", got, want)
+		} else if got, want := region, `us-west-000`; got != want {
+			t.Fatalf("region=%q, want %q", got, want)
+		} else if got, want := endpoint, `https://s3.us-west-000.backblazeb2.com`; got != want {
+			t.Fatalf("endpoint=%q, want %q", got, want)
+		} else if got, want := forcePathStyle, true; got != want {
+			t.Fatalf("forcePathStyle=%v, want %v", got, want)
+		}
+	})
+
+	// Ensure GCS URLs extract bucket & endpoint from host.
+	t.Run("GCS", func(t *testing.T) {
+		bucket, region, endpoint, forcePathStyle := s3.ParseHost(`litestream.io.storage.googleapis.com`)
+		if got, want := bucket, `litestream.io`; got != want {
+			t.Fatalf("bucket=%q, want %q", got, want)
+		} else if got, want := region, `us-east-1`; got != want {
+			t.Fatalf("region=%q, want %q", got, want)
+		} else if got, want := endpoint, `https://storage.googleapis.com`; got != want {
+			t.Fatalf("endpoint=%q, want %q", got, want)
+		} else if got, want := forcePathStyle, true; got != want {
+			t.Fatalf("forcePathStyle=%v, want %v", got, want)
 		}
 	})
 }
