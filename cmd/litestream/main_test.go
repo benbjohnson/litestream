@@ -8,6 +8,7 @@ import (
 
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 )
 
@@ -160,23 +161,17 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 			t.Fatalf("ForcePathStyle=%v, want %v", got, want)
 		}
 	})
+}
 
-	t.Run("GCS", func(t *testing.T) {
-		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo.storage.googleapis.com/bar"}, nil)
-		if err != nil {
-			t.Fatal(err)
-		} else if client, ok := r.Client.(*s3.ReplicaClient); !ok {
-			t.Fatal("unexpected replica type")
-		} else if got, want := client.Bucket, "foo"; got != want {
-			t.Fatalf("Bucket=%s, want %s", got, want)
-		} else if got, want := client.Path, "bar"; got != want {
-			t.Fatalf("Path=%s, want %s", got, want)
-		} else if got, want := client.Region, "us-east-1"; got != want {
-			t.Fatalf("Region=%s, want %s", got, want)
-		} else if got, want := client.Endpoint, "https://storage.googleapis.com"; got != want {
-			t.Fatalf("Endpoint=%s, want %s", got, want)
-		} else if got, want := client.ForcePathStyle, true; got != want {
-			t.Fatalf("ForcePathStyle=%v, want %v", got, want)
-		}
-	})
+func TestNewGCSReplicaFromConfig(t *testing.T) {
+	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "gcs://foo/bar"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	} else if client, ok := r.Client.(*gcs.ReplicaClient); !ok {
+		t.Fatal("unexpected replica type")
+	} else if got, want := client.Bucket, "foo"; got != want {
+		t.Fatalf("Bucket=%s, want %s", got, want)
+	} else if got, want := client.Path, "bar"; got != want {
+		t.Fatalf("Path=%s, want %s", got, want)
+	}
 }

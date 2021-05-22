@@ -1,4 +1,4 @@
-package s3_test
+package litestream_test
 
 import (
 	"context"
@@ -12,38 +12,45 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 )
 
-var (
-	// Enables integration tests.
-	integration = flag.Bool("integration", false, "")
-
-	// Replica client settings
-	accessKeyID     = flag.String("access-key-id", os.Getenv("LITESTREAM_S3_ACCESS_KEY_ID"), "")
-	secretAccessKey = flag.String("secret-access-key", os.Getenv("LITESTREAM_S3_SECRET_ACCESS_KEY"), "")
-	region          = flag.String("region", os.Getenv("LITESTREAM_S3_REGION"), "")
-	bucket          = flag.String("bucket", os.Getenv("LITESTREAM_S3_BUCKET"), "")
-	pathFlag        = flag.String("path", os.Getenv("LITESTREAM_S3_PATH"), "")
-	endpoint        = flag.String("endpoint", os.Getenv("LITESTREAM_S3_ENDPOINT"), "")
-	forcePathStyle  = flag.Bool("force-path-style", os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE") == "true", "")
-	skipVerify      = flag.Bool("skip-verify", os.Getenv("LITESTREAM_S3_SKIP_VERIFY") == "true", "")
-)
-
-func TestReplicaClient_Type(t *testing.T) {
-	if got, want := s3.NewReplicaClient().Type(), "s3"; got != want {
-		t.Fatalf("Type()=%v, want %v", got, want)
-	}
+func init() {
+	rand.Seed(time.Now().UnixNano())
 }
 
-func TestReplicaClient_Generations(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		t.Parallel()
+var (
+	// Enables integration tests.
+	integration = flag.String("integration", "file", "")
+)
 
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
+// S3 settings
+var (
+	// Replica client settings
+	s3AccessKeyID     = flag.String("s3-access-key-id", os.Getenv("LITESTREAM_S3_ACCESS_KEY_ID"), "")
+	s3SecretAccessKey = flag.String("s3-secret-access-key", os.Getenv("LITESTREAM_S3_SECRET_ACCESS_KEY"), "")
+	s3Region          = flag.String("s3-region", os.Getenv("LITESTREAM_S3_REGION"), "")
+	s3Bucket          = flag.String("s3-bucket", os.Getenv("LITESTREAM_S3_BUCKET"), "")
+	s3Path            = flag.String("s3-path", os.Getenv("LITESTREAM_S3_PATH"), "")
+	s3Endpoint        = flag.String("s3-endpoint", os.Getenv("LITESTREAM_S3_ENDPOINT"), "")
+	s3ForcePathStyle  = flag.Bool("s3-force-path-style", os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE") == "true", "")
+	s3SkipVerify      = flag.Bool("s3-skip-verify", os.Getenv("LITESTREAM_S3_SKIP_VERIFY") == "true", "")
+)
+
+// GCS settings
+var (
+	gcsBucket = flag.String("gcs-bucket", os.Getenv("LITESTREAM_GCS_BUCKET"), "")
+	gcsPath   = flag.String("gcs-path", os.Getenv("LITESTREAM_GCS_PATH"), "")
+)
+
+func TestReplicaClient_Generations(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Parallel()
 
 		// Write snapshots.
 		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
@@ -62,11 +69,9 @@ func TestReplicaClient_Generations(t *testing.T) {
 		}
 	})
 
-	t.Run("NoGenerationsDir", func(t *testing.T) {
+	RunWithReplicaClient(t, "NoGenerationsDir", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 		if generations, err := c.Generations(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if got, want := len(generations), 0; got != want {
@@ -76,11 +81,8 @@ func TestReplicaClient_Generations(t *testing.T) {
 }
 
 func TestReplicaClient_Snapshots(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		// Write snapshots.
 		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 1, strings.NewReader(``)); err != nil {
@@ -135,11 +137,8 @@ func TestReplicaClient_Snapshots(t *testing.T) {
 		}
 	})
 
-	t.Run("NoGenerationDir", func(t *testing.T) {
+	RunWithReplicaClient(t, "NoGenerationDir", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		itr, err := c.Snapshots(context.Background(), "5efbd8d042012dca")
 		if err != nil {
@@ -152,26 +151,22 @@ func TestReplicaClient_Snapshots(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNoGeneration", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
-
-		if itr, err := c.Snapshots(context.Background(), ""); err != nil {
-			t.Fatal(err)
-		} else if err := itr.Close(); err == nil || err.Error() != `cannot determine snapshot directory path: generation required` {
+		itr, err := c.Snapshots(context.Background(), "")
+		if err == nil {
+			err = itr.Close()
+		}
+		if err == nil || err.Error() != `cannot determine snapshots path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
 func TestReplicaClient_WriteSnapshot(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 1000, strings.NewReader(`foobar`)); err != nil {
 			t.Fatal(err)
@@ -188,20 +183,17 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNoGeneration", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := NewIntegrationReplicaClient(t).WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
 func TestReplicaClient_SnapshotReader(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(`foo`)); err != nil {
 			t.Fatal(err)
@@ -220,22 +212,16 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNotFound", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1); !os.IsNotExist(err) {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
 
-	t.Run("ErrGeneration", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
@@ -244,11 +230,8 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 }
 
 func TestReplicaClient_WALs(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}, strings.NewReader(``)); err != nil {
 			t.Fatal(err)
@@ -321,11 +304,8 @@ func TestReplicaClient_WALs(t *testing.T) {
 		}
 	})
 
-	t.Run("NoGenerationDir", func(t *testing.T) {
+	RunWithReplicaClient(t, "NoGenerationDir", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		itr, err := c.WALSegments(context.Background(), "5efbd8d042012dca")
 		if err != nil {
@@ -338,11 +318,8 @@ func TestReplicaClient_WALs(t *testing.T) {
 		}
 	})
 
-	t.Run("NoWALs", func(t *testing.T) {
+	RunWithReplicaClient(t, "NoWALs", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
 			t.Fatal(err)
@@ -359,26 +336,22 @@ func TestReplicaClient_WALs(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNoGeneration", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
-
-		if itr, err := c.WALSegments(context.Background(), ""); err != nil {
-			t.Fatal(err)
-		} else if err := itr.Close(); err == nil || err.Error() != `cannot determine wal directory path: generation required` {
+		itr, err := c.WALSegments(context.Background(), "")
+		if err == nil {
+			err = itr.Close()
+		}
+		if err == nil || err.Error() != `cannot determine wal path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
 func TestReplicaClient_WriteWALSegment(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}, strings.NewReader(`foobar`)); err != nil {
 			t.Fatal(err)
@@ -395,25 +368,22 @@ func TestReplicaClient_WriteWALSegment(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNoGeneration", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := NewIntegrationReplicaClient(t).WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
 func TestReplicaClient_WALReader(t *testing.T) {
-	t.Parallel()
 
-	c := NewIntegrationReplicaClient(t)
-	defer MustDeleteAll(t, c)
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Parallel()
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5}, strings.NewReader(`foobar`)); err != nil {
+			t.Fatal(err)
+		}
 
-	if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5}, strings.NewReader(`foobar`)); err != nil {
-		t.Fatal(err)
-	}
-
-	t.Run("OK", func(t *testing.T) {
 		r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5})
 		if err != nil {
 			t.Fatal(err)
@@ -427,11 +397,8 @@ func TestReplicaClient_WALReader(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNotFound", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}); !os.IsNotExist(err) {
 			t.Fatalf("expected not exist, got %#v", err)
@@ -440,11 +407,8 @@ func TestReplicaClient_WALReader(t *testing.T) {
 }
 
 func TestReplicaClient_DeleteWALSegments(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
+	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-
-		c := NewIntegrationReplicaClient(t)
-		defer MustDeleteAll(t, c)
 
 		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}, strings.NewReader(`foo`)); err != nil {
 			t.Fatal(err)
@@ -466,113 +430,89 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNoGeneration", func(t *testing.T) {
+	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if err := NewIntegrationReplicaClient(t).DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
-func TestParseHost(t *testing.T) {
-	// Ensure non-specific hosts return as buckets.
-	t.Run("S3", func(t *testing.T) {
-		bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test.litestream.io`)
-		if got, want := bucket, `test.litestream.io`; got != want {
-			t.Fatalf("bucket=%q, want %q", got, want)
-		} else if got, want := region, ``; got != want {
-			t.Fatalf("region=%q, want %q", got, want)
-		} else if got, want := endpoint, ``; got != want {
-			t.Fatalf("endpoint=%q, want %q", got, want)
-		} else if got, want := forcePathStyle, false; got != want {
-			t.Fatalf("forcePathStyle=%v, want %v", got, want)
-		}
-	})
+// RunWithReplicaClient executes fn with each replica specified by the -integration flag
+func RunWithReplicaClient(t *testing.T, name string, fn func(*testing.T, litestream.ReplicaClient)) {
+	t.Run(name, func(t *testing.T) {
+		for _, typ := range strings.Split(*integration, ",") {
+			t.Run(typ, func(t *testing.T) {
+				c := NewReplicaClient(t, typ)
+				defer MustDeleteAll(t, c)
 
-	// Ensure localhosts use an HTTP endpoint and extract the bucket name.
-	t.Run("Localhost", func(t *testing.T) {
-		t.Run("WithPort", func(t *testing.T) {
-			bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test.localhost:9000`)
-			if got, want := bucket, `test`; got != want {
-				t.Fatalf("bucket=%q, want %q", got, want)
-			} else if got, want := region, `us-east-1`; got != want {
-				t.Fatalf("region=%q, want %q", got, want)
-			} else if got, want := endpoint, `http://localhost:9000`; got != want {
-				t.Fatalf("endpoint=%q, want %q", got, want)
-			} else if got, want := forcePathStyle, true; got != want {
-				t.Fatalf("forcePathStyle=%v, want %v", got, want)
-			}
-		})
-
-		t.Run("WithoutPort", func(t *testing.T) {
-			bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test.localhost`)
-			if got, want := bucket, `test`; got != want {
-				t.Fatalf("bucket=%q, want %q", got, want)
-			} else if got, want := region, `us-east-1`; got != want {
-				t.Fatalf("region=%q, want %q", got, want)
-			} else if got, want := endpoint, `http://localhost`; got != want {
-				t.Fatalf("endpoint=%q, want %q", got, want)
-			} else if got, want := forcePathStyle, true; got != want {
-				t.Fatalf("forcePathStyle=%v, want %v", got, want)
-			}
-		})
-	})
-
-	// Ensure backblaze B2 URLs extract bucket, region, & endpoint from host.
-	t.Run("Backblaze", func(t *testing.T) {
-		bucket, region, endpoint, forcePathStyle := s3.ParseHost(`test-123.s3.us-west-000.backblazeb2.com`)
-		if got, want := bucket, `test-123`; got != want {
-			t.Fatalf("bucket=%q, want %q", got, want)
-		} else if got, want := region, `us-west-000`; got != want {
-			t.Fatalf("region=%q, want %q", got, want)
-		} else if got, want := endpoint, `https://s3.us-west-000.backblazeb2.com`; got != want {
-			t.Fatalf("endpoint=%q, want %q", got, want)
-		} else if got, want := forcePathStyle, true; got != want {
-			t.Fatalf("forcePathStyle=%v, want %v", got, want)
-		}
-	})
-
-	// Ensure GCS URLs extract bucket & endpoint from host.
-	t.Run("GCS", func(t *testing.T) {
-		bucket, region, endpoint, forcePathStyle := s3.ParseHost(`litestream.io.storage.googleapis.com`)
-		if got, want := bucket, `litestream.io`; got != want {
-			t.Fatalf("bucket=%q, want %q", got, want)
-		} else if got, want := region, `us-east-1`; got != want {
-			t.Fatalf("region=%q, want %q", got, want)
-		} else if got, want := endpoint, `https://storage.googleapis.com`; got != want {
-			t.Fatalf("endpoint=%q, want %q", got, want)
-		} else if got, want := forcePathStyle, true; got != want {
-			t.Fatalf("forcePathStyle=%v, want %v", got, want)
+				fn(t, c)
+			})
 		}
 	})
 }
 
-// NewIntegrationReplicaClient returns a new client for integration testing.
-// If integration flag is not set then test/benchmark is skipped.
-func NewIntegrationReplicaClient(tb testing.TB) *s3.ReplicaClient {
+// NewReplicaClient returns a new client for integration testing by type name.
+func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 	tb.Helper()
 
-	if !*integration {
-		tb.Skip("integration tests disabled")
+	switch typ {
+	case file.ReplicaClientType:
+		return NewFileReplicaClient(tb)
+	case s3.ReplicaClientType:
+		return NewS3ReplicaClient(tb)
+	case gcs.ReplicaClientType:
+		return NewGCSReplicaClient(tb)
+	default:
+		tb.Fatalf("invalid replica client type: %q", typ)
+		return nil
 	}
+}
+
+// NewFileReplicaClient returns a new client for integration testing.
+func NewFileReplicaClient(tb testing.TB) *file.ReplicaClient {
+	tb.Helper()
+	return file.NewReplicaClient(tb.TempDir())
+}
+
+// NewS3ReplicaClient returns a new client for integration testing.
+func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
+	tb.Helper()
 
 	c := s3.NewReplicaClient()
-	c.AccessKeyID = *accessKeyID
-	c.SecretAccessKey = *secretAccessKey
-	c.Region = *region
-	c.Bucket = *bucket
-	c.Path = path.Join(*pathFlag, fmt.Sprintf("%016x", rand.Uint64()))
-	c.Endpoint = *endpoint
-	c.ForcePathStyle = *forcePathStyle
-	c.SkipVerify = *skipVerify
+	c.AccessKeyID = *s3AccessKeyID
+	c.SecretAccessKey = *s3SecretAccessKey
+	c.Region = *s3Region
+	c.Bucket = *s3Bucket
+	c.Path = path.Join(*s3Path, fmt.Sprintf("%016x", rand.Uint64()))
+	c.Endpoint = *s3Endpoint
+	c.ForcePathStyle = *s3ForcePathStyle
+	c.SkipVerify = *s3SkipVerify
+	return c
+}
 
+// NewGCSReplicaClient returns a new client for integration testing.
+func NewGCSReplicaClient(tb testing.TB) *gcs.ReplicaClient {
+	tb.Helper()
+
+	c := gcs.NewReplicaClient()
+	c.Bucket = *gcsBucket
+	c.Path = path.Join(*gcsPath, fmt.Sprintf("%016x", rand.Uint64()))
 	return c
 }
 
 // MustDeleteAll deletes all objects under the client's path.
-func MustDeleteAll(tb testing.TB, c *s3.ReplicaClient) {
+func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
 	tb.Helper()
-	if err := c.DeleteAll(context.Background()); err != nil {
+
+	generations, err := c.Generations(context.Background())
+	if err != nil {
 		tb.Fatal(err)
+	}
+
+	for _, generation := range generations {
+		if err := c.DeleteGeneration(context.Background(), generation); err != nil {
+			tb.Fatalf("cannot delete generation: %s", err)
+		}
 	}
 }

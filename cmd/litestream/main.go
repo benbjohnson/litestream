@@ -20,6 +20,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
@@ -330,6 +331,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
+	case "gcs":
+		if r.Client, err = newGCSReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
 	}
@@ -428,6 +433,45 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	return client, nil
+}
+
+// newGCSReplicaClientFromConfig returns a new instance of gcs.ReplicaClient built from config.
+func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *gcs.ReplicaClient, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for gcs replica")
+	} else if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for gcs replica")
+	}
+
+	bucket, path := c.Bucket, c.Path
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		_, uhost, upath, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, err
+		}
+
+		// Only apply URL parts to field that have not been overridden.
+		if path == "" {
+			path = upath
+		}
+		if bucket == "" {
+			bucket = uhost
+		}
+	}
+
+	// Ensure required settings are set.
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for gcs replica")
+	}
+
+	// Build replica.
+	client := gcs.NewReplicaClient()
+	client.Bucket = bucket
+	client.Path = path
 	return client, nil
 }
 
