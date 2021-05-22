@@ -17,13 +17,25 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
+      - name: Extract GCP credentials
+        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+
       - name: Run unit tests
         run: go test -v ./...
 
       - name: Run s3 integration tests
-        run: go test -v ./s3 -integration
+        run: go test -v -run=TestReplicaClient . -integration s3
         env:
           LITESTREAM_S3_ACCESS_KEY_ID:     ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
           LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
           LITESTREAM_S3_REGION:            ${{ secrets.LITESTREAM_S3_REGION }}
           LITESTREAM_S3_BUCKET:            ${{ secrets.LITESTREAM_S3_BUCKET }}
+
+      - name: Run gcs integration tests
+        run: go test -v -run=TestReplicaClient . -integration gcs
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
+          LITESTREAM_GCS_BUCKET:           ${{ secrets.LITESTREAM_GCS_BUCKET }}

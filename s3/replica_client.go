@@ -27,6 +27,9 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// ReplicaClientType is the client type for this package.
+const ReplicaClientType = "s3"
+
 // MaxKeys is the number of keys S3 can operate on per batch.
 const MaxKeys = 1000
 
@@ -61,7 +64,7 @@ func NewReplicaClient() *ReplicaClient {
 
 // Type returns "s3" as the client type.
 func (c *ReplicaClient) Type() string {
-	return "s3"
+	return ReplicaClientType
 }
 
 // Init initializes the connection to S3. No-op if already initialized.
@@ -181,7 +184,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 
 	dir, err := litestream.GenerationPath(c.Path, generation)
 	if err != nil {
-		return fmt.Errorf("cannot determine generation directory path: %w", err)
+		return fmt.Errorf("cannot determine generation path: %w", err)
 	}
 
 	// Collect all files for the generation.
@@ -499,7 +502,7 @@ func (itr *snapshotIterator) fetch() error {
 
 	dir, err := litestream.SnapshotsPath(itr.client.Path, itr.generation)
 	if err != nil {
-		return fmt.Errorf("cannot determine snapshot directory path: %w", err)
+		return fmt.Errorf("cannot determine snapshots path: %w", err)
 	}
 
 	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
@@ -602,7 +605,7 @@ func (itr *walSegmentIterator) fetch() error {
 
 	dir, err := litestream.WALPath(itr.client.Path, itr.generation)
 	if err != nil {
-		return fmt.Errorf("cannot determine wal directory path: %w", err)
+		return fmt.Errorf("cannot determine wal path: %w", err)
 	}
 
 	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
@@ -691,9 +694,6 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 	if a := localhostRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], "us-east-1"
 		scheme, endpoint = "http", "localhost"
-	} else if a := gcsRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], "us-east-1"
-		endpoint = "storage.googleapis.com"
 	} else if a := digitalOceanRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], a[2]
 		endpoint = fmt.Sprintf("%s.digitaloceanspaces.com", region)
@@ -726,7 +726,6 @@ var (
 	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
 	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects.com$`)
 	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
-	gcsRegex          = regexp.MustCompile(`^(?:(.+)\.)?storage.googleapis.com$`)
 )
 
 func isNotExists(err error) bool {

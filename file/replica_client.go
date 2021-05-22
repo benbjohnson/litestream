@@ -13,6 +13,9 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 )
 
+// ReplicaClientType is the client type for this package.
+const ReplicaClientType = "file"
+
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing snapshots & WAL segments to disk.
@@ -39,7 +42,7 @@ func (c *ReplicaClient) db() *litestream.DB {
 
 // Type returns "file" as the client type.
 func (c *ReplicaClient) Type() string {
-	return "file"
+	return ReplicaClientType
 }
 
 // Path returns the destination path to replicate the database to.
@@ -132,7 +135,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string) error {
 	dir, err := c.GenerationDir(generation)
 	if err != nil {
-		return fmt.Errorf("cannot determine generation directory: %w", err)
+		return fmt.Errorf("cannot determine generation path: %w", err)
 	}
 
 	if err := os.RemoveAll(dir); err != nil && !os.IsNotExist(err) {
@@ -145,7 +148,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
 	dir, err := c.SnapshotsDir(generation)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot directory: %w", err)
+		return nil, fmt.Errorf("cannot determine snapshots path: %w", err)
 	}
 
 	f, err := os.Open(dir)
@@ -261,7 +264,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
 	dir, err := c.WALDir(generation)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal directory: %w", err)
+		return nil, fmt.Errorf("cannot determine wal path: %w", err)
 	}
 
 	f, err := os.Open(dir)

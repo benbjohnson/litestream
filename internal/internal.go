@@ -60,12 +60,12 @@ func CreateFile(filename string, fi os.FileInfo) (*os.File, error) {
 	if fi != nil {
 		mode = fi.Mode()
 	}
-	
+
 	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	uid, gid := Fileinfo(fi)
 	_ = f.Chown(uid, gid)
 	return f, nil
@@ -74,7 +74,7 @@ func CreateFile(filename string, fi os.FileInfo) (*os.File, error) {
 // MkdirAll is a copy of os.MkdirAll() except that it attempts to set the
 // mode/uid/gid to match fi for each created directory.
 func MkdirAll(path string, fi os.FileInfo) error {
-		uid, gid := Fileinfo(fi)
+	uid, gid := Fileinfo(fi)
 
 	// Fast path: if we can tell whether path is a directory or file, stop with success or error.
 	dir, err := os.Stat(path)
@@ -123,4 +123,3 @@ func MkdirAll(path string, fi os.FileInfo) error {
 	_ = os.Chown(path, uid, gid)
 	return nil
 }
-
