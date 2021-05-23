@@ -6,7 +6,7 @@ on:
 name: release (linux/static)
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-18.04
     strategy:
       matrix:
         include:
