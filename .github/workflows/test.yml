@@ -26,7 +26,7 @@ jobs:
       - name: Run unit tests
         run: go test -v ./...
 
-      - name: Run s3 integration tests
+      - name: Run aws s3 tests
         run: go test -v -run=TestReplicaClient . -integration s3
         env:
           LITESTREAM_S3_ACCESS_KEY_ID:     ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
@@ -34,8 +34,15 @@ jobs:
           LITESTREAM_S3_REGION:            ${{ secrets.LITESTREAM_S3_REGION }}
           LITESTREAM_S3_BUCKET:            ${{ secrets.LITESTREAM_S3_BUCKET }}
 
-      - name: Run gcs integration tests
+      - name: Run google cloud storage (gcs) tests
         run: go test -v -run=TestReplicaClient . -integration gcs
         env:
           GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
           LITESTREAM_GCS_BUCKET:           ${{ secrets.LITESTREAM_GCS_BUCKET }}
+
+      - name: Run azure blob storage (abs) tests
+        run: go test -v -run=TestReplicaClient . -integration abs
+        env:
+          LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET:           ${{ secrets.LITESTREAM_ABS_BUCKET }}
