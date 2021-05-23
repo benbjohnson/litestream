@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
@@ -292,6 +293,10 @@ type ReplicaConfig struct {
 	Endpoint        string `yaml:"endpoint"`
 	ForcePathStyle  *bool  `yaml:"force-path-style"`
 	SkipVerify      bool   `yaml:"skip-verify"`
+
+	// ABS settings
+	AccountName string `yaml:"account-name"`
+	AccountKey  string `yaml:"account-key"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
@@ -333,6 +338,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		}
 	case "gcs":
 		if r.Client, err = newGCSReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case "abs":
+		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	default:
@@ -472,6 +481,48 @@ func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 	client := gcs.NewReplicaClient()
 	client.Bucket = bucket
 	client.Path = path
+	return client, nil
+}
+
+// newABSReplicaClientFromConfig returns a new instance of abs.ReplicaClient built from config.
+func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *abs.ReplicaClient, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for abs replica")
+	} else if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for abs replica")
+	}
+
+	bucket, path := c.Bucket, c.Path
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		_, uhost, upath, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, err
+		}
+
+		// Only apply URL parts to field that have not been overridden.
+		if path == "" {
+			path = upath
+		}
+		if bucket == "" {
+			bucket = uhost
+		}
+	}
+
+	// Ensure required settings are set.
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for abs replica")
+	}
+
+	// Build replica.
+	client := abs.NewReplicaClient()
+	client.AccountName = c.AccountName
+	client.AccountKey = c.AccountKey
+	client.Bucket = bucket
+	client.Path = path
+	client.Endpoint = c.Endpoint
 	return client, nil
 }
 
