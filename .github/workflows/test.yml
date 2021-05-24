@@ -23,6 +23,12 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
 
+      - name: Extract SSH key
+        run: 'echo "$LITESTREAM_SFTP_KEY" > /opt/id_ed25519'
+        shell: bash
+        env:
+          LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
+
       - name: Run unit tests
         run: go test -v ./...
 
@@ -46,3 +52,11 @@ jobs:
           LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
           LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
           LITESTREAM_ABS_BUCKET:           ${{ secrets.LITESTREAM_ABS_BUCKET }}
+
+      - name: Run sftp tests
+        run: go test -v -run=TestReplicaClient . -integration sftp
+        env:
+          LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
+          LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
+          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
+          LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}

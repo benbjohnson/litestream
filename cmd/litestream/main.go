@@ -23,6 +23,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
+	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
 )
@@ -297,6 +298,12 @@ type ReplicaConfig struct {
 	// ABS settings
 	AccountName string `yaml:"account-name"`
 	AccountKey  string `yaml:"account-key"`
+
+	// SFTP settings
+	Host     string `yaml:"host"`
+	User     string `yaml:"user"`
+	Password string `yaml:"password"`
+	KeyPath  string `yaml:"key-path"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
@@ -342,6 +349,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		}
 	case "abs":
 		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case "sftp":
+		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	default:
@@ -523,6 +534,56 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 	client.Bucket = bucket
 	client.Path = path
 	client.Endpoint = c.Endpoint
+	return client, nil
+}
+
+// newSFTPReplicaClientFromConfig returns a new instance of sftp.ReplicaClient built from config.
+func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *sftp.ReplicaClient, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for sftp replica")
+	} else if c.URL != "" && c.Host != "" {
+		return nil, fmt.Errorf("cannot specify url & host for sftp replica")
+	}
+
+	host, user, password, path := c.Host, c.User, c.Password, c.Path
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		u, err := url.Parse(c.URL)
+		if err != nil {
+			return nil, err
+		}
+
+		// Only apply URL parts to field that have not been overridden.
+		if host == "" {
+			host = u.Host
+		}
+		if user == "" && u.User != nil {
+			user = u.User.Username()
+		}
+		if password == "" && u.User != nil {
+			password, _ = u.User.Password()
+		}
+		if path == "" {
+			path = u.Path
+		}
+	}
+
+	// Ensure required settings are set.
+	if host == "" {
+		return nil, fmt.Errorf("host required for sftp replica")
+	} else if user == "" {
+		return nil, fmt.Errorf("user required for sftp replica")
+	}
+
+	// Build replica.
+	client := sftp.NewReplicaClient()
+	client.Host = host
+	client.User = user
+	client.Password = password
+	client.Path = path
+	client.KeyPath = c.KeyPath
 	return client, nil
 }
 

@@ -19,6 +19,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
+	"github.com/benbjohnson/litestream/sftp"
 )
 
 func init() {
@@ -55,6 +56,15 @@ var (
 	absAccountKey  = flag.String("abs-account-key", os.Getenv("LITESTREAM_ABS_ACCOUNT_KEY"), "")
 	absBucket      = flag.String("abs-bucket", os.Getenv("LITESTREAM_ABS_BUCKET"), "")
 	absPath        = flag.String("abs-path", os.Getenv("LITESTREAM_ABS_PATH"), "")
+)
+
+// SFTP settings
+var (
+	sftpHost     = flag.String("sftp-host", os.Getenv("LITESTREAM_SFTP_HOST"), "")
+	sftpUser     = flag.String("sftp-user", os.Getenv("LITESTREAM_SFTP_USER"), "")
+	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
+	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
+	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
 )
 
 func TestReplicaClient_Generations(t *testing.T) {
@@ -474,6 +484,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewGCSReplicaClient(tb)
 	case abs.ReplicaClientType:
 		return NewABSReplicaClient(tb)
+	case sftp.ReplicaClientType:
+		return NewSFTPReplicaClient(tb)
 	default:
 		tb.Fatalf("invalid replica client type: %q", typ)
 		return nil
@@ -524,18 +536,38 @@ func NewABSReplicaClient(tb testing.TB) *abs.ReplicaClient {
 	return c
 }
 
+// NewSFTPReplicaClient returns a new client for integration testing.
+func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
+	tb.Helper()
+
+	c := sftp.NewReplicaClient()
+	c.Host = *sftpHost
+	c.User = *sftpUser
+	c.Password = *sftpPassword
+	c.KeyPath = *sftpKeyPath
+	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
+	return c
+}
+
 // MustDeleteAll deletes all objects under the client's path.
 func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
 	tb.Helper()
 
 	generations, err := c.Generations(context.Background())
 	if err != nil {
-		tb.Fatal(err)
+		tb.Fatalf("cannot list generations for deletion: %s", err)
 	}
 
 	for _, generation := range generations {
 		if err := c.DeleteGeneration(context.Background(), generation); err != nil {
 			tb.Fatalf("cannot delete generation: %s", err)
+		}
+	}
+
+	switch c := c.(type) {
+	case *sftp.ReplicaClient:
+		if err := c.Cleanup(context.Background()); err != nil {
+			tb.Fatalf("cannot cleanup sftp: %s", err)
 		}
 	}
 }
