@@ -323,8 +323,6 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	}
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
-	} else if c.ReplicaType() == "s3" {
-		r.SyncInterval = 10 * time.Second // default s3 to 10s for configs
 	}
 	if v := c.SnapshotInterval; v != nil {
 		r.SnapshotInterval = *v
