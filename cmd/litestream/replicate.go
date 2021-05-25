@@ -9,6 +9,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"os"
+	"os/exec"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -16,11 +17,15 @@ import (
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/mattn/go-shellwords"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
+	cmd    *exec.Cmd  // subcommand
+	execCh chan error // subcommand error channel
+
 	Config Config
 
 	// List of managed databases specified in the config.
@@ -28,12 +33,15 @@ type ReplicateCommand struct {
 }
 
 func NewReplicateCommand() *ReplicateCommand {
-	return &ReplicateCommand{}
+	return &ReplicateCommand{
+		execCh: make(chan error),
+	}
 }
 
 // ParseFlags parses the CLI flags and loads the configuration file.
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
+	execFlag := fs.String("exec", "", "execute subcommand")
 	tracePath := fs.String("trace", "", "trace path")
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
@@ -67,6 +75,11 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		}
 	}
 
+	// Override config exec command, if specified.
+	if *execFlag != "" {
+		c.Config.Exec = *execFlag
+	}
+
 	// Enable trace logging.
 	if *tracePath != "" {
 		f, err := os.Create(*tracePath)
@@ -85,6 +98,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	// Display version information.
 	log.Printf("litestream %s", Version)
 
+	// Setup databases.
 	if len(c.Config.DBs) == 0 {
 		log.Println("no databases specified in configuration")
 	}
@@ -141,6 +155,23 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}()
 	}
 
+	// Parse exec commands args & start subprocess.
+	if c.Config.Exec != "" {
+		execArgs, err := shellwords.Parse(c.Config.Exec)
+		if err != nil {
+			return fmt.Errorf("cannot parse exec command: %w", err)
+		}
+
+		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
+		c.cmd.Env = os.Environ()
+		c.cmd.Stdout = os.Stdout
+		c.cmd.Stderr = os.Stderr
+		if err := c.cmd.Start(); err != nil {
+			return fmt.Errorf("cannot start exec command: %w", err)
+		}
+		go func() { c.execCh <- c.cmd.Wait() }()
+	}
+
 	return nil
 }
 
@@ -177,6 +208,10 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-exec CMD
+	    Executes a subcommand. Litestream will exit when the child
+	    process exits. Useful for simple process management.
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
