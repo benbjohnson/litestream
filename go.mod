@@ -8,6 +8,7 @@ require (
 	github.com/Azure/go-autorest/autorest v0.9.0 // indirect
 	github.com/aws/aws-sdk-go v1.27.0
 	github.com/davecgh/go-spew v1.1.1
+	github.com/mattn/go-shellwords v1.0.11 // indirect
 	github.com/mattn/go-sqlite3 v1.14.5
 	github.com/pierrec/lz4/v4 v4.1.3
 	github.com/pkg/sftp v1.13.0 // indirect

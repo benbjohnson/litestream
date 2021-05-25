@@ -20,7 +20,7 @@ func runWindowsService(ctx context.Context) error {
 }
 
 func signalChan() <-chan os.Signal {
-	ch := make(chan os.Signal, 1)
+	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	return ch
 }

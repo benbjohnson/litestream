@@ -9,7 +9,6 @@ import (
 	"log"
 	"net/url"
 	"os"
-	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
@@ -87,24 +86,40 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 		// Setup signal handler.
 		ctx, cancel := context.WithCancel(ctx)
-		ch := signalChan()
-		go func() { <-ch; cancel() }()
+		signalCh := signalChan()
 
 		if err := c.Run(ctx); err != nil {
 			return err
 		}
 
 		// Wait for signal to stop program.
-		<-ctx.Done()
-		signal.Reset()
-		fmt.Println("signal received, litestream shutting down")
+		select {
+		case err = <-c.execCh:
+			cancel()
+			fmt.Println("subprocess exited, litestream shutting down")
+		case sig := <-signalCh:
+			cancel()
+			fmt.Println("signal received, litestream shutting down")
+
+			if c.cmd != nil {
+				fmt.Println("sending signal to exec process")
+				if err := c.cmd.Process.Signal(sig); err != nil {
+					return fmt.Errorf("cannot signal exec process: %w", err)
+				}
+
+				fmt.Println("waiting for exec process to close")
+				if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
+					return fmt.Errorf("cannot wait for exec process: %w", err)
+				}
+			}
+		}
 
 		// Gracefully close.
-		if err := c.Close(); err != nil {
-			return err
+		if e := c.Close(); e != nil && err == nil {
+			err = e
 		}
 		fmt.Println("litestream shut down")
-		return nil
+		return err
 
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
@@ -151,6 +166,10 @@ type Config struct {
 
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
+
+	// Subcommand to execute during replication.
+	// Litestream will shutdown when subcommand exits.
+	Exec string `yaml:"exec"`
 
 	// Global S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
