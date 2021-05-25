@@ -75,7 +75,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 
 	// Build pipeline and reference to container.
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{})
+	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
+		Retry: azblob.RetryOptions{
+			TryTimeout: 24 * time.Hour,
+		},
+	})
 	containerURL := azblob.NewServiceURL(*endpointURL, pipeline).NewContainerURL(c.Bucket)
 	c.containerURL = &containerURL
 
