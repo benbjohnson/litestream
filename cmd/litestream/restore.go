@@ -28,6 +28,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&opt.Generation, "generation", "", "generation name")
 	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
+	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	verbose := fs.Bool("v", false, "verbose output")
@@ -58,14 +59,20 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
-		if r, err = c.loadFromURL(ctx, fs.Arg(0), &opt); err != nil {
+		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); err == errSkipDBExists {
+			fmt.Println("database already exists, skipping")
+			return nil
+		} else if err != nil {
 			return err
 		}
 	} else {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, &opt); err != nil {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); err == errSkipDBExists {
+			fmt.Println("database already exists, skipping")
+			return nil
+		} else if err != nil {
 			return err
 		}
 	}
@@ -84,7 +91,16 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 }
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
-func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+	if opt.OutputPath == "" {
+		return nil, fmt.Errorf("output path required")
+	}
+
+	// Exit successfully if the output file already exists.
+	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+		return nil, errSkipDBExists
+	}
+
 	syncInterval := litestream.DefaultSyncInterval
 	r, err := NewReplicaFromConfig(&ReplicaConfig{
 		URL:          replicaURL,
@@ -98,7 +114,7 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, opt
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	// Load configuration.
 	config, err := ReadConfigFile(configPath, expandEnv)
 	if err != nil {
@@ -121,6 +137,11 @@ func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath 
 	// Restore into original database path if not specified.
 	if opt.OutputPath == "" {
 		opt.OutputPath = dbPath
+	}
+
+	// Exit successfully if the output file already exists.
+	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+		return nil, errSkipDBExists
 	}
 
 	// Determine the appropriate replica & generation to restore from,
@@ -173,6 +194,9 @@ Arguments:
 	    Output path of the restored database.
 	    Defaults to original DB path.
 
+	-if-db-not-exists
+	    Returns exit code of 0 if the database already exists.
+
 	-if-replica-exists
 	    Returns exit code of 0 if no backups found.
 
@@ -205,3 +229,5 @@ Examples:
 		DefaultConfigPath(),
 	)
 }
+
+var errSkipDBExists = errors.New("database already exists, skipping")
