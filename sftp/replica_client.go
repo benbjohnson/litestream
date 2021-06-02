@@ -13,9 +13,8 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 	"github.com/pkg/sftp"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -178,7 +177,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 			return fmt.Errorf("cannot delete file %q: %w", walker.Path(), err)
 		}
 
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	// Remove directories in reverse order after they have been emptied.
@@ -269,8 +268,8 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(n))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
 	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
@@ -301,7 +300,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
 	return f, nil
 }
@@ -324,7 +323,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return fmt.Errorf("cannot delete snapshot %q: %w", filename, err)
 	}
 
-	operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	return nil
 }
 
@@ -403,8 +402,8 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(n))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
 	return litestream.WALSegmentInfo{
 		Generation: pos.Generation,
@@ -435,7 +434,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
 	return f, nil
 }
@@ -458,7 +457,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		if err := sftpClient.Remove(filename); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("cannot delete wal segment %q: %w", filename, err)
 		}
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	return nil
@@ -496,16 +495,3 @@ func (c *ReplicaClient) resetOnConnError(err error) {
 		c.sshClient = nil
 	}
 }
-
-// SFTP metrics.
-var (
-	operationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_sftp_operation_total",
-		Help: "The number of SFTP operations performed",
-	}, []string{"type"})
-
-	operationBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_sftp_operation_bytes",
-		Help: "The number of bytes used by SFTP operations",
-	}, []string{"type"})
-)

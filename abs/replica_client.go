@@ -14,8 +14,6 @@ import (
 	"github.com/Azure/azure-storage-blob-go/azblob"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -95,7 +93,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	var generations []string
 	var marker azblob.Marker
 	for marker.NotDone() {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		resp, err := c.containerURL.ListBlobsHierarchySegment(ctx, marker, "/", azblob.ListBlobsSegmentOptions{
 			Prefix: litestream.GenerationsPath(c.Path) + "/",
@@ -130,7 +128,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 
 	var marker azblob.Marker
 	for marker.NotDone() {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
 		if err != nil {
@@ -139,7 +137,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
-			operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+			internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 			blobURL := c.containerURL.NewBlobURL(item.Name)
 			if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
@@ -185,8 +183,8 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(rc.N()))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
 	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
@@ -217,8 +215,8 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
 	}
 
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
-	operationBytesCounterVec.WithLabelValues("GET").Add(float64(resp.ContentLength()))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(resp.ContentLength()))
 
 	return resp.Body(azblob.RetryReaderOptions{}), nil
 }
@@ -234,7 +232,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 
-	operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 	blobURL := c.containerURL.NewBlobURL(key)
 	if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
@@ -275,8 +273,8 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(rc.N()))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
 	return litestream.WALSegmentInfo{
 		Generation: pos.Generation,
@@ -307,8 +305,8 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
 	}
 
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
-	operationBytesCounterVec.WithLabelValues("GET").Add(float64(resp.ContentLength()))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(resp.ContentLength()))
 
 	return resp.Body(azblob.RetryReaderOptions{}), nil
 }
@@ -325,7 +323,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 			return fmt.Errorf("cannot determine wal segment path: %w", err)
 		}
 
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 		blobURL := c.containerURL.NewBlobURL(key)
 		if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
@@ -375,7 +373,7 @@ func (itr *snapshotIterator) fetch() error {
 
 	var marker azblob.Marker
 	for marker.NotDone() {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
 		if err != nil {
@@ -481,7 +479,7 @@ func (itr *walSegmentIterator) fetch() error {
 
 	var marker azblob.Marker
 	for marker.NotDone() {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
 		if err != nil {
@@ -559,16 +557,3 @@ func isNotExists(err error) bool {
 		return false
 	}
 }
-
-// Azure blob storage metrics.
-var (
-	operationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_abs_operation_total",
-		Help: "The number of ABS operations performed",
-	}, []string{"type"})
-
-	operationBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_abs_operation_bytes",
-		Help: "The number of bytes used by ABS operations",
-	}, []string{"type"})
-)

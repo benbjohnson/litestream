@@ -4,6 +4,9 @@ import (
 	"io"
 	"os"
 	"syscall"
+
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
 // ReadCloser wraps a reader to also attach a separate closer.
@@ -123,3 +126,16 @@ func MkdirAll(path string, fi os.FileInfo) error {
 	_ = os.Chown(path, uid, gid)
 	return nil
 }
+
+// Shared replica metrics.
+var (
+	OperationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_replica_operation_total",
+		Help: "The number of replica operations performed",
+	}, []string{"replica_type", "operation"})
+
+	OperationBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_replica_operation_bytes",
+		Help: "The number of bytes used by replica operations",
+	}, []string{"replica_type", "operation"})
+)
