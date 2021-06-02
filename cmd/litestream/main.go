@@ -502,36 +502,37 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 		return nil, fmt.Errorf("cannot specify url & bucket for abs replica")
 	}
 
-	bucket, path := c.Bucket, c.Path
-
-	// Apply settings from URL, if specified.
-	if c.URL != "" {
-		_, uhost, upath, err := ParseReplicaURL(c.URL)
-		if err != nil {
-			return nil, err
-		}
-
-		// Only apply URL parts to field that have not been overridden.
-		if path == "" {
-			path = upath
-		}
-		if bucket == "" {
-			bucket = uhost
-		}
-	}
-
-	// Ensure required settings are set.
-	if bucket == "" {
-		return nil, fmt.Errorf("bucket required for abs replica")
-	}
-
 	// Build replica.
 	client := abs.NewReplicaClient()
 	client.AccountName = c.AccountName
 	client.AccountKey = c.AccountKey
-	client.Bucket = bucket
-	client.Path = path
+	client.Bucket = c.Bucket
+	client.Path = c.Path
 	client.Endpoint = c.Endpoint
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		u, err := url.Parse(c.URL)
+		if err != nil {
+			return nil, err
+		}
+
+		if client.AccountName == "" && u.User != nil {
+			client.AccountName = u.User.Username()
+		}
+		if client.Bucket == "" {
+			client.Bucket = u.Host
+		}
+		if client.Path == "" {
+			client.Path = strings.TrimPrefix(path.Clean(u.Path), "/")
+		}
+	}
+
+	// Ensure required settings are set.
+	if client.Bucket == "" {
+		return nil, fmt.Errorf("bucket required for abs replica")
+	}
+
 	return client, nil
 }
 
