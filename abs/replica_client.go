@@ -493,7 +493,6 @@ func (itr *walSegmentIterator) fetch() error {
 		}
 		marker = resp.NextMarker
 
-		println("dbg/wal.fetch", len(resp.Segment.BlobItems))
 		for _, item := range resp.Segment.BlobItems {
 			key := path.Base(item.Name)
 			index, offset, err := litestream.ParseWALSegmentPath(key)
