@@ -56,8 +56,14 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
+	// Read account key from environment, if available.
+	accountKey := c.AccountKey
+	if accountKey == "" {
+		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
+	}
+
 	// Authenticate to ACS.
-	credential, err := azblob.NewSharedKeyCredential(c.AccountName, c.AccountKey)
+	credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
 	if err != nil {
 		return err
 	}
@@ -487,6 +493,7 @@ func (itr *walSegmentIterator) fetch() error {
 		}
 		marker = resp.NextMarker
 
+		println("dbg/wal.fetch", len(resp.Segment.BlobItems))
 		for _, item := range resp.Segment.BlobItems {
 			key := path.Base(item.Name)
 			index, offset, err := litestream.ParseWALSegmentPath(key)
