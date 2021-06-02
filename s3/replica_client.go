@@ -692,15 +692,17 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 	if a := localhostRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], "us-east-1"
 		scheme, endpoint = "http", "localhost"
+	} else if a := backblazeRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], a[2]
+		endpoint = fmt.Sprintf("s3.%s.backblazeb2.com", region)
+	} else if a := filebaseRegex.FindStringSubmatch(host); a != nil {
+		bucket, endpoint = a[1], "s3.filebase.com"
 	} else if a := digitalOceanRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], a[2]
 		endpoint = fmt.Sprintf("%s.digitaloceanspaces.com", region)
 	} else if a := linodeRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], a[2]
 		endpoint = fmt.Sprintf("%s.linodeobjects.com", region)
-	} else if a := backblazeRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], a[2]
-		endpoint = fmt.Sprintf("s3.%s.backblazeb2.com", region)
 	} else {
 		bucket = host
 		forcePathStyle = false
@@ -721,9 +723,10 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 
 var (
 	localhostRegex    = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
+	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
+	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
 	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
 	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects.com$`)
-	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
 )
 
 func isNotExists(err error) bool {
