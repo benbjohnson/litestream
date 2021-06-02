@@ -22,8 +22,6 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -159,7 +157,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 		Prefix:    aws.String(litestream.GenerationsPath(c.Path) + "/"),
 		Delimiter: aws.String("/"),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, prefix := range page.CommonPrefixes {
 			name := path.Base(*prefix.Prefix)
@@ -193,7 +191,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		Bucket: aws.String(c.Bucket),
 		Prefix: aws.String(dir),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
 			objIDs = append(objIDs, &s3.ObjectIdentifier{Key: obj.Key})
@@ -216,7 +214,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		}); err != nil {
 			return err
 		}
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 		objIDs = objIDs[n:]
 	}
@@ -255,8 +253,8 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(rc.N()))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
 	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
@@ -288,8 +286,8 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 	} else if err != nil {
 		return nil, err
 	}
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
-	operationBytesCounterVec.WithLabelValues("GET").Add(float64(*out.ContentLength))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*out.ContentLength))
 
 	return out.Body, nil
 }
@@ -312,7 +310,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return err
 	}
 
-	operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	return nil
 }
 
@@ -345,8 +343,8 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(rc.N()))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
 	return litestream.WALSegmentInfo{
 		Generation: pos.Generation,
@@ -378,8 +376,8 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 	} else if err != nil {
 		return nil, err
 	}
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
-	operationBytesCounterVec.WithLabelValues("GET").Add(float64(*out.ContentLength))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*out.ContentLength))
 
 	return out.Body, nil
 }
@@ -414,7 +412,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 			return err
 		}
 
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 		a = a[n:]
 	}
@@ -439,7 +437,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		Bucket: aws.String(c.Bucket),
 		Prefix: aws.String(prefix),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
 			objIDs = append(objIDs, &s3.ObjectIdentifier{Key: obj.Key})
@@ -462,7 +460,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		}); err != nil {
 			return err
 		}
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 		objIDs = objIDs[n:]
 	}
@@ -510,7 +508,7 @@ func (itr *snapshotIterator) fetch() error {
 		Prefix:    aws.String(dir + "/"),
 		Delimiter: aws.String("/"),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
 			key := path.Base(*obj.Key)
@@ -613,7 +611,7 @@ func (itr *walSegmentIterator) fetch() error {
 		Prefix:    aws.String(dir + "/"),
 		Delimiter: aws.String("/"),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		operationTotalCounterVec.WithLabelValues("LIST").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
 			key := path.Base(*obj.Key)
@@ -736,16 +734,3 @@ func isNotExists(err error) bool {
 		return false
 	}
 }
-
-// S3 metrics.
-var (
-	operationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_s3_operation_total",
-		Help: "The number of S3 operations performed",
-	}, []string{"type"})
-
-	operationBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_s3_operation_bytes",
-		Help: "The number of bytes used by S3 operations",
-	}, []string{"type"})
-)

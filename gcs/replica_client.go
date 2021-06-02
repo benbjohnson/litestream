@@ -12,8 +12,7 @@ import (
 
 	"cloud.google.com/go/storage"
 	"github.com/benbjohnson/litestream"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/benbjohnson/litestream/internal"
 	"google.golang.org/api/iterator"
 )
 
@@ -105,7 +104,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 	}
 
 	// Iterate over every object in generation and delete it.
-	operationTotalCounterVec.WithLabelValues("LIST").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"}); ; {
 		attrs, err := it.Next()
 		if err == iterator.Done {
@@ -119,7 +118,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		} else if err != nil {
 			return fmt.Errorf("cannot delete object %q: %w", attrs.Name, err)
 		}
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	// log.Printf("%s(%s): retainer: deleting generation: %s", r.db.Path(), r.Name(), generation)
@@ -161,8 +160,8 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(n))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
 	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
@@ -192,8 +191,8 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
 	}
 
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
-	operationBytesCounterVec.WithLabelValues("GET").Add(float64(r.Attrs.Size))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(r.Attrs.Size))
 
 	return r, nil
 }
@@ -213,7 +212,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return fmt.Errorf("cannot delete snapshot %q: %w", key, err)
 	}
 
-	operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	return nil
 }
 
@@ -251,8 +250,8 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("PUT").Inc()
-	operationBytesCounterVec.WithLabelValues("PUT").Add(float64(n))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
 	return litestream.WALSegmentInfo{
 		Generation: pos.Generation,
@@ -282,8 +281,8 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 
-	operationTotalCounterVec.WithLabelValues("GET").Inc()
-	operationBytesCounterVec.WithLabelValues("GET").Add(float64(r.Attrs.Size))
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(r.Attrs.Size))
 
 	return r, nil
 }
@@ -303,7 +302,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
 			return fmt.Errorf("cannot delete wal segment %q: %w", key, err)
 		}
-		operationTotalCounterVec.WithLabelValues("DELETE").Inc()
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	return nil
@@ -427,16 +426,3 @@ func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
 func isNotExists(err error) bool {
 	return err == storage.ErrObjectNotExist
 }
-
-// GCS metrics.
-var (
-	operationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_gcs_operation_total",
-		Help: "The number of GCS operations performed",
-	}, []string{"type"})
-
-	operationBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_gcs_operation_bytes",
-		Help: "The number of bytes used by GCS operations",
-	}, []string{"type"})
-)
