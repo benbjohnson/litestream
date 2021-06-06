@@ -18,8 +18,6 @@ import (
 	"golang.org/x/crypto/ssh"
 )
 
-// TODO(sftp): Add public key support
-
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "sftp"
 
