@@ -1058,7 +1058,7 @@ func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
 		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, frame[:8])  // frame header
 		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, frame[24:]) // frame data
 		if chksum0 != fchksum0 || chksum1 != fchksum1 {
-			log.Printf("copy shadow: checksum mismatch, skipping: offset=%d (%x,%x) != (%x,%x)", offset, chksum0, chksum1, fchksum0, fchksum1)
+			Tracef("%s: copy shadow: checksum mismatch, skipping: offset=%d (%x,%x) != (%x,%x)", db.path, offset, chksum0, chksum1, fchksum0, fchksum1)
 			break
 		}
 
