@@ -455,10 +455,6 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return info, ErrNoGeneration
 	}
 
-	// TODO: Check if snapshot already exists & skip.
-
-	// startTime := time.Now()
-
 	// Open db file descriptor, if not already open, & position at beginning.
 	if r.f == nil {
 		if r.f, err = os.Open(r.db.Path()); err != nil {
@@ -491,9 +487,13 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	// Delegate write to client & wait for writer goroutine to finish.
 	if info, err = r.Client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr); err != nil {
 		return info, err
+	} else if err := g.Wait(); err != nil {
+		return info, err
 	}
 
-	return info, g.Wait()
+	log.Printf("%s(%s): snapshot written %s/%08x", r.db.Path(), r.Name(), pos.Generation, pos.Index)
+
+	return info, nil
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
@@ -559,9 +559,9 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 		if err := r.Client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
 			return fmt.Errorf("delete snapshot %s/%08x: %w", info.Generation, info.Index, err)
 		}
+		log.Printf("%s(%s): snapshot deleted %s/%08x", r.db.Path(), r.Name(), generation, index)
 	}
 
-	// log.Printf("%s(%s): retainer: deleting snapshots before %s/%08x; n=%d", r.db.Path(), r.Name(), generation, index, n)
 	return itr.Close()
 }
 
@@ -584,11 +584,15 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation s
 		return err
 	}
 
+	if len(a) == 0 {
+		return nil
+	}
+
 	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
+	log.Printf("%s(%s): wal segmented deleted before %s/%08x: n=%d", r.db.Path(), r.Name(), generation, index, len(a))
 
-	// log.Printf("%s(%s): retainer: deleting wal segment %s/%08x:%d", r.db.Path(), r.Name(), generation, index, offset)
 	return nil
 }
 

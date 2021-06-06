@@ -185,7 +185,6 @@ func (c *ReplicateCommand) Close() (err error) {
 			}
 		}
 	}
-	// TODO(windows): Clear DBs
 	return err
 }
 
