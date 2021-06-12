@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -84,7 +85,7 @@ func (c *ReplicaClient) SnapshotPath(generation string, index int) (string, erro
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, litestream.FormatSnapshotPath(index)), nil
+	return filepath.Join(dir, litestream.FormatIndex(index)+".snapshot.lz4"), nil
 }
 
 // WALDir returns the path to a generation's WAL directory
@@ -102,7 +103,7 @@ func (c *ReplicaClient) WALSegmentPath(generation string, index int, offset int6
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, litestream.FormatWALSegmentPath(index, offset)), nil
+	return filepath.Join(dir, litestream.FormatIndex(index), fmt.Sprintf("%08x.wal.lz4", offset)), nil
 }
 
 // Generations returns a list of available generation names.
@@ -168,7 +169,7 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 	infos := make([]litestream.SnapshotInfo, 0, len(fis))
 	for _, fi := range fis {
 		// Parse index from filename.
-		index, err := litestream.ParseSnapshotPath(fi.Name())
+		index, err := internal.ParseSnapshotPath(filepath.Base(fi.Name()))
 		if err != nil {
 			continue
 		}
@@ -281,26 +282,18 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 	}
 
 	// Iterate over every file and convert to metadata.
-	infos := make([]litestream.WALSegmentInfo, 0, len(fis))
+	indexes := make([]int, 0, len(fis))
 	for _, fi := range fis {
-		// Parse index from filename.
-		index, offset, err := litestream.ParseWALSegmentPath(fi.Name())
-		if err != nil {
+		index, err := litestream.ParseIndex(fi.Name())
+		if err != nil || !fi.IsDir() {
 			continue
 		}
-
-		infos = append(infos, litestream.WALSegmentInfo{
-			Generation: generation,
-			Index:      index,
-			Offset:     offset,
-			Size:       fi.Size(),
-			CreatedAt:  fi.ModTime().UTC(),
-		})
+		indexes = append(indexes, index)
 	}
 
-	sort.Sort(litestream.WALSegmentInfoSlice(infos))
+	sort.Ints(indexes)
 
-	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
+	return newWALSegmentIterator(dir, generation, indexes), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
@@ -378,4 +371,98 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		}
 	}
 	return nil
+}
+
+type walSegmentIterator struct {
+	dir        string
+	generation string
+	indexes    []int
+
+	infos []litestream.WALSegmentInfo
+	err   error
+}
+
+func newWALSegmentIterator(dir, generation string, indexes []int) *walSegmentIterator {
+	return &walSegmentIterator{
+		dir:        dir,
+		generation: generation,
+		indexes:    indexes,
+	}
+}
+
+func (itr *walSegmentIterator) Close() (err error) {
+	return itr.err
+}
+
+func (itr *walSegmentIterator) Next() bool {
+	// Exit if an error has already occurred.
+	if itr.err != nil {
+		return false
+	}
+
+	for {
+		// Move to the next segment in cache, if available.
+		if len(itr.infos) > 1 {
+			itr.infos = itr.infos[1:]
+			return true
+		}
+		itr.infos = itr.infos[:0] // otherwise clear infos
+
+		// Move to the next index unless this is the first time initializing.
+		if itr.infos != nil && len(itr.indexes) > 0 {
+			itr.indexes = itr.indexes[1:]
+		}
+
+		// If no indexes remain, stop iteration.
+		if len(itr.indexes) == 0 {
+			return false
+		}
+
+		// Read segments into a cache for the current index.
+		index := itr.indexes[0]
+		f, err := os.Open(filepath.Join(itr.dir, litestream.FormatIndex(index)))
+		if err != nil {
+			itr.err = err
+			return false
+		}
+		defer f.Close()
+
+		fis, err := f.Readdir(-1)
+		if err != nil {
+			itr.err = err
+			return false
+		}
+		for _, fi := range fis {
+			filename := filepath.Base(fi.Name())
+			if fi.IsDir() {
+				continue
+			}
+
+			offset, err := litestream.ParseOffset(strings.TrimSuffix(filename, ".wal.lz4"))
+			if err != nil {
+				continue
+			}
+
+			itr.infos = append(itr.infos, litestream.WALSegmentInfo{
+				Generation: itr.generation,
+				Index:      index,
+				Offset:     offset,
+				Size:       fi.Size(),
+				CreatedAt:  fi.ModTime().UTC(),
+			})
+		}
+
+		if len(itr.infos) > 0 {
+			return true
+		}
+	}
+}
+
+func (itr *walSegmentIterator) Err() error { return itr.err }
+
+func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
+	if len(itr.infos) == 0 {
+		return litestream.WALSegmentInfo{}
+	}
+	return itr.infos[0]
 }

@@ -118,7 +118,7 @@ func TestReplicaClient_WALSegmentPath(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		if got, err := file.NewReplicaClient("/foo").WALSegmentPath("0123456701234567", 1000, 1001); err != nil {
 			t.Fatal(err)
-		} else if want := "/foo/generations/0123456701234567/wal/000003e8_000003e9.wal.lz4"; got != want {
+		} else if want := "/foo/generations/0123456701234567/wal/000003e8/000003e9.wal.lz4"; got != want {
 			t.Fatalf("WALPath()=%v, want %v", got, want)
 		}
 	})

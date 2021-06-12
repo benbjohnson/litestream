@@ -102,7 +102,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		resp, err := c.containerURL.ListBlobsHierarchySegment(ctx, marker, "/", azblob.ListBlobsSegmentOptions{
-			Prefix: litestream.GenerationsPath(c.Path) + "/",
+			Prefix: path.Join(c.Path, "generations") + "/",
 		})
 		if err != nil {
 			return nil, err
@@ -125,18 +125,17 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string) error {
 	if err := c.Init(ctx); err != nil {
 		return err
+	} else if generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
-	dir, err := litestream.GenerationPath(c.Path, generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine generation path: %w", err)
-	}
+	prefix := path.Join(c.Path, "generations", generation) + "/"
 
 	var marker azblob.Marker
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}
@@ -171,12 +170,11 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
+	} else if generation == "" {
+		return info, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
@@ -206,12 +204,11 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 
 	blobURL := c.containerURL.NewBlobURL(key)
 	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
@@ -231,12 +228,11 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
 	if err := c.Init(ctx); err != nil {
 		return err
+	} else if generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
@@ -261,12 +257,11 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
+	} else if pos.Generation == "" {
+		return info, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
@@ -296,12 +291,11 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if pos.Generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 
 	blobURL := c.containerURL.NewBlobURL(key)
 	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
@@ -324,10 +318,11 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	}
 
 	for _, pos := range a {
-		key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-		if err != nil {
-			return fmt.Errorf("cannot determine wal segment path: %w", err)
+		if pos.Generation == "" {
+			return fmt.Errorf("generation required")
 		}
+
+		key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
@@ -372,24 +367,24 @@ func newSnapshotIterator(ctx context.Context, generation string, client *Replica
 func (itr *snapshotIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.SnapshotsPath(itr.client.Path, itr.generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshots path: %w", err)
+	if itr.generation == "" {
+		return fmt.Errorf("generation required")
 	}
+
+	prefix := path.Join(itr.client.Path, "generations", itr.generation) + "/"
 
 	var marker azblob.Marker
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}
 		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
-			key := path.Base(item.Name)
-			index, err := litestream.ParseSnapshotPath(key)
+			index, err := internal.ParseSnapshotPath(path.Base(item.Name))
 			if err != nil {
 				continue
 			}
@@ -478,24 +473,24 @@ func newWALSegmentIterator(ctx context.Context, generation string, client *Repli
 func (itr *walSegmentIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.WALPath(itr.client.Path, itr.generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine wal path: %w", err)
+	if itr.generation == "" {
+		return fmt.Errorf("generation required")
 	}
+	prefix := path.Join(itr.client.Path, "generations", itr.generation, "wal")
 
 	var marker azblob.Marker
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}
 		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
-			key := path.Base(item.Name)
-			index, offset, err := litestream.ParseWALSegmentPath(key)
+			key := strings.TrimPrefix(item.Name, prefix+"/")
+			index, offset, err := internal.ParseWALSegmentPath(key)
 			if err != nil {
 				continue
 			}
