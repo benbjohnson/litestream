@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -154,7 +155,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	var generations []string
 	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
 		Bucket:    aws.String(c.Bucket),
-		Prefix:    aws.String(litestream.GenerationsPath(c.Path) + "/"),
+		Prefix:    aws.String(path.Join(c.Path, "generations") + "/"),
 		Delimiter: aws.String("/"),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
@@ -178,18 +179,15 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string) error {
 	if err := c.Init(ctx); err != nil {
 		return err
-	}
-
-	dir, err := litestream.GenerationPath(c.Path, generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine generation path: %w", err)
+	} else if generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
 	// Collect all files for the generation.
 	var objIDs []*s3.ObjectIdentifier
 	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
 		Bucket: aws.String(c.Bucket),
-		Prefix: aws.String(dir),
+		Prefix: aws.String(path.Join(c.Path, "generations", generation)),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
@@ -236,12 +234,11 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
+	} else if generation == "" {
+		return info, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
@@ -270,12 +267,11 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 
 	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
@@ -296,12 +292,11 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
 	if err := c.Init(ctx); err != nil {
 		return err
+	} else if generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 
 	if _, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
 		Bucket: aws.String(c.Bucket),
@@ -326,12 +321,11 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
+	} else if pos.Generation == "" {
+		return info, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
@@ -360,12 +354,11 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if pos.Generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 
 	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
@@ -397,10 +390,10 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 
 		// Generate a batch of object IDs for deleting the WAL segments.
 		for i, pos := range a[:n] {
-			key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-			if err != nil {
-				return fmt.Errorf("cannot determine wal segment path: %w", err)
+			if pos.Generation == "" {
+				return fmt.Errorf("generation required")
 			}
+			key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 			objIDs[i] = &s3.ObjectIdentifier{Key: &key}
 		}
 
@@ -498,10 +491,11 @@ func newSnapshotIterator(ctx context.Context, client *ReplicaClient, generation 
 func (itr *snapshotIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.SnapshotsPath(itr.client.Path, itr.generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshots path: %w", err)
+	if itr.generation == "" {
+		return fmt.Errorf("generation required")
 	}
+
+	dir := path.Join(itr.client.Path, "generations", itr.generation, "snapshots")
 
 	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
 		Bucket:    aws.String(itr.client.Bucket),
@@ -511,8 +505,7 @@ func (itr *snapshotIterator) fetch() error {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(*obj.Key)
-			index, err := litestream.ParseSnapshotPath(key)
+			index, err := internal.ParseSnapshotPath(path.Base(*obj.Key))
 			if err != nil {
 				continue
 			}
@@ -601,21 +594,20 @@ func newWALSegmentIterator(ctx context.Context, client *ReplicaClient, generatio
 func (itr *walSegmentIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.WALPath(itr.client.Path, itr.generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine wal path: %w", err)
+	if itr.generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
+	prefix := path.Join(itr.client.Path, "generations", itr.generation, "wal") + "/"
+
 	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
-		Bucket:    aws.String(itr.client.Bucket),
-		Prefix:    aws.String(dir + "/"),
-		Delimiter: aws.String("/"),
+		Bucket: aws.String(itr.client.Bucket),
+		Prefix: aws.String(prefix),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(*obj.Key)
-			index, offset, err := litestream.ParseWALSegmentPath(key)
+			index, offset, err := internal.ParseWALSegmentPath(strings.TrimPrefix(*obj.Key, prefix))
 			if err != nil {
 				continue
 			}

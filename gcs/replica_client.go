@@ -68,7 +68,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	// Construct query to only pull generation directory names.
 	query := &storage.Query{
 		Delimiter: "/",
-		Prefix:    litestream.GenerationsPath(c.Path) + "/",
+		Prefix:    path.Join(c.Path, "generations") + "/",
 	}
 
 	// Loop over results and only build list of generation-formatted names.
@@ -96,16 +96,15 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string) error {
 	if err := c.Init(ctx); err != nil {
 		return err
+	} else if generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
-	dir, err := litestream.GenerationPath(c.Path, generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine generation path: %w", err)
-	}
+	prefix := path.Join(c.Path, "generations", generation) + "/"
 
 	// Iterate over every object in generation and delete it.
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
-	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"}); ; {
+	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}); ; {
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
@@ -130,24 +129,22 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
-	dir, err := litestream.SnapshotsPath(c.Path, generation)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshots path: %w", err)
-	}
-	return newSnapshotIterator(generation, c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
+	prefix := path.Join(c.Path, "generations", generation) + "/"
+	return newSnapshotIterator(generation, c.bkt.Objects(ctx, &storage.Query{Prefix: prefix})), nil
 }
 
 // WriteSnapshot writes LZ4 compressed data from rd to the object storage.
 func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
+	} else if generation == "" {
+		return info, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 	startTime := time.Now()
 
 	w := c.bkt.Object(key).NewWriter(ctx)
@@ -177,12 +174,11 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 
 	r, err := c.bkt.Object(key).NewReader(ctx)
 	if isNotExists(err) {
@@ -201,12 +197,11 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
 	if err := c.Init(ctx); err != nil {
 		return err
+	} else if generation == "" {
+		return fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index), ".snapshot.lz4")
 
 	if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
 		return fmt.Errorf("cannot delete snapshot %q: %w", key, err)
@@ -220,24 +215,22 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
-	dir, err := litestream.WALPath(c.Path, generation)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal path: %w", err)
-	}
-	return newWALSegmentIterator(generation, c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
+	prefix := path.Join(c.Path, "generations", generation, "wal") + "/"
+	return newWALSegmentIterator(generation, prefix, c.bkt.Objects(ctx, &storage.Query{Prefix: prefix})), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
 func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
+	} else if pos.Generation == "" {
+		return info, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 	startTime := time.Now()
 
 	w := c.bkt.Object(key).NewWriter(ctx)
@@ -267,12 +260,11 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	} else if pos.Generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 
 	r, err := c.bkt.Object(key).NewReader(ctx)
 	if isNotExists(err) {
@@ -294,11 +286,11 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	}
 
 	for _, pos := range a {
-		key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
-		if err != nil {
-			return fmt.Errorf("cannot determine wal segment path: %w", err)
+		if pos.Generation == "" {
+			return fmt.Errorf("generation required")
 		}
 
+		key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 		if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
 			return fmt.Errorf("cannot delete wal segment %q: %w", key, err)
 		}
@@ -344,7 +336,7 @@ func (itr *snapshotIterator) Next() bool {
 		}
 
 		// Parse index, otherwise skip to the next object.
-		index, err := litestream.ParseSnapshotPath(path.Base(attrs.Name))
+		index, err := internal.ParseSnapshotPath(path.Base(attrs.Name))
 		if err != nil {
 			continue
 		}
@@ -366,15 +358,17 @@ func (itr *snapshotIterator) Snapshot() litestream.SnapshotInfo { return itr.inf
 
 type walSegmentIterator struct {
 	generation string
+	prefix     string
 
 	it   *storage.ObjectIterator
 	info litestream.WALSegmentInfo
 	err  error
 }
 
-func newWALSegmentIterator(generation string, it *storage.ObjectIterator) *walSegmentIterator {
+func newWALSegmentIterator(generation, prefix string, it *storage.ObjectIterator) *walSegmentIterator {
 	return &walSegmentIterator{
 		generation: generation,
+		prefix:     prefix,
 		it:         it,
 	}
 }
@@ -400,7 +394,7 @@ func (itr *walSegmentIterator) Next() bool {
 		}
 
 		// Parse index & offset, otherwise skip to the next object.
-		index, offset, err := litestream.ParseWALSegmentPath(path.Base(attrs.Name))
+		index, offset, err := internal.ParseWALSegmentPath(strings.TrimPrefix(attrs.Name, itr.prefix))
 		if err != nil {
 			continue
 		}

@@ -177,7 +177,7 @@ func TestReplicaClient_Snapshots(t *testing.T) {
 		if err == nil {
 			err = itr.Close()
 		}
-		if err == nil || err.Error() != `cannot determine snapshots path: generation required` {
+		if err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -204,7 +204,7 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -242,13 +242,13 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
-func TestReplicaClient_WALs(t *testing.T) {
+func TestReplicaClient_WALSegments(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
@@ -362,7 +362,7 @@ func TestReplicaClient_WALs(t *testing.T) {
 		if err == nil {
 			err = itr.Close()
 		}
-		if err == nil || err.Error() != `cannot determine wal path: generation required` {
+		if err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -389,13 +389,13 @@ func TestReplicaClient_WriteWALSegment(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
 }
 
-func TestReplicaClient_WALReader(t *testing.T) {
+func TestReplicaClient_WALSegmentReader(t *testing.T) {
 
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
@@ -451,7 +451,7 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
