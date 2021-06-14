@@ -16,6 +16,8 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -168,7 +170,7 @@ func (db *DB) ShadowWALDir(generation string) string {
 // Panics if generation is blank or index is negative.
 func (db *DB) ShadowWALPath(generation string, index int) string {
 	assert(index >= 0, "shadow wal index cannot be negative")
-	return filepath.Join(db.ShadowWALDir(generation), FormatWALPath(index))
+	return filepath.Join(db.ShadowWALDir(generation), FormatIndex(index)+".wal")
 }
 
 // CurrentShadowWALPath returns the path to the last shadow WAL in a generation.
@@ -191,8 +193,8 @@ func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, e
 
 	// Find highest wal index.
 	for _, fi := range fis {
-		if v, err := ParseWALPath(fi.Name()); err != nil {
-			continue // invalid wal filename
+		if v, err := parseWALPath(fi.Name()); err != nil {
+			continue // invalid filename
 		} else if v > index {
 			index = v
 		}
@@ -584,7 +586,7 @@ func (db *DB) cleanWAL() error {
 		return err
 	}
 	for _, fi := range fis {
-		if idx, err := ParseWALPath(fi.Name()); err != nil || idx >= min {
+		if idx, err := parseWALPath(fi.Name()); err != nil || idx >= min {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
@@ -928,13 +930,13 @@ func (db *DB) syncWAL(info syncInfo) (newSize int64, err error) {
 
 	// Parse index of current shadow WAL file.
 	dir, base := filepath.Split(info.shadowWALPath)
-	index, err := ParseWALPath(base)
+	index, err := parseWALPath(base)
 	if err != nil {
 		return 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
 	}
 
 	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(dir, FormatWALPath(index+1))
+	newShadowWALPath := filepath.Join(dir, formatWALPath(index+1))
 	newSize, err = db.initShadowWALFile(newShadowWALPath)
 	if err != nil {
 		return 0, fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
@@ -1298,13 +1300,13 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	}
 
 	// Parse index of current shadow WAL file.
-	index, err := ParseWALPath(shadowWALPath)
+	index, err := parseWALPath(shadowWALPath)
 	if err != nil {
 		return fmt.Errorf("cannot parse shadow wal filename: %s", shadowWALPath)
 	}
 
 	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(filepath.Dir(shadowWALPath), FormatWALPath(index+1))
+	newShadowWALPath := filepath.Join(filepath.Dir(shadowWALPath), formatWALPath(index+1))
 	if _, err := db.initShadowWALFile(newShadowWALPath); err != nil {
 		return fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
 	}
@@ -1480,6 +1482,28 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 	}
 	return h.Sum64(), pos, nil
 }
+
+// parseWALPath returns the index for the WAL file.
+// Returns an error if the path is not a valid WAL path.
+func parseWALPath(s string) (index int, err error) {
+	s = filepath.Base(s)
+
+	a := walPathRegex.FindStringSubmatch(s)
+	if a == nil {
+		return 0, fmt.Errorf("invalid wal path: %s", s)
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	return int(i64), nil
+}
+
+// formatWALPath formats a WAL filename with a given index.
+func formatWALPath(index int) string {
+	assert(index >= 0, "wal index must be non-negative")
+	return FormatIndex(index) + ".wal"
+}
+
+var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.wal$`)
 
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.
 const DefaultRestoreParallelism = 8

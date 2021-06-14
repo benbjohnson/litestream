@@ -1,8 +1,11 @@
 package internal
 
 import (
+	"fmt"
 	"io"
 	"os"
+	"regexp"
+	"strconv"
 	"syscall"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -126,6 +129,33 @@ func MkdirAll(path string, fi os.FileInfo) error {
 	_ = os.Chown(path, uid, gid)
 	return nil
 }
+
+// ParseSnapshotPath parses the index from a snapshot filename. Used by path-based replicas.
+func ParseSnapshotPath(s string) (index int, err error) {
+	a := snapshotPathRegex.FindStringSubmatch(s)
+	if a == nil {
+		return 0, fmt.Errorf("invalid snapshot path")
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	return int(i64), nil
+}
+
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot\.lz4$`)
+
+// ParseWALSegmentPath parses the index/offset from a segment filename. Used by path-based replicas.
+func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
+	a := walSegmentPathRegex.FindStringSubmatch(s)
+	if a == nil {
+		return 0, 0, fmt.Errorf("invalid wal segment path")
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	off64, _ := strconv.ParseUint(a[2], 16, 64)
+	return int(i64), int64(off64), nil
+}
+
+var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\/([0-9a-f]{8})\.wal\.lz4$`)
 
 // Shared replica metrics.
 var (
