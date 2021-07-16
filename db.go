@@ -17,12 +17,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -49,8 +51,16 @@ type DB struct {
 	db       *sql.DB       // target database
 	f        *os.File      // long-running db file descriptor
 	rtx      *sql.Tx       // long running read transaction
+	pos      Pos           // cached position
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
+
+	// Cached salt & checksum from current shadow header.
+	hdr              []byte
+	frame            []byte
+	salt0, salt1     uint32
+	chksum0, chksum1 uint32
+	byteOrder        binary.ByteOrder
 
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
@@ -96,6 +106,8 @@ type DB struct {
 	// List of replicas for the database.
 	// Must be set before calling Open().
 	Replicas []*Replica
+
+	Logger *log.Logger
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -108,6 +120,8 @@ func NewDB(path string) *DB {
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
+
+		Logger: log.New(LogWriter, fmt.Sprintf("%s: ", path), LogFlags),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -145,7 +159,7 @@ func (db *DB) WALPath() string {
 // MetaPath returns the path to the database metadata.
 func (db *DB) MetaPath() string {
 	dir, file := filepath.Split(db.path)
-	return filepath.Join(dir, "."+file+MetaDirSuffix)
+	return filepath.Join(dir, file+MetaDirSuffix)
 }
 
 // GenerationNamePath returns the path of the name of the current generation.
@@ -164,44 +178,6 @@ func (db *DB) GenerationPath(generation string) string {
 // Panics if generation is blank.
 func (db *DB) ShadowWALDir(generation string) string {
 	return filepath.Join(db.GenerationPath(generation), "wal")
-}
-
-// ShadowWALPath returns the path of a single shadow WAL file.
-// Panics if generation is blank or index is negative.
-func (db *DB) ShadowWALPath(generation string, index int) string {
-	assert(index >= 0, "shadow wal index cannot be negative")
-	return filepath.Join(db.ShadowWALDir(generation), FormatIndex(index)+".wal")
-}
-
-// CurrentShadowWALPath returns the path to the last shadow WAL in a generation.
-func (db *DB) CurrentShadowWALPath(generation string) (string, error) {
-	index, _, err := db.CurrentShadowWALIndex(generation)
-	if err != nil {
-		return "", err
-	}
-	return db.ShadowWALPath(generation, index), nil
-}
-
-// CurrentShadowWALIndex returns the current WAL index & total size.
-func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, err error) {
-	fis, err := ioutil.ReadDir(filepath.Join(db.GenerationPath(generation), "wal"))
-	if os.IsNotExist(err) {
-		return 0, 0, nil // no wal files written for generation
-	} else if err != nil {
-		return 0, 0, err
-	}
-
-	// Find highest wal index.
-	for _, fi := range fis {
-		if v, err := parseWALPath(fi.Name()); err != nil {
-			continue // invalid filename
-		} else if v > index {
-			index = v
-		}
-
-		size += fi.Size()
-	}
-	return index, size, nil
 }
 
 // FileInfo returns the cached file stats for the database file when it was initialized.
@@ -224,28 +200,208 @@ func (db *DB) Replica(name string) *Replica {
 	return nil
 }
 
-// Pos returns the current position of the database.
-func (db *DB) Pos() (Pos, error) {
+// Pos returns the cached position of the database.
+// Returns a zero position if no position has been calculated or if there is no generation.
+func (db *DB) Pos() Pos {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.pos
+}
+
+// reset clears all cached data.
+func (db *DB) reset() {
+	db.pos = Pos{}
+	db.hdr, db.frame = nil, nil
+	db.salt0, db.salt1 = 0, 0
+	db.chksum0, db.chksum1 = 0, 0
+	db.byteOrder = nil
+}
+
+// invalidate refreshes cached position, salt, & checksum from on-disk data.
+func (db *DB) invalidate(ctx context.Context) (err error) {
+	// Clear cached data before starting.
+	db.reset()
+
+	// If any error occurs, ensure all cached data is cleared.
+	defer func() {
+		if err != nil {
+			db.reset()
+		}
+	}()
+
+	// Determine the last position of the current generation.
+	if err := db.invalidatePos(ctx); err != nil {
+		return fmt.Errorf("cannot determine pos: %w", err)
+	} else if db.pos.IsZero() {
+		return nil // no position, exit
+	}
+
+	// Determine salt & last checksum.
+	if err := db.invalidateChecksum(ctx); err != nil {
+		return fmt.Errorf("cannot determine last salt/checksum: %w", err)
+	}
+	return nil
+}
+
+func (db *DB) invalidatePos(ctx context.Context) error {
+	// Determine generation based off "generation" file in meta directory.
 	generation, err := db.CurrentGeneration()
 	if err != nil {
-		return Pos{}, err
+		return err
 	} else if generation == "" {
-		return Pos{}, nil
+		return nil
 	}
 
-	index, _, err := db.CurrentShadowWALIndex(generation)
+	// Iterate over all segments to find the last one.
+	itr, err := db.WALSegments(context.Background(), generation)
 	if err != nil {
-		return Pos{}, err
+		return err
+	}
+	defer itr.Close()
+
+	pos := Pos{Generation: generation}
+	for itr.Next() {
+		info := itr.WALSegment()
+		pos = info.Pos()
+	}
+	if err := itr.Close(); err != nil {
+		return err
 	}
 
-	fi, err := os.Stat(db.ShadowWALPath(generation, index))
-	if os.IsNotExist(err) {
-		return Pos{Generation: generation, Index: index}, nil
-	} else if err != nil {
-		return Pos{}, err
+	// Exit if no WAL segments exist.
+	if pos.IsZero() {
+		return nil
 	}
 
-	return Pos{Generation: generation, Index: index, Offset: frameAlign(fi.Size(), db.pageSize)}, nil
+	// Read size of last segment to determine ending position.
+	rd, err := db.WALSegmentReader(ctx, pos)
+	if err != nil {
+		return fmt.Errorf("cannot read last wal segment: %w", err)
+	}
+	defer rd.Close()
+
+	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
+	if err != nil {
+		return err
+	}
+	pos.Offset += n
+
+	// Save position to cache.
+	db.pos = pos
+
+	return nil
+}
+
+func (db *DB) invalidateChecksum(ctx context.Context) error {
+	assert(!db.pos.IsZero(), "position required to invalidate checksum")
+
+	// Read entire WAL from combined segments.
+	walReader, err := db.WALReader(ctx, db.pos.Generation, db.pos.Index)
+	if err != nil {
+		return fmt.Errorf("cannot read last wal: %w", err)
+	}
+	defer walReader.Close()
+
+	// Ensure we don't read past our position.
+	r := &io.LimitedReader{R: walReader, N: db.pos.Offset}
+
+	// Read header.
+	hdr := make([]byte, WALHeaderSize)
+	if _, err := io.ReadFull(r, hdr); err != nil {
+		return fmt.Errorf("read shadow wal header: %w", err)
+	}
+
+	// Read byte order.
+	byteOrder, err := headerByteOrder(hdr)
+	if err != nil {
+		return err
+	}
+
+	// Save salt & checksum to cache, although checksum may be overridden later.
+	db.salt0 = binary.BigEndian.Uint32(hdr[16:])
+	db.salt1 = binary.BigEndian.Uint32(hdr[20:])
+	db.chksum0 = binary.BigEndian.Uint32(hdr[24:])
+	db.chksum1 = binary.BigEndian.Uint32(hdr[28:])
+	db.byteOrder = byteOrder
+
+	// Iterate over each page in the WAL and save the checksum.
+	frame := make([]byte, db.pageSize+WALFrameHeaderSize)
+	var hasFrame bool
+	for {
+		// Read next page from WAL file.
+		if _, err := io.ReadFull(r, frame); err == io.EOF {
+			break // end of WAL file
+		} else if err != nil {
+			return fmt.Errorf("read wal: %w", err)
+		}
+
+		// Save frame checksum to cache.
+		hasFrame = true
+		db.chksum0 = binary.BigEndian.Uint32(frame[16:])
+		db.chksum1 = binary.BigEndian.Uint32(frame[20:])
+	}
+
+	// Save last frame to cache.
+	if hasFrame {
+		db.frame = frame
+	} else {
+		db.frame = nil
+	}
+
+	return nil
+}
+
+// WALReader returns the entire uncompressed WAL file for a given index.
+func (db *DB) WALReader(ctx context.Context, generation string, index int) (_ io.ReadCloser, err error) {
+	// If any error occurs, we need to clean up all open handles.
+	var rcs []io.ReadCloser
+	defer func() {
+		if err != nil {
+			for _, rc := range rcs {
+				rc.Close()
+			}
+		}
+	}()
+
+	offsets, err := db.walSegmentOffsetsByIndex(generation, index)
+	if err != nil {
+		return nil, fmt.Errorf("wal segment offsets: %w", err)
+	}
+
+	for _, offset := range offsets {
+		f, err := os.Open(filepath.Join(db.ShadowWALDir(generation), FormatIndex(index), FormatOffset(offset)+".wal.lz4"))
+		if err != nil {
+			return nil, err
+		}
+		rcs = append(rcs, internal.NewReadCloser(lz4.NewReader(f), f))
+	}
+
+	return internal.NewMultiReadCloser(rcs), nil
+}
+
+func (db *DB) walSegmentOffsetsByIndex(generation string, index int) ([]int64, error) {
+	// Read files from index directory.
+	ents, err := os.ReadDir(filepath.Join(db.ShadowWALDir(generation), FormatIndex(index)))
+	if err != nil {
+		return nil, err
+	}
+
+	var offsets []int64
+	for _, ent := range ents {
+		if !strings.HasSuffix(ent.Name(), ".wal.lz4") {
+			continue
+		}
+		offset, err := ParseOffset(strings.TrimSuffix(filepath.Base(ent.Name()), ".wal.lz4"))
+		if err != nil {
+			continue
+		}
+		offsets = append(offsets, offset)
+	}
+
+	// Sort before returning.
+	sort.Slice(offsets, func(i, j int) bool { return offsets[i] < offsets[j] })
+
+	return offsets, nil
 }
 
 // Notify returns a channel that closes when the shadow WAL changes.
@@ -431,13 +587,13 @@ func (db *DB) init() (err error) {
 
 	// Create a table to force writes to the WAL when empty.
 	// There should only ever be one row with id=1.
-	if _, err := db.db.Exec(`CREATE TABLE IF NOT EXISTS _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);`); err != nil {
+	if _, err := db.db.ExecContext(db.ctx, `CREATE TABLE IF NOT EXISTS _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);`); err != nil {
 		return fmt.Errorf("create _litestream_seq table: %w", err)
 	}
 
 	// Create a lock table to force write locks during sync.
 	// The sync write transaction always rolls back so no data should be in this table.
-	if _, err := db.db.Exec(`CREATE TABLE IF NOT EXISTS _litestream_lock (id INTEGER);`); err != nil {
+	if _, err := db.db.ExecContext(db.ctx, `CREATE TABLE IF NOT EXISTS _litestream_lock (id INTEGER);`); err != nil {
 		return fmt.Errorf("create _litestream_lock table: %w", err)
 	}
 
@@ -448,7 +604,7 @@ func (db *DB) init() (err error) {
 	}
 
 	// Read page size.
-	if err := db.db.QueryRow(`PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
+	if err := db.db.QueryRowContext(db.ctx, `PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
 		return fmt.Errorf("read page size: %w", err)
 	} else if db.pageSize <= 0 {
 		return fmt.Errorf("invalid db page size: %d", db.pageSize)
@@ -459,16 +615,21 @@ func (db *DB) init() (err error) {
 		return err
 	}
 
+	// Determine current position, if available.
+	if err := db.invalidate(db.ctx); err != nil {
+		return fmt.Errorf("cannot determine position: %w", err)
+	}
+
 	// If we have an existing shadow WAL, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		log.Printf("%s: init: cannot determine last wal position, clearing generation; %s", db.path, err)
+		db.Logger.Printf("init: cannot determine last wal position, clearing generation; %s", err)
 		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove generation name: %w", err)
 		}
 	}
 
 	// Clean up previous generations.
-	if err := db.clean(); err != nil {
+	if err := db.clean(db.ctx); err != nil {
 		return fmt.Errorf("clean: %w", err)
 	}
 
@@ -482,50 +643,37 @@ func (db *DB) init() (err error) {
 
 // verifyHeadersMatch returns true if the primary WAL and last shadow WAL header match.
 func (db *DB) verifyHeadersMatch() error {
-	// Determine current generation.
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return err
-	} else if generation == "" {
+	// Skip verification if we have no current position.
+	if db.pos.IsZero() {
 		return nil
 	}
 
-	// Find current generation & latest shadow WAL.
-	shadowWALPath, err := db.CurrentShadowWALPath(generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine current shadow wal path: %w", err)
-	}
-
-	hdr0, err := readWALHeader(db.WALPath())
+	// Read header from the real WAL file.
+	hdr, err := readWALHeader(db.WALPath())
 	if os.IsNotExist(err) {
 		return fmt.Errorf("no primary wal: %w", err)
 	} else if err != nil {
 		return fmt.Errorf("primary wal header: %w", err)
 	}
 
-	hdr1, err := readWALHeader(shadowWALPath)
-	if os.IsNotExist(err) {
-		return fmt.Errorf("no shadow wal")
-	} else if err != nil {
-		return fmt.Errorf("shadow wal header: %w", err)
-	}
-
-	if !bytes.Equal(hdr0, hdr1) {
-		return fmt.Errorf("wal header mismatch %x <> %x on %s", hdr0, hdr1, shadowWALPath)
+	// Compare real WAL header with shadow WAL header.
+	// If there is a mismatch then the real WAL has been restarted outside Litestream.
+	if !bytes.Equal(hdr, db.hdr) {
+		return fmt.Errorf("wal header mismatch at %s", db.pos.Truncate())
 	}
 	return nil
 }
 
 // clean removes old generations & WAL files.
-func (db *DB) clean() error {
-	if err := db.cleanGenerations(); err != nil {
+func (db *DB) clean(ctx context.Context) error {
+	if err := db.cleanGenerations(ctx); err != nil {
 		return err
 	}
-	return db.cleanWAL()
+	return db.cleanWAL(ctx)
 }
 
 // cleanGenerations removes old generations.
-func (db *DB) cleanGenerations() error {
+func (db *DB) cleanGenerations(ctx context.Context) error {
 	generation, err := db.CurrentGeneration()
 	if err != nil {
 		return err
@@ -553,46 +701,48 @@ func (db *DB) cleanGenerations() error {
 }
 
 // cleanWAL removes WAL files that have been replicated.
-func (db *DB) cleanWAL() error {
+func (db *DB) cleanWAL(ctx context.Context) error {
 	generation, err := db.CurrentGeneration()
 	if err != nil {
-		return err
+		return fmt.Errorf("current generation: %w", err)
 	}
 
 	// Determine lowest index that's been replicated to all replicas.
-	min := -1
+	var min Pos
 	for _, r := range db.Replicas {
-		pos := r.Pos()
+		pos := r.Pos().Truncate()
 		if pos.Generation != generation {
-			pos = Pos{} // different generation, reset index to zero
-		}
-		if min == -1 || pos.Index < min {
-			min = pos.Index
+			continue // different generation, skip
+		} else if min.IsZero() || pos.Index < min.Index {
+			min = pos
 		}
 	}
 
-	// Skip if our lowest index is too small.
-	if min <= 0 {
+	// Skip if our lowest position is too small.
+	if min.IsZero() {
 		return nil
 	}
-	min-- // Keep an extra WAL file.
 
-	// Remove all WAL files for the generation before the lowest index.
-	dir := db.ShadowWALDir(generation)
-	fis, err := ioutil.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		return err
+	// Remove all WAL files before minimum.
+	itr, err := db.WALSegments(ctx, generation)
+	if err != nil {
+		return fmt.Errorf("wal segments: %w", err)
 	}
-	for _, fi := range fis {
-		if idx, err := parseWALPath(fi.Name()); err != nil || idx >= min {
+	defer itr.Close()
+
+	var deleted []Pos
+	for itr.Next() {
+		info := itr.WALSegment()
+		if info.Index >= min.Index {
 			continue
 		}
-		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
-			return err
-		}
+		deleted = append(deleted, info.Pos())
 	}
+
+	if err := db.DeleteWALSegments(ctx, deleted); err != nil {
+		return fmt.Errorf("delete wal segments: %w", err)
+	}
+
 	return nil
 }
 
@@ -609,7 +759,7 @@ func (db *DB) acquireReadLock() error {
 	}
 
 	// Execute read query to obtain read lock.
-	if _, err := tx.ExecContext(db.ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
+	if _, err := tx.Exec(`SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -635,14 +785,12 @@ func (db *DB) releaseReadLock() error {
 // CurrentGeneration returns the name of the generation saved to the "generation"
 // file in the meta data directory. Returns empty string if none exists.
 func (db *DB) CurrentGeneration() (string, error) {
-	buf, err := ioutil.ReadFile(db.GenerationNamePath())
+	buf, err := os.ReadFile(db.GenerationNamePath())
 	if os.IsNotExist(err) {
 		return "", nil
 	} else if err != nil {
 		return "", err
 	}
-
-	// TODO: Verify if generation directory exists. If not, delete name file.
 
 	generation := strings.TrimSpace(string(buf))
 	if len(generation) != GenerationNameLen {
@@ -654,7 +802,7 @@ func (db *DB) CurrentGeneration() (string, error) {
 // createGeneration starts a new generation by creating the generation
 // directory, snapshotting to each replica, and updating the current
 // generation name.
-func (db *DB) createGeneration() (string, error) {
+func (db *DB) createGeneration(ctx context.Context) (string, error) {
 	// Generate random generation hex name.
 	buf := make([]byte, GenerationNameLen/2)
 	_, _ = rand.New(rand.NewSource(time.Now().UnixNano())).Read(buf)
@@ -667,7 +815,7 @@ func (db *DB) createGeneration() (string, error) {
 	}
 
 	// Initialize shadow WAL with copy of header.
-	if _, err := db.initShadowWALFile(db.ShadowWALPath(generation, 0)); err != nil {
+	if err := db.initShadowWALIndex(ctx, Pos{Generation: generation}); err != nil {
 		return "", fmt.Errorf("initialize shadow wal: %w", err)
 	}
 
@@ -677,7 +825,7 @@ func (db *DB) createGeneration() (string, error) {
 	if db.fileInfo != nil {
 		mode = db.fileInfo.Mode()
 	}
-	if err := ioutil.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), mode); err != nil {
+	if err := os.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), mode); err != nil {
 		return "", fmt.Errorf("write generation temp file: %w", err)
 	}
 	uid, gid := internal.Fileinfo(db.fileInfo)
@@ -687,7 +835,7 @@ func (db *DB) createGeneration() (string, error) {
 	}
 
 	// Remove old generations.
-	if err := db.clean(); err != nil {
+	if err := db.clean(db.ctx); err != nil {
 		return "", err
 	}
 
@@ -703,9 +851,23 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	if err := db.init(); err != nil {
 		return err
 	} else if db.db == nil {
-		Tracef("%s: sync: no database found", db.path)
 		return nil
 	}
+
+	// Ensure the cached position exists.
+	if db.pos.IsZero() {
+		if err := db.invalidate(ctx); err != nil {
+			return fmt.Errorf("invalidate: %w", err)
+		}
+	}
+	origPos := db.pos
+
+	// If sync fails, reset position & cache.
+	defer func() {
+		if err != nil {
+			db.reset()
+		}
+	}()
 
 	// Track total sync metrics.
 	t := time.Now()
@@ -729,72 +891,72 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot verify wal state: %w", err)
 	}
-	Tracef("%s: sync: info=%#v", db.path, info)
-
-	// Track if anything in the shadow WAL changes and then notify at the end.
-	changed := info.walSize != info.shadowWALSize || info.restart || info.reason != ""
 
 	// If we are unable to verify the WAL state then we start a new generation.
 	if info.reason != "" {
 		// Start new generation & notify user via log message.
-		if info.generation, err = db.createGeneration(); err != nil {
+		if info.generation, err = db.createGeneration(ctx); err != nil {
 			return fmt.Errorf("create generation: %w", err)
 		}
-		log.Printf("%s: sync: new generation %q, %s", db.path, info.generation, info.reason)
+		db.Logger.Printf("sync: new generation %q, %s", info.generation, info.reason)
 
 		// Clear shadow wal info.
-		info.shadowWALPath = db.ShadowWALPath(info.generation, 0)
-		info.shadowWALSize = WALHeaderSize
 		info.restart = false
 		info.reason = ""
-
 	}
 
 	// Synchronize real WAL with current shadow WAL.
-	newWALSize, err := db.syncWAL(info)
-	if err != nil {
-		return fmt.Errorf("sync wal: %w", err)
+	if err := db.copyToShadowWAL(ctx); err != nil {
+		return fmt.Errorf("cannot copy to shadow wal: %w", err)
+	}
+
+	// If we are at the end of the WAL file, start a new index.
+	if info.restart {
+		// Move to beginning of next index.
+		pos := db.pos.Truncate()
+		pos.Index++
+
+		// Attempt to restart WAL from beginning of new index.
+		// Position is only committed to cache if successful.
+		if err := db.initShadowWALIndex(ctx, pos); err != nil {
+			return fmt.Errorf("cannot init shadow wal: pos=%s err=%w", pos, err)
+		}
 	}
 
 	// If WAL size is great than max threshold, force checkpoint.
 	// If WAL size is greater than min threshold, attempt checkpoint.
 	var checkpoint bool
 	checkpointMode := CheckpointModePassive
-	if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
+	if db.MaxCheckpointPageN > 0 && db.pos.Offset >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
 		checkpoint, checkpointMode = true, CheckpointModeRestart
-	} else if newWALSize >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
+	} else if db.pos.Offset >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
 		checkpoint = true
-	} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
+	} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && db.pos.Offset > calcWALSize(db.pageSize, 1) {
 		checkpoint = true
 	}
 
 	// Issue the checkpoint.
 	if checkpoint {
-		changed = true
-
 		if err := db.checkpoint(ctx, info.generation, checkpointMode); err != nil {
 			return fmt.Errorf("checkpoint: mode=%v err=%w", checkpointMode, err)
 		}
 	}
 
 	// Clean up any old files.
-	if err := db.clean(); err != nil {
+	if err := db.clean(ctx); err != nil {
 		return fmt.Errorf("cannot clean: %w", err)
 	}
 
 	// Compute current index and total shadow WAL size.
 	// This is only for metrics so we ignore any errors that occur.
-	index, size, _ := db.CurrentShadowWALIndex(info.generation)
-	db.shadowWALIndexGauge.Set(float64(index))
-	db.shadowWALSizeGauge.Set(float64(size))
+	db.shadowWALIndexGauge.Set(float64(db.pos.Index))
+	db.shadowWALSizeGauge.Set(float64(db.pos.Offset))
 
 	// Notify replicas of WAL changes.
-	if changed {
+	if db.pos != origPos {
 		close(db.notify)
 		db.notify = make(chan struct{})
 	}
-
-	Tracef("%s: sync: ok", db.path)
 
 	return nil
 }
@@ -838,67 +1000,36 @@ func (db *DB) verify() (info syncInfo, err error) {
 	if err != nil {
 		return info, err
 	}
-	info.walSize = frameAlign(fi.Size(), db.pageSize)
+	walSize := fi.Size()
 	info.walModTime = fi.ModTime()
-	db.walSizeGauge.Set(float64(fi.Size()))
+	db.walSizeGauge.Set(float64(walSize))
 
-	// Open shadow WAL to copy append to.
-	index, _, err := db.CurrentShadowWALIndex(info.generation)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine shadow WAL index: %w", err)
-	} else if index >= MaxIndex {
+	// Verify the index is not out of bounds.
+	if db.pos.Index >= MaxIndex {
 		info.reason = "max index exceeded"
 		return info, nil
 	}
-	info.shadowWALPath = db.ShadowWALPath(generation, index)
 
-	// Determine shadow WAL current size.
-	fi, err = os.Stat(info.shadowWALPath)
-	if os.IsNotExist(err) {
-		info.reason = "no shadow wal"
-		return info, nil
-	} else if err != nil {
-		return info, err
-	}
-	info.shadowWALSize = frameAlign(fi.Size(), db.pageSize)
-
-	// Exit if shadow WAL does not contain a full header.
-	if info.shadowWALSize < WALHeaderSize {
-		info.reason = "short shadow wal"
-		return info, nil
-	}
-
-	// If shadow WAL is larger than real WAL then the WAL has been truncated
-	// so we cannot determine our last state.
-	if info.shadowWALSize > info.walSize {
+	// If shadow WAL position is larger than real WAL then the WAL has been
+	// truncated so we cannot determine our last state.
+	if db.pos.Offset > walSize {
 		info.reason = "wal truncated by another process"
 		return info, nil
 	}
 
 	// Compare WAL headers. Start a new shadow WAL if they are mismatched.
-	if hdr0, err := readWALHeader(db.WALPath()); err != nil {
+	if hdr, err := readWALHeader(db.WALPath()); err != nil {
 		return info, fmt.Errorf("cannot read wal header: %w", err)
-	} else if hdr1, err := readWALHeader(info.shadowWALPath); err != nil {
-		return info, fmt.Errorf("cannot read shadow wal header: %w", err)
-	} else if !bytes.Equal(hdr0, hdr1) {
-		info.restart = !bytes.Equal(hdr0, hdr1)
+	} else if !bytes.Equal(hdr, db.hdr) {
+		info.restart = true
 	}
 
-	// If we only have a header then ensure header matches.
-	// Otherwise we need to start a new generation.
-	if info.shadowWALSize == WALHeaderSize && info.restart {
-		info.reason = "wal header only, mismatched"
-		return info, nil
-	}
-
-	// Verify last page synced still matches.
-	if info.shadowWALSize > WALHeaderSize {
-		offset := info.shadowWALSize - int64(db.pageSize+WALFrameHeaderSize)
-		if buf0, err := readWALFileAt(db.WALPath(), offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
+	// Verify last frame synced still matches.
+	if db.pos.Offset > WALHeaderSize {
+		offset := db.pos.Offset - int64(db.pageSize+WALFrameHeaderSize)
+		if frame, err := readWALFileAt(db.WALPath(), offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
 			return info, fmt.Errorf("cannot read last synced wal page: %w", err)
-		} else if buf1, err := readWALFileAt(info.shadowWALPath, offset, int64(db.pageSize+WALFrameHeaderSize)); err != nil {
-			return info, fmt.Errorf("cannot read last synced shadow wal page: %w", err)
-		} else if !bytes.Equal(buf0, buf1) {
+		} else if !bytes.Equal(frame, db.frame) {
 			info.reason = "wal overwritten by another process"
 			return info, nil
 		}
@@ -908,254 +1039,363 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 type syncInfo struct {
-	generation    string    // generation name
-	dbModTime     time.Time // last modified date of real DB file
-	walSize       int64     // size of real WAL file
-	walModTime    time.Time // last modified date of real WAL file
-	shadowWALPath string    // name of last shadow WAL file
-	shadowWALSize int64     // size of last shadow WAL file
-	restart       bool      // if true, real WAL header does not match shadow WAL
-	reason        string    // if non-blank, reason for sync failure
+	generation string    // generation name
+	dbModTime  time.Time // last modified date of real DB file
+	walModTime time.Time // last modified date of real WAL file
+	restart    bool      // if true, real WAL header does not match shadow WAL
+	reason     string    // if non-blank, reason for sync failure
 }
 
-// syncWAL copies pending bytes from the real WAL to the shadow WAL.
-func (db *DB) syncWAL(info syncInfo) (newSize int64, err error) {
-	// Copy WAL starting from end of shadow WAL. Exit if no new shadow WAL needed.
-	newSize, err = db.copyToShadowWAL(info.shadowWALPath)
-	if err != nil {
-		return newSize, fmt.Errorf("cannot copy to shadow wal: %w", err)
-	} else if !info.restart {
-		return newSize, nil // If no restart required, exit.
-	}
+func (db *DB) initShadowWALIndex(ctx context.Context, pos Pos) error {
+	assert(pos.Offset == 0, "must init shadow wal index with zero offset")
 
-	// Parse index of current shadow WAL file.
-	dir, base := filepath.Split(info.shadowWALPath)
-	index, err := parseWALPath(base)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
-	}
-
-	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(dir, formatWALPath(index+1))
-	newSize, err = db.initShadowWALFile(newShadowWALPath)
-	if err != nil {
-		return 0, fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
-	}
-	return newSize, nil
-}
-
-func (db *DB) initShadowWALFile(filename string) (int64, error) {
 	hdr, err := readWALHeader(db.WALPath())
 	if err != nil {
-		return 0, fmt.Errorf("read header: %w", err)
+		return fmt.Errorf("read header: %w", err)
 	}
 
 	// Determine byte order for checksumming from header magic.
-	bo, err := headerByteOrder(hdr)
+	byteOrder, err := headerByteOrder(hdr)
 	if err != nil {
-		return 0, err
+		return err
 	}
 
 	// Verify checksum.
-	s0 := binary.BigEndian.Uint32(hdr[24:])
-	s1 := binary.BigEndian.Uint32(hdr[28:])
-	if v0, v1 := Checksum(bo, 0, 0, hdr[:24]); v0 != s0 || v1 != s1 {
-		return 0, fmt.Errorf("invalid header checksum: (%x,%x) != (%x,%x)", v0, v1, s0, s1)
+	chksum0 := binary.BigEndian.Uint32(hdr[24:])
+	chksum1 := binary.BigEndian.Uint32(hdr[28:])
+	if v0, v1 := Checksum(byteOrder, 0, 0, hdr[:24]); v0 != chksum0 || v1 != chksum1 {
+		return fmt.Errorf("invalid header checksum: (%x,%x) != (%x,%x)", v0, v1, chksum0, chksum1)
 	}
 
-	// Write header to new WAL shadow file.
-	mode := os.FileMode(0600)
-	if fi := db.fileInfo; fi != nil {
-		mode = fi.Mode()
+	// Compress header to LZ4.
+	var buf bytes.Buffer
+	zw := lz4.NewWriter(&buf)
+	if _, err := zw.Write(hdr); err != nil {
+		return err
+	} else if err := zw.Close(); err != nil {
+		return err
 	}
-	if err := internal.MkdirAll(filepath.Dir(filename), db.dirInfo); err != nil {
-		return 0, err
-	} else if err := ioutil.WriteFile(filename, hdr, mode); err != nil {
-		return 0, err
+
+	// Write header segment to shadow WAL & update position.
+	if err := db.writeWALSegment(ctx, pos, &buf); err != nil {
+		return fmt.Errorf("write shadow wal header: %w", err)
 	}
-	uid, gid := internal.Fileinfo(db.fileInfo)
-	_ = os.Chown(filename, uid, gid)
+	pos.Offset += int64(len(hdr))
+	db.pos = pos
+
+	// Save header, salt & checksum to cache.
+	db.hdr = hdr
+	db.salt0 = binary.BigEndian.Uint32(hdr[16:])
+	db.salt1 = binary.BigEndian.Uint32(hdr[20:])
+	db.chksum0, db.chksum1 = chksum0, chksum1
+	db.byteOrder = byteOrder
 
 	// Copy as much shadow WAL as available.
-	newSize, err := db.copyToShadowWAL(filename)
-	if err != nil {
-		return 0, fmt.Errorf("cannot copy to new shadow wal: %w", err)
+	if err := db.copyToShadowWAL(ctx); err != nil {
+		return fmt.Errorf("cannot copy to new shadow wal: %w", err)
 	}
-	return newSize, nil
+	return nil
 }
 
-func (db *DB) copyToShadowWAL(filename string) (newSize int64, err error) {
-	Tracef("%s: copy-shadow: %s", db.path, filename)
+func (db *DB) copyToShadowWAL(ctx context.Context) error {
+	pos := db.pos
+	assert(!pos.IsZero(), "zero pos for wal copy")
 
 	r, err := os.Open(db.WALPath())
 	if err != nil {
-		return 0, err
+		return err
 	}
 	defer r.Close()
 
-	w, err := os.OpenFile(filename, os.O_RDWR, 0666)
-	if err != nil {
-		return 0, err
-	}
-	defer w.Close()
+	// Write to a temporary WAL segment file.
+	tempFilename := filepath.Join(db.ShadowWALDir(pos.Generation), FormatIndex(pos.Index), FormatOffset(pos.Offset)+".wal.tmp")
+	defer os.Remove(tempFilename)
 
-	fi, err := w.Stat()
+	f, err := os.Create(tempFilename)
 	if err != nil {
-		return 0, err
+		return err
 	}
-	origSize := frameAlign(fi.Size(), db.pageSize)
-
-	// Read shadow WAL header to determine byte order for checksum & salt.
-	hdr := make([]byte, WALHeaderSize)
-	if _, err := io.ReadFull(w, hdr); err != nil {
-		return 0, fmt.Errorf("read header: %w", err)
-	}
-	hsalt0 := binary.BigEndian.Uint32(hdr[16:])
-	hsalt1 := binary.BigEndian.Uint32(hdr[20:])
-
-	bo, err := headerByteOrder(hdr)
-	if err != nil {
-		return 0, err
-	}
-
-	// Read previous checksum.
-	chksum0, chksum1, err := readLastChecksumFrom(w, db.pageSize)
-	if err != nil {
-		return 0, fmt.Errorf("last checksum: %w", err)
-	}
+	defer f.Close()
 
 	// Seek to correct position on real wal.
-	if _, err := r.Seek(origSize, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("real wal seek: %w", err)
-	} else if _, err := w.Seek(origSize, io.SeekStart); err != nil {
-		return 0, fmt.Errorf("shadow wal seek: %w", err)
+	if _, err := r.Seek(pos.Offset, io.SeekStart); err != nil {
+		return fmt.Errorf("real wal seek: %w", err)
 	}
 
-	// Read through WAL from last position to find the page of the last
-	// committed transaction.
+	// The high water mark (HWM) tracks the position & checksum of the position
+	// of the last committed transaction frame.
+	hwm := struct {
+		pos     Pos
+		chksum0 uint32
+		chksum1 uint32
+		frame   []byte
+	}{db.pos, db.chksum0, db.chksum1, make([]byte, db.pageSize+WALFrameHeaderSize)}
+
+	// Copy from last position in real WAL to the last committed transaction.
 	frame := make([]byte, db.pageSize+WALFrameHeaderSize)
-	var buf bytes.Buffer
-	offset := origSize
-	lastCommitSize := origSize
+	chksum0, chksum1 := db.chksum0, db.chksum1
 	for {
 		// Read next page from WAL file.
 		if _, err := io.ReadFull(r, frame); err == io.EOF || err == io.ErrUnexpectedEOF {
-			Tracef("%s: copy-shadow: break %s @ %d; err=%s", db.path, filename, offset, err)
 			break // end of file or partial page
 		} else if err != nil {
-			return 0, fmt.Errorf("read wal: %w", err)
+			return fmt.Errorf("read wal: %w", err)
 		}
 
 		// Read frame salt & compare to header salt. Stop reading on mismatch.
 		salt0 := binary.BigEndian.Uint32(frame[8:])
 		salt1 := binary.BigEndian.Uint32(frame[12:])
-		if salt0 != hsalt0 || salt1 != hsalt1 {
-			Tracef("%s: copy-shadow: break: salt mismatch", db.path)
+		if salt0 != db.salt0 || salt1 != db.salt1 {
 			break
 		}
 
 		// Verify checksum of page is valid.
 		fchksum0 := binary.BigEndian.Uint32(frame[16:])
 		fchksum1 := binary.BigEndian.Uint32(frame[20:])
-		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, frame[:8])  // frame header
-		chksum0, chksum1 = Checksum(bo, chksum0, chksum1, frame[24:]) // frame data
+		chksum0, chksum1 = Checksum(db.byteOrder, chksum0, chksum1, frame[:8])  // frame header
+		chksum0, chksum1 = Checksum(db.byteOrder, chksum0, chksum1, frame[24:]) // frame data
 		if chksum0 != fchksum0 || chksum1 != fchksum1 {
-			Tracef("%s: copy shadow: checksum mismatch, skipping: offset=%d (%x,%x) != (%x,%x)", db.path, offset, chksum0, chksum1, fchksum0, fchksum1)
 			break
 		}
 
 		// Add page to the new size of the shadow WAL.
-		buf.Write(frame)
+		if _, err := f.Write(frame); err != nil {
+			return fmt.Errorf("write temp shadow wal segment: %w", err)
+		}
 
-		Tracef("%s: copy-shadow: ok %s offset=%d salt=%x %x", db.path, filename, offset, salt0, salt1)
-		offset += int64(len(frame))
+		pos.Offset += int64(len(frame))
 
 		// Flush to shadow WAL if commit record.
 		newDBSize := binary.BigEndian.Uint32(frame[4:])
 		if newDBSize != 0 {
-			if _, err := buf.WriteTo(w); err != nil {
-				return 0, fmt.Errorf("write shadow wal: %w", err)
-			}
-			buf.Reset()
-			lastCommitSize = offset
+			hwm.pos = pos
+			hwm.chksum0, hwm.chksum1 = chksum0, chksum1
+			copy(hwm.frame, frame)
 		}
 	}
 
-	// Sync & close.
-	if err := w.Sync(); err != nil {
-		return 0, err
-	} else if err := w.Close(); err != nil {
-		return 0, err
+	// If no WAL writes found, exit.
+	if db.pos == hwm.pos {
+		return nil
+	}
+
+	walByteN := hwm.pos.Offset - db.pos.Offset
+
+	// Move to beginning of temporary file.
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("temp file seek: %w", err)
+	}
+
+	// Copy temporary file to a pipe while compressing the data.
+	// Only read up to the number of bytes from the original position to the HWM.
+	pr, pw := io.Pipe()
+	go func() {
+		zw := lz4.NewWriter(pw)
+		if _, err := io.Copy(zw, &io.LimitedReader{R: f, N: walByteN}); err != nil {
+			pw.CloseWithError(err)
+		} else if err := zw.Close(); err != nil {
+			pw.CloseWithError(err)
+		}
+		pw.Close()
+	}()
+
+	// Write a new, compressed segment via pipe.
+	if err := db.writeWALSegment(ctx, db.pos, pr); err != nil {
+		return fmt.Errorf("write wal segment: pos=%s err=%w", db.pos, err)
+	}
+
+	// Update the position & checksum on success.
+	db.pos = hwm.pos
+	db.chksum0, db.chksum1 = hwm.chksum0, hwm.chksum1
+	db.frame = hwm.frame
+
+	// Close & remove temporary file.
+	if err := f.Close(); err != nil {
+		return err
+	} else if err := os.Remove(tempFilename); err != nil {
+		return err
 	}
 
 	// Track total number of bytes written to WAL.
-	db.totalWALBytesCounter.Add(float64(lastCommitSize - origSize))
+	db.totalWALBytesCounter.Add(float64(walByteN))
 
-	return lastCommitSize, nil
+	return nil
 }
 
-// ShadowWALReader opens a reader for a shadow WAL file at a given position.
-// If the reader is at the end of the file, it attempts to return the next file.
-//
-// The caller should check Pos() & Size() on the returned reader to check offset.
-func (db *DB) ShadowWALReader(pos Pos) (r *ShadowWALReader, err error) {
-	// Fetch reader for the requested position. Return if it has data.
-	r, err = db.shadowWALReader(pos)
-	if err != nil {
-		return nil, err
-	} else if r.N() > 0 {
-		return r, nil
-	} else if err := r.Close(); err != nil { // no data, close, try next
-		return nil, err
+// WALSegmentReader returns a reader for a section of WAL data at the given position.
+// Returns os.ErrNotExist if no matching index/offset is found.
+func (db *DB) WALSegmentReader(ctx context.Context, pos Pos) (io.ReadCloser, error) {
+	if pos.Generation == "" {
+		return nil, fmt.Errorf("generation required")
 	}
-
-	// Otherwise attempt to read the start of the next WAL file.
-	pos.Index, pos.Offset = pos.Index+1, 0
-
-	r, err = db.shadowWALReader(pos)
-	if os.IsNotExist(err) {
-		return nil, io.EOF
-	}
-	return r, err
+	return os.Open(filepath.Join(db.ShadowWALDir(pos.Generation), FormatIndex(pos.Index), FormatOffset(pos.Offset)+".wal.lz4"))
 }
 
-// shadowWALReader opens a file reader for a shadow WAL file at a given position.
-func (db *DB) shadowWALReader(pos Pos) (r *ShadowWALReader, err error) {
-	filename := db.ShadowWALPath(pos.Generation, pos.Index)
+// writeWALSegment writes LZ4 compressed data from rd into a file on disk.
+func (db *DB) writeWALSegment(ctx context.Context, pos Pos, rd io.Reader) error {
+	if pos.Generation == "" {
+		return fmt.Errorf("generation required")
+	}
+	filename := filepath.Join(db.ShadowWALDir(pos.Generation), FormatIndex(pos.Index), FormatOffset(pos.Offset)+".wal.lz4")
 
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
+	// Ensure parent directory exists.
+	if err := internal.MkdirAll(filepath.Dir(filename), db.dirInfo); err != nil {
+		return err
 	}
 
-	// Ensure file is closed if any error occurs.
-	defer func() {
-		if err != nil {
-			f.Close()
+	// Write WAL segment to temporary file next to destination path.
+	f, err := internal.CreateFile(filename+".tmp", db.fileInfo)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, rd); err != nil {
+		return err
+	} else if err := f.Sync(); err != nil {
+		return err
+	} else if err := f.Close(); err != nil {
+		return err
+	}
+
+	// Move WAL segment to final path when it has been written & synced to disk.
+	if err := os.Rename(filename+".tmp", filename); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// DeleteWALSegments deletes WAL segments at the given positions.
+func (db *DB) DeleteWALSegments(ctx context.Context, a []Pos) error {
+	for _, pos := range a {
+		if pos.Generation == "" {
+			return fmt.Errorf("generation required")
 		}
-	}()
+		filename := filepath.Join(db.ShadowWALDir(pos.Generation), FormatIndex(pos.Index), FormatOffset(pos.Offset)+".wal.lz4")
 
-	// Fetch frame-aligned file size and ensure requested offset is not past EOF.
-	fi, err := f.Stat()
-	if err != nil {
+		if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// WALSegments returns an iterator over all available WAL files for a generation.
+func (db *DB) WALSegments(ctx context.Context, generation string) (WALSegmentIterator, error) {
+	ents, err := os.ReadDir(db.ShadowWALDir(generation))
+	if os.IsNotExist(err) {
+		return NewWALSegmentInfoSliceIterator(nil), nil
+	} else if err != nil {
 		return nil, err
 	}
 
-	fileSize := frameAlign(fi.Size(), db.pageSize)
-	if pos.Offset > fileSize {
-		return nil, fmt.Errorf("wal reader offset too high: %d > %d", pos.Offset, fi.Size())
+	// Iterate over every file and convert to metadata.
+	indexes := make([]int, 0, len(ents))
+	for _, ent := range ents {
+		index, err := ParseIndex(ent.Name())
+		if err != nil {
+			continue
+		}
+		indexes = append(indexes, index)
 	}
 
-	// Move file handle to offset position.
-	if _, err := f.Seek(pos.Offset, io.SeekStart); err != nil {
-		return nil, err
+	sort.Ints(indexes)
+
+	return newShadowWALSegmentIterator(db, generation, indexes), nil
+}
+
+type shadowWALSegmentIterator struct {
+	db         *DB
+	generation string
+	indexes    []int
+
+	infos []WALSegmentInfo
+	err   error
+}
+
+func newShadowWALSegmentIterator(db *DB, generation string, indexes []int) *shadowWALSegmentIterator {
+	return &shadowWALSegmentIterator{
+		db:         db,
+		generation: generation,
+		indexes:    indexes,
+	}
+}
+
+func (itr *shadowWALSegmentIterator) Close() (err error) {
+	return itr.err
+}
+
+func (itr *shadowWALSegmentIterator) Next() bool {
+	// Exit if an error has already occurred.
+	if itr.err != nil {
+		return false
 	}
 
-	return &ShadowWALReader{
-		f:   f,
-		n:   fileSize - pos.Offset,
-		pos: pos,
-	}, nil
+	for {
+		// Move to the next segment in cache, if available.
+		if len(itr.infos) > 1 {
+			itr.infos = itr.infos[1:]
+			return true
+		}
+		itr.infos = itr.infos[:0] // otherwise clear infos
+
+		// If no indexes remain, stop iteration.
+		if len(itr.indexes) == 0 {
+			return false
+		}
+
+		// Read segments into a cache for the current index.
+		index := itr.indexes[0]
+		itr.indexes = itr.indexes[1:]
+		f, err := os.Open(filepath.Join(itr.db.ShadowWALDir(itr.generation), FormatIndex(index)))
+		if err != nil {
+			itr.err = err
+			return false
+		}
+		defer f.Close()
+
+		fis, err := f.Readdir(-1)
+		if err != nil {
+			itr.err = err
+			return false
+		}
+		for _, fi := range fis {
+			filename := filepath.Base(fi.Name())
+			if fi.IsDir() {
+				continue
+			}
+
+			offset, err := ParseOffset(strings.TrimSuffix(filename, ".wal.lz4"))
+			if err != nil {
+				continue
+			}
+
+			itr.infos = append(itr.infos, WALSegmentInfo{
+				Generation: itr.generation,
+				Index:      index,
+				Offset:     offset,
+				Size:       fi.Size(),
+				CreatedAt:  fi.ModTime().UTC(),
+			})
+		}
+
+		// Ensure segments are sorted within index.
+		sort.Sort(WALSegmentInfoSlice(itr.infos))
+
+		if len(itr.infos) > 0 {
+			return true
+		}
+	}
+}
+
+func (itr *shadowWALSegmentIterator) Err() error { return itr.err }
+
+func (itr *shadowWALSegmentIterator) WALSegment() WALSegmentInfo {
+	if len(itr.infos) == 0 {
+		return WALSegmentInfo{}
+	}
+	return itr.infos[0]
 }
 
 // frameAlign returns a frame-aligned offset.
@@ -1171,40 +1411,6 @@ func frameAlign(offset int64, pageSize int) int64 {
 	frameSize := WALFrameHeaderSize + int64(pageSize)
 	frameN := (offset - WALHeaderSize) / frameSize
 	return (frameN * frameSize) + WALHeaderSize
-}
-
-// ShadowWALReader represents a reader for a shadow WAL file that tracks WAL position.
-type ShadowWALReader struct {
-	f   *os.File
-	n   int64
-	pos Pos
-}
-
-// Name returns the filename of the underlying file.
-func (r *ShadowWALReader) Name() string { return r.f.Name() }
-
-// Close closes the underlying WAL file handle.
-func (r *ShadowWALReader) Close() error { return r.f.Close() }
-
-// N returns the remaining bytes in the reader.
-func (r *ShadowWALReader) N() int64 { return r.n }
-
-// Pos returns the current WAL position.
-func (r *ShadowWALReader) Pos() Pos { return r.pos }
-
-// Read reads bytes into p, updates the position, and returns the bytes read.
-// Returns io.EOF at the end of the available section of the WAL.
-func (r *ShadowWALReader) Read(p []byte) (n int, err error) {
-	if r.n <= 0 {
-		return 0, io.EOF
-	}
-	if int64(len(p)) > r.n {
-		p = p[0:r.n]
-	}
-	n, err = r.f.Read(p)
-	r.n -= int64(n)
-	r.pos.Offset += int64(n)
-	return n, err
 }
 
 // SQLite WAL constants
@@ -1248,11 +1454,6 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 // checkpointAndInit performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
-	shadowWALPath, err := db.CurrentShadowWALPath(generation)
-	if err != nil {
-		return err
-	}
-
 	// Read WAL header before checkpoint to check if it has been restarted.
 	hdr, err := readWALHeader(db.WALPath())
 	if err != nil {
@@ -1260,7 +1461,7 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	}
 
 	// Copy shadow WAL before checkpoint to copy as much as possible.
-	if _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
+	if err := db.copyToShadowWAL(ctx); err != nil {
 		return fmt.Errorf("cannot copy to end of shadow wal before checkpoint: %w", err)
 	}
 
@@ -1295,20 +1496,14 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	}
 
 	// Copy the end of the previous WAL before starting a new shadow WAL.
-	if _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
+	if err := db.copyToShadowWAL(ctx); err != nil {
 		return fmt.Errorf("cannot copy to end of shadow wal: %w", err)
 	}
 
-	// Parse index of current shadow WAL file.
-	index, err := parseWALPath(shadowWALPath)
-	if err != nil {
-		return fmt.Errorf("cannot parse shadow wal filename: %s", shadowWALPath)
-	}
-
 	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(filepath.Dir(shadowWALPath), formatWALPath(index+1))
-	if _, err := db.initShadowWALFile(newShadowWALPath); err != nil {
-		return fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
+	pos := Pos{Generation: db.pos.Generation, Index: db.pos.Index + 1}
+	if err := db.initShadowWALIndex(ctx, pos); err != nil {
+		return fmt.Errorf("cannot init shadow wal file: pos=%s err=%w", pos, err)
 	}
 
 	// Release write lock before checkpointing & exiting.
@@ -1354,11 +1549,11 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	if err := db.db.QueryRow(rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
 		return err
 	}
-	Tracef("%s: checkpoint: mode=%v (%d,%d,%d)", db.path, mode, row[0], row[1], row[2])
+	db.Logger.Printf("checkpoint(%s): [%d,%d,%d]", mode, row[0], row[1], row[2])
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return fmt.Errorf("reacquire read lock: %w", err)
 	}
 
 	return nil
@@ -1379,7 +1574,7 @@ func (db *DB) monitor() {
 
 		// Sync the database to the shadow WAL.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("%s: sync error: %s", db.path, err)
+			db.Logger.Printf("sync error: %s", err)
 		}
 	}
 }
@@ -1467,10 +1662,7 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 
 	// Obtain current position. Clear the offset since we are only reading the
 	// DB and not applying the current WAL.
-	pos, err := db.Pos()
-	if err != nil {
-		return 0, pos, err
-	}
+	pos := db.pos
 	pos.Offset = 0
 
 	// Seek to the beginning of the db file descriptor and checksum whole file.

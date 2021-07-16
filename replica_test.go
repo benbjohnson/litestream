@@ -43,10 +43,7 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Fetch current database position.
-	dpos, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
-	}
+	dpos := db.Pos()
 
 	c := file.NewReplicaClient(t.TempDir())
 	r := litestream.NewReplica(db, "")
@@ -69,11 +66,11 @@ func TestReplica_Sync(t *testing.T) {
 	// Verify WAL matches replica WAL.
 	if b0, err := os.ReadFile(db.Path() + "-wal"); err != nil {
 		t.Fatal(err)
-	} else if r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: generations[0], Index: 0, Offset: 0}); err != nil {
+	} else if r0, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: generations[0], Index: 0, Offset: 0}); err != nil {
 		t.Fatal(err)
-	} else if b1, err := io.ReadAll(lz4.NewReader(r)); err != nil {
+	} else if b1, err := io.ReadAll(lz4.NewReader(r0)); err != nil {
 		t.Fatal(err)
-	} else if err := r.Close(); err != nil {
+	} else if err := r0.Close(); err != nil {
 		t.Fatal(err)
 	} else if !bytes.Equal(b0, b1) {
 		t.Fatalf("wal mismatch: len(%d), len(%d)", len(b0), len(b1))
@@ -98,10 +95,8 @@ func TestReplica_Snapshot(t *testing.T) {
 	}
 
 	// Fetch current database position & snapshot.
-	pos0, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
-	} else if info, err := r.Snapshot(context.Background()); err != nil {
+	pos0 := db.Pos()
+	if info, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
 	} else if got, want := info.Pos(), pos0.Truncate(); got != want {
 		t.Fatalf("pos=%s, want %s", got, want)
@@ -122,10 +117,8 @@ func TestReplica_Snapshot(t *testing.T) {
 	}
 
 	// Fetch current database position & snapshot.
-	pos1, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
-	} else if info, err := r.Snapshot(context.Background()); err != nil {
+	pos1 := db.Pos()
+	if info, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
 	} else if got, want := info.Pos(), pos1.Truncate(); got != want {
 		t.Fatalf("pos=%v, want %v", got, want)

@@ -2,15 +2,21 @@ package main_test
 
 import (
 	"io/ioutil"
+	"log"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 )
+
+func init() {
+	litestream.LogFlags = log.Lmsgprefix | log.Ldate | log.Ltime | log.Lmicroseconds | log.LUTC | log.Lshortfile
+}
 
 func TestReadConfigFile(t *testing.T) {
 	// Ensure global AWS settings are propagated down to replica configurations.

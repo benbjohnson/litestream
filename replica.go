@@ -2,7 +2,6 @@ package litestream
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"hash/crc64"
 	"io"
@@ -67,6 +66,8 @@ type Replica struct {
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
+
+	Logger *log.Logger
 }
 
 func NewReplica(db *DB, name string) *Replica {
@@ -80,6 +81,12 @@ func NewReplica(db *DB, name string) *Replica {
 		RetentionCheckInterval: DefaultRetentionCheckInterval,
 		MonitorEnabled:         true,
 	}
+
+	prefix := fmt.Sprintf("%s: ", r.Name())
+	if db != nil {
+		prefix = fmt.Sprintf("%s(%s): ", db.Path(), r.Name())
+	}
+	r.Logger = log.New(LogWriter, prefix, LogFlags)
 
 	return r
 }
@@ -149,15 +156,11 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	}()
 
 	// Find current position of database.
-	dpos, err := r.db.Pos()
-	if err != nil {
-		return fmt.Errorf("cannot determine current generation: %w", err)
-	} else if dpos.IsZero() {
+	dpos := r.db.Pos()
+	if dpos.IsZero() {
 		return fmt.Errorf("no generation, waiting for data")
 	}
 	generation := dpos.Generation
-
-	Tracef("%s(%s): replica sync: db.pos=%s", r.db.Path(), r.Name(), dpos)
 
 	// Create snapshot if no snapshots exist for generation.
 	snapshotN, err := r.snapshotN(generation)
@@ -180,117 +183,140 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot determine replica position: %s", err)
 		}
 
-		Tracef("%s(%s): replica sync: calc new pos: %s", r.db.Path(), r.Name(), pos)
 		r.mu.Lock()
 		r.pos = pos
 		r.mu.Unlock()
 	}
 
 	// Read all WAL files since the last position.
-	for {
-		if err = r.syncWAL(ctx); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
+	if err = r.syncWAL(ctx); err != nil {
+		return err
 	}
 
 	return nil
 }
 
 func (r *Replica) syncWAL(ctx context.Context) (err error) {
-	rd, err := r.db.ShadowWALReader(r.Pos())
-	if err == io.EOF {
+	pos := r.Pos()
+
+	itr, err := r.db.WALSegments(ctx, pos.Generation)
+	if err != nil {
 		return err
-	} else if err != nil {
-		return fmt.Errorf("replica wal reader: %w", err)
 	}
-	defer rd.Close()
+	defer itr.Close()
+
+	// Group segments by index.
+	var segments [][]WALSegmentInfo
+	for itr.Next() {
+		info := itr.WALSegment()
+		if cmp, err := ComparePos(pos, info.Pos()); err != nil {
+			return fmt.Errorf("compare pos: %w", err)
+		} else if cmp == 1 {
+			continue // already processed, skip
+		}
+
+		// Start a new chunk if index has changed.
+		if len(segments) == 0 || segments[len(segments)-1][0].Index != info.Index {
+			segments = append(segments, []WALSegmentInfo{info})
+			continue
+		}
+
+		// Add segment to the end of the current index, if matching.
+		segments[len(segments)-1] = append(segments[len(segments)-1], info)
+	}
+
+	// Write out segments to replica by index so they can be combined.
+	for i := range segments {
+		if err := r.writeIndexSegments(ctx, segments[i]); err != nil {
+			return fmt.Errorf("write index segments: index=%d err=%w", segments[i][0].Index, err)
+		}
+	}
+
+	return nil
+}
+
+func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentInfo) (err error) {
+	assert(len(segments) > 0, "segments required for replication")
+
+	// First segment position must be equal to last replica position or
+	// the start of the next index.
+	if pos := r.Pos(); pos != segments[0].Pos() {
+		nextIndexPos := pos.Truncate()
+		nextIndexPos.Index++
+		if nextIndexPos != segments[0].Pos() {
+			return fmt.Errorf("replica skipped position: replica=%s initial=%s", pos, segments[0].Pos())
+		}
+	}
+
+	pos := segments[0].Pos()
+	initialPos := pos
 
 	// Copy shadow WAL to client write via io.Pipe().
 	pr, pw := io.Pipe()
 	defer func() { _ = pw.CloseWithError(err) }()
 
-	// Obtain initial position from shadow reader.
-	// It may have moved to the next index if previous position was at the end.
-	pos := rd.Pos()
-
 	// Copy through pipe into client from the starting position.
 	var g errgroup.Group
 	g.Go(func() error {
-		_, err := r.Client.WriteWALSegment(ctx, pos, pr)
+		_, err := r.Client.WriteWALSegment(ctx, initialPos, pr)
 		return err
 	})
 
 	// Wrap writer to LZ4 compress.
 	zw := lz4.NewWriter(pw)
 
-	// Track total WAL bytes written to replica client.
-	walBytesCounter := replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name())
+	// Write each segment out to the replica.
+	for _, info := range segments {
+		if err := func() error {
+			// Ensure segments are in order and no bytes are skipped.
+			if pos != info.Pos() {
+				return fmt.Errorf("non-contiguous segment: expected=%s current=%s", pos, info.Pos())
+			}
 
-	// Copy header if at offset zero.
-	var psalt uint64 // previous salt value
-	if pos := rd.Pos(); pos.Offset == 0 {
-		buf := make([]byte, WALHeaderSize)
-		if _, err := io.ReadFull(rd, buf); err != nil {
-			return err
+			rc, err := r.db.WALSegmentReader(ctx, info.Pos())
+			if err != nil {
+				return err
+			}
+			defer rc.Close()
+
+			n, err := io.Copy(zw, lz4.NewReader(rc))
+			if err != nil {
+				return err
+			} else if err := rc.Close(); err != nil {
+				return err
+			}
+
+			// Track last position written.
+			pos = info.Pos()
+			pos.Offset += n
+
+			return nil
+		}(); err != nil {
+			return fmt.Errorf("wal segment: pos=%s err=%w", info.Pos(), err)
 		}
-
-		psalt = binary.BigEndian.Uint64(buf[16:24])
-
-		n, err := zw.Write(buf)
-		if err != nil {
-			return err
-		}
-		walBytesCounter.Add(float64(n))
 	}
 
-	// Copy frames.
-	for {
-		pos := rd.Pos()
-		assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
-
-		buf := make([]byte, WALFrameHeaderSize+r.db.pageSize)
-		if _, err := io.ReadFull(rd, buf); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-
-		// Verify salt matches the previous frame/header read.
-		salt := binary.BigEndian.Uint64(buf[8:16])
-		if psalt != 0 && psalt != salt {
-			return fmt.Errorf("replica salt mismatch: %s", pos.String())
-		}
-		psalt = salt
-
-		n, err := zw.Write(buf)
-		if err != nil {
-			return err
-		}
-		walBytesCounter.Add(float64(n))
-	}
-
-	// Flush LZ4 writer and close pipe.
+	// Flush LZ4 writer, close pipe, and wait for write to finish.
 	if err := zw.Close(); err != nil {
 		return err
 	} else if err := pw.Close(); err != nil {
 		return err
-	}
-
-	// Wait for client to finish write.
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("client write: %w", err)
+	} else if err := g.Wait(); err != nil {
+		return err
 	}
 
 	// Save last replicated position.
 	r.mu.Lock()
-	r.pos = rd.Pos()
+	r.pos = pos
 	r.mu.Unlock()
 
-	// Track current position
-	replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
-	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
+	replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name()).Add(float64(pos.Offset - initialPos.Offset))
+
+	// Track total WAL bytes written to replica client.
+	replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(pos.Index))
+	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(pos.Offset))
+
+	r.Logger.Printf("wal segment written: %s sz=%d", initialPos, pos.Offset-initialPos.Offset)
 
 	return nil
 }
@@ -448,10 +474,8 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	defer func() { _ = tx.Rollback() }()
 
 	// Obtain current position.
-	pos, err := r.db.Pos()
-	if err != nil {
-		return info, fmt.Errorf("cannot determine db position: %w", err)
-	} else if pos.IsZero() {
+	pos := r.db.Pos()
+	if pos.IsZero() {
 		return info, ErrNoGeneration
 	}
 
@@ -491,7 +515,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return info, err
 	}
 
-	log.Printf("%s(%s): snapshot written %s/%08x", r.db.Path(), r.Name(), pos.Generation, pos.Index)
+	log.Printf("snapshot written %s/%08x", pos.Generation, pos.Index)
 
 	return info, nil
 }
@@ -559,7 +583,7 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 		if err := r.Client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
 			return fmt.Errorf("delete snapshot %s/%08x: %w", info.Generation, info.Index, err)
 		}
-		log.Printf("%s(%s): snapshot deleted %s/%08x", r.db.Path(), r.Name(), generation, index)
+		r.Logger.Printf("snapshot deleted %s/%08x", generation, index)
 	}
 
 	return itr.Close()
@@ -591,7 +615,10 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation s
 	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
-	log.Printf("%s(%s): wal segmented deleted before %s/%08x: n=%d", r.db.Path(), r.Name(), generation, index, len(a))
+
+	for _, pos := range a {
+		r.Logger.Printf("wal segmented deleted: %s", pos)
+	}
 
 	return nil
 }
@@ -628,7 +655,7 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
-			log.Printf("%s(%s): monitor error: %s", r.db.Path(), r.Name(), err)
+			r.Logger.Printf("monitor error: %s", err)
 			continue
 		}
 	}
@@ -656,7 +683,7 @@ func (r *Replica) retainer(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
-				log.Printf("%s(%s): retainer error: %s", r.db.Path(), r.Name(), err)
+				r.Logger.Printf("retainer error: %s", err)
 				continue
 			}
 		}
@@ -678,7 +705,7 @@ func (r *Replica) snapshotter(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if _, err := r.Snapshot(ctx); err != nil && err != ErrNoGeneration {
-				log.Printf("%s(%s): snapshotter error: %s", r.db.Path(), r.Name(), err)
+				r.Logger.Printf("snapshotter error: %s", err)
 				continue
 			}
 		}
@@ -706,7 +733,7 @@ func (r *Replica) validator(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.Validate(ctx); err != nil {
-				log.Printf("%s(%s): validation error: %s", r.db.Path(), r.Name(), err)
+				r.Logger.Printf("validation error: %s", err)
 				continue
 			}
 		}
@@ -768,7 +795,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	if mismatch {
 		status = "mismatch"
 	}
-	log.Printf("%s(%s): validator: status=%s db=%016x replica=%016x pos=%s", db.Path(), r.Name(), status, chksum0, chksum1, pos)
+	r.Logger.Printf("validator: status=%s db=%016x replica=%016x pos=%s", status, chksum0, chksum1, pos)
 
 	// Validate checksums match.
 	if mismatch {
@@ -786,8 +813,6 @@ func (r *Replica) Validate(ctx context.Context) error {
 
 // waitForReplica blocks until replica reaches at least the given position.
 func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
-	db := r.DB()
-
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -810,7 +835,7 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 		// Obtain current position of replica, check if past target position.
 		curr := r.Pos()
 		if curr.IsZero() {
-			log.Printf("%s(%s): validator: no replica position available", db.Path(), r.Name())
+			r.Logger.Printf("validator: no replica position available")
 			continue
 		}
 
