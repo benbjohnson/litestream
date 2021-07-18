@@ -40,6 +40,14 @@ var (
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
+var (
+	// LogWriter is the destination writer for all logging.
+	LogWriter = os.Stderr
+
+	// LogFlags are the flags passed to log.New().
+	LogFlags = 0
+)
+
 // SnapshotIterator represents an iterator over a collection of snapshot metadata.
 type SnapshotIterator interface {
 	io.Closer
@@ -289,6 +297,26 @@ func (p Pos) IsZero() bool {
 // Truncate returns p with the offset truncated to zero.
 func (p Pos) Truncate() Pos {
 	return Pos{Generation: p.Generation, Index: p.Index}
+}
+
+// ComparePos returns -1 if a is less than b, 1 if a is greater than b, and
+// returns 0 if a and b are equal. Only index & offset are compared.
+// Returns an error if generations are not equal.
+func ComparePos(a, b Pos) (int, error) {
+	if a.Generation != b.Generation {
+		return 0, fmt.Errorf("generation mismatch")
+	}
+
+	if a.Index < b.Index {
+		return -1, nil
+	} else if a.Index > b.Index {
+		return 1, nil
+	} else if a.Offset < b.Offset {
+		return -1, nil
+	} else if a.Offset > b.Offset {
+		return 1, nil
+	}
+	return 0, nil
 }
 
 // Checksum computes a running SQLite checksum over a byte slice.
