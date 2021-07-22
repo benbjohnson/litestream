@@ -408,11 +408,6 @@ func (itr *walSegmentIterator) Next() bool {
 		}
 		itr.infos = itr.infos[:0] // otherwise clear infos
 
-		// Move to the next index unless this is the first time initializing.
-		if itr.infos != nil && len(itr.indexes) > 0 {
-			itr.indexes = itr.indexes[1:]
-		}
-
 		// If no indexes remain, stop iteration.
 		if len(itr.indexes) == 0 {
 			return false
@@ -420,6 +415,7 @@ func (itr *walSegmentIterator) Next() bool {
 
 		// Read segments into a cache for the current index.
 		index := itr.indexes[0]
+		itr.indexes = itr.indexes[1:]
 		f, err := os.Open(filepath.Join(itr.dir, litestream.FormatIndex(index)))
 		if err != nil {
 			itr.err = err
@@ -431,7 +427,11 @@ func (itr *walSegmentIterator) Next() bool {
 		if err != nil {
 			itr.err = err
 			return false
+		} else if err := f.Close(); err != nil {
+			itr.err = err
+			return false
 		}
+
 		for _, fi := range fis {
 			filename := filepath.Base(fi.Name())
 			if fi.IsDir() {
@@ -451,6 +451,9 @@ func (itr *walSegmentIterator) Next() bool {
 				CreatedAt:  fi.ModTime().UTC(),
 			})
 		}
+
+		// Ensure segments are sorted within index.
+		sort.Sort(litestream.WALSegmentInfoSlice(itr.infos))
 
 		if len(itr.infos) > 0 {
 			return true
