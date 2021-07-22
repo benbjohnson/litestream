@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/url"
 	"os"
+	"os/signal"
 	"os/user"
 	"path"
 	"path/filepath"
@@ -86,7 +87,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 		// Setup signal handler.
 		ctx, cancel := context.WithCancel(ctx)
-		signalCh := signalChan()
+		signalCh := make(chan os.Signal, 1)
+		signal.Notify(signalCh, notifySignals...)
 
 		if err := c.Run(ctx); err != nil {
 			return err
@@ -94,6 +96,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 		// Wait for signal to stop program.
 		select {
+		case <-ctx.Done():
+			fmt.Println("context done, litestream shutting down")
 		case err = <-c.execCh:
 			cancel()
 			fmt.Println("subprocess exited, litestream shutting down")

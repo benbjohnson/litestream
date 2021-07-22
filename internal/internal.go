@@ -39,6 +39,39 @@ func (r *ReadCloser) Close() error {
 	return r.c.Close()
 }
 
+// MultiReadCloser is a logical concatenation of io.ReadCloser.
+// It works like io.MultiReader except all objects are closed when Close() is called.
+type MultiReadCloser struct {
+	mr      io.Reader
+	closers []io.Closer
+}
+
+// NewMultiReadCloser returns a new instance of MultiReadCloser.
+func NewMultiReadCloser(a []io.ReadCloser) *MultiReadCloser {
+	readers := make([]io.Reader, len(a))
+	closers := make([]io.Closer, len(a))
+	for i, rc := range a {
+		readers[i] = rc
+		closers[i] = rc
+	}
+	return &MultiReadCloser{mr: io.MultiReader(readers...), closers: closers}
+}
+
+// Read reads from the next available reader.
+func (mrc *MultiReadCloser) Read(p []byte) (n int, err error) {
+	return mrc.mr.Read(p)
+}
+
+// Close closes all underlying ReadClosers and returns first error encountered.
+func (mrc *MultiReadCloser) Close() (err error) {
+	for _, c := range mrc.closers {
+		if e := c.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	return err
+}
+
 // ReadCounter wraps an io.Reader and counts the total number of bytes read.
 type ReadCounter struct {
 	r io.Reader
