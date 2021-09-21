@@ -33,35 +33,29 @@ energy into the project to help make it better:
 
 - Thanks to [Cory LaNou](https://twitter.com/corylanou) for giving early feedback and testing when Litestream was still pre-release.
 - Thanks to [Michael Lynch](https://github.com/mtlynch) for digging into issues and contributing to the documentation.
-- Thanks to [Kurt Mackey](https://twitter.com/mrkurt) for feedback and testing. Also, thanks to fly.io for providing testing resources.
+- Thanks to [Kurt Mackey](https://twitter.com/mrkurt) for feedback and testing.
 - Thanks to [Sam Weston](https://twitter.com/cablespaghetti) for figuring out how to run Litestream on Kubernetes and writing up the docs for it.
 - Thanks to [Rafael](https://github.com/netstx) & [Jungle Boogie](https://github.com/jungle-boogie) for helping to get OpenBSD release builds working.
-- Thanks to [Simon Gottschlag](https://github.com/simongottschlag), [Marin](https://github.com/supermarin),[Victor Björklund](https://github.com/victorbjorklund), [Jonathan Beri](https://twitter.com/beriberikix) [Yuri](https://github.com/yurivish), [Nathan Probst](https://github.com/nprbst), [Yann Coleuu](https://github.com/yanc0), and [Nicholas Grilly](https://twitter.com/ngrilly) for frequent feedback, testing, & support.
+- Thanks to [Simon Gottschlag](https://github.com/simongottschlag), [Marin](https://github.com/supermarin),[Victor Björklund](https://github.com/victorbjorklund), [Jonathan Beri](https://twitter.com/beriberikix) [Yuri](https://github.com/yurivish), [Nathan Probst](https://github.com/nprbst), [Yann Coleu](https://github.com/yanc0), and [Nicholas Grilly](https://twitter.com/ngrilly) for frequent feedback, testing, & support.
+
+Huge thanks to fly.io for their support and for contributing credits for testing and development!
 
 
+## Contribution Policy
 
+Initially, Litestream was closed to outside contributions. The goal was to
+reduce burnout by limiting the maintenance overhead of reviewing and validating
+third-party code. However, this policy is overly broad and has prevented small,
+easily testable patches from being contributed.
 
-## Open-source, not open-contribution
+Litestream is now open to code contributions for bug fixes only. Features carry
+a long-term maintenance burden so they will not be accepted at this time.
+Please [submit an issue][new-issue] if you have a feature you'd like to
+request.
 
-[Similar to SQLite](https://www.sqlite.org/copyright.html), Litestream is open
-source but closed to code contributions. This keeps the code base free of
-proprietary or licensed code but it also helps me continue to maintain and build
-Litestream.
+If you find mistakes in the documentation, please submit a fix to the
+[documentation repository][docs].
 
-As the author of [BoltDB](https://github.com/boltdb/bolt), I found that
-accepting and maintaining third party patches contributed to my burn out and
-I eventually archived the project. Writing databases & low-level replication
-tools involves nuance and simple one line changes can have profound and
-unexpected changes in correctness and performance. Small contributions
-typically required hours of my time to properly test and validate them.
-
-I am grateful for community involvement, bug reports, & feature requests. I do
-not wish to come off as anything but welcoming, however, I've
-made the decision to keep this project closed to contributions for my own
-mental health and long term viability of the project.
-
-The [documentation repository][docs] is MIT licensed and pull requests are welcome there.
-
-[releases]: https://github.com/benbjohnson/litestream/releases
+[new-issue]: https://github.com/benbjohnson/litestream/issues/new
 [docs]: https://github.com/benbjohnson/litestream.io
 
