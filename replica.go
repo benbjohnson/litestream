@@ -980,7 +980,10 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (ge
 func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
-		return fmt.Errorf("output path required")
+		if r.db.path == "" {
+			return fmt.Errorf("output path required")
+		}
+		opt.OutputPath = r.db.path
 	} else if opt.Generation == "" && opt.Index != math.MaxInt32 {
 		return fmt.Errorf("must specify generation when restoring to index")
 	} else if opt.Index != math.MaxInt32 && !opt.Timestamp.IsZero() {
