@@ -68,6 +68,13 @@ type Replica struct {
 	MonitorEnabled bool
 
 	Logger *log.Logger
+
+	state ReplicaState
+}
+
+type ReplicaState struct {
+	NumSnapshots      int
+	CurrentGeneration string
 }
 
 func NewReplica(db *DB, name string) *Replica {
@@ -80,6 +87,7 @@ func NewReplica(db *DB, name string) *Replica {
 		Retention:              DefaultRetention,
 		RetentionCheckInterval: DefaultRetentionCheckInterval,
 		MonitorEnabled:         true,
+		state:                  ReplicaState{CurrentGeneration: "", NumSnapshots: -1},
 	}
 
 	prefix := fmt.Sprintf("%s: ", r.Name())
@@ -323,6 +331,12 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 
 // snapshotN returns the number of snapshots for a generation.
 func (r *Replica) snapshotN(generation string) (int, error) {
+
+	if r.state.CurrentGeneration == generation && r.state.NumSnapshots > -1 {
+		r.Logger.Printf("return cached snapshots in generation %s/%v", generation, r.state.NumSnapshots)
+		return r.state.NumSnapshots, nil
+	}
+
 	itr, err := r.Client.Snapshots(context.Background(), generation)
 	if err != nil {
 		return 0, err
@@ -333,6 +347,10 @@ func (r *Replica) snapshotN(generation string) (int, error) {
 	for itr.Next() {
 		n++
 	}
+
+	r.state.CurrentGeneration = generation
+	r.state.NumSnapshots = n
+
 	return n, itr.Close()
 }
 
@@ -516,6 +534,13 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	}
 
 	r.Logger.Printf("snapshot written %s/%08x", pos.Generation, pos.Index)
+
+	if pos.Generation == r.state.CurrentGeneration {
+		r.state.NumSnapshots++
+	} else {
+		r.state.NumSnapshots = 1
+	}
+	r.state.CurrentGeneration = pos.Generation
 
 	return info, nil
 }
