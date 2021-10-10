@@ -159,22 +159,21 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 
 	Tracef("%s(%s): replica sync: db.pos=%s", r.db.Path(), r.Name(), dpos)
 
-	// Create snapshot if no snapshots exist for generation.
-	snapshotN, err := r.snapshotN(generation)
-	if err != nil {
-		return err
-	} else if snapshotN == 0 {
-		if info, err := r.Snapshot(ctx); err != nil {
-			return err
-		} else if info.Generation != generation {
-			return fmt.Errorf("generation changed during snapshot, exiting sync")
-		}
-		snapshotN = 1
-	}
-	replicaSnapshotTotalGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(snapshotN))
-
-	// Determine position, if necessary.
+	// Create a new snapshot and update the current replica position if
+	// the generation on the database has changed.
 	if r.Pos().Generation != generation {
+		// Create snapshot if no snapshots exist for generation.
+		snapshotN, err := r.snapshotN(generation)
+		if err != nil {
+			return err
+		} else if snapshotN == 0 {
+			if info, err := r.Snapshot(ctx); err != nil {
+				return err
+			} else if info.Generation != generation {
+				return fmt.Errorf("generation changed during snapshot, exiting sync")
+			}
+		}
+
 		pos, err := r.calcPos(ctx, generation)
 		if err != nil {
 			return fmt.Errorf("cannot determine replica position: %s", err)
@@ -1307,13 +1306,6 @@ func (r *Replica) downloadWAL(ctx context.Context, generation string, index int,
 
 // Replica metrics.
 var (
-	replicaSnapshotTotalGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "snapshot_total",
-		Help:      "The current number of snapshots",
-	}, []string{"db", "name"})
-
 	replicaWALBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",
