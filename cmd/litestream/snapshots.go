@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"text/tabwriter"
 	"time"
 
@@ -85,6 +86,8 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 			log.Printf("cannot determine snapshots: %s", err)
 			continue
 		}
+		// Sort snapshots by creation time from newest to oldest.
+		sort.Slice(infos, func(i, j int) bool { return infos[i].CreatedAt.After(infos[j].CreatedAt) })
 		for _, info := range infos {
 			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
 				r.Name(),
