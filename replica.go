@@ -266,7 +266,9 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 	zw := lz4.NewWriter(pw)
 
 	// Write each segment out to the replica.
-	for _, info := range segments {
+	for i := range segments {
+		info := &segments[i]
+
 		if err := func() error {
 			// Ensure segments are in order and no bytes are skipped.
 			if pos != info.Pos() {
