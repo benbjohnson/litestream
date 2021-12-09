@@ -213,11 +213,13 @@ func FilterSnapshotsAfter(a []SnapshotInfo, t time.Time) []SnapshotInfo {
 // FindMinSnapshotByGeneration finds the snapshot with the lowest index in a generation.
 func FindMinSnapshotByGeneration(a []SnapshotInfo, generation string) *SnapshotInfo {
 	var min *SnapshotInfo
-	for _, snapshot := range a {
+	for i := range a {
+		snapshot := &a[i]
+
 		if snapshot.Generation != generation {
 			continue
 		} else if min == nil || snapshot.Index < min.Index {
-			min = &snapshot
+			min = snapshot
 		}
 	}
 	return min

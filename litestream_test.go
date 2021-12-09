@@ -40,6 +40,16 @@ func TestChecksum(t *testing.T) {
 	})
 }
 
+func TestFindMinSnapshotByGeneration(t *testing.T) {
+	infos := []litestream.SnapshotInfo{
+		{Generation: "29cf4bced74e92ab", Index: 0},
+		{Generation: "5dfeb4aa03232553", Index: 24},
+	}
+	if got, want := litestream.FindMinSnapshotByGeneration(infos, "29cf4bced74e92ab"), &infos[0]; got != want {
+		t.Fatalf("info=%#v, want %#v", got, want)
+	}
+}
+
 func MustDecodeHexString(s string) []byte {
 	b, err := hex.DecodeString(s)
 	if err != nil {
