@@ -1,8 +1,10 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"strings"
@@ -469,6 +471,67 @@ func TestDB_Sync(t *testing.T) {
 		// Ensure position is now on the second index.
 		if got, want := db.Pos().Index, 1; got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
+		}
+	})
+}
+
+func TestReadWALFields(t *testing.T) {
+	b, err := os.ReadFile("testdata/read-wal-fields/ok")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("OK", func(t *testing.T) {
+		if salt0, salt1, chksum0, chksum1, byteOrder, frame, err := litestream.ReadWALFields(bytes.NewReader(b), 4096); err != nil {
+			t.Fatal(err)
+		} else if got, want := salt0, uint32(0x4F7598FD); got != want {
+			t.Fatalf("salt0=%x, want %x", got, want)
+		} else if got, want := salt1, uint32(0x875FFD5B); got != want {
+			t.Fatalf("salt1=%x, want %x", got, want)
+		} else if got, want := chksum0, uint32(0x2081CAF7); got != want {
+			t.Fatalf("chksum0=%x, want %x", got, want)
+		} else if got, want := chksum1, uint32(0x31093CD3); got != want {
+			t.Fatalf("chksum1=%x, want %x", got, want)
+		} else if got, want := byteOrder, binary.LittleEndian; got != want {
+			t.Fatalf("chksum1=%x, want %x", got, want)
+		} else if !bytes.Equal(frame, b[8272:]) {
+			t.Fatal("last frame mismatch")
+		}
+	})
+
+	t.Run("HeaderOnly", func(t *testing.T) {
+		if salt0, salt1, chksum0, chksum1, byteOrder, frame, err := litestream.ReadWALFields(bytes.NewReader(b[:32]), 4096); err != nil {
+			t.Fatal(err)
+		} else if got, want := salt0, uint32(0x4F7598FD); got != want {
+			t.Fatalf("salt0=%x, want %x", got, want)
+		} else if got, want := salt1, uint32(0x875FFD5B); got != want {
+			t.Fatalf("salt1=%x, want %x", got, want)
+		} else if got, want := chksum0, uint32(0xD27F7862); got != want {
+			t.Fatalf("chksum0=%x, want %x", got, want)
+		} else if got, want := chksum1, uint32(0xE664AF8E); got != want {
+			t.Fatalf("chksum1=%x, want %x", got, want)
+		} else if got, want := byteOrder, binary.LittleEndian; got != want {
+			t.Fatalf("chksum1=%x, want %x", got, want)
+		} else if frame != nil {
+			t.Fatal("expected no frame")
+		}
+	})
+
+	t.Run("ErrShortHeader", func(t *testing.T) {
+		if _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader([]byte{}), 4096); err == nil || err.Error() != `short wal header: EOF` {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("ErrBadMagic", func(t *testing.T) {
+		if _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader(make([]byte, 32)), 4096); err == nil || err.Error() != `invalid wal header magic: 0` {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("ErrShortFrame", func(t *testing.T) {
+		if _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader(b[:100]), 4096); err == nil || err.Error() != `short wal frame (n=68): unexpected EOF` {
+			t.Fatal(err)
 		}
 	})
 }
