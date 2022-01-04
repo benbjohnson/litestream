@@ -14,12 +14,15 @@ import (
 )
 
 // SnapshotsCommand represents a command to list snapshots for a command.
-type SnapshotsCommand struct{}
+type SnapshotsCommand struct {
+	configPath  string
+	noExpandEnv bool
+}
 
 // Run executes the command.
 func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-snapshots", flag.ContinueOnError)
-	configPath, noExpandEnv := registerConfigFlag(fs)
+	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
 	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -33,19 +36,19 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	var db *litestream.DB
 	var r *litestream.Replica
 	if isURL(fs.Arg(0)) {
-		if *configPath != "" {
+		if c.configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
 	} else {
-		if *configPath == "" {
-			*configPath = DefaultConfigPath()
+		if c.configPath == "" {
+			c.configPath = DefaultConfigPath()
 		}
 
 		// Load configuration.
-		config, err := ReadConfigFile(*configPath, !*noExpandEnv)
+		config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
 		if err != nil {
 			return err
 		}

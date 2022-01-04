@@ -20,7 +20,6 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
@@ -126,7 +125,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return err
 
 	case "restore":
-		return (&RestoreCommand{}).Run(ctx, args)
+		return NewRestoreCommand().Run(ctx, args)
 	case "snapshots":
 		return (&SnapshotsCommand{}).Run(ctx, args)
 	case "version":
@@ -383,8 +382,8 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	return r, nil
 }
 
-// newFileReplicaClientFromConfig returns a new instance of file.ReplicaClient built from config.
-func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *file.ReplicaClient, err error) {
+// newFileReplicaClientFromConfig returns a new instance of FileReplicaClient built from config.
+func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *litestream.FileReplicaClient, err error) {
 	// Ensure URL & path are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for file replica")
@@ -409,9 +408,7 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	}
 
 	// Instantiate replica and apply time fields, if set.
-	client := file.NewReplicaClient(path)
-	client.Replica = r
-	return client, nil
+	return litestream.NewFileReplicaClient(path), nil
 }
 
 // newS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
@@ -669,9 +666,9 @@ func DefaultConfigPath() string {
 	return defaultConfigPath
 }
 
-func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
-	return fs.String("config", "", "config path"),
-		fs.Bool("no-expand-env", false, "do not expand env vars in config")
+func registerConfigFlag(fs *flag.FlagSet, configPath *string, noExpandEnv *bool) {
+	fs.StringVar(configPath, "config", "", "config path")
+	fs.BoolVar(noExpandEnv, "no-expand-env", false, "do not expand env vars in config")
 }
 
 // expand returns an absolute path for s.

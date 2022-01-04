@@ -9,7 +9,6 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
-	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 )
@@ -103,7 +102,7 @@ func TestNewFileReplicaFromConfig(t *testing.T) {
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{Path: "/foo"}, nil)
 	if err != nil {
 		t.Fatal(err)
-	} else if client, ok := r.Client.(*file.ReplicaClient); !ok {
+	} else if client, ok := r.Client.(*litestream.FileReplicaClient); !ok {
 		t.Fatal("unexpected replica type")
 	} else if got, want := client.Path(), "/foo"; got != want {
 		t.Fatalf("Path=%s, want %s", got, want)

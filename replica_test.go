@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/mock"
 	"github.com/pierrec/lz4/v4"
 )
@@ -45,9 +44,9 @@ func TestReplica_Sync(t *testing.T) {
 	// Fetch current database position.
 	dpos := db.Pos()
 
-	c := file.NewReplicaClient(t.TempDir())
+	c := litestream.NewFileReplicaClient(t.TempDir())
 	r := litestream.NewReplica(db, "")
-	c.Replica, r.Client = r, c
+	r.Client = c
 
 	if err := r.Sync(context.Background()); err != nil {
 		t.Fatal(err)
@@ -81,7 +80,7 @@ func TestReplica_Snapshot(t *testing.T) {
 	db, sqldb := MustOpenDBs(t)
 	defer MustCloseDBs(t, db, sqldb)
 
-	c := file.NewReplicaClient(t.TempDir())
+	c := litestream.NewFileReplicaClient(t.TempDir())
 	r := litestream.NewReplica(db, "")
 	r.Client = c
 

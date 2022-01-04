@@ -94,27 +94,19 @@ func (r *ReadCounter) Read(p []byte) (int, error) {
 func (r *ReadCounter) N() int64 { return r.n }
 
 // CreateFile creates the file and matches the mode & uid/gid of fi.
-func CreateFile(filename string, fi os.FileInfo) (*os.File, error) {
-	mode := os.FileMode(0600)
-	if fi != nil {
-		mode = fi.Mode()
-	}
-
+func CreateFile(filename string, mode os.FileMode, uid, gid int) (*os.File, error) {
 	f, err := os.OpenFile(filename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		return nil, err
 	}
 
-	uid, gid := Fileinfo(fi)
 	_ = f.Chown(uid, gid)
 	return f, nil
 }
 
 // MkdirAll is a copy of os.MkdirAll() except that it attempts to set the
 // mode/uid/gid to match fi for each created directory.
-func MkdirAll(path string, fi os.FileInfo) error {
-	uid, gid := Fileinfo(fi)
-
+func MkdirAll(path string, mode os.FileMode, uid, gid int) error {
 	// Fast path: if we can tell whether path is a directory or file, stop with success or error.
 	dir, err := os.Stat(path)
 	if err == nil {
@@ -137,17 +129,13 @@ func MkdirAll(path string, fi os.FileInfo) error {
 
 	if j > 1 {
 		// Create parent.
-		err = MkdirAll(fixRootDirectory(path[:j-1]), fi)
+		err = MkdirAll(fixRootDirectory(path[:j-1]), mode, uid, gid)
 		if err != nil {
 			return err
 		}
 	}
 
 	// Parent now exists; invoke Mkdir and use its result.
-	mode := os.FileMode(0700)
-	if fi != nil {
-		mode = fi.Mode()
-	}
 	err = os.Mkdir(path, mode)
 	if err != nil {
 		// Handle arguments like "foo/." by

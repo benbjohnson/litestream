@@ -2,572 +2,582 @@ package litestream_test
 
 import (
 	"context"
-	"flag"
 	"fmt"
-	"io/ioutil"
-	"math/rand"
 	"os"
-	"path"
-	"reflect"
-	"sort"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gcs"
-	"github.com/benbjohnson/litestream/s3"
-	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/mock"
 )
 
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
-
-var (
-	// Enables integration tests.
-	integration = flag.String("integration", "file", "")
-)
-
-// S3 settings
-var (
-	// Replica client settings
-	s3AccessKeyID     = flag.String("s3-access-key-id", os.Getenv("LITESTREAM_S3_ACCESS_KEY_ID"), "")
-	s3SecretAccessKey = flag.String("s3-secret-access-key", os.Getenv("LITESTREAM_S3_SECRET_ACCESS_KEY"), "")
-	s3Region          = flag.String("s3-region", os.Getenv("LITESTREAM_S3_REGION"), "")
-	s3Bucket          = flag.String("s3-bucket", os.Getenv("LITESTREAM_S3_BUCKET"), "")
-	s3Path            = flag.String("s3-path", os.Getenv("LITESTREAM_S3_PATH"), "")
-	s3Endpoint        = flag.String("s3-endpoint", os.Getenv("LITESTREAM_S3_ENDPOINT"), "")
-	s3ForcePathStyle  = flag.Bool("s3-force-path-style", os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE") == "true", "")
-	s3SkipVerify      = flag.Bool("s3-skip-verify", os.Getenv("LITESTREAM_S3_SKIP_VERIFY") == "true", "")
-)
-
-// Google cloud storage settings
-var (
-	gcsBucket = flag.String("gcs-bucket", os.Getenv("LITESTREAM_GCS_BUCKET"), "")
-	gcsPath   = flag.String("gcs-path", os.Getenv("LITESTREAM_GCS_PATH"), "")
-)
-
-// Azure blob storage settings
-var (
-	absAccountName = flag.String("abs-account-name", os.Getenv("LITESTREAM_ABS_ACCOUNT_NAME"), "")
-	absAccountKey  = flag.String("abs-account-key", os.Getenv("LITESTREAM_ABS_ACCOUNT_KEY"), "")
-	absBucket      = flag.String("abs-bucket", os.Getenv("LITESTREAM_ABS_BUCKET"), "")
-	absPath        = flag.String("abs-path", os.Getenv("LITESTREAM_ABS_PATH"), "")
-)
-
-// SFTP settings
-var (
-	sftpHost     = flag.String("sftp-host", os.Getenv("LITESTREAM_SFTP_HOST"), "")
-	sftpUser     = flag.String("sftp-user", os.Getenv("LITESTREAM_SFTP_USER"), "")
-	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
-	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
-	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
-)
-
-func TestReplicaClient_Generations(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		// Write snapshots.
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
+func TestFindSnapshotForIndex(t *testing.T) {
+	t.Run("BeforeIndex", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-snapshot-for-index", "ok"))
+		if snapshotIndex, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000007d0); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 0, strings.NewReader(`bar`)); err != nil {
-			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "155fe292f8333c72", 0, strings.NewReader(`baz`)); err != nil {
-			t.Fatal(err)
-		}
-
-		// Verify returned generations.
-		if got, err := c.Generations(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if want := []string{"155fe292f8333c72", "5efbd8d042012dca", "b16ddcf5c697540f"}; !reflect.DeepEqual(got, want) {
-			t.Fatalf("Generations()=%v, want %v", got, want)
+		} else if got, want := snapshotIndex, 0x000003e8; got != want {
+			t.Fatalf("index=%08x, want %08x", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "NoGenerationsDir", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if generations, err := c.Generations(context.Background()); err != nil {
+	t.Run("AtIndex", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-snapshot-for-index", "ok"))
+		if snapshotIndex, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000003e8); err != nil {
 			t.Fatal(err)
-		} else if got, want := len(generations), 0; got != want {
-			t.Fatalf("len(Generations())=%v, want %v", got, want)
+		} else if got, want := snapshotIndex, 0x000003e8; got != want {
+			t.Fatalf("index=%08x, want %08x", got, want)
+		}
+	})
+
+	t.Run("ErrNoSnapshotsBeforeIndex", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-snapshot-for-index", "no-snapshots-before-index"))
+		_, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000003e8)
+		if err == nil || err.Error() != `no snapshots available at or before index 000003e8` {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-snapshot-for-index", "no-snapshots"))
+		_, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000003e8)
+		if err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+		_, err := litestream.FindSnapshotForIndex(context.Background(), &client, "0000000000000000", 0x000003e8)
+		if err == nil || err.Error() != `snapshots: marker` {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrSnapshotIterator", func(t *testing.T) {
+		var itr mock.SnapshotIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
+
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return &itr, nil
+		}
+
+		_, err := litestream.FindSnapshotForIndex(context.Background(), &client, "0000000000000000", 0x000003e8)
+		if err == nil || err.Error() != `snapshot iteration: marker` {
+			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 }
 
-func TestReplicaClient_Snapshots(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		// Write snapshots.
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 1, strings.NewReader(``)); err != nil {
+func TestSnapshotTimeBounds(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "snapshot-time-bounds", "ok"))
+		if min, max, err := litestream.SnapshotTimeBounds(context.Background(), client, "0000000000000000"); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 5, strings.NewReader(`x`)); err != nil {
-			t.Fatal(err)
-		} else if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 10, strings.NewReader(`xyz`)); err != nil {
-			t.Fatal(err)
-		}
-
-		// Fetch all snapshots by generation.
-		itr, err := c.Snapshots(context.Background(), "b16ddcf5c697540f")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer itr.Close()
-
-		// Read all snapshots into a slice so they can be sorted.
-		a, err := litestream.SliceSnapshotIterator(itr)
-		if err != nil {
-			t.Fatal(err)
-		} else if got, want := len(a), 2; got != want {
-			t.Fatalf("len=%v, want %v", got, want)
-		}
-		sort.Sort(litestream.SnapshotInfoSlice(a))
-
-		// Verify first snapshot metadata.
-		if got, want := a[0].Generation, "b16ddcf5c697540f"; got != want {
-			t.Fatalf("Generation=%v, want %v", got, want)
-		} else if got, want := a[0].Index, 5; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if got, want := a[0].Size, int64(1); got != want {
-			t.Fatalf("Size=%v, want %v", got, want)
-		} else if a[0].CreatedAt.IsZero() {
-			t.Fatalf("expected CreatedAt")
-		}
-
-		// Verify second snapshot metadata.
-		if got, want := a[1].Generation, "b16ddcf5c697540f"; got != want {
-			t.Fatalf("Generation=%v, want %v", got, want)
-		} else if got, want := a[1].Index, 0xA; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if got, want := a[1].Size, int64(3); got != want {
-			t.Fatalf("Size=%v, want %v", got, want)
-		} else if a[1].CreatedAt.IsZero() {
-			t.Fatalf("expected CreatedAt")
-		}
-
-		// Ensure close is clean.
-		if err := itr.Close(); err != nil {
-			t.Fatal(err)
+		} else if got, want := min, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("min=%s, want %s", got, want)
+		} else if got, want := max, time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("max=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "NoGenerationDir", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		itr, err := c.Snapshots(context.Background(), "5efbd8d042012dca")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer itr.Close()
-
-		if itr.Next() {
-			t.Fatal("expected no snapshots")
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "snapshot-time-bounds", "no-snapshots"))
+		if _, _, err := litestream.SnapshotTimeBounds(context.Background(), client, "0000000000000000"); err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		itr, err := c.Snapshots(context.Background(), "")
-		if err == nil {
-			err = itr.Close()
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
 		}
-		if err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
+
+		_, _, err := litestream.SnapshotTimeBounds(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshotIterator", func(t *testing.T) {
+		var itr mock.SnapshotIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
+
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return &itr, nil
+		}
+
+		_, _, err := litestream.SnapshotTimeBounds(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `snapshot iteration: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
 
-func TestReplicaClient_WriteSnapshot(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if _, err := c.WriteSnapshot(context.Background(), "b16ddcf5c697540f", 1000, strings.NewReader(`foobar`)); err != nil {
+func TestWALTimeBounds(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "wal-time-bounds", "ok"))
+		if min, max, err := litestream.WALTimeBounds(context.Background(), client, "0000000000000000"); err != nil {
 			t.Fatal(err)
-		}
-
-		if r, err := c.SnapshotReader(context.Background(), "b16ddcf5c697540f", 1000); err != nil {
-			t.Fatal(err)
-		} else if buf, err := ioutil.ReadAll(r); err != nil {
-			t.Fatal(err)
-		} else if err := r.Close(); err != nil {
-			t.Fatal(err)
-		} else if got, want := string(buf), `foobar`; got != want {
-			t.Fatalf("data=%q, want %q", got, want)
+		} else if got, want := min, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("min=%s, want %s", got, want)
+		} else if got, want := max, time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("max=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_SnapshotReader(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 10, strings.NewReader(`foo`)); err != nil {
-			t.Fatal(err)
-		}
-
-		r, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 10)
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer r.Close()
-
-		if buf, err := ioutil.ReadAll(r); err != nil {
-			t.Fatal(err)
-		} else if got, want := string(buf), "foo"; got != want {
-			t.Fatalf("ReadAll=%v, want %v", got, want)
+	t.Run("ErrNoWALSegments", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "wal-time-bounds", "no-wal-segments"))
+		if _, _, err := litestream.WALTimeBounds(context.Background(), client, "0000000000000000"); err != litestream.ErrNoWALSegments {
+			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
+	t.Run("ErrWALSegments", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
 
-		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1); !os.IsNotExist(err) {
-			t.Fatalf("expected not exist, got %#v", err)
+		_, _, err := litestream.WALTimeBounds(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `wal segments: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
+	t.Run("ErrWALSegmentIterator", func(t *testing.T) {
+		var itr mock.WALSegmentIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
 
-		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
+		var client mock.ReplicaClient
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return &itr, nil
+		}
+
+		_, _, err := litestream.WALTimeBounds(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `wal segment iteration: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
 
-func TestReplicaClient_WALSegments(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}, strings.NewReader(``)); err != nil {
+func TestGenerationTimeBounds(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "generation-time-bounds", "ok"))
+		if min, max, err := litestream.GenerationTimeBounds(context.Background(), client, "0000000000000000"); err != nil {
 			t.Fatal(err)
-		}
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 0}, strings.NewReader(`12345`)); err != nil {
-			t.Fatal(err)
-		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 2, Offset: 5}, strings.NewReader(`67`)); err != nil {
-			t.Fatal(err)
-		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 3, Offset: 0}, strings.NewReader(`xyz`)); err != nil {
-			t.Fatal(err)
-		}
-
-		itr, err := c.WALSegments(context.Background(), "b16ddcf5c697540f")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer itr.Close()
-
-		// Read all WAL segment files into a slice so they can be sorted.
-		a, err := litestream.SliceWALSegmentIterator(itr)
-		if err != nil {
-			t.Fatal(err)
-		} else if got, want := len(a), 3; got != want {
-			t.Fatalf("len=%v, want %v", got, want)
-		}
-		sort.Sort(litestream.WALSegmentInfoSlice(a))
-
-		// Verify first WAL segment metadata.
-		if got, want := a[0].Generation, "b16ddcf5c697540f"; got != want {
-			t.Fatalf("Generation=%v, want %v", got, want)
-		} else if got, want := a[0].Index, 2; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if got, want := a[0].Offset, int64(0); got != want {
-			t.Fatalf("Offset=%v, want %v", got, want)
-		} else if got, want := a[0].Size, int64(5); got != want {
-			t.Fatalf("Size=%v, want %v", got, want)
-		} else if a[0].CreatedAt.IsZero() {
-			t.Fatalf("expected CreatedAt")
-		}
-
-		// Verify first WAL segment metadata.
-		if got, want := a[1].Generation, "b16ddcf5c697540f"; got != want {
-			t.Fatalf("Generation=%v, want %v", got, want)
-		} else if got, want := a[1].Index, 2; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if got, want := a[1].Offset, int64(5); got != want {
-			t.Fatalf("Offset=%v, want %v", got, want)
-		} else if got, want := a[1].Size, int64(2); got != want {
-			t.Fatalf("Size=%v, want %v", got, want)
-		} else if a[1].CreatedAt.IsZero() {
-			t.Fatalf("expected CreatedAt")
-		}
-
-		// Verify third WAL segment metadata.
-		if got, want := a[2].Generation, "b16ddcf5c697540f"; got != want {
-			t.Fatalf("Generation=%v, want %v", got, want)
-		} else if got, want := a[2].Index, 3; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if got, want := a[2].Offset, int64(0); got != want {
-			t.Fatalf("Offset=%v, want %v", got, want)
-		} else if got, want := a[2].Size, int64(3); got != want {
-			t.Fatalf("Size=%v, want %v", got, want)
-		} else if a[1].CreatedAt.IsZero() {
-			t.Fatalf("expected CreatedAt")
-		}
-
-		// Ensure close is clean.
-		if err := itr.Close(); err != nil {
-			t.Fatal(err)
+		} else if got, want := min, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("min=%s, want %s", got, want)
+		} else if got, want := max, time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("max=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "NoGenerationDir", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		itr, err := c.WALSegments(context.Background(), "5efbd8d042012dca")
-		if err != nil {
+	t.Run("SnapshotsOnly", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "generation-time-bounds", "snapshots-only"))
+		if min, max, err := litestream.GenerationTimeBounds(context.Background(), client, "0000000000000000"); err != nil {
 			t.Fatal(err)
-		}
-		defer itr.Close()
-
-		if itr.Next() {
-			t.Fatal("expected no wal files")
+		} else if got, want := min, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("min=%s, want %s", got, want)
+		} else if got, want := max, time.Date(2000, 1, 2, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("max=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "NoWALs", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if _, err := c.WriteSnapshot(context.Background(), "5efbd8d042012dca", 0, strings.NewReader(`foo`)); err != nil {
-			t.Fatal(err)
-		}
-
-		itr, err := c.WALSegments(context.Background(), "5efbd8d042012dca")
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer itr.Close()
-
-		if itr.Next() {
-			t.Fatal("expected no wal files")
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "generation-time-bounds", "no-snapshots"))
+		if _, _, err := litestream.GenerationTimeBounds(context.Background(), client, "0000000000000000"); err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		itr, err := c.WALSegments(context.Background(), "")
-		if err == nil {
-			err = itr.Close()
+	t.Run("ErrWALSegments", func(t *testing.T) {
+		var snapshotN int
+		var itr mock.SnapshotIterator
+		itr.NextFunc = func() bool {
+			snapshotN++
+			return snapshotN == 1
 		}
-		if err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
+		itr.SnapshotFunc = func() litestream.SnapshotInfo {
+			return litestream.SnapshotInfo{CreatedAt: time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)}
+		}
+		itr.CloseFunc = func() error { return nil }
+
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return &itr, nil
+		}
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, _, err := litestream.GenerationTimeBounds(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `wal segments: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
 
-func TestReplicaClient_WriteWALSegment(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}, strings.NewReader(`foobar`)); err != nil {
+func TestFindLatestGeneration(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-latest-generation", "ok"))
+		if generation, err := litestream.FindLatestGeneration(context.Background(), client); err != nil {
 			t.Fatal(err)
-		}
-
-		if r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}); err != nil {
-			t.Fatal(err)
-		} else if buf, err := ioutil.ReadAll(r); err != nil {
-			t.Fatal(err)
-		} else if err := r.Close(); err != nil {
-			t.Fatal(err)
-		} else if got, want := string(buf), `foobar`; got != want {
-			t.Fatalf("data=%q, want %q", got, want)
+		} else if got, want := generation, "0000000000000001"; got != want {
+			t.Fatalf("generation=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_WALSegmentReader(t *testing.T) {
-
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5}, strings.NewReader(`foobar`)); err != nil {
-			t.Fatal(err)
-		}
-
-		r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 10, Offset: 5})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer r.Close()
-
-		if buf, err := ioutil.ReadAll(r); err != nil {
-			t.Fatal(err)
-		} else if got, want := string(buf), "foobar"; got != want {
-			t.Fatalf("ReadAll=%v, want %v", got, want)
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-latest-generation", "no-generations"))
+		if generation, err := litestream.FindLatestGeneration(context.Background(), client); err != litestream.ErrNoGeneration {
+			t.Fatalf("unexpected error: %s", err)
+		} else if got, want := generation, ""; got != want {
+			t.Fatalf("generation=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
+	t.Run("ErrGenerations", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.GenerationsFunc = func(ctx context.Context) ([]string, error) {
+			return nil, fmt.Errorf("marker")
+		}
 
-		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}); !os.IsNotExist(err) {
-			t.Fatalf("expected not exist, got %#v", err)
+		_, err := litestream.FindLatestGeneration(context.Background(), &client)
+		if err == nil || err.Error() != `generations: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.GenerationsFunc = func(ctx context.Context) ([]string, error) {
+			return []string{"0000000000000000"}, nil
+		}
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindLatestGeneration(context.Background(), &client)
+		if err == nil || err.Error() != `generation time bounds: snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
 
-func TestReplicaClient_DeleteWALSegments(t *testing.T) {
-	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}, strings.NewReader(`foo`)); err != nil {
+func TestReplicaClientTimeBounds(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-latest-generation", "ok"))
+		if min, max, err := litestream.ReplicaClientTimeBounds(context.Background(), client); err != nil {
 			t.Fatal(err)
-		} else if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}, strings.NewReader(`bar`)); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{
-			{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2},
-			{Generation: "5efbd8d042012dca", Index: 3, Offset: 4},
-		}); err != nil {
-			t.Fatal(err)
-		}
-
-		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}); !os.IsNotExist(err) {
-			t.Fatalf("expected not exist, got %#v", err)
-		} else if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}); !os.IsNotExist(err) {
-			t.Fatalf("expected not exist, got %#v", err)
+		} else if got, want := min, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("min=%s, want %s", got, want)
+		} else if got, want := max, time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC); !got.Equal(want) {
+			t.Fatalf("max=%s, want %s", got, want)
 		}
 	})
 
-	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
-		t.Parallel()
-		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `generation required` {
-			t.Fatalf("unexpected error: %v", err)
+	t.Run("ErrNoGeneration", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.GenerationsFunc = func(ctx context.Context) ([]string, error) {
+			return nil, nil
+		}
+
+		_, _, err := litestream.ReplicaClientTimeBounds(context.Background(), &client)
+		if err != litestream.ErrNoGeneration {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrGenerations", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.GenerationsFunc = func(ctx context.Context) ([]string, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, _, err := litestream.ReplicaClientTimeBounds(context.Background(), &client)
+		if err == nil || err.Error() != `generations: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.GenerationsFunc = func(ctx context.Context) ([]string, error) {
+			return []string{"0000000000000000"}, nil
+		}
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, _, err := litestream.ReplicaClientTimeBounds(context.Background(), &client)
+		if err == nil || err.Error() != `generation time bounds: snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
 
-// RunWithReplicaClient executes fn with each replica specified by the -integration flag
-func RunWithReplicaClient(t *testing.T, name string, fn func(*testing.T, litestream.ReplicaClient)) {
-	t.Run(name, func(t *testing.T) {
-		for _, typ := range strings.Split(*integration, ",") {
-			t.Run(typ, func(t *testing.T) {
-				c := NewReplicaClient(t, typ)
-				defer MustDeleteAll(t, c)
+func TestFindMaxSnapshotIndexByGeneration(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-snapshot-index", "ok"))
+		if index, err := litestream.FindMaxSnapshotIndexByGeneration(context.Background(), client, "0000000000000000"); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x000007d0; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
 
-				fn(t, c)
-			})
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-snapshot-index", "no-snapshots"))
+
+		_, err := litestream.FindMaxSnapshotIndexByGeneration(context.Background(), client, "0000000000000000")
+		if err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindMaxSnapshotIndexByGeneration(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshotIteration", func(t *testing.T) {
+		var itr mock.SnapshotIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
+
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return &itr, nil
+		}
+
+		_, err := litestream.FindMaxSnapshotIndexByGeneration(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `snapshot iteration: marker` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
 
-// NewReplicaClient returns a new client for integration testing by type name.
-func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
-	tb.Helper()
-
-	switch typ {
-	case file.ReplicaClientType:
-		return NewFileReplicaClient(tb)
-	case s3.ReplicaClientType:
-		return NewS3ReplicaClient(tb)
-	case gcs.ReplicaClientType:
-		return NewGCSReplicaClient(tb)
-	case abs.ReplicaClientType:
-		return NewABSReplicaClient(tb)
-	case sftp.ReplicaClientType:
-		return NewSFTPReplicaClient(tb)
-	default:
-		tb.Fatalf("invalid replica client type: %q", typ)
-		return nil
-	}
-}
-
-// NewFileReplicaClient returns a new client for integration testing.
-func NewFileReplicaClient(tb testing.TB) *file.ReplicaClient {
-	tb.Helper()
-	return file.NewReplicaClient(tb.TempDir())
-}
-
-// NewS3ReplicaClient returns a new client for integration testing.
-func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
-	tb.Helper()
-
-	c := s3.NewReplicaClient()
-	c.AccessKeyID = *s3AccessKeyID
-	c.SecretAccessKey = *s3SecretAccessKey
-	c.Region = *s3Region
-	c.Bucket = *s3Bucket
-	c.Path = path.Join(*s3Path, fmt.Sprintf("%016x", rand.Uint64()))
-	c.Endpoint = *s3Endpoint
-	c.ForcePathStyle = *s3ForcePathStyle
-	c.SkipVerify = *s3SkipVerify
-	return c
-}
-
-// NewGCSReplicaClient returns a new client for integration testing.
-func NewGCSReplicaClient(tb testing.TB) *gcs.ReplicaClient {
-	tb.Helper()
-
-	c := gcs.NewReplicaClient()
-	c.Bucket = *gcsBucket
-	c.Path = path.Join(*gcsPath, fmt.Sprintf("%016x", rand.Uint64()))
-	return c
-}
-
-// NewABSReplicaClient returns a new client for integration testing.
-func NewABSReplicaClient(tb testing.TB) *abs.ReplicaClient {
-	tb.Helper()
-
-	c := abs.NewReplicaClient()
-	c.AccountName = *absAccountName
-	c.AccountKey = *absAccountKey
-	c.Bucket = *absBucket
-	c.Path = path.Join(*absPath, fmt.Sprintf("%016x", rand.Uint64()))
-	return c
-}
-
-// NewSFTPReplicaClient returns a new client for integration testing.
-func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
-	tb.Helper()
-
-	c := sftp.NewReplicaClient()
-	c.Host = *sftpHost
-	c.User = *sftpUser
-	c.Password = *sftpPassword
-	c.KeyPath = *sftpKeyPath
-	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
-	return c
-}
-
-// MustDeleteAll deletes all objects under the client's path.
-func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
-	tb.Helper()
-
-	generations, err := c.Generations(context.Background())
-	if err != nil {
-		tb.Fatalf("cannot list generations for deletion: %s", err)
-	}
-
-	for _, generation := range generations {
-		if err := c.DeleteGeneration(context.Background(), generation); err != nil {
-			tb.Fatalf("cannot delete generation: %s", err)
+func TestFindMaxWALIndexByGeneration(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-wal-index", "ok"))
+		if index, err := litestream.FindMaxWALIndexByGeneration(context.Background(), client, "0000000000000000"); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 1; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
 		}
-	}
+	})
 
-	switch c := c.(type) {
-	case *sftp.ReplicaClient:
-		if err := c.Cleanup(context.Background()); err != nil {
-			tb.Fatalf("cannot cleanup sftp: %s", err)
+	t.Run("ErrNoWALSegments", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-wal-index", "no-wal"))
+
+		_, err := litestream.FindMaxWALIndexByGeneration(context.Background(), client, "0000000000000000")
+		if err != litestream.ErrNoWALSegments {
+			t.Fatalf("unexpected error: %s", err)
 		}
-	}
+	})
+
+	t.Run("ErrWALSegments", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindMaxWALIndexByGeneration(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `wal segments: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrWALSegmentIteration", func(t *testing.T) {
+		var itr mock.WALSegmentIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
+
+		var client mock.ReplicaClient
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return &itr, nil
+		}
+
+		_, err := litestream.FindMaxWALIndexByGeneration(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `wal segment iteration: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+}
+
+func TestFindMaxIndexByGeneration(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-index", "ok"))
+		if index, err := litestream.FindMaxIndexByGeneration(context.Background(), client, "0000000000000000"); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x00000002; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("NoWAL", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-index", "no-wal"))
+		if index, err := litestream.FindMaxIndexByGeneration(context.Background(), client, "0000000000000000"); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x00000001; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("SnapshotLaterThanWAL", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-index", "snapshot-later-than-wal"))
+		if index, err := litestream.FindMaxIndexByGeneration(context.Background(), client, "0000000000000000"); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x00000001; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "max-index", "no-snapshots"))
+
+		_, err := litestream.FindMaxIndexByGeneration(context.Background(), client, "0000000000000000")
+		if err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindMaxIndexByGeneration(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `max snapshot index: snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrWALSegments", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return litestream.NewSnapshotInfoSliceIterator([]litestream.SnapshotInfo{{Index: 0x00000001}}), nil
+		}
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindMaxIndexByGeneration(context.Background(), &client, "0000000000000000")
+		if err == nil || err.Error() != `max wal index: wal segments: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+}
+
+func TestRestoreSnapshot(t *testing.T) { t.Skip("TODO") }
+
+func TestRestore(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		testDir := filepath.Join("testdata", "restore", "ok")
+		tempDir := t.TempDir()
+
+		client := litestream.NewFileReplicaClient(testDir)
+		if err := litestream.Restore(context.Background(), client, filepath.Join(tempDir, "db"), "0000000000000000", 0, 2, litestream.NewRestoreOptions()); err != nil {
+			t.Fatal(err)
+		} else if !fileEqual(t, filepath.Join(testDir, "00000002.db"), filepath.Join(tempDir, "db")) {
+			t.Fatalf("file mismatch")
+		}
+	})
+
+	t.Run("SnapshotOnly", func(t *testing.T) {
+		testDir := filepath.Join("testdata", "restore", "snapshot-only")
+		tempDir := t.TempDir()
+
+		client := litestream.NewFileReplicaClient(testDir)
+		if err := litestream.Restore(context.Background(), client, filepath.Join(tempDir, "db"), "0000000000000000", 0, 0, litestream.NewRestoreOptions()); err != nil {
+			t.Fatal(err)
+		} else if !fileEqual(t, filepath.Join(testDir, "00000000.db"), filepath.Join(tempDir, "db")) {
+			t.Fatalf("file mismatch")
+		}
+	})
+
+	t.Run("DefaultParallelism", func(t *testing.T) {
+		testDir := filepath.Join("testdata", "restore", "ok")
+		tempDir := t.TempDir()
+
+		client := litestream.NewFileReplicaClient(testDir)
+		opt := litestream.NewRestoreOptions()
+		opt.Parallelism = 0
+		if err := litestream.Restore(context.Background(), client, filepath.Join(tempDir, "db"), "0000000000000000", 0, 2, opt); err != nil {
+			t.Fatal(err)
+		} else if !fileEqual(t, filepath.Join(testDir, "00000002.db"), filepath.Join(tempDir, "db")) {
+			t.Fatalf("file mismatch")
+		}
+	})
+
+	t.Run("ErrPathRequired", func(t *testing.T) {
+		var client mock.ReplicaClient
+		if err := litestream.Restore(context.Background(), &client, "", "0000000000000000", 0, 0, litestream.NewRestoreOptions()); err == nil || err.Error() != `restore path required` {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrGenerationRequired", func(t *testing.T) {
+		var client mock.ReplicaClient
+		if err := litestream.Restore(context.Background(), &client, t.TempDir(), "", 0, 0, litestream.NewRestoreOptions()); err == nil || err.Error() != `generation required` {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrSnapshotIndexRequired", func(t *testing.T) {
+		var client mock.ReplicaClient
+		if err := litestream.Restore(context.Background(), &client, t.TempDir(), "0000000000000000", -1, 0, litestream.NewRestoreOptions()); err == nil || err.Error() != `snapshot index required` {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrTargetIndexRequired", func(t *testing.T) {
+		var client mock.ReplicaClient
+		if err := litestream.Restore(context.Background(), &client, t.TempDir(), "0000000000000000", 0, -1, litestream.NewRestoreOptions()); err == nil || err.Error() != `target index required` {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrPathExists", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "db")
+		if err := os.WriteFile(filename, []byte("foo"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var client mock.ReplicaClient
+		if err := litestream.Restore(context.Background(), &client, filename, "0000000000000000", 0, 0, litestream.NewRestoreOptions()); err == nil || !strings.Contains(err.Error(), `cannot restore, output path already exists`) {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrPathPermissions", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.Chmod(dir, 0000); err != nil {
+			t.Fatal(err)
+		}
+
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "restore", "bad-permissions"))
+		if err := litestream.Restore(context.Background(), client, filepath.Join(dir, "db"), "0000000000000000", 0, 0, litestream.NewRestoreOptions()); err == nil || !strings.Contains(err.Error(), `permission denied`) {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
 }

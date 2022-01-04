@@ -13,7 +13,6 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
@@ -23,6 +22,9 @@ import (
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
+	configPath  string
+	noExpandEnv bool
+
 	cmd    *exec.Cmd  // subcommand
 	execCh chan error // subcommand error channel
 
@@ -42,7 +44,7 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
-	configPath, noExpandEnv := registerConfigFlag(fs)
+	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -52,7 +54,7 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	if fs.NArg() == 1 {
 		return fmt.Errorf("must specify at least one replica URL for %s", fs.Arg(0))
 	} else if fs.NArg() > 1 {
-		if *configPath != "" {
+		if c.configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
 
@@ -66,10 +68,10 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
 	} else {
-		if *configPath == "" {
-			*configPath = DefaultConfigPath()
+		if c.configPath == "" {
+			c.configPath = DefaultConfigPath()
 		}
-		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
+		if c.Config, err = ReadConfigFile(c.configPath, !c.noExpandEnv); err != nil {
 			return err
 		}
 	}
@@ -110,7 +112,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		log.Printf("initialized db: %s", db.Path())
 		for _, r := range db.Replicas {
 			switch client := r.Client.(type) {
-			case *file.ReplicaClient:
+			case *litestream.FileReplicaClient:
 				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), client.Type(), client.Path())
 			case *s3.ReplicaClient:
 				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q endpoint=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, client.Region, client.Endpoint, r.SyncInterval)

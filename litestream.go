@@ -37,6 +37,7 @@ const (
 var (
 	ErrNoGeneration     = errors.New("no generation available")
 	ErrNoSnapshots      = errors.New("no snapshots available")
+	ErrNoWALSegments    = errors.New("no wal segments available")
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
@@ -438,6 +439,20 @@ func ParseOffset(s string) (int64, error) {
 		return -1, fmt.Errorf("cannot parse index: %q", s)
 	}
 	return v, nil
+}
+
+// removeDBFiles deletes the database and related files (journal, shm, wal).
+func removeDBFiles(filename string) error {
+	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cannot delete database %q: %w", filename, err)
+	} else if err := os.Remove(filename + "-journal"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cannot delete journal for %q: %w", filename, err)
+	} else if err := os.Remove(filename + "-shm"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cannot delete shared memory for %q: %w", filename, err)
+	} else if err := os.Remove(filename + "-wal"); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("cannot delete wal for %q: %w", filename, err)
+	}
+	return nil
 }
 
 // isHexChar returns true if ch is a lowercase hex character.
