@@ -1,0 +1,17 @@
+To reproduce this testdata, run sqlite3 and execute:
+
+	PRAGMA journal_mode = WAL;
+	CREATE TABLE t (x);
+	INSERT INTO t (x) VALUES (1);
+	INSERT INTO t (x) VALUES (2);
+
+And copy & split the WAL into segments:
+
+	sl3 split -o generations/0000000000000000/wal/00000000 db-wal
+	cp db-wal 00000000.wal
+
+
+Finally, remove the original database files:
+
+	rm db*
+

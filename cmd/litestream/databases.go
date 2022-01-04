@@ -10,12 +10,15 @@ import (
 )
 
 // DatabasesCommand is a command for listing managed databases.
-type DatabasesCommand struct{}
+type DatabasesCommand struct {
+	configPath  string
+	noExpandEnv bool
+}
 
 // Run executes the command.
 func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-databases", flag.ContinueOnError)
-	configPath, noExpandEnv := registerConfigFlag(fs)
+	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -24,10 +27,10 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	if *configPath == "" {
-		*configPath = DefaultConfigPath()
+	if c.configPath == "" {
+		c.configPath = DefaultConfigPath()
 	}
-	config, err := ReadConfigFile(*configPath, !*noExpandEnv)
+	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
 	if err != nil {
 		return err
 	}

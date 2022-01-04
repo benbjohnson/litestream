@@ -7,31 +7,46 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
-	"time"
 
 	"github.com/benbjohnson/litestream"
 )
 
 // RestoreCommand represents a command to restore a database from a backup.
-type RestoreCommand struct{}
+type RestoreCommand struct {
+	snapshotIndex int // index of snapshot to start from
+
+	// CLI options
+	configPath      string // path to config file
+	noExpandEnv     bool   // if true, do not expand env variables in config
+	outputPath      string // path to restore database to
+	replicaName     string // optional, name of replica to restore from
+	generation      string // optional, generation to restore
+	targetIndex     int    // optional, last WAL index to replay
+	ifDBNotExists   bool   // if true, skips restore if output path already exists
+	ifReplicaExists bool   // if true, skips if no backups exist
+	opt             litestream.RestoreOptions
+}
+
+func NewRestoreCommand() *RestoreCommand {
+	return &RestoreCommand{
+		targetIndex: -1,
+		opt:         litestream.NewRestoreOptions(),
+	}
+}
 
 // Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
-	opt := litestream.NewRestoreOptions()
-	opt.Verbose = true
-
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
-	configPath, noExpandEnv := registerConfigFlag(fs)
-	fs.StringVar(&opt.OutputPath, "o", "", "output path")
-	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
-	fs.StringVar(&opt.Generation, "generation", "", "generation name")
-	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
-	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
-	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
-	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
-	timestampStr := fs.String("timestamp", "", "timestamp")
-	verbose := fs.Bool("v", false, "verbose output")
+	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
+	fs.StringVar(&c.outputPath, "o", "", "output path")
+	fs.StringVar(&c.replicaName, "replica", "", "replica name")
+	fs.StringVar(&c.generation, "generation", "", "generation name")
+	fs.Var((*indexVar)(&c.targetIndex), "index", "wal index")
+	fs.IntVar(&c.opt.Parallelism, "parallelism", c.opt.Parallelism, "parallelism")
+	fs.BoolVar(&c.ifDBNotExists, "if-db-not-exists", false, "")
+	fs.BoolVar(&c.ifReplicaExists, "if-replica-exists", false, "")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -40,83 +55,100 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
+	arg := fs.Arg(0)
 
-	// Parse timestamp, if specified.
-	if *timestampStr != "" {
-		if opt.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
-			return errors.New("invalid -timestamp, must specify in ISO 8601 format (e.g. 2000-01-01T00:00:00Z)")
-		}
+	// Ensure a generation is specified if target index is specified.
+	if c.targetIndex != -1 && c.generation == "" {
+		return fmt.Errorf("must specify -generation when using -index flag")
 	}
 
-	// Instantiate logger if verbose output is enabled.
-	if *verbose {
-		opt.Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+	// Default to original database path if output path not specified.
+	if !isURL(arg) && c.outputPath == "" {
+		c.outputPath = arg
 	}
 
-	// Determine replica & generation to restore from.
-	var r *litestream.Replica
-	if isURL(fs.Arg(0)) {
-		if *configPath != "" {
-			return fmt.Errorf("cannot specify a replica URL and the -config flag")
-		}
-		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); err == errSkipDBExists {
-			fmt.Println("database already exists, skipping")
-			return nil
+	// Exit successfully if the output file already exists and flag is set.
+	if _, err := os.Stat(c.outputPath); !os.IsNotExist(err) && c.ifDBNotExists {
+		fmt.Println("database already exists, skipping")
+		return nil
+	}
+
+	// Create parent directory if it doesn't already exist.
+	if err := os.MkdirAll(filepath.Dir(c.outputPath), 0700); err != nil {
+		return fmt.Errorf("cannot create parent directory: %w", err)
+	}
+
+	// Build replica from either a URL or config.
+	r, err := c.loadReplica(ctx, arg)
+	if err != nil {
+		return err
+	}
+
+	// Determine latest generation if one is not specified.
+	if c.generation == "" {
+		if c.generation, err = litestream.FindLatestGeneration(ctx, r.Client); err == litestream.ErrNoGeneration {
+			// Return an error if no matching targets found.
+			// If optional flag set, return success. Useful for automated recovery.
+			if c.ifReplicaExists {
+				fmt.Println("no matching backups found")
+				return nil
+			}
+			return fmt.Errorf("no matching backups found")
 		} else if err != nil {
-			return err
-		}
-	} else {
-		if *configPath == "" {
-			*configPath = DefaultConfigPath()
-		}
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); err == errSkipDBExists {
-			fmt.Println("database already exists, skipping")
-			return nil
-		} else if err != nil {
-			return err
+			return fmt.Errorf("cannot determine latest generation: %w", err)
 		}
 	}
 
-	// Return an error if no matching targets found.
-	// If optional flag set, return success. Useful for automated recovery.
-	if opt.Generation == "" {
-		if *ifReplicaExists {
-			fmt.Println("no matching backups found")
-			return nil
+	// Determine the maximum available index for the generation if one is not specified.
+	if c.targetIndex == -1 {
+		if c.targetIndex, err = litestream.FindMaxIndexByGeneration(ctx, r.Client, c.generation); err != nil {
+			return fmt.Errorf("cannot determine latest index in generation %q: %w", c.generation, err)
 		}
-		return fmt.Errorf("no matching backups found")
 	}
 
-	return r.Restore(ctx, opt)
+	// Find lastest snapshot that occurs before the index.
+	// TODO: Optionally allow -snapshot-index
+	if c.snapshotIndex, err = litestream.FindSnapshotForIndex(ctx, r.Client, c.generation, c.targetIndex); err != nil {
+		return fmt.Errorf("cannot find snapshot index: %w", err)
+	}
+
+	c.opt.Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+
+	return litestream.Restore(ctx, r.Client, c.outputPath, c.generation, c.snapshotIndex, c.targetIndex, c.opt)
 }
 
-// loadFromURL creates a replica & updates the restore options from a replica URL.
-func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
-	if opt.OutputPath == "" {
+func (c *RestoreCommand) loadReplica(ctx context.Context, arg string) (*litestream.Replica, error) {
+	if isURL(arg) {
+		return c.loadReplicaFromURL(ctx, arg)
+	}
+	return c.loadReplicaFromConfig(ctx, arg)
+}
+
+// loadReplicaFromURL creates a replica & updates the restore options from a replica URL.
+func (c *RestoreCommand) loadReplicaFromURL(ctx context.Context, replicaURL string) (*litestream.Replica, error) {
+	if c.configPath != "" {
+		return nil, fmt.Errorf("cannot specify a replica URL and the -config flag")
+	} else if c.replicaName != "" {
+		return nil, fmt.Errorf("cannot specify a replica URL and the -replica flag")
+	} else if c.outputPath == "" {
 		return nil, fmt.Errorf("output path required")
 	}
 
-	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
-		return nil, errSkipDBExists
-	}
-
 	syncInterval := litestream.DefaultSyncInterval
-	r, err := NewReplicaFromConfig(&ReplicaConfig{
+	return NewReplicaFromConfig(&ReplicaConfig{
 		URL:          replicaURL,
 		SyncInterval: &syncInterval,
 	}, nil)
-	if err != nil {
-		return nil, err
-	}
-	opt.Generation, _, err = r.CalcRestoreTarget(ctx, *opt)
-	return r, err
 }
 
-// loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+// loadReplicaFromConfig returns replicas based on the specific config path.
+func (c *RestoreCommand) loadReplicaFromConfig(ctx context.Context, dbPath string) (*litestream.Replica, error) {
+	if c.configPath == "" {
+		c.configPath = DefaultConfigPath()
+	}
+
 	// Load configuration.
-	config, err := ReadConfigFile(configPath, expandEnv)
+	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -132,25 +164,34 @@ func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath 
 	db, err := NewDBFromConfig(dbConfig)
 	if err != nil {
 		return nil, err
+	} else if len(db.Replicas) == 0 {
+		return nil, fmt.Errorf("database has no replicas: %s", dbPath)
 	}
 
-	// Restore into original database path if not specified.
-	if opt.OutputPath == "" {
-		opt.OutputPath = dbPath
+	// Filter by replica name if specified.
+	if c.replicaName != "" {
+		r := db.Replica(c.replicaName)
+		if r == nil {
+			return nil, fmt.Errorf("replica %q not found", c.replicaName)
+		}
+		return r, nil
 	}
 
-	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
-		return nil, errSkipDBExists
+	// Choose only replica if only one available and no name is specified.
+	if len(db.Replicas) == 1 {
+		return db.Replicas[0], nil
 	}
 
-	// Determine the appropriate replica & generation to restore from,
-	r, generation, err := db.CalcRestoreTarget(ctx, *opt)
+	// A replica must be specified when restoring a specific generation with multiple replicas.
+	if c.generation != "" {
+		return nil, fmt.Errorf("must specify -replica when restoring from a specific generation")
+	}
+
+	// Determine latest replica to restore from.
+	r, err := litestream.LatestReplica(ctx, db.Replicas)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("cannot determine latest replica: %w", err)
 	}
-	opt.Generation = generation
-
 	return r, nil
 }
 
@@ -186,10 +227,6 @@ Arguments:
 	    Restore up to a specific hex-encoded WAL index (inclusive).
 	    Defaults to use the highest available index.
 
-	-timestamp TIMESTAMP
-	    Restore to a specific point-in-time.
-	    Defaults to use the latest available backup.
-
 	-o PATH
 	    Output path of the restored database.
 	    Defaults to original DB path.
@@ -212,9 +249,6 @@ Examples:
 
 	# Restore latest replica for database to original location.
 	$ litestream restore /path/to/db
-
-	# Restore replica for database to a given point in time.
-	$ litestream restore -timestamp 2020-01-01T00:00:00Z /path/to/db
 
 	# Restore latest replica for database to new /tmp directory
 	$ litestream restore -o /tmp/db /path/to/db

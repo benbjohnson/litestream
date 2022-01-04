@@ -12,7 +12,6 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -62,8 +61,9 @@ type DB struct {
 	chksum0, chksum1 uint32
 	byteOrder        binary.ByteOrder
 
-	fileInfo os.FileInfo // db info cached during init
-	dirInfo  os.FileInfo // parent dir info cached during init
+	fileMode os.FileMode // db mode cached during init
+	dirMode  os.FileMode // parent dir mode cached during init
+	uid, gid int         // db user & group id cached during init
 
 	ctx    context.Context
 	cancel func()
@@ -178,16 +178,6 @@ func (db *DB) GenerationPath(generation string) string {
 // Panics if generation is blank.
 func (db *DB) ShadowWALDir(generation string) string {
 	return filepath.Join(db.GenerationPath(generation), "wal")
-}
-
-// FileInfo returns the cached file stats for the database file when it was initialized.
-func (db *DB) FileInfo() os.FileInfo {
-	return db.fileInfo
-}
-
-// DirInfo returns the cached file stats for the parent directory of the database file when it was initialized.
-func (db *DB) DirInfo() os.FileInfo {
-	return db.dirInfo
 }
 
 // Replica returns a replica by name.
@@ -505,13 +495,14 @@ func (db *DB) init() (err error) {
 	} else if err != nil {
 		return err
 	}
-	db.fileInfo = fi
+	db.fileMode = fi.Mode()
+	db.uid, db.gid = internal.Fileinfo(fi)
 
 	// Obtain permissions for parent directory.
 	if fi, err = os.Stat(filepath.Dir(db.path)); err != nil {
 		return err
 	}
-	db.dirInfo = fi
+	db.dirMode = fi.Mode()
 
 	dsn := db.path
 	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
@@ -577,7 +568,7 @@ func (db *DB) init() (err error) {
 	}
 
 	// Ensure meta directory structure exists.
-	if err := internal.MkdirAll(db.MetaPath(), db.dirInfo); err != nil {
+	if err := internal.MkdirAll(db.MetaPath(), db.dirMode, db.uid, db.gid); err != nil {
 		return err
 	}
 
@@ -785,7 +776,7 @@ func (db *DB) createGeneration(ctx context.Context) (string, error) {
 
 	// Generate new directory.
 	dir := filepath.Join(db.MetaPath(), "generations", generation)
-	if err := internal.MkdirAll(dir, db.dirInfo); err != nil {
+	if err := internal.MkdirAll(dir, db.dirMode, db.uid, db.gid); err != nil {
 		return "", err
 	}
 
@@ -796,15 +787,10 @@ func (db *DB) createGeneration(ctx context.Context) (string, error) {
 
 	// Atomically write generation name as current generation.
 	generationNamePath := db.GenerationNamePath()
-	mode := os.FileMode(0600)
-	if db.fileInfo != nil {
-		mode = db.fileInfo.Mode()
-	}
-	if err := os.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), mode); err != nil {
+	if err := os.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), db.fileMode); err != nil {
 		return "", fmt.Errorf("write generation temp file: %w", err)
 	}
-	uid, gid := internal.Fileinfo(db.fileInfo)
-	_ = os.Chown(generationNamePath+".tmp", uid, gid)
+	_ = os.Chown(generationNamePath+".tmp", db.uid, db.gid)
 	if err := os.Rename(generationNamePath+".tmp", generationNamePath); err != nil {
 		return "", fmt.Errorf("rename generation file: %w", err)
 	}
@@ -1086,7 +1072,7 @@ func (db *DB) copyToShadowWAL(ctx context.Context) error {
 	tempFilename := filepath.Join(db.ShadowWALDir(pos.Generation), FormatIndex(pos.Index), FormatOffset(pos.Offset)+".wal.tmp")
 	defer os.Remove(tempFilename)
 
-	f, err := internal.CreateFile(tempFilename, db.fileInfo)
+	f, err := internal.CreateFile(tempFilename, db.fileMode, db.uid, db.gid)
 	if err != nil {
 		return err
 	}
@@ -1214,12 +1200,12 @@ func (db *DB) writeWALSegment(ctx context.Context, pos Pos, rd io.Reader) error 
 	filename := filepath.Join(db.ShadowWALDir(pos.Generation), FormatIndex(pos.Index), FormatOffset(pos.Offset)+".wal.lz4")
 
 	// Ensure parent directory exists.
-	if err := internal.MkdirAll(filepath.Dir(filename), db.dirInfo); err != nil {
+	if err := internal.MkdirAll(filepath.Dir(filename), db.dirMode, db.uid, db.gid); err != nil {
 		return err
 	}
 
 	// Write WAL segment to temporary file next to destination path.
-	f, err := internal.CreateFile(filename+".tmp", db.fileInfo)
+	f, err := internal.CreateFile(filename+".tmp", db.fileMode, db.uid, db.gid)
 	if err != nil {
 		return err
 	}
@@ -1542,39 +1528,10 @@ func (db *DB) monitor() {
 	}
 }
 
-// CalcRestoreTarget returns a replica & generation to restore from based on opt criteria.
-func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Replica, string, error) {
-	var target struct {
-		replica    *Replica
-		generation string
-		updatedAt  time.Time
-	}
-
-	for _, r := range db.Replicas {
-		// Skip replica if it does not match filter.
-		if opt.ReplicaName != "" && r.Name() != opt.ReplicaName {
-			continue
-		}
-
-		generation, updatedAt, err := r.CalcRestoreTarget(ctx, opt)
-		if err != nil {
-			return nil, "", err
-		}
-
-		// Use the latest replica if we have multiple candidates.
-		if !updatedAt.After(target.updatedAt) {
-			continue
-		}
-
-		target.replica, target.generation, target.updatedAt = r, generation, updatedAt
-	}
-	return target.replica, target.generation, nil
-}
-
-// applyWAL performs a truncating checkpoint on the given database.
-func applyWAL(ctx context.Context, index int, dbPath string) error {
+// ApplyWAL performs a truncating checkpoint on the given database.
+func ApplyWAL(ctx context.Context, dbPath, walPath string) error {
 	// Copy WAL file from it's staging path to the correct "-wal" location.
-	if err := os.Rename(fmt.Sprintf("%s-%08x-wal", dbPath, index), dbPath+"-wal"); err != nil {
+	if err := os.Rename(walPath, dbPath+"-wal"); err != nil {
 		return err
 	}
 
@@ -1583,7 +1540,7 @@ func applyWAL(ctx context.Context, index int, dbPath string) error {
 	if err != nil {
 		return err
 	}
-	defer d.Close()
+	defer func() { _ = d.Close() }()
 
 	var row [3]int
 	if err := d.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE);`).Scan(&row[0], &row[1], &row[2]); err != nil {
@@ -1659,47 +1616,6 @@ func formatWALPath(index int) string {
 }
 
 var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.wal$`)
-
-// DefaultRestoreParallelism is the default parallelism when downloading WAL files.
-const DefaultRestoreParallelism = 8
-
-// RestoreOptions represents options for DB.Restore().
-type RestoreOptions struct {
-	// Target path to restore into.
-	// If blank, the original DB path is used.
-	OutputPath string
-
-	// Specific replica to restore from.
-	// If blank, all replicas are considered.
-	ReplicaName string
-
-	// Specific generation to restore from.
-	// If blank, all generations considered.
-	Generation string
-
-	// Specific index to restore from.
-	// Set to math.MaxInt32 to ignore index.
-	Index int
-
-	// Point-in-time to restore database.
-	// If zero, database restore to most recent state available.
-	Timestamp time.Time
-
-	// Specifies how many WAL files are downloaded in parallel during restore.
-	Parallelism int
-
-	// Logging settings.
-	Logger  *log.Logger
-	Verbose bool
-}
-
-// NewRestoreOptions returns a new instance of RestoreOptions with defaults.
-func NewRestoreOptions() RestoreOptions {
-	return RestoreOptions{
-		Index:       math.MaxInt32,
-		Parallelism: DefaultRestoreParallelism,
-	}
-}
 
 // ReadWALFields iterates over the header & frames in the WAL data in r.
 // Returns salt, checksum, byte order & the last frame. WAL data must start
