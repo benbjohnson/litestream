@@ -4,15 +4,28 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"os"
+	"io"
 	"strings"
 	"text/tabwriter"
 )
 
 // DatabasesCommand is a command for listing managed databases.
 type DatabasesCommand struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+
 	configPath  string
 	noExpandEnv bool
+}
+
+// NewDatabasesCommand returns a new instance of DatabasesCommand.
+func NewDatabasesCommand(stdin io.Reader, stdout, stderr io.Writer) *DatabasesCommand {
+	return &DatabasesCommand{
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+	}
 }
 
 // Run executes the command.
@@ -27,16 +40,16 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	if c.configPath == "" {
-		c.configPath = DefaultConfigPath()
-	}
 	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
 	if err != nil {
 		return err
+	} else if len(config.DBs) == 0 {
+		fmt.Fprintln(c.stdout, "No databases found in config file.")
+		return nil
 	}
 
 	// List all databases.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	w := tabwriter.NewWriter(c.stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
 	fmt.Fprintln(w, "path\treplicas")
@@ -62,7 +75,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 
 // Usage prints the help screen to STDOUT.
 func (c *DatabasesCommand) Usage() {
-	fmt.Printf(`
+	fmt.Fprintf(c.stdout, `
 The databases command lists all databases in the configuration file.
 
 Usage:

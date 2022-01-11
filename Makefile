@@ -1,9 +1,10 @@
 .PHONY: default
-default: testdata
+default:
 
 .PHONY: testdata
 testdata:
 	make -C testdata
+	make -C cmd/litestream testdata
 
 docker:
 	docker build -t litestream .

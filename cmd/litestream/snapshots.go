@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
-	"os"
 	"sort"
 	"text/tabwriter"
 	"time"
@@ -15,99 +15,89 @@ import (
 
 // SnapshotsCommand represents a command to list snapshots for a command.
 type SnapshotsCommand struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+
 	configPath  string
 	noExpandEnv bool
+
+	replicaName string
+}
+
+// NewSnapshotsCommand returns a new instance of SnapshotsCommand.
+func NewSnapshotsCommand(stdin io.Reader, stdout, stderr io.Writer) *SnapshotsCommand {
+	return &SnapshotsCommand{
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+	}
 }
 
 // Run executes the command.
-func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
+func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (ret error) {
 	fs := flag.NewFlagSet("litestream-snapshots", flag.ContinueOnError)
 	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
-	replicaName := fs.String("replica", "", "replica name")
+	fs.StringVar(&c.replicaName, "replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("database path required")
+		return fmt.Errorf("database path or replica URL required")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
 
-	var db *litestream.DB
-	var r *litestream.Replica
-	if isURL(fs.Arg(0)) {
-		if c.configPath != "" {
-			return fmt.Errorf("cannot specify a replica URL and the -config flag")
-		}
-		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
-			return err
-		}
-	} else {
-		if c.configPath == "" {
-			c.configPath = DefaultConfigPath()
-		}
+	// Load configuration.
+	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
+	if err != nil {
+		return err
+	}
 
-		// Load configuration.
-		config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
+	// Determine list of replicas to pull snapshots from.
+	replicas, _, err := loadReplicas(ctx, config, fs.Arg(0), c.replicaName)
+	if err != nil {
+		return err
+	}
+
+	// Build list of snapshot metadata with associated replica.
+	var infos []replicaSnapshotInfo
+	for _, r := range replicas {
+		a, err := r.Snapshots(ctx)
 		if err != nil {
-			return err
+			log.Printf("cannot determine snapshots: %s", err)
+			ret = errExit // signal error return without printing message
+			continue
 		}
-
-		// Lookup database from configuration file by path.
-		if path, err := expand(fs.Arg(0)); err != nil {
-			return err
-		} else if dbc := config.DBConfig(path); dbc == nil {
-			return fmt.Errorf("database not found in config: %s", path)
-		} else if db, err = NewDBFromConfig(dbc); err != nil {
-			return err
-		}
-
-		// Filter by replica, if specified.
-		if *replicaName != "" {
-			if r = db.Replica(*replicaName); r == nil {
-				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
-			}
+		for i := range a {
+			infos = append(infos, replicaSnapshotInfo{SnapshotInfo: a[i], replicaName: r.Name()})
 		}
 	}
 
-	// Find snapshots by db or replica.
-	var replicas []*litestream.Replica
-	if r != nil {
-		replicas = []*litestream.Replica{r}
-	} else {
-		replicas = db.Replicas
-	}
+	// Sort snapshots by creation time from newest to oldest.
+	sort.Slice(infos, func(i, j int) bool { return infos[i].CreatedAt.After(infos[j].CreatedAt) })
 
 	// List all snapshots.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	w := tabwriter.NewWriter(c.stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
 	fmt.Fprintln(w, "replica\tgeneration\tindex\tsize\tcreated")
-	for _, r := range replicas {
-		infos, err := r.Snapshots(ctx)
-		if err != nil {
-			log.Printf("cannot determine snapshots: %s", err)
-			continue
-		}
-		// Sort snapshots by creation time from newest to oldest.
-		sort.Slice(infos, func(i, j int) bool { return infos[i].CreatedAt.After(infos[j].CreatedAt) })
-		for _, info := range infos {
-			fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%s\n",
-				r.Name(),
-				info.Generation,
-				info.Index,
-				info.Size,
-				info.CreatedAt.Format(time.RFC3339),
-			)
-		}
+	for _, info := range infos {
+		fmt.Fprintf(w, "%s\t%s\t%08x\t%d\t%s\n",
+			info.replicaName,
+			info.Generation,
+			info.Index,
+			info.Size,
+			info.CreatedAt.Format(time.RFC3339),
+		)
 	}
 
-	return nil
+	return ret
 }
 
 // Usage prints the help screen to STDOUT.
 func (c *SnapshotsCommand) Usage() {
-	fmt.Printf(`
+	fmt.Fprintf(c.stdout, `
 The snapshots command lists all snapshots available for a database or replica.
 
 Usage:
@@ -142,4 +132,10 @@ Examples:
 `[1:],
 		DefaultConfigPath(),
 	)
+}
+
+// replicaSnapshotInfo represents snapshot metadata with associated replica name.
+type replicaSnapshotInfo struct {
+	litestream.SnapshotInfo
+	replicaName string
 }

@@ -1,3 +1,4 @@
+//go:build windows
 // +build windows
 
 package main
@@ -41,7 +42,7 @@ func runWindowsService(ctx context.Context) error {
 	log.Print("Litestream service starting")
 
 	if err := svc.Run(serviceName, &windowsService{ctx: ctx}); err != nil {
-		return errStop
+		return errExit
 	}
 
 	log.Print("Litestream service stopped")

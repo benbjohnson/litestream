@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -22,6 +23,10 @@ import (
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+
 	configPath  string
 	noExpandEnv bool
 
@@ -34,8 +39,13 @@ type ReplicateCommand struct {
 	DBs []*litestream.DB
 }
 
-func NewReplicateCommand() *ReplicateCommand {
+// NewReplicateCommand returns a new instance of ReplicateCommand.
+func NewReplicateCommand(stdin io.Reader, stdout, stderr io.Writer) *ReplicateCommand {
 	return &ReplicateCommand{
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+
 		execCh: make(chan error),
 	}
 }
@@ -181,7 +191,7 @@ func (c *ReplicateCommand) Close() (err error) {
 
 // Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
-	fmt.Printf(`
+	fmt.Fprintf(c.stdout, `
 The replicate command starts a server to monitor & replicate databases. 
 You can specify your database & replicas in a configuration file or you can
 replicate a single database file by specifying its path and its replicas in the

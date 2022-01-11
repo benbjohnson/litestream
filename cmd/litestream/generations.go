@@ -4,93 +4,80 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"text/tabwriter"
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // GenerationsCommand represents a command to list all generations for a database.
 type GenerationsCommand struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+
 	configPath  string
 	noExpandEnv bool
+
+	replicaName string
+}
+
+// NewGenerationsCommand returns a new instance of GenerationsCommand.
+func NewGenerationsCommand(stdin io.Reader, stdout, stderr io.Writer) *GenerationsCommand {
+	return &GenerationsCommand{
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+	}
 }
 
 // Run executes the command.
-func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error) {
+func (c *GenerationsCommand) Run(ctx context.Context, args []string) (ret error) {
 	fs := flag.NewFlagSet("litestream-generations", flag.ContinueOnError)
 	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
-	replicaName := fs.String("replica", "", "replica name")
+	fs.StringVar(&c.replicaName, "replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
-	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
+	} else if fs.Arg(0) == "" {
 		return fmt.Errorf("database path or replica URL required")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
 
-	var db *litestream.DB
-	var r *litestream.Replica
-	dbUpdatedAt := time.Now()
-	if isURL(fs.Arg(0)) {
-		if c.configPath != "" {
-			return fmt.Errorf("cannot specify a replica URL and the -config flag")
-		}
-		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
-			return err
-		}
-	} else {
-		if c.configPath == "" {
-			c.configPath = DefaultConfigPath()
-		}
-
-		// Load configuration.
-		config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
-		if err != nil {
-			return err
-		}
-
-		// Lookup database from configuration file by path.
-		if path, err := expand(fs.Arg(0)); err != nil {
-			return err
-		} else if dbc := config.DBConfig(path); dbc == nil {
-			return fmt.Errorf("database not found in config: %s", path)
-		} else if db, err = NewDBFromConfig(dbc); err != nil {
-			return err
-		}
-
-		// Filter by replica, if specified.
-		if *replicaName != "" {
-			if r = db.Replica(*replicaName); r == nil {
-				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
-			}
-		}
-
-		// Determine last time database or WAL was updated.
-		if dbUpdatedAt, err = db.UpdatedAt(); err != nil {
-			return err
-		}
+	// Load configuration.
+	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
+	if err != nil {
+		return err
 	}
 
-	var replicas []*litestream.Replica
-	if r != nil {
-		replicas = []*litestream.Replica{r}
-	} else {
-		replicas = db.Replicas
+	replicas, db, err := loadReplicas(ctx, config, fs.Arg(0), c.replicaName)
+	if err != nil {
+		return err
+	}
+
+	// Determine last time database or WAL was updated.
+	var dbUpdatedAt time.Time
+	if db != nil {
+		if dbUpdatedAt, err = db.UpdatedAt(); err != nil && !os.IsNotExist(err) {
+			return err
+		}
 	}
 
 	// List each generation.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	w := tabwriter.NewWriter(c.stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
 	fmt.Fprintln(w, "name\tgeneration\tlag\tstart\tend")
+
 	for _, r := range replicas {
 		generations, err := r.Client.Generations(ctx)
 		if err != nil {
-			log.Printf("%s: cannot list generations: %s", r.Name(), err)
+			fmt.Fprintf(c.stderr, "%s: cannot list generations: %s", r.Name(), err)
+			ret = errExit // signal error return without printing message
 			continue
 		}
 
@@ -98,26 +85,35 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 		for _, generation := range generations {
 			createdAt, updatedAt, err := litestream.GenerationTimeBounds(ctx, r.Client, generation)
 			if err != nil {
-				log.Printf("%s: cannot determine generation time bounds: %s", r.Name(), err)
+				fmt.Fprintf(c.stderr, "%s: cannot determine generation time bounds: %s", r.Name(), err)
+				ret = errExit // signal error return without printing message
 				continue
+			}
+
+			// Calculate lag from database mod time to the replica mod time.
+			// This is ignored if the database mod time is unavailable such as
+			// when specifying the replica URL or if the database file is missing.
+			lag := "-"
+			if !dbUpdatedAt.IsZero() {
+				lag = internal.TruncateDuration(dbUpdatedAt.Sub(updatedAt)).String()
 			}
 
 			fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
 				r.Name(),
 				generation,
-				truncateDuration(dbUpdatedAt.Sub(updatedAt)).String(),
+				lag,
 				createdAt.Format(time.RFC3339),
 				updatedAt.Format(time.RFC3339),
 			)
 		}
 	}
 
-	return nil
+	return ret
 }
 
 // Usage prints the help message to STDOUT.
 func (c *GenerationsCommand) Usage() {
-	fmt.Printf(`
+	fmt.Fprintf(c.stdout, `
 The generations command lists all generations for a database or replica. It also
 lists stats about their lag behind the primary database and the time range they
 cover.
@@ -143,30 +139,4 @@ Arguments:
 `[1:],
 		DefaultConfigPath(),
 	)
-}
-
-func truncateDuration(d time.Duration) time.Duration {
-	if d < 0 {
-		if d < -10*time.Second {
-			return d.Truncate(time.Second)
-		} else if d < -time.Second {
-			return d.Truncate(time.Second / 10)
-		} else if d < -time.Millisecond {
-			return d.Truncate(time.Millisecond)
-		} else if d < -time.Microsecond {
-			return d.Truncate(time.Microsecond)
-		}
-		return d
-	}
-
-	if d > 10*time.Second {
-		return d.Truncate(time.Second)
-	} else if d > time.Second {
-		return d.Truncate(time.Second / 10)
-	} else if d > time.Millisecond {
-		return d.Truncate(time.Millisecond)
-	} else if d > time.Microsecond {
-		return d.Truncate(time.Microsecond)
-	}
-	return d
 }

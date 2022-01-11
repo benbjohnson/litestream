@@ -13,7 +13,6 @@ import (
 	"testing"
 	"time"
 
-	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -82,7 +81,8 @@ dbs:
 
 	// Replicate database unless the context is canceled.
 	g.Go(func() error {
-		return main.NewMain().Run(mainctx, []string{"replicate", "-config", configPath})
+		m, _, _, _ := newMain()
+		return m.Run(mainctx, []string{"replicate", "-config", configPath})
 	})
 
 	if err := g.Wait(); err != nil {
@@ -94,7 +94,8 @@ dbs:
 	chksum0 := mustChecksum(t, dbPath)
 
 	// Restore to another path.
-	if err := main.NewMain().Run(context.Background(), []string{"restore", "-config", configPath, "-o", restorePath, dbPath}); err != nil && !errors.Is(err, context.Canceled) {
+	m, _, _, _ := newMain()
+	if err := m.Run(context.Background(), []string{"restore", "-config", configPath, "-o", restorePath, dbPath}); err != nil && !errors.Is(err, context.Canceled) {
 		t.Fatal(err)
 	}
 
