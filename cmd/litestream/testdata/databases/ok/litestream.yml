@@ -1,0 +1,7 @@
+dbs:
+  - path: /var/lib/db
+    replicas:
+      - path: /var/lib/replica
+      - url:  s3://mybkt/db
+
+  - path: /my/other/db

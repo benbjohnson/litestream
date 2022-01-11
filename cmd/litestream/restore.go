@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -15,6 +16,10 @@ import (
 
 // RestoreCommand represents a command to restore a database from a backup.
 type RestoreCommand struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+
 	snapshotIndex int // index of snapshot to start from
 
 	// CLI options
@@ -29,8 +34,13 @@ type RestoreCommand struct {
 	opt             litestream.RestoreOptions
 }
 
-func NewRestoreCommand() *RestoreCommand {
+// NewRestoreCommand returns a new instance of RestoreCommand.
+func NewRestoreCommand(stdin io.Reader, stdout, stderr io.Writer) *RestoreCommand {
 	return &RestoreCommand{
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+
 		targetIndex: -1,
 		opt:         litestream.NewRestoreOptions(),
 	}
@@ -55,31 +65,39 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
-	arg := fs.Arg(0)
+	pathOrURL := fs.Arg(0)
 
 	// Ensure a generation is specified if target index is specified.
 	if c.targetIndex != -1 && c.generation == "" {
-		return fmt.Errorf("must specify -generation when using -index flag")
+		return fmt.Errorf("must specify -generation flag when using -index flag")
 	}
 
 	// Default to original database path if output path not specified.
-	if !isURL(arg) && c.outputPath == "" {
-		c.outputPath = arg
+	if !isURL(pathOrURL) && c.outputPath == "" {
+		c.outputPath = pathOrURL
 	}
 
 	// Exit successfully if the output file already exists and flag is set.
-	if _, err := os.Stat(c.outputPath); !os.IsNotExist(err) && c.ifDBNotExists {
-		fmt.Println("database already exists, skipping")
-		return nil
+	if _, err := os.Stat(c.outputPath); os.IsNotExist(err) {
+		// file doesn't exist, continue
+	} else if err != nil {
+		return err
+	} else if err == nil {
+		if c.ifDBNotExists {
+			fmt.Fprintln(c.stdout, "database already exists, skipping")
+			return nil
+		}
+		return fmt.Errorf("output file already exists: %s", c.outputPath)
 	}
 
-	// Create parent directory if it doesn't already exist.
-	if err := os.MkdirAll(filepath.Dir(c.outputPath), 0700); err != nil {
-		return fmt.Errorf("cannot create parent directory: %w", err)
+	// Load configuration.
+	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
+	if err != nil {
+		return err
 	}
 
 	// Build replica from either a URL or config.
-	r, err := c.loadReplica(ctx, arg)
+	r, err := c.loadReplica(ctx, config, pathOrURL)
 	if err != nil {
 		return err
 	}
@@ -90,7 +108,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 			// Return an error if no matching targets found.
 			// If optional flag set, return success. Useful for automated recovery.
 			if c.ifReplicaExists {
-				fmt.Println("no matching backups found")
+				fmt.Fprintln(c.stdout, "no matching backups found, skipping")
 				return nil
 			}
 			return fmt.Errorf("no matching backups found")
@@ -112,47 +130,42 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("cannot find snapshot index: %w", err)
 	}
 
-	c.opt.Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
+	// Create parent directory if it doesn't already exist.
+	if err := os.MkdirAll(filepath.Dir(c.outputPath), 0700); err != nil {
+		return fmt.Errorf("cannot create parent directory: %w", err)
+	}
+
+	c.opt.Logger = log.New(c.stdout, "", log.LstdFlags|log.Lmicroseconds)
 
 	return litestream.Restore(ctx, r.Client, c.outputPath, c.generation, c.snapshotIndex, c.targetIndex, c.opt)
 }
 
-func (c *RestoreCommand) loadReplica(ctx context.Context, arg string) (*litestream.Replica, error) {
+func (c *RestoreCommand) loadReplica(ctx context.Context, config Config, arg string) (*litestream.Replica, error) {
 	if isURL(arg) {
-		return c.loadReplicaFromURL(ctx, arg)
+		return c.loadReplicaFromURL(ctx, config, arg)
 	}
-	return c.loadReplicaFromConfig(ctx, arg)
+	return c.loadReplicaFromConfig(ctx, config, arg)
 }
 
 // loadReplicaFromURL creates a replica & updates the restore options from a replica URL.
-func (c *RestoreCommand) loadReplicaFromURL(ctx context.Context, replicaURL string) (*litestream.Replica, error) {
-	if c.configPath != "" {
-		return nil, fmt.Errorf("cannot specify a replica URL and the -config flag")
-	} else if c.replicaName != "" {
-		return nil, fmt.Errorf("cannot specify a replica URL and the -replica flag")
+func (c *RestoreCommand) loadReplicaFromURL(ctx context.Context, config Config, replicaURL string) (*litestream.Replica, error) {
+	if c.replicaName != "" {
+		return nil, fmt.Errorf("cannot specify both the replica URL and the -replica flag")
 	} else if c.outputPath == "" {
-		return nil, fmt.Errorf("output path required")
+		return nil, fmt.Errorf("output path required when using a replica URL")
 	}
 
 	syncInterval := litestream.DefaultSyncInterval
 	return NewReplicaFromConfig(&ReplicaConfig{
-		URL:          replicaURL,
-		SyncInterval: &syncInterval,
+		URL:             replicaURL,
+		AccessKeyID:     config.AccessKeyID,
+		SecretAccessKey: config.SecretAccessKey,
+		SyncInterval:    &syncInterval,
 	}, nil)
 }
 
 // loadReplicaFromConfig returns replicas based on the specific config path.
-func (c *RestoreCommand) loadReplicaFromConfig(ctx context.Context, dbPath string) (*litestream.Replica, error) {
-	if c.configPath == "" {
-		c.configPath = DefaultConfigPath()
-	}
-
-	// Load configuration.
-	config, err := ReadConfigFile(c.configPath, !c.noExpandEnv)
-	if err != nil {
-		return nil, err
-	}
-
+func (c *RestoreCommand) loadReplicaFromConfig(ctx context.Context, config Config, dbPath string) (_ *litestream.Replica, err error) {
 	// Lookup database from configuration file by path.
 	if dbPath, err = expand(dbPath); err != nil {
 		return nil, err
@@ -184,7 +197,7 @@ func (c *RestoreCommand) loadReplicaFromConfig(ctx context.Context, dbPath strin
 
 	// A replica must be specified when restoring a specific generation with multiple replicas.
 	if c.generation != "" {
-		return nil, fmt.Errorf("must specify -replica when restoring from a specific generation")
+		return nil, fmt.Errorf("must specify -replica flag when restoring from a specific generation")
 	}
 
 	// Determine latest replica to restore from.
@@ -197,7 +210,7 @@ func (c *RestoreCommand) loadReplicaFromConfig(ctx context.Context, dbPath strin
 
 // Usage prints the help screen to STDOUT.
 func (c *RestoreCommand) Usage() {
-	fmt.Printf(`
+	fmt.Fprintf(c.stdout, `
 The restore command recovers a database from a previous snapshot and WAL.
 
 Usage:

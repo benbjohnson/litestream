@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"syscall"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -190,3 +191,30 @@ var (
 		Help: "The number of bytes used by replica operations",
 	}, []string{"replica_type", "operation"})
 )
+
+// TruncateDuration truncates d to the nearest major unit (s, ms, µs, ns).
+func TruncateDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		if d < -10*time.Second {
+			return d.Truncate(time.Second)
+		} else if d < -time.Second {
+			return d.Truncate(time.Second / 10)
+		} else if d < -time.Millisecond {
+			return d.Truncate(time.Millisecond)
+		} else if d < -time.Microsecond {
+			return d.Truncate(time.Microsecond)
+		}
+		return d
+	}
+
+	if d > 10*time.Second {
+		return d.Truncate(time.Second)
+	} else if d > time.Second {
+		return d.Truncate(time.Second / 10)
+	} else if d > time.Millisecond {
+		return d.Truncate(time.Millisecond)
+	} else if d > time.Microsecond {
+		return d.Truncate(time.Microsecond)
+	}
+	return d
+}

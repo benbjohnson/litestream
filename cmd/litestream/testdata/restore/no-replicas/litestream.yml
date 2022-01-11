@@ -1,0 +1,2 @@
+dbs:
+  - path: $LITESTREAM_TESTDIR/db

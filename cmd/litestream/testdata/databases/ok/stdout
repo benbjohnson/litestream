@@ -1,0 +1,3 @@
+path          replicas
+/var/lib/db   file,s3
+/my/other/db  

@@ -1,0 +1,4 @@
+dbs:
+  - path: $LITESTREAM_TESTDIR/db
+    replicas:
+      - url: s3://bkt/db

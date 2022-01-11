@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/benbjohnson/litestream/internal"
 )
@@ -55,6 +56,44 @@ func TestParseWALSegmentPath(t *testing.T) {
 				t.Errorf("offset=%#v, want %#v", got, want)
 			} else if got, want := err, tt.err; !reflect.DeepEqual(got, want) {
 				t.Errorf("err=%#v, want %#v", got, want)
+			}
+		})
+	}
+}
+
+func TestTruncateDuration(t *testing.T) {
+	for _, tt := range []struct {
+		input, output time.Duration
+	}{
+		{0, 0 * time.Nanosecond},
+
+		{1, 1 * time.Nanosecond},
+		{12, 12 * time.Nanosecond},
+		{123, 123 * time.Nanosecond},
+		{1234, 1 * time.Microsecond},
+		{12345, 12 * time.Microsecond},
+		{123456, 123 * time.Microsecond},
+		{1234567, 1 * time.Millisecond},
+		{12345678, 12 * time.Millisecond},
+		{123456789, 123 * time.Millisecond},
+		{1234567890, 1200 * time.Millisecond},
+		{12345678900, 12 * time.Second},
+
+		{-1, -1 * time.Nanosecond},
+		{-12, -12 * time.Nanosecond},
+		{-123, -123 * time.Nanosecond},
+		{-1234, -1 * time.Microsecond},
+		{-12345, -12 * time.Microsecond},
+		{-123456, -123 * time.Microsecond},
+		{-1234567, -1 * time.Millisecond},
+		{-12345678, -12 * time.Millisecond},
+		{-123456789, -123 * time.Millisecond},
+		{-1234567890, -1200 * time.Millisecond},
+		{-12345678900, -12 * time.Second},
+	} {
+		t.Run(fmt.Sprint(int(tt.input)), func(t *testing.T) {
+			if got, want := internal.TruncateDuration(tt.input), tt.output; got != want {
+				t.Fatalf("duration=%s, want %s", got, want)
 			}
 		})
 	}

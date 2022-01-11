@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"net/url"
@@ -32,14 +33,14 @@ var (
 	Version = "(development build)"
 )
 
-// errStop is a terminal error for indicating program should quit.
-var errStop = errors.New("stop")
+// errExit is a terminal error for indicating program should quit.
+var errExit = errors.New("exit")
 
 func main() {
 	log.SetFlags(0)
 
-	m := NewMain()
-	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
+	m := NewMain(os.Stdin, os.Stdout, os.Stderr)
+	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errExit {
 		os.Exit(1)
 	} else if err != nil {
 		log.Println(err)
@@ -48,11 +49,19 @@ func main() {
 }
 
 // Main represents the main program execution.
-type Main struct{}
+type Main struct {
+	stdin  io.Reader
+	stdout io.Writer
+	stderr io.Writer
+}
 
 // NewMain returns a new instance of Main.
-func NewMain() *Main {
-	return &Main{}
+func NewMain(stdin io.Reader, stdout, stderr io.Writer) *Main {
+	return &Main{
+		stdin:  stdin,
+		stdout: stdout,
+		stderr: stderr,
+	}
 }
 
 // Run executes the program.
@@ -75,11 +84,11 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 	switch cmd {
 	case "databases":
-		return (&DatabasesCommand{}).Run(ctx, args)
+		return NewDatabasesCommand(m.stdin, m.stdout, m.stderr).Run(ctx, args)
 	case "generations":
-		return (&GenerationsCommand{}).Run(ctx, args)
+		return NewGenerationsCommand(m.stdin, m.stdout, m.stderr).Run(ctx, args)
 	case "replicate":
-		c := NewReplicateCommand()
+		c := NewReplicateCommand(m.stdin, m.stdout, m.stderr)
 		if err := c.ParseFlags(ctx, args); err != nil {
 			return err
 		}
@@ -96,21 +105,21 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Wait for signal to stop program.
 		select {
 		case <-ctx.Done():
-			fmt.Println("context done, litestream shutting down")
+			fmt.Fprintln(m.stdout, "context done, litestream shutting down")
 		case err = <-c.execCh:
 			cancel()
-			fmt.Println("subprocess exited, litestream shutting down")
+			fmt.Fprintln(m.stdout, "subprocess exited, litestream shutting down")
 		case sig := <-signalCh:
 			cancel()
-			fmt.Println("signal received, litestream shutting down")
+			fmt.Fprintln(m.stdout, "signal received, litestream shutting down")
 
 			if c.cmd != nil {
-				fmt.Println("sending signal to exec process")
+				fmt.Fprintln(m.stdout, "sending signal to exec process")
 				if err := c.cmd.Process.Signal(sig); err != nil {
 					return fmt.Errorf("cannot signal exec process: %w", err)
 				}
 
-				fmt.Println("waiting for exec process to close")
+				fmt.Fprintln(m.stdout, "waiting for exec process to close")
 				if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
 					return fmt.Errorf("cannot wait for exec process: %w", err)
 				}
@@ -121,17 +130,17 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		if e := c.Close(); e != nil && err == nil {
 			err = e
 		}
-		fmt.Println("litestream shut down")
+		fmt.Fprintln(m.stdout, "litestream shut down")
 		return err
 
 	case "restore":
-		return NewRestoreCommand().Run(ctx, args)
+		return NewRestoreCommand(m.stdin, m.stdout, m.stderr).Run(ctx, args)
 	case "snapshots":
-		return (&SnapshotsCommand{}).Run(ctx, args)
+		return NewSnapshotsCommand(m.stdin, m.stdout, m.stderr).Run(ctx, args)
 	case "version":
-		return (&VersionCommand{}).Run(ctx, args)
+		return NewVersionCommand(m.stdin, m.stdout, m.stderr).Run(ctx, args)
 	case "wal":
-		return (&WALCommand{}).Run(ctx, args)
+		return NewWALCommand(m.stdin, m.stdout, m.stderr).Run(ctx, args)
 	default:
 		if cmd == "" || cmd == "help" || strings.HasPrefix(cmd, "-") {
 			m.Usage()
@@ -143,7 +152,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 // Usage prints the help screen to STDOUT.
 func (m *Main) Usage() {
-	fmt.Println(`
+	fmt.Fprintln(m.stdout, `
 litestream is a tool for replicating SQLite databases.
 
 Usage:
@@ -210,8 +219,14 @@ func (c *Config) DBConfig(path string) *DBConfig {
 
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
 // If expandEnv is true then environment variables are expanded in the config.
+// If filename is blank then the default config path is used.
 func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	config := DefaultConfig()
+
+	useDefaultPath := filename == ""
+	if useDefaultPath {
+		filename = DefaultConfigPath()
+	}
 
 	// Expand filename, if necessary.
 	filename, err = expand(filename)
@@ -220,8 +235,12 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	}
 
 	// Read configuration.
+	// Do not return an error if using default path and file is missing.
 	buf, err := ioutil.ReadFile(filename)
 	if os.IsNotExist(err) {
+		if useDefaultPath {
+			return config, nil
+		}
 		return config, fmt.Errorf("config file not found: %s", filename)
 	} else if err != nil {
 		return config, err
@@ -354,7 +373,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	}
 
 	// Build and set client on replica.
-	switch c.ReplicaType() {
+	switch typ := c.ReplicaType(); typ {
 	case "file":
 		if r.Client, err = newFileReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
@@ -376,7 +395,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
+		return nil, fmt.Errorf("unknown replica type in config: %q", typ)
 	}
 
 	return r, nil
@@ -713,4 +732,46 @@ func (v *indexVar) Set(s string) error {
 	}
 	*v = indexVar(i)
 	return nil
+}
+
+// loadReplicas returns a list of replicas to use based on CLI flags. Filters
+// by replicaName, if not blank. The DB is returned if pathOrURL is not a replica URL.
+func loadReplicas(ctx context.Context, config Config, pathOrURL, replicaName string) ([]*litestream.Replica, *litestream.DB, error) {
+	// Build a replica based on URL, if specified.
+	if isURL(pathOrURL) {
+		r, err := NewReplicaFromConfig(&ReplicaConfig{
+			URL:             pathOrURL,
+			AccessKeyID:     config.AccessKeyID,
+			SecretAccessKey: config.SecretAccessKey,
+		}, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		return []*litestream.Replica{r}, nil, nil
+	}
+
+	// Otherwise use replicas from the database configuration file.
+	path, err := expand(pathOrURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	dbc := config.DBConfig(path)
+	if dbc == nil {
+		return nil, nil, fmt.Errorf("database not found in config: %s", path)
+	}
+	db, err := NewDBFromConfig(dbc)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Filter by replica, if specified.
+	if replicaName != "" {
+		r := db.Replica(replicaName)
+		if r == nil {
+			return nil, nil, fmt.Errorf("replica %q not found for database %q", replicaName, db.Path())
+		}
+		return []*litestream.Replica{r}, db, nil
+	}
+
+	return db.Replicas, db, nil
 }

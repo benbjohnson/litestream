@@ -1,6 +1,8 @@
 package main_test
 
 import (
+	"bytes"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -179,4 +181,18 @@ func TestNewGCSReplicaFromConfig(t *testing.T) {
 	} else if got, want := client.Path, "bar"; got != want {
 		t.Fatalf("Path=%s, want %s", got, want)
 	}
+}
+
+// newMain returns a new instance of Main and associated buffers.
+func newMain() (m *main.Main, stdin, stdout, stderr *bytes.Buffer) {
+	stdin, stdout, stderr = &bytes.Buffer{}, &bytes.Buffer{}, &bytes.Buffer{}
+
+	// Split stdout/stderr to terminal if verbose flag set.
+	out, err := io.Writer(stdout), io.Writer(stderr)
+	if testing.Verbose() {
+		out = io.MultiWriter(out, os.Stdout)
+		err = io.MultiWriter(err, os.Stderr)
+	}
+
+	return main.NewMain(stdin, out, err), stdin, stdout, stderr
 }
