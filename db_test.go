@@ -482,7 +482,7 @@ func TestReadWALFields(t *testing.T) {
 	}
 
 	t.Run("OK", func(t *testing.T) {
-		if salt0, salt1, chksum0, chksum1, byteOrder, frame, err := litestream.ReadWALFields(bytes.NewReader(b), 4096); err != nil {
+		if salt0, salt1, chksum0, chksum1, byteOrder, _, frame, err := litestream.ReadWALFields(bytes.NewReader(b), 4096); err != nil {
 			t.Fatal(err)
 		} else if got, want := salt0, uint32(0x4F7598FD); got != want {
 			t.Fatalf("salt0=%x, want %x", got, want)
@@ -500,7 +500,7 @@ func TestReadWALFields(t *testing.T) {
 	})
 
 	t.Run("HeaderOnly", func(t *testing.T) {
-		if salt0, salt1, chksum0, chksum1, byteOrder, frame, err := litestream.ReadWALFields(bytes.NewReader(b[:32]), 4096); err != nil {
+		if salt0, salt1, chksum0, chksum1, byteOrder, _, frame, err := litestream.ReadWALFields(bytes.NewReader(b[:32]), 4096); err != nil {
 			t.Fatal(err)
 		} else if got, want := salt0, uint32(0x4F7598FD); got != want {
 			t.Fatalf("salt0=%x, want %x", got, want)
@@ -518,19 +518,19 @@ func TestReadWALFields(t *testing.T) {
 	})
 
 	t.Run("ErrShortHeader", func(t *testing.T) {
-		if _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader([]byte{}), 4096); err == nil || err.Error() != `short wal header: EOF` {
+		if _, _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader([]byte{}), 4096); err == nil || err.Error() != `short wal header: EOF` {
 			t.Fatal(err)
 		}
 	})
 
 	t.Run("ErrBadMagic", func(t *testing.T) {
-		if _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader(make([]byte, 32)), 4096); err == nil || err.Error() != `invalid wal header magic: 0` {
+		if _, _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader(make([]byte, 32)), 4096); err == nil || err.Error() != `invalid wal header magic: 0` {
 			t.Fatal(err)
 		}
 	})
 
 	t.Run("ErrShortFrame", func(t *testing.T) {
-		if _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader(b[:100]), 4096); err == nil || err.Error() != `short wal frame (n=68): unexpected EOF` {
+		if _, _, _, _, _, _, _, err := litestream.ReadWALFields(bytes.NewReader(b[:100]), 4096); err == nil || err.Error() != `short wal frame (n=68): unexpected EOF` {
 			t.Fatal(err)
 		}
 	})

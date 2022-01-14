@@ -18,7 +18,7 @@ func TestWALCommand(t *testing.T) {
 		m, _, stdout, _ := newMain()
 		if err := m.Run(context.Background(), []string{"wal", "-config", filepath.Join(testDir, "litestream.yml"), filepath.Join(testDir, "db")}); err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})
@@ -30,7 +30,7 @@ func TestWALCommand(t *testing.T) {
 		m, _, stdout, _ := newMain()
 		if err := m.Run(context.Background(), []string{"wal", "-config", filepath.Join(testDir, "litestream.yml"), "-replica", "replica1", filepath.Join(testDir, "db")}); err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})
@@ -43,7 +43,7 @@ func TestWALCommand(t *testing.T) {
 		m, _, stdout, _ := newMain()
 		if err := m.Run(context.Background(), []string{"wal", replicaURL}); err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})

@@ -121,7 +121,7 @@ func NewDB(path string) *DB {
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
 
-		Logger: log.New(LogWriter, fmt.Sprintf("%s: ", path), LogFlags),
+		Logger: log.New(LogWriter, fmt.Sprintf("%s: ", logPrefixPath(path)), LogFlags),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -300,7 +300,7 @@ func (db *DB) invalidateChecksum(ctx context.Context) error {
 	r := &io.LimitedReader{R: rc, N: db.pos.Offset}
 
 	// Determine cache values from the current WAL file.
-	db.salt0, db.salt1, db.chksum0, db.chksum1, db.byteOrder, db.frame, err = ReadWALFields(r, db.pageSize)
+	db.salt0, db.salt1, db.chksum0, db.chksum1, db.byteOrder, db.hdr, db.frame, err = ReadWALFields(r, db.pageSize)
 	if err != nil {
 		return fmt.Errorf("calc checksum: %w", err)
 	}
@@ -1621,11 +1621,11 @@ var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.wal$`)
 // Returns salt, checksum, byte order & the last frame. WAL data must start
 // from the beginning of the WAL header and must end on either the WAL header
 // or at the end of a WAL frame.
-func ReadWALFields(r io.Reader, pageSize int) (salt0, salt1, chksum0, chksum1 uint32, byteOrder binary.ByteOrder, frame []byte, err error) {
+func ReadWALFields(r io.Reader, pageSize int) (salt0, salt1, chksum0, chksum1 uint32, byteOrder binary.ByteOrder, hdr, frame []byte, err error) {
 	// Read header.
-	hdr := make([]byte, WALHeaderSize)
+	hdr = make([]byte, WALHeaderSize)
 	if _, err := io.ReadFull(r, hdr); err != nil {
-		return 0, 0, 0, 0, nil, nil, fmt.Errorf("short wal header: %w", err)
+		return 0, 0, 0, 0, nil, nil, nil, fmt.Errorf("short wal header: %w", err)
 	}
 
 	// Save salt, initial checksum, & byte order.
@@ -1634,7 +1634,7 @@ func ReadWALFields(r io.Reader, pageSize int) (salt0, salt1, chksum0, chksum1 ui
 	chksum0 = binary.BigEndian.Uint32(hdr[24:])
 	chksum1 = binary.BigEndian.Uint32(hdr[28:])
 	if byteOrder, err = headerByteOrder(hdr); err != nil {
-		return 0, 0, 0, 0, nil, nil, err
+		return 0, 0, 0, 0, nil, nil, nil, err
 	}
 
 	// Iterate over each page in the WAL and save the checksum.
@@ -1645,7 +1645,7 @@ func ReadWALFields(r io.Reader, pageSize int) (salt0, salt1, chksum0, chksum1 ui
 		if n, err := io.ReadFull(r, frame); err == io.EOF {
 			break // end of WAL file
 		} else if err != nil {
-			return 0, 0, 0, 0, nil, nil, fmt.Errorf("short wal frame (n=%d): %w", n, err)
+			return 0, 0, 0, 0, nil, nil, nil, fmt.Errorf("short wal frame (n=%d): %w", n, err)
 		}
 
 		// Update checksum on each successful frame.
@@ -1659,7 +1659,7 @@ func ReadWALFields(r io.Reader, pageSize int) (salt0, salt1, chksum0, chksum1 ui
 		frame = nil
 	}
 
-	return salt0, salt1, chksum0, chksum1, byteOrder, frame, nil
+	return salt0, salt1, chksum0, chksum1, byteOrder, hdr, frame, nil
 }
 
 // Database metrics.
@@ -1730,4 +1730,13 @@ func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {
 	default:
 		return nil, fmt.Errorf("invalid wal header magic: %x", magic)
 	}
+}
+
+// logPrefixPath returns the path to be used for logging.
+// The path is reduced to its base if it appears to be a temporary test path.
+func logPrefixPath(path string) string {
+	if strings.Contains(path, "TestCmd") {
+		return filepath.Base(path)
+	}
+	return path
 }

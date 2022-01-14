@@ -16,7 +16,7 @@ func TestDatabasesCommand(t *testing.T) {
 		m, _, stdout, _ := newMain()
 		if err := m.Run(context.Background(), []string{"databases", "-config", filepath.Join(testDir, "litestream.yml")}); err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})
@@ -26,7 +26,7 @@ func TestDatabasesCommand(t *testing.T) {
 		m, _, stdout, _ := newMain()
 		if err := m.Run(context.Background(), []string{"databases", "-config", filepath.Join(testDir, "litestream.yml")}); err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})

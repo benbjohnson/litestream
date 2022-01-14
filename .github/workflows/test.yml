@@ -29,6 +29,9 @@ jobs:
         env:
           LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
 
+      - name: Build binary
+        run: go install ./cmd/litestream
+
       - name: Run unit tests
         run: make testdata && go test -v ./...
 
@@ -53,10 +56,13 @@ jobs:
           LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
           LITESTREAM_ABS_BUCKET:           integration
 
-      - name: Run sftp tests
-        run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
-        env:
-          LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
-          LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
-          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
-          LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+      #- name: Run sftp tests
+      #  run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
+      #  env:
+      #    LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
+      #    LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
+      #    LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
+      #    LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+
+      - name: Run long-running test
+        run: go test -v ./integration -long-running-duration 1m

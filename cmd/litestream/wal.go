@@ -69,7 +69,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (ret error) {
 		if c.generation != "" {
 			generations = []string{c.generation}
 		} else {
-			if generations, err = r.Client.Generations(ctx); err != nil {
+			if generations, err = r.Client().Generations(ctx); err != nil {
 				log.Printf("%s: cannot determine generations: %s", r.Name(), err)
 				ret = errExit // signal error return without printing message
 				continue
@@ -78,7 +78,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (ret error) {
 
 		for _, generation := range generations {
 			if err := func() error {
-				itr, err := r.Client.WALSegments(ctx, generation)
+				itr, err := r.Client().WALSegments(ctx, generation)
 				if err != nil {
 					return err
 				}

@@ -74,7 +74,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (ret error)
 	fmt.Fprintln(w, "name\tgeneration\tlag\tstart\tend")
 
 	for _, r := range replicas {
-		generations, err := r.Client.Generations(ctx)
+		generations, err := r.Client().Generations(ctx)
 		if err != nil {
 			fmt.Fprintf(c.stderr, "%s: cannot list generations: %s", r.Name(), err)
 			ret = errExit // signal error return without printing message
@@ -83,7 +83,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (ret error)
 
 		// Iterate over each generation for the replica.
 		for _, generation := range generations {
-			createdAt, updatedAt, err := litestream.GenerationTimeBounds(ctx, r.Client, generation)
+			createdAt, updatedAt, err := litestream.GenerationTimeBounds(ctx, r.Client(), generation)
 			if err != nil {
 				fmt.Fprintf(c.stderr, "%s: cannot determine generation time bounds: %s", r.Name(), err)
 				ret = errExit // signal error return without printing message

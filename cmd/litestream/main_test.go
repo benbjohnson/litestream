@@ -104,7 +104,7 @@ func TestNewFileReplicaFromConfig(t *testing.T) {
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{Path: "/foo"}, nil)
 	if err != nil {
 		t.Fatal(err)
-	} else if client, ok := r.Client.(*litestream.FileReplicaClient); !ok {
+	} else if client, ok := r.Client().(*litestream.FileReplicaClient); !ok {
 		t.Fatal("unexpected replica type")
 	} else if got, want := client.Path(), "/foo"; got != want {
 		t.Fatalf("Path=%s, want %s", got, want)
@@ -116,7 +116,7 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo/bar"}, nil)
 		if err != nil {
 			t.Fatal(err)
-		} else if client, ok := r.Client.(*s3.ReplicaClient); !ok {
+		} else if client, ok := r.Client().(*s3.ReplicaClient); !ok {
 			t.Fatal("unexpected replica type")
 		} else if got, want := client.Bucket, "foo"; got != want {
 			t.Fatalf("Bucket=%s, want %s", got, want)
@@ -135,7 +135,7 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo.localhost:9000/bar"}, nil)
 		if err != nil {
 			t.Fatal(err)
-		} else if client, ok := r.Client.(*s3.ReplicaClient); !ok {
+		} else if client, ok := r.Client().(*s3.ReplicaClient); !ok {
 			t.Fatal("unexpected replica type")
 		} else if got, want := client.Bucket, "foo"; got != want {
 			t.Fatalf("Bucket=%s, want %s", got, want)
@@ -154,7 +154,7 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo.s3.us-west-000.backblazeb2.com/bar"}, nil)
 		if err != nil {
 			t.Fatal(err)
-		} else if client, ok := r.Client.(*s3.ReplicaClient); !ok {
+		} else if client, ok := r.Client().(*s3.ReplicaClient); !ok {
 			t.Fatal("unexpected replica type")
 		} else if got, want := client.Bucket, "foo"; got != want {
 			t.Fatalf("Bucket=%s, want %s", got, want)
@@ -174,7 +174,7 @@ func TestNewGCSReplicaFromConfig(t *testing.T) {
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "gcs://foo/bar"}, nil)
 	if err != nil {
 		t.Fatal(err)
-	} else if client, ok := r.Client.(*gcs.ReplicaClient); !ok {
+	} else if client, ok := r.Client().(*gcs.ReplicaClient); !ok {
 		t.Fatal("unexpected replica type")
 	} else if got, want := client.Bucket, "foo"; got != want {
 		t.Fatalf("Bucket=%s, want %s", got, want)

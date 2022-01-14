@@ -120,7 +120,7 @@ func TestRestoreCommand(t *testing.T) {
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-if-db-not-exists", filepath.Join(testDir, "db")})
 		if err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})
@@ -133,7 +133,7 @@ func TestRestoreCommand(t *testing.T) {
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-if-replica-exists", filepath.Join(testDir, "db")})
 		if err != nil {
 			t.Fatal(err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
 		}
 	})
@@ -147,9 +147,9 @@ func TestRestoreCommand(t *testing.T) {
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-o", filepath.Join(tempDir, "db"), filepath.Join(testDir, "db")})
 		if err == nil || err.Error() != `no matching backups found` {
 			t.Fatalf("unexpected error: %s", err)
-		} else if got, want := stdout.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
 			t.Fatalf("stdout=%q, want %q", got, want)
-		} else if got, want := stderr.String(), string(testingutil.MustReadFile(t, filepath.Join(testDir, "stderr"))); got != want {
+		} else if got, want := stderr.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stderr"))); got != want {
 			t.Fatalf("stderr=%q, want %q", got, want)
 		}
 	})

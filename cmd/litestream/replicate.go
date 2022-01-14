@@ -121,7 +121,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	for _, db := range c.DBs {
 		log.Printf("initialized db: %s", db.Path())
 		for _, r := range db.Replicas {
-			switch client := r.Client.(type) {
+			switch client := r.Client().(type) {
 			case *litestream.FileReplicaClient:
 				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), client.Type(), client.Path())
 			case *s3.ReplicaClient:
@@ -172,6 +172,8 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 		go func() { c.execCh <- c.cmd.Wait() }()
 	}
+
+	log.Printf("litestream initialization complete")
 
 	return nil
 }
