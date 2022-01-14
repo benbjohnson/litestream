@@ -1,0 +1,7 @@
+dbs:
+  - path: $LITESTREAM_TEMPDIR/db
+    replicas:
+      - path: $LITESTREAM_TEMPDIR/replica
+
+    monitor-interval: 100ms
+    max-checkpoint-page-count: 10

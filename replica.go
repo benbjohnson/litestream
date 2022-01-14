@@ -43,7 +43,7 @@ type Replica struct {
 	cancel func()
 
 	// Client used to connect to the remote replica.
-	Client ReplicaClient
+	client ReplicaClient
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
@@ -68,10 +68,11 @@ type Replica struct {
 	Logger *log.Logger
 }
 
-func NewReplica(db *DB, name string) *Replica {
+func NewReplica(db *DB, name string, client ReplicaClient) *Replica {
 	r := &Replica{
 		db:     db,
 		name:   name,
+		client: client,
 		cancel: func() {},
 
 		SyncInterval:           DefaultSyncInterval,
@@ -82,7 +83,7 @@ func NewReplica(db *DB, name string) *Replica {
 
 	prefix := fmt.Sprintf("%s: ", r.Name())
 	if db != nil {
-		prefix = fmt.Sprintf("%s(%s): ", db.Path(), r.Name())
+		prefix = fmt.Sprintf("%s(%s): ", logPrefixPath(db.Path()), r.Name())
 	}
 	r.Logger = log.New(LogWriter, prefix, LogFlags)
 
@@ -91,14 +92,17 @@ func NewReplica(db *DB, name string) *Replica {
 
 // Name returns the name of the replica.
 func (r *Replica) Name() string {
-	if r.name == "" && r.Client != nil {
-		return r.Client.Type()
+	if r.name == "" && r.client != nil {
+		return r.client.Type()
 	}
 	return r.name
 }
 
 // DB returns a reference to the database the replica is attached to, if any.
 func (r *Replica) DB() *DB { return r.db }
+
+// Client returns the client the replica was initialized with.
+func (r *Replica) Client() ReplicaClient { return r.client }
 
 // Starts replicating in a background goroutine.
 func (r *Replica) Start(ctx context.Context) error {
@@ -265,7 +269,7 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 	// Copy through pipe into client from the starting position.
 	var g errgroup.Group
 	g.Go(func() error {
-		_, err := r.Client.WriteWALSegment(ctx, initialPos, pr)
+		_, err := r.client.WriteWALSegment(ctx, initialPos, pr)
 		return err
 	})
 
@@ -332,7 +336,7 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 
 // snapshotN returns the number of snapshots for a generation.
 func (r *Replica) snapshotN(generation string) (int, error) {
-	itr, err := r.Client.Snapshots(context.Background(), generation)
+	itr, err := r.client.Snapshots(context.Background(), generation)
 	if err != nil {
 		return 0, err
 	}
@@ -364,7 +368,7 @@ func (r *Replica) calcPos(ctx context.Context, generation string) (pos Pos, err 
 	}
 
 	// Read segment to determine size to add to offset.
-	rd, err := r.Client.WALSegmentReader(ctx, segment.Pos())
+	rd, err := r.client.WALSegmentReader(ctx, segment.Pos())
 	if err != nil {
 		return pos, fmt.Errorf("wal segment reader: %w", err)
 	}
@@ -385,7 +389,7 @@ func (r *Replica) calcPos(ctx context.Context, generation string) (pos Pos, err 
 
 // maxSnapshot returns the last snapshot in a generation.
 func (r *Replica) maxSnapshot(ctx context.Context, generation string) (*SnapshotInfo, error) {
-	itr, err := r.Client.Snapshots(ctx, generation)
+	itr, err := r.client.Snapshots(ctx, generation)
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +406,7 @@ func (r *Replica) maxSnapshot(ctx context.Context, generation string) (*Snapshot
 
 // maxWALSegment returns the highest WAL segment in a generation.
 func (r *Replica) maxWALSegment(ctx context.Context, generation string) (*WALSegmentInfo, error) {
-	itr, err := r.Client.WALSegments(ctx, generation)
+	itr, err := r.client.WALSegments(ctx, generation)
 	if err != nil {
 		return nil, err
 	}
@@ -427,7 +431,7 @@ func (r *Replica) Pos() Pos {
 
 // Snapshots returns a list of all snapshots across all generations.
 func (r *Replica) Snapshots(ctx context.Context) ([]SnapshotInfo, error) {
-	generations, err := r.Client.Generations(ctx)
+	generations, err := r.client.Generations(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("cannot fetch generations: %w", err)
 	}
@@ -435,7 +439,7 @@ func (r *Replica) Snapshots(ctx context.Context) ([]SnapshotInfo, error) {
 	var a []SnapshotInfo
 	for _, generation := range generations {
 		if err := func() error {
-			itr, err := r.Client.Snapshots(ctx, generation)
+			itr, err := r.client.Snapshots(ctx, generation)
 			if err != nil {
 				return err
 			}
@@ -518,7 +522,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	})
 
 	// Delegate write to client & wait for writer goroutine to finish.
-	if info, err = r.Client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr); err != nil {
+	if info, err = r.client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr); err != nil {
 		return info, err
 	} else if err := g.Wait(); err != nil {
 		return info, err
@@ -549,7 +553,7 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 	}
 
 	// Loop over generations and delete unretained snapshots & WAL files.
-	generations, err := r.Client.Generations(ctx)
+	generations, err := r.client.Generations(ctx)
 	if err != nil {
 		return fmt.Errorf("generations: %w", err)
 	}
@@ -559,7 +563,7 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 
 		// Delete entire generation if no snapshots are being retained.
 		if snapshot == nil {
-			if err := r.Client.DeleteGeneration(ctx, generation); err != nil {
+			if err := r.client.DeleteGeneration(ctx, generation); err != nil {
 				return fmt.Errorf("delete generation: %w", err)
 			}
 			continue
@@ -577,7 +581,7 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 }
 
 func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation string, index int) error {
-	itr, err := r.Client.Snapshots(ctx, generation)
+	itr, err := r.client.Snapshots(ctx, generation)
 	if err != nil {
 		return fmt.Errorf("fetch snapshots: %w", err)
 	}
@@ -589,7 +593,7 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 			continue
 		}
 
-		if err := r.Client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
+		if err := r.client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
 			return fmt.Errorf("delete snapshot %s/%08x: %w", info.Generation, info.Index, err)
 		}
 		r.Logger.Printf("snapshot deleted %s/%08x", generation, index)
@@ -599,7 +603,7 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 }
 
 func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation string, index int) error {
-	itr, err := r.Client.WALSegments(ctx, generation)
+	itr, err := r.client.WALSegments(ctx, generation)
 	if err != nil {
 		return fmt.Errorf("fetch wal segments: %w", err)
 	}
@@ -621,7 +625,7 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation s
 		return nil
 	}
 
-	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
+	if err := r.client.DeleteWALSegments(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
 
@@ -774,7 +778,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	}
 
 	// Find lastest snapshot that occurs before the index.
-	snapshotIndex, err := FindSnapshotForIndex(ctx, r.Client, pos.Generation, pos.Index-1)
+	snapshotIndex, err := FindSnapshotForIndex(ctx, r.client, pos.Generation, pos.Index-1)
 	if err != nil {
 		return fmt.Errorf("cannot find snapshot index: %w", err)
 	}
@@ -784,7 +788,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 		Logger:    log.New(os.Stderr, "", 0),
 		LogPrefix: r.logPrefix(),
 	}
-	if err := Restore(ctx, r.Client, restorePath, pos.Generation, snapshotIndex, pos.Index-1, opt); err != nil {
+	if err := Restore(ctx, r.client, restorePath, pos.Generation, snapshotIndex, pos.Index-1, opt); err != nil {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
 
@@ -880,7 +884,7 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 func (r *Replica) GenerationCreatedAt(ctx context.Context, generation string) (time.Time, error) {
 	var min time.Time
 
-	itr, err := r.Client.Snapshots(ctx, generation)
+	itr, err := r.client.Snapshots(ctx, generation)
 	if err != nil {
 		return min, err
 	}
@@ -897,7 +901,7 @@ func (r *Replica) GenerationCreatedAt(ctx context.Context, generation string) (t
 // SnapshotIndexAt returns the highest index for a snapshot within a generation
 // that occurs before timestamp. If timestamp is zero, returns the latest snapshot.
 func (r *Replica) SnapshotIndexAt(ctx context.Context, generation string, timestamp time.Time) (int, error) {
-	itr, err := r.Client.Snapshots(ctx, generation)
+	itr, err := r.client.Snapshots(ctx, generation)
 	if err != nil {
 		return 0, err
 	}
@@ -929,7 +933,7 @@ func LatestReplica(ctx context.Context, replicas []*Replica) (*Replica, error) {
 	var t time.Time
 	var r *Replica
 	for i := range replicas {
-		_, max, err := ReplicaClientTimeBounds(ctx, replicas[i].Client)
+		_, max, err := ReplicaClientTimeBounds(ctx, replicas[i].client)
 		if err != nil {
 			return nil, err
 		} else if r == nil || max.After(t) {

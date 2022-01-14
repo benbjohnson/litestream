@@ -1,0 +1,4 @@
+dbs:
+  - path: $LITESTREAM_TEMPDIR/db
+    replicas:
+      - path: $LITESTREAM_TEMPDIR/replica

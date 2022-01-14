@@ -37,7 +37,7 @@ func runWindowsService(ctx context.Context) error {
 
 	// Set eventlog as log writer while running.
 	log.SetOutput((*eventlogWriter)(elog))
-	defer log.SetOutput(os.Stderr)
+	defer log.SetOutput(os.Stdout)
 
 	log.Print("Litestream service starting")
 

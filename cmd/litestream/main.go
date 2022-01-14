@@ -38,6 +38,7 @@ var errExit = errors.New("exit")
 
 func main() {
 	log.SetFlags(0)
+	log.SetOutput(os.Stdout)
 
 	m := NewMain(os.Stdin, os.Stdout, os.Stderr)
 	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errExit {
@@ -354,8 +355,35 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", c.Path)
 	}
 
+	// Build and set client on replica.
+	var client litestream.ReplicaClient
+	switch typ := c.ReplicaType(); typ {
+	case "file":
+		if client, err = newFileReplicaClientFromConfig(c); err != nil {
+			return nil, err
+		}
+	case "s3":
+		if client, err = newS3ReplicaClientFromConfig(c); err != nil {
+			return nil, err
+		}
+	case "gcs":
+		if client, err = newGCSReplicaClientFromConfig(c); err != nil {
+			return nil, err
+		}
+	case "abs":
+		if client, err = newABSReplicaClientFromConfig(c); err != nil {
+			return nil, err
+		}
+	case "sftp":
+		if client, err = newSFTPReplicaClientFromConfig(c); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unknown replica type in config: %q", typ)
+	}
+
 	// Build replica.
-	r := litestream.NewReplica(db, c.Name)
+	r := litestream.NewReplica(db, c.Name, client)
 	if v := c.Retention; v != nil {
 		r.Retention = *v
 	}
@@ -372,37 +400,11 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		r.ValidationInterval = *v
 	}
 
-	// Build and set client on replica.
-	switch typ := c.ReplicaType(); typ {
-	case "file":
-		if r.Client, err = newFileReplicaClientFromConfig(c, r); err != nil {
-			return nil, err
-		}
-	case "s3":
-		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
-			return nil, err
-		}
-	case "gcs":
-		if r.Client, err = newGCSReplicaClientFromConfig(c, r); err != nil {
-			return nil, err
-		}
-	case "abs":
-		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
-			return nil, err
-		}
-	case "sftp":
-		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
-			return nil, err
-		}
-	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", typ)
-	}
-
 	return r, nil
 }
 
 // newFileReplicaClientFromConfig returns a new instance of FileReplicaClient built from config.
-func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *litestream.FileReplicaClient, err error) {
+func newFileReplicaClientFromConfig(c *ReplicaConfig) (_ *litestream.FileReplicaClient, err error) {
 	// Ensure URL & path are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for file replica")
@@ -431,7 +433,7 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 }
 
 // newS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
-func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s3.ReplicaClient, err error) {
+func newS3ReplicaClientFromConfig(c *ReplicaConfig) (_ *s3.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for s3 replica")
@@ -494,7 +496,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s
 }
 
 // newGCSReplicaClientFromConfig returns a new instance of gcs.ReplicaClient built from config.
-func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *gcs.ReplicaClient, err error) {
+func newGCSReplicaClientFromConfig(c *ReplicaConfig) (_ *gcs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for gcs replica")
@@ -533,7 +535,7 @@ func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 }
 
 // newABSReplicaClientFromConfig returns a new instance of abs.ReplicaClient built from config.
-func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *abs.ReplicaClient, err error) {
+func newABSReplicaClientFromConfig(c *ReplicaConfig) (_ *abs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for abs replica")
@@ -576,7 +578,7 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 }
 
 // newSFTPReplicaClientFromConfig returns a new instance of sftp.ReplicaClient built from config.
-func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *sftp.ReplicaClient, err error) {
+func newSFTPReplicaClientFromConfig(c *ReplicaConfig) (_ *sftp.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for sftp replica")

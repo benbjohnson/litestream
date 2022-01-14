@@ -14,13 +14,12 @@ import (
 
 func TestReplica_Name(t *testing.T) {
 	t.Run("WithName", func(t *testing.T) {
-		if got, want := litestream.NewReplica(nil, "NAME").Name(), "NAME"; got != want {
+		if got, want := litestream.NewReplica(nil, "NAME", nil).Name(), "NAME"; got != want {
 			t.Fatalf("Name()=%v, want %v", got, want)
 		}
 	})
 	t.Run("WithoutName", func(t *testing.T) {
-		r := litestream.NewReplica(nil, "")
-		r.Client = &mock.ReplicaClient{}
+		r := litestream.NewReplica(nil, "", &mock.ReplicaClient{})
 		if got, want := r.Name(), "mock"; got != want {
 			t.Fatalf("Name()=%v, want %v", got, want)
 		}
@@ -45,8 +44,7 @@ func TestReplica_Sync(t *testing.T) {
 	dpos := db.Pos()
 
 	c := litestream.NewFileReplicaClient(t.TempDir())
-	r := litestream.NewReplica(db, "")
-	r.Client = c
+	r := litestream.NewReplica(db, "", c)
 
 	if err := r.Sync(context.Background()); err != nil {
 		t.Fatal(err)
@@ -81,8 +79,7 @@ func TestReplica_Snapshot(t *testing.T) {
 	defer MustCloseDBs(t, db, sqldb)
 
 	c := litestream.NewFileReplicaClient(t.TempDir())
-	r := litestream.NewReplica(db, "")
-	r.Client = c
+	r := litestream.NewReplica(db, "", c)
 
 	// Execute a query to force a write to the WAL.
 	if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {

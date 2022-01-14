@@ -104,7 +104,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Determine latest generation if one is not specified.
 	if c.generation == "" {
-		if c.generation, err = litestream.FindLatestGeneration(ctx, r.Client); err == litestream.ErrNoGeneration {
+		if c.generation, err = litestream.FindLatestGeneration(ctx, r.Client()); err == litestream.ErrNoGeneration {
 			// Return an error if no matching targets found.
 			// If optional flag set, return success. Useful for automated recovery.
 			if c.ifReplicaExists {
@@ -119,14 +119,14 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Determine the maximum available index for the generation if one is not specified.
 	if c.targetIndex == -1 {
-		if c.targetIndex, err = litestream.FindMaxIndexByGeneration(ctx, r.Client, c.generation); err != nil {
+		if c.targetIndex, err = litestream.FindMaxIndexByGeneration(ctx, r.Client(), c.generation); err != nil {
 			return fmt.Errorf("cannot determine latest index in generation %q: %w", c.generation, err)
 		}
 	}
 
 	// Find lastest snapshot that occurs before the index.
 	// TODO: Optionally allow -snapshot-index
-	if c.snapshotIndex, err = litestream.FindSnapshotForIndex(ctx, r.Client, c.generation, c.targetIndex); err != nil {
+	if c.snapshotIndex, err = litestream.FindSnapshotForIndex(ctx, r.Client(), c.generation, c.targetIndex); err != nil {
 		return fmt.Errorf("cannot find snapshot index: %w", err)
 	}
 
@@ -137,7 +137,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	c.opt.Logger = log.New(c.stdout, "", log.LstdFlags|log.Lmicroseconds)
 
-	return litestream.Restore(ctx, r.Client, c.outputPath, c.generation, c.snapshotIndex, c.targetIndex, c.opt)
+	return litestream.Restore(ctx, r.Client(), c.outputPath, c.generation, c.snapshotIndex, c.targetIndex, c.opt)
 }
 
 func (c *RestoreCommand) loadReplica(ctx context.Context, config Config, arg string) (*litestream.Replica, error) {
