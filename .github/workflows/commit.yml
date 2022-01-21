@@ -1,0 +1,123 @@
+on: push
+
+jobs:
+  build:
+    name: Build & Unit Test
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+        with:
+          go-version: '1.17'
+      - uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ inputs.os }}-go-
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: make testdata
+      - run: go test -v ./...
+
+      - name: Build integration test
+        run: go test -c ./integration
+
+      - uses: actions/upload-artifact@v2
+        with:
+          name: integration.test
+          path: integration.test
+          if-no-files-found: error
+
+  long-running-test:
+    name: Run Long Running Unit Test
+    runs-on: ubuntu-18.04
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-go@v2
+        with: 
+          go-version: '1.17'
+      - uses: actions/cache@v2
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ inputs.os }}-go-
+
+      - run: go install ./cmd/litestream
+      - run: go test -v -run=TestCmd_Replicate_LongRunning ./integration -long-running-duration 1m
+
+  s3-integration-test:
+    name: Run S3 Integration Tests
+    runs-on: ubuntu-18.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: integration.test
+      - run: chmod +x integration.test
+
+      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type s3
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+  gcp-integration-test:
+    name: Run GCP Integration Tests
+    runs-on: ubuntu-18.04
+    needs: build
+    steps:
+      - name: Extract GCP credentials
+        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+
+      - uses: actions/download-artifact@v2
+        with:
+          name: integration.test
+      - run: chmod +x integration.test
+
+      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type gcs
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
+          LITESTREAM_GCS_BUCKET:           integration.litestream.io
+
+  abs-integration-test:
+    name: Run Azure Blob Store Integration Tests
+    runs-on: ubuntu-18.04
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v2
+        with:
+          name: integration.test
+      - run: chmod +x integration.test
+
+      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type abs
+        env:
+          LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET:           integration
+
+#  sftp-integration-test:
+#    name: Run SFTP Integration Tests
+#    runs-on: ubuntu-18.04
+#    needs: build
+#    steps:
+#      - name: Extract SSH key
+#        run: 'echo "$LITESTREAM_SFTP_KEY" > /opt/id_ed25519'
+#        shell: bash
+#        env:
+#          LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
+#
+#      - name: Run sftp tests
+#        run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
+#        env:
+#          LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
+#          LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
+#          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
+#          LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+
