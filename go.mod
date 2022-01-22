@@ -3,6 +3,7 @@ module github.com/benbjohnson/litestream
 go 1.16
 
 require (
+	cloud.google.com/go/iam v0.1.1 // indirect
 	cloud.google.com/go/storage v1.18.2
 	github.com/Azure/azure-storage-blob-go v0.13.0
 	github.com/aws/aws-sdk-go v1.42.39
@@ -13,7 +14,7 @@ require (
 	github.com/prometheus/client_golang v1.9.0
 	golang.org/x/crypto v0.0.0-20210513164829-c07d793c2f9a
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20210917161153-d61c044b1678
-	google.golang.org/api v0.58.0
+	golang.org/x/sys v0.0.0-20211216021012-1d35b9e2eb4e
+	google.golang.org/api v0.65.0
 	gopkg.in/yaml.v2 v2.4.0
 )
