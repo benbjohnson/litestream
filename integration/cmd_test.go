@@ -217,6 +217,8 @@ func TestCmd_Replicate_ResumeWithNewGeneration(t *testing.T) {
 func TestCmd_Replicate_HighLoad(t *testing.T) {
 	if testing.Short() {
 		t.Skip("short mode enabled, skipping")
+	} else if os.Getenv("CI") != "" {
+		t.Skip("ci, skipping")
 	}
 
 	const writeDuration = 30 * time.Second
