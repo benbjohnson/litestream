@@ -5,7 +5,7 @@ go 1.16
 require (
 	cloud.google.com/go/iam v0.1.1 // indirect
 	cloud.google.com/go/storage v1.18.2
-	github.com/Azure/azure-storage-blob-go v0.13.0
+	github.com/Azure/azure-storage-blob-go v0.14.0
 	github.com/aws/aws-sdk-go v1.42.39
 	github.com/mattn/go-shellwords v1.0.11
 	github.com/mattn/go-sqlite3 v1.14.10
