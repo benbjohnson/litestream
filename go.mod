@@ -10,7 +10,7 @@ require (
 	github.com/mattn/go-shellwords v1.0.12
 	github.com/mattn/go-sqlite3 v1.14.10
 	github.com/pierrec/lz4/v4 v4.1.12
-	github.com/pkg/sftp v1.13.0
+	github.com/pkg/sftp v1.13.4
 	github.com/prometheus/client_golang v1.9.0
 	golang.org/x/crypto v0.0.0-20220112180741-5e0467b6c7ce
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
