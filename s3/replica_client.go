@@ -100,6 +100,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 	c.s3 = s3.New(sess)
 	c.uploader = s3manager.NewUploader(sess)
+	c.uploader.MaxUploadParts = 1000
+	c.uploader.PartSize = 100 << 20
 	return nil
 }
 
