@@ -1,0 +1,34 @@
+#name: SFTP Integration Tests
+#on: pull_request
+#
+#jobs:
+#  sftp-integration-test:
+#    name: Run SFTP Integration Tests
+#    runs-on: ubuntu-18.04
+#    steps:
+#      - uses: actions/checkout@v2
+#
+#      - uses: actions/setup-go@v2
+#        with:
+#          go-version: '1.17'
+#
+#      - uses: actions/cache@v2
+#        with:
+#          path: ~/go/pkg/mod
+#          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
+#          restore-keys: ${{ inputs.os }}-go-
+#
+#      - name: Extract SSH key
+#        run: 'echo "$LITESTREAM_SFTP_KEY" > /opt/id_ed25519'
+#        shell: bash
+#        env:
+#          LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
+#
+#      - name: Run sftp tests
+#        run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
+#        env:
+#          LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
+#          LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
+#          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
+#          LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+
