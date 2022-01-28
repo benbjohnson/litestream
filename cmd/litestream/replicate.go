@@ -178,7 +178,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 // Close closes all open databases.
 func (c *ReplicateCommand) Close() (err error) {
 	for _, db := range c.DBs {
-		if e := db.SoftClose(); e != nil {
+		if e := db.Close(); e != nil {
 			log.Printf("error closing db: path=%s err=%s", db.Path(), e)
 			if err == nil {
 				err = e

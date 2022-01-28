@@ -270,8 +270,8 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Verify WAL does not exist.
-		if _, err := os.Stat(db.WALPath()); !os.IsNotExist(err) {
+		// Remove WAL file.
+		if err := os.Remove(db.WALPath()); err != nil {
 			t.Fatal(err)
 		}
 

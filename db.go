@@ -291,20 +291,9 @@ func (db *DB) Open() (err error) {
 	return nil
 }
 
-// Close releases the read lock & closes the database. This method should only
-// be called by tests as it causes the underlying database to be checkpointed.
+// Close flushes outstanding WAL writes to replicas, releases the read lock,
+// and closes the database.
 func (db *DB) Close() (err error) {
-	return db.close(false)
-}
-
-// SoftClose closes everything but the underlying db connection. This method
-// is available because the binary needs to avoid closing the database on exit
-// to prevent autocheckpointing.
-func (db *DB) SoftClose() (err error) {
-	return db.close(true)
-}
-
-func (db *DB) close(soft bool) (err error) {
 	db.cancel()
 	db.wg.Wait()
 
@@ -325,7 +314,7 @@ func (db *DB) close(soft bool) (err error) {
 				err = e
 			}
 		}
-		r.Stop(!soft)
+		r.Stop(true)
 	}
 
 	// Release the read lock to allow other applications to handle checkpointing.
@@ -335,9 +324,7 @@ func (db *DB) close(soft bool) (err error) {
 		}
 	}
 
-	// Only perform full close if this is not a soft close.
-	// This closes the underlying database connection which can clean up the WAL.
-	if !soft && db.db != nil {
+	if db.db != nil {
 		if e := db.db.Close(); e != nil && err == nil {
 			err = e
 		}
@@ -392,8 +379,9 @@ func (db *DB) init() (err error) {
 	dsn := db.path
 	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
 
-	// Connect to SQLite database.
-	if db.db, err = sql.Open("sqlite3", dsn); err != nil {
+	// Connect to SQLite database. Use the driver registered with a hook to
+	// prevent WAL files from being removed.
+	if db.db, err = sql.Open("litestream-sqlite3", dsn); err != nil {
 		return err
 	}
 
@@ -1419,7 +1407,7 @@ func applyWAL(ctx context.Context, index int, dbPath string) error {
 	}
 
 	// Open SQLite database and force a truncating checkpoint.
-	d, err := sql.Open("sqlite3", dbPath)
+	d, err := sql.Open("litestream-sqlite3", dbPath)
 	if err != nil {
 		return err
 	}
