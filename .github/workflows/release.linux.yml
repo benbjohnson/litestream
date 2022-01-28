@@ -21,6 +21,7 @@ jobs:
           - arch:   amd64
             cc:     gcc
             static: true
+            deploy_test_runner: true
 
           - arch: arm64
             cc:   aarch64-linux-gnu-gcc
@@ -123,3 +124,10 @@ jobs:
           asset_path: ./dist/litestream-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.deb
           asset_name: litestream-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.deb
           asset_content_type: application/octet-stream
+
+      - name: Dispatch test runner
+        if: matrix.deploy_test_runner
+        run: sleep 60 && gh workflow run deploy.yml -R benbjohnson/litestream-test-runner -f run_id=${{ github.run_id }} -f litestream_version=${{ github.sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+
