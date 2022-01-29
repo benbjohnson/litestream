@@ -1,0 +1,23 @@
+name: Request Test Runner
+on: 
+  workflow_dispatch:
+    inputs:
+      run_id:
+        required: true
+        type: string
+      litestream_version:
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: ubuntu-18.04
+    environment: 
+      name: test
+      url: http://litestream-test-runner-${{ github.sha }}.fly.dev
+    steps:
+      - name: Dispatch test runner
+        run: gh workflow run deploy.yml -R benbjohnson/litestream-test-runner -f run_id=${{ github.event.inputs.run_id }} -f litestream_version=${{ github.event.inputs.litestream_version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+

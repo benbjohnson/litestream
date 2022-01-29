@@ -8,7 +8,7 @@ on:
       - synchronize
       - reopened
 
-name: Release (Linux)
+name: Release Linux
 jobs:
   build:
     runs-on: ubuntu-18.04
@@ -17,11 +17,11 @@ jobs:
         include:
           - arch:   amd64
             cc:     gcc
+            request_test_runner: true
 
           - arch:   amd64
             cc:     gcc
             static: true
-            deploy_test_runner: true
 
           - arch: arm64
             cc:   aarch64-linux-gnu-gcc
@@ -125,9 +125,9 @@ jobs:
           asset_name: litestream-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.deb
           asset_content_type: application/octet-stream
 
-      - name: Dispatch test runner
-        if: matrix.deploy_test_runner
-        run: sleep 60 && gh workflow run deploy.yml -R benbjohnson/litestream-test-runner -f run_id=${{ github.run_id }} -f litestream_version=${{ github.sha }}
+      - name: Request test runner
+        if: matrix.request_test_runner
+        run: gh workflow run request_test_runner.yml -R benbjohnson/litestream -f run_id=${{ github.run_id }} -f litestream_version=${{ env.VERSION }}
         env:
-          GITHUB_TOKEN: ${{ secrets.PAT_TOKEN }}
+          GITHUB_TOKEN: ${{ github.token }}
 
