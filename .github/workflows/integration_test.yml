@@ -101,10 +101,10 @@ jobs:
       - name: Run sftp tests w/ key
         run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
         env:
-          LITESTREAM_SFTP_HOST:     litestream-test-sftp.fly.dev:2222
-          LITESTREAM_SFTP_USER:     litestream
-          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
-          LITESTREAM_SFTP_PATH:     /litestream
+          LITESTREAM_SFTP_HOST: litestream-test-sftp.fly.dev:2222
+          LITESTREAM_SFTP_USER: litestream
+          LITESTREAM_SFTP_PATH: /litestream
+          LITESTREAM_SFTP_KEY_PATH:      /opt/id_ed25519
 
       - name: Run sftp tests w/ password
         run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
