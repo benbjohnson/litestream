@@ -41,6 +41,7 @@ type ReplicaClient struct {
 	Password    string
 	Path        string
 	KeyPath     string
+	HostKeyPath string
 	DialTimeout time.Duration
 }
 
@@ -71,12 +72,26 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 
 	// Build SSH configuration & auth methods
 	config := &ssh.ClientConfig{
-		User:            c.User,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
-		BannerCallback:  ssh.BannerDisplayStderr(),
+		User:           c.User,
+		BannerCallback: ssh.BannerDisplayStderr(),
 	}
 	if c.Password != "" {
 		config.Auth = append(config.Auth, ssh.Password(c.Password))
+	}
+
+	if c.HostKeyPath == "" {
+		config.HostKeyCallback = ssh.InsecureIgnoreHostKey()
+	} else {
+		buf, err := os.ReadFile(c.HostKeyPath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot read sftp host key path: %w", err)
+		}
+
+		key, _, _, _, err := ssh.ParseAuthorizedKey(buf)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse sftp host key path: path=%s len=%d err=%w", c.HostKeyPath, len(buf), err)
+		}
+		config.HostKeyCallback = ssh.FixedHostKey(key)
 	}
 
 	if c.KeyPath != "" {

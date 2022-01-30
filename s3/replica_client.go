@@ -715,10 +715,10 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 
 var (
 	localhostRegex    = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
-	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
-	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
-	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
-	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects.com$`)
+	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3\.([^.]+)\.backblazeb2\.com$`)
+	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3\.filebase\.com$`)
+	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces\.com$`)
+	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects\.com$`)
 )
 
 func isNotExists(err error) bool {

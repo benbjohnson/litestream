@@ -59,11 +59,12 @@ var (
 
 // SFTP settings
 var (
-	sftpHost     = flag.String("sftp-host", os.Getenv("LITESTREAM_SFTP_HOST"), "")
-	sftpUser     = flag.String("sftp-user", os.Getenv("LITESTREAM_SFTP_USER"), "")
-	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
-	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
-	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
+	sftpHost        = flag.String("sftp-host", os.Getenv("LITESTREAM_SFTP_HOST"), "")
+	sftpUser        = flag.String("sftp-user", os.Getenv("LITESTREAM_SFTP_USER"), "")
+	sftpPassword    = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
+	sftpKeyPath     = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
+	sftpHostKeyPath = flag.String("sftp-host-key-path", os.Getenv("LITESTREAM_SFTP_HOST_KEY_PATH"), "")
+	sftpPath        = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
 )
 
 func TestReplicaClient_Generations(t *testing.T) {
@@ -538,6 +539,7 @@ func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
 	c.User = *sftpUser
 	c.Password = *sftpPassword
 	c.KeyPath = *sftpKeyPath
+	c.HostKeyPath = *sftpHostKeyPath
 	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
 	return c
 }

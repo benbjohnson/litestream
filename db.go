@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
+	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
@@ -1593,8 +1594,11 @@ func parseWALPath(s string) (index int, err error) {
 		return 0, fmt.Errorf("invalid wal path: %s", s)
 	}
 
-	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	return int(i64), nil
+	i32, _ := strconv.ParseUint(a[1], 16, 32)
+	if i32 > math.MaxInt32 {
+		return 0, fmt.Errorf("index too large in wal path: %s", s)
+	}
+	return int(i32), nil
 }
 
 // formatWALPath formats a WAL filename with a given index.
