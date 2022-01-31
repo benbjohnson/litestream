@@ -12,13 +12,10 @@ import (
 	"io"
 	"io/ioutil"
 	"log"
-	"math"
 	"math/rand"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -429,7 +426,9 @@ func (db *DB) Close() (err error) {
 				err = e
 			}
 		}
-		r.Stop(true)
+		if e := r.Stop(true); e != nil && err == nil {
+			err = e
+		}
 	}
 
 	// Release the read lock to allow other applications to handle checkpointing.
@@ -1142,11 +1141,11 @@ func (db *DB) copyToShadowWAL(ctx context.Context) error {
 	go func() {
 		zw := lz4.NewWriter(pw)
 		if _, err := io.Copy(zw, &io.LimitedReader{R: f, N: walByteN}); err != nil {
-			pw.CloseWithError(err)
+			_ = pw.CloseWithError(err)
 		} else if err := zw.Close(); err != nil {
-			pw.CloseWithError(err)
+			_ = pw.CloseWithError(err)
 		}
-		pw.Close()
+		_ = pw.Close()
 	}()
 
 	// Write a new, compressed segment via pipe.
@@ -1336,46 +1335,11 @@ func (itr *shadowWALSegmentIterator) WALSegment() WALSegmentInfo {
 	return itr.infos[0]
 }
 
-// frameAlign returns a frame-aligned offset.
-// Returns zero if offset is less than the WAL header size.
-func frameAlign(offset int64, pageSize int) int64 {
-	assert(offset >= 0, "frameAlign(): offset must be non-negative")
-	assert(pageSize >= 0, "frameAlign(): page size must be non-negative")
-
-	if offset < WALHeaderSize {
-		return 0
-	}
-
-	frameSize := WALFrameHeaderSize + int64(pageSize)
-	frameN := (offset - WALHeaderSize) / frameSize
-	return (frameN * frameSize) + WALHeaderSize
-}
-
 // SQLite WAL constants
 const (
 	WALHeaderChecksumOffset      = 24
 	WALFrameHeaderChecksumOffset = 16
 )
-
-func readLastChecksumFrom(f *os.File, pageSize int) (uint32, uint32, error) {
-	// Determine the byte offset of the checksum for the header (if no pages
-	// exist) or for the last page (if at least one page exists).
-	offset := int64(WALHeaderChecksumOffset)
-	if fi, err := f.Stat(); err != nil {
-		return 0, 0, err
-	} else if sz := frameAlign(fi.Size(), pageSize); fi.Size() > WALHeaderSize {
-		offset = sz - int64(pageSize) - WALFrameHeaderSize + WALFrameHeaderChecksumOffset
-	}
-
-	// Read big endian checksum.
-	b := make([]byte, 8)
-	if n, err := f.ReadAt(b, offset); err != nil {
-		return 0, 0, err
-	} else if n != len(b) {
-		return 0, 0, io.ErrUnexpectedEOF
-	}
-	return binary.BigEndian.Uint32(b[0:]), binary.BigEndian.Uint32(b[4:]), nil
-}
 
 // Checkpoint performs a checkpoint on the WAL file.
 func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
@@ -1583,31 +1547,6 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 	}
 	return h.Sum64(), pos, nil
 }
-
-// parseWALPath returns the index for the WAL file.
-// Returns an error if the path is not a valid WAL path.
-func parseWALPath(s string) (index int, err error) {
-	s = filepath.Base(s)
-
-	a := walPathRegex.FindStringSubmatch(s)
-	if a == nil {
-		return 0, fmt.Errorf("invalid wal path: %s", s)
-	}
-
-	i32, _ := strconv.ParseUint(a[1], 16, 32)
-	if i32 > math.MaxInt32 {
-		return 0, fmt.Errorf("index too large in wal path: %s", s)
-	}
-	return int(i32), nil
-}
-
-// formatWALPath formats a WAL filename with a given index.
-func formatWALPath(index int) string {
-	assert(index >= 0, "wal index must be non-negative")
-	return FormatIndex(index) + ".wal"
-}
-
-var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.wal$`)
 
 // ReadWALFields iterates over the header & frames in the WAL data in r.
 // Returns salt, checksum, byte order & the last frame. WAL data must start

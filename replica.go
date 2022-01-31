@@ -105,14 +105,14 @@ func (r *Replica) DB() *DB { return r.db }
 func (r *Replica) Client() ReplicaClient { return r.client }
 
 // Starts replicating in a background goroutine.
-func (r *Replica) Start(ctx context.Context) error {
+func (r *Replica) Start(ctx context.Context) {
 	// Ignore if replica is being used sychronously.
 	if !r.MonitorEnabled {
-		return nil
+		return
 	}
 
 	// Stop previous replication.
-	r.Stop(false)
+	_ = r.Stop(false)
 
 	// Wrap context with cancelation.
 	ctx, r.cancel = context.WithCancel(ctx)
@@ -123,8 +123,6 @@ func (r *Replica) Start(ctx context.Context) error {
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
 	go func() { defer r.wg.Done(); r.snapshotter(ctx) }()
 	go func() { defer r.wg.Done(); r.validator(ctx) }()
-
-	return nil
 }
 
 // Stop cancels any outstanding replication and blocks until finished.
@@ -512,10 +510,10 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		defer zr.Close()
 
 		if _, err := io.Copy(zr, r.f); err != nil {
-			pw.CloseWithError(err)
+			_ = pw.CloseWithError(err)
 			return err
 		} else if err := zr.Close(); err != nil {
-			pw.CloseWithError(err)
+			_ = pw.CloseWithError(err)
 			return err
 		}
 		return pw.Close()

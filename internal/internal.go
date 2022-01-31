@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"crypto/md5"
 	"fmt"
 	"io"
 	"math"
@@ -180,7 +181,7 @@ func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
 	if i32 > math.MaxInt32 {
 		return 0, 0, fmt.Errorf("index too large in wal segment path %q", s)
 	}
-	off64, _ := strconv.ParseInt(a[2], 16, 64)
+	off64, _ := strconv.ParseUint(a[2], 16, 64)
 	if off64 > math.MaxInt64 {
 		return 0, 0, fmt.Errorf("offset too large in wal segment path %q", s)
 	}
@@ -227,4 +228,9 @@ func TruncateDuration(d time.Duration) time.Duration {
 		return d.Truncate(time.Microsecond)
 	}
 	return d
+}
+
+// MD5hash returns a hex-encoded MD5 hash of b.
+func MD5hash(b []byte) string {
+	return fmt.Sprintf("%x", md5.Sum(b))
 }

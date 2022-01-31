@@ -96,6 +96,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 		// Setup signal handler.
 		ctx, cancel := context.WithCancel(ctx)
+		defer cancel()
 		signalCh := make(chan os.Signal, 1)
 		signal.Notify(signalCh, notifySignals...)
 

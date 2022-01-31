@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
 )
 
@@ -193,7 +194,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			filename := filepath.Join(tempDir, "generations", "0000000000000000", "wal", fmt.Sprintf("%08x", i), "00000000.wal.lz4")
 			if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
 				t.Fatal(err)
-			} else if err := os.WriteFile(filename, compressLZ4(t, []byte(fmt.Sprint(i))), 0666); err != nil {
+			} else if err := os.WriteFile(filename, testingutil.CompressLZ4(t, []byte(fmt.Sprint(i))), 0666); err != nil {
 				t.Fatal(err)
 			}
 		}
