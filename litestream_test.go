@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
-	"io"
 	"os"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
 	_ "github.com/mattn/go-sqlite3"
-	"github.com/pierrec/lz4/v4"
 )
 
 func TestChecksum(t *testing.T) {
@@ -79,27 +77,4 @@ func fileEqual(tb testing.TB, x, y string) bool {
 	}
 
 	return bytes.Equal(bx, by)
-}
-
-func compressLZ4(tb testing.TB, b []byte) []byte {
-	tb.Helper()
-
-	var buf bytes.Buffer
-	zw := lz4.NewWriter(&buf)
-	if _, err := zw.Write(b); err != nil {
-		tb.Fatal(err)
-	} else if err := zw.Close(); err != nil {
-		tb.Fatal(err)
-	}
-	return buf.Bytes()
-}
-
-func decompressLZ4(tb testing.TB, b []byte) []byte {
-	tb.Helper()
-
-	buf, err := io.ReadAll(lz4.NewReader(bytes.NewReader(b)))
-	if err != nil {
-		tb.Fatal(err)
-	}
-	return buf
 }

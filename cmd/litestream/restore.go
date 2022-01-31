@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -276,5 +275,3 @@ Examples:
 		DefaultConfigPath(),
 	)
 }
-
-var errSkipDBExists = errors.New("database already exists, skipping")

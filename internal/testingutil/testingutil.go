@@ -1,9 +1,12 @@
 package testingutil
 
 import (
+	"bytes"
 	"io"
 	"os"
 	"testing"
+
+	"github.com/pierrec/lz4/v4"
 )
 
 // ReadFile reads all data from filename. Fail on error.
@@ -61,4 +64,27 @@ func Setenv(tb testing.TB, key, value string) func() {
 			tb.Fatal(tb)
 		}
 	}
+}
+
+func CompressLZ4(tb testing.TB, b []byte) []byte {
+	tb.Helper()
+
+	var buf bytes.Buffer
+	zw := lz4.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		tb.Fatal(err)
+	} else if err := zw.Close(); err != nil {
+		tb.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func DecompressLZ4(tb testing.TB, b []byte) []byte {
+	tb.Helper()
+
+	buf, err := io.ReadAll(lz4.NewReader(bytes.NewReader(b)))
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return buf
 }

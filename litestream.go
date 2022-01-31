@@ -1,10 +1,8 @@
 package litestream
 
 import (
-	"crypto/md5"
 	"database/sql"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -473,12 +471,6 @@ func removeDBFiles(filename string) error {
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
-}
-
-// md5hash returns a hex-encoded MD5 hash of b.
-func md5hash(b []byte) string {
-	sum := md5.Sum(b)
-	return hex.EncodeToString(sum[:])
 }
 
 // Tracef is used for low-level tracing.
