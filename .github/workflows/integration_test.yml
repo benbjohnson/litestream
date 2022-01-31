@@ -5,6 +5,7 @@ jobs:
   s3-integration-test:
     name: Run S3 Integration Tests
     runs-on: ubuntu-18.04
+    if: github.actor != 'dependabot'
     steps:
       - uses: actions/checkout@v2
 
@@ -30,6 +31,7 @@ jobs:
   gcp-integration-test:
     name: Run GCP Integration Tests
     runs-on: ubuntu-18.04
+    if: github.actor != 'dependabot'
     steps:
       - uses: actions/checkout@v2
 
@@ -57,6 +59,7 @@ jobs:
   abs-integration-test:
     name: Run Azure Blob Store Integration Tests
     runs-on: ubuntu-18.04
+    if: github.actor != 'dependabot'
     steps:
       - uses: actions/checkout@v2
 
@@ -79,6 +82,7 @@ jobs:
   sftp-integration-test:
     name: Run SFTP Integration Tests
     runs-on: ubuntu-18.04
+    if: github.actor != 'dependabot'
     steps:
       - uses: actions/checkout@v2
 
