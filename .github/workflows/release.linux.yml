@@ -7,6 +7,8 @@ on:
       - opened
       - synchronize
       - reopened
+    branches-ignore:
+      - "dependabot/**"
 
 name: Release (Linux)
 jobs:
