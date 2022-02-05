@@ -17,6 +17,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -67,13 +68,6 @@ func NewMain(stdin io.Reader, stdout, stderr io.Writer) *Main {
 
 // Run executes the program.
 func (m *Main) Run(ctx context.Context, args []string) (err error) {
-	// Execute replication command if running as a Windows service.
-	if isService, err := isWindowsService(); err != nil {
-		return err
-	} else if isService {
-		return runWindowsService(ctx)
-	}
-
 	// Copy "LITESTEAM" environment credentials.
 	applyLitestreamEnv()
 
@@ -98,7 +92,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		ctx, cancel := context.WithCancel(ctx)
 		defer cancel()
 		signalCh := make(chan os.Signal, 1)
-		signal.Notify(signalCh, notifySignals...)
+		signal.Notify(signalCh, syscall.SIGINT, syscall.SIGTERM)
 
 		if err := c.Run(ctx); err != nil {
 			return err
@@ -685,7 +679,7 @@ func DefaultConfigPath() string {
 	if v := os.Getenv("LITESTREAM_CONFIG"); v != "" {
 		return v
 	}
-	return defaultConfigPath
+	return "/etc/litestream.yml"
 }
 
 func registerConfigFlag(fs *flag.FlagSet, configPath *string, noExpandEnv *bool) {

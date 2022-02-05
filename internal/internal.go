@@ -132,7 +132,7 @@ func MkdirAll(path string, mode os.FileMode, uid, gid int) error {
 
 	if j > 1 {
 		// Create parent.
-		err = MkdirAll(fixRootDirectory(path[:j-1]), mode, uid, gid)
+		err = MkdirAll(path[:j-1], mode, uid, gid)
 		if err != nil {
 			return err
 		}
@@ -152,6 +152,15 @@ func MkdirAll(path string, mode os.FileMode, uid, gid int) error {
 	}
 	_ = os.Chown(path, uid, gid)
 	return nil
+}
+
+// Fileinfo returns syscall fields from a FileInfo object.
+func Fileinfo(fi os.FileInfo) (uid, gid int) {
+	if fi == nil {
+		return -1, -1
+	}
+	stat := fi.Sys().(*syscall.Stat_t)
+	return int(stat.Uid), int(stat.Gid)
 }
 
 // ParseSnapshotPath parses the index from a snapshot filename. Used by path-based replicas.
