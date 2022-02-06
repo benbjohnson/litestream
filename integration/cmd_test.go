@@ -43,6 +43,8 @@ func TestCmd_Replicate_OK(t *testing.T) {
 	db, err := sql.Open("sqlite3", filepath.Join(tempDir, "db"))
 	if err != nil {
 		t.Fatal(err)
+	} else if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
 	} else if _, err := db.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
@@ -378,9 +380,9 @@ func waitForLogMessage(tb testing.TB, b *internal.LockingBuffer, msg string) {
 // killLitestreamCmd interrupts the process and waits for a clean shutdown.
 func killLitestreamCmd(tb testing.TB, cmd *exec.Cmd, stdout *internal.LockingBuffer) {
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
-		tb.Fatal(err)
+		tb.Fatal("kill litestream: signal:", err)
 	} else if err := cmd.Wait(); err != nil {
-		tb.Fatal(err)
+		tb.Fatal("kill litestream: cmd:", err)
 	}
 }
 

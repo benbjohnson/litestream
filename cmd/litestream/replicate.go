@@ -35,8 +35,7 @@ type ReplicateCommand struct {
 
 	Config Config
 
-	// List of managed databases specified in the config.
-	DBs []*litestream.DB
+	server *litestream.Server
 }
 
 // NewReplicateCommand returns a new instance of ReplicateCommand.
@@ -104,21 +103,27 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		log.Println("no databases specified in configuration")
 	}
 
+	c.server = litestream.NewServer()
+	if err := c.server.Open(); err != nil {
+		return fmt.Errorf("open server: %w", err)
+	}
+
+	// Add databases to the server.
 	for _, dbConfig := range c.Config.DBs {
-		db, err := NewDBFromConfig(dbConfig)
+		path, err := expand(dbConfig.Path)
 		if err != nil {
 			return err
 		}
 
-		// Open database & attach to program.
-		if err := db.Open(); err != nil {
+		if err := c.server.Watch(path, func(path string) (*litestream.DB, error) {
+			return NewDBFromConfigWithPath(dbConfig, path)
+		}); err != nil {
 			return err
 		}
-		c.DBs = append(c.DBs, db)
 	}
 
 	// Notify user that initialization is done.
-	for _, db := range c.DBs {
+	for _, db := range c.server.DBs() {
 		log.Printf("initialized db: %s", db.Path())
 		for _, r := range db.Replicas {
 			switch client := r.Client().(type) {
@@ -180,13 +185,8 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 // Close closes all open databases.
 func (c *ReplicateCommand) Close() (err error) {
-	for _, db := range c.DBs {
-		if e := db.Close(); e != nil {
-			log.Printf("error closing db: path=%s err=%s", db.Path(), e)
-			if err == nil {
-				err = e
-			}
-		}
+	if e := c.server.Close(); e != nil && err == nil {
+		err = e
 	}
 	return err
 }

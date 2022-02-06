@@ -662,7 +662,7 @@ func (r *Replica) monitor(ctx context.Context) {
 		}
 
 		// Fetch new notify channel before replicating data.
-		notify = r.db.Notify()
+		notify = r.db.WALNotify()
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {

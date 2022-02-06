@@ -28,11 +28,14 @@ import (
 
 // Default DB settings.
 const (
-	DefaultMonitorInterval    = 1 * time.Second
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultMinCheckpointPageN = 1000
 	DefaultMaxCheckpointPageN = 10000
 )
+
+// MonitorDelayInterval is the time Litestream will wait after receiving a file
+// change notification before processing the WAL file for changes.
+const MonitorDelayInterval = 100 * time.Millisecond
 
 // MaxIndex is the maximum possible WAL index.
 // If this index is reached then a new generation will be started.
@@ -43,14 +46,15 @@ const BusyTimeout = 1 * time.Second
 
 // DB represents a managed instance of a SQLite database in the file system.
 type DB struct {
-	mu       sync.RWMutex
-	path     string        // part to database
-	db       *sql.DB       // target database
-	f        *os.File      // long-running db file descriptor
-	rtx      *sql.Tx       // long running read transaction
-	pos      Pos           // cached position
-	pageSize int           // page size, in bytes
-	notify   chan struct{} // closes on WAL change
+	mu        sync.RWMutex
+	path      string        // part to database
+	db        *sql.DB       // target database
+	f         *os.File      // long-running db file descriptor
+	rtx       *sql.Tx       // long running read transaction
+	pos       Pos           // cached position
+	pageSize  int           // page size, in bytes
+	notifyCh  chan struct{} // notifies DB of changes
+	walNotify chan struct{} // closes on WAL change
 
 	// Cached salt & checksum from current shadow header.
 	hdr              []byte
@@ -98,9 +102,6 @@ type DB struct {
 	// better precision.
 	CheckpointInterval time.Duration
 
-	// Frequency at which to perform db sync.
-	MonitorInterval time.Duration
-
 	// List of replicas for the database.
 	// Must be set before calling Open().
 	Replicas []*Replica
@@ -111,13 +112,13 @@ type DB struct {
 // NewDB returns a new instance of DB for a given path.
 func NewDB(path string) *DB {
 	db := &DB{
-		path:   path,
-		notify: make(chan struct{}),
+		path:      path,
+		notifyCh:  make(chan struct{}, 1),
+		walNotify: make(chan struct{}),
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
 		CheckpointInterval: DefaultCheckpointInterval,
-		MonitorInterval:    DefaultMonitorInterval,
 
 		Logger: log.New(LogWriter, fmt.Sprintf("%s: ", logPrefixPath(path)), LogFlags),
 	}
@@ -358,11 +359,16 @@ func (db *DB) walSegmentOffsetsByIndex(generation string, index int) ([]int64, e
 	return offsets, nil
 }
 
-// Notify returns a channel that closes when the shadow WAL changes.
-func (db *DB) Notify() <-chan struct{} {
+// NotifyCh returns a channel that can be used to signal changes in the DB.
+func (db *DB) NotifyCh() chan<- struct{} {
+	return db.notifyCh
+}
+
+// WALNotify returns a channel that closes when the shadow WAL changes.
+func (db *DB) WALNotify() <-chan struct{} {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	return db.notify
+	return db.walNotify
 }
 
 // PageSize returns the page size of the underlying database.
@@ -395,10 +401,8 @@ func (db *DB) Open() (err error) {
 	}
 
 	// Start monitoring SQLite database in a separate goroutine.
-	if db.MonitorInterval > 0 {
-		db.wg.Add(1)
-		go func() { defer db.wg.Done(); db.monitor() }()
-	}
+	db.wg.Add(1)
+	go func() { defer db.wg.Done(); db.monitor() }()
 
 	return nil
 }
@@ -903,8 +907,8 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 
 	// Notify replicas of WAL changes.
 	if db.pos != origPos {
-		close(db.notify)
-		db.notify = make(chan struct{})
+		close(db.walNotify)
+		db.walNotify = make(chan struct{})
 	}
 
 	return nil
@@ -1367,18 +1371,27 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 
 // monitor runs in a separate goroutine and monitors the database & WAL.
 func (db *DB) monitor() {
-	ticker := time.NewTicker(db.MonitorInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(MonitorDelayInterval)
+	defer timer.Stop()
 
 	for {
-		// Wait for ticker or context close.
+		// Wait for a file change notification from the file system.
 		select {
 		case <-db.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-db.notifyCh:
 		}
 
-		// Sync the database to the shadow WAL.
+		// Wait for small delay before processing changes.
+		timer.Reset(MonitorDelayInterval)
+		<-timer.C
+
+		// Clear any additional change notifications that occurred during delay.
+		select {
+		case <-db.notifyCh:
+		default:
+		}
+
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			db.Logger.Printf("sync error: %s", err)
 		}
