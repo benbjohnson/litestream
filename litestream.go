@@ -302,7 +302,7 @@ func (p Pos) String() string {
 	if p.IsZero() {
 		return ""
 	}
-	return fmt.Sprintf("%s/%08x:%d", p.Generation, p.Index, p.Offset)
+	return fmt.Sprintf("%s/%08x:%08x", p.Generation, p.Index, p.Offset)
 }
 
 // IsZero returns true if p is the zero value.

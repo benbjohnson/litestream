@@ -110,7 +110,7 @@ func (r *Replica) Start(ctx context.Context) {
 	}
 
 	// Stop previous replication.
-	_ = r.Stop(false)
+	r.Stop()
 
 	// Wrap context with cancelation.
 	ctx, r.cancel = context.WithCancel(ctx)
@@ -123,17 +123,17 @@ func (r *Replica) Start(ctx context.Context) {
 }
 
 // Stop cancels any outstanding replication and blocks until finished.
-//
-// Performing a hard stop will close the DB file descriptor which could release
-// locks on per-process locks. Hard stops should only be performed when
-// stopping the entire process.
-func (r *Replica) Stop(hard bool) (err error) {
+func (r *Replica) Stop() {
 	r.cancel()
 	r.wg.Wait()
+}
 
+// Close will close the DB file descriptor which could release locks on
+// per-process locks (e.g. non-Linux OSes).
+func (r *Replica) Close() (err error) {
 	r.muf.Lock()
 	defer r.muf.Unlock()
-	if hard && r.f != nil {
+	if r.f != nil {
 		if e := r.f.Close(); e != nil && err == nil {
 			err = e
 		}
@@ -297,9 +297,9 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 
 	// Flush LZ4 writer, close pipe, and wait for write to finish.
 	if err := zw.Close(); err != nil {
-		return err
+		return fmt.Errorf("lz4 writer close: %w", err)
 	} else if err := pw.Close(); err != nil {
-		return err
+		return fmt.Errorf("pipe writer close: %w", err)
 	} else if err := g.Wait(); err != nil {
 		return err
 	}
