@@ -8,7 +8,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/crc64"
 	"io"
 	"io/ioutil"
 	"log"
@@ -1419,50 +1418,6 @@ func ApplyWAL(ctx context.Context, dbPath, walPath string) error {
 		return fmt.Errorf("truncation checkpoint failed during restore (%d,%d,%d)", row[0], row[1], row[2])
 	}
 	return d.Close()
-}
-
-// CRC64 returns a CRC-64 ISO checksum of the database and its current position.
-//
-// This function obtains a read lock so it prevents syncs from occurring until
-// the operation is complete. The database will still be usable but it will be
-// unable to checkpoint during this time.
-//
-// If dst is set, the database file is copied to that location before checksum.
-func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if err := db.init(); err != nil {
-		return 0, Pos{}, err
-	} else if db.db == nil {
-		return 0, Pos{}, os.ErrNotExist
-	}
-
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return 0, Pos{}, fmt.Errorf("cannot find current generation: %w", err)
-	} else if generation == "" {
-		return 0, Pos{}, fmt.Errorf("no current generation")
-	}
-
-	// Force a RESTART checkpoint to ensure the database is at the start of the WAL.
-	if err := db.checkpoint(ctx, generation, CheckpointModeRestart); err != nil {
-		return 0, Pos{}, err
-	}
-
-	// Obtain current position. Clear the offset since we are only reading the
-	// DB and not applying the current WAL.
-	pos := db.pos
-	pos.Offset = 0
-
-	// Seek to the beginning of the db file descriptor and checksum whole file.
-	h := crc64.New(crc64.MakeTable(crc64.ISO))
-	if _, err := db.f.Seek(0, io.SeekStart); err != nil {
-		return 0, pos, err
-	} else if _, err := io.Copy(h, db.f); err != nil {
-		return 0, pos, err
-	}
-	return h.Sum64(), pos, nil
 }
 
 // ReadWALFields iterates over the header & frames in the WAL data in r.
