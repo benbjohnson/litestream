@@ -560,7 +560,6 @@ func MustOpenDB(tb testing.TB) *litestream.DB {
 func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
 	db := litestream.NewDB(path)
-	db.MonitorInterval = 0 // disable background goroutine
 	if err := db.Open(); err != nil {
 		tb.Fatal(err)
 	}

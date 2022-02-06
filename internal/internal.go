@@ -239,7 +239,7 @@ func TruncateDuration(d time.Duration) time.Duration {
 	return d
 }
 
-// MD5hash returns a hex-encoded MD5 hash of b.
-func MD5hash(b []byte) string {
+// MD5Hash returns a hex-encoded MD5 hash of b.
+func MD5Hash(b []byte) string {
 	return fmt.Sprintf("%x", md5.Sum(b))
 }
