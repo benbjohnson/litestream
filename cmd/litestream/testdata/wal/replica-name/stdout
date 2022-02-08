@@ -1,2 +1,2 @@
-replica   generation        index     offset    size  created
-replica1  0000000000000001  00000000  00000000  93    2000-01-04T00:00:00Z
+replica   generation        index             offset            size  created
+replica1  0000000000000001  0000000000000000  0000000000000000  93    2000-01-04T00:00:00Z

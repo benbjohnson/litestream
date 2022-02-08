@@ -19,7 +19,7 @@ func TestFindSnapshotForIndex(t *testing.T) {
 		if snapshotIndex, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000007d0); err != nil {
 			t.Fatal(err)
 		} else if got, want := snapshotIndex, 0x000003e8; got != want {
-			t.Fatalf("index=%08x, want %08x", got, want)
+			t.Fatalf("index=%s, want %s", litestream.FormatIndex(got), litestream.FormatIndex(want))
 		}
 	})
 
@@ -28,14 +28,14 @@ func TestFindSnapshotForIndex(t *testing.T) {
 		if snapshotIndex, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000003e8); err != nil {
 			t.Fatal(err)
 		} else if got, want := snapshotIndex, 0x000003e8; got != want {
-			t.Fatalf("index=%08x, want %08x", got, want)
+			t.Fatalf("index=%s, want %s", litestream.FormatIndex(got), litestream.FormatIndex(want))
 		}
 	})
 
 	t.Run("ErrNoSnapshotsBeforeIndex", func(t *testing.T) {
 		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "find-snapshot-for-index", "no-snapshots-before-index"))
 		_, err := litestream.FindSnapshotForIndex(context.Background(), client, "0000000000000000", 0x000003e8)
-		if err == nil || err.Error() != `no snapshots available at or before index 000003e8` {
+		if err == nil || err.Error() != `no snapshots available at or before index 00000000000003e8` {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -499,7 +499,7 @@ func TestRestore(t *testing.T) {
 		client := litestream.NewFileReplicaClient(testDir)
 		if err := litestream.Restore(context.Background(), client, filepath.Join(tempDir, "db"), "0000000000000000", 0, 2, litestream.NewRestoreOptions()); err != nil {
 			t.Fatal(err)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000002.db"), filepath.Join(tempDir, "db")) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000002.db"), filepath.Join(tempDir, "db")) {
 			t.Fatalf("file mismatch")
 		}
 	})
@@ -511,7 +511,7 @@ func TestRestore(t *testing.T) {
 		client := litestream.NewFileReplicaClient(testDir)
 		if err := litestream.Restore(context.Background(), client, filepath.Join(tempDir, "db"), "0000000000000000", 0, 0, litestream.NewRestoreOptions()); err != nil {
 			t.Fatal(err)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000000.db"), filepath.Join(tempDir, "db")) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000000.db"), filepath.Join(tempDir, "db")) {
 			t.Fatalf("file mismatch")
 		}
 	})
@@ -525,7 +525,7 @@ func TestRestore(t *testing.T) {
 		opt.Parallelism = 0
 		if err := litestream.Restore(context.Background(), client, filepath.Join(tempDir, "db"), "0000000000000000", 0, 2, opt); err != nil {
 			t.Fatal(err)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000002.db"), filepath.Join(tempDir, "db")) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000002.db"), filepath.Join(tempDir, "db")) {
 			t.Fatalf("file mismatch")
 		}
 	})

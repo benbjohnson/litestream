@@ -514,7 +514,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return info, err
 	}
 
-	r.Logger.Printf("snapshot written %s/%08x", pos.Generation, pos.Index)
+	r.Logger.Printf("snapshot written %s/%s", pos.Generation, FormatIndex(pos.Index))
 
 	return info, nil
 }
@@ -580,9 +580,9 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 		}
 
 		if err := r.client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
-			return fmt.Errorf("delete snapshot %s/%08x: %w", info.Generation, info.Index, err)
+			return fmt.Errorf("delete snapshot %s/%s: %w", info.Generation, FormatIndex(info.Index), err)
 		}
-		r.Logger.Printf("snapshot deleted %s/%08x", generation, index)
+		r.Logger.Printf("snapshot deleted %s/%s", generation, FormatIndex(index))
 	}
 
 	return itr.Close()

@@ -718,7 +718,7 @@ var _ flag.Value = (*indexVar)(nil)
 
 // String returns an 8-character hexadecimal value.
 func (v *indexVar) String() string {
-	return fmt.Sprintf("%08x", int(*v))
+	return litestream.FormatIndex(int(*v))
 }
 
 // Set parses s into an integer from a hexadecimal value.

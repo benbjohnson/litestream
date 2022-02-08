@@ -7,8 +7,8 @@ To reproduce this testdata, run sqlite3 and execute:
 
 And copy & split the WAL into segments:
 
-	sl3 split -o generations/0000000000000000/wal/00000000 db-wal
-	cp db-wal 00000000.wal
+	sl3 split -o generations/0000000000000000/wal/0000000000000000 db-wal
+	cp db-wal 0000000000000000.wal
 
 
 Finally, remove the original database files:

@@ -108,11 +108,11 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (ret error) {
 
 	fmt.Fprintln(w, "replica\tgeneration\tindex\toffset\tsize\tcreated")
 	for _, info := range infos {
-		fmt.Fprintf(w, "%s\t%s\t%08x\t%08x\t%d\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%d\t%s\n",
 			info.replicaName,
 			info.Generation,
-			info.Index,
-			info.Offset,
+			litestream.FormatIndex(info.Index),
+			litestream.FormatOffset(info.Offset),
 			info.Size,
 			info.CreatedAt.Format(time.RFC3339),
 		)

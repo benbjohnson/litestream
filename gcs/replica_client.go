@@ -160,8 +160,6 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
-
 	return litestream.SnapshotInfo{
 		Generation: generation,
 		Index:      index,
