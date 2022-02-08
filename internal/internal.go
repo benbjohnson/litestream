@@ -15,6 +15,12 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
+// Platform-independent maximum integer sizes.
+const (
+	MaxUint = ^uint(0)
+	MaxInt  = int(MaxUint >> 1)
+)
+
 // ReadCloser wraps a reader to also attach a separate closer.
 type ReadCloser struct {
 	r io.Reader
@@ -170,14 +176,14 @@ func ParseSnapshotPath(s string) (index int, err error) {
 		return 0, fmt.Errorf("invalid snapshot path")
 	}
 
-	i32, _ := strconv.ParseUint(a[1], 16, 32)
-	if i32 > math.MaxInt32 {
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	if i64 > uint64(MaxInt) {
 		return 0, fmt.Errorf("index too large in snapshot path %q", s)
 	}
-	return int(i32), nil
+	return int(i64), nil
 }
 
-var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot\.lz4$`)
+var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{16})\.snapshot\.lz4$`)
 
 // ParseWALSegmentPath parses the index/offset from a segment filename. Used by path-based replicas.
 func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
@@ -186,18 +192,18 @@ func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
 		return 0, 0, fmt.Errorf("invalid wal segment path")
 	}
 
-	i32, _ := strconv.ParseUint(a[1], 16, 32)
-	if i32 > math.MaxInt32 {
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	if i64 > uint64(MaxInt) {
 		return 0, 0, fmt.Errorf("index too large in wal segment path %q", s)
 	}
 	off64, _ := strconv.ParseUint(a[2], 16, 64)
 	if off64 > math.MaxInt64 {
 		return 0, 0, fmt.Errorf("offset too large in wal segment path %q", s)
 	}
-	return int(i32), int64(off64), nil
+	return int(i64), int64(off64), nil
 }
 
-var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\/([0-9a-f]{8})\.wal\.lz4$`)
+var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{16})\/([0-9a-f]{16})\.wal\.lz4$`)
 
 // Shared replica metrics.
 var (

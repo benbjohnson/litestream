@@ -272,7 +272,7 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 // of the on-disk file on success.
 func (d *WALDownloader) downloadWAL(ctx context.Context, index int, offsets []int64) (string, error) {
 	// Open handle to destination WAL path.
-	walPath := fmt.Sprintf("%s-%08x-wal", d.prefix, index)
+	walPath := fmt.Sprintf("%s-%s-wal", d.prefix, FormatIndex(index))
 	f, err := internal.CreateFile(walPath, d.Mode, d.Uid, d.Gid)
 	if err != nil {
 		return "", err
@@ -285,7 +285,7 @@ func (d *WALDownloader) downloadWAL(ctx context.Context, index int, offsets []in
 		if err := func() error {
 			// Ensure next offset is our current position in the file.
 			if written != offset {
-				return fmt.Errorf("missing WAL offset: generation=%s index=%08x offset=%08x", d.generation, index, written)
+				return fmt.Errorf("missing WAL offset: generation=%s index=%s offset=%s", d.generation, FormatIndex(index), FormatOffset(written))
 			}
 
 			rd, err := d.client.WALSegmentReader(ctx, Pos{Generation: d.generation, Index: index, Offset: offset})
@@ -331,5 +331,5 @@ type WALNotFoundError struct {
 
 // Error returns the error string.
 func (e *WALNotFoundError) Error() string {
-	return fmt.Sprintf("wal not found: generation=%s index=%08x", e.Generation, e.Index)
+	return fmt.Sprintf("wal not found: generation=%s index=%s", e.Generation, FormatIndex(e.Index))
 }

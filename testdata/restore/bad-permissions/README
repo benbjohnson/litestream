@@ -5,9 +5,9 @@ To reproduce this testdata, run sqlite3 and execute:
 	INSERT INTO t (x) VALUES (1);
 	INSERT INTO t (x) VALUES (2);
 
-	sl3 split -o generations/0000000000000000/wal/00000000 db-wal
-	cp db generations/0000000000000000/snapshots/00000000.snapshot
-	lz4 -c --rm generations/0000000000000000/snapshots/00000000.snapshot
+	sl3 split -o generations/0000000000000000/wal/0000000000000000 db-wal
+	cp db generations/0000000000000000/snapshots/0000000000000000.snapshot
+	lz4 -c --rm generations/0000000000000000/snapshots/0000000000000000.snapshot
 
 
 Then execute:
@@ -15,7 +15,7 @@ Then execute:
 	PRAGMA wal_checkpoint(TRUNCATE);
 	INSERT INTO t (x) VALUES (3);
 
-	sl3 split -o generations/0000000000000000/wal/00000001 db-wal
+	sl3 split -o generations/0000000000000000/wal/0000000000000001 db-wal
 
 
 Then execute:
@@ -24,13 +24,13 @@ Then execute:
 	INSERT INTO t (x) VALUES (4);
 	INSERT INTO t (x) VALUES (5);
 
-	sl3 split -o generations/0000000000000000/wal/00000002 db-wal
+	sl3 split -o generations/0000000000000000/wal/0000000000000002 db-wal
 
 
 Finally, obtain the final snapshot:
 
 	PRAGMA wal_checkpoint(TRUNCATE);
 
-	cp db 00000002.db
+	cp db 0000000000000002.db
 	rm db*
 

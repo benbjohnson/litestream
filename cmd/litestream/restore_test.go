@@ -27,10 +27,10 @@ func TestRestoreCommand(t *testing.T) {
 		// STDOUT has timing info so we need to grep per line.
 		lines := strings.Split(stdout.String(), "\n")
 		for i, substr := range []string{
-			`restoring snapshot 0000000000000000/00000000 to ` + filepath.Join(tempDir, "db.tmp"),
-			`applied wal 0000000000000000/00000000 elapsed=`,
-			`applied wal 0000000000000000/00000001 elapsed=`,
-			`applied wal 0000000000000000/00000002 elapsed=`,
+			`restoring snapshot 0000000000000000/0000000000000000 to ` + filepath.Join(tempDir, "db.tmp"),
+			`applied wal 0000000000000000/0000000000000000 elapsed=`,
+			`applied wal 0000000000000000/0000000000000001 elapsed=`,
+			`applied wal 0000000000000000/0000000000000002 elapsed=`,
 			`renaming database from temporary location`,
 		} {
 			if !strings.Contains(lines[i], substr) {
@@ -54,7 +54,7 @@ func TestRestoreCommand(t *testing.T) {
 		// STDOUT has timing info so we need to grep per line.
 		lines := strings.Split(stdout.String(), "\n")
 		for i, substr := range []string{
-			`restoring snapshot 0000000000000001/00000001 to ` + filepath.Join(tempDir, "db.tmp"),
+			`restoring snapshot 0000000000000001/0000000000000001 to ` + filepath.Join(tempDir, "db.tmp"),
 			`no wal files found, snapshot only`,
 			`renaming database from temporary location`,
 		} {
@@ -78,7 +78,7 @@ func TestRestoreCommand(t *testing.T) {
 
 		lines := strings.Split(stdout.String(), "\n")
 		for i, substr := range []string{
-			`restoring snapshot 0000000000000000/00000000 to ` + filepath.Join(tempDir, "db.tmp"),
+			`restoring snapshot 0000000000000000/0000000000000000 to ` + filepath.Join(tempDir, "db.tmp"),
 			`no wal files found, snapshot only`,
 			`renaming database from temporary location`,
 		} {
@@ -102,7 +102,7 @@ func TestRestoreCommand(t *testing.T) {
 
 		lines := strings.Split(stdout.String(), "\n")
 		for i, substr := range []string{
-			`restoring snapshot 0000000000000001/00000000 to ` + filepath.Join(tempDir, "db.tmp"),
+			`restoring snapshot 0000000000000001/0000000000000000 to ` + filepath.Join(tempDir, "db.tmp"),
 			`no wal files found, snapshot only`,
 			`renaming database from temporary location`,
 		} {
@@ -256,7 +256,7 @@ func TestRestoreCommand(t *testing.T) {
 
 	t.Run("ErrInvalidReplicaURL", func(t *testing.T) {
 		m, _, _, _ := newMain()
-		err := m.Run(context.Background(), []string{"restore", "-o", "/tmp/db", "xyz://xyz"})
+		err := m.Run(context.Background(), []string{"restore", "-o", filepath.Join(t.TempDir(), "db"), "xyz://xyz"})
 		if err == nil || err.Error() != `unknown replica type in config: "xyz"` {
 			t.Fatalf("unexpected error: %s", err)
 		}

@@ -78,7 +78,7 @@ func TestReplicaClient_SnapshotPath(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		if got, err := litestream.NewFileReplicaClient("/foo").SnapshotPath("0123456701234567", 1000); err != nil {
 			t.Fatal(err)
-		} else if want := "/foo/generations/0123456701234567/snapshots/000003e8.snapshot.lz4"; got != want {
+		} else if want := "/foo/generations/0123456701234567/snapshots/00000000000003e8.snapshot.lz4"; got != want {
 			t.Fatalf("SnapshotPath()=%v, want %v", got, want)
 		}
 	})
@@ -118,7 +118,7 @@ func TestReplicaClient_WALSegmentPath(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		if got, err := litestream.NewFileReplicaClient("/foo").WALSegmentPath("0123456701234567", 1000, 1001); err != nil {
 			t.Fatal(err)
-		} else if want := "/foo/generations/0123456701234567/wal/000003e8/000003e9.wal.lz4"; got != want {
+		} else if want := "/foo/generations/0123456701234567/wal/00000000000003e8/00000000000003e9.wal.lz4"; got != want {
 			t.Fatalf("WALPath()=%v, want %v", got, want)
 		}
 	})

@@ -100,7 +100,7 @@ func (c *FileReplicaClient) WALSegmentPath(generation string, index int, offset 
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, FormatIndex(index), fmt.Sprintf("%08x.wal.lz4", offset)), nil
+	return filepath.Join(dir, FormatIndex(index), fmt.Sprintf("%s.wal.lz4", FormatOffset(offset))), nil
 }
 
 // Generations returns a list of available generation names.

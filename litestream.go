@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/benbjohnson/litestream/internal"
 	"github.com/mattn/go-sqlite3"
 )
 
@@ -302,7 +304,7 @@ func (p Pos) String() string {
 	if p.IsZero() {
 		return ""
 	}
-	return fmt.Sprintf("%s/%08x:%08x", p.Generation, p.Index, p.Offset)
+	return fmt.Sprintf("%s/%s:%s", p.Generation, FormatIndex(p.Index), FormatOffset(p.Offset))
 }
 
 // IsZero returns true if p is the zero value.
@@ -426,32 +428,36 @@ func IsGenerationName(s string) bool {
 	return true
 }
 
-// FormatIndex formats an index as an 8-character hex value.
+// FormatIndex formats an index as a hex value.
 func FormatIndex(index int) string {
-	return fmt.Sprintf("%08x", index)
+	return fmt.Sprintf("%016x", index)
 }
 
 // ParseIndex parses a hex-formatted index into an integer.
 func ParseIndex(s string) (int, error) {
-	v, err := strconv.ParseUint(s, 16, 32)
+	v, err := strconv.ParseUint(s, 16, 64)
 	if err != nil {
 		return -1, fmt.Errorf("cannot parse index: %q", s)
+	} else if v > uint64(internal.MaxInt) {
+		return -1, fmt.Errorf("index too large: %q", s)
 	}
 	return int(v), nil
 }
 
-// FormatOffset formats an offset as an 8-character hex value.
+// FormatOffset formats an offset as a hex value.
 func FormatOffset(offset int64) string {
-	return fmt.Sprintf("%08x", offset)
+	return fmt.Sprintf("%016x", offset)
 }
 
 // ParseOffset parses a hex-formatted offset into an integer.
 func ParseOffset(s string) (int64, error) {
-	v, err := strconv.ParseInt(s, 16, 32)
+	v, err := strconv.ParseUint(s, 16, 64)
 	if err != nil {
-		return -1, fmt.Errorf("cannot parse index: %q", s)
+		return -1, fmt.Errorf("cannot parse offset: %q", s)
+	} else if v > math.MaxInt64 {
+		return -1, fmt.Errorf("offset too large: %q", s)
 	}
-	return v, nil
+	return int64(v), nil
 }
 
 // removeDBFiles deletes the database and related files (journal, shm, wal).

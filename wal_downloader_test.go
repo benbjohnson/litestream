@@ -38,7 +38,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 0; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000000.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000000.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -46,7 +46,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 1; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000001.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000001.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -54,7 +54,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 2; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000002.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000002.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -82,7 +82,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 0; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000000.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000000.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -106,7 +106,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 1; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000001.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000001.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -130,7 +130,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 0; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000000.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000000.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -138,7 +138,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 1; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000001.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000001.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -162,7 +162,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 1; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000001.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000001.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -170,7 +170,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 2; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000002.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000002.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -191,7 +191,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 		const n = 1000
 		tempDir := t.TempDir()
 		for i := 0; i < n; i++ {
-			filename := filepath.Join(tempDir, "generations", "0000000000000000", "wal", fmt.Sprintf("%08x", i), "00000000.wal.lz4")
+			filename := filepath.Join(tempDir, "generations", "0000000000000000", "wal", litestream.FormatIndex(i), "0000000000000000.wal.lz4")
 			if err := os.MkdirAll(filepath.Dir(filename), 0777); err != nil {
 				t.Fatal(err)
 			} else if err := os.WriteFile(filename, testingutil.CompressLZ4(t, []byte(fmt.Sprint(i))), 0666); err != nil {
@@ -316,7 +316,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 			t.Fatal(err)
 		} else if got, want := index, 0; got != want {
 			t.Fatalf("index=%d, want %d", got, want)
-		} else if !fileEqual(t, filepath.Join(testDir, "00000000.wal"), filename) {
+		} else if !fileEqual(t, filepath.Join(testDir, "0000000000000000.wal"), filename) {
 			t.Fatalf("output file mismatch: %s", filename)
 		}
 
@@ -441,7 +441,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 		d := litestream.NewWALDownloader(client, filepath.Join(tempDir, "wal"), "0000000000000000", 0, 0)
 		defer d.Close()
 
-		if _, _, err := d.Next(context.Background()); err == nil || err.Error() != `missing WAL offset: generation=0000000000000000 index=00000000 offset=00002050` {
+		if _, _, err := d.Next(context.Background()); err == nil || err.Error() != `missing WAL offset: generation=0000000000000000 index=0000000000000000 offset=0000000000002050` {
 			t.Fatal(err)
 		} else if err := d.Close(); err != nil {
 			t.Fatal(err)
@@ -529,7 +529,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 
 func TestWALNotFoundError(t *testing.T) {
 	err := &litestream.WALNotFoundError{Generation: "0123456789abcdef", Index: 1000}
-	if got, want := err.Error(), `wal not found: generation=0123456789abcdef index=000003e8`; got != want {
+	if got, want := err.Error(), `wal not found: generation=0123456789abcdef index=00000000000003e8`; got != want {
 		t.Fatalf("Error()=%q, want %q", got, want)
 	}
 }

@@ -88,7 +88,7 @@ func FindSnapshotForIndex(ctx context.Context, client ReplicaClient, generation 
 	if n == 0 {
 		return 0, ErrNoSnapshots
 	} else if snapshotIndex == -1 {
-		return 0, fmt.Errorf("no snapshots available at or before index %08x", index)
+		return 0, fmt.Errorf("no snapshots available at or before index %s", FormatIndex(index))
 	}
 	return snapshotIndex, nil
 }
@@ -349,7 +349,7 @@ func Restore(ctx context.Context, client ReplicaClient, filename, generation str
 
 	// Copy snapshot to output path.
 	tmpPath := filename + ".tmp"
-	logger.Printf("%srestoring snapshot %s/%08x to %s", opt.LogPrefix, generation, snapshotIndex, tmpPath)
+	logger.Printf("%srestoring snapshot %s/%s to %s", opt.LogPrefix, generation, FormatIndex(snapshotIndex), tmpPath)
 	if err := RestoreSnapshot(ctx, client, tmpPath, generation, snapshotIndex, opt.Mode, opt.Uid, opt.Gid); err != nil {
 		return fmt.Errorf("cannot restore snapshot: %w", err)
 	}
@@ -380,7 +380,7 @@ func Restore(ctx context.Context, client ReplicaClient, filename, generation str
 		if err = ApplyWAL(ctx, tmpPath, walPath); err != nil {
 			return fmt.Errorf("cannot apply wal: %w", err)
 		}
-		logger.Printf("%sapplied wal %s/%08x elapsed=%s", opt.LogPrefix, generation, walIndex, time.Since(startTime).String())
+		logger.Printf("%sapplied wal %s/%s elapsed=%s", opt.LogPrefix, generation, FormatIndex(walIndex), time.Since(startTime).String())
 	}
 
 	// Copy file to final location.

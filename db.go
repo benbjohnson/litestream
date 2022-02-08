@@ -703,7 +703,7 @@ func (db *DB) cleanWAL(ctx context.Context) error {
 			return err
 		}
 
-		db.Logger.Printf("remove shadow index: %s/%08x", generation, index)
+		db.Logger.Printf("remove shadow index: %s/%s", generation, FormatIndex(index))
 	}
 
 	return nil
