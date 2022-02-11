@@ -39,10 +39,12 @@ const (
 
 // Litestream errors.
 var (
-	ErrNoGeneration     = errors.New("no generation available")
-	ErrNoSnapshots      = errors.New("no snapshots available")
-	ErrNoWALSegments    = errors.New("no wal segments available")
-	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
+	ErrDBClosed          = errors.New("database closed")
+	ErrNoGeneration      = errors.New("no generation available")
+	ErrGenerationChanged = errors.New("generation changed")
+	ErrNoSnapshots       = errors.New("no snapshots available")
+	ErrNoWALSegments     = errors.New("no wal segments available")
+	ErrChecksumMismatch  = errors.New("invalid replica, checksum mismatch")
 )
 
 var (

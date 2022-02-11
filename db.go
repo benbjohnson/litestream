@@ -45,15 +45,17 @@ const BusyTimeout = 1 * time.Second
 
 // DB represents a managed instance of a SQLite database in the file system.
 type DB struct {
-	mu        sync.RWMutex
-	path      string        // part to database
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pos       Pos           // cached position
-	pageSize  int           // page size, in bytes
-	notifyCh  chan struct{} // notifies DB of changes
-	walNotify chan struct{} // closes on WAL change
+	mu       sync.RWMutex
+	path     string        // part to database
+	db       *sql.DB       // target database
+	f        *os.File      // long-running db file descriptor
+	rtx      *sql.Tx       // long running read transaction
+	pos      Pos           // cached position
+	pageSize int           // page size, in bytes
+	notifyCh chan struct{} // notifies DB of changes
+
+	// Iterators used to stream new WAL changes to replicas
+	itrs map[*FileWALSegmentIterator]struct{}
 
 	// Cached salt & checksum from current shadow header.
 	hdr              []byte
@@ -111,9 +113,10 @@ type DB struct {
 // NewDB returns a new instance of DB for a given path.
 func NewDB(path string) *DB {
 	db := &DB{
-		path:      path,
-		notifyCh:  make(chan struct{}, 1),
-		walNotify: make(chan struct{}),
+		path:     path,
+		notifyCh: make(chan struct{}, 1),
+
+		itrs: make(map[*FileWALSegmentIterator]struct{}),
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
@@ -245,7 +248,7 @@ func (db *DB) invalidatePos(ctx context.Context) error {
 	}
 
 	// Iterate over all segments to find the last one.
-	itr, err := db.WALSegments(context.Background(), generation)
+	itr, err := db.walSegments(context.Background(), generation, false)
 	if err != nil {
 		return err
 	}
@@ -363,13 +366,6 @@ func (db *DB) NotifyCh() chan<- struct{} {
 	return db.notifyCh
 }
 
-// WALNotify returns a channel that closes when the shadow WAL changes.
-func (db *DB) WALNotify() <-chan struct{} {
-	db.mu.RLock()
-	defer db.mu.RUnlock()
-	return db.walNotify
-}
-
 // PageSize returns the page size of the underlying database.
 // Only valid after database exists & Init() has successfully run.
 func (db *DB) PageSize() int {
@@ -439,6 +435,14 @@ func (db *DB) Close() (err error) {
 			err = e
 		}
 	}
+
+	// Remove all iterators.
+	db.mu.Lock()
+	for itr := range db.itrs {
+		itr.SetErr(ErrDBClosed)
+		delete(db.itrs, itr)
+	}
+	db.mu.Unlock()
 
 	// Release the read lock to allow other applications to handle checkpointing.
 	if db.rtx != nil {
@@ -833,7 +837,6 @@ func (db *DB) sync(ctx context.Context) (err error) {
 			return fmt.Errorf("invalidate: %w", err)
 		}
 	}
-	origPos := db.pos
 
 	// If sync fails, reset position & cache.
 	defer func() {
@@ -933,12 +936,6 @@ func (db *DB) sync(ctx context.Context) (err error) {
 	// This is only for metrics so we ignore any errors that occur.
 	db.shadowWALIndexGauge.Set(float64(db.pos.Index))
 	db.shadowWALSizeGauge.Set(float64(db.pos.Offset))
-
-	// Notify replicas of WAL changes.
-	if db.pos != origPos {
-		close(db.walNotify)
-		db.walNotify = make(chan struct{})
-	}
 
 	return nil
 }
@@ -1263,7 +1260,8 @@ func (db *DB) writeWALSegment(ctx context.Context, pos Pos, rd io.Reader) error 
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(f, rd); err != nil {
+	n, err := io.Copy(f, rd)
+	if err != nil {
 		return err
 	} else if err := f.Sync(); err != nil {
 		return err
@@ -1276,14 +1274,47 @@ func (db *DB) writeWALSegment(ctx context.Context, pos Pos, rd io.Reader) error 
 		return err
 	}
 
+	// Generate
+	info := WALSegmentInfo{
+		Generation: pos.Generation,
+		Index:      pos.Index,
+		Offset:     pos.Offset,
+		Size:       n,
+		CreatedAt:  time.Now(),
+	}
+
+	// Notify all managed segment iterators.
+	for itr := range db.itrs {
+		// Notify iterators of generation change.
+		if itr.Generation() != pos.Generation {
+			itr.SetErr(ErrGenerationChanged)
+			delete(db.itrs, itr)
+			continue
+		}
+
+		// Attempt to append segment to end of iterator.
+		// On error, mark it on the iterator and remove from future notifications.
+		if err := itr.Append(info); err != nil {
+			itr.SetErr(fmt.Errorf("cannot append wal segment: %w", err))
+			delete(db.itrs, itr)
+			continue
+		}
+	}
+
 	return nil
 }
 
 // WALSegments returns an iterator over all available WAL files for a generation.
-func (db *DB) WALSegments(ctx context.Context, generation string) (WALSegmentIterator, error) {
+func (db *DB) WALSegments(ctx context.Context, generation string) (*FileWALSegmentIterator, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	return db.walSegments(ctx, generation, true)
+}
+
+func (db *DB) walSegments(ctx context.Context, generation string, managed bool) (*FileWALSegmentIterator, error) {
 	ents, err := os.ReadDir(db.ShadowWALDir(generation))
 	if os.IsNotExist(err) {
-		return NewWALSegmentInfoSliceIterator(nil), nil
+		return NewFileWALSegmentIterator(db.ShadowWALDir(generation), generation, nil), nil
 	} else if err != nil {
 		return nil, err
 	}
@@ -1300,7 +1331,27 @@ func (db *DB) WALSegments(ctx context.Context, generation string) (WALSegmentIte
 
 	sort.Ints(indexes)
 
-	return newFileWALSegmentIterator(db.ShadowWALDir(generation), generation, indexes), nil
+	itr := NewFileWALSegmentIterator(db.ShadowWALDir(generation), generation, indexes)
+
+	// Managed iterators will have new segments pushed to them.
+	if managed {
+		itr.closeFunc = func() error {
+			return db.CloseWALSegmentIterator(itr)
+		}
+
+		db.itrs[itr] = struct{}{}
+	}
+
+	return itr, nil
+}
+
+// CloseWALSegmentIterator removes itr from the list of managed iterators.
+func (db *DB) CloseWALSegmentIterator(itr *FileWALSegmentIterator) error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	delete(db.itrs, itr)
+	return nil
 }
 
 // SQLite WAL constants
