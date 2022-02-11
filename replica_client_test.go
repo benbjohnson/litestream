@@ -489,8 +489,6 @@ func TestFindMaxIndexByGeneration(t *testing.T) {
 	})
 }
 
-func TestRestoreSnapshot(t *testing.T) { t.Skip("TODO") }
-
 func TestRestore(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		testDir := filepath.Join("testdata", "restore", "ok")

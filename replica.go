@@ -33,6 +33,7 @@ type Replica struct {
 
 	mu  sync.RWMutex
 	pos Pos // current replicated position
+	itr *FileWALSegmentIterator
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -126,6 +127,11 @@ func (r *Replica) Start(ctx context.Context) {
 func (r *Replica) Stop() {
 	r.cancel()
 	r.wg.Wait()
+
+	if r.itr != nil {
+		r.itr.Close()
+		r.itr = nil
+	}
 }
 
 // Close will close the DB file descriptor which could release locks on
@@ -155,9 +161,23 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	// Find current position of database.
 	dpos := r.db.Pos()
 	if dpos.IsZero() {
-		return fmt.Errorf("no generation, waiting for data")
+		return ErrNoGeneration
 	}
 	generation := dpos.Generation
+
+	// Close out iterator if the generation has changed.
+	if r.itr != nil && r.itr.Generation() != generation {
+		_ = r.itr.Close()
+		r.itr = nil
+	}
+
+	// Ensure we obtain a WAL iterator before we snapshot so we don't miss any segments.
+	resetItr := r.itr == nil
+	if resetItr {
+		if r.itr, err = r.db.WALSegments(ctx, generation); err != nil {
+			return fmt.Errorf("wal segments: %w", err)
+		}
+	}
 
 	// Create snapshot if no snapshots exist for generation.
 	snapshotN, err := r.snapshotN(generation)
@@ -174,7 +194,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	replicaSnapshotTotalGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(snapshotN))
 
 	// Determine position, if necessary.
-	if r.Pos().Generation != generation {
+	if resetItr {
 		pos, err := r.calcPos(ctx, generation)
 		if err != nil {
 			return fmt.Errorf("cannot determine replica position: %s", err)
@@ -196,16 +216,11 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	pos := r.Pos()
 
-	itr, err := r.db.WALSegments(ctx, pos.Generation)
-	if err != nil {
-		return err
-	}
-	defer itr.Close()
-
 	// Group segments by index.
 	var segments [][]WALSegmentInfo
-	for itr.Next() {
-		info := itr.WALSegment()
+	for r.itr.Next() {
+		info := r.itr.WALSegment()
+
 		if cmp, err := ComparePos(pos, info.Pos()); err != nil {
 			return fmt.Errorf("compare pos: %w", err)
 		} else if cmp == 1 {
@@ -624,38 +639,39 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation s
 
 // monitor runs in a separate goroutine and continuously replicates the DB.
 func (r *Replica) monitor(ctx context.Context) {
-	ticker := time.NewTicker(r.SyncInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(r.SyncInterval)
+	defer timer.Stop()
 
-	// Continuously check for new data to replicate.
-	ch := make(chan struct{})
-	close(ch)
-	var notify <-chan struct{} = ch
+	for {
+		if err := r.Sync(ctx); ctx.Err() != nil {
+			return
+		} else if err != nil && err != ErrNoGeneration {
+			r.Logger.Printf("monitor error: %s", err)
+		}
 
-	for initial := true; ; initial = false {
-		// Enforce a minimum time between synchronization.
-		if !initial {
+		// Wait for a change to the WAL iterator.
+		if r.itr != nil {
 			select {
 			case <-ctx.Done():
 				return
-			case <-ticker.C:
+			case <-r.itr.NotifyCh():
 			}
 		}
 
-		// Wait for changes to the database.
+		// Wait for the sync interval to collect additional changes.
+		timer.Reset(r.SyncInterval)
 		select {
 		case <-ctx.Done():
 			return
-		case <-notify:
+		case <-timer.C:
 		}
 
-		// Fetch new notify channel before replicating data.
-		notify = r.db.WALNotify()
-
-		// Synchronize the shadow wal into the replication directory.
-		if err := r.Sync(ctx); err != nil {
-			r.Logger.Printf("monitor error: %s", err)
-			continue
+		// Flush any additional notifications from the WAL iterator.
+		if r.itr != nil {
+			select {
+			case <-r.itr.NotifyCh():
+			default:
+			}
 		}
 	}
 }

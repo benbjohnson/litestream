@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -130,6 +131,136 @@ func TestReplicaClient_WALSegmentPath(t *testing.T) {
 	t.Run("ErrNoGeneration", func(t *testing.T) {
 		if _, err := litestream.NewFileReplicaClient("/foo").WALSegmentPath("", 1000, 0); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestFileWALSegmentIterator_Append(t *testing.T) {
+	t.Run("Empty", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err != nil {
+			t.Fatal(err)
+		}
+
+		select {
+		case <-itr.NotifyCh():
+		default:
+			t.Fatal("expected notification")
+		}
+
+		if !itr.Next() {
+			t.Fatal("expected next")
+		} else if got, want := itr.WALSegment(), (litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); got != want {
+			t.Fatalf("info=%#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("MultiOffset", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 1}); err != nil {
+			t.Fatal(err)
+		}
+
+		select {
+		case <-itr.NotifyCh():
+		default:
+			t.Fatal("expected notification")
+		}
+
+		if !itr.Next() {
+			t.Fatal("expected next")
+		} else if got, want := itr.WALSegment(), (litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); got != want {
+			t.Fatalf("info=%#v, want %#v", got, want)
+		}
+
+		if !itr.Next() {
+			t.Fatal("expected next")
+		} else if got, want := itr.WALSegment(), (litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 1}); got != want {
+			t.Fatalf("info=%#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("MultiIndex", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 1, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 1, Offset: 1}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 2, Offset: 0}); err != nil {
+			t.Fatal(err)
+		}
+
+		if got, want := itr.Indexes(), []int{1, 2}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("indexes=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("ErrGenerationMismatch", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0000000000000000", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err == nil || err.Error() != `generation mismatch` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrBelowMaxIndex", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 1, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err == nil || err.Error() != `appended index "0000000000000000" below max index "0000000000000001"` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrAboveMaxIndex", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 1, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 3, Offset: 0}); err == nil || err.Error() != `appended index "0000000000000003" skips index "0000000000000002"` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrBelowCurrentIndex", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 1, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err == nil || err.Error() != `appended index "0000000000000000" below current index "0000000000000001"` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSkipsNextIndex", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 0}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 2, Offset: 0}); err == nil || err.Error() != `appended index "0000000000000002" skips next index "0000000000000001"` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrBelowOffset", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 5}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 4}); err == nil || err.Error() != `appended offset 0000000000000000/0000000000000004 before last offset 0000000000000000/0000000000000005` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrDuplicateOffset", func(t *testing.T) {
+		itr := litestream.NewFileWALSegmentIterator(t.TempDir(), "0123456789abcdef", nil)
+		if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 5}); err != nil {
+			t.Fatal(err)
+		} else if err := itr.Append(litestream.WALSegmentInfo{Generation: "0123456789abcdef", Index: 0, Offset: 5}); err == nil || err.Error() != `duplicate offset 0000000000000000/0000000000000005 appended` {
+			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 }
