@@ -14,14 +14,8 @@ name: Release (Docker)
 jobs:
   docker:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        include:
-          - platform: linux/amd64
-          - platform: linux/arm64
-          - platform: linux/arm/v7
-
     env:
+      PLATFORMS: "${{ github.event_name == 'release' && 'linux/amd64,linux/arm64,linux/arm/v7' || 'linux/amd64,linux/arm64' }}"
       VERSION: "${{ github.event_name == 'release' && github.event.release.name || github.sha }}"
 
     steps:
@@ -50,7 +44,7 @@ jobs:
         with:
           context: .
           push: true
-          platforms: ${{ matrix.platform }}
+          platforms: ${{ env.PLATFORMS }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
