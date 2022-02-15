@@ -19,6 +19,7 @@ jobs:
         include:
           - platform: linux/amd64
           - platform: linux/arm64
+          - platform: linux/arm/v7
 
     env:
       VERSION: "${{ github.event_name == 'release' && github.event.release.name || github.sha }}"
