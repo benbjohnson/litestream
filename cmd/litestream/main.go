@@ -266,10 +266,11 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 
 // DBConfig represents the configuration for a single database.
 type DBConfig struct {
-	Path               string         `yaml:"path"`
-	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
-	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
-	MaxCheckpointPageN *int           `yaml:"max-checkpoint-page-count"`
+	Path                 string         `yaml:"path"`
+	MonitorDelayInterval *time.Duration `yaml:"monitor-delay-interval"`
+	CheckpointInterval   *time.Duration `yaml:"checkpoint-interval"`
+	MinCheckpointPageN   *int           `yaml:"min-checkpoint-page-count"`
+	MaxCheckpointPageN   *int           `yaml:"max-checkpoint-page-count"`
 
 	Replicas []*ReplicaConfig `yaml:"replicas"`
 }
@@ -289,6 +290,9 @@ func NewDBFromConfigWithPath(dbc *DBConfig, path string) (*litestream.DB, error)
 	db := litestream.NewDB(path)
 
 	// Override default database settings if specified in configuration.
+	if dbc.MonitorDelayInterval != nil {
+		db.MonitorDelayInterval = *dbc.MonitorDelayInterval
+	}
 	if dbc.CheckpointInterval != nil {
 		db.CheckpointInterval = *dbc.CheckpointInterval
 	}
