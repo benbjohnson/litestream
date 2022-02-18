@@ -27,14 +27,12 @@ import (
 
 // Default DB settings.
 const (
-	DefaultCheckpointInterval = 1 * time.Minute
+	DefaultMonitorDelayInterval = 10 * time.Millisecond
+	DefaultCheckpointInterval   = 1 * time.Minute
+
 	DefaultMinCheckpointPageN = 1000
 	DefaultMaxCheckpointPageN = 10000
 )
-
-// MonitorDelayInterval is the time Litestream will wait after receiving a file
-// change notification before processing the WAL file for changes.
-const MonitorDelayInterval = 10 * time.Millisecond
 
 // MaxIndex is the maximum possible WAL index.
 // If this index is reached then a new generation will be started.
@@ -98,6 +96,11 @@ type DB struct {
 	// unbounded if there are always read transactions occurring.
 	MaxCheckpointPageN int
 
+	// Time after receiving change notification before reading next WAL segment.
+	// Used for batching changes into fewer files instead of every transaction
+	// creating its own file.
+	MonitorDelayInterval time.Duration
+
 	// Time between automatic checkpoints in the WAL. This is done to allow
 	// more fine-grained WAL files so that restores can be performed with
 	// better precision.
@@ -118,9 +121,10 @@ func NewDB(path string) *DB {
 
 		itrs: make(map[*FileWALSegmentIterator]struct{}),
 
-		MinCheckpointPageN: DefaultMinCheckpointPageN,
-		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
-		CheckpointInterval: DefaultCheckpointInterval,
+		MinCheckpointPageN:   DefaultMinCheckpointPageN,
+		MaxCheckpointPageN:   DefaultMaxCheckpointPageN,
+		MonitorDelayInterval: DefaultMonitorDelayInterval,
+		CheckpointInterval:   DefaultCheckpointInterval,
 
 		Logger: log.New(LogWriter, fmt.Sprintf("%s: ", logPrefixPath(path)), LogFlags),
 	}
@@ -1497,8 +1501,12 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 
 // monitor runs in a separate goroutine and monitors the database & WAL.
 func (db *DB) monitor() {
-	timer := time.NewTimer(MonitorDelayInterval)
-	defer timer.Stop()
+	var timer *time.Timer
+
+	if db.MonitorDelayInterval > 0 {
+		timer := time.NewTimer(db.MonitorDelayInterval)
+		defer timer.Stop()
+	}
 
 	for {
 		// Wait for a file change notification from the file system.
@@ -1509,8 +1517,10 @@ func (db *DB) monitor() {
 		}
 
 		// Wait for small delay before processing changes.
-		timer.Reset(MonitorDelayInterval)
-		<-timer.C
+		if timer != nil {
+			timer.Reset(db.MonitorDelayInterval)
+			<-timer.C
+		}
 
 		// Clear any additional change notifications that occurred during delay.
 		select {

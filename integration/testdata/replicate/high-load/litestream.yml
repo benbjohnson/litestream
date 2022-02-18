@@ -3,5 +3,4 @@ dbs:
     replicas:
       - path: $LITESTREAM_TEMPDIR/replica
 
-    monitor-interval: 100ms
     max-checkpoint-page-count: 20

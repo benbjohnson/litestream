@@ -215,6 +215,55 @@ func TestCmd_Replicate_ResumeWithNewGeneration(t *testing.T) {
 	restoreAndVerify(t, ctx, env, filepath.Join(testDir, "litestream.yml"), filepath.Join(tempDir, "db"))
 }
 
+// Ensure the monitor interval can be turned off.
+func TestCmd_Replicate_NoMonitorDelayInterval(t *testing.T) {
+	ctx := context.Background()
+	testDir, tempDir := filepath.Join("testdata", "replicate", "no-monitor-delay-interval"), t.TempDir()
+	env := []string{"LITESTREAM_TEMPDIR=" + tempDir}
+
+	cmd, stdout, _ := commandContext(ctx, env, "replicate", "-config", filepath.Join(testDir, "litestream.yml"))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err := sql.Open("sqlite3", filepath.Join(tempDir, "db"))
+	if err != nil {
+		t.Fatal(err)
+	} else if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	} else if _, err := db.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	time.Sleep(1 * time.Second)
+
+	// Execute writes periodically.
+	for i := 0; i < 10; i++ {
+		t.Logf("[exec] INSERT INTO t (id) VALUES (%d)", i)
+		if _, err := db.ExecContext(ctx, `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Stop & wait for Litestream command.
+	killLitestreamCmd(t, cmd, stdout)
+
+	// Ensure signal and shutdown are logged.
+	if s := stdout.String(); !strings.Contains(s, `signal received, litestream shutting down`) {
+		t.Fatal("missing log output for signal received")
+	} else if s := stdout.String(); !strings.Contains(s, `litestream shut down`) {
+		t.Fatal("missing log output for shut down")
+	}
+
+	// Checkpoint & verify original SQLite database.
+	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	restoreAndVerify(t, ctx, env, filepath.Join(testDir, "litestream.yml"), filepath.Join(tempDir, "db"))
+}
+
 // Ensure the default configuration works with heavy write load.
 func TestCmd_Replicate_HighLoad(t *testing.T) {
 	if testing.Short() {
