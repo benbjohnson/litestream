@@ -6,19 +6,16 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/exec"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/http"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	"github.com/mattn/go-shellwords"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
@@ -35,7 +32,8 @@ type ReplicateCommand struct {
 
 	Config Config
 
-	server *litestream.Server
+	server     *litestream.Server
+	httpServer *http.Server
 }
 
 // NewReplicateCommand returns a new instance of ReplicateCommand.
@@ -143,22 +141,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 	}
 
-	// Serve metrics over HTTP if enabled.
+	// Serve HTTP if enabled.
 	if c.Config.Addr != "" {
-		hostport := c.Config.Addr
-		if host, port, _ := net.SplitHostPort(c.Config.Addr); port == "" {
-			return fmt.Errorf("must specify port for bind address: %q", c.Config.Addr)
-		} else if host == "" {
-			hostport = net.JoinHostPort("localhost", port)
+		c.httpServer = http.NewServer(c.server, c.Config.Addr)
+		if err := c.httpServer.Open(); err != nil {
+			return fmt.Errorf("cannot start http server: %w", err)
 		}
-
-		log.Printf("serving metrics on http://%s/metrics", hostport)
-		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
-				log.Printf("cannot start metrics server: %s", err)
-			}
-		}()
 	}
 
 	// Parse exec commands args & start subprocess.
@@ -183,10 +171,17 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	return nil
 }
 
-// Close closes all open databases.
+// Close closes the HTTP server & all open databases.
 func (c *ReplicateCommand) Close() (err error) {
-	if e := c.server.Close(); e != nil && err == nil {
-		err = e
+	if c.httpServer != nil {
+		if e := c.httpServer.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+	if c.server != nil {
+		if e := c.server.Close(); e != nil && err == nil {
+			err = e
+		}
 	}
 	return err
 }

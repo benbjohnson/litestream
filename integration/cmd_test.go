@@ -391,6 +391,69 @@ LOOP:
 	restoreAndVerify(t, ctx, env, filepath.Join(testDir, "litestream.yml"), filepath.Join(tempDir, "db"))
 }
 
+// Ensure a database can be replicated over HTTP.
+func TestCmd_Replicate_HTTP(t *testing.T) {
+	ctx := context.Background()
+	testDir, tempDir := filepath.Join("testdata", "replicate", "http"), t.TempDir()
+	if err := os.Mkdir(filepath.Join(tempDir, "0"), 0777); err != nil {
+		t.Fatal(err)
+	} else if err := os.Mkdir(filepath.Join(tempDir, "1"), 0777); err != nil {
+		t.Fatal(err)
+	}
+
+	env0 := []string{"LITESTREAM_TEMPDIR=" + tempDir}
+	env1 := []string{"LITESTREAM_TEMPDIR=" + tempDir, "LITESTREAM_UPSTREAM_URL=http://localhost:10001"}
+
+	cmd0, stdout0, _ := commandContext(ctx, env0, "replicate", "-config", filepath.Join(testDir, "litestream.0.yml"))
+	if err := cmd0.Start(); err != nil {
+		t.Fatal(err)
+	}
+	cmd1, stdout1, _ := commandContext(ctx, env1, "replicate", "-config", filepath.Join(testDir, "litestream.1.yml"))
+	if err := cmd1.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	db0, err := sql.Open("sqlite3", filepath.Join(tempDir, "0", "db"))
+	if err != nil {
+		t.Fatal(err)
+	} else if _, err := db0.ExecContext(ctx, `PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	} else if _, err := db0.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	defer db0.Close()
+
+	// Execute writes periodically.
+	for i := 0; i < 100; i++ {
+		t.Logf("[exec] INSERT INTO t (id) VALUES (%d)", i)
+		if _, err := db0.ExecContext(ctx, `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Wait for replica to catch up.
+	time.Sleep(1 * time.Second)
+
+	// Verify count in replica table.
+	db1, err := sql.Open("sqlite3", filepath.Join(tempDir, "1", "db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db1.Close()
+
+	var n int
+	if err := db1.QueryRowContext(ctx, `SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatal(err)
+	} else if got, want := n, 100; got != want {
+		t.Fatalf("replica count=%d, want %d", got, want)
+	}
+
+	// Stop & wait for Litestream command.
+	killLitestreamCmd(t, cmd1, stdout1) // kill
+	killLitestreamCmd(t, cmd0, stdout0)
+}
+
 // commandContext returns a "litestream" command with stdout/stderr buffers.
 func commandContext(ctx context.Context, env []string, arg ...string) (cmd *exec.Cmd, stdout, stderr *internal.LockingBuffer) {
 	cmd = exec.CommandContext(ctx, "litestream", arg...)
@@ -428,6 +491,7 @@ func waitForLogMessage(tb testing.TB, b *internal.LockingBuffer, msg string) {
 
 // killLitestreamCmd interrupts the process and waits for a clean shutdown.
 func killLitestreamCmd(tb testing.TB, cmd *exec.Cmd, stdout *internal.LockingBuffer) {
+	tb.Helper()
 	if err := cmd.Process.Signal(os.Interrupt); err != nil {
 		tb.Fatal("kill litestream: signal:", err)
 	} else if err := cmd.Wait(); err != nil {
