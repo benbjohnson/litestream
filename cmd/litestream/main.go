@@ -23,6 +23,7 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/http"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
@@ -267,6 +268,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 // DBConfig represents the configuration for a single database.
 type DBConfig struct {
 	Path                 string         `yaml:"path"`
+	Upstream             UpstreamConfig `yaml:"upstream"`
 	MonitorDelayInterval *time.Duration `yaml:"monitor-delay-interval"`
 	CheckpointInterval   *time.Duration `yaml:"checkpoint-interval"`
 	MinCheckpointPageN   *int           `yaml:"min-checkpoint-page-count"`
@@ -288,6 +290,14 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 func NewDBFromConfigWithPath(dbc *DBConfig, path string) (*litestream.DB, error) {
 	// Initialize database with given path.
 	db := litestream.NewDB(path)
+
+	// Attach upstream HTTP client if specified.
+	if upstreamURL := dbc.Upstream.URL; upstreamURL != "" {
+		if dbc.Upstream.Path == "" {
+			return nil, fmt.Errorf("upstream path required")
+		}
+		db.StreamClient = http.NewClient(upstreamURL, dbc.Upstream.Path)
+	}
 
 	// Override default database settings if specified in configuration.
 	if dbc.MonitorDelayInterval != nil {
@@ -313,6 +323,11 @@ func NewDBFromConfigWithPath(dbc *DBConfig, path string) (*litestream.DB, error)
 	}
 
 	return db, nil
+}
+
+type UpstreamConfig struct {
+	URL  string `yaml:"url"`
+	Path string `yaml:"path"`
 }
 
 // ReplicaConfig represents the configuration for a single replica in a database.

@@ -113,6 +113,21 @@ func CreateFile(filename string, mode os.FileMode, uid, gid int) (*os.File, erro
 	return f, nil
 }
 
+// WriteFile writes data to a named file and sets the mode & uid/gid.
+func WriteFile(name string, data []byte, perm os.FileMode, uid, gid int) error {
+	f, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	_ = f.Chown(uid, gid)
+
+	_, err = f.Write(data)
+	if err1 := f.Close(); err1 != nil && err == nil {
+		err = err1
+	}
+	return err
+}
+
 // MkdirAll is a copy of os.MkdirAll() except that it attempts to set the
 // mode/uid/gid to match fi for each created directory.
 func MkdirAll(path string, mode os.FileMode, uid, gid int) error {

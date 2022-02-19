@@ -1,0 +1,5 @@
+addr: :10001
+
+dbs:
+  - path: $LITESTREAM_TEMPDIR/0/db
+    max-checkpoint-page-count: 20
