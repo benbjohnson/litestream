@@ -71,9 +71,9 @@ func init() {
 type SnapshotIterator interface {
 	io.Closer
 
-	// Prepares the the next snapshot for reading with the Snapshot() method.
+	// Prepares the next snapshot for reading with the Snapshot() method.
 	// Returns true if another snapshot is available. Returns false if no more
-	// snapshots are available or if an error occured.
+	// snapshots are available or if an error occurred.
 	Next() bool
 
 	// Returns an error that occurred during iteration.
@@ -133,9 +133,9 @@ func (itr *SnapshotInfoSliceIterator) Snapshot() SnapshotInfo {
 type WALSegmentIterator interface {
 	io.Closer
 
-	// Prepares the the next WAL for reading with the WAL() method.
+	// Prepares the next WAL for reading with the WAL() method.
 	// Returns true if another WAL is available. Returns false if no more
-	// WAL files are available or if an error occured.
+	// WAL files are available or if an error occurred.
 	Next() bool
 
 	// Returns an error that occurred during iteration.
