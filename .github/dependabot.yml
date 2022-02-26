@@ -5,4 +5,4 @@ updates:
     assignees:
       - "benbjohnson"
     schedule:
-      interval: "weekly"
+      interval: "monthly"
