@@ -217,13 +217,34 @@ func (c *Config) DBConfig(path string) *DBConfig {
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
 // If expandEnv is true then environment variables are expanded in the config.
 // If filename is blank then the default config path is used.
-func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
-	config := DefaultConfig()
-
-	useDefaultPath := filename == ""
-	if useDefaultPath {
-		filename = DefaultConfigPath()
+func ReadConfigFile(filename string, expandEnv bool) (config Config, err error) {
+	var filenames []string
+	if filename != "" {
+		filenames = append(filenames, filename)
 	}
+	filenames = append(filenames, "./litestream.yml")
+	filenames = append(filenames, DefaultConfigPath())
+
+	for _, name := range filenames {
+		isDefaultPath := name != filename
+
+		if config, err = readConfigFile(name, expandEnv); os.IsNotExist(err) {
+			if isDefaultPath {
+				continue
+			}
+			return config, fmt.Errorf("config file not found: %s", filename)
+		} else if err != nil {
+			return config, err
+		}
+		break
+	}
+	return config, nil
+}
+
+// readConfigFile unmarshals config from filename. Expands path if needed.
+// If expandEnv is true then environment variables are expanded in the config.
+func readConfigFile(filename string, expandEnv bool) (_ Config, err error) {
+	config := DefaultConfig()
 
 	// Expand filename, if necessary.
 	filename, err = expand(filename)
@@ -234,12 +255,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	// Read configuration.
 	// Do not return an error if using default path and file is missing.
 	buf, err := ioutil.ReadFile(filename)
-	if os.IsNotExist(err) {
-		if useDefaultPath {
-			return config, nil
-		}
-		return config, fmt.Errorf("config file not found: %s", filename)
-	} else if err != nil {
+	if err != nil {
 		return config, err
 	}
 
