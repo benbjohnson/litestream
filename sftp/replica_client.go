@@ -270,12 +270,13 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 	if err != nil {
 		return info, fmt.Errorf("cannot open snapshot file for writing: %w", err)
 	}
-	defer f.Close()
+	closer := internal.OnceCloser(f)
+	defer closer.Close()
 
 	n, err := io.Copy(f, rd)
 	if err != nil {
 		return info, err
-	} else if err := f.Close(); err != nil {
+	} else if err := closer.Close(); err != nil {
 		return info, err
 	}
 
@@ -391,12 +392,13 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	if err != nil {
 		return info, fmt.Errorf("cannot open snapshot file for writing: %w", err)
 	}
-	defer f.Close()
+	closer := internal.OnceCloser(f)
+	defer closer.Close()
 
 	n, err := io.Copy(f, rd)
 	if err != nil {
 		return info, err
-	} else if err := f.Close(); err != nil {
+	} else if err := closer.Close(); err != nil {
 		return info, err
 	}
 

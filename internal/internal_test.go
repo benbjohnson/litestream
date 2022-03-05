@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestParseSnapshotPath(t *testing.T) {
@@ -98,5 +99,29 @@ func TestTruncateDuration(t *testing.T) {
 				t.Fatalf("duration=%s, want %s", got, want)
 			}
 		})
+	}
+}
+
+func TestOnceCloser(t *testing.T) {
+	var closed bool
+	var rc = &mock.ReadCloser{
+		CloseFunc: func() error {
+			if closed {
+				t.Fatal("already closed")
+			}
+			closed = true
+			return nil
+		},
+	}
+
+	oc := internal.OnceCloser(rc)
+	if err := oc.Close(); err != nil {
+		t.Fatalf("first close: %s", err)
+	} else if err := oc.Close(); err != nil {
+		t.Fatalf("second close: %s", err)
+	}
+
+	if !closed {
+		t.Fatal("expected close")
 	}
 }

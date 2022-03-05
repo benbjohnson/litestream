@@ -8,6 +8,7 @@ import (
 	"os"
 	"regexp"
 	"strconv"
+	"sync"
 	"syscall"
 	"time"
 
@@ -263,4 +264,19 @@ func TruncateDuration(d time.Duration) time.Duration {
 // MD5Hash returns a hex-encoded MD5 hash of b.
 func MD5Hash(b []byte) string {
 	return fmt.Sprintf("%x", md5.Sum(b))
+}
+
+// OnceCloser returns a closer that will only ignore duplicate closes.
+func OnceCloser(c io.Closer) io.Closer {
+	return &onceCloser{Closer: c}
+}
+
+type onceCloser struct {
+	sync.Once
+	io.Closer
+}
+
+func (c *onceCloser) Close() (err error) {
+	c.Once.Do(func() { err = c.Closer.Close() })
+	return err
 }
