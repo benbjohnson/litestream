@@ -51,6 +51,7 @@ func NewReplicateCommand(stdin io.Reader, stdout, stderr io.Writer) *ReplicateCo
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
+	addr := fs.String("addr", "", "HTTP bind address (host:port)")
 	registerConfigFlag(fs, &c.configPath, &c.noExpandEnv)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -83,7 +84,10 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		}
 	}
 
-	// Override config exec command, if specified.
+	// Override config with flags, if specified.
+	if *addr != "" {
+		c.Config.Addr = *addr
+	}
 	if *execFlag != "" {
 		c.Config.Exec = *execFlag
 	}
@@ -147,6 +151,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		if err := c.httpServer.Open(); err != nil {
 			return fmt.Errorf("cannot start http server: %w", err)
 		}
+		log.Printf("http server running at %s", c.httpServer.URL())
 	}
 
 	// Parse exec commands args & start subprocess.
