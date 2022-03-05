@@ -7,7 +7,7 @@ require (
 	github.com/Azure/azure-storage-blob-go v0.14.0
 	github.com/aws/aws-sdk-go v1.42.53
 	github.com/mattn/go-shellwords v1.0.12
-	github.com/mattn/go-sqlite3 v1.14.11
+	github.com/mattn/go-sqlite3 v1.14.12
 	github.com/pierrec/lz4/v4 v4.1.14
 	github.com/pkg/sftp v1.13.4
 	github.com/prometheus/client_golang v1.12.1
