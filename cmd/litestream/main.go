@@ -22,7 +22,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/http"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
@@ -396,8 +396,8 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		if client, err = newS3ReplicaClientFromConfig(c); err != nil {
 			return nil, err
 		}
-	case "gcs":
-		if client, err = newGCSReplicaClientFromConfig(c); err != nil {
+	case "gs":
+		if client, err = newGSReplicaClientFromConfig(c); err != nil {
 			return nil, err
 		}
 	case "abs":
@@ -525,13 +525,13 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig) (_ *s3.ReplicaClient, err er
 	return client, nil
 }
 
-// newGCSReplicaClientFromConfig returns a new instance of gcs.ReplicaClient built from config.
-func newGCSReplicaClientFromConfig(c *ReplicaConfig) (_ *gcs.ReplicaClient, err error) {
+// newGSReplicaClientFromConfig returns a new instance of gs.ReplicaClient built from config.
+func newGSReplicaClientFromConfig(c *ReplicaConfig) (_ *gs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
-		return nil, fmt.Errorf("cannot specify url & path for gcs replica")
+		return nil, fmt.Errorf("cannot specify url & path for gs replica")
 	} else if c.URL != "" && c.Bucket != "" {
-		return nil, fmt.Errorf("cannot specify url & bucket for gcs replica")
+		return nil, fmt.Errorf("cannot specify url & bucket for gs replica")
 	}
 
 	bucket, path := c.Bucket, c.Path
@@ -554,11 +554,11 @@ func newGCSReplicaClientFromConfig(c *ReplicaConfig) (_ *gcs.ReplicaClient, err 
 
 	// Ensure required settings are set.
 	if bucket == "" {
-		return nil, fmt.Errorf("bucket required for gcs replica")
+		return nil, fmt.Errorf("bucket required for gs replica")
 	}
 
 	// Build replica.
-	client := gcs.NewReplicaClient()
+	client := gs.NewReplicaClient()
 	client.Bucket = bucket
 	client.Path = path
 	return client, nil

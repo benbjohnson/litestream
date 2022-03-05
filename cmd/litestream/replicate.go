@@ -11,7 +11,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/http"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
@@ -133,7 +133,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), client.Type(), client.Path())
 			case *s3.ReplicaClient:
 				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q endpoint=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, client.Region, client.Endpoint, r.SyncInterval)
-			case *gcs.ReplicaClient:
+			case *gs.ReplicaClient:
 				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, r.SyncInterval)
 			case *abs.ReplicaClient:
 				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q endpoint=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, client.Endpoint, r.SyncInterval)

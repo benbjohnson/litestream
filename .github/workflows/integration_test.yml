@@ -52,10 +52,10 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
 
-      - run: go test -v -run=TestReplicaClient ./integration -replica-type gcs
+      - run: go test -v -run=TestReplicaClient ./integration -replica-type gs
         env:
           GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
-          LITESTREAM_GCS_BUCKET:           integration.litestream.io
+          LITESTREAM_GS_BUCKET:            integration.litestream.io
 
   abs-integration-test:
     name: Run Azure Blob Store Integration Tests
