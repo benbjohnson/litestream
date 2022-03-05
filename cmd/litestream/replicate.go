@@ -156,8 +156,14 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot parse exec command: %w", err)
 		}
 
+		// Pass first database path to child process.
+		env := os.Environ()
+		if dbs := c.server.DBs(); len(dbs) > 0 {
+			env = append(env, fmt.Sprintf("LITESTREAM_DB_PATH=%s", dbs[0].Path()))
+		}
+
 		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
-		c.cmd.Env = os.Environ()
+		c.cmd.Env = env
 		c.cmd.Stdout = os.Stdout
 		c.cmd.Stderr = os.Stderr
 		if err := c.cmd.Start(); err != nil {
