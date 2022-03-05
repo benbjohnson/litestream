@@ -1,8 +1,0 @@
-version: 2
-updates:
-  - package-ecosystem: "gomod"
-    directory: "/"
-    assignees:
-      - "benbjohnson"
-    schedule:
-      interval: "monthly"
