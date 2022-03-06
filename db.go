@@ -585,6 +585,16 @@ func (db *DB) init() (err error) {
 	db.fileMode = fi.Mode()
 	db.uid, db.gid = internal.Fileinfo(fi)
 
+	// Pass permissions to file replicas, if they exist.
+	for _, r := range db.Replicas {
+		if client, ok := r.Client().(*FileReplicaClient); ok {
+			client.FileMode = db.fileMode
+			client.DirMode = db.dirMode
+			client.Uid = db.uid
+			client.Gid = db.gid
+		}
+	}
+
 	// Start a long-running read transaction to prevent other transactions
 	// from checkpointing.
 	if err := db.acquireReadLock(); err != nil {
