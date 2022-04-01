@@ -450,10 +450,10 @@ func (itr *FileWALSegmentIterator) Next() bool {
 			itr.err = err
 			return false
 		}
-		defer f.Close()
 
 		fis, err := f.Readdir(-1)
 		if err != nil {
+			f.Close()
 			itr.err = err
 			return false
 		} else if err := f.Close(); err != nil {
