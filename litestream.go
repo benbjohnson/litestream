@@ -530,6 +530,7 @@ type StreamClient interface {
 // StreamReader represents a reader that streams snapshot and WAL records.
 type StreamReader interface {
 	io.ReadCloser
+	PageSize() int
 	Next() (*StreamRecordHeader, error)
 }
 

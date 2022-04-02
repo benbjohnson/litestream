@@ -677,8 +677,6 @@ func (db *DB) initReplica(pageSize int) (err error) {
 			return fmt.Errorf("enable wal failed, mode=%q", mode)
 		}
 
-		// TODO: Set page size.
-
 		if _, err := db.db.ExecContext(db.ctx, `CREATE TABLE IF NOT EXISTS _litestream (id INTEGER)`); err != nil {
 			return fmt.Errorf("create _litestream table: %w", err)
 		} else if _, err := db.db.ExecContext(db.ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
