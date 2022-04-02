@@ -1,15 +1,14 @@
 package http
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	httppprof "net/http/pprof"
-	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/benbjohnson/litestream"
@@ -142,6 +141,9 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Set the page size in the header.
+	w.Header().Set("Litestream-page-size", strconv.Itoa(db.PageSize()))
+
 	// TODO: Restart stream from a previous position, if specified.
 
 	// Determine starting position.
@@ -259,115 +261,4 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-}
-
-type Client struct {
-	// Upstream endpoint
-	URL string
-
-	// Path of database on upstream server.
-	Path string
-
-	// Underlying HTTP client
-	HTTPClient *http.Client
-}
-
-func NewClient(rawurl, path string) *Client {
-	return &Client{
-		URL:        rawurl,
-		Path:       path,
-		HTTPClient: http.DefaultClient,
-	}
-}
-
-func (c *Client) Stream(ctx context.Context) (litestream.StreamReader, error) {
-	u, err := url.Parse(c.URL)
-	if err != nil {
-		return nil, fmt.Errorf("invalid client URL: %w", err)
-	} else if u.Scheme != "http" && u.Scheme != "https" {
-		return nil, fmt.Errorf("invalid URL scheme")
-	} else if u.Host == "" {
-		return nil, fmt.Errorf("URL host required")
-	}
-
-	// Strip off everything but the scheme & host.
-	*u = url.URL{
-		Scheme: u.Scheme,
-		Host:   u.Host,
-		Path:   "/stream",
-		RawQuery: (url.Values{
-			"path": []string{c.Path},
-		}).Encode(),
-	}
-
-	req, err := http.NewRequest("GET", u.String(), nil)
-	if err != nil {
-		return nil, err
-	}
-	req = req.WithContext(ctx)
-
-	resp, err := c.HTTPClient.Do(req)
-	if err != nil {
-		return nil, err
-	} else if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
-		return nil, fmt.Errorf("invalid response: code=%d", resp.StatusCode)
-	}
-
-	return &StreamReader{
-		body: resp.Body,
-		file: io.LimitedReader{R: resp.Body},
-	}, nil
-}
-
-type StreamReader struct {
-	body io.ReadCloser
-	file io.LimitedReader
-	err  error
-}
-
-func (r *StreamReader) Close() error {
-	if e := r.body.Close(); e != nil && r.err == nil {
-		r.err = e
-	}
-	return r.err
-}
-
-func (r *StreamReader) Read(p []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	} else if r.file.R == nil {
-		return 0, io.EOF
-	}
-	return r.file.Read(p)
-}
-
-func (r *StreamReader) Next() (*litestream.StreamRecordHeader, error) {
-	if r.err != nil {
-		return nil, r.err
-	}
-
-	// If bytes remain on the current file, discard.
-	if r.file.N > 0 {
-		if _, r.err = io.Copy(io.Discard, &r.file); r.err != nil {
-			return nil, r.err
-		}
-	}
-
-	// Read record header.
-	buf := make([]byte, litestream.StreamRecordHeaderSize)
-	if _, err := io.ReadFull(r.body, buf); err != nil {
-		r.err = fmt.Errorf("http.StreamReader.Next(): %w", err)
-		return nil, r.err
-	}
-
-	var hdr litestream.StreamRecordHeader
-	if r.err = hdr.UnmarshalBinary(buf); r.err != nil {
-		return nil, r.err
-	}
-
-	// Update remaining bytes on file reader.
-	r.file.N = hdr.Size
-
-	return &hdr, nil
 }
