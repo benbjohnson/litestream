@@ -914,6 +914,11 @@ func (db *DB) createGeneration(ctx context.Context) (string, error) {
 
 // Sync copies pending data from the WAL to the shadow WAL.
 func (db *DB) Sync(ctx context.Context) error {
+	if db.StreamClient != nil {
+		db.Logger.Printf("using upstream client, skipping sync")
+		return nil
+	}
+
 	const retryN = 5
 
 	for i := 0; i < retryN; i++ {
@@ -1417,6 +1422,20 @@ func (db *DB) writeWALSegment(ctx context.Context, pos Pos, rd io.Reader) error 
 	return nil
 }
 
+// readPositionFile reads the position from the position file.
+func (db *DB) readPositionFile() (Pos, error) {
+	buf, err := os.ReadFile(db.PositionPath())
+	if os.IsNotExist(err) {
+		return Pos{}, nil
+	} else if err != nil {
+		return Pos{}, err
+	}
+
+	// Treat invalid format as a non-existent file so we return an empty position.
+	pos, _ := ParsePos(strings.TrimSpace(string(buf)))
+	return pos, nil
+}
+
 // writePositionFile writes pos as the current position.
 func (db *DB) writePositionFile(pos Pos) error {
 	return internal.WriteFile(db.PositionPath(), []byte(pos.String()+"\n"), db.fileMode, db.uid, db.gid)
@@ -1675,18 +1694,20 @@ func (db *DB) monitorUpstream(ctx context.Context) error {
 
 // stream initializes the local database and continuously streams new upstream data.
 func (db *DB) stream(ctx context.Context) error {
+	pos, err := db.readPositionFile()
+	if err != nil {
+		return fmt.Errorf("read position file: %w", err)
+	}
+
 	// Continuously stream and apply records from client.
-	sr, err := db.StreamClient.Stream(ctx)
+	sr, err := db.StreamClient.Stream(ctx, pos)
 	if err != nil {
 		return fmt.Errorf("stream connect: %w", err)
 	}
 	defer sr.Close()
 
-	// TODO: Determine page size of upstream database before creating local.
-	const pageSize = 4096
-
 	// Initialize the database and create it if it doesn't exist.
-	if err := db.initReplica(pageSize); err != nil {
+	if err := db.initReplica(sr.PageSize()); err != nil {
 		return fmt.Errorf("init replica: %w", err)
 	}
 
