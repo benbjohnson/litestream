@@ -309,10 +309,12 @@ func NewDBFromConfigWithPath(dbc *DBConfig, path string) (*litestream.DB, error)
 
 	// Attach upstream HTTP client if specified.
 	if upstreamURL := dbc.Upstream.URL; upstreamURL != "" {
-		if dbc.Upstream.Path == "" {
-			return nil, fmt.Errorf("upstream path required")
+		// Use local database path if upstream path is not specified.
+		upstreamPath := dbc.Upstream.Path
+		if upstreamPath == "" {
+			upstreamPath = db.Path()
 		}
-		db.StreamClient = http.NewClient(upstreamURL, dbc.Upstream.Path)
+		db.StreamClient = http.NewClient(upstreamURL, upstreamPath)
 	}
 
 	// Override default database settings if specified in configuration.
