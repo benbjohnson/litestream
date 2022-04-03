@@ -119,7 +119,7 @@ func (s *Server) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		case http.MethodGet:
 			s.handleGetStream(w, r)
 		default:
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			s.writeError(w, r, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	default:
 		http.NotFound(w, r)
@@ -132,12 +132,12 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 	// TODO: Listen for all databases matching query criteria.
 	path := q.Get("path")
 	if path == "" {
-		http.Error(w, "Database name required", http.StatusBadRequest)
+		s.writeError(w, r, "Database name required", http.StatusBadRequest)
 		return
 	}
 	db := s.server.DB(path)
 	if db == nil {
-		http.Error(w, "Database not found", http.StatusNotFound)
+		s.writeError(w, r, "Database not found", http.StatusNotFound)
 		return
 	}
 
@@ -149,7 +149,7 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 	// Determine starting position.
 	pos := db.Pos()
 	if pos.Generation == "" {
-		http.Error(w, "No generation available", http.StatusServiceUnavailable)
+		s.writeError(w, r, "No generation available", http.StatusServiceUnavailable)
 		return
 	}
 	pos.Offset = 0
@@ -160,7 +160,7 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 	// Obtain iterator before snapshot so we don't miss any WAL segments.
 	itr, err := db.WALSegments(r.Context(), pos.Generation)
 	if err != nil {
-		http.Error(w, fmt.Sprintf("Cannot obtain WAL iterator: %s", err), http.StatusInternalServerError)
+		s.writeError(w, r, fmt.Sprintf("Cannot obtain WAL iterator: %s", err), http.StatusInternalServerError)
 		return
 	}
 	defer itr.Close()
@@ -191,7 +191,7 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 
 		return nil
 	}); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		s.writeError(w, r, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -261,4 +261,9 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+}
+
+func (s *Server) writeError(w http.ResponseWriter, r *http.Request, err string, code int) {
+	s.Logger.Printf("error: %s", err)
+	http.Error(w, err, code)
 }
