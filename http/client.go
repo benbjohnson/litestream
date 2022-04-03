@@ -33,7 +33,7 @@ func NewClient(rawurl, path string) *Client {
 }
 
 // Stream returns a snapshot and continuous stream of WAL updates.
-func (c *Client) Stream(ctx context.Context) (litestream.StreamReader, error) {
+func (c *Client) Stream(ctx context.Context, pos litestream.Pos) (litestream.StreamReader, error) {
 	u, err := url.Parse(c.URL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid client URL: %w", err)
@@ -43,14 +43,19 @@ func (c *Client) Stream(ctx context.Context) (litestream.StreamReader, error) {
 		return nil, fmt.Errorf("URL host required")
 	}
 
+	// Add path & position to query path.
+	q := url.Values{"path": []string{c.Path}}
+	if !pos.IsZero() {
+		q.Set("generation", pos.Generation)
+		q.Set("index", litestream.FormatIndex(pos.Index))
+	}
+
 	// Strip off everything but the scheme & host.
 	*u = url.URL{
-		Scheme: u.Scheme,
-		Host:   u.Host,
-		Path:   "/stream",
-		RawQuery: (url.Values{
-			"path": []string{c.Path},
-		}).Encode(),
+		Scheme:   u.Scheme,
+		Host:     u.Host,
+		Path:     "/stream",
+		RawQuery: q.Encode(),
 	}
 
 	req, err := http.NewRequest("GET", u.String(), nil)

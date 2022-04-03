@@ -52,6 +52,78 @@ func TestFindMinSnapshotByGeneration(t *testing.T) {
 	}
 }
 
+func TestBufferedWALSegmentIterator(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		a := []litestream.WALSegmentInfo{{Index: 1}, {Index: 2}}
+		itr := litestream.NewBufferedWALSegmentIterator(litestream.NewWALSegmentInfoSliceIterator(a))
+
+		if info, ok := itr.Peek(); !ok {
+			t.Fatal("expected info")
+		} else if got, want := info.Index, 1; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+
+		if !itr.Next() {
+			t.Fatal("expected next")
+		} else if got, want := itr.WALSegment().Index, 1; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+
+		if !itr.Next() {
+			t.Fatal("expected next")
+		} else if got, want := itr.WALSegment().Index, 2; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+
+		if itr.Next() {
+			t.Fatal("expected eof")
+		}
+	})
+
+	t.Run("Empty", func(t *testing.T) {
+		itr := litestream.NewBufferedWALSegmentIterator(litestream.NewWALSegmentInfoSliceIterator(nil))
+
+		if info, ok := itr.Peek(); ok {
+			t.Fatal("expected eof")
+		} else if got, want := info.Index, 0; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+}
+
+func TestParsePos(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		if pos, err := litestream.ParsePos("29cf4bced74e92ab/00000000000003e8:00000000000007d0"); err != nil {
+			t.Fatal(err)
+		} else if got, want := pos.Generation, "29cf4bced74e92ab"; got != want {
+			t.Fatalf("generation=%s, want %s", got, want)
+		} else if got, want := pos.Index, 1000; got != want {
+			t.Fatalf("index=%v, want %v", got, want)
+		} else if got, want := pos.Offset, 2000; got != int64(want) {
+			t.Fatalf("offset=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("ErrMismatch", func(t *testing.T) {
+		_, err := litestream.ParsePos("29cf4bced74e92ab-00000000000003e8-00000000000007d0")
+		if err == nil || err.Error() != `invalid pos: "29cf4bced74e92ab-00000000000003e8-00000000000007d0"` {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ErrInvalidIndex", func(t *testing.T) {
+		_, err := litestream.ParsePos("29cf4bced74e92ab/0000000000000xxx:00000000000007d0")
+		if err == nil || err.Error() != `cannot parse index: "0000000000000xxx"` {
+			t.Fatal(err)
+		}
+	})
+	t.Run("ErrInvalidIndex", func(t *testing.T) {
+		_, err := litestream.ParsePos("29cf4bced74e92ab/00000000000003e8:0000000000000xxx")
+		if err == nil || err.Error() != `cannot parse offset: "0000000000000xxx"` {
+			t.Fatal(err)
+		}
+	})
+}
+
 func decodeHexString(tb testing.TB, s string) []byte {
 	tb.Helper()
 
