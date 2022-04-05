@@ -585,7 +585,7 @@ func (hdr *StreamRecordHeader) UnmarshalBinary(data []byte) error {
 	}
 	hdr.Type = int(binary.BigEndian.Uint32(data[0:4]))
 	hdr.Flags = int(binary.BigEndian.Uint32(data[4:8]))
-	hdr.Generation = fmt.Sprintf("%16x", binary.BigEndian.Uint64(data[8:16]))
+	hdr.Generation = fmt.Sprintf("%016x", binary.BigEndian.Uint64(data[8:16]))
 	hdr.Index = int(binary.BigEndian.Uint64(data[16:24]))
 	hdr.Offset = int64(binary.BigEndian.Uint64(data[24:32]))
 	hdr.Size = int64(binary.BigEndian.Uint64(data[32:40]))

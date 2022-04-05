@@ -33,6 +33,7 @@ const (
 
 	DefaultMinCheckpointPageN = 1000
 	DefaultMaxCheckpointPageN = 10000
+	DefaultShadowRetentionN   = 32
 )
 
 // MaxIndex is the maximum possible WAL index.
@@ -102,6 +103,10 @@ type DB struct {
 	// unbounded if there are always read transactions occurring.
 	MaxCheckpointPageN int
 
+	// Number of shadow WAL indexes to retain. This keeps files long enough for
+	// live replicas to retrieve the data but allows files to eventually be removed.
+	ShadowRetentionN int
+
 	// Time after receiving change notification before reading next WAL segment.
 	// Used for batching changes into fewer files instead of every transaction
 	// creating its own file.
@@ -129,6 +134,7 @@ func NewDB(path string) *DB {
 
 		MinCheckpointPageN:   DefaultMinCheckpointPageN,
 		MaxCheckpointPageN:   DefaultMaxCheckpointPageN,
+		ShadowRetentionN:     DefaultShadowRetentionN,
 		MonitorDelayInterval: DefaultMonitorDelayInterval,
 		CheckpointInterval:   DefaultCheckpointInterval,
 
@@ -778,21 +784,26 @@ func (db *DB) cleanWAL(ctx context.Context) error {
 	generation, err := db.CurrentGeneration()
 	if err != nil {
 		return fmt.Errorf("current generation: %w", err)
+	} else if generation == "" {
+		return nil
 	}
 
 	// Determine lowest index that's been replicated to all replicas.
-	minIndex := -1
+	minReplicaIndex := -1
 	for _, r := range db.Replicas {
 		pos := r.Pos().Truncate()
 		if pos.Generation != generation {
 			continue // different generation, skip
-		} else if minIndex == -1 || pos.Index < minIndex {
-			minIndex = pos.Index
+		} else if minReplicaIndex == -1 || pos.Index < minReplicaIndex {
+			minReplicaIndex = pos.Index
 		}
 	}
 
-	// Skip if our lowest position is too small.
-	if minIndex <= 0 {
+	// Retain a certain number of WAL indexes since
+	minRetentionIndex := db.pos.Index - db.ShadowRetentionN
+
+	// Skip if we have replicas but none have replicated this generation yet.
+	if len(db.Replicas) > 0 && minReplicaIndex <= 0 {
 		return nil
 	}
 
@@ -807,8 +818,10 @@ func (db *DB) cleanWAL(ctx context.Context) error {
 		index, err := ParseIndex(ent.Name())
 		if err != nil {
 			continue
-		} else if index >= minIndex {
-			continue // not below min, skip
+		} else if len(db.Replicas) > 0 && index >= minReplicaIndex {
+			continue // not replicated yet, skip
+		} else if index >= minRetentionIndex {
+			continue // retain certain number of indexes, skip
 		}
 
 		if err := os.RemoveAll(filepath.Join(dir, FormatIndex(index))); err != nil {
