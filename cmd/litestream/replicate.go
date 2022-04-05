@@ -221,6 +221,10 @@ Arguments:
 	    Executes a subcommand. Litestream will exit when the child
 	    process exits. Useful for simple process management.
 
+	-addr BIND_ADDR
+	    Starts an HTTP server that reports prometheus metrics and provides
+	    an endpoint for live read replication. (e.g. ":9090")
+
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
