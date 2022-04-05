@@ -1,0 +1,5 @@
+dbs:
+  - path: $LITESTREAM_TEMPDIR/1/db
+    upstream:
+      url: "$LITESTREAM_UPSTREAM_URL"
+      path: "$LITESTREAM_TEMPDIR/0/db"

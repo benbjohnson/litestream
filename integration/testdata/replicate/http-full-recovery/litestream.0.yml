@@ -1,0 +1,6 @@
+addr: :10002
+
+dbs:
+  - path: $LITESTREAM_TEMPDIR/0/db
+    max-checkpoint-page-count: 5
+    shadow-retention-count: 3

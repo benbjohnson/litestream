@@ -289,6 +289,7 @@ type DBConfig struct {
 	CheckpointInterval   *time.Duration `yaml:"checkpoint-interval"`
 	MinCheckpointPageN   *int           `yaml:"min-checkpoint-page-count"`
 	MaxCheckpointPageN   *int           `yaml:"max-checkpoint-page-count"`
+	ShadowRetentionN     *int           `yaml:"shadow-retention-count"`
 
 	Replicas []*ReplicaConfig `yaml:"replicas"`
 }
@@ -329,6 +330,9 @@ func NewDBFromConfigWithPath(dbc *DBConfig, path string) (*litestream.DB, error)
 	}
 	if dbc.MaxCheckpointPageN != nil {
 		db.MaxCheckpointPageN = *dbc.MaxCheckpointPageN
+	}
+	if dbc.ShadowRetentionN != nil {
+		db.ShadowRetentionN = *dbc.ShadowRetentionN
 	}
 
 	// Instantiate and attach replicas.
