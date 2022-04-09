@@ -23,7 +23,6 @@ jobs:
           - arch:   amd64
             cc:     gcc
             static: true
-            deploy_test_runner: true
 
           - arch: arm64
             cc:   aarch64-linux-gnu-gcc
@@ -104,6 +103,13 @@ jobs:
           name: litestream-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.deb
           path: dist/litestream-${{ env.VERSION }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}${{ env.SUFFIX }}.deb
           if-no-files-found: error
+
+      - name: Get release
+        id: release
+        uses: bruceadams/get-release@v1.2.3
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Upload release tarball
         uses: actions/upload-release-asset@v1.0.2
