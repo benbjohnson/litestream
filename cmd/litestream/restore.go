@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 )
@@ -22,14 +23,15 @@ type RestoreCommand struct {
 	snapshotIndex int // index of snapshot to start from
 
 	// CLI options
-	configPath      string // path to config file
-	noExpandEnv     bool   // if true, do not expand env variables in config
-	outputPath      string // path to restore database to
-	replicaName     string // optional, name of replica to restore from
-	generation      string // optional, generation to restore
-	targetIndex     int    // optional, last WAL index to replay
-	ifDBNotExists   bool   // if true, skips restore if output path already exists
-	ifReplicaExists bool   // if true, skips if no backups exist
+	configPath      string    // path to config file
+	noExpandEnv     bool      // if true, do not expand env variables in config
+	outputPath      string    // path to restore database to
+	replicaName     string    // optional, name of replica to restore from
+	generation      string    // optional, generation to restore
+	targetIndex     int       // optional, last WAL index to replay
+	timestamp       time.Time // optional, restore to point-in-time (ISO 8601)
+	ifDBNotExists   bool      // if true, skips restore if output path already exists
+	ifReplicaExists bool      // if true, skips if no backups exist
 	opt             litestream.RestoreOptions
 }
 
@@ -53,6 +55,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs.StringVar(&c.replicaName, "replica", "", "replica name")
 	fs.StringVar(&c.generation, "generation", "", "generation name")
 	fs.Var((*indexVar)(&c.targetIndex), "index", "wal index")
+	timestampStr := fs.String("timestamp", "", "point-in-time restore (ISO 8601)")
 	fs.IntVar(&c.opt.Parallelism, "parallelism", c.opt.Parallelism, "parallelism")
 	fs.BoolVar(&c.ifDBNotExists, "if-db-not-exists", false, "")
 	fs.BoolVar(&c.ifReplicaExists, "if-replica-exists", false, "")
@@ -66,9 +69,20 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 	pathOrURL := fs.Arg(0)
 
+	// Parse timestamp.
+	if *timestampStr != "" {
+		if c.timestamp, err = time.Parse(time.RFC3339Nano, *timestampStr); err != nil {
+			return fmt.Errorf("invalid -timestamp, expected ISO 8601: %w", err)
+		}
+	}
+
 	// Ensure a generation is specified if target index is specified.
-	if c.targetIndex != -1 && c.generation == "" {
+	if c.targetIndex != -1 && !c.timestamp.IsZero() {
+		return fmt.Errorf("cannot specify both -index flag and -timestamp flag")
+	} else if c.targetIndex != -1 && c.generation == "" {
 		return fmt.Errorf("must specify -generation flag when using -index flag")
+	} else if !c.timestamp.IsZero() && c.generation == "" {
+		return fmt.Errorf("must specify -generation flag when using -timestamp flag")
 	}
 
 	// Default to original database path if output path not specified.
@@ -117,7 +131,11 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Determine the maximum available index for the generation if one is not specified.
-	if c.targetIndex == -1 {
+	if !c.timestamp.IsZero() {
+		if c.targetIndex, err = litestream.FindIndexByTimestamp(ctx, r.Client(), c.generation, c.timestamp); err != nil {
+			return fmt.Errorf("cannot find index for timestamp in generation %q: %w", c.generation, err)
+		}
+	} else if c.targetIndex == -1 {
 		if c.targetIndex, err = litestream.FindMaxIndexByGeneration(ctx, r.Client(), c.generation); err != nil {
 			return fmt.Errorf("cannot determine latest index in generation %q: %w", c.generation, err)
 		}
@@ -239,6 +257,10 @@ Arguments:
 	    Restore up to a specific hex-encoded WAL index (inclusive).
 	    Defaults to use the highest available index.
 
+	-timestamp DATETIME
+	    Restore up to a specific point-in-time. Must be ISO 8601.
+	    Cannot be specified with -index flag.
+
 	-o PATH
 	    Output path of the restored database.
 	    Defaults to original DB path.
@@ -270,6 +292,9 @@ Examples:
 
 	# Restore database from specific generation on S3.
 	$ litestream restore -replica s3 -generation xxxxxxxx /path/to/db
+
+	# Restore database to a specific point in time.
+	$ litestream restore -generation xxxxxxxx -timestamp 2000-01-01T00:00:00Z /path/to/db
 
 `[1:],
 		DefaultConfigPath(),

@@ -489,6 +489,167 @@ func TestFindMaxIndexByGeneration(t *testing.T) {
 	})
 }
 
+func TestFindSnapshotIndexByTimestamp(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "snapshot-index-by-timestamp", "ok"))
+		if index, err := litestream.FindSnapshotIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x000007d0; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "snapshot-index-by-timestamp", "no-snapshots"))
+
+		_, err := litestream.FindSnapshotIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindSnapshotIndexByTimestamp(context.Background(), &client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err == nil || err.Error() != `snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshotIteration", func(t *testing.T) {
+		var itr mock.SnapshotIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
+
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return &itr, nil
+		}
+
+		_, err := litestream.FindSnapshotIndexByTimestamp(context.Background(), &client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err == nil || err.Error() != `snapshot iteration: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+}
+
+func TestFindWALIndexByTimestamp(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "wal-index-by-timestamp", "ok"))
+		if index, err := litestream.FindWALIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 1; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("ErrNoWALSegments", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "wal-index-by-timestamp", "no-wal"))
+
+		_, err := litestream.FindWALIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err != litestream.ErrNoWALSegments {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrWALSegments", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindWALIndexByTimestamp(context.Background(), &client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err == nil || err.Error() != `wal segments: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrWALSegmentIteration", func(t *testing.T) {
+		var itr mock.WALSegmentIterator
+		itr.NextFunc = func() bool { return false }
+		itr.CloseFunc = func() error { return fmt.Errorf("marker") }
+
+		var client mock.ReplicaClient
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return &itr, nil
+		}
+
+		_, err := litestream.FindWALIndexByTimestamp(context.Background(), &client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err == nil || err.Error() != `wal segment iteration: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+}
+
+func TestFindIndexByTimestamp(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "index-by-timestamp", "ok"))
+		if index, err := litestream.FindIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 4, 0, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x00000002; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("NoWAL", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "index-by-timestamp", "no-wal"))
+		if index, err := litestream.FindIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 2, 0, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x00000001; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("SnapshotLaterThanWAL", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "index-by-timestamp", "snapshot-later-than-wal"))
+		if index, err := litestream.FindIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 3, 0, 0, 0, 0, time.UTC)); err != nil {
+			t.Fatal(err)
+		} else if got, want := index, 0x00000001; got != want {
+			t.Fatalf("index=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("ErrNoSnapshots", func(t *testing.T) {
+		client := litestream.NewFileReplicaClient(filepath.Join("testdata", "index-by-timestamp", "no-snapshots"))
+
+		_, err := litestream.FindIndexByTimestamp(context.Background(), client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err != litestream.ErrNoSnapshots {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrSnapshots", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindIndexByTimestamp(context.Background(), &client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err == nil || err.Error() != `max snapshot index: snapshots: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+
+	t.Run("ErrWALSegments", func(t *testing.T) {
+		var client mock.ReplicaClient
+		client.SnapshotsFunc = func(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+			return litestream.NewSnapshotInfoSliceIterator([]litestream.SnapshotInfo{{Index: 0x00000001}}), nil
+		}
+		client.WALSegmentsFunc = func(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+			return nil, fmt.Errorf("marker")
+		}
+
+		_, err := litestream.FindIndexByTimestamp(context.Background(), &client, "0000000000000000", time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC))
+		if err == nil || err.Error() != `max wal index: wal segments: marker` {
+			t.Fatalf("unexpected error: %s", err)
+		}
+	})
+}
+
 func TestRestore(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
 		testDir := filepath.Join("testdata", "restore", "ok")

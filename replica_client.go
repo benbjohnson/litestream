@@ -234,6 +234,88 @@ func ReplicaClientTimeBounds(ctx context.Context, client ReplicaClient) (min, ma
 	return min, max, nil
 }
 
+// FindIndexByTimestamp returns the highest index before a given point-in-time
+// within a generation. Returns ErrNoSnapshots if no index exists on the replica
+// for the generation.
+func FindIndexByTimestamp(ctx context.Context, client ReplicaClient, generation string, timestamp time.Time) (index int, err error) {
+	snapshotIndex, err := FindSnapshotIndexByTimestamp(ctx, client, generation, timestamp)
+	if err == ErrNoSnapshots {
+		return 0, err
+	} else if err != nil {
+		return 0, fmt.Errorf("max snapshot index: %w", err)
+	}
+
+	// Determine the highest available WAL index.
+	walIndex, err := FindWALIndexByTimestamp(ctx, client, generation, timestamp)
+	if err != nil && err != ErrNoWALSegments {
+		return 0, fmt.Errorf("max wal index: %w", err)
+	}
+
+	// Use snapshot index if it's after the last WAL index.
+	if snapshotIndex > walIndex {
+		return snapshotIndex, nil
+	}
+	return walIndex, nil
+}
+
+// FindSnapshotIndexByTimestamp returns the highest snapshot index before timestamp.
+// Returns ErrNoSnapshots if no snapshots exist for the generation on the replica.
+func FindSnapshotIndexByTimestamp(ctx context.Context, client ReplicaClient, generation string, timestamp time.Time) (index int, err error) {
+	itr, err := client.Snapshots(ctx, generation)
+	if err != nil {
+		return 0, fmt.Errorf("snapshots: %w", err)
+	}
+	defer func() { _ = itr.Close() }()
+
+	// Iterate over snapshots to find the highest index.
+	var n int
+	for ; itr.Next(); n++ {
+		if info := itr.Snapshot(); info.CreatedAt.After(timestamp) {
+			continue
+		} else if info.Index > index {
+			index = info.Index
+		}
+	}
+	if err := itr.Close(); err != nil {
+		return 0, fmt.Errorf("snapshot iteration: %w", err)
+	}
+
+	// Return an error if no snapshots were found.
+	if n == 0 {
+		return 0, ErrNoSnapshots
+	}
+	return index, nil
+}
+
+// FindWALIndexByTimestamp returns the highest WAL index before timestamp.
+// Returns ErrNoWALSegments if no segments exist for the generation on the replica.
+func FindWALIndexByTimestamp(ctx context.Context, client ReplicaClient, generation string, timestamp time.Time) (index int, err error) {
+	itr, err := client.WALSegments(ctx, generation)
+	if err != nil {
+		return 0, fmt.Errorf("wal segments: %w", err)
+	}
+	defer func() { _ = itr.Close() }()
+
+	// Iterate over WAL segments to find the highest index.
+	var n int
+	for ; itr.Next(); n++ {
+		if info := itr.WALSegment(); info.CreatedAt.After(timestamp) {
+			continue
+		} else if info.Index > index {
+			index = info.Index
+		}
+	}
+	if err := itr.Close(); err != nil {
+		return 0, fmt.Errorf("wal segment iteration: %w", err)
+	}
+
+	// Return an error if no WAL segments were found.
+	if n == 0 {
+		return 0, ErrNoWALSegments
+	}
+	return index, nil
+}
+
 // FindMaxIndexByGeneration returns the last index within a generation.
 // Returns ErrNoSnapshots if no index exists on the replica for the generation.
 func FindMaxIndexByGeneration(ctx context.Context, client ReplicaClient, generation string) (index int, err error) {
