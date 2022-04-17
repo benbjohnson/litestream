@@ -102,6 +102,24 @@ func TestTruncateDuration(t *testing.T) {
 	}
 }
 
+func TestMD5Hash(t *testing.T) {
+	for _, tt := range []struct {
+		input []byte
+		output string
+	}{
+		{[]byte{}, "d41d8cd98f00b204e9800998ecf8427e"},
+		{[]byte{0x0}, "93b885adfe0da089cdf634904fd59f71"},
+		{[]byte{0x0, 0x1, 0x2, 0x3}, "37b59afd592725f9305e484a5d7f5168"},
+		{[]byte("Hello, world!"), "6cd3556deb0da54bca060b4c39479839"},
+	} {
+		t.Run(fmt.Sprintf("%v", tt.input), func(t *testing.T) {
+			if got, want := internal.MD5Hash(tt.input), tt.output; got != want {
+				t.Fatalf("hash=%s, want %s", got, want)
+			}
+		})
+	}
+}
+
 func TestOnceCloser(t *testing.T) {
 	var closed bool
 	var rc = &mock.ReadCloser{
