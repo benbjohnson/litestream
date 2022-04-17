@@ -22,4 +22,9 @@ jobs:
         run: go install ./cmd/litestream
 
       - name: Run unit tests
-        run: make testdata && go test -v ./...
+        run: make testdata && go test -v --coverprofile=.coverage.out ./... && go tool cover -html .coverage.out -o .coverage.html
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: code-coverage
+          path: coverage.html

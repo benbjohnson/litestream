@@ -1,2 +1,3 @@
+.coverage.*
 .DS_Store
 /dist
