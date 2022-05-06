@@ -3,10 +3,11 @@ package litestream
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 
-	"github.com/benbjohnson/litestream/internal"
+	"github.com/fsnotify/fsnotify"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -15,7 +16,7 @@ import (
 type Server struct {
 	mu      sync.Mutex
 	dbs     map[string]*DB // databases by path
-	watcher internal.FileWatcher
+	watcher *fsnotify.Watcher
 
 	ctx      context.Context
 	cancel   func()
@@ -31,8 +32,9 @@ func NewServer() *Server {
 
 // Open initializes the server and begins watching for file system events.
 func (s *Server) Open() error {
-	s.watcher = internal.NewFileWatcher()
-	if err := s.watcher.Open(); err != nil {
+	var err error
+	s.watcher, err = fsnotify.NewWatcher()
+	if err != nil {
 		return err
 	}
 
@@ -110,10 +112,8 @@ func (s *Server) Watch(path string, fn func(path string) (*DB, error)) error {
 	s.dbs[path] = db
 
 	// Watch for changes on the database file & WAL.
-	if err := s.watcher.Watch(path); err != nil {
+	if err := s.watcher.Add(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("watch db file: %w", err)
-	} else if err := s.watcher.Watch(path + "-wal"); err != nil {
-		return fmt.Errorf("watch wal file: %w", err)
 	}
 
 	// Kick off an initial sync.
@@ -137,7 +137,7 @@ func (s *Server) Unwatch(path string) error {
 	delete(s.dbs, path)
 
 	// Stop watching for changes on the database WAL.
-	if err := s.watcher.Unwatch(path + "-wal"); err != nil {
+	if err := s.watcher.Remove(path + "-wal"); err != nil {
 		return fmt.Errorf("unwatch file: %w", err)
 	}
 
@@ -149,13 +149,26 @@ func (s *Server) Unwatch(path string) error {
 	return nil
 }
 
+func (s *Server) isWatched(event fsnotify.Event) bool {
+	path := event.Name
+	path = strings.TrimSuffix(path, "-wal")
+
+	if _, ok := s.dbs[path]; ok {
+		return true
+	}
+	return false
+}
+
 // monitor runs in a separate goroutine and dispatches notifications to managed DBs.
 func (s *Server) monitor(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case event := <-s.watcher.Events():
+		case event := <-s.watcher.Events:
+			if !s.isWatched(event) {
+				continue
+			}
 			if err := s.dispatchFileEvent(ctx, event); err != nil {
 				return err
 			}
@@ -164,7 +177,7 @@ func (s *Server) monitor(ctx context.Context) error {
 }
 
 // dispatchFileEvent dispatches a notification to the database which owns the file.
-func (s *Server) dispatchFileEvent(ctx context.Context, event internal.FileEvent) error {
+func (s *Server) dispatchFileEvent(ctx context.Context, event fsnotify.Event) error {
 	path := event.Name
 	path = strings.TrimSuffix(path, "-wal")
 
