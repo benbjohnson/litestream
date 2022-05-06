@@ -137,7 +137,7 @@ func (s *Server) Unwatch(path string) error {
 	delete(s.dbs, path)
 
 	// Stop watching for changes on the database WAL.
-	if err := s.watcher.Remove(path + "-wal"); err != nil {
+	if err := s.watcher.Remove(filepath.Dir(path)); err != nil {
 		return fmt.Errorf("unwatch file: %w", err)
 	}
 
