@@ -703,6 +703,13 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 		endpoint = net.JoinHostPort(endpoint, port)
 	}
 
+	if e := os.Getenv("LITESTREAM_ENDPOINT"); e != "" {
+		endpoint = e
+	}
+	if r := os.Getenv("LITESTREAM_REGION"); r != "" {
+		region = r
+	}
+
 	// Prepend scheme to endpoint.
 	if endpoint != "" {
 		endpoint = scheme + "://" + endpoint
