@@ -693,6 +693,15 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 	} else if a := linodeRegex.FindStringSubmatch(host); a != nil {
 		bucket, region = a[1], a[2]
 		endpoint = fmt.Sprintf("%s.linodeobjects.com", region)
+	} else if a := sakuraStorageRegex.FindStringSubmatch(host); a != nil {
+		bucket, region = a[1], a[2]
+		endpoint = fmt.Sprintf("s3.%s.sakurastorage.jp", region)
+		if region == "isk01" {
+			region = "jp-north-1"
+		} else {
+			panic("unsupported region")
+		}
+		forcePathStyle = false
 	} else {
 		bucket = host
 		forcePathStyle = false
@@ -712,11 +721,12 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 }
 
 var (
-	localhostRegex    = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
-	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3\.([^.]+)\.backblazeb2\.com$`)
-	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3\.filebase\.com$`)
-	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces\.com$`)
-	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects\.com$`)
+	localhostRegex     = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
+	backblazeRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3\.([^.]+)\.backblazeb2\.com$`)
+	filebaseRegex      = regexp.MustCompile(`^(?:(.+)\.)?s3\.filebase\.com$`)
+	digitalOceanRegex  = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces\.com$`)
+	linodeRegex        = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects\.com$`)
+	sakuraStorageRegex = regexp.MustCompile(`^(?:(.+)\.)?s3\.([^.]+)\.sakurastorage\.jp$`)
 )
 
 func isNotExists(err error) bool {
