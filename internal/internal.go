@@ -176,6 +176,15 @@ func MkdirAll(path string, mode os.FileMode, uid, gid int) error {
 	return nil
 }
 
+// Fileinfo returns syscall fields from a FileInfo object.
+func Fileinfo(fi os.FileInfo) (uid, gid int) {
+	if fi == nil {
+		return -1, -1
+	}
+	stat := fi.Sys().(*syscall.Stat_t)
+	return int(stat.Uid), int(stat.Gid)
+}
+
 // ParseSnapshotPath parses the index from a snapshot filename. Used by path-based replicas.
 func ParseSnapshotPath(s string) (index int, err error) {
 	a := snapshotPathRegex.FindStringSubmatch(s)
