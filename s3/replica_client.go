@@ -10,6 +10,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -703,11 +704,25 @@ func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) 
 		endpoint = net.JoinHostPort(endpoint, port)
 	}
 
+	if s := os.Getenv("LITESTREAM_SCHEME"); s != "" {
+		if s != "https" && s != "http" {
+			panic(fmt.Sprintf("Unsupported LITESTREAM_SCHEME value: %q", s))
+		} else {
+			scheme = s
+		}
+	}
 	if e := os.Getenv("LITESTREAM_ENDPOINT"); e != "" {
 		endpoint = e
 	}
 	if r := os.Getenv("LITESTREAM_REGION"); r != "" {
 		region = r
+	}
+	if s := os.Getenv("LITESTREAM_FORCE_PATH_STYLE"); s != "" {
+		if b, err := strconv.ParseBool(s); err != nil {
+			panic(fmt.Sprintf("Invalid LITESTREAM_FORCE_PATH_STYLE value: %q", s))
+		} else {
+			forcePathStyle = b
+		}
 	}
 
 	// Prepend scheme to endpoint.
