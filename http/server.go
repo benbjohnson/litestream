@@ -289,7 +289,7 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 			// Flush after WAL segment has been written.
 			w.(http.Flusher).Flush()
 		}
-		if bitr.Err() != nil {
+		if err := bitr.Err(); err != nil {
 			s.Logger.Printf("wal iterator error: %s", err)
 			return
 		}
