@@ -252,7 +252,7 @@ func (w *InotifyFileWatcher) monitor(ctx context.Context) error {
 	}
 }
 
-// read reads from the inotify file descriptor. Automatically rety on EINTR.
+// read reads from the inotify file descriptor. Automatically retry on EINTR.
 func (w *InotifyFileWatcher) read(ctx context.Context) error {
 	for {
 		n, err := unix.Read(w.inotify.fd, w.inotify.buf)

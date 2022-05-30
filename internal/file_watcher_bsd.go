@@ -221,7 +221,7 @@ func (w *KqueueFileWatcher) monitor(ctx context.Context) error {
 	}
 }
 
-// recv processes a single event from kqeueue.
+// recv processes a single event from kqueue.
 func (w *KqueueFileWatcher) recv(ctx context.Context, kevent *unix.Kevent_t) error {
 	if err := ctx.Err(); err != nil {
 		return err

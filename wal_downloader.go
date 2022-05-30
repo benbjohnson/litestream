@@ -15,12 +15,12 @@ import (
 // WALDownloader represents a parallel downloader of WAL files from a replica client.
 //
 // It works on a per-index level so WAL files are always downloaded in their
-// entirety and are not segmented. WAL files are downloaded from minIndex to
+// entiretry and are not segmented. WAL files are downloaded from minIndex to
 // maxIndex, inclusively, and are written to a path prefix. WAL files are named
 // with the prefix and suffixed with the WAL index. It is the responsibility of
 // the caller to clean up these WAL files.
 //
-// The purpose of the parallization is that RTT & WAL apply time can consume
+// The purpose of the parallelization is that RTT & WAL apply time can consume
 // much of the restore time so it's useful to download multiple WAL files in
 // the background to minimize the latency. While some WAL indexes may be
 // downloaded out of order, the WALDownloader ensures that Next() always
