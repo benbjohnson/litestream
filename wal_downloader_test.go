@@ -383,7 +383,7 @@ func testWALDownloader(t *testing.T, parallelism int) {
 		}
 	})
 
-	// Ensure a gap in indicies returns an error.
+	// Ensure a gap in indices returns an error.
 	t.Run("ErrMissingMiddleIndex", func(t *testing.T) {
 		testDir := filepath.Join("testdata", "wal-downloader", "missing-middle-index")
 		tempDir := t.TempDir()

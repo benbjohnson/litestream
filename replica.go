@@ -105,7 +105,7 @@ func (r *Replica) Client() ReplicaClient { return r.client }
 
 // Starts replicating in a background goroutine.
 func (r *Replica) Start(ctx context.Context) {
-	// Ignore if replica is being used sychronously.
+	// Ignore if replica is being used synchronously.
 	if !r.MonitorEnabled {
 		return
 	}
