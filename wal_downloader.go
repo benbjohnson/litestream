@@ -15,7 +15,7 @@ import (
 // WALDownloader represents a parallel downloader of WAL files from a replica client.
 //
 // It works on a per-index level so WAL files are always downloaded in their
-// entiretry and are not segmented. WAL files are downloaded from minIndex to
+// entirety and are not segmented. WAL files are downloaded from minIndex to
 // maxIndex, inclusively, and are written to a path prefix. WAL files are named
 // with the prefix and suffixed with the WAL index. It is the responsibility of
 // the caller to clean up these WAL files.
