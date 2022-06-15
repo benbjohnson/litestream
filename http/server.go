@@ -134,15 +134,30 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	generationStr := q.Get("generation")
+	indexStr := q.Get("index")
+	offsetStr := q.Get("offset")
+
 	// Parse current client position, if available.
 	var pos litestream.Pos
-	if generation, index := q.Get("generation"), q.Get("index"); generation != "" && index != "" {
-		pos.Generation = generation
+	if generationStr != "" && indexStr != "" && offsetStr != "" {
 
-		var err error
-		if pos.Index, err = litestream.ParseIndex(index); err != nil {
+		index, err := litestream.ParseIndex(indexStr)
+		if err != nil {
 			s.writeError(w, r, "Invalid index query parameter", http.StatusBadRequest)
 			return
+		}
+
+		offset, err := litestream.ParseOffset(offsetStr)
+		if err != nil {
+			s.writeError(w, r, "Invalid offset query parameter", http.StatusBadRequest)
+			return
+		}
+
+		pos = litestream.Pos{
+			Generation: generationStr,
+			Index:      index,
+			Offset:     offset,
 		}
 	}
 
@@ -162,7 +177,6 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, "No generation available", http.StatusServiceUnavailable)
 		return
 	}
-	dbPos.Offset = 0
 
 	// Use database position if generation has changed.
 	var snapshotRequired bool
@@ -170,6 +184,7 @@ func (s *Server) handleGetStream(w http.ResponseWriter, r *http.Request) {
 		s.Logger.Printf("stream generation mismatch, using primary position: client.pos=%s", pos)
 		pos, snapshotRequired = dbPos, true
 	}
+	pos.Offset = 0
 
 	// Obtain iterator before snapshot so we don't miss any WAL segments.
 	fitr, err := db.WALSegments(r.Context(), pos.Generation)

@@ -481,7 +481,7 @@ func TestCmd_Replicate_HTTP_PartialRecovery(t *testing.T) {
 		t.Fatal(err)
 	} else if _, err := db0.ExecContext(ctx, `PRAGMA journal_mode = wal`); err != nil {
 		t.Fatal(err)
-	} else if _, err := db0.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+	} else if _, err := db0.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, DATA TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	defer db0.Close()
@@ -489,8 +489,8 @@ func TestCmd_Replicate_HTTP_PartialRecovery(t *testing.T) {
 	var index int
 	insertAndWait := func() {
 		index++
-		t.Logf("[exec] INSERT INTO t (id) VALUES (%d)", index)
-		if _, err := db0.ExecContext(ctx, `INSERT INTO t (id) VALUES (?)`, index); err != nil {
+		t.Logf("[exec] INSERT INTO t (id, data) VALUES (%d, '...')", index)
+		if _, err := db0.ExecContext(ctx, `INSERT INTO t (id, data) VALUES (?, ?)`, index, strings.Repeat("x", 512)); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(100 * time.Millisecond)

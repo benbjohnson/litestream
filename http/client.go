@@ -48,6 +48,7 @@ func (c *Client) Stream(ctx context.Context, pos litestream.Pos) (litestream.Str
 	if !pos.IsZero() {
 		q.Set("generation", pos.Generation)
 		q.Set("index", litestream.FormatIndex(pos.Index))
+		q.Set("offset", litestream.FormatOffset(pos.Offset))
 	}
 
 	// Strip off everything but the scheme & host.
