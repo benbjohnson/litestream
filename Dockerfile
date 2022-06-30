@@ -1,8 +1,8 @@
-FROM golang:1.18 as builder
+FROM golang:1.18-alpine as builder
 
 # add ca certificates and timezone data files
 # hadolint ignore=DL3018
-RUN apk add -U --no-cache ca-certificates tzdata
+RUN apk add -U --no-cache ca-certificates tzdata gcc musl-dev
 
 # add unprivileged user
 RUN adduser -s /bin/true -u 1000 -D -h /app app \
