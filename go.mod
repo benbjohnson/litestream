@@ -8,7 +8,7 @@ require (
 	github.com/aws/aws-sdk-go v1.27.0
 	github.com/mattn/go-shellwords v1.0.11
 	github.com/mattn/go-sqlite3 v1.14.12
-	github.com/pierrec/lz4/v4 v4.1.3
+	github.com/pierrec/lz4/v4 v4.1.15
 	github.com/pkg/sftp v1.13.0
 	github.com/prometheus/client_golang v1.9.0
 	golang.org/x/crypto v0.0.0-20210513164829-c07d793c2f9a
