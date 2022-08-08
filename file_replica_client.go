@@ -362,9 +362,8 @@ func (c *FileReplicaClient) DeleteWALSegments(ctx context.Context, a []Pos) erro
 }
 
 type FileWALSegmentIterator struct {
-	mu        sync.Mutex
-	notifyCh  chan struct{}
-	closeFunc func() error
+	mu       sync.Mutex
+	notifyCh chan struct{}
 
 	dir        string
 	generation string
@@ -386,12 +385,6 @@ func NewFileWALSegmentIterator(dir, generation string, indexes []int) *FileWALSe
 }
 
 func (itr *FileWALSegmentIterator) Close() (err error) {
-	if itr.closeFunc != nil {
-		if e := itr.closeFunc(); e != nil && err == nil {
-			err = e
-		}
-	}
-
 	if e := itr.Err(); e != nil && err == nil {
 		err = e
 	}
