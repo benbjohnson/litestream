@@ -138,6 +138,19 @@ func TestRestoreCommand(t *testing.T) {
 		}
 	})
 
+	t.Run("IfReplicaExists/Multiple", func(t *testing.T) {
+		testDir := filepath.Join("testdata", "restore", "if-replica-exists-flag-multiple")
+		defer testingutil.Setenv(t, "LITESTREAM_TESTDIR", testDir)()
+
+		m, _, stdout, _ := newMain()
+		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-if-replica-exists", filepath.Join(testDir, "db")})
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+			t.Fatalf("stdout=%q, want %q", got, want)
+		}
+	})
+
 	t.Run("ErrNoBackups", func(t *testing.T) {
 		testDir := filepath.Join("testdata", "restore", "no-backups")
 		defer testingutil.Setenv(t, "LITESTREAM_TESTDIR", testDir)()
@@ -241,7 +254,7 @@ func TestRestoreCommand(t *testing.T) {
 	t.Run("ErrNoOutputPathWithReplicaURL", func(t *testing.T) {
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "file://path/to/replica"})
-		if err == nil || err.Error() != `output path required when using a replica URL` {
+		if err == nil || err.Error() != `cannot determine latest replica: output path required when using a replica URL` {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -249,7 +262,7 @@ func TestRestoreCommand(t *testing.T) {
 	t.Run("ErrReplicaNameWithReplicaURL", func(t *testing.T) {
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "-replica", "replica0", "file://path/to/replica"})
-		if err == nil || err.Error() != `cannot specify both the replica URL and the -replica flag` {
+		if err == nil || err.Error() != `cannot determine latest replica: cannot specify both the replica URL and the -replica flag` {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -257,7 +270,7 @@ func TestRestoreCommand(t *testing.T) {
 	t.Run("ErrInvalidReplicaURL", func(t *testing.T) {
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "-o", filepath.Join(t.TempDir(), "db"), "xyz://xyz"})
-		if err == nil || err.Error() != `unknown replica type in config: "xyz"` {
+		if err == nil || err.Error() != `cannot determine latest replica: unknown replica type in config: "xyz"` {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -268,7 +281,7 @@ func TestRestoreCommand(t *testing.T) {
 
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "/no/such/db"})
-		if err == nil || err.Error() != `database not found in config: /no/such/db` {
+		if err == nil || err.Error() != `cannot determine latest replica: database not found in config: /no/such/db` {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -280,7 +293,7 @@ func TestRestoreCommand(t *testing.T) {
 
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-o", filepath.Join(tempDir, "db"), filepath.Join(testDir, "db")})
-		if err == nil || err.Error() != `database has no replicas: `+filepath.Join(testingutil.Getwd(t), testDir, "db") {
+		if err == nil || err.Error() != `cannot determine latest replica: database has no replicas: `+filepath.Join(testingutil.Getwd(t), testDir, "db") {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -292,7 +305,7 @@ func TestRestoreCommand(t *testing.T) {
 
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-o", filepath.Join(tempDir, "db"), "-replica", "no_such_replica", filepath.Join(testDir, "db")})
-		if err == nil || err.Error() != `replica "no_such_replica" not found` {
+		if err == nil || err.Error() != `cannot determine latest replica: replica "no_such_replica" not found` {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -304,7 +317,7 @@ func TestRestoreCommand(t *testing.T) {
 
 		m, _, _, _ := newMain()
 		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-o", filepath.Join(tempDir, "db"), "-generation", "0000000000000000", filepath.Join(testDir, "db")})
-		if err == nil || err.Error() != `must specify -replica flag when restoring from a specific generation` {
+		if err == nil || err.Error() != `cannot determine latest replica: must specify -replica flag when restoring from a specific generation` {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
