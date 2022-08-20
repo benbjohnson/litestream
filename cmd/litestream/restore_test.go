@@ -138,6 +138,19 @@ func TestRestoreCommand(t *testing.T) {
 		}
 	})
 
+	t.Run("IfReplicaExists/Multiple", func(t *testing.T) {
+		testDir := filepath.Join("testdata", "restore", "if-replica-exists-flag-multiple")
+		defer testingutil.Setenv(t, "LITESTREAM_TESTDIR", testDir)()
+
+		m, _, stdout, _ := newMain()
+		err := m.Run(context.Background(), []string{"restore", "-config", filepath.Join(testDir, "litestream.yml"), "-if-replica-exists", filepath.Join(testDir, "db")})
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := stdout.String(), string(testingutil.ReadFile(t, filepath.Join(testDir, "stdout"))); got != want {
+			t.Fatalf("stdout=%q, want %q", got, want)
+		}
+	})
+
 	t.Run("ErrNoBackups", func(t *testing.T) {
 		testDir := filepath.Join("testdata", "restore", "no-backups")
 		defer testingutil.Setenv(t, "LITESTREAM_TESTDIR", testDir)()

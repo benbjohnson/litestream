@@ -1,0 +1,5 @@
+dbs:
+  - path: $LITESTREAM_TESTDIR/db
+    replicas:
+      - path: $LITESTREAM_TESTDIR/replica0
+      - path: $LITESTREAM_TESTDIR/replica1

@@ -111,8 +111,16 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Build replica from either a URL or config.
 	r, err := c.loadReplica(ctx, config, pathOrURL)
-	if err != nil {
-		return err
+	if err == litestream.ErrNoGeneration {
+		// Return an error if no replicas can be loaded to restore from.
+		// If optional flag set, return success. Useful for automated recovery.
+		if c.ifReplicaExists {
+			fmt.Fprintln(c.stdout, "no replicas have generations to restore from, skipping")
+			return nil
+		}
+		return fmt.Errorf("no replicas have generations to restore from")
+	} else if err != nil {
+		return fmt.Errorf("cannot determine latest replica: %w", err)
 	}
 
 	// Determine latest generation if one is not specified.
@@ -218,11 +226,7 @@ func (c *RestoreCommand) loadReplicaFromConfig(ctx context.Context, config Confi
 	}
 
 	// Determine latest replica to restore from.
-	r, err := litestream.LatestReplica(ctx, db.Replicas)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine latest replica: %w", err)
-	}
-	return r, nil
+	return litestream.LatestReplica(ctx, db.Replicas)
 }
 
 // Usage prints the help screen to STDOUT.
