@@ -218,10 +218,12 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 				return nil // no more input
 			}
 
+			walPath, err := d.downloadWAL(ctx, input.index, input.offsets)
+
 			// Wait until next index equals input index and then send file to
-			// output to ensure sorted order.
-			if err := func() error {
-				walPath, err := d.downloadWAL(ctx, input.index, input.offsets)
+			// output to ensure sorted order. Run in background to allow parallel
+			// downloads to continue.
+			go func(err error) {
 
 				d.mu.Lock()
 				defer d.mu.Unlock()
@@ -233,7 +235,7 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 				// Keep looping until our index matches the next index to send.
 				for d.nextIndex != input.index {
 					if ctxErr := ctx.Err(); ctxErr != nil {
-						return ctxErr
+						return
 					}
 					d.cond.Wait()
 				}
@@ -241,7 +243,7 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 				// Still under lock, wait until Next() requests next index.
 				select {
 				case <-ctx.Done():
-					return ctx.Err()
+					return
 
 				case d.output <- walDownloadOutput{
 					index: input.index,
@@ -252,15 +254,15 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 					// the Next() method to return io.EOF.
 					if d.nextIndex == d.maxIndex {
 						close(d.output)
-						return nil
+						return
 					}
 
 					// Update next expected index now that our send is successful.
 					d.nextIndex++
 				}
+			}(err)
 
-				return err
-			}(); err != nil {
+			if err != nil {
 				return err
 			}
 		}
