@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/pierrec/lz4/v4"
@@ -52,6 +54,9 @@ type WALDownloader struct {
 
 	// Number of downloads occurring in parallel.
 	Parallelism int
+
+	// Logger instance if logging is enabled.
+	Logger *log.Logger
 }
 
 // NewWALDownloader returns a new instance of WALDownloader.
@@ -221,7 +226,14 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 			// Wait until next index equals input index and then send file to
 			// output to ensure sorted order.
 			if err := func() error {
-				walPath, err := d.downloadWAL(ctx, input.index, input.offsets)
+				startTime := time.Now()
+				walPath, bytes, err := d.downloadWAL(ctx, input.index, input.offsets)
+				elapsed := time.Since(startTime)
+
+				if d.Logger != nil {
+					d.Logger.Printf("downloaded wal %s/%s elapsed=%s offsets=%d bytes=%d speed=%s",
+						d.generation, FormatIndex(input.index), elapsed.String(), len(input.offsets), bytes, calculateSpeed(bytes, elapsed))
+				}
 
 				d.mu.Lock()
 				defer d.mu.Unlock()
@@ -270,12 +282,12 @@ func (d *WALDownloader) downloader(ctx context.Context) error {
 // downloadWAL sequentially downloads all the segments for WAL index from the
 // replica client and appends them to a single on-disk file. Returns the name
 // of the on-disk file on success.
-func (d *WALDownloader) downloadWAL(ctx context.Context, index int, offsets []int64) (string, error) {
+func (d *WALDownloader) downloadWAL(ctx context.Context, index int, offsets []int64) (string, int64, error) {
 	// Open handle to destination WAL path.
 	walPath := fmt.Sprintf("%s-%s-wal", d.prefix, FormatIndex(index))
 	f, err := internal.CreateFile(walPath, d.Mode, d.Uid, d.Gid)
 	if err != nil {
-		return "", err
+		return "", 0, err
 	}
 	defer f.Close()
 
@@ -302,14 +314,14 @@ func (d *WALDownloader) downloadWAL(ctx context.Context, index int, offsets []in
 
 			return nil
 		}(); err != nil {
-			return "", err
+			return "", 0, err
 		}
 	}
 
 	if err := f.Close(); err != nil {
-		return "", err
+		return "", 0, err
 	}
-	return walPath, nil
+	return walPath, written, nil
 }
 
 type walDownloadInput struct {

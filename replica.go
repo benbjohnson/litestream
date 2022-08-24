@@ -262,6 +262,7 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 
 	pos := segments[0].Pos()
 	initialPos := pos
+	startTime := time.Now()
 
 	// Copy shadow WAL to client write via io.Pipe().
 	pr, pw := io.Pipe()
@@ -324,13 +325,15 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 	r.pos = pos
 	r.mu.Unlock()
 
-	replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name()).Add(float64(pos.Offset - initialPos.Offset))
+	bytesWritten := pos.Offset - initialPos.Offset
+	replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name()).Add(float64(bytesWritten))
 
 	// Track total WAL bytes written to replica client.
 	replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(pos.Index))
 	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(pos.Offset))
 
-	r.Logger.Printf("wal segment written: %s sz=%d", initialPos, pos.Offset-initialPos.Offset)
+	elapsed := time.Since(startTime)
+	r.Logger.Printf("wal segment written: %s elapsed=%s bytes=%d speed=%s", initialPos, elapsed.String(), bytesWritten, calculateSpeed(bytesWritten, elapsed))
 
 	return nil
 }
@@ -522,14 +525,18 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return pw.Close()
 	})
 
+	r.Logger.Printf("writing snapshot %s/%s", pos.Generation, FormatIndex(pos.Index))
+
 	// Delegate write to client & wait for writer goroutine to finish.
+	startTime := time.Now()
 	if info, err = r.client.WriteSnapshot(ctx, pos.Generation, pos.Index, pr); err != nil {
 		return info, err
 	} else if err := g.Wait(); err != nil {
 		return info, err
 	}
+	elapsed := time.Since(startTime)
 
-	r.Logger.Printf("snapshot written %s/%s", pos.Generation, FormatIndex(pos.Index))
+	r.Logger.Printf("snapshot written %s/%s elapsed=%s bytes=%d speed=%s (compressed)", pos.Generation, FormatIndex(pos.Index), elapsed.String(), info.Size, calculateSpeed(info.Size, elapsed))
 
 	return info, nil
 }

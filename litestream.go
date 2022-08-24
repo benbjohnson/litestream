@@ -562,3 +562,22 @@ func assert(condition bool, message string) {
 		panic("assertion failed: " + message)
 	}
 }
+
+// Calculate human readable speed
+func calculateSpeed(bytes int64, elapsed time.Duration) string {
+	ps := float64(bytes*8) / elapsed.Seconds()
+	unit := "bps"
+
+	if ps > 1000*1000*1000 {
+		ps /= 1000 * 1000 * 1000
+		unit = "Gbps"
+	} else if ps > 1000*1000 {
+		ps /= 1000 * 1000
+		unit = "Mbps"
+	} else if ps > 1000 {
+		ps /= 1000
+		unit = "Kbps"
+	}
+
+	return fmt.Sprintf("%.2f%s", ps, unit)
+}

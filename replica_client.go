@@ -416,7 +416,7 @@ func Restore(ctx context.Context, client ReplicaClient, filename, generation str
 	// Ensure logger exists.
 	logger := opt.Logger
 	if logger == nil {
-		logger = log.New(io.Discard, "", 0)
+		logger = log.New(io.Discard, opt.LogPrefix, 0)
 	}
 
 	// Ensure output path does not already exist.
@@ -431,16 +431,24 @@ func Restore(ctx context.Context, client ReplicaClient, filename, generation str
 
 	// Copy snapshot to output path.
 	tmpPath := filename + ".tmp"
-	logger.Printf("%srestoring snapshot %s/%s to %s", opt.LogPrefix, generation, FormatIndex(snapshotIndex), tmpPath)
-	if err := RestoreSnapshot(ctx, client, tmpPath, generation, snapshotIndex, opt.Mode, opt.Uid, opt.Gid); err != nil {
+	logger.Printf("restoring snapshot %s/%s to %s", generation, FormatIndex(snapshotIndex), tmpPath)
+	startTime := time.Now()
+	bytes, err := RestoreSnapshot(ctx, client, tmpPath, generation, snapshotIndex, opt.Mode, opt.Uid, opt.Gid)
+	if err != nil {
 		return fmt.Errorf("cannot restore snapshot: %w", err)
 	}
+	elapsed := time.Since(startTime)
+
+	// Restore timings are combined download+decompress where bytes is the uncompressed file.
+	logger.Printf("restored snapshot %s/%s elapsed=%s bytes=%d speed=%s (uncompressed)",
+		generation, FormatIndex(snapshotIndex), elapsed.String(), bytes, calculateSpeed(bytes, elapsed))
 
 	// Download & apply all WAL files between the snapshot & the target index.
 	d := NewWALDownloader(client, tmpPath, generation, snapshotIndex, targetIndex)
 	d.Parallelism = opt.Parallelism
 	d.Mode = opt.Mode
 	d.Uid, d.Gid = opt.Uid, opt.Gid
+	d.Logger = logger
 
 	for {
 		// Read next WAL file from downloader.
@@ -451,7 +459,7 @@ func Restore(ctx context.Context, client ReplicaClient, filename, generation str
 
 		// If we are only reading a single index, a WAL file may not be found.
 		if _, ok := err.(*WALNotFoundError); ok && snapshotIndex == targetIndex {
-			logger.Printf("%sno wal files found, snapshot only", opt.LogPrefix)
+			logger.Printf("no wal files found, snapshot only")
 			break
 		} else if err != nil {
 			return fmt.Errorf("cannot download WAL: %w", err)
@@ -462,11 +470,11 @@ func Restore(ctx context.Context, client ReplicaClient, filename, generation str
 		if err = ApplyWAL(ctx, tmpPath, walPath); err != nil {
 			return fmt.Errorf("cannot apply wal: %w", err)
 		}
-		logger.Printf("%sapplied wal %s/%s elapsed=%s", opt.LogPrefix, generation, FormatIndex(walIndex), time.Since(startTime).String())
+		logger.Printf("applied wal %s/%s elapsed=%s", generation, FormatIndex(walIndex), time.Since(startTime).String())
 	}
 
 	// Copy file to final location.
-	logger.Printf("%srenaming database from temporary location", opt.LogPrefix)
+	logger.Printf("renaming database from temporary location")
 	if err := os.Rename(tmpPath, filename); err != nil {
 		return err
 	}
@@ -497,23 +505,24 @@ func NewRestoreOptions() RestoreOptions {
 }
 
 // RestoreSnapshot copies a snapshot from the replica client to a file.
-func RestoreSnapshot(ctx context.Context, client ReplicaClient, filename, generation string, index int, mode os.FileMode, uid, gid int) error {
+func RestoreSnapshot(ctx context.Context, client ReplicaClient, filename, generation string, index int, mode os.FileMode, uid, gid int) (int64, error) {
 	f, err := internal.CreateFile(filename, mode, uid, gid)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer f.Close()
 
 	rd, err := client.SnapshotReader(ctx, generation, index)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer rd.Close()
 
-	if _, err := io.Copy(f, lz4.NewReader(rd)); err != nil {
-		return err
+	written, err := io.Copy(f, lz4.NewReader(rd))
+	if err != nil {
+		return 0, err
 	} else if err := f.Sync(); err != nil {
-		return err
+		return 0, err
 	}
-	return f.Close()
+	return written, f.Close()
 }
