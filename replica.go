@@ -180,7 +180,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	}
 
 	// Create snapshot if no snapshots exist for generation.
-	snapshotN, err := r.snapshotN(generation)
+	snapshotN, err := r.snapshotN(ctx, generation)
 	if err != nil {
 		return err
 	} else if snapshotN == 0 {
@@ -336,8 +336,8 @@ func (r *Replica) writeIndexSegments(ctx context.Context, segments []WALSegmentI
 }
 
 // snapshotN returns the number of snapshots for a generation.
-func (r *Replica) snapshotN(generation string) (int, error) {
-	itr, err := r.client.Snapshots(context.Background(), generation)
+func (r *Replica) snapshotN(ctx context.Context, generation string) (int, error) {
+	itr, err := r.client.Snapshots(ctx, generation)
 	if err != nil {
 		return 0, err
 	}
