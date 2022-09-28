@@ -155,6 +155,12 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 			r.mu.Lock()
 			r.pos = Pos{}
 			r.mu.Unlock()
+
+			// Reset iterator since we lost position
+			if r.itr != nil {
+				_ = r.itr.Close()
+				r.itr = nil
+			}
 		}
 	}()
 
