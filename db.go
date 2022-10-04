@@ -775,7 +775,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		checkpoint, checkpointMode = true, CheckpointModeTruncate
 	} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
 		checkpoint, checkpointMode = true, CheckpointModeRestart
-	} else if newWALSize >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
+	} else if db.MinCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
 		checkpoint = true
 	} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
 		checkpoint = true
