@@ -293,6 +293,9 @@ func (db *DB) Open() (err error) {
 		go func() { defer db.wg.Done(); db.monitor() }()
 	}
 
+	// Try to initialize the database early, allow failing.
+	db.init()
+
 	return nil
 }
 
