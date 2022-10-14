@@ -6,7 +6,7 @@ Litestream
 ![test](https://github.com/benbjohnson/litestream/workflows/test/badge.svg)
 ==========
 
-Litestream is a standalone streaming replication tool for SQLite. It runs as a
+Litestream is a standalone disaster recovery tool for SQLite. It runs as a
 background process and safely replicates changes incrementally to another file
 or S3. Litestream only communicates with SQLite through the SQLite API so it
 will not corrupt your database.
