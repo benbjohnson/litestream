@@ -208,10 +208,14 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 			n = len(objIDs)
 		}
 
-		if _, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
 			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
-		}); err != nil {
+		})
+		if err != nil {
+			return err
+		}
+		if err := deleteOutputError(out); err != nil {
 			return err
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -303,10 +307,14 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 
-	if _, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+	out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
 		Bucket: aws.String(c.Bucket),
 		Delete: &s3.Delete{Objects: []*s3.ObjectIdentifier{{Key: &key}}, Quiet: aws.Bool(true)},
-	}); err != nil {
+	})
+	if err != nil {
+		return err
+	}
+	if err := deleteOutputError(out); err != nil {
 		return err
 	}
 
@@ -405,13 +413,16 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		}
 
 		// Delete S3 objects in bulk.
-		if _, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
 			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
-		}); err != nil {
+		})
+		if err != nil {
 			return err
 		}
-
+		if err := deleteOutputError(out); err != nil {
+			return err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
 		a = a[n:]
@@ -454,10 +465,14 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			n = len(objIDs)
 		}
 
-		if _, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
 			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
-		}); err != nil {
+		})
+		if err != nil {
+			return err
+		}
+		if err := deleteOutputError(out); err != nil {
 			return err
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -735,5 +750,17 @@ func isNotExists(err error) bool {
 		return err.Code() == `NoSuchKey`
 	default:
 		return false
+	}
+}
+
+func deleteOutputError(out *s3.DeleteObjectsOutput) error {
+	switch len(out.Errors) {
+	case 0:
+		return nil
+	case 1:
+		return fmt.Errorf("deleting object %s: %s - %s", *out.Errors[0].Key, *out.Errors[0].Code, *out.Errors[0].Message)
+	default:
+		return fmt.Errorf("%d errors occured deleting objects, %s: %s - (%s (and %d others)",
+			len(out.Errors), *out.Errors[0].Key, *out.Errors[0].Code, *out.Errors[0].Message, len(out.Errors)-1)
 	}
 }
