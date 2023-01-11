@@ -92,7 +92,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	if region != "" {
 		config.Region = aws.String(region)
 	}
-	config.CredentialsChainVerboseErrors = aws.Bool(true)
 
 	sess, err := session.NewSession(config)
 	if err != nil {
