@@ -16,7 +16,6 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/defaults"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
@@ -93,6 +92,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	if region != "" {
 		config.Region = aws.String(region)
 	}
+	config.CredentialsChainVerboseErrors = aws.Bool(true)
+
 	sess, err := session.NewSession(config)
 	if err != nil {
 		return fmt.Errorf("cannot create aws session: %w", err)
@@ -105,7 +106,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 // config returns the AWS configuration. Uses the default credential chain
 // unless a key/secret are explicitly set.
 func (c *ReplicaClient) config() *aws.Config {
-	config := defaults.Get().Config
+	config := &aws.Config{}
+
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
 		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
 	}
