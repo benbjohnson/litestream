@@ -2,16 +2,22 @@ package abs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"path"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/Azure/azure-storage-blob-go/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blockblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/container"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 	"golang.org/x/sync/errgroup"
@@ -24,8 +30,8 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing snapshots & WAL segments to disk.
 type ReplicaClient struct {
-	mu           sync.Mutex
-	containerURL *azblob.ContainerURL
+	mu     sync.Mutex
+	client *container.Client
 
 	// Azure credentials
 	AccountName string
@@ -52,7 +58,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.containerURL != nil {
+	if c.client != nil {
 		return nil
 	}
 
@@ -62,10 +68,10 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
 	}
 
-	// Authenticate to ACS.
-	credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
+	// Authenticate to Azure Blob Storage using shared key credentials.
+	credentials, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
 	if err != nil {
-		return err
+		return fmt.Errorf("cannot create Shared Key Credential object: %w", err)
 	}
 
 	// Construct & parse endpoint unless already set.
@@ -73,19 +79,25 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	if endpoint == "" {
 		endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
 	}
-	endpointURL, err := url.Parse(endpoint)
-	if err != nil {
-		return fmt.Errorf("cannot parse azure endpoint: %w", err)
+	if !strings.HasSuffix(endpoint, "/") {
+		endpoint += "/"
 	}
+	endpoint += c.Bucket
 
 	// Build pipeline and reference to container.
-	pipeline := azblob.NewPipeline(credential, azblob.PipelineOptions{
-		Retry: azblob.RetryOptions{
-			TryTimeout: 24 * time.Hour,
+	c.client, err = container.NewClientWithSharedKeyCredential(endpoint, credentials, &container.ClientOptions{
+		ClientOptions: policy.ClientOptions{
+			Retry: policy.RetryOptions{
+				TryTimeout: 24 * time.Hour,
+			},
+			Telemetry: policy.TelemetryOptions{
+				ApplicationID: "litestream",
+			},
 		},
 	})
-	containerURL := azblob.NewServiceURL(*endpointURL, pipeline).NewContainerURL(c.Bucket)
-	c.containerURL = &containerURL
+	if err != nil {
+		return fmt.Errorf("cannot create Azure Blob Storage client: %w", err)
+	}
 
 	return nil
 }
@@ -97,20 +109,20 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 	}
 
 	var generations []string
-	var marker azblob.Marker
-	for marker.NotDone() {
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
-
-		resp, err := c.containerURL.ListBlobsHierarchySegment(ctx, marker, "/", azblob.ListBlobsSegmentOptions{
-			Prefix: path.Join(c.Path, "generations") + "/",
-		})
+	pager := c.client.NewListBlobsHierarchyPager("/", &container.ListBlobsHierarchyOptions{
+		Prefix: to.Ptr(c.Path + "/generations/"),
+	})
+	for pager.More() {
+		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return nil, err
 		}
-		marker = resp.NextMarker
 
 		for _, prefix := range resp.Segment.BlobPrefixes {
-			name := path.Base(strings.TrimSuffix(prefix.Name, "/"))
+			if prefix == nil || prefix.Name == nil {
+				continue
+			}
+			name := path.Base(strings.TrimSuffix(*prefix.Name, "/"))
 			if !litestream.IsGenerationName(name) {
 				continue
 			}
@@ -126,28 +138,31 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 	if err := c.Init(ctx); err != nil {
 		return err
 	} else if generation == "" {
-		return fmt.Errorf("generation required")
+		return errors.New("generation required")
 	}
 
-	prefix := path.Join(c.Path, "generations", generation) + "/"
-
-	var marker azblob.Marker
-	for marker.NotDone() {
+	pager := c.client.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: to.Ptr(c.Path + "/generations/" + generation + "/"),
+	})
+	for pager.More() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := c.containerURL.ListBlobsFlatSegment(ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
+		resp, err := pager.NextPage(ctx)
 		if err != nil {
 			return err
 		}
-		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
+			if item == nil || item.Name == nil {
+				continue
+			}
 			internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
-			blobURL := c.containerURL.NewBlobURL(item.Name)
-			if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
-				continue
-			} else if err != nil {
+			_, err = c.client.NewBlobClient(*item.Name).Delete(ctx, nil)
+			if err != nil {
+				if bloberror.HasCode(err, bloberror.BlobNotFound) {
+					continue
+				}
 				return err
 			}
 		}
@@ -179,11 +194,12 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 	rc := internal.NewReadCounter(rd)
 
-	blobURL := c.containerURL.NewBlockBlobURL(key)
-	if _, err := azblob.UploadStreamToBlockBlob(ctx, rc, blobURL, azblob.UploadStreamToBlockBlobOptions{
-		BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: "application/octet-stream"},
-		BlobAccessTier:  azblob.DefaultAccessTier,
-	}); err != nil {
+	_, err = c.client.NewBlockBlobClient(key).UploadStream(ctx, rc, &blockblob.UploadStreamOptions{
+		HTTPHeaders: &blob.HTTPHeaders{
+			BlobContentType: to.Ptr("application/octet-stream"),
+		},
+	})
+	if err != nil {
 		return info, err
 	}
 
@@ -208,18 +224,18 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 
 	key := path.Join(c.Path, "generations", generation, "snapshots", litestream.FormatIndex(index)+".snapshot.lz4")
 
-	blobURL := c.containerURL.NewBlobURL(key)
-	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-	if isNotExists(err) {
-		return nil, os.ErrNotExist
-	} else if err != nil {
+	resp, err := c.client.NewBlobClient(key).DownloadStream(ctx, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, os.ErrNotExist
+		}
 		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(resp.ContentLength()))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
 
-	return resp.Body(azblob.RetryReaderOptions{}), nil
+	return resp.NewRetryReader(ctx, nil), nil
 }
 
 // DeleteSnapshot deletes a snapshot with the given generation & index.
@@ -234,12 +250,14 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
-	blobURL := c.containerURL.NewBlobURL(key)
-	if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
-		return nil
-	} else if err != nil {
+	_, err := c.client.NewBlobClient(key).Delete(ctx, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil
+		}
 		return fmt.Errorf("cannot delete snapshot %q: %w", key, err)
 	}
+
 	return nil
 }
 
@@ -264,11 +282,12 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 
 	rc := internal.NewReadCounter(rd)
 
-	blobURL := c.containerURL.NewBlockBlobURL(key)
-	if _, err := azblob.UploadStreamToBlockBlob(ctx, rc, blobURL, azblob.UploadStreamToBlockBlobOptions{
-		BlobHTTPHeaders: azblob.BlobHTTPHeaders{ContentType: "application/octet-stream"},
-		BlobAccessTier:  azblob.DefaultAccessTier,
-	}); err != nil {
+	_, err = c.client.NewBlockBlobClient(key).UploadStream(ctx, rc, &blockblob.UploadStreamOptions{
+		HTTPHeaders: &blob.HTTPHeaders{
+			BlobContentType: to.Ptr("application/octet-stream"),
+		},
+	})
+	if err != nil {
 		return info, err
 	}
 
@@ -295,23 +314,24 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 
 	key := path.Join(c.Path, "generations", pos.Generation, "wal", litestream.FormatIndex(pos.Index), litestream.FormatOffset(pos.Offset)+".wal.lz4")
 
-	blobURL := c.containerURL.NewBlobURL(key)
-	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
-	if isNotExists(err) {
-		return nil, os.ErrNotExist
-	} else if err != nil {
+	resp, err := c.client.NewBlobClient(key).DownloadStream(ctx, nil)
+	if err != nil {
+		if bloberror.HasCode(err, bloberror.BlobNotFound) {
+			return nil, os.ErrNotExist
+		}
 		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(resp.ContentLength()))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
 
-	return resp.Body(azblob.RetryReaderOptions{}), nil
+	return resp.NewRetryReader(ctx, nil), nil
 }
 
 // DeleteWALSegments deletes WAL segments with at the given positions.
 func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Pos) error {
-	if err := c.Init(ctx); err != nil {
+	var err error
+	if err = c.Init(ctx); err != nil {
 		return err
 	}
 
@@ -324,10 +344,11 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
-		blobURL := c.containerURL.NewBlobURL(key)
-		if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
-			continue
-		} else if err != nil {
+		_, err := c.client.NewBlobClient(key).Delete(ctx, nil)
+		if err != nil {
+			if bloberror.HasCode(err, bloberror.BlobNotFound) {
+				continue
+			}
 			return fmt.Errorf("cannot delete wal segment %q: %w", key, err)
 		}
 	}
@@ -366,23 +387,26 @@ func (itr *snapshotIterator) fetch() error {
 	defer close(itr.ch)
 
 	if itr.generation == "" {
-		return fmt.Errorf("generation required")
+		return errors.New("generation required")
 	}
 
-	prefix := path.Join(itr.client.Path, "generations", itr.generation) + "/"
-
-	var marker azblob.Marker
-	for marker.NotDone() {
+	pager := itr.client.client.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: to.Ptr(itr.client.Path + "/generations/" + itr.generation + "/"),
+	})
+	for pager.More() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
+		resp, err := pager.NextPage(itr.ctx)
 		if err != nil {
 			return err
 		}
-		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
-			index, err := internal.ParseSnapshotPath(path.Base(item.Name))
+			if item == nil || item.Name == nil {
+				continue
+			}
+
+			index, err := internal.ParseSnapshotPath(path.Base(*item.Name))
 			if err != nil {
 				continue
 			}
@@ -400,6 +424,7 @@ func (itr *snapshotIterator) fetch() error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -476,18 +501,23 @@ func (itr *walSegmentIterator) fetch() error {
 	}
 	prefix := path.Join(itr.client.Path, "generations", itr.generation, "wal")
 
-	var marker azblob.Marker
-	for marker.NotDone() {
+	pager := itr.client.client.NewListBlobsFlatPager(&container.ListBlobsFlatOptions{
+		Prefix: to.Ptr(prefix),
+	})
+	for pager.More() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
+		resp, err := pager.NextPage(itr.ctx)
 		if err != nil {
 			return err
 		}
-		marker = resp.NextMarker
 
 		for _, item := range resp.Segment.BlobItems {
-			key := strings.TrimPrefix(item.Name, prefix+"/")
+			if item == nil || item.Name == nil {
+				continue
+			}
+
+			key := strings.TrimPrefix(*item.Name, prefix+"/")
 			index, offset, err := internal.ParseWALSegmentPath(key)
 			if err != nil {
 				continue
@@ -507,6 +537,7 @@ func (itr *walSegmentIterator) fetch() error {
 			}
 		}
 	}
+
 	return nil
 }
 
@@ -546,13 +577,4 @@ func (itr *walSegmentIterator) Err() error { return itr.err }
 
 func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
 	return itr.info
-}
-
-func isNotExists(err error) bool {
-	switch err := err.(type) {
-	case azblob.StorageError:
-		return err.ServiceCode() == azblob.ServiceCodeBlobNotFound
-	default:
-		return false
-	}
 }

@@ -7,13 +7,13 @@ on:
 jobs:
   s3-integration-test:
     name: Run S3 Integration Tests
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
 
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.17'
+          go-version: '1.19'
 
       - uses: actions/cache@v2
         with:
@@ -32,13 +32,13 @@ jobs:
 
   gcp-integration-test:
     name: Run GCP Integration Tests
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
 
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.17'
+          go-version: '1.19'
 
       - uses: actions/cache@v2
         with:
@@ -59,13 +59,13 @@ jobs:
 
   abs-integration-test:
     name: Run Azure Blob Store Integration Tests
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
 
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.17'
+          go-version: '1.19'
 
       - uses: actions/cache@v2
         with:
@@ -81,13 +81,13 @@ jobs:
 
   sftp-integration-test:
     name: Run SFTP Integration Tests
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
 
       - uses: actions/setup-go@v2
         with:
-          go-version: '1.17'
+          go-version: '1.19'
 
       - uses: actions/cache@v2
         with:
@@ -119,13 +119,13 @@ jobs:
 
   long-running-test:
     name: Run Long-Running Test
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v2
 
       - uses: actions/setup-go@v2
         with: 
-          go-version: '1.17'
+          go-version: '1.19'
 
       - uses: actions/cache@v2
         with:
