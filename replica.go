@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"sort"
@@ -375,7 +374,7 @@ func (r *Replica) calcPos(ctx context.Context, generation string) (pos Pos, err 
 	}
 	defer rd.Close()
 
-	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
+	n, err := io.Copy(io.Discard, lz4.NewReader(rd))
 	if err != nil {
 		return pos, err
 	}
