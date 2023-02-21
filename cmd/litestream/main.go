@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"net/url"
 	"os"
@@ -253,7 +252,7 @@ func readConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 
 	// Read configuration.
 	// Do not return an error if using default path and file is missing.
-	buf, err := ioutil.ReadFile(filename)
+	buf, err := os.ReadFile(filename)
 	if err != nil {
 		return config, err
 	}

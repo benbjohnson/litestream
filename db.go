@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"os"
@@ -292,7 +291,7 @@ func (db *DB) invalidatePos(ctx context.Context) error {
 	}
 	defer rd.Close()
 
-	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
+	n, err := io.Copy(io.Discard, lz4.NewReader(rd))
 	if err != nil {
 		return err
 	}
@@ -671,7 +670,7 @@ func (db *DB) cleanGenerations(ctx context.Context) error {
 	}
 
 	dir := filepath.Join(db.MetaPath(), "generations")
-	fis, err := ioutil.ReadDir(dir)
+	fis, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {

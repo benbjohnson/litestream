@@ -3,7 +3,6 @@ package main_test
 import (
 	"bytes"
 	"io"
-	"io/ioutil"
 	"log"
 	"os"
 	"path/filepath"
@@ -23,7 +22,7 @@ func TestReadConfigFile(t *testing.T) {
 	// Ensure global AWS settings are propagated down to replica configurations.
 	t.Run("PropagateGlobalSettings", func(t *testing.T) {
 		filename := filepath.Join(t.TempDir(), "litestream.yml")
-		if err := ioutil.WriteFile(filename, []byte(`
+		if err := os.WriteFile(filename, []byte(`
 access-key-id: XXX
 secret-access-key: YYY
 
@@ -55,7 +54,7 @@ dbs:
 		os.Setenv("LITESTREAM_TEST_1872363", "s3://foo/bar")
 
 		filename := filepath.Join(t.TempDir(), "litestream.yml")
-		if err := ioutil.WriteFile(filename, []byte(`
+		if err := os.WriteFile(filename, []byte(`
 dbs:
   - path: $LITESTREAM_TEST_0129380
     replicas:
@@ -82,7 +81,7 @@ dbs:
 		os.Setenv("LITESTREAM_TEST_9847533", "s3://foo/bar")
 
 		filename := filepath.Join(t.TempDir(), "litestream.yml")
-		if err := ioutil.WriteFile(filename, []byte(`
+		if err := os.WriteFile(filename, []byte(`
 dbs:
   - path: /path/to/db
     replicas:
