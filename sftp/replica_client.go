@@ -79,16 +79,15 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	if c.KeyPath != "" {
-		buf, err := os.ReadFile(c.KeyPath)
+		signer, err := c.getSigner()
 		if err != nil {
-			return nil, fmt.Errorf("cannot read sftp key path: %w", err)
-		}
-
-		signer, err := ssh.ParsePrivateKey(buf)
-		if err != nil {
-			return nil, fmt.Errorf("cannot parse sftp key path: %w", err)
+			return nil, err
 		}
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
+
+		if certSigner, err := c.getCertSigner(signer); err != nil {
+			config.Auth = append(config.Auth, ssh.PublicKeys(certSigner))
+		}
 	}
 
 	// Append standard port, if necessary.
@@ -110,6 +109,44 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	return c.sftpClient, nil
+}
+
+func (c *ReplicaClient) getSigner() (ssh.Signer, error) {
+	buf, err := os.ReadFile(c.KeyPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read sftp key path: %w", err)
+	}
+
+	signer, err := ssh.ParsePrivateKey(buf)
+	if err != nil {
+		return nil, fmt.Errorf("cannot parse sftp key path: %w", err)
+	}
+
+	return signer, nil
+}
+
+func (c *ReplicaClient) getCertSigner(priv ssh.Signer) (ssh.Signer, error) {
+	certBuf, err := os.ReadFile(c.KeyPath + "-cert.pub")
+	if err != nil {
+		return nil, err
+	}
+
+	pub, _, _, _, err := ssh.ParseAuthorizedKey(certBuf)
+	if err != nil {
+		return nil, err
+	}
+
+	cert, ok := pub.(*ssh.Certificate)
+	if !ok {
+		return nil, errors.New("bad certificate type")
+	}
+
+	signer, err := ssh.NewCertSigner(cert, priv)
+	if err != nil {
+		return nil, err
+	}
+
+	return signer, nil
 }
 
 // Generations returns a list of available generation names.
