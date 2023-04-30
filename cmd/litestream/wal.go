@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -86,7 +85,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 			generations = []string{*generation}
 		} else {
 			if generations, err = r.Client.Generations(ctx); err != nil {
-				log.Printf("%s: cannot determine generations: %s", r.Name(), err)
+				r.Logger().Error("cannot determine generations", "error", err)
 				continue
 			}
 		}
@@ -113,7 +112,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 				}
 				return itr.Close()
 			}(); err != nil {
-				log.Printf("%s: cannot fetch wal segments: %s", r.Name(), err)
+				r.Logger().Error("cannot fetch wal segments", "error", err)
 				continue
 			}
 		}

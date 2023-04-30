@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"strconv"
 	"time"
@@ -19,7 +18,6 @@ type RestoreCommand struct{}
 // Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	opt := litestream.NewRestoreOptions()
-	opt.Verbose = true
 
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
@@ -31,7 +29,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
-	verbose := fs.Bool("v", false, "verbose output")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -46,11 +43,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if opt.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
 			return errors.New("invalid -timestamp, must specify in ISO 8601 format (e.g. 2000-01-01T00:00:00Z)")
 		}
-	}
-
-	// Instantiate logger if verbose output is enabled.
-	if *verbose {
-		opt.Logger = log.New(os.Stderr, "", log.LstdFlags|log.Lmicroseconds)
 	}
 
 	// Determine replica & generation to restore from.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"net"
 	"net/http"
 	_ "net/http/pprof"
@@ -42,7 +42,6 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
-	tracePath := fs.String("trace", "", "trace path")
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -80,27 +79,17 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		c.Config.Exec = *execFlag
 	}
 
-	// Enable trace logging.
-	if *tracePath != "" {
-		f, err := os.Create(*tracePath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-		litestream.Tracef = log.New(f, "", log.LstdFlags|log.Lmicroseconds|log.LUTC|log.Lshortfile).Printf
-	}
-
 	return nil
 }
 
 // Run loads all databases specified in the configuration.
 func (c *ReplicateCommand) Run() (err error) {
 	// Display version information.
-	log.Printf("litestream %s", Version)
+	slog.Info("litestream", "version", Version)
 
 	// Setup databases.
 	if len(c.Config.DBs) == 0 {
-		log.Println("no databases specified in configuration")
+		slog.Error("no databases specified in configuration")
 	}
 
 	for _, dbConfig := range c.Config.DBs {
@@ -118,21 +107,22 @@ func (c *ReplicateCommand) Run() (err error) {
 
 	// Notify user that initialization is done.
 	for _, db := range c.DBs {
-		log.Printf("initialized db: %s", db.Path())
+		slog.Info("initialized db", "path", db.Path())
 		for _, r := range db.Replicas {
+			slog := slog.With("name", r.Name(), "type", r.Client.Type(), "sync-interval", r.SyncInterval)
 			switch client := r.Client.(type) {
 			case *file.ReplicaClient:
-				log.Printf("replicating to: name=%q type=%q path=%q", r.Name(), client.Type(), client.Path())
+				slog.Info("replicating to", "path", client.Path())
 			case *s3.ReplicaClient:
-				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q region=%q endpoint=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, client.Region, client.Endpoint, r.SyncInterval)
+				slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region, "endpoint", client.Endpoint)
 			case *gcs.ReplicaClient:
-				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, r.SyncInterval)
+				slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
 			case *abs.ReplicaClient:
-				log.Printf("replicating to: name=%q type=%q bucket=%q path=%q endpoint=%q sync-interval=%s", r.Name(), client.Type(), client.Bucket, client.Path, client.Endpoint, r.SyncInterval)
+				slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
 			case *sftp.ReplicaClient:
-				log.Printf("replicating to: name=%q type=%q host=%q user=%q path=%q sync-interval=%s", r.Name(), client.Type(), client.Host, client.User, client.Path, r.SyncInterval)
+				slog.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
 			default:
-				log.Printf("replicating to: name=%q type=%q", r.Name(), client.Type())
+				slog.Info("replicating to")
 			}
 		}
 	}
@@ -146,11 +136,11 @@ func (c *ReplicateCommand) Run() (err error) {
 			hostport = net.JoinHostPort("localhost", port)
 		}
 
-		log.Printf("serving metrics on http://%s/metrics", hostport)
+		slog.Info("serving metrics on", "url", fmt.Sprintf("http://%s/metrics", hostport))
 		go func() {
 			http.Handle("/metrics", promhttp.Handler())
 			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
-				log.Printf("cannot start metrics server: %s", err)
+				slog.Error("cannot start metrics server", "error", err)
 			}
 		}()
 	}
@@ -179,7 +169,7 @@ func (c *ReplicateCommand) Run() (err error) {
 func (c *ReplicateCommand) Close() (err error) {
 	for _, db := range c.DBs {
 		if e := db.Close(); e != nil {
-			log.Printf("error closing db: path=%s err=%s", db.Path(), e)
+			db.Logger.Error("error closing db", "error", e)
 			if err == nil {
 				err = e
 			}
@@ -214,9 +204,6 @@ Arguments:
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
-
-	-trace PATH
-	    Write verbose trace logging to PATH.
 
 `[1:], DefaultConfigPath())
 }

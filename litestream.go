@@ -540,9 +540,6 @@ func isHexChar(ch rune) bool {
 	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
 }
 
-// Tracef is used for low-level tracing.
-var Tracef = func(format string, a ...interface{}) {}
-
 func assert(condition bool, message string) {
 	if !condition {
 		panic("assertion failed: " + message)

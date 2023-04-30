@@ -1,11 +1,10 @@
-// +build windows
+//go:build windows
 
 package main
 
 import (
 	"context"
 	"io"
-	"log"
 	"os"
 	"os/signal"
 
@@ -63,13 +62,13 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 	// Instantiate replication command and load configuration.
 	c := NewReplicateCommand()
 	if c.Config, err = ReadConfigFile(DefaultConfigPath(), true); err != nil {
-		log.Printf("cannot load configuration: %s", err)
+		slog.Error("cannot load configuration", "error", err)
 		return true, 1
 	}
 
 	// Execute replication command.
 	if err := c.Run(s.ctx); err != nil {
-		log.Printf("cannot replicate: %s", err)
+		slog.Error("cannot replicate", "error", err)
 		statusCh <- svc.Status{State: svc.StopPending}
 		return true, 2
 	}
@@ -88,7 +87,7 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 			case svc.Interrogate:
 				statusCh <- req.CurrentStatus
 			default:
-				log.Printf("Litestream service received unexpected change request cmd: %d", req.Cmd)
+				slog.Error("Litestream service received unexpected change request", "cmd", req.Cmd)
 			}
 		}
 	}
