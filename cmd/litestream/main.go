@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"filippo.io/age"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
@@ -323,6 +324,12 @@ type ReplicaConfig struct {
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	KeyPath  string `yaml:"key-path"`
+
+	// Encryption identities and recipients
+	Age struct {
+		Identities []string `yaml:"identities"`
+		Recipients []string `yaml:"recipients"`
+	} `yaml:"age"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
@@ -348,6 +355,22 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	}
 	if v := c.ValidationInterval; v != nil {
 		r.ValidationInterval = *v
+	}
+	for _, str := range c.Age.Identities {
+		identities, err := age.ParseIdentities(strings.NewReader(str))
+		if err != nil {
+			return nil, err
+		}
+
+		r.AgeIdentities = append(r.AgeIdentities, identities...)
+	}
+	for _, str := range c.Age.Recipients {
+		recipients, err := age.ParseRecipients(strings.NewReader(str))
+		if err != nil {
+			return nil, err
+		}
+
+		r.AgeRecipients = append(r.AgeRecipients, recipients...)
 	}
 
 	// Build and set client on replica.
