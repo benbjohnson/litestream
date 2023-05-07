@@ -471,6 +471,10 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	r.muf.Lock()
 	defer r.muf.Unlock()
 
+	// Prevent checkpoints during snapshot.
+	r.db.BeginSnapshot()
+	defer r.db.EndSnapshot()
+
 	// Issue a passive checkpoint to flush any pages to disk before snapshotting.
 	if _, err := r.db.db.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE);`); err != nil {
 		return info, fmt.Errorf("pre-snapshot checkpoint: %w", err)

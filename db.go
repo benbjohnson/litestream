@@ -50,6 +50,7 @@ type DB struct {
 	rtx      *sql.Tx       // long running read transaction
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
+	chkMu    sync.Mutex    // checkpoint lock
 
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
@@ -1293,6 +1294,12 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 // checkpointAndInit performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
+	// Try getting a checkpoint lock, will fail during snapshots.
+	if !db.chkMu.TryLock() {
+		return nil
+	}
+	defer db.chkMu.Unlock()
+
 	shadowWALPath, err := db.CurrentShadowWALPath(generation)
 	if err != nil {
 		return err
@@ -1526,6 +1533,19 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 		return 0, pos, err
 	}
 	return h.Sum64(), pos, nil
+}
+
+// BeginSnapshot takes an internal snapshot lock preventing checkpoints.
+//
+// When calling this the caller must also call EndSnapshot() once the snapshot
+// is finished.
+func (db *DB) BeginSnapshot() {
+	db.chkMu.Lock()
+}
+
+// EndSnapshot releases the internal snapshot lock that prevents checkpoints.
+func (db *DB) EndSnapshot() {
+	db.chkMu.Unlock()
 }
 
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.
