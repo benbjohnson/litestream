@@ -731,6 +731,30 @@ func (r *Replica) snapshotter(ctx context.Context) {
 		return
 	}
 
+	if pos, err := r.db.Pos(); err != nil {
+		log.Printf("%s(%s): snapshotter cannot determine generation: %s", r.db.Path(), r.Name(), err)
+	} else if !pos.IsZero() {
+		if snapshot, err := r.maxSnapshot(ctx, pos.Generation); err != nil {
+			log.Printf("%s(%s): snapshotter cannot determine latest snapshot: %s", r.db.Path(), r.Name(), err)
+		} else if snapshot != nil {
+			nextSnapshot := r.SnapshotInterval - time.Since(snapshot.CreatedAt)
+			if nextSnapshot < 0 {
+				nextSnapshot = 0
+			}
+
+			log.Printf("%s(%s): previous snapshot created at %s, next in %s", r.db.Path(), r.Name(), snapshot.CreatedAt.Format(time.RFC3339), nextSnapshot.String())
+
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(nextSnapshot):
+				if _, err := r.Snapshot(ctx); err != nil && err != ErrNoGeneration {
+					log.Printf("%s(%s): snapshotter error: %s", r.db.Path(), r.Name(), err)
+				}
+			}
+		}
+	}
+
 	ticker := time.NewTicker(r.SnapshotInterval)
 	defer ticker.Stop()
 
