@@ -72,6 +72,9 @@ type Replica struct {
 	// Encryption identities and recipients
 	AgeIdentities []age.Identity
 	AgeRecipients []age.Recipient
+
+	// The logger to send logging messages to. Defaults to log.Default()
+	Logger *log.Logger
 }
 
 func NewReplica(db *DB, name string) *Replica {
@@ -84,6 +87,7 @@ func NewReplica(db *DB, name string) *Replica {
 		Retention:              DefaultRetention,
 		RetentionCheckInterval: DefaultRetentionCheckInterval,
 		MonitorEnabled:         true,
+		Logger:                 log.Default(),
 	}
 
 	return r
@@ -534,7 +538,7 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 		return info, err
 	}
 
-	log.Printf("%s(%s): snapshot written %s/%08x", r.db.Path(), r.Name(), pos.Generation, pos.Index)
+	r.Logger.Printf("%s(%s): snapshot written %s/%08x", r.db.Path(), r.Name(), pos.Generation, pos.Index)
 
 	return info, nil
 }
@@ -602,7 +606,7 @@ func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, generation str
 		if err := r.Client.DeleteSnapshot(ctx, info.Generation, info.Index); err != nil {
 			return fmt.Errorf("delete snapshot %s/%08x: %w", info.Generation, info.Index, err)
 		}
-		log.Printf("%s(%s): snapshot deleted %s/%08x", r.db.Path(), r.Name(), generation, index)
+		r.Logger.Printf("%s(%s): snapshot deleted %s/%08x", r.db.Path(), r.Name(), generation, index)
 	}
 
 	return itr.Close()
@@ -634,7 +638,7 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, generation s
 	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
-	log.Printf("%s(%s): wal segmented deleted before %s/%08x: n=%d", r.db.Path(), r.Name(), generation, index, len(a))
+	r.Logger.Printf("%s(%s): wal segmented deleted before %s/%08x: n=%d", r.db.Path(), r.Name(), generation, index, len(a))
 
 	return nil
 }
@@ -671,7 +675,7 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
-			log.Printf("%s(%s): monitor error: %s", r.db.Path(), r.Name(), err)
+			r.Logger.Printf("%s(%s): monitor error: %s", r.db.Path(), r.Name(), err)
 			continue
 		}
 	}
@@ -699,7 +703,7 @@ func (r *Replica) retainer(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
-				log.Printf("%s(%s): retainer error: %s", r.db.Path(), r.Name(), err)
+				r.Logger.Printf("%s(%s): retainer error: %s", r.db.Path(), r.Name(), err)
 				continue
 			}
 		}
@@ -721,7 +725,7 @@ func (r *Replica) snapshotter(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if _, err := r.Snapshot(ctx); err != nil && err != ErrNoGeneration {
-				log.Printf("%s(%s): snapshotter error: %s", r.db.Path(), r.Name(), err)
+				r.Logger.Printf("%s(%s): snapshotter error: %s", r.db.Path(), r.Name(), err)
 				continue
 			}
 		}
@@ -749,7 +753,7 @@ func (r *Replica) validator(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := r.Validate(ctx); err != nil {
-				log.Printf("%s(%s): validation error: %s", r.db.Path(), r.Name(), err)
+				r.Logger.Printf("%s(%s): validation error: %s", r.db.Path(), r.Name(), err)
 				continue
 			}
 		}
@@ -786,7 +790,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 		ReplicaName: r.Name(),
 		Generation:  pos.Generation,
 		Index:       pos.Index - 1,
-		Logger:      log.New(os.Stderr, "", 0),
+		Logger:      r.Logger,
 	}); err != nil {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
@@ -811,7 +815,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	if mismatch {
 		status = "mismatch"
 	}
-	log.Printf("%s(%s): validator: status=%s db=%016x replica=%016x pos=%s", db.Path(), r.Name(), status, chksum0, chksum1, pos)
+	r.Logger.Printf("%s(%s): validator: status=%s db=%016x replica=%016x pos=%s", db.Path(), r.Name(), status, chksum0, chksum1, pos)
 
 	// Validate checksums match.
 	if mismatch {
@@ -853,7 +857,7 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 		// Obtain current position of replica, check if past target position.
 		curr := r.Pos()
 		if curr.IsZero() {
-			log.Printf("%s(%s): validator: no replica position available", db.Path(), r.Name())
+			r.Logger.Printf("%s(%s): validator: no replica position available", db.Path(), r.Name())
 			continue
 		}
 
@@ -1008,7 +1012,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Ensure logger exists.
 	logger := opt.Logger
 	if logger == nil {
-		logger = log.New(ioutil.Discard, "", 0)
+		logger = r.Logger
 	}
 
 	logPrefix := r.Name()
