@@ -94,6 +94,9 @@ type DB struct {
 	// List of replicas for the database.
 	// Must be set before calling Open().
 	Replicas []*Replica
+
+	// Where to send log messages, defaults to log.Default()
+	Logger *log.Logger
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -106,6 +109,8 @@ func NewDB(path string) *DB {
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
+
+		Logger: log.Default(),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -447,7 +452,7 @@ func (db *DB) init() (err error) {
 
 	// If we have an existing shadow WAL, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		log.Printf("%s: init: cannot determine last wal position, clearing generation; %s", db.path, err)
+		db.Logger.Printf("%s: init: cannot determine last wal position, clearing generation; %s", db.path, err)
 		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove generation name: %w", err)
 		}
@@ -726,7 +731,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		if info.generation, err = db.createGeneration(); err != nil {
 			return fmt.Errorf("create generation: %w", err)
 		}
-		log.Printf("%s: sync: new generation %q, %s", db.path, info.generation, info.reason)
+		db.Logger.Printf("%s: sync: new generation %q, %s", db.path, info.generation, info.reason)
 
 		// Clear shadow wal info.
 		info.shadowWALPath = db.ShadowWALPath(info.generation, 0)
@@ -1365,7 +1370,7 @@ func (db *DB) monitor() {
 
 		// Sync the database to the shadow WAL.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("%s: sync error: %s", db.path, err)
+			db.Logger.Printf("%s: sync error: %s", db.path, err)
 		}
 	}
 }
