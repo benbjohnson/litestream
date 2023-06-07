@@ -86,20 +86,17 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Setup signal handler.
-		ctx, cancel := context.WithCancel(ctx)
 		signalCh := signalChan()
 
-		if err := c.Run(ctx); err != nil {
+		if err := c.Run(); err != nil {
 			return err
 		}
 
 		// Wait for signal to stop program.
 		select {
 		case err = <-c.execCh:
-			cancel()
 			fmt.Println("subprocess exited, litestream shutting down")
 		case sig := <-signalCh:
-			cancel()
 			fmt.Println("signal received, litestream shutting down")
 
 			if c.cmd != nil {
