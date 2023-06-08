@@ -94,7 +94,7 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 }
 
 // Run loads all databases specified in the configuration.
-func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
+func (c *ReplicateCommand) Run() (err error) {
 	// Display version information.
 	log.Printf("litestream %s", Version)
 
@@ -162,7 +162,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot parse exec command: %w", err)
 		}
 
-		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
+		c.cmd = exec.Command(execArgs[0], execArgs[1:]...)
 		c.cmd.Env = os.Environ()
 		c.cmd.Stdout = os.Stdout
 		c.cmd.Stderr = os.Stderr
