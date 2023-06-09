@@ -247,6 +247,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 // DBConfig represents the configuration for a single database.
 type DBConfig struct {
 	Path               string         `yaml:"path"`
+	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
@@ -266,6 +267,9 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	db := litestream.NewDB(path)
 
 	// Override default database settings if specified in configuration.
+	if dbc.MetaPath != nil {
+		db.SetMetaPath(*dbc.MetaPath)
+	}
 	if dbc.MonitorInterval != nil {
 		db.MonitorInterval = *dbc.MonitorInterval
 	}
