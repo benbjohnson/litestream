@@ -44,6 +44,7 @@ const BusyTimeout = 1 * time.Second
 type DB struct {
 	mu       sync.RWMutex
 	path     string        // part to database
+	metaPath string        // Path to the database metadata.
 	db       *sql.DB       // target database
 	f        *os.File      // long-running db file descriptor
 	rtx      *sql.Tx       // long running read transaction
@@ -101,9 +102,12 @@ type DB struct {
 
 // NewDB returns a new instance of DB for a given path.
 func NewDB(path string) *DB {
+	dir, file := filepath.Split(path)
+
 	db := &DB{
-		path:   path,
-		notify: make(chan struct{}),
+		path:     path,
+		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
+		notify:   make(chan struct{}),
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
 		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
@@ -147,20 +151,24 @@ func (db *DB) WALPath() string {
 
 // MetaPath returns the path to the database metadata.
 func (db *DB) MetaPath() string {
-	dir, file := filepath.Split(db.path)
-	return filepath.Join(dir, "."+file+MetaDirSuffix)
+	return db.metaPath
+}
+
+// SetMetaPath sets the path to database metadata.
+func (db *DB) SetMetaPath(mp string) {
+	db.metaPath = mp
 }
 
 // GenerationNamePath returns the path of the name of the current generation.
 func (db *DB) GenerationNamePath() string {
-	return filepath.Join(db.MetaPath(), "generation")
+	return filepath.Join(db.metaPath, "generation")
 }
 
 // GenerationPath returns the path of a single generation.
 // Panics if generation is blank.
 func (db *DB) GenerationPath(generation string) string {
 	assert(generation != "", "generation name required")
-	return filepath.Join(db.MetaPath(), "generations", generation)
+	return filepath.Join(db.metaPath, "generations", generation)
 }
 
 // ShadowWALDir returns the path of the shadow wal directory.
@@ -283,7 +291,7 @@ func (db *DB) Open() (err error) {
 	}
 
 	// Clear old temporary files that my have been left from a crash.
-	if err := removeTmpFiles(db.MetaPath()); err != nil {
+	if err := removeTmpFiles(db.metaPath); err != nil {
 		return fmt.Errorf("cannot remove tmp files: %w", err)
 	}
 
@@ -446,7 +454,7 @@ func (db *DB) init() (err error) {
 	}
 
 	// Ensure meta directory structure exists.
-	if err := internal.MkdirAll(db.MetaPath(), db.dirInfo); err != nil {
+	if err := internal.MkdirAll(db.metaPath, db.dirInfo); err != nil {
 		return err
 	}
 
@@ -522,7 +530,7 @@ func (db *DB) cleanGenerations() error {
 		return err
 	}
 
-	dir := filepath.Join(db.MetaPath(), "generations")
+	dir := filepath.Join(db.metaPath, "generations")
 	fis, err := ioutil.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
@@ -652,7 +660,7 @@ func (db *DB) createGeneration() (string, error) {
 	generation := hex.EncodeToString(buf)
 
 	// Generate new directory.
-	dir := filepath.Join(db.MetaPath(), "generations", generation)
+	dir := filepath.Join(db.metaPath, "generations", generation)
 	if err := internal.MkdirAll(dir, db.dirInfo); err != nil {
 		return "", err
 	}
