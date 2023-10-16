@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -82,7 +82,7 @@ func (c *SnapshotsCommand) Run(ctx context.Context, args []string) (err error) {
 	for _, r := range replicas {
 		infos, err := r.Snapshots(ctx)
 		if err != nil {
-			log.Printf("cannot determine snapshots: %s", err)
+			slog.Error("cannot determine snapshots", "error", err)
 			continue
 		}
 		for _, info := range infos {

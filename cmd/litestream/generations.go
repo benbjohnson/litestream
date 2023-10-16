@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log"
 	"os"
 	"text/tabwriter"
 	"time"
@@ -87,7 +86,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 	for _, r := range replicas {
 		generations, err := r.Client.Generations(ctx)
 		if err != nil {
-			log.Printf("%s: cannot list generations: %s", r.Name(), err)
+			r.Logger().Error("cannot list generations", "error", err)
 			continue
 		}
 
@@ -95,7 +94,7 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 		for _, generation := range generations {
 			createdAt, updatedAt, err := r.GenerationTimeBounds(ctx, generation)
 			if err != nil {
-				log.Printf("%s: cannot determine generation time bounds: %s", r.Name(), err)
+				r.Logger().Error("cannot determine generation time bounds", "error", err)
 				continue
 			}
 
