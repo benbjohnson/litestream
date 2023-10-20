@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"strconv"
 	"time"
@@ -52,7 +53,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
 		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); err == errSkipDBExists {
-			fmt.Println("database already exists, skipping")
+			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
 			return err
@@ -62,7 +63,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 			*configPath = DefaultConfigPath()
 		}
 		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); err == errSkipDBExists {
-			fmt.Println("database already exists, skipping")
+			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
 			return err
@@ -73,7 +74,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	// If optional flag set, return success. Useful for automated recovery.
 	if opt.Generation == "" {
 		if *ifReplicaExists {
-			fmt.Println("no matching backups found")
+			slog.Info("no matching backups found")
 			return nil
 		}
 		return fmt.Errorf("no matching backups found")
