@@ -20,7 +20,8 @@ ifndef LITESTREAM_VERSION
 	$(error LITESTREAM_VERSION is undefined)
 endif
 	mkdir -p dist
-	go build -v -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}'"  -o dist/litestream ./cmd/litestream
+
+	GOOS=darwin GOARCH=amd64 CC="gcc -target amd64-apple-macos11" CGO_ENABLED=1 go build -v -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}'"  -o dist/litestream ./cmd/litestream
 	gon etc/gon.hcl
 	mv dist/litestream.zip dist/litestream-${LITESTREAM_VERSION}-darwin-amd64.zip
 	openssl dgst -sha256 dist/litestream-${LITESTREAM_VERSION}-darwin-amd64.zip
