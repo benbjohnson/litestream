@@ -99,7 +99,11 @@ func (r *Replica) Name() string {
 
 // Logger returns the DB sub-logger for this replica.
 func (r *Replica) Logger() *slog.Logger {
-	return r.db.Logger.With("replica", r.Name())
+	logger := slog.Default()
+	if r.db != nil {
+		logger = r.db.Logger
+	}
+	return logger.With("replica", r.Name())
 }
 
 // DB returns a reference to the database the replica is attached to, if any.
