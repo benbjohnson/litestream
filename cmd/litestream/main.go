@@ -36,6 +36,8 @@ var (
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
 
+var loggerLevel slog.LevelVar
+
 func main() {
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
@@ -256,16 +258,16 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	}
 
 	logOptions := slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: &loggerLevel,
 	}
 
 	switch strings.ToUpper(config.Logging.Level) {
 	case "DEBUG":
-		logOptions.Level = slog.LevelDebug
+		loggerLevel.Set(slog.LevelDebug)
 	case "WARN", "WARNING":
-		logOptions.Level = slog.LevelWarn
+		loggerLevel.Set(slog.LevelWarn)
 	case "ERROR":
-		logOptions.Level = slog.LevelError
+		loggerLevel.Set(slog.LevelError)
 	}
 
 	var logHandler slog.Handler
