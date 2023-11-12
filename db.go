@@ -355,6 +355,12 @@ func (db *DB) Close() (err error) {
 		}
 	}
 
+	if db.f != nil {
+		if e := db.f.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
 	return err
 }
 
