@@ -317,13 +317,10 @@ func (db *DB) Open() (err error) {
 }
 
 // Close flushes outstanding WAL writes to replicas, releases the read lock,
-// and closes the database.
-func (db *DB) Close() (err error) {
+// and closes the database. Takes a context for final sync.
+func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
-
-	// Start a new context for shutdown since we canceled the DB context.
-	ctx := context.Background()
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
