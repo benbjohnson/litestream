@@ -352,6 +352,12 @@ func (db *DB) Close(ctx context.Context) (err error) {
 		}
 	}
 
+	if db.f != nil {
+		if e := db.f.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
 	return err
 }
 
