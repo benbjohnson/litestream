@@ -264,7 +264,7 @@ func TestDB_Sync(t *testing.T) {
 		// Checkpoint & fully close which should close WAL file.
 		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
 			t.Fatal(err)
-		} else if err := db.Close(); err != nil {
+		} else if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := sqldb.Close(); err != nil {
 			t.Fatal(err)
@@ -314,7 +314,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Fully close which should close WAL file.
-		if err := db.Close(); err != nil {
+		if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := sqldb.Close(); err != nil {
 			t.Fatal(err)
@@ -367,7 +367,7 @@ func TestDB_Sync(t *testing.T) {
 		pos0, err := db.Pos()
 		if err != nil {
 			t.Fatal(err)
-		} else if err := db.Close(); err != nil {
+		} else if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -413,7 +413,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Close & truncate shadow WAL to simulate a partial header write.
-		if err := db.Close(); err != nil {
+		if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := os.Truncate(db.ShadowWALPath(pos0.Generation, pos0.Index), litestream.WALHeaderSize-1); err != nil {
 			t.Fatal(err)
@@ -458,7 +458,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Close & truncate shadow WAL to simulate a partial frame write.
-		if err := db.Close(); err != nil {
+		if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := os.Truncate(db.ShadowWALPath(pos0.Generation, pos0.Index), fi.Size()-1); err != nil {
 			t.Fatal(err)
@@ -504,7 +504,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Close & delete shadow WAL to simulate dir created but not WAL.
-		if err := db.Close(); err != nil {
+		if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := os.Remove(db.ShadowWALPath(pos0.Generation, pos0.Index)); err != nil {
 			t.Fatal(err)
@@ -626,7 +626,7 @@ func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 // MustCloseDB closes db and removes its parent directory.
 func MustCloseDB(tb testing.TB, db *litestream.DB) {
 	tb.Helper()
-	if err := db.Close(); err != nil && !strings.Contains(err.Error(), `database is closed`) {
+	if err := db.Close(context.Background()); err != nil && !strings.Contains(err.Error(), `database is closed`) {
 		tb.Fatal(err)
 	} else if err := os.RemoveAll(filepath.Dir(db.Path())); err != nil {
 		tb.Fatal(err)

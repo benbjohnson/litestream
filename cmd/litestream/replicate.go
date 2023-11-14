@@ -168,7 +168,7 @@ func (c *ReplicateCommand) Run() (err error) {
 // Close closes all open databases.
 func (c *ReplicateCommand) Close() (err error) {
 	for _, db := range c.DBs {
-		if e := db.Close(); e != nil {
+		if e := db.Close(context.Background()); e != nil {
 			db.Logger.Error("error closing db", "error", e)
 			if err == nil {
 				err = e
