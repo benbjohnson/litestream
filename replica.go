@@ -237,6 +237,12 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	var g errgroup.Group
 	g.Go(func() error {
 		_, err := r.Client.WriteWALSegment(ctx, pos, pr)
+
+		// Always close pipe reader to signal writers.
+		if e := pr.CloseWithError(err); err == nil {
+			return e
+		}
+
 		return err
 	})
 
