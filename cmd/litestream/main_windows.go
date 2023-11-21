@@ -5,6 +5,8 @@ package main
 import (
 	"context"
 	"io"
+	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 
