@@ -17,6 +17,7 @@ import (
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/storj"
 	"github.com/mattn/go-shellwords"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
@@ -121,6 +122,8 @@ func (c *ReplicateCommand) Run() (err error) {
 				slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
 			case *sftp.ReplicaClient:
 				slog.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
+			case *storj.ReplicaClient:
+				slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
 			default:
 				slog.Info("replicating to")
 			}

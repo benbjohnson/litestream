@@ -24,6 +24,7 @@ import (
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/storj"
 	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
 )
@@ -171,6 +172,9 @@ type Config struct {
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
 
+	// Global storj settings
+	AccessGrant string `yaml:"access-grant"`
+
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
 }
@@ -191,6 +195,9 @@ func (c *Config) propagateGlobalSettings() {
 			}
 			if rc.SecretAccessKey == "" {
 				rc.SecretAccessKey = c.SecretAccessKey
+			}
+			if rc.AccessGrant == "" {
+				rc.AccessGrant = c.AccessGrant
 			}
 		}
 	}
@@ -364,6 +371,9 @@ type ReplicaConfig struct {
 	Password string `yaml:"password"`
 	KeyPath  string `yaml:"key-path"`
 
+	// STORJ settings
+	AccessGrant string `yaml:"access-grant"`
+
 	// Encryption identities and recipients
 	Age struct {
 		Identities []string `yaml:"identities"`
@@ -432,6 +442,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		}
 	case "sftp":
 		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case "storj":
+		if r.Client, err = newStorjReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	default:
@@ -664,6 +678,57 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	client.Password = password
 	client.Path = path
 	client.KeyPath = c.KeyPath
+	return client, nil
+}
+
+// newStorjReplicaClientFromConfig returns a new instance of gcs.ReplicaClient built from config.
+func newStorjReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *storj.ReplicaClient, err error) {
+
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for storj replica")
+	} else if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for storj replica")
+	}
+
+	bucket, path, accessGrant := c.Bucket, c.Path, c.AccessGrant
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		_, host, upath, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, err
+		}
+		ubucket := host
+
+		// Only apply URL parts to field that have not been overridden.
+		if path == "" {
+			path = upath
+		}
+		if bucket == "" {
+			bucket = ubucket
+		}
+	}
+
+	// Ensure required settings are set.
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for storj replica")
+	}
+
+	if accessGrant == "" {
+		if v, ok := os.LookupEnv("LITESTREAM_STORJ_ACCESS_GRANT"); ok {
+			accessGrant = v
+		} else {
+			return nil, fmt.Errorf("access-grant or LITESTREAM_STORJ_ACCESS_GRANT required for storj replica")
+		}
+	}
+
+	// Build replica.
+	client := storj.NewReplicaClient()
+	client.AccessGrant = accessGrant
+	client.Bucket = bucket
+	client.Path = path
+
 	return client, nil
 }
 

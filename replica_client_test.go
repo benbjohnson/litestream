@@ -67,6 +67,13 @@ var (
 	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
 )
 
+// STORJ settings
+var (
+	storjAccessGrant = flag.String("storj-access-grant", os.Getenv("LITESTREAM_STORJ_ACCESS_GRANT"), "")
+	storjBucket      = flag.String("storj-bucket", os.Getenv("LITESTREAM_STORJ_BUCKET"), "")
+	storjPath        = flag.String("storj-path", os.Getenv("LITESTREAM_STORJ_PATH"), "")
+)
+
 func TestReplicaClient_Generations(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()

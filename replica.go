@@ -1025,7 +1025,7 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (ge
 		}
 
 		// Use the latest replica if we have multiple candidates.
-		if !updatedAt.After(target.updatedAt) {
+		if generation == target.generation && !updatedAt.After(target.updatedAt) {
 			continue
 		}
 

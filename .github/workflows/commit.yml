@@ -119,3 +119,24 @@ jobs:
 #          LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
 #          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
 #          LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+
+#  storj-integration-test:
+#    name: Run storj Integration Tests
+#    runs-on: ubuntu-latest
+#    needs: build
+#    steps:
+#      - name: Extract storj credentials
+#        run: 'echo "$LITESTREAM_STORJ_ACCESS_GRANT" > /opt/storj.json'
+#        shell: bash
+#        env:
+#          LITESTREAM_STORJ_ACCESS_GRANT: ${{secrets.STORJ_ACCESS_GRANT}}
+#
+#      - uses: actions/download-artifact@v2
+#        with:
+#          name: integration.test
+#      - run: chmod +x integration.test
+#
+#      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type storj
+#        env:
+#          LITESTREAM_STORJ_ACCESS_GRANT:  /opt/storj.json
+#          LITESTREAM_STORJ_BUCKET:           integration
