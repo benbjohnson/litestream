@@ -1485,7 +1485,7 @@ func applyWAL(ctx context.Context, index int, dbPath string) error {
 	}
 
 	// Open SQLite database and force a truncating checkpoint.
-	d, err := sql.Open("litestream-sqlite3", dbPath)
+	d, err := sql.Open("sqlite3", dbPath)
 	if err != nil {
 		return err
 	}
