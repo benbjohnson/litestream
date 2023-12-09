@@ -1,0 +1,31 @@
+{
+    "$schema": "https://raw.githubusercontent.com/devcontainers/spec/main/schemas/devContainer.schema.json",
+    "name": "litestream",
+    "image": "mcr.microsoft.com/devcontainers/base:bullseye",
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils": {
+            "installZsh": true,
+            "installOhMyZsh": true,
+            "configureZshAsDefaultShell": true,
+            "upgradePackages": true,
+            "nonFreePackages": true
+        },
+        "ghcr.io/devcontainers/features/docker-in-docker": {
+            "installDockerBuildx": true,
+            "moby": true,
+            "version": "latest"
+        },
+        "ghcr.io/devcontainers/features/go": {
+            "version": "1.21"
+        }
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "azuretools.vscode-docker",
+                "golang.go",
+                "ms-vscode.makefile-tools"
+            ]
+        }
+    }
+}
