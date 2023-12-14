@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
-	"io/ioutil"
 	"log/slog"
 	"math"
 	"os"
@@ -380,7 +379,7 @@ func (r *Replica) calcPos(ctx context.Context, generation string) (pos Pos, err 
 		rd = io.NopCloser(drd)
 	}
 
-	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
+	n, err := io.Copy(io.Discard, lz4.NewReader(rd))
 	if err != nil {
 		return pos, err
 	}
@@ -812,7 +811,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	db := r.DB()
 
 	// Restore replica to a temporary directory.
-	tmpdir, err := ioutil.TempDir("", "*-litestream")
+	tmpdir, err := os.MkdirTemp("", "*-litestream")
 	if err != nil {
 		return err
 	}

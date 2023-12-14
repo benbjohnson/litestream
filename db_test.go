@@ -3,7 +3,6 @@ package litestream_test
 import (
 	"context"
 	"database/sql"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
@@ -374,9 +373,9 @@ func TestDB_Sync(t *testing.T) {
 		// Read existing file, update header checksum, and write back only header
 		// to simulate a header with a mismatched checksum.
 		shadowWALPath := db.ShadowWALPath(pos0.Generation, pos0.Index)
-		if buf, err := ioutil.ReadFile(shadowWALPath); err != nil {
+		if buf, err := os.ReadFile(shadowWALPath); err != nil {
 			t.Fatal(err)
-		} else if err := ioutil.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0600); err != nil {
+		} else if err := os.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0600); err != nil {
 			t.Fatal(err)
 		}
 
