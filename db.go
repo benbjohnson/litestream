@@ -338,7 +338,14 @@ func (db *DB) Close(ctx context.Context) (err error) {
 				err = e
 			}
 		}
-		r.Stop(true)
+		err := r.Stop(true)
+		if err != nil {
+			db.Logger.Warn("stopping replica failed",
+				"error", err,
+				"db", db.path,
+				"replica", r.name,
+			)
+		}
 	}
 
 	// Release the read lock to allow other applications to handle checkpointing.
@@ -490,7 +497,14 @@ func (db *DB) init() (err error) {
 
 	// Start replication.
 	for _, r := range db.Replicas {
-		r.Start(db.ctx)
+		err := r.Start(db.ctx)
+		if err != nil {
+			db.Logger.Warn("starting replica failed",
+				"error", err,
+				"db", db.path,
+				"replica", r.name,
+			)
+		}
 	}
 
 	return nil

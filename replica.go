@@ -116,7 +116,11 @@ func (r *Replica) Start(ctx context.Context) error {
 	}
 
 	// Stop previous replication.
-	r.Stop(false)
+	if err := r.Stop(false); err != nil {
+		r.Logger().Warn("stopping previous replica failed",
+			"error", err,
+		)
+	}
 
 	// Wrap context with cancelation.
 	ctx, r.cancel = context.WithCancel(ctx)
