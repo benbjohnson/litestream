@@ -1085,7 +1085,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	// Ensure that we found the specific index, if one was specified.
-	if opt.Index != math.MaxInt32 && opt.Index != opt.Index {
+	if opt.Index != math.MaxInt32 && opt.Index != maxWALIndex {
 		return fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", opt.Index, opt.Generation, maxWALIndex)
 	}
 
@@ -1265,7 +1265,7 @@ func (r *Replica) SnapshotIndexByIndex(ctx context.Context, generation string, i
 		}
 
 		// Use snapshot if it newer.
-		if snapshotIndex == -1 || snapshotIndex >= snapshotIndex {
+		if snapshotIndex == -1 || snapshot.Index >= snapshotIndex {
 			snapshotIndex = snapshot.Index
 		}
 	}
