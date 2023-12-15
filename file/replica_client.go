@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"sort"
@@ -112,7 +111,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("cannot determine generations path: %w", err)
 	}
 
-	fis, err := ioutil.ReadDir(root)
+	fis, err := os.ReadDir(root)
 	if os.IsNotExist(err) {
 		return nil, nil
 	} else if err != nil {

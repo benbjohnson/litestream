@@ -4,7 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"math/rand"
 	"os"
 	"path"
@@ -12,7 +12,6 @@ import (
 	"sort"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -21,10 +20,6 @@ import (
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 var (
 	// Enables integration tests.
@@ -193,7 +188,7 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 
 		if r, err := c.SnapshotReader(context.Background(), "b16ddcf5c697540f", 1000); err != nil {
 			t.Fatal(err)
-		} else if buf, err := ioutil.ReadAll(r); err != nil {
+		} else if buf, err := io.ReadAll(r); err != nil {
 			t.Fatal(err)
 		} else if err := r.Close(); err != nil {
 			t.Fatal(err)
@@ -224,7 +219,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 		}
 		defer r.Close()
 
-		if buf, err := ioutil.ReadAll(r); err != nil {
+		if buf, err := io.ReadAll(r); err != nil {
 			t.Fatal(err)
 		} else if got, want := string(buf), "foo"; got != want {
 			t.Fatalf("ReadAll=%v, want %v", got, want)
@@ -378,7 +373,7 @@ func TestReplicaClient_WriteWALSegment(t *testing.T) {
 
 		if r, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1000, Offset: 2000}); err != nil {
 			t.Fatal(err)
-		} else if buf, err := ioutil.ReadAll(r); err != nil {
+		} else if buf, err := io.ReadAll(r); err != nil {
 			t.Fatal(err)
 		} else if err := r.Close(); err != nil {
 			t.Fatal(err)
@@ -409,7 +404,7 @@ func TestReplicaClient_WALReader(t *testing.T) {
 		}
 		defer r.Close()
 
-		if buf, err := ioutil.ReadAll(r); err != nil {
+		if buf, err := io.ReadAll(r); err != nil {
 			t.Fatal(err)
 		} else if got, want := string(buf), "foobar"; got != want {
 			t.Fatalf("ReadAll=%v, want %v", got, want)

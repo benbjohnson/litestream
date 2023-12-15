@@ -5,7 +5,6 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log/slog"
 	"net/url"
 	"os"
@@ -223,7 +222,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	}
 
 	// Read configuration.
-	buf, err := ioutil.ReadFile(filename)
+	buf, err := os.ReadFile(filename)
 	if os.IsNotExist(err) {
 		return config, fmt.Errorf("config file not found: %s", filename)
 	} else if err != nil {
