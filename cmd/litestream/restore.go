@@ -197,9 +197,6 @@ Arguments:
 	    Determines the number of WAL files downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
 
-	-v
-	    Verbose output.
-
 
 Examples:
 
