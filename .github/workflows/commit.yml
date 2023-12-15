@@ -20,7 +20,6 @@ jobs:
       - uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
 
       - run: |
           go install golang.org/x/tools/cmd/goimports@latest
@@ -28,6 +27,27 @@ jobs:
           export PATH="$HOME/go/bin:$PATH"
 
       - uses: pre-commit/action@v3.0.0
+
+  build-windows:
+    name: Build Windows
+    runs-on: ubuntu-latest
+    steps:
+      - run: sudo apt-get install -y mingw-w64
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - run: |
+          go build ./cmd/litestream/
+          file ./litestream.exe
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
 
   build:
     name: Build & Unit Test
@@ -38,12 +58,6 @@ jobs:
       - uses: actions/setup-go@v4
         with:
           go-version: ${{ env.GO_VERSION }}
-
-      - uses: actions/cache@v2
-        with:
-          path: ~/go/pkg/mod
-          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ inputs.os }}-go-
 
       - run: go env
 

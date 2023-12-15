@@ -5,7 +5,6 @@ package main
 import (
 	"context"
 	"io"
-	"log"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -37,16 +36,16 @@ func runWindowsService(ctx context.Context) error {
 	defer elog.Close()
 
 	// Set eventlog as log writer while running.
-	log.SetOutput((*eventlogWriter)(elog))
-	defer log.SetOutput(os.Stderr)
+	slog.SetDefault(slog.New(slog.NewTextHandler((*eventlogWriter)(elog), nil)))
+	defer slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, nil)))
 
-	log.Print("Litestream service starting")
+	slog.Info("Litestream service starting")
 
 	if err := svc.Run(serviceName, &windowsService{ctx: ctx}); err != nil {
 		return errStop
 	}
 
-	log.Print("Litestream service stopped")
+	slog.Info("Litestream service stopped")
 	return nil
 }
 
@@ -69,7 +68,7 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 	}
 
 	// Execute replication command.
-	if err := c.Run(s.ctx); err != nil {
+	if err := c.Run(); err != nil {
 		slog.Error("cannot replicate", "error", err)
 		statusCh <- svc.Status{State: svc.StopPending}
 		return true, 2
