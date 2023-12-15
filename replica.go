@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
-	"io/ioutil"
 	"log/slog"
 	"math"
 	"os"
@@ -380,7 +379,7 @@ func (r *Replica) calcPos(ctx context.Context, generation string) (pos Pos, err 
 		rd = io.NopCloser(drd)
 	}
 
-	n, err := io.Copy(ioutil.Discard, lz4.NewReader(rd))
+	n, err := io.Copy(io.Discard, lz4.NewReader(rd))
 	if err != nil {
 		return pos, err
 	}
@@ -812,7 +811,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	db := r.DB()
 
 	// Restore replica to a temporary directory.
-	tmpdir, err := ioutil.TempDir("", "*-litestream")
+	tmpdir, err := os.MkdirTemp("", "*-litestream")
 	if err != nil {
 		return err
 	}
@@ -1086,7 +1085,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	// Ensure that we found the specific index, if one was specified.
-	if opt.Index != math.MaxInt32 && opt.Index != opt.Index {
+	if opt.Index != math.MaxInt32 && opt.Index != maxWALIndex {
 		return fmt.Errorf("unable to locate index %d in generation %q, highest index was %d", opt.Index, opt.Generation, maxWALIndex)
 	}
 
@@ -1266,7 +1265,7 @@ func (r *Replica) SnapshotIndexByIndex(ctx context.Context, generation string, i
 		}
 
 		// Use snapshot if it newer.
-		if snapshotIndex == -1 || snapshotIndex >= snapshotIndex {
+		if snapshotIndex == -1 || snapshot.Index >= snapshotIndex {
 			snapshotIndex = snapshot.Index
 		}
 	}

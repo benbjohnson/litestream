@@ -17,4 +17,4 @@ repos:
           - "github.com/benbjohnson/litestrem"
           - "-w"
       - id: go-vet-repo-mod
-#     - id: go-staticcheck-repo-mod
+      - id: go-staticcheck-repo-mod
