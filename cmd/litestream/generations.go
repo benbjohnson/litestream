@@ -121,7 +121,7 @@ cover.
 Usage:
 
 	litestream generations [arguments] DB_PATH
-	
+
 	litestream generations [arguments] REPLICA_URL
 
 Arguments:

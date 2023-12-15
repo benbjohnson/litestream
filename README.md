@@ -58,4 +58,3 @@ If you find mistakes in the documentation, please submit a fix to the
 
 [new-issue]: https://github.com/benbjohnson/litestream/issues/new
 [docs]: https://github.com/benbjohnson/litestream.io
-

@@ -181,7 +181,7 @@ func (c *ReplicateCommand) Close() (err error) {
 // Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
 	fmt.Printf(`
-The replicate command starts a server to monitor & replicate databases. 
+The replicate command starts a server to monitor & replicate databases.
 You can specify your database & replicas in a configuration file or you can
 replicate a single database file by specifying its path and its replicas in the
 command line arguments.

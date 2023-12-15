@@ -2,13 +2,13 @@ on:
   release:
     types:
       - published
-  pull_request:
-    types:
-      - opened
-      - synchronize
-      - reopened
-    branches-ignore:
-      - "dependabot/**"
+# pull_request:
+#   types:
+#     - opened
+#     - synchronize
+#     - reopened
+#   branches-ignore:
+#     - "dependabot/**"
 
 name: Release (Docker)
 jobs:
@@ -27,7 +27,7 @@ jobs:
         with:
           username: benbjohnson
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      
+
       - id: meta
         uses: docker/metadata-action@v3
         with:
@@ -39,7 +39,7 @@ jobs:
             type=sha,format=long
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-      
+
       - uses: docker/build-push-action@v2
         with:
           context: .
