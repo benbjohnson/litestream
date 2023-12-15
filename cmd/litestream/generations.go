@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"text/tabwriter"
 	"time"
 
@@ -89,6 +90,8 @@ func (c *GenerationsCommand) Run(ctx context.Context, args []string) (err error)
 			r.Logger().Error("cannot list generations", "error", err)
 			continue
 		}
+
+		sort.Strings(generations)
 
 		// Iterate over each generation for the replica.
 		for _, generation := range generations {

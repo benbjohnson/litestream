@@ -8,7 +8,6 @@ import (
 	"net"
 	"os"
 	"path"
-	"sort"
 	"sync"
 	"time"
 
@@ -141,8 +140,6 @@ func (c *ReplicaClient) Generations(ctx context.Context) (_ []string, err error)
 		generations = append(generations, name)
 	}
 
-	sort.Strings(generations)
-
 	return generations, nil
 }
 
@@ -228,8 +225,6 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (_ lit
 			CreatedAt:  fi.ModTime().UTC(),
 		})
 	}
-
-	sort.Sort(litestream.SnapshotInfoSlice(infos))
 
 	return litestream.NewSnapshotInfoSliceIterator(infos), nil
 }
@@ -362,8 +357,6 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (_ l
 			CreatedAt:  fi.ModTime().UTC(),
 		})
 	}
-
-	sort.Sort(litestream.WALSegmentInfoSlice(infos))
 
 	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
 }

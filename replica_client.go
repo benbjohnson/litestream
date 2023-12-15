@@ -10,13 +10,13 @@ type ReplicaClient interface {
 	// Returns the type of client.
 	Type() string
 
-	// Returns a list of available generations.
+	// Returns a list of available generations. Order is undefined.
 	Generations(ctx context.Context) ([]string, error)
 
 	// Deletes all snapshots & WAL segments within a generation.
 	DeleteGeneration(ctx context.Context, generation string) error
 
-	// Returns an iterator of all snapshots within a generation on the replica.
+	// Returns an iterator of all snapshots within a generation on the replica. Order is undefined.
 	Snapshots(ctx context.Context, generation string) (SnapshotIterator, error)
 
 	// Writes LZ4 compressed snapshot data to the replica at a given index
@@ -31,7 +31,7 @@ type ReplicaClient interface {
 	// the snapshot does not exist.
 	SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error)
 
-	// Returns an iterator of all WAL segments within a generation on the replica.
+	// Returns an iterator of all WAL segments within a generation on the replica. Order is undefined.
 	WALSegments(ctx context.Context, generation string) (WALSegmentIterator, error)
 
 	// Writes an LZ4 compressed WAL segment at a given position.
