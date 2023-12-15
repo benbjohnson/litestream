@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log/slog"
 	"net/url"
 	"os"
@@ -26,6 +26,7 @@ import (
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
 	"gopkg.in/yaml.v2"
+	cosiapi "sigs.k8s.io/container-object-storage-interface-api/apis"
 )
 
 // Build information.
@@ -211,6 +212,18 @@ func (c *Config) DBConfig(path string) *DBConfig {
 	return nil
 }
 
+func (c *Config) readBucketInfo() error {
+	for _, db := range c.DBs {
+		for _, rc := range db.Replicas {
+			if err := parseBucketInfo(rc); err != nil {
+				return fmt.Errorf("failed parsing BucketInfo for %q: %w", db.Path, err)
+			}
+		}
+	}
+
+	return nil
+}
+
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
 // If expandEnv is true then environment variables are expanded in the config.
 func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
@@ -223,7 +236,7 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	}
 
 	// Read configuration.
-	buf, err := ioutil.ReadFile(filename)
+	buf, err := os.ReadFile(filename)
 	if os.IsNotExist(err) {
 		return config, fmt.Errorf("config file not found: %s", filename)
 	} else if err != nil {
@@ -278,6 +291,10 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 
 	// Set global default logger.
 	slog.SetDefault(slog.New(logHandler))
+
+	if err := config.readBucketInfo(); err != nil {
+		return config, err
+	}
 
 	return config, nil
 }
@@ -344,6 +361,9 @@ type ReplicaConfig struct {
 	SyncInterval           *time.Duration `yaml:"sync-interval"`
 	SnapshotInterval       *time.Duration `yaml:"snapshot-interval"`
 	ValidationInterval     *time.Duration `yaml:"validation-interval"`
+
+	// Path to the Container Object Storage Interface BucketInfo file
+	BucketInfo string `yaml:"bucket-info"`
 
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
@@ -773,5 +793,40 @@ func (v *indexVar) Set(s string) error {
 		return fmt.Errorf("invalid hexadecimal format")
 	}
 	*v = indexVar(i)
+	return nil
+}
+
+func parseBucketInfo(c *ReplicaConfig) error {
+	if c.BucketInfo == "" {
+		return nil
+	}
+
+	f, err := os.Open(c.BucketInfo)
+	if err != nil {
+		return fmt.Errorf("unable to open BucketInfo file: %w", err)
+	}
+
+	bi := cosiapi.BucketInfo{}
+
+	if err := json.NewDecoder(f).Decode(&bi); err != nil {
+		return fmt.Errorf("unable to decode BucketInfo: %w", err)
+	}
+
+	switch {
+	case bi.Spec.S3 != nil:
+		c.Type = "s3"
+		c.Bucket = bi.Spec.BucketName
+		c.Endpoint = bi.Spec.S3.Endpoint
+		c.AccessKeyID = bi.Spec.S3.AccessKeyID
+		c.SecretAccessKey = bi.Spec.S3.AccessSecretKey
+		c.Region = bi.Spec.S3.Region
+
+	case bi.Spec.Azure != nil:
+		return fmt.Errorf("unsupported storage: Azure Blob")
+
+	default:
+		return fmt.Errorf("unknown storage with %q protocols and %q authentication type", bi.Spec.Protocols, bi.Spec.AuthenticationType)
+	}
+
 	return nil
 }

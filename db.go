@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"hash/crc64"
 	"io"
-	"io/ioutil"
 	"log/slog"
 	"math"
 	"math/rand"
@@ -207,7 +206,7 @@ func (db *DB) CurrentShadowWALPath(generation string) (string, error) {
 
 // CurrentShadowWALIndex returns the current WAL index & total size.
 func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, err error) {
-	fis, err := ioutil.ReadDir(filepath.Join(db.GenerationPath(generation), "wal"))
+	dis, err := os.ReadDir(filepath.Join(db.GenerationPath(generation), "wal"))
 	if os.IsNotExist(err) {
 		return 0, 0, nil // no wal files written for generation
 	} else if err != nil {
@@ -215,14 +214,17 @@ func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, e
 	}
 
 	// Find highest wal index.
-	for _, fi := range fis {
-		if v, err := ParseWALPath(fi.Name()); err != nil {
+	for _, di := range dis {
+		if v, err := ParseWALPath(di.Name()); err != nil {
 			continue // invalid wal filename
 		} else if v > index {
 			index = v
 		}
 
-		size += fi.Size()
+		fi, _ := di.Info() // discard error, just check the size
+		if fi != nil {
+			size += fi.Size()
+		}
 	}
 	return index, size, nil
 }
@@ -336,7 +338,14 @@ func (db *DB) Close(ctx context.Context) (err error) {
 				err = e
 			}
 		}
-		r.Stop(true)
+		err := r.Stop(true)
+		if err != nil {
+			db.Logger.Warn("stopping replica failed",
+				"error", err,
+				"db", db.path,
+				"replica", r.name,
+			)
+		}
 	}
 
 	// Release the read lock to allow other applications to handle checkpointing.
@@ -488,7 +497,14 @@ func (db *DB) init() (err error) {
 
 	// Start replication.
 	for _, r := range db.Replicas {
-		r.Start(db.ctx)
+		err := r.Start(db.ctx)
+		if err != nil {
+			db.Logger.Warn("starting replica failed",
+				"error", err,
+				"db", db.path,
+				"replica", r.name,
+			)
+		}
 	}
 
 	return nil
@@ -546,7 +562,7 @@ func (db *DB) cleanGenerations() error {
 	}
 
 	dir := filepath.Join(db.metaPath, "generations")
-	fis, err := ioutil.ReadDir(dir)
+	fis, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -593,7 +609,7 @@ func (db *DB) cleanWAL() error {
 
 	// Remove all WAL files for the generation before the lowest index.
 	dir := db.ShadowWALDir(generation)
-	fis, err := ioutil.ReadDir(dir)
+	fis, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
 	} else if err != nil {
@@ -649,7 +665,7 @@ func (db *DB) releaseReadLock() error {
 // CurrentGeneration returns the name of the generation saved to the "generation"
 // file in the meta data directory. Returns empty string if none exists.
 func (db *DB) CurrentGeneration() (string, error) {
-	buf, err := ioutil.ReadFile(db.GenerationNamePath())
+	buf, err := os.ReadFile(db.GenerationNamePath())
 	if os.IsNotExist(err) {
 		return "", nil
 	} else if err != nil {
@@ -691,7 +707,7 @@ func (db *DB) createGeneration() (string, error) {
 	if db.fileInfo != nil {
 		mode = db.fileInfo.Mode()
 	}
-	if err := ioutil.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), mode); err != nil {
+	if err := os.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), mode); err != nil {
 		return "", fmt.Errorf("write generation temp file: %w", err)
 	}
 	uid, gid := internal.Fileinfo(db.fileInfo)
@@ -986,7 +1002,7 @@ func (db *DB) initShadowWALFile(filename string) (int64, error) {
 	}
 	if err := internal.MkdirAll(filepath.Dir(filename), db.dirInfo); err != nil {
 		return 0, err
-	} else if err := ioutil.WriteFile(filename, hdr, mode); err != nil {
+	} else if err := os.WriteFile(filename, hdr, mode); err != nil {
 		return 0, err
 	}
 	uid, gid := internal.Fileinfo(db.fileInfo)
