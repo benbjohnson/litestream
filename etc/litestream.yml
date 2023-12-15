@@ -7,4 +7,3 @@
 #    replicas:
 #      - path: /path/to/replica           # File-based replication
 #      - url:  s3://my.bucket.com/db      # S3-based replication
-

@@ -1,14 +1,44 @@
-on: push
+on:
+  push:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
 
+env:
+  GO_VERSION: "1.21"
+
+name: Commit
 jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - run: |
+          go install golang.org/x/tools/cmd/goimports@latest
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          export PATH="$HOME/go/bin:$PATH"
+
+      - uses: pre-commit/action@v3.0.0
+
   build:
     name: Build & Unit Test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-go@v2
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
         with:
-          go-version: '1.21'
+          go-version: ${{ env.GO_VERSION }}
+
       - uses: actions/cache@v2
         with:
           path: ~/go/pkg/mod
@@ -36,7 +66,7 @@ jobs:
 #    steps:
 #      - uses: actions/checkout@v2
 #      - uses: actions/setup-go@v2
-#        with: 
+#        with:
 #          go-version: '1.20'
 #      - uses: actions/cache@v2
 #        with:
