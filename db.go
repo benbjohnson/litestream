@@ -216,7 +216,9 @@ func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, e
 	// Find highest wal index.
 	for _, de := range des {
 		fi, err := de.Info()
-		if err != nil {
+		if os.IsNotExist(err) {
+			continue // file was deleted after os.ReadDir returned
+		} else if err != nil {
 			return 0, 0, err
 		}
 
