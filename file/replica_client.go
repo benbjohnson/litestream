@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -180,8 +179,6 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 		})
 	}
 
-	sort.Sort(litestream.SnapshotInfoSlice(infos))
-
 	return litestream.NewSnapshotInfoSliceIterator(infos), nil
 }
 
@@ -296,8 +293,6 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 			CreatedAt:  fi.ModTime().UTC(),
 		})
 	}
-
-	sort.Sort(litestream.WALSegmentInfoSlice(infos))
 
 	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
 }

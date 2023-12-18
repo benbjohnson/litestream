@@ -1302,10 +1302,15 @@ func (r *Replica) walSegmentMap(ctx context.Context, generation string, minIndex
 	}
 	defer itr.Close()
 
-	m := make(map[int][]int64)
+	a := []WALSegmentInfo{}
 	for itr.Next() {
-		info := itr.WALSegment()
+		a = append(a, itr.WALSegment())
+	}
 
+	sort.Sort(WALSegmentInfoSlice(a))
+
+	m := make(map[int][]int64)
+	for _, info := range a {
 		// Exit if we go past the max timestamp or index.
 		if !maxTimestamp.IsZero() && info.CreatedAt.After(maxTimestamp) {
 			break // after max timestamp, skip
