@@ -91,6 +91,29 @@ jobs:
 #      - run: go install ./cmd/litestream
 #      - run: go test -v -run=TestCmd_Replicate_LongRunning ./integration -long-running-duration 1m
 
+  s3-mock-test:
+    name: Run S3 Mock Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+#         cache: 'pip'
+      - run: pip install moto[s3,server]
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration s3
+
 #  s3-integration-test:
 #    name: Run S3 Integration Tests
 #    runs-on: ubuntu-latest
