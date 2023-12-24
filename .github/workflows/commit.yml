@@ -65,15 +65,6 @@ jobs:
 
       - run: go test -v ./...
 
-#      - name: Build integration test
-#        run: go test -c ./integration
-#
-#      - uses: actions/upload-artifact@v2
-#        with:
-#          name: integration.test
-#          path: integration.test
-#          if-no-files-found: error
-
 #  long-running-test:
 #    name: Run Long Running Unit Test
 #    runs-on: ubuntu-latest
@@ -114,75 +105,108 @@ jobs:
 
       - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration s3
 
-#  s3-integration-test:
-#    name: Run S3 Integration Tests
-#    runs-on: ubuntu-latest
-#    needs: build
-#    steps:
-#      - uses: actions/download-artifact@v2
-#        with:
-#          name: integration.test
-#      - run: chmod +x integration.test
-#
-#      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type s3
-#        env:
-#          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
-#          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
-#          LITESTREAM_S3_REGION: us-east-1
-#          LITESTREAM_S3_BUCKET: integration.litestream.io
+  s3-integration-test:
+    name: Run S3 Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    concurrency:
+      group: integration-test-s3
+    steps:
+      - uses: actions/checkout@v4
 
-#  gcp-integration-test:
-#    name: Run GCP Integration Tests
-#    runs-on: ubuntu-latest
-#    needs: build
-#    steps:
-#      - name: Extract GCP credentials
-#        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
-#        shell: bash
-#        env:
-#          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
-#
-#      - uses: actions/download-artifact@v2
-#        with:
-#          name: integration.test
-#      - run: chmod +x integration.test
-#
-#      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type gcs
-#        env:
-#          GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
-#          LITESTREAM_GCS_BUCKET:           integration.litestream.io
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-#  abs-integration-test:
-#    name: Run Azure Blob Store Integration Tests
-#    runs-on: ubuntu-latest
-#    needs: build
-#    steps:
-#      - uses: actions/download-artifact@v2
-#        with:
-#          name: integration.test
-#      - run: chmod +x integration.test
-#
-#      - run: ./integration.test -test.v -test.run=TestReplicaClient -replica-type abs
-#        env:
-#          LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
-#          LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
-#          LITESTREAM_ABS_BUCKET:           integration
+      - run: go env
 
-#  sftp-integration-test:
-#    name: Run SFTP Integration Tests
-#    runs-on: ubuntu-latest
-#    needs: build
-#    steps:
-#      - name: Extract SSH key
-#        run: 'echo "$LITESTREAM_SFTP_KEY" > /opt/id_ed25519'
-#        shell: bash
-#        env:
-#          LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
-#
-#      - name: Run sftp tests
-#        run: go test -v -run=TestReplicaClient ./integration -replica-type sftp
-#        env:
-#          LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
-#          LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
-#          LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
-#          LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration s3
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+  gcp-integration-test:
+    name: Run GCP Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    concurrency:
+      group: integration-test-gcp
+    steps:
+      - name: Extract GCP credentials
+        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration gcs
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
+          LITESTREAM_GCS_BUCKET:           integration.litestream.io
+
+  abs-integration-test:
+    name: Run Azure Blob Store Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    concurrency:
+      group: integration-test-abs
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration abs
+        env:
+          LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET:           integration
+
+## this doesn't yet work
+# sftp-integration-test:
+#   name: Run SFTP Integration Tests
+#   runs-on: ubuntu-latest
+#   needs: build
+#   concurrency:
+#     group: integration-test-sftp
+#   steps:
+#     - name: Extract SSH key
+#       run: 'echo "$LITESTREAM_SFTP_KEY" > /opt/id_ed25519'
+#       shell: bash
+#       env:
+#         LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
+
+#     - uses: actions/checkout@v4
+
+#     - uses: actions/setup-go@v4
+#       with:
+#         go-version: ${{ env.GO_VERSION }}
+
+#     - run: go env
+
+#     - run: go install ./cmd/litestream
+
+#     - run: go test -v ./replica_client_test.go -integration sftp
+#       env:
+#         LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
+#         LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
+#         LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
+#         LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
