@@ -75,10 +75,14 @@ func TestReplicaClient_Generations(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Verify returned generations.
-		if got, err := c.Generations(context.Background()); err != nil {
+		// Fetch and sort generations.
+		got, err := c.Generations(context.Background())
+		if err != nil {
 			t.Fatal(err)
-		} else if want := []string{"155fe292f8333c72", "5efbd8d042012dca", "b16ddcf5c697540f"}; !reflect.DeepEqual(got, want) {
+		}
+		sort.Strings(got)
+
+		if want := []string{"155fe292f8333c72", "5efbd8d042012dca", "b16ddcf5c697540f"}; !reflect.DeepEqual(got, want) {
 			t.Fatalf("Generations()=%v, want %v", got, want)
 		}
 	})

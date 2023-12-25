@@ -183,34 +183,47 @@ jobs:
           LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
           LITESTREAM_ABS_BUCKET:           integration
 
-## this doesn't yet work
-# sftp-integration-test:
-#   name: Run SFTP Integration Tests
-#   runs-on: ubuntu-latest
-#   needs: build
-#   if: github.ref == 'refs/heads/main'
-#   concurrency:
-#     group: integration-test-sftp
-#   steps:
-#     - name: Extract SSH key
-#       run: 'echo "$LITESTREAM_SFTP_KEY" > /opt/id_ed25519'
-#       shell: bash
-#       env:
-#         LITESTREAM_SFTP_KEY: ${{secrets.LITESTREAM_SFTP_KEY}}
+  sftp-integration-test:
+    name: Run SFTP Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Prepare OpenSSH server
+        run: |-
+          sudo mkdir -p /test/etc/ssh /test/home /run/sshd /test/data/
+          sudo ssh-keygen -t ed25519 -f /test/etc/ssh/id_ed25519_host -N ""
+          sudo ssh-keygen -t ed25519 -f /test/etc/ssh/id_ed25519 -N ""
+          sudo chmod 0600 /test/etc/ssh/id_ed25519_host /test/etc/ssh/id_ed25519
+          sudo chmod 0644 /test/etc/ssh/id_ed25519_host.pub /test/etc/ssh/id_ed25519.pub
+          sudo cp /test/etc/ssh/id_ed25519 /test/id_ed25519
+          sudo chown $USER /test/id_ed25519
+          sudo tee /test/etc/ssh/sshd_config <<EOF
+          Port 2222
+          HostKey /test/etc/ssh/id_ed25519_host
+          AuthorizedKeysFile /test/etc/ssh/id_ed25519.pub
+          AuthenticationMethods publickey
+          Subsystem sftp internal-sftp
+          UsePAM no
+          LogLevel DEBUG
+          EOF
+          sudo /usr/sbin/sshd -e -f /test/etc/ssh/sshd_config -E /test/debug.log
 
-#     - uses: actions/checkout@v4
+      - name: Test OpenSSH server works with pubkey auth
+        run: ssh -v -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost whoami || (sudo cat /test/debug.log && exit 1)
 
-#     - uses: actions/setup-go@v4
-#       with:
-#         go-version: ${{ env.GO_VERSION }}
+      - uses: actions/checkout@v4
 
-#     - run: go env
+      - uses: actions/setup-go@v4
+        with:
+          go-version: ${{ env.GO_VERSION }}
 
-#     - run: go install ./cmd/litestream
+      - run: go env
 
-#     - run: go test -v ./replica_client_test.go -integration sftp
-#       env:
-#         LITESTREAM_SFTP_HOST:     ${{ secrets.LITESTREAM_SFTP_HOST }}
-#         LITESTREAM_SFTP_USER:     ${{ secrets.LITESTREAM_SFTP_USER }}
-#         LITESTREAM_SFTP_KEY_PATH: /opt/id_ed25519
-#         LITESTREAM_SFTP_PATH:     ${{ secrets.LITESTREAM_SFTP_PATH }}
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration sftp
+        env:
+          LITESTREAM_SFTP_HOST:     "localhost:2222"
+          LITESTREAM_SFTP_USER:     "root"
+          LITESTREAM_SFTP_KEY_PATH: /test/id_ed25519
+          LITESTREAM_SFTP_PATH:     /test/data
