@@ -77,12 +77,12 @@ func (c *ReplicaClient) SnapshotsDir(generation string) (string, error) {
 }
 
 // SnapshotPath returns the path to an uncompressed snapshot file.
-func (c *ReplicaClient) SnapshotPath(generation string, index int) (string, error) {
-	dir, err := c.SnapshotsDir(generation)
+func (c *ReplicaClient) SnapshotPath(info litestream.SnapshotInfo) (string, error) {
+	dir, err := c.SnapshotsDir(info.Generation)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, litestream.FormatSnapshotPath(index)), nil
+	return filepath.Join(dir, info.FormatPath()), nil
 }
 
 // WALDir returns the path to a generation's WAL directory
@@ -95,12 +95,12 @@ func (c *ReplicaClient) WALDir(generation string) (string, error) {
 }
 
 // WALSegmentPath returns the path to a WAL segment file.
-func (c *ReplicaClient) WALSegmentPath(generation string, index int, offset int64) (string, error) {
-	dir, err := c.WALDir(generation)
+func (c *ReplicaClient) WALSegmentPath(info litestream.WALSegmentInfo) (string, error) {
+	dir, err := c.WALDir(info.Generation)
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(dir, litestream.FormatWALSegmentPath(index, offset)), nil
+	return filepath.Join(dir, info.FormatPath()), nil
 }
 
 // Generations returns a list of available generation names.
@@ -165,28 +165,28 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 	// Iterate over every file and convert to metadata.
 	infos := make([]litestream.SnapshotInfo, 0, len(fis))
 	for _, fi := range fis {
-		// Parse index from filename.
-		index, err := litestream.ParseSnapshotPath(fi.Name())
+		info := litestream.SnapshotInfo{
+			Generation: generation,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		}
+
+		err := info.ParsePath(fi.Name())
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, litestream.SnapshotInfo{
-			Generation: generation,
-			Index:      index,
-			Size:       fi.Size(),
-			CreatedAt:  fi.ModTime().UTC(),
-		})
+		infos = append(infos, info)
 	}
 
 	return litestream.NewSnapshotInfoSliceIterator(infos), nil
 }
 
 // WriteSnapshot writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
-	filename, err := c.SnapshotPath(generation, index)
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, info *litestream.SnapshotInfo, rd io.Reader) error {
+	filename, err := c.SnapshotPath(*info)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
+		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 
 	var fileInfo, dirInfo os.FileInfo
@@ -196,48 +196,45 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 	// Ensure parent directory exists.
 	if err := internal.MkdirAll(filepath.Dir(filename), dirInfo); err != nil {
-		return info, err
+		return err
 	}
 
 	// Write snapshot to temporary file next to destination path.
 	f, err := internal.CreateFile(filename+".tmp", fileInfo)
 	if err != nil {
-		return info, err
+		return err
 	}
 	defer f.Close()
 
 	if _, err := io.Copy(f, rd); err != nil {
-		return info, err
+		return err
 	} else if err := f.Sync(); err != nil {
-		return info, err
+		return err
 	} else if err := f.Close(); err != nil {
-		return info, err
+		return err
 	}
 
 	// Build metadata.
 	fi, err := os.Stat(filename + ".tmp")
 	if err != nil {
-		return info, err
+		return err
 	}
-	info = litestream.SnapshotInfo{
-		Generation: generation,
-		Index:      index,
-		Size:       fi.Size(),
-		CreatedAt:  fi.ModTime().UTC(),
-	}
+
+	info.Size = fi.Size()
+	info.CreatedAt = fi.ModTime().UTC()
 
 	// Move snapshot to final path when it has been fully written & synced to disk.
 	if err := os.Rename(filename+".tmp", filename); err != nil {
-		return info, err
+		return err
 	}
 
-	return info, nil
+	return nil
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
 // Returns os.ErrNotExist if no matching index is found.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
-	filename, err := c.SnapshotPath(generation, index)
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, info litestream.SnapshotInfo) (io.ReadCloser, error) {
+	filename, err := c.SnapshotPath(info)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -245,8 +242,8 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 }
 
 // DeleteSnapshot deletes a snapshot with the given generation & index.
-func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
-	filename, err := c.SnapshotPath(generation, index)
+func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, info litestream.SnapshotInfo) error {
+	filename, err := c.SnapshotPath(info)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -279,29 +276,29 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 	// Iterate over every file and convert to metadata.
 	infos := make([]litestream.WALSegmentInfo, 0, len(fis))
 	for _, fi := range fis {
+		info := litestream.WALSegmentInfo{
+			Generation: generation,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		}
+
 		// Parse index from filename.
-		index, offset, err := litestream.ParseWALSegmentPath(fi.Name())
+		err := info.ParsePath(fi.Name())
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, litestream.WALSegmentInfo{
-			Generation: generation,
-			Index:      index,
-			Offset:     offset,
-			Size:       fi.Size(),
-			CreatedAt:  fi.ModTime().UTC(),
-		})
+		infos = append(infos, info)
 	}
 
 	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
-	filename, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, info *litestream.WALSegmentInfo, rd io.Reader) error {
+	filename, err := c.WALSegmentPath(*info)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
+		return fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
 
 	var fileInfo, dirInfo os.FileInfo
@@ -311,49 +308,45 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 
 	// Ensure parent directory exists.
 	if err := internal.MkdirAll(filepath.Dir(filename), dirInfo); err != nil {
-		return info, err
+		return err
 	}
 
 	// Write WAL segment to temporary file next to destination path.
 	f, err := internal.CreateFile(filename+".tmp", fileInfo)
 	if err != nil {
-		return info, err
+		return err
 	}
 	defer f.Close()
 
 	if _, err := io.Copy(f, rd); err != nil {
-		return info, err
+		return err
 	} else if err := f.Sync(); err != nil {
-		return info, err
+		return err
 	} else if err := f.Close(); err != nil {
-		return info, err
+		return err
 	}
 
 	// Build metadata.
 	fi, err := os.Stat(filename + ".tmp")
 	if err != nil {
-		return info, err
+		return err
 	}
-	info = litestream.WALSegmentInfo{
-		Generation: pos.Generation,
-		Index:      pos.Index,
-		Offset:     pos.Offset,
-		Size:       fi.Size(),
-		CreatedAt:  fi.ModTime().UTC(),
-	}
+
+	info.Size = fi.Size()
+	info.CreatedAt = fi.ModTime().UTC()
 
 	// Move WAL segment to final path when it has been written & synced to disk.
 	if err := os.Rename(filename+".tmp", filename); err != nil {
-		return info, err
+		return err
 	}
 
-	return info, nil
+	return nil
 }
 
 // WALSegmentReader returns a reader for a section of WAL data at the given position.
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
-	filename, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
+func (c *ReplicaClient) WALSegmentReader(ctx context.Context, info litestream.WALSegmentInfo) (io.ReadCloser, error) {
+	filename, err := c.WALSegmentPath(info)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -361,9 +354,9 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 }
 
 // DeleteWALSegments deletes WAL segments at the given positions.
-func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Pos) error {
-	for _, pos := range a {
-		filename, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
+func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.WALSegmentInfo) error {
+	for _, info := range a {
+		filename, err := c.WALSegmentPath(info)
 		if err != nil {
 			return fmt.Errorf("cannot determine wal segment path: %w", err)
 		}

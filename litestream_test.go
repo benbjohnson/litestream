@@ -85,14 +85,22 @@ func TestSnapshotsPath(t *testing.T) {
 
 func TestSnapshotPath(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
-		if got, err := litestream.SnapshotPath("foo", "0123456701234567", 1000); err != nil {
+		info := litestream.SnapshotInfo{
+			Generation:  "0123456701234567",
+			Index:       1000,
+			Compression: litestream.CompressionLZ4,
+		}
+		if got, err := litestream.SnapshotPath("foo", info); err != nil {
 			t.Fatal(err)
 		} else if want := "foo/generations/0123456701234567/snapshots/000003e8.snapshot.lz4"; got != want {
 			t.Fatalf("SnapshotPath()=%v, want %v", got, want)
 		}
 	})
 	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := litestream.SnapshotPath("foo", "", 1000); err == nil || err.Error() != `generation required` {
+		info := litestream.SnapshotInfo{
+			Index: 1000,
+		}
+		if _, err := litestream.SnapshotPath("foo", info); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -115,14 +123,23 @@ func TestWALPath(t *testing.T) {
 
 func TestWALSegmentPath(t *testing.T) {
 	t.Run("OK", func(t *testing.T) {
-		if got, err := litestream.WALSegmentPath("foo", "0123456701234567", 1000, 1001); err != nil {
+		info := litestream.WALSegmentInfo{
+			Generation:  "0123456701234567",
+			Index:       1000,
+			Offset:      1001,
+			Compression: litestream.CompressionLZ4,
+		}
+		if got, err := litestream.WALSegmentPath("foo", info); err != nil {
 			t.Fatal(err)
 		} else if want := "foo/generations/0123456701234567/wal/000003e8_000003e9.wal.lz4"; got != want {
 			t.Fatalf("WALPath()=%v, want %v", got, want)
 		}
 	})
 	t.Run("ErrNoGeneration", func(t *testing.T) {
-		if _, err := litestream.WALSegmentPath("foo", "", 1000, 0); err == nil || err.Error() != `generation required` {
+		info := litestream.WALSegmentInfo{
+			Index: 1000,
+		}
+		if _, err := litestream.WALSegmentPath("foo", info); err == nil || err.Error() != `generation required` {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})

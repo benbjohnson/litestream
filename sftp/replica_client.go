@@ -212,53 +212,54 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (_ lit
 	// Iterate over every file and convert to metadata.
 	infos := make([]litestream.SnapshotInfo, 0, len(fis))
 	for _, fi := range fis {
+		info := litestream.SnapshotInfo{
+			Generation: generation,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		}
+
 		// Parse index from filename.
-		index, err := litestream.ParseSnapshotPath(path.Base(fi.Name()))
+		err := info.ParsePath(path.Base(fi.Name()))
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, litestream.SnapshotInfo{
-			Generation: generation,
-			Index:      index,
-			Size:       fi.Size(),
-			CreatedAt:  fi.ModTime().UTC(),
-		})
+		infos = append(infos, info)
 	}
 
 	return litestream.NewSnapshotInfoSliceIterator(infos), nil
 }
 
 // WriteSnapshot writes LZ4 compressed data from rd to the object storage.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, info *litestream.SnapshotInfo, rd io.Reader) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
 	if err != nil {
-		return info, err
+		return err
 	}
 
-	filename, err := litestream.SnapshotPath(c.Path, generation, index)
+	filename, err := litestream.SnapshotPath(c.Path, *info)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
+		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 	startTime := time.Now()
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
-		return info, fmt.Errorf("cannot make parent wal segment directory %q: %w", path.Dir(filename), err)
+		return fmt.Errorf("cannot make parent wal segment directory %q: %w", path.Dir(filename), err)
 	}
 
 	f, err := sftpClient.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		return info, fmt.Errorf("cannot open snapshot file for writing: %w", err)
+		return fmt.Errorf("cannot open snapshot file for writing: %w", err)
 	}
 	defer f.Close()
 
 	n, err := io.Copy(f, rd)
 	if err != nil {
-		return info, err
+		return err
 	} else if err := f.Close(); err != nil {
-		return info, err
+		return err
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
@@ -266,16 +267,13 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
-	return litestream.SnapshotInfo{
-		Generation: generation,
-		Index:      index,
-		Size:       n,
-		CreatedAt:  startTime.UTC(),
-	}, nil
+	info.Size = n
+	info.CreatedAt = startTime.UTC()
+	return nil
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (_ io.ReadCloser, err error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, info litestream.SnapshotInfo) (_ io.ReadCloser, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -283,7 +281,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, err
 	}
 
-	filename, err := litestream.SnapshotPath(c.Path, generation, index)
+	filename, err := litestream.SnapshotPath(c.Path, info)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -299,7 +297,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 }
 
 // DeleteSnapshot deletes a snapshot with the given generation & index.
-func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) (err error) {
+func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, info litestream.SnapshotInfo) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -307,7 +305,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 		return err
 	}
 
-	filename, err := litestream.SnapshotPath(c.Path, generation, index)
+	filename, err := litestream.SnapshotPath(c.Path, info)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -344,70 +342,66 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (_ l
 	// Iterate over every file and convert to metadata.
 	infos := make([]litestream.WALSegmentInfo, 0, len(fis))
 	for _, fi := range fis {
-		index, offset, err := litestream.ParseWALSegmentPath(path.Base(fi.Name()))
+		info := litestream.WALSegmentInfo{
+			Generation: generation,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		}
+
+		err := info.ParsePath(path.Base(fi.Name()))
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, litestream.WALSegmentInfo{
-			Generation: generation,
-			Index:      index,
-			Offset:     offset,
-			Size:       fi.Size(),
-			CreatedAt:  fi.ModTime().UTC(),
-		})
+		infos = append(infos, info)
 	}
 
 	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, info *litestream.WALSegmentInfo, rd io.Reader) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
 	if err != nil {
-		return info, err
+		return err
 	}
 
-	filename, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	filename, err := litestream.WALSegmentPath(c.Path, *info)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
+		return fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
 	startTime := time.Now()
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
-		return info, fmt.Errorf("cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
+		return fmt.Errorf("cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
 	}
 
 	f, err := sftpClient.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		return info, fmt.Errorf("cannot open snapshot file for writing: %w", err)
+		return fmt.Errorf("cannot open snapshot file for writing: %w", err)
 	}
 	defer f.Close()
 
 	n, err := io.Copy(f, rd)
 	if err != nil {
-		return info, err
+		return err
 	} else if err := f.Close(); err != nil {
-		return info, err
+		return err
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	return litestream.WALSegmentInfo{
-		Generation: pos.Generation,
-		Index:      pos.Index,
-		Offset:     pos.Offset,
-		Size:       n,
-		CreatedAt:  startTime.UTC(),
-	}, nil
+	info.Size = n
+	info.CreatedAt = startTime.UTC()
+	return nil
 }
 
 // WALSegmentReader returns a reader for a section of WAL data at the given index.
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (_ io.ReadCloser, err error) {
+func (c *ReplicaClient) WALSegmentReader(ctx context.Context, info litestream.WALSegmentInfo) (_ io.ReadCloser, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -415,7 +409,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 
-	filename, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	filename, err := litestream.WALSegmentPath(c.Path, info)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -431,7 +425,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 }
 
 // DeleteWALSegments deletes WAL segments with at the given positions.
-func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Pos) (err error) {
+func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.WALSegmentInfo) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -439,8 +433,8 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		return err
 	}
 
-	for _, pos := range a {
-		filename, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	for _, info := range a {
+		filename, err := litestream.WALSegmentPath(c.Path, info)
 		if err != nil {
 			return fmt.Errorf("cannot determine wal segment path: %w", err)
 		}

@@ -23,8 +23,8 @@ const (
 
 	WALDirName    = "wal"
 	WALExt        = ".wal"
-	WALSegmentExt = ".wal.lz4"
-	SnapshotExt   = ".snapshot.lz4"
+	SnapshotExt   = ".snapshot"
+	EncryptionExt = ".age"
 
 	GenerationNameLen = 16
 )
@@ -36,6 +36,35 @@ const (
 	CheckpointModeRestart  = "RESTART"
 	CheckpointModeTruncate = "TRUNCATE"
 )
+
+const (
+	CompressionNone Compression = ""
+	CompressionLZ4  Compression = "lz4"
+)
+
+type Compression string
+
+func (c Compression) IsValid() bool {
+	return c == CompressionNone || c == CompressionLZ4
+}
+
+func (c Compression) Ext() string {
+	if c.IsValid() && c != "" {
+		return "." + string(c)
+	}
+
+	return ""
+}
+
+type Encryption bool
+
+func (e Encryption) Ext() string {
+	if e {
+		return ".age"
+	}
+
+	return ""
+}
 
 // Litestream errors.
 var (
@@ -189,10 +218,42 @@ func (itr *WALSegmentInfoSliceIterator) WALSegment() WALSegmentInfo {
 
 // SnapshotInfo represents file information about a snapshot.
 type SnapshotInfo struct {
-	Generation string
-	Index      int
-	Size       int64
-	CreatedAt  time.Time
+	Generation  string
+	Index       int
+	Compression Compression
+	Encryption  Encryption
+	Size        int64
+	CreatedAt   time.Time
+}
+
+func (info *SnapshotInfo) FormatPath() string {
+	assert(info.Index >= 0, "snapshot index must be non-negative")
+	return fmt.Sprintf("%08x%s%s%s", info.Index, SnapshotExt, info.Compression.Ext(), info.Encryption.Ext())
+}
+
+var snapshotPathRegexExt = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot(\.([0-9a-z]+))?(\.age)?$`)
+
+// ParseSnapshotPath returns the index for the snapshot.
+// Returns an error if the path is not a valid snapshot path.
+func (info *SnapshotInfo) ParsePath(s string) error {
+	s = filepath.Base(s)
+
+	a := snapshotPathRegexExt.FindStringSubmatch(s)
+	if a == nil {
+		return fmt.Errorf("invalid snapshot path: %s", s)
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	info.Index = int(i64)
+
+	info.Compression = Compression(a[3])
+	info.Encryption = Encryption(len(a[4]) > 0)
+
+	if !info.Compression.IsValid() {
+		return fmt.Errorf("invalid snapshot compression: %s", s)
+	}
+
+	return nil
 }
 
 // Pos returns the WAL position when the snapshot was made.
@@ -263,11 +324,43 @@ func (a WALInfoSlice) Less(i, j int) bool {
 
 // WALSegmentInfo represents file information about a WAL segment file.
 type WALSegmentInfo struct {
-	Generation string
-	Index      int
-	Offset     int64
-	Size       int64
-	CreatedAt  time.Time
+	Generation  string
+	Index       int
+	Offset      int64
+	Compression Compression
+	Encryption  Encryption
+	Size        int64
+	CreatedAt   time.Time
+}
+
+func (info *WALSegmentInfo) FormatPath() string {
+	assert(info.Index >= 0, "wal index must be non-negative")
+	assert(info.Offset >= 0, "wal offset must be non-negative")
+	return fmt.Sprintf("%08x_%08x%s%s%s", info.Index, info.Offset, WALExt, info.Compression.Ext(), info.Encryption.Ext())
+}
+
+var walSegmentPathRegexExt = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))\.wal(\.([0-9a-z]+))?(\.age)?$`)
+
+func (info *WALSegmentInfo) ParsePath(s string) error {
+	s = filepath.Base(s)
+
+	a := walSegmentPathRegexExt.FindStringSubmatch(s)
+	if a == nil {
+		return fmt.Errorf("invalid wal segment path: %s", s)
+	}
+
+	i64, _ := strconv.ParseUint(a[1], 16, 64)
+	info.Index = int(i64)
+	info.Offset, _ = strconv.ParseInt(a[2], 16, 64)
+
+	info.Compression = Compression(a[4])
+	info.Encryption = Encryption(len(a[5]) > 0)
+
+	if !info.Compression.IsValid() {
+		return fmt.Errorf("invalid snapshot compression: %s", s)
+	}
+
+	return nil
 }
 
 // Pos returns the WAL position when the segment was made.
@@ -431,12 +524,12 @@ func SnapshotsPath(root, generation string) (string, error) {
 }
 
 // SnapshotPath returns the path to an uncompressed snapshot file.
-func SnapshotPath(root, generation string, index int) (string, error) {
-	dir, err := SnapshotsPath(root, generation)
+func SnapshotPath(root string, info SnapshotInfo) (string, error) {
+	dir, err := SnapshotsPath(root, info.Generation)
 	if err != nil {
 		return "", err
 	}
-	return path.Join(dir, FormatSnapshotPath(index)), nil
+	return path.Join(dir, info.FormatPath()), nil
 }
 
 // WALPath returns the path to a generation's WAL directory
@@ -449,40 +542,18 @@ func WALPath(root, generation string) (string, error) {
 }
 
 // WALSegmentPath returns the path to a WAL segment file.
-func WALSegmentPath(root, generation string, index int, offset int64) (string, error) {
-	dir, err := WALPath(root, generation)
+func WALSegmentPath(root string, info WALSegmentInfo) (string, error) {
+	dir, err := WALPath(root, info.Generation)
 	if err != nil {
 		return "", err
 	}
-	return path.Join(dir, FormatWALSegmentPath(index, offset)), nil
+	return path.Join(dir, info.FormatPath()), nil
 }
 
 // IsSnapshotPath returns true if s is a path to a snapshot file.
 func IsSnapshotPath(s string) bool {
-	return snapshotPathRegex.MatchString(s)
+	return snapshotPathRegexExt.MatchString(s)
 }
-
-// ParseSnapshotPath returns the index for the snapshot.
-// Returns an error if the path is not a valid snapshot path.
-func ParseSnapshotPath(s string) (index int, err error) {
-	s = filepath.Base(s)
-
-	a := snapshotPathRegex.FindStringSubmatch(s)
-	if a == nil {
-		return 0, fmt.Errorf("invalid snapshot path: %s", s)
-	}
-
-	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	return int(i64), nil
-}
-
-// FormatSnapshotPath formats a snapshot filename with a given index.
-func FormatSnapshotPath(index int) string {
-	assert(index >= 0, "snapshot index must be non-negative")
-	return fmt.Sprintf("%08x%s", index, SnapshotExt)
-}
-
-var snapshotPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot\.lz4$`)
 
 // IsWALPath returns true if s is a path to a WAL file.
 func IsWALPath(s string) bool {
@@ -510,30 +581,6 @@ func FormatWALPath(index int) string {
 }
 
 var walPathRegex = regexp.MustCompile(`^([0-9a-f]{8})\.wal$`)
-
-// ParseWALSegmentPath returns the index & offset for the WAL segment file.
-// Returns an error if the path is not a valid wal segment path.
-func ParseWALSegmentPath(s string) (index int, offset int64, err error) {
-	s = filepath.Base(s)
-
-	a := walSegmentPathRegex.FindStringSubmatch(s)
-	if a == nil {
-		return 0, 0, fmt.Errorf("invalid wal segment path: %s", s)
-	}
-
-	i64, _ := strconv.ParseUint(a[1], 16, 64)
-	off64, _ := strconv.ParseUint(a[2], 16, 64)
-	return int(i64), int64(off64), nil
-}
-
-// FormatWALSegmentPath formats a WAL segment filename with a given index & offset.
-func FormatWALSegmentPath(index int, offset int64) string {
-	assert(index >= 0, "wal index must be non-negative")
-	assert(offset >= 0, "wal offset must be non-negative")
-	return fmt.Sprintf("%08x_%08x%s", index, offset, WALSegmentExt)
-}
-
-var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))\.wal\.lz4$`)
 
 // isHexChar returns true if ch is a lowercase hex character.
 func isHexChar(ch rune) bool {

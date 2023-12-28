@@ -13,10 +13,12 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
-func nextIndex(pos litestream.Pos) litestream.Pos {
-	return litestream.Pos{
-		Generation: pos.Generation,
-		Index:      pos.Index + 1,
+func nextIndex(pos litestream.Pos) litestream.WALSegmentInfo {
+	return litestream.WALSegmentInfo{
+		Generation:  pos.Generation,
+		Index:       pos.Index + 1,
+		Offset:      0,
+		Compression: litestream.CompressionLZ4, // FIXME: this matches the assumption in replica.go for now
 	}
 }
 
@@ -108,7 +110,7 @@ func TestReplica_Sync(t *testing.T) {
 	// Verify WAL matches replica WAL.
 	if b0, err := os.ReadFile(db.Path() + "-wal"); err != nil {
 		t.Fatal(err)
-	} else if r, err := c.WALSegmentReader(context.Background(), dpos.Truncate()); err != nil {
+	} else if r, err := c.WALSegmentReader(context.Background(), litestream.WALSegmentInfo{Generation: dpos.Generation, Index: dpos.Index, Compression: litestream.CompressionLZ4}); err != nil {
 		t.Fatal(err)
 	} else if b1, err := io.ReadAll(lz4.NewReader(r)); err != nil {
 		t.Fatal(err)
@@ -142,8 +144,8 @@ func TestReplica_Snapshot(t *testing.T) {
 		t.Fatal(err)
 	} else if info, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
-	} else if got, want := info.Pos(), nextIndex(pos0); got != want {
-		t.Fatalf("pos=%s, want %s", got, want)
+	} else if got, want := info.Pos(), nextIndex(pos0); got != want.Pos() {
+		t.Fatalf("pos=%s, want %s", got, want.Pos())
 	}
 
 	// Sync database and then replica.
@@ -166,7 +168,7 @@ func TestReplica_Snapshot(t *testing.T) {
 		t.Fatal(err)
 	} else if info, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
-	} else if got, want := info.Pos(), nextIndex(pos1); got != want {
+	} else if got, want := info.Pos(), nextIndex(pos1); got != want.Pos() {
 		t.Fatalf("pos=%v, want %v", got, want)
 	}
 
@@ -177,9 +179,9 @@ func TestReplica_Snapshot(t *testing.T) {
 		t.Fatalf("len=%v, want %v", got, want)
 	} else if got, want := infos[0].Pos(), pos0.Truncate(); got != want {
 		t.Fatalf("info[0]=%s, want %s", got, want)
-	} else if got, want := infos[1].Pos(), nextIndex(pos0); got != want {
-		t.Fatalf("info[1]=%s, want %s", got, want)
-	} else if got, want := infos[2].Pos(), nextIndex(pos1); got != want {
-		t.Fatalf("info[2]=%s, want %s", got, want)
+	} else if got, want := infos[1].Pos(), nextIndex(pos0); got != want.Pos() {
+		t.Fatalf("info[1]=%s, want %s", got, want.Pos())
+	} else if got, want := infos[2].Pos(), nextIndex(pos1); got != want.Pos() {
+		t.Fatalf("info[2]=%s, want %s", got, want.Pos())
 	}
 }
