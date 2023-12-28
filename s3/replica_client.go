@@ -238,14 +238,14 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 }
 
 // WriteSnapshot writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, info *litestream.SnapshotInfo, rd io.Reader) error {
 	if err := c.Init(ctx); err != nil {
-		return info, err
+		return err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.Path, *info)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
+		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
 	startTime := time.Now()
 
@@ -255,7 +255,7 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 		Key:    aws.String(key),
 		Body:   rc,
 	}); err != nil {
-		return info, err
+		return err
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
@@ -263,21 +263,18 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 
 	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
 
-	return litestream.SnapshotInfo{
-		Generation: generation,
-		Index:      index,
-		Size:       rc.N(),
-		CreatedAt:  startTime.UTC(),
-	}, nil
+	info.Size = rc.N()
+	info.CreatedAt = startTime.UTC()
+	return nil
 }
 
 // SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, info litestream.SnapshotInfo) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.Path, info)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -298,12 +295,12 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 }
 
 // DeleteSnapshot deletes a snapshot with the given generation & index.
-func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
+func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, info litestream.SnapshotInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.Path, info)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -332,14 +329,14 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, info *litestream.WALSegmentInfo, rd io.Reader) error {
 	if err := c.Init(ctx); err != nil {
-		return info, err
+		return err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.Path, *info)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
+		return fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
 	startTime := time.Now()
 
@@ -349,29 +346,25 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		Key:    aws.String(key),
 		Body:   rc,
 	}); err != nil {
-		return info, err
+		return err
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
-	return litestream.WALSegmentInfo{
-		Generation: pos.Generation,
-		Index:      pos.Index,
-		Offset:     pos.Offset,
-		Size:       rc.N(),
-		CreatedAt:  startTime.UTC(),
-	}, nil
+	info.Size = rc.N()
+	info.CreatedAt = startTime.UTC()
+	return nil
 }
 
 // WALSegmentReader returns a reader for a section of WAL data at the given index.
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
+func (c *ReplicaClient) WALSegmentReader(ctx context.Context, info litestream.WALSegmentInfo) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.Path, info)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -392,7 +385,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 }
 
 // DeleteWALSegments deletes WAL segments with at the given positions.
-func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Pos) error {
+func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.WALSegmentInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
@@ -405,8 +398,8 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 		}
 
 		// Generate a batch of object IDs for deleting the WAL segments.
-		for i, pos := range a[:n] {
-			key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+		for i, info := range a[:n] {
+			key, err := litestream.WALSegmentPath(c.Path, info)
 			if err != nil {
 				return fmt.Errorf("cannot determine wal segment path: %w", err)
 			}
@@ -527,17 +520,16 @@ func (itr *snapshotIterator) fetch() error {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(*obj.Key)
-			index, err := litestream.ParseSnapshotPath(key)
-			if err != nil {
-				continue
-			}
-
 			info := litestream.SnapshotInfo{
 				Generation: itr.generation,
-				Index:      index,
 				Size:       *obj.Size,
 				CreatedAt:  obj.LastModified.UTC(),
+			}
+
+			key := path.Base(*obj.Key)
+			err := info.ParsePath(key)
+			if err != nil {
+				continue
 			}
 
 			select {
@@ -630,18 +622,16 @@ func (itr *walSegmentIterator) fetch() error {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(*obj.Key)
-			index, offset, err := litestream.ParseWALSegmentPath(key)
-			if err != nil {
-				continue
-			}
-
 			info := litestream.WALSegmentInfo{
 				Generation: itr.generation,
-				Index:      index,
-				Offset:     offset,
 				Size:       *obj.Size,
 				CreatedAt:  obj.LastModified.UTC(),
+			}
+
+			key := path.Base(*obj.Key)
+			err := info.ParsePath(key)
+			if err != nil {
+				continue
 			}
 
 			select {
