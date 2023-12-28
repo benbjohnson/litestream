@@ -156,6 +156,9 @@ The commands are:
 
 // Config represents a configuration file for the litestream daemon.
 type Config struct {
+	// Global replica settings
+	ReplicaSettings
+
 	// Bind address for serving metrics.
 	Addr string `yaml:"addr"`
 
@@ -165,10 +168,6 @@ type Config struct {
 	// Subcommand to execute during replication.
 	// Litestream will shutdown when subcommand exits.
 	Exec string `yaml:"exec"`
-
-	// Global S3 settings
-	AccessKeyID     string `yaml:"access-key-id"`
-	SecretAccessKey string `yaml:"secret-access-key"`
 
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
@@ -181,16 +180,11 @@ type LoggingConfig struct {
 	Stderr bool   `yaml:"stderr"`
 }
 
-// propagateGlobalSettings copies global S3 settings to replica configs.
+// propagateGlobalSettings copies global replica settings to replica configs.
 func (c *Config) propagateGlobalSettings() {
 	for _, dbc := range c.DBs {
 		for _, rc := range dbc.Replicas {
-			if rc.AccessKeyID == "" {
-				rc.AccessKeyID = c.AccessKeyID
-			}
-			if rc.SecretAccessKey == "" {
-				rc.SecretAccessKey = c.SecretAccessKey
-			}
+			rc.ReplicaSettings.SetDefaults(&c.ReplicaSettings)
 		}
 	}
 }
@@ -332,18 +326,8 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	return db, nil
 }
 
-// ReplicaConfig represents the configuration for a single replica in a database.
-type ReplicaConfig struct {
-	Type                   string         `yaml:"type"` // "file", "s3"
-	Name                   string         `yaml:"name"` // name of replica, optional.
-	Path                   string         `yaml:"path"`
-	URL                    string         `yaml:"url"`
-	Retention              *time.Duration `yaml:"retention"`
-	RetentionCheckInterval *time.Duration `yaml:"retention-check-interval"`
-	SyncInterval           *time.Duration `yaml:"sync-interval"`
-	SnapshotInterval       *time.Duration `yaml:"snapshot-interval"`
-	ValidationInterval     *time.Duration `yaml:"validation-interval"`
-
+// ReplicaSettings stores replica access credentials
+type ReplicaSettings struct {
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
@@ -368,6 +352,75 @@ type ReplicaConfig struct {
 		Identities []string `yaml:"identities"`
 		Recipients []string `yaml:"recipients"`
 	} `yaml:"age"`
+}
+
+func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
+	// S3 settings
+	if rs.AccessKeyID == "" {
+		rs.AccessKeyID = src.AccessKeyID
+	}
+	if rs.SecretAccessKey == "" {
+		rs.SecretAccessKey = src.SecretAccessKey
+	}
+	if rs.Region == "" {
+		rs.Region = src.Region
+	}
+	if rs.Bucket == "" {
+		rs.Bucket = src.Bucket
+	}
+	if rs.Endpoint == "" {
+		rs.Endpoint = src.Endpoint
+	}
+	if rs.ForcePathStyle == nil {
+		rs.ForcePathStyle = src.ForcePathStyle
+	}
+	if src.SkipVerify {
+		rs.SkipVerify = true
+	}
+
+	// ABS settings
+	if rs.AccountName == "" {
+		rs.AccountName = src.AccountName
+	}
+	if rs.AccountKey == "" {
+		rs.AccountKey = src.AccountKey
+	}
+
+	// SFTP settings
+	if rs.Host == "" {
+		rs.Host = src.Host
+	}
+	if rs.User == "" {
+		rs.User = src.User
+	}
+	if rs.Password == "" {
+		rs.Password = src.Password
+	}
+	if rs.KeyPath == "" {
+		rs.KeyPath = src.KeyPath
+	}
+
+	if len(rs.Age.Identities) == 0 {
+		rs.Age.Identities = src.Age.Identities
+	}
+	if len(rs.Age.Recipients) == 0 {
+		rs.Age.Recipients = src.Age.Recipients
+	}
+}
+
+// ReplicaConfig represents the configuration for a single replica in a database.
+type ReplicaConfig struct {
+	ReplicaSettings
+
+	Type                   string         `yaml:"type"` // "file", "s3"
+	Name                   string         `yaml:"name"` // name of replica, optional.
+	Path                   string         `yaml:"path"`
+	URL                    string         `yaml:"url"`
+	Retention              *time.Duration `yaml:"retention"`
+	RetentionCheckInterval *time.Duration `yaml:"retention-check-interval"`
+	SyncInterval           *time.Duration `yaml:"sync-interval"`
+	SnapshotInterval       *time.Duration `yaml:"snapshot-interval"`
+	ValidationInterval     *time.Duration `yaml:"validation-interval"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
