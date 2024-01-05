@@ -763,9 +763,9 @@ func deleteOutputError(out *s3.DeleteObjectsOutput) error {
 	case 0:
 		return nil
 	case 1:
-		return fmt.Errorf("deleting object %s: %s - %s", *out.Errors[0].Key, *out.Errors[0].Code, *out.Errors[0].Message)
+		return fmt.Errorf("deleting object: %s", out.Errors[0].String())
 	default:
-		return fmt.Errorf("%d errors occurred deleting objects, %s: %s - (%s (and %d others)",
-			len(out.Errors), *out.Errors[0].Key, *out.Errors[0].Code, *out.Errors[0].Message, len(out.Errors)-1)
+		return fmt.Errorf("%d errors occurred deleting objects: %s (and %d others)",
+			len(out.Errors), out.Errors[0].String(), len(out.Errors)-1)
 	}
 }
