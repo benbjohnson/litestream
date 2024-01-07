@@ -161,7 +161,7 @@ func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, prefix := range page.CommonPrefixes {
-			name := path.Base(*prefix.Prefix)
+			name := path.Base(aws.StringValue(prefix.Prefix))
 			if !litestream.IsGenerationName(name) {
 				continue
 			}
@@ -292,7 +292,7 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 		return nil, err
 	}
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*out.ContentLength))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
 
 	return out.Body, nil
 }
@@ -386,7 +386,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*out.ContentLength))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
 
 	return out.Body, nil
 }
@@ -527,7 +527,7 @@ func (itr *snapshotIterator) fetch() error {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(*obj.Key)
+			key := path.Base(aws.StringValue(obj.Key))
 			index, err := litestream.ParseSnapshotPath(key)
 			if err != nil {
 				continue
@@ -536,7 +536,7 @@ func (itr *snapshotIterator) fetch() error {
 			info := litestream.SnapshotInfo{
 				Generation: itr.generation,
 				Index:      index,
-				Size:       *obj.Size,
+				Size:       aws.Int64Value(obj.Size),
 				CreatedAt:  obj.LastModified.UTC(),
 			}
 
@@ -630,7 +630,7 @@ func (itr *walSegmentIterator) fetch() error {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(*obj.Key)
+			key := path.Base(aws.StringValue(obj.Key))
 			index, offset, err := litestream.ParseWALSegmentPath(key)
 			if err != nil {
 				continue
@@ -640,7 +640,7 @@ func (itr *walSegmentIterator) fetch() error {
 				Generation: itr.generation,
 				Index:      index,
 				Offset:     offset,
-				Size:       *obj.Size,
+				Size:       aws.Int64Value(obj.Size),
 				CreatedAt:  obj.LastModified.UTC(),
 			}
 
@@ -763,9 +763,9 @@ func deleteOutputError(out *s3.DeleteObjectsOutput) error {
 	case 0:
 		return nil
 	case 1:
-		return fmt.Errorf("deleting object %s: %s - %s", *out.Errors[0].Key, *out.Errors[0].Code, *out.Errors[0].Message)
+		return fmt.Errorf("deleting object %s: %s - %s", aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message))
 	default:
 		return fmt.Errorf("%d errors occurred deleting objects, %s: %s - (%s (and %d others)",
-			len(out.Errors), *out.Errors[0].Key, *out.Errors[0].Code, *out.Errors[0].Message, len(out.Errors)-1)
+			len(out.Errors), aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message), len(out.Errors)-1)
 	}
 }
