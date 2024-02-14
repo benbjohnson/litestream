@@ -101,7 +101,7 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 				for itr.Next() {
 					info := itr.WALSegment()
 
-					fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%s\n",
+					fmt.Fprintf(w, "%s\t%s\t%x\t%d\t%d\t%s\n",
 						r.Name(),
 						info.Generation,
 						info.Index,
