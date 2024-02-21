@@ -42,6 +42,9 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
+	snapshotIntervalFlag := fs.Duration("snapshot-interval", 0, "interval to create snapshots")
+	validationIntervalFlag := fs.Duration("validation-interval", 0, "interval to validate snapshots")
+	syncInterval := fs.Duration("sync-interval", litestream.DefaultSyncInterval, "interval to sync replicas")
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -55,13 +58,13 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
-
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
-			syncInterval := litestream.DefaultSyncInterval
 			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
-				URL:          u,
-				SyncInterval: &syncInterval,
+				URL:                u,
+				SyncInterval:       syncInterval,
+				SnapshotInterval:   snapshotIntervalFlag,
+				ValidationInterval: validationIntervalFlag,
 			})
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
@@ -205,5 +208,14 @@ Arguments:
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
-`[1:], DefaultConfigPath())
+	-sync-interval DURATION
+	    Snapshot interval duration (Default: %s).
+
+	-snapshot-interval DURATION
+	    New snapshot every interval duration (Disabled by default).
+
+	-validation-interval DURATION
+	    Run validator every interval duration (Disabled by default).
+
+`[1:], DefaultConfigPath(), litestream.DefaultSyncInterval)
 }
