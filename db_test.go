@@ -375,7 +375,7 @@ func TestDB_Sync(t *testing.T) {
 		shadowWALPath := db.ShadowWALPath(pos0.Generation, pos0.Index)
 		if buf, err := os.ReadFile(shadowWALPath); err != nil {
 			t.Fatal(err)
-		} else if err := os.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0600); err != nil {
+		} else if err := os.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0o600); err != nil {
 			t.Fatal(err)
 		}
 
@@ -552,12 +552,7 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Ensure position is now on the second index.
-		if pos, err := db.Pos(); err != nil {
-			t.Fatal(err)
-		} else if got, want := pos.Index, 1; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		}
+		// NOTE: The minimum checkpoint may only do a PASSIVE checkpoint so we can't guarantee a rollover.
 	})
 
 	// Ensure DB checkpoints after interval.
@@ -580,13 +575,6 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		} else if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
-		}
-
-		// Ensure position is now on the second index.
-		if pos, err := db.Pos(); err != nil {
-			t.Fatal(err)
-		} else if got, want := pos.Index, 1; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
 		}
 	})
 }

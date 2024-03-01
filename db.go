@@ -629,7 +629,7 @@ func (db *DB) acquireReadLock() error {
 	}
 
 	// Execute read query to obtain read lock.
-	if _, err := tx.ExecContext(db.ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
+	if _, err := tx.ExecContext(context.Background(), `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -649,6 +649,10 @@ func (db *DB) releaseReadLock() error {
 	// Rollback & clear read transaction.
 	err := db.rtx.Rollback()
 	db.rtx = nil
+
+	if errors.Is(err, context.Canceled) {
+		err = nil
+	}
 	return err
 }
 
@@ -693,7 +697,7 @@ func (db *DB) createGeneration() (string, error) {
 
 	// Atomically write generation name as current generation.
 	generationNamePath := db.GenerationNamePath()
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0o600)
 	if db.fileInfo != nil {
 		mode = db.fileInfo.Mode()
 	}
@@ -986,7 +990,7 @@ func (db *DB) initShadowWALFile(filename string) (int64, error) {
 	}
 
 	// Write header to new WAL shadow file.
-	mode := os.FileMode(0600)
+	mode := os.FileMode(0o600)
 	if fi := db.fileInfo; fi != nil {
 		mode = fi.Mode()
 	}
@@ -1022,7 +1026,7 @@ func (db *DB) copyToShadowWAL(filename string) (origWalSize int64, newSize int64
 	}
 	origWalSize = frameAlign(fi.Size(), db.pageSize)
 
-	w, err := os.OpenFile(filename, os.O_RDWR, 0666)
+	w, err := os.OpenFile(filename, os.O_RDWR, 0o666)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1334,7 +1338,7 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	// a new page is written.
 	if err := db.execCheckpoint(mode); err != nil {
 		return err
-	} else if _, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
+	} else if err := db.ensureWALExists(); err != nil {
 		return err
 	}
 
@@ -1424,7 +1428,7 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return fmt.Errorf("acquire read lock: %w", err)
 	}
 
 	return nil
