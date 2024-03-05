@@ -50,6 +50,10 @@ func TestReplica_Sync(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
 	c := file.NewReplicaClient(t.TempDir())
 	r := litestream.NewReplica(db, "")
 	c.Replica, r.Client = r, c
@@ -142,7 +146,7 @@ func TestReplica_Snapshot(t *testing.T) {
 		t.Fatal(err)
 	} else if info, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
-	} else if got, want := info.Pos(), nextIndex(pos0); got != want {
+	} else if got, want := info.Pos(), pos0.Truncate(); got != want {
 		t.Fatalf("pos=%s, want %s", got, want)
 	}
 
@@ -166,20 +170,18 @@ func TestReplica_Snapshot(t *testing.T) {
 		t.Fatal(err)
 	} else if info, err := r.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
-	} else if got, want := info.Pos(), nextIndex(pos1); got != want {
+	} else if got, want := info.Pos(), pos1.Truncate(); got != want {
 		t.Fatalf("pos=%v, want %v", got, want)
 	}
 
-	// Verify three snapshots exist.
+	// Verify snapshots exist.
 	if infos, err := r.Snapshots(context.Background()); err != nil {
 		t.Fatal(err)
-	} else if got, want := len(infos), 3; got != want {
+	} else if got, want := len(infos), 2; got != want {
 		t.Fatalf("len=%v, want %v", got, want)
 	} else if got, want := infos[0].Pos(), pos0.Truncate(); got != want {
 		t.Fatalf("info[0]=%s, want %s", got, want)
-	} else if got, want := infos[1].Pos(), nextIndex(pos0); got != want {
+	} else if got, want := infos[1].Pos(), pos1.Truncate(); got != want {
 		t.Fatalf("info[1]=%s, want %s", got, want)
-	} else if got, want := infos[2].Pos(), nextIndex(pos1); got != want {
-		t.Fatalf("info[2]=%s, want %s", got, want)
 	}
 }
