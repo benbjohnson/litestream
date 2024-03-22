@@ -169,6 +169,7 @@ type Config struct {
 	// Global S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
+	SessionToken    string `yaml:"session-token"`
 
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
@@ -190,6 +191,9 @@ func (c *Config) propagateGlobalSettings() {
 			}
 			if rc.SecretAccessKey == "" {
 				rc.SecretAccessKey = c.SecretAccessKey
+			}
+			if rc.SessionToken == "" {
+				rc.SessionToken = c.SessionToken
 			}
 		}
 	}
@@ -347,6 +351,7 @@ type ReplicaConfig struct {
 	// S3 settings
 	AccessKeyID     string `yaml:"access-key-id"`
 	SecretAccessKey string `yaml:"secret-access-key"`
+	SessionToken    string `yaml:"session-token"`
 	Region          string `yaml:"region"`
 	Bucket          string `yaml:"bucket"`
 	Endpoint        string `yaml:"endpoint"`
@@ -525,6 +530,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s
 	client := s3.NewReplicaClient()
 	client.AccessKeyID = c.AccessKeyID
 	client.SecretAccessKey = c.SecretAccessKey
+	client.SessionToken = c.SessionToken
 	client.Bucket = bucket
 	client.Path = path
 	client.Region = region
@@ -678,6 +684,11 @@ func applyLitestreamEnv() {
 	if v, ok := os.LookupEnv("LITESTREAM_SECRET_ACCESS_KEY"); ok {
 		if _, ok := os.LookupEnv("AWS_SECRET_ACCESS_KEY"); !ok {
 			os.Setenv("AWS_SECRET_ACCESS_KEY", v)
+		}
+	}
+	if v, ok := os.LookupEnv("LITESTREAM_SESSION_TOKEN"); ok {
+		if _, ok := os.LookupEnv("AWS_SESSION_TOKEN"); !ok {
+			os.Setenv("AWS_SESSION_TOKEN", v)
 		}
 	}
 }

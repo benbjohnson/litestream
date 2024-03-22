@@ -44,6 +44,7 @@ type ReplicaClient struct {
 	// AWS authentication keys.
 	AccessKeyID     string
 	SecretAccessKey string
+	SessionToken    string
 
 	// S3 bucket information
 	Region         string
@@ -108,7 +109,7 @@ func (c *ReplicaClient) config() *aws.Config {
 	config := &aws.Config{}
 
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
+		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, c.SessionToken)
 	}
 	if c.Endpoint != "" {
 		config.Endpoint = aws.String(c.Endpoint)
