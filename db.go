@@ -1305,7 +1305,7 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 	return db.checkpoint(ctx, generation, mode)
 }
 
-// checkpointAndInit performs a checkpoint on the WAL file and initializes a
+// checkpoint performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	// Try getting a checkpoint lock, will fail during snapshots.
