@@ -146,7 +146,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
 	dir, err := c.SnapshotsDir(generation)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshots path: %w", err)
+		return nil, litestream.ErrSnapshotPathNoGeneration
 	}
 
 	f, err := os.Open(dir)
@@ -186,7 +186,7 @@ func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (lites
 func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
 	filename, err := c.SnapshotPath(generation, index)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
+		return info, litestream.ErrSnapshotPathNoGeneration
 	}
 
 	var fileInfo, dirInfo os.FileInfo
@@ -239,16 +239,23 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
 	filename, err := c.SnapshotPath(generation, index)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
+		return nil, litestream.ErrSnapshotDoesNotExist
 	}
-	return os.Open(filename)
+	f, err := os.Open(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, litestream.ErrSnapshotDoesNotExist
+		}
+		return nil, err
+	}
+	return f, nil
 }
 
 // DeleteSnapshot deletes a snapshot with the given generation & index.
 func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
 	filename, err := c.SnapshotPath(generation, index)
 	if err != nil {
-		return fmt.Errorf("cannot determine snapshot path: %w", err)
+		return litestream.ErrSnapshotDoesNotExist
 	}
 	if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
 		return err
@@ -260,19 +267,22 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
 	dir, err := c.WALDir(generation)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal path: %w", err)
+		return nil, litestream.ErrWALPathNoGeneration
 	}
 
 	f, err := os.Open(dir)
 	if os.IsNotExist(err) {
 		return litestream.NewWALSegmentInfoSliceIterator(nil), nil
 	} else if err != nil {
-		return nil, err
+		return nil, litestream.ErrWALPathNoGeneration
 	}
 	defer f.Close()
 
 	fis, err := f.Readdir(-1)
 	if err != nil {
+		if err == os.ErrNotExist {
+			return nil, litestream.ErrWALPathNoGeneration
+		}
 		return nil, err
 	}
 
@@ -301,7 +311,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (lit
 func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
 	filename, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
 	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
+		return info, litestream.ErrWALPathNoGeneration
 	}
 
 	var fileInfo, dirInfo os.FileInfo
@@ -355,9 +365,16 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
 	filename, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
+		return nil, litestream.ErrWALSegmentPathNoGeneration
 	}
-	return os.Open(filename)
+	f, err := os.Open(filename)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, litestream.ErrSnapshotDoesNotExist
+		}
+		return nil, err
+	}
+	return f, nil
 }
 
 // DeleteWALSegments deletes WAL segments at the given positions.
@@ -365,7 +382,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	for _, pos := range a {
 		filename, err := c.WALSegmentPath(pos.Generation, pos.Index, pos.Offset)
 		if err != nil {
-			return fmt.Errorf("cannot determine wal segment path: %w", err)
+			return litestream.ErrWALSegmentPathNoGeneration
 		}
 		if err := os.Remove(filename); err != nil && !os.IsNotExist(err) {
 			return err

@@ -39,9 +39,14 @@ const (
 
 // Litestream errors.
 var (
-	ErrNoGeneration     = errors.New("no generation available")
-	ErrNoSnapshots      = errors.New("no snapshots available")
-	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
+	ErrNoGeneration               = errors.New("no generation available")
+	ErrNoSnapshots                = errors.New("no snapshots available")
+	ErrChecksumMismatch           = errors.New("invalid replica, checksum mismatch")
+	ErrGenerationRequired         = errors.New("generation required")
+	ErrSnapshotPathNoGeneration   = errors.New("cannot determine snapshots path: generation required")
+	ErrSnapshotDoesNotExist       = errors.New("snapshot does not exist")
+	ErrWALPathNoGeneration        = errors.New("cannot determine wal path: generation required")
+	ErrWALSegmentPathNoGeneration = errors.New("cannot determine wal segment path: generation required")
 )
 
 var (
@@ -416,7 +421,7 @@ func GenerationsPath(root string) string {
 func GenerationPath(root, generation string) (string, error) {
 	dir := GenerationsPath(root)
 	if generation == "" {
-		return "", fmt.Errorf("generation required")
+		return "", ErrGenerationRequired
 	}
 	return path.Join(dir, generation), nil
 }
