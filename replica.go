@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/srilekha98/litestream/internal"
 	"golang.org/x/sync/errgroup"
 )
 
