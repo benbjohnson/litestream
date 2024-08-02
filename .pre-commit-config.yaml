@@ -14,7 +14,7 @@ repos:
       - id: go-imports-repo
         args:
           - "-local"
-          - "github.com/benbjohnson/litestrem"
+          - "github.com/srilekha98/litestrem"
           - "-w"
       - id: go-vet-repo-mod
       - id: go-staticcheck-repo-mod

@@ -1,4 +1,4 @@
-module github.com/benbjohnson/litestream
+module github.com/srilekha98/litestream
 
 go 1.21
 
