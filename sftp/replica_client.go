@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/pkg/sftp"
+	"github.com/srilekha98/litestream/internal"
 	"golang.org/x/crypto/ssh"
 )
 
