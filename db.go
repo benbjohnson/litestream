@@ -415,7 +415,7 @@ func (db *DB) init() (err error) {
 
 	// Connect to SQLite database. Use the driver registered with a hook to
 	// prevent WAL files from being removed.
-	if db.db, err = sql.Open("litestream-sqlite3", dsn); err != nil {
+	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
 	}
 
