@@ -9,7 +9,7 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/benbjohnson/litestream"
+	"github.com/srilekha98/litestream"
 )
 
 // SnapshotsCommand represents a command to list snapshots for a command.

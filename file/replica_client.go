@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/benbjohnson/litestream"
+	"github.com/srilekha98/litestream"
 	"github.com/srilekha98/litestream/internal"
 )
 

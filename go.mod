@@ -7,7 +7,6 @@ require (
 	filippo.io/age v1.1.1
 	github.com/Azure/azure-storage-blob-go v0.15.0
 	github.com/aws/aws-sdk-go v1.49.5
-	github.com/benbjohnson/litestream v0.3.13
 	github.com/mattn/go-shellwords v1.0.12
 	github.com/pierrec/lz4/v4 v4.1.19
 	github.com/pkg/sftp v1.13.6
@@ -39,7 +38,6 @@ require (
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/mattn/go-ieproxy v0.0.11 // indirect
-	github.com/mattn/go-sqlite3 v1.14.17 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/prometheus/client_model v0.5.0 // indirect
 	github.com/prometheus/common v0.45.0 // indirect

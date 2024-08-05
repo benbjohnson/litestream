@@ -3,7 +3,7 @@ package file_test
 import (
 	"testing"
 
-	"github.com/benbjohnson/litestream/file"
+	"github.com/srilekha98/litestream/file"
 )
 
 func TestReplicaClient_Path(t *testing.T) {

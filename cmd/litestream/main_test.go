@@ -5,10 +5,10 @@ import (
 	"path/filepath"
 	"testing"
 
-	main "github.com/benbjohnson/litestream/cmd/litestream"
-	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gcs"
-	"github.com/benbjohnson/litestream/s3"
+	main "github.com/srilekha98/litestream/cmd/litestream"
+	"github.com/srilekha98/litestream/file"
+	"github.com/srilekha98/litestream/gcs"
+	"github.com/srilekha98/litestream/s3"
 )
 
 func TestReadConfigFile(t *testing.T) {
