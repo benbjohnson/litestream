@@ -22,6 +22,7 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	_ "modernc.org/sqlite"
 )
 
 // Default DB settings.
@@ -415,7 +416,7 @@ func (db *DB) init() (err error) {
 
 	// Connect to SQLite database. Use the driver registered with a hook to
 	// prevent WAL files from being removed.
-	if db.db, err = sql.Open("litestream-sqlite3", dsn); err != nil {
+	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
 	}
 
