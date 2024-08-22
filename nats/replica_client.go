@@ -9,7 +9,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
-	natsClient "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nats.go/jetstream"
 	"github.com/valyala/bytebufferpool"
 )
@@ -21,12 +21,11 @@ const (
 	DefaultBucketMaxBytes = 0               // unlimited
 	DefaultBucketTTL      = 0 * time.Second // unlimited
 
-	generationsPrefix    = "generations/"
-	generationsPrefixLen = len(generationsPrefix)
+	generationsPrefix = "generations/"
 )
 
 type ReplicaClient struct {
-	nc          *natsClient.Conn
+	nc          *nats.Conn
 	objectStore jetstream.ObjectStore
 
 	// NATS connection info
@@ -36,7 +35,7 @@ type ReplicaClient struct {
 	BucketTTL      time.Duration
 }
 
-func NewReplicaClient(nc *natsClient.Conn) *ReplicaClient {
+func NewReplicaClient(nc *nats.Conn) *ReplicaClient {
 	return &ReplicaClient{
 		nc:             nc,
 		BucketName:     DefaultBucketName,
@@ -46,7 +45,7 @@ func NewReplicaClient(nc *natsClient.Conn) *ReplicaClient {
 	}
 }
 
-// Returns the type of client.
+// Type returns the type of client.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
@@ -60,8 +59,9 @@ func (c *ReplicaClient) Generations(ctx context.Context) (_ []string, err error)
 
 	generations := make([]string, 0, len(infos))
 	for _, info := range infos {
-		endGenIdx := strings.Index(info.Name[generationsPrefixLen:], "/")
-		generation := info.Name[generationsPrefixLen : generationsPrefixLen+endGenIdx]
+		offset := len(generationsPrefix)
+		endGenIdx := strings.Index(info.Name[offset:], "/")
+		generation := info.Name[offset : offset+endGenIdx]
 		generations = append(generations, generation)
 	}
 
@@ -76,7 +76,8 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 	}
 
 	for _, info := range infos {
-		infoGeneration := info.Name[generationsPrefixLen : generationsPrefixLen+len(generation)]
+		offset := len(generationsPrefix)
+		infoGeneration := info.Name[offset : offset+len(generation)]
 		if infoGeneration != generation {
 			continue
 		}

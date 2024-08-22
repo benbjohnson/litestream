@@ -146,7 +146,7 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
 	dir, err := c.SnapshotsDir(generation)
 	if err != nil {
-		return nil, litestream.ErrSnapshotPathNoGeneration
+		return nil, fmt.Errorf("cannot determine snapshots path: %w", err)
 	}
 
 	f, err := os.Open(dir)
