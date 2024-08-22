@@ -16,11 +16,14 @@ import (
 	"strings"
 	"time"
 
+	natsClient "github.com/nats-io/nats.go"
+
 	"filippo.io/age"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
@@ -363,6 +366,12 @@ type ReplicaConfig struct {
 	Password string `yaml:"password"`
 	KeyPath  string `yaml:"key-path"`
 
+	// NATS settings
+	JWT            string `yaml:"jwt"`
+	Seed           string `yaml:"seed"`
+	ReplicaCount   int    `yaml:"replica"`
+	RetentionBytes int64  `yaml:"retention-bytes"`
+
 	// Encryption identities and recipients
 	Age struct {
 		Identities []string `yaml:"identities"`
@@ -413,24 +422,28 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 
 	// Build and set client on replica.
 	switch c.ReplicaType() {
-	case "file":
+	case file.ReplicaClientType:
 		if r.Client, err = newFileReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
-	case "s3":
+	case s3.ReplicaClientType:
 		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
-	case "gcs":
+	case gcs.ReplicaClientType:
 		if r.Client, err = newGCSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
-	case "abs":
+	case abs.ReplicaClientType:
 		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
-	case "sftp":
+	case sftp.ReplicaClientType:
 		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case nats.ReplicaClientType:
+		if r.Client, err = newNATSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	default:
@@ -663,6 +676,41 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	client.Password = password
 	client.Path = path
 	client.KeyPath = c.KeyPath
+	return client, nil
+}
+
+// newNATSReplicaClientFromConfig returns a new instance of nats.ReplicaClient built from config.
+func newNATSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *nats.ReplicaClient, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for nats replica")
+	}
+
+	// Ensure required settings are set.
+	if c.Bucket == "" {
+		return nil, fmt.Errorf("bucket required for nats replica")
+	}
+
+	nc, err := natsClient.Connect(
+		c.URL,
+		natsClient.UserJWTAndSeed(c.JWT, c.Seed),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("cannot connect to nats server: %w", err)
+	}
+
+	// Build replica.
+	client := nats.NewReplicaClient(nc)
+	client.BucketName = c.Bucket
+	client.BucketMaxBytes = c.RetentionBytes
+	if c.ReplicaCount > 0 {
+		client.BucketReplicas = c.ReplicaCount
+	}
+
+	if c.Retention != nil {
+		client.BucketTTL = *c.Retention
+	}
+
 	return client, nil
 }
 

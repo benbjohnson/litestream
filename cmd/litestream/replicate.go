@@ -15,6 +15,7 @@ import (
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	"github.com/mattn/go-shellwords"
@@ -121,6 +122,8 @@ func (c *ReplicateCommand) Run() (err error) {
 				slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
 			case *sftp.ReplicaClient:
 				slog.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
+			case *nats.ReplicaClient:
+				slog.Info("replicating to", "bucket", client.BucketName)
 			default:
 				slog.Info("replicating to")
 			}
