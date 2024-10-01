@@ -1,11 +1,11 @@
-package main_test
+package cmd_test
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 
-	main "github.com/benbjohnson/litestream/cmd/litestream"
+	main "github.com/benbjohnson/litestream/cmd"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
