@@ -35,9 +35,9 @@ var (
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
 
-func Run(args []string) error {
+func Run(ctx context.Context, args []string) error {
 	m := NewMain()
-	err := m.Run(context.Background(), args)
+	err := m.Run(ctx, args)
 	if err == flag.ErrHelp || err == errStop {
 	} else if err != nil {
 		slog.Error("failed to run", "error", err)
