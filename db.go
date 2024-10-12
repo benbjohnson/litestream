@@ -145,6 +145,40 @@ func NewDB(path string) *DB {
 	return db
 }
 
+// NewDB returns a new instance of DB for a given path and metadatapath, for use replicating a litefs fuse mounted db.
+func NewLFSDB(path string, metapath string) *DB {
+	_, file := filepath.Split(path)
+
+	db := &DB{
+		path:     path,
+		metaPath: filepath.Join(metapath, "."+file+MetaDirSuffix),
+		notify:   make(chan struct{}),
+
+		MinCheckpointPageN: DefaultMinCheckpointPageN,
+		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
+		TruncatePageN:      DefaultTruncatePageN,
+		CheckpointInterval: DefaultCheckpointInterval,
+		MonitorInterval:    DefaultMonitorInterval,
+		Logger:             slog.With("db", path),
+	}
+
+	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
+	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
+	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
+	db.shadowWALIndexGauge = shadowWALIndexGaugeVec.WithLabelValues(db.path)
+	db.shadowWALSizeGauge = shadowWALSizeGaugeVec.WithLabelValues(db.path)
+	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
+	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
+	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
+	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+
+	db.ctx, db.cancel = context.WithCancel(context.Background())
+
+	return db
+}
+
 // SQLDB returns a reference to the underlying sql.DB connection.
 func (db *DB) SQLDB() *sql.DB {
 	return db.db
