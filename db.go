@@ -330,7 +330,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
-		if e := db.Sync(ctx); e != nil && err == nil {
+		if e := db.Sync(ctx); e != nil {
 			err = e
 		}
 	}
@@ -1480,7 +1480,7 @@ func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Repli
 }
 
 // applyWAL performs a truncating checkpoint on the given database.
-func applyWAL(ctx context.Context, index int, dbPath string) error {
+func applyWAL(_ context.Context, index int, dbPath string) error {
 	// Copy WAL file from it's staging path to the correct "-wal" location.
 	if err := os.Rename(fmt.Sprintf("%s-%08x-wal", dbPath, index), dbPath+"-wal"); err != nil {
 		return err
