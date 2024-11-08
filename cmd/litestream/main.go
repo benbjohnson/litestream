@@ -32,13 +32,20 @@ var (
 	Version = "(development build)"
 )
 
-// errStop is a terminal error for indicating program should quit.
-var errStop = errors.New("stop")
+var (
+	// errStop is a terminal error for indicating program should quit.
+	errStop = errors.New("stop")
+
+	// errLeaseExpired is a terminal error indicatingthe program has exited due to lease expiration.
+	errLeaseExpired = errors.New("lease expired")
+)
 
 func main() {
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
 		os.Exit(1)
+	} else if err == errLeaseExpired {
+		os.Exit(2)
 	} else if err != nil {
 		slog.Error("failed to run", "error", err)
 		os.Exit(1)
@@ -89,8 +96,11 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			return err
 		}
 
-		// Wait for signal to stop program.
+		// Wait for lease expiration or for a signal to stop program.
 		select {
+		case <-c.leaseExpireCh:
+			return errLeaseExpired
+
 		case err = <-c.execCh:
 			slog.Info("subprocess exited, litestream shutting down")
 		case sig := <-signalCh:
@@ -161,6 +171,9 @@ type Config struct {
 
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
+
+	// Optional. Distributed lease configuration.
+	Lease *LeaseConfig `yaml:"lease"`
 
 	// Subcommand to execute during replication.
 	// Litestream will shutdown when subcommand exits.
@@ -279,6 +292,119 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	slog.SetDefault(slog.New(logHandler))
 
 	return config, nil
+}
+
+// LeaseConfig represents the configuration for a distributed lease.
+type LeaseConfig struct {
+	Type    string         `yaml:"type"` // "s3"
+	Path    string         `yaml:"path"`
+	URL     string         `yaml:"url"`
+	Timeout *time.Duration `yaml:"timeout"`
+	Owner   string         `yaml:"owner"`
+
+	// S3 settings
+	AccessKeyID     string `yaml:"access-key-id"`
+	SecretAccessKey string `yaml:"secret-access-key"`
+	Region          string `yaml:"region"`
+	Bucket          string `yaml:"bucket"`
+	Endpoint        string `yaml:"endpoint"`
+	ForcePathStyle  *bool  `yaml:"force-path-style"`
+	SkipVerify      bool   `yaml:"skip-verify"`
+}
+
+// NewLeaserFromConfig instantiates a lease client.
+func NewLeaserFromConfig(c *LeaseConfig) (_ litestream.Leaser, err error) {
+	// Ensure user did not specify URL in path.
+	if isURL(c.Path) {
+		return nil, fmt.Errorf("leaser path cannot be a url, please use the 'url' field instead: %s", c.Path)
+	}
+
+	switch c.Type {
+	case "s3":
+		return newS3LeaserFromConfig(c)
+	default:
+		return nil, fmt.Errorf("unknown leaser type in config: %q", c.Type)
+	}
+}
+
+// newS3LeaserFromConfig returns a new instance of s3.Leaser built from config.
+func newS3LeaserFromConfig(c *LeaseConfig) (_ *s3.Leaser, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for s3 leaser")
+	} else if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for s3 leaser")
+	}
+
+	bucket, path := c.Bucket, c.Path
+	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
+
+	// Use path style if an endpoint is explicitly set. This works because the
+	// only service to not use path style is AWS which does not use an endpoint.
+	forcePathStyle := (endpoint != "")
+	if v := c.ForcePathStyle; v != nil {
+		forcePathStyle = *v
+	}
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		_, host, upath, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, err
+		}
+		ubucket, uregion, uendpoint, uforcePathStyle := s3.ParseHost(host)
+
+		// Only apply URL parts to field that have not been overridden.
+		if path == "" {
+			path = upath
+		}
+		if bucket == "" {
+			bucket = ubucket
+		}
+		if region == "" {
+			region = uregion
+		}
+		if endpoint == "" {
+			endpoint = uendpoint
+		}
+		if !forcePathStyle {
+			forcePathStyle = uforcePathStyle
+		}
+	}
+
+	// Ensure required settings are set.
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for s3 leaser")
+	}
+
+	// Build leaser.
+	leaser := s3.NewLeaser()
+	leaser.AccessKeyID = c.AccessKeyID
+	leaser.AccessKeyID = c.AccessKeyID
+	leaser.SecretAccessKey = c.SecretAccessKey
+	leaser.Bucket = bucket
+	leaser.Path = path
+	leaser.Region = region
+	leaser.Endpoint = endpoint
+	leaser.ForcePathStyle = forcePathStyle
+	leaser.SkipVerify = skipVerify
+
+	owner := c.Owner
+	if owner == "" {
+		owner, _ = os.Hostname()
+	}
+	leaser.Owner = owner
+
+	if v := c.Timeout; v != nil {
+		leaser.LeaseTimeout = *v
+	}
+
+	// Initialize leaser to build client.
+	if err := leaser.Open(); err != nil {
+		return nil, err
+	}
+
+	return leaser, nil
 }
 
 // DBConfig represents the configuration for a single database.
