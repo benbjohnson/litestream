@@ -26,19 +26,17 @@ import (
 
 // Default DB settings.
 const (
-	DefaultMonitorInterval    = 1 * time.Second
-	DefaultCheckpointInterval = 1 * time.Minute
-	DefaultMinCheckpointPageN = 1000
-	DefaultMaxCheckpointPageN = 10000
-	DefaultTruncatePageN      = 500000
+	DefaultMonitorInterval     = 1 * time.Second
+	DefaultCheckpointInterval  = 1 * time.Minute
+	DefaultBusyTimeoutInterval = 1 * time.Second
+	DefaultMinCheckpointPageN  = 1000
+	DefaultMaxCheckpointPageN  = 10000
+	DefaultTruncatePageN       = 500000
 )
 
 // MaxIndex is the maximum possible WAL index.
 // If this index is reached then a new generation will be started.
 const MaxIndex = 0x7FFFFFFF
-
-// BusyTimeout is the timeout to wait for EBUSY from SQLite.
-const BusyTimeout = 1 * time.Second
 
 // DB represents a managed instance of a SQLite database in the file system.
 type DB struct {
@@ -103,6 +101,9 @@ type DB struct {
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
 
+	// The timeout to wait for EBUSY from SQLite.
+	BusyTimeoutInterval time.Duration
+
 	// List of replicas for the database.
 	// Must be set before calling Open().
 	Replicas []*Replica
@@ -120,12 +121,13 @@ func NewDB(path string) *DB {
 		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
 		notify:   make(chan struct{}),
 
-		MinCheckpointPageN: DefaultMinCheckpointPageN,
-		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
-		TruncatePageN:      DefaultTruncatePageN,
-		CheckpointInterval: DefaultCheckpointInterval,
-		MonitorInterval:    DefaultMonitorInterval,
-		Logger:             slog.With("db", path),
+		MinCheckpointPageN:  DefaultMinCheckpointPageN,
+		MaxCheckpointPageN:  DefaultMaxCheckpointPageN,
+		TruncatePageN:       DefaultTruncatePageN,
+		CheckpointInterval:  DefaultCheckpointInterval,
+		MonitorInterval:     DefaultMonitorInterval,
+		BusyTimeoutInterval: DefaultBusyTimeoutInterval,
+		Logger:              slog.With("db", path),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -411,7 +413,7 @@ func (db *DB) init() (err error) {
 	db.dirInfo = fi
 
 	dsn := db.path
-	dsn += fmt.Sprintf("?_busy_timeout=%d", BusyTimeout.Milliseconds())
+	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeoutInterval.Milliseconds())
 
 	// Connect to SQLite database. Use the driver registered with a hook to
 	// prevent WAL files from being removed.
