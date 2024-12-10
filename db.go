@@ -26,12 +26,12 @@ import (
 
 // Default DB settings.
 const (
-	DefaultMonitorInterval     = 1 * time.Second
-	DefaultCheckpointInterval  = 1 * time.Minute
-	DefaultBusyTimeoutInterval = 1 * time.Second
-	DefaultMinCheckpointPageN  = 1000
-	DefaultMaxCheckpointPageN  = 10000
-	DefaultTruncatePageN       = 500000
+	DefaultMonitorInterval    = 1 * time.Second
+	DefaultCheckpointInterval = 1 * time.Minute
+	DefaultBusyTimeout        = 1 * time.Second
+	DefaultMinCheckpointPageN = 1000
+	DefaultMaxCheckpointPageN = 10000
+	DefaultTruncatePageN      = 500000
 )
 
 // MaxIndex is the maximum possible WAL index.
@@ -102,7 +102,7 @@ type DB struct {
 	MonitorInterval time.Duration
 
 	// The timeout to wait for EBUSY from SQLite.
-	BusyTimeoutInterval time.Duration
+	BusyTimeout time.Duration
 
 	// List of replicas for the database.
 	// Must be set before calling Open().
@@ -121,13 +121,13 @@ func NewDB(path string) *DB {
 		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
 		notify:   make(chan struct{}),
 
-		MinCheckpointPageN:  DefaultMinCheckpointPageN,
-		MaxCheckpointPageN:  DefaultMaxCheckpointPageN,
-		TruncatePageN:       DefaultTruncatePageN,
-		CheckpointInterval:  DefaultCheckpointInterval,
-		MonitorInterval:     DefaultMonitorInterval,
-		BusyTimeoutInterval: DefaultBusyTimeoutInterval,
-		Logger:              slog.With("db", path),
+		MinCheckpointPageN: DefaultMinCheckpointPageN,
+		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
+		TruncatePageN:      DefaultTruncatePageN,
+		CheckpointInterval: DefaultCheckpointInterval,
+		MonitorInterval:    DefaultMonitorInterval,
+		BusyTimeout:        DefaultBusyTimeout,
+		Logger:             slog.With("db", path),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -413,7 +413,7 @@ func (db *DB) init() (err error) {
 	db.dirInfo = fi
 
 	dsn := db.path
-	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeoutInterval.Milliseconds())
+	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeout.Milliseconds())
 
 	// Connect to SQLite database. Use the driver registered with a hook to
 	// prevent WAL files from being removed.
