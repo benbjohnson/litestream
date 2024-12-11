@@ -2,11 +2,9 @@ package s3
 
 import (
 	"context"
-	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
-	"net/http"
 	"os"
 	"path"
 	"regexp"
@@ -15,8 +13,6 @@ import (
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/benbjohnson/litestream"
@@ -29,9 +25,6 @@ const ReplicaClientType = "s3"
 
 // MaxKeys is the number of keys S3 can operate on per batch.
 const MaxKeys = 1000
-
-// DefaultRegion is the region used if one is not specified.
-const DefaultRegion = "us-east-1"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
@@ -73,77 +66,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// Look up region if not specified and no endpoint is used.
-	// Endpoints are typically used for non-S3 object stores and do not
-	// necessarily require a region.
-	region := c.Region
-	if region == "" {
-		if c.Endpoint == "" {
-			if region, err = c.findBucketRegion(ctx, c.Bucket); err != nil {
-				return fmt.Errorf("cannot lookup bucket region: %w", err)
-			}
-		} else {
-			region = DefaultRegion // default for non-S3 object stores
-		}
-	}
-
-	// Create new AWS session.
-	config := c.config()
-	if region != "" {
-		config.Region = aws.String(region)
-	}
-
-	sess, err := session.NewSession(config)
+	sess, err := newSession(ctx, c.AccessKeyID, c.SecretAccessKey, c.Region, c.Bucket, c.Path, c.Endpoint, c.ForcePathStyle, c.SkipVerify)
 	if err != nil {
-		return fmt.Errorf("cannot create aws session: %w", err)
+		return err
 	}
 	c.s3 = s3.New(sess)
 	c.uploader = s3manager.NewUploader(sess)
 	return nil
-}
-
-// config returns the AWS configuration. Uses the default credential chain
-// unless a key/secret are explicitly set.
-func (c *ReplicaClient) config() *aws.Config {
-	config := &aws.Config{}
-
-	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
-	}
-	if c.Endpoint != "" {
-		config.Endpoint = aws.String(c.Endpoint)
-	}
-	if c.ForcePathStyle {
-		config.S3ForcePathStyle = aws.Bool(c.ForcePathStyle)
-	}
-	if c.SkipVerify {
-		config.HTTPClient = &http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
-	}
-
-	return config
-}
-
-func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
-	// Connect to US standard region to fetch info.
-	config := c.config()
-	config.Region = aws.String(DefaultRegion)
-	sess, err := session.NewSession(config)
-	if err != nil {
-		return "", err
-	}
-
-	// Fetch bucket location, if possible. Must be bucket owner.
-	// This call can return a nil location which means it's in us-east-1.
-	if out, err := s3.New(sess).HeadBucketWithContext(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(bucket),
-	}); err != nil {
-		return "", err
-	} else if out.BucketRegion != nil {
-		return *out.BucketRegion, nil
-	}
-	return DefaultRegion, nil
 }
 
 // Generations returns a list of available generation names.

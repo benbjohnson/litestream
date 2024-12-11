@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,9 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -23,19 +27,39 @@ import (
 
 // ReplicateCommand represents a command that continuously replicates SQLite databases.
 type ReplicateCommand struct {
-	cmd    *exec.Cmd  // subcommand
-	execCh chan error // subcommand error channel
+	cmd           *exec.Cmd // subcommand
+	wg            sync.WaitGroup
+	execCh        chan error    // subcommand error channel
+	leaseExpireCh chan struct{} // lease expiration error channel
+	leaserCtx     context.Context
+	leaserCancel  context.CancelCauseFunc
+
+	// Holds the current lease, if any.
+	lease atomic.Value // *litestream.Lease
 
 	Config Config
+
+	// Lease client for managing distributed lease.
+	// May be nil if no lease config specified.
+	Leaser litestream.Leaser
 
 	// List of managed databases specified in the config.
 	DBs []*litestream.DB
 }
 
 func NewReplicateCommand() *ReplicateCommand {
-	return &ReplicateCommand{
-		execCh: make(chan error),
+	c := &ReplicateCommand{
+		execCh:        make(chan error),
+		leaseExpireCh: make(chan struct{}),
 	}
+	c.leaserCtx, c.leaserCancel = context.WithCancelCause(context.Background())
+
+	c.lease.Store((*litestream.Lease)(nil))
+	return c
+}
+
+func (c *ReplicateCommand) Lease() *litestream.Lease {
+	return c.lease.Load().(*litestream.Lease)
 }
 
 // ParseFlags parses the CLI flags and loads the configuration file.
@@ -86,6 +110,18 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 func (c *ReplicateCommand) Run() (err error) {
 	// Display version information.
 	slog.Info("litestream", "version", Version)
+
+	// Acquire lease if config specified.
+	if c.Config.Lease != nil {
+		c.Leaser, err = NewLeaserFromConfig(c.Config.Lease)
+		if err != nil {
+			return fmt.Errorf("initialize leaser: %w", err)
+		}
+
+		if err := c.acquireLease(context.Background()); err != nil {
+			return fmt.Errorf("acquire initial lease: %w", err)
+		}
+	}
 
 	// Setup databases.
 	if len(c.Config.DBs) == 0 {
@@ -175,7 +211,114 @@ func (c *ReplicateCommand) Close() (err error) {
 			}
 		}
 	}
+
+	// Stop lease monitoring.
+	c.leaserCancel(errors.New("litestream shutting down"))
+	c.wg.Wait()
+
+	// Release the most recent lease.
+	if lease := c.Lease(); lease != nil {
+		slog.Info("releasing lease", slog.Int64("epoch", lease.Epoch))
+
+		if e := c.Leaser.ReleaseLease(context.Background(), lease.Epoch); e != nil {
+			slog.Error("failed to release lease",
+				slog.Int64("epoch", lease.Epoch),
+				slog.Any("error", e))
+		}
+	}
+
 	return err
+}
+
+// acquireLease initializes a lease client based on the config, acquires the initial
+// lease, and then continuously monitors & renews the lease in the background.
+func (c *ReplicateCommand) acquireLease(ctx context.Context) (err error) {
+	timer := time.NewTimer(1)
+	defer timer.Stop()
+
+	// Continually try to acquire lease if there is an existing lease.
+OUTER:
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-timer.C:
+			var leaseExistsError *litestream.LeaseExistsError
+			lease, err := c.Leaser.AcquireLease(ctx)
+			if errors.As(err, &leaseExistsError) {
+				timer.Reset(litestream.LeaseRetryInterval)
+				slog.Info("lease already exists, waiting to retry",
+					slog.Int64("epoch", leaseExistsError.Lease.Epoch),
+					slog.String("owner", leaseExistsError.Lease.Owner),
+					slog.Time("expires", leaseExistsError.Lease.Deadline()))
+				continue
+			} else if err != nil {
+				return fmt.Errorf("acquire lease: %w", err)
+			}
+			c.lease.Store(lease)
+			break OUTER
+		}
+	}
+
+	lease := c.Lease()
+	slog.Info("lease acquired",
+		slog.Int64("epoch", lease.Epoch),
+		slog.Duration("timeout", lease.Timeout),
+		slog.String("owner", lease.Owner))
+
+	// Continuously monitor and renew lease in a separate goroutine.
+	c.wg.Add(1)
+	go func() { defer c.wg.Done(); c.monitorLease(c.leaserCtx) }()
+
+	return nil
+}
+
+func (c *ReplicateCommand) monitorLease(ctx context.Context) {
+	timer := time.NewTimer(c.Lease().Timeout / 2)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Error("stopping lease monitor")
+			return
+
+		case <-timer.C:
+			var leaseExistsError *litestream.LeaseExistsError
+
+			lease := c.Lease()
+			slog.Debug("attempting to renew lease", slog.Int64("epoch", lease.Epoch))
+
+			// Attempt to renew our currently held lease.
+			newLease, err := c.Leaser.RenewLease(ctx, lease)
+			if errors.As(err, &leaseExistsError) {
+				slog.Error("cannot renew lease, another lease exists, exiting",
+					slog.Int64("epoch", leaseExistsError.Lease.Epoch),
+					slog.String("owner", leaseExistsError.Lease.Owner))
+				c.leaseExpireCh <- struct{}{}
+				return
+			}
+
+			// If our lease has expired then give up and exit.
+			if lease.Expired() {
+				slog.Error("lease expired, exiting")
+				c.leaseExpireCh <- struct{}{}
+				return
+			}
+
+			// If we hit a temporary error then aggressively retry.
+			if err != nil {
+				slog.Warn("temporarily unable to renew lease, retrying", slog.Any("error", err))
+				timer.Reset(1 * time.Second)
+				continue
+			}
+
+			// Replace lease and try to renew after halfway through the timeout.
+			slog.Debug("lease renewed", slog.Int64("epoch", newLease.Epoch))
+			c.lease.Store(newLease)
+			timer.Reset(lease.Timeout / 2)
+		}
+	}
 }
 
 // Usage prints the help screen to STDOUT.
