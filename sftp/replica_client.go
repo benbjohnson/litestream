@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path"
@@ -39,6 +40,7 @@ type ReplicaClient struct {
 	Password    string
 	Path        string
 	KeyPath     string
+	HostKey     string
 	DialTimeout time.Duration
 }
 
@@ -68,9 +70,20 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	// Build SSH configuration & auth methods
+	var hostkey ssh.HostKeyCallback
+	if c.HostKey != "" {
+		var pubkey, _, _, _, err = ssh.ParseAuthorizedKey([]byte(c.HostKey))
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse sftp host key: %w", err)
+		}
+		hostkey = ssh.FixedHostKey(pubkey)
+	} else {
+		slog.Warn("sftp host key not verified", "host", c.Host)
+		hostkey = ssh.InsecureIgnoreHostKey()
+	}
 	config := &ssh.ClientConfig{
 		User:            c.User,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostkey,
 		BannerCallback:  ssh.BannerDisplayStderr(),
 	}
 	if c.Password != "" {
