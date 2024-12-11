@@ -10,20 +10,24 @@ import (
 	"path"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	natsClient "github.com/nats-io/nats.go"
 )
 
 var (
 	// Enables integration tests.
-	integration = flag.String("integration", "file", "")
+	integration = flag.String("integration", file.ReplicaClientType, "")
 )
 
 // S3 settings
@@ -60,6 +64,17 @@ var (
 	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
 	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
 	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
+)
+
+// NATS settings
+var (
+	natsServerURL      = flag.String("nats-server-url", os.Getenv("LITESTREAM_NATS_SERVER_URL"), "")
+	natsAccountJWT     = flag.String("nats-account-jwt", os.Getenv("LITESTREAM_NATS_ACCOUNT_JWT"), "")
+	natsAccountSeed    = flag.String("nats-account-seed", os.Getenv("LITESTREAM_NATS_ACCOUNT_SEED"), "")
+	natsBucketName     = flag.String("nats-bucket-name", os.Getenv("LITESTREAM_NATS_BUCKET_NAME"), "")
+	natsBucketReplicas = flag.String("nats-bucket-replicas", os.Getenv("LITESTREAM_NATS_BUCKET_REPLICAS"), "")
+	natsBucketMaxBytes = flag.String("nats-bucket-max-bytes", os.Getenv("LITESTREAM_NATS_BUCKET_MAX_BYTES"), "")
+	natsBucketTTL      = flag.String("nats-bucket-ttl", os.Getenv("LITESTREAM_NATS_BUCKET_TTL"), "")
 )
 
 func TestReplicaClient_Generations(t *testing.T) {
@@ -176,7 +191,7 @@ func TestReplicaClient_Snapshots(t *testing.T) {
 		if err == nil {
 			err = itr.Close()
 		}
-		if err == nil || err.Error() != `cannot determine snapshots path: generation required` {
+		if err == nil || err != litestream.ErrSnapshotPathNoGeneration {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -203,7 +218,7 @@ func TestReplicaClient_WriteSnapshot(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.WriteSnapshot(context.Background(), "", 0, nil); err == nil || err != litestream.ErrSnapshotPathNoGeneration {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -233,7 +248,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1); !os.IsNotExist(err) {
+		if _, err := c.SnapshotReader(context.Background(), "5efbd8d042012dca", 1); err != litestream.ErrSnapshotDoesNotExist {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
@@ -241,7 +256,7 @@ func TestReplicaClient_SnapshotReader(t *testing.T) {
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err.Error() != `cannot determine snapshot path: generation required` {
+		if _, err := c.SnapshotReader(context.Background(), "", 1); err == nil || err != litestream.ErrSnapshotDoesNotExist {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -361,7 +376,7 @@ func TestReplicaClient_WALs(t *testing.T) {
 		if err == nil {
 			err = itr.Close()
 		}
-		if err == nil || err.Error() != `cannot determine wal path: generation required` {
+		if err == nil || err != litestream.ErrWALPathNoGeneration {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -388,7 +403,7 @@ func TestReplicaClient_WriteWALSegment(t *testing.T) {
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if _, err := c.WriteWALSegment(context.Background(), litestream.Pos{Generation: "", Index: 0, Offset: 0}, nil); err == nil || err != litestream.ErrWALPathNoGeneration {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -418,7 +433,7 @@ func TestReplicaClient_WALReader(t *testing.T) {
 	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}); !os.IsNotExist(err) {
+		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 1, Offset: 0}); err != litestream.ErrSnapshotDoesNotExist {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
@@ -441,16 +456,16 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}); !os.IsNotExist(err) {
+		if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "b16ddcf5c697540f", Index: 1, Offset: 2}); err != litestream.ErrSnapshotDoesNotExist {
 			t.Fatalf("expected not exist, got %#v", err)
-		} else if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}); !os.IsNotExist(err) {
+		} else if _, err := c.WALSegmentReader(context.Background(), litestream.Pos{Generation: "5efbd8d042012dca", Index: 3, Offset: 4}); err != litestream.ErrSnapshotDoesNotExist {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
 
 	RunWithReplicaClient(t, "ErrNoGeneration", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
-		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err.Error() != `cannot determine wal segment path: generation required` {
+		if err := c.DeleteWALSegments(context.Background(), []litestream.Pos{{}}); err == nil || err != litestream.ErrWALSegmentPathNoGeneration {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	})
@@ -485,6 +500,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewABSReplicaClient(tb)
 	case sftp.ReplicaClientType:
 		return NewSFTPReplicaClient(tb)
+	case nats.ReplicaClientType:
+		return NewNATSReplicaClient(tb)
 	default:
 		tb.Fatalf("invalid replica client type: %q", typ)
 		return nil
@@ -548,25 +565,72 @@ func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
 	return c
 }
 
+// NewNATSReplicaClient returns a new client for integration testing.
+func NewNATSReplicaClient(tb testing.TB) *nats.ReplicaClient {
+	tb.Helper()
+
+	var err error
+
+	nc, err := natsClient.Connect(
+		*natsServerURL,
+		natsClient.UserJWTAndSeed(*natsAccountJWT, *natsAccountSeed),
+	)
+	if err != nil {
+		tb.Fatalf("cannot connect to nats: %s", err)
+	}
+
+	c := nats.NewReplicaClient(nc)
+	c.BucketName = *natsBucketName
+
+	if natsBucketReplicas != nil && *natsBucketReplicas != "" {
+		c.BucketReplicas, err = strconv.Atoi(*natsBucketReplicas)
+		if err != nil {
+			tb.Fatalf("cannot convert replicas to int: %s", err)
+		}
+	}
+
+	if natsBucketMaxBytes != nil && *natsBucketMaxBytes != "" {
+		c.BucketMaxBytes, err = strconv.ParseInt(*natsBucketMaxBytes, 10, 64)
+		if err != nil {
+			tb.Fatalf("cannot convert max bytes to int64: %s", err)
+		}
+	}
+
+	if natsBucketTTL != nil && *natsBucketTTL != "" {
+		c.BucketTTL, err = time.ParseDuration(*natsBucketTTL)
+		if err != nil {
+			tb.Fatalf("cannot convert ttl to int: %s", err)
+		}
+	}
+
+	return c
+}
+
 // MustDeleteAll deletes all objects under the client's path.
 func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
 	tb.Helper()
 
-	generations, err := c.Generations(context.Background())
+	ctx := context.Background()
+
+	generations, err := c.Generations(ctx)
 	if err != nil {
 		tb.Fatalf("cannot list generations for deletion: %s", err)
 	}
 
 	for _, generation := range generations {
-		if err := c.DeleteGeneration(context.Background(), generation); err != nil {
+		if err := c.DeleteGeneration(ctx, generation); err != nil {
 			tb.Fatalf("cannot delete generation: %s", err)
 		}
 	}
 
 	switch c := c.(type) {
 	case *sftp.ReplicaClient:
-		if err := c.Cleanup(context.Background()); err != nil {
+		if err := c.Cleanup(ctx); err != nil {
 			tb.Fatalf("cannot cleanup sftp: %s", err)
+		}
+	case *nats.ReplicaClient:
+		if err := c.Cleanup(ctx); err != nil {
+			tb.Fatalf("cannot cleanup nats: %s", err)
 		}
 	}
 }
