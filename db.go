@@ -391,7 +391,7 @@ func (db *DB) UpdatedAt() (time.Time, error) {
 
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
-func (db *DB) init() (err error) {
+func (db *DB) init(ctx context.Context) (err error) {
 	// Exit if already initialized.
 	if db.db != nil {
 		return nil
@@ -465,7 +465,7 @@ func (db *DB) init() (err error) {
 
 	// Start a long-running read transaction to prevent other transactions
 	// from checkpointing.
-	if err := db.acquireReadLock(); err != nil {
+	if err := db.acquireReadLock(ctx); err != nil {
 		return fmt.Errorf("acquire read lock: %w", err)
 	}
 
@@ -619,7 +619,7 @@ func (db *DB) cleanWAL() error {
 }
 
 // acquireReadLock begins a read transaction on the database to prevent checkpointing.
-func (db *DB) acquireReadLock() error {
+func (db *DB) acquireReadLock(ctx context.Context) error {
 	if db.rtx != nil {
 		return nil
 	}
@@ -631,7 +631,7 @@ func (db *DB) acquireReadLock() error {
 	}
 
 	// Execute read query to obtain read lock.
-	if _, err := tx.ExecContext(db.ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
+	if _, err := tx.ExecContext(ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
 		_ = tx.Rollback()
 		return err
 	}
@@ -722,7 +722,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	defer db.mu.Unlock()
 
 	// Initialize database, if necessary. Exit if no DB exists.
-	if err := db.init(); err != nil {
+	if err := db.init(ctx); err != nil {
 		return err
 	} else if db.db == nil {
 		db.Logger.Debug("sync: no database found")
@@ -1334,7 +1334,7 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
-	if err := db.execCheckpoint(mode); err != nil {
+	if err := db.execCheckpoint(ctx, mode); err != nil {
 		return err
 	} else if _, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
 		return err
@@ -1386,7 +1386,7 @@ func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
 	return nil
 }
 
-func (db *DB) execCheckpoint(mode string) (err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
 		return nil
@@ -1408,7 +1408,6 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	if err := db.releaseReadLock(); err != nil {
 		return fmt.Errorf("release read lock: %w", err)
 	}
-	defer func() { _ = db.acquireReadLock() }()
 
 	// A non-forced checkpoint is issued as "PASSIVE". This will only checkpoint
 	// if there are not pending transactions. A forced checkpoint ("RESTART")
@@ -1425,8 +1424,8 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
 
 	// Reacquire the read lock immediately after the checkpoint.
-	if err := db.acquireReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+	if err := db.acquireReadLock(ctx); err != nil {
+		return fmt.Errorf("acquire read lock: %w", err)
 	}
 
 	return nil
@@ -1515,7 +1514,7 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	if err := db.init(); err != nil {
+	if err := db.init(ctx); err != nil {
 		return 0, Pos{}, err
 	} else if db.db == nil {
 		return 0, Pos{}, os.ErrNotExist
