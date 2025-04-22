@@ -25,8 +25,6 @@ const (
 	WALExt        = ".wal"
 	WALSegmentExt = ".wal.lz4"
 	SnapshotExt   = ".snapshot.lz4"
-
-	GenerationNameLen = 16
 )
 
 // SQLite checkpoint modes.
@@ -39,7 +37,6 @@ const (
 
 // Litestream errors.
 var (
-	ErrNoGeneration     = errors.New("no generation available")
 	ErrNoSnapshots      = errors.New("no snapshots available")
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
@@ -189,15 +186,14 @@ func (itr *WALSegmentInfoSliceIterator) WALSegment() WALSegmentInfo {
 
 // SnapshotInfo represents file information about a snapshot.
 type SnapshotInfo struct {
-	Generation string
-	Index      int
-	Size       int64
-	CreatedAt  time.Time
+	Index     int
+	Size      int64
+	CreatedAt time.Time
 }
 
 // Pos returns the WAL position when the snapshot was made.
 func (info *SnapshotInfo) Pos() Pos {
-	return Pos{Generation: info.Generation, Index: info.Index}
+	return Pos{Index: info.Index}
 }
 
 // SnapshotInfoSlice represents a slice of snapshot metadata.
@@ -208,9 +204,6 @@ func (a SnapshotInfoSlice) Len() int { return len(a) }
 func (a SnapshotInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
 func (a SnapshotInfoSlice) Less(i, j int) bool {
-	if a[i].Generation != a[j].Generation {
-		return a[i].Generation < a[j].Generation
-	}
 	return a[i].Index < a[j].Index
 }
 
@@ -225,15 +218,13 @@ func FilterSnapshotsAfter(a []SnapshotInfo, t time.Time) []SnapshotInfo {
 	return other
 }
 
-// FindMinSnapshotByGeneration finds the snapshot with the lowest index in a generation.
-func FindMinSnapshotByGeneration(a []SnapshotInfo, generation string) *SnapshotInfo {
+// FindMinSnapshot finds the snapshot with the lowest index.
+func FindMinSnapshot(a []SnapshotInfo) *SnapshotInfo {
 	var min *SnapshotInfo
 	for i := range a {
 		snapshot := &a[i]
 
-		if snapshot.Generation != generation {
-			continue
-		} else if min == nil || snapshot.Index < min.Index {
+		if min == nil || snapshot.Index < min.Index {
 			min = snapshot
 		}
 	}
@@ -242,9 +233,8 @@ func FindMinSnapshotByGeneration(a []SnapshotInfo, generation string) *SnapshotI
 
 // WALInfo represents file information about a WAL file.
 type WALInfo struct {
-	Generation string
-	Index      int
-	CreatedAt  time.Time
+	Index     int
+	CreatedAt time.Time
 }
 
 // WALInfoSlice represents a slice of WAL metadata.
@@ -255,24 +245,20 @@ func (a WALInfoSlice) Len() int { return len(a) }
 func (a WALInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
 func (a WALInfoSlice) Less(i, j int) bool {
-	if a[i].Generation != a[j].Generation {
-		return a[i].Generation < a[j].Generation
-	}
 	return a[i].Index < a[j].Index
 }
 
 // WALSegmentInfo represents file information about a WAL segment file.
 type WALSegmentInfo struct {
-	Generation string
-	Index      int
-	Offset     int64
-	Size       int64
-	CreatedAt  time.Time
+	Index     int
+	Offset    int64
+	Size      int64
+	CreatedAt time.Time
 }
 
 // Pos returns the WAL position when the segment was made.
 func (info *WALSegmentInfo) Pos() Pos {
-	return Pos{Generation: info.Generation, Index: info.Index, Offset: info.Offset}
+	return Pos{Index: info.Index, Offset: info.Offset}
 }
 
 // WALSegmentInfoSlice represents a slice of WAL segment metadata.
@@ -283,19 +269,16 @@ func (a WALSegmentInfoSlice) Len() int { return len(a) }
 func (a WALSegmentInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
 
 func (a WALSegmentInfoSlice) Less(i, j int) bool {
-	if a[i].Generation != a[j].Generation {
-		return a[i].Generation < a[j].Generation
-	} else if a[i].Index != a[j].Index {
+	if a[i].Index != a[j].Index {
 		return a[i].Index < a[j].Index
 	}
 	return a[i].Offset < a[j].Offset
 }
 
-// Pos is a position in the WAL for a generation.
+// Pos is a position in the WAL.
 type Pos struct {
-	Generation string // generation name
-	Index      int    // wal file index
-	Offset     int64  // offset within wal file
+	Index  int   // wal file index
+	Offset int64 // offset within wal file
 }
 
 // String returns a string representation.
@@ -303,7 +286,7 @@ func (p Pos) String() string {
 	if p.IsZero() {
 		return ""
 	}
-	return fmt.Sprintf("%s/%08x:%d", p.Generation, p.Index, p.Offset)
+	return fmt.Sprintf("%08x:%d", p.Index, p.Offset)
 }
 
 // IsZero returns true if p is the zero value.
@@ -313,7 +296,7 @@ func (p Pos) IsZero() bool {
 
 // Truncate returns p with the offset truncated to zero.
 func (p Pos) Truncate() Pos {
-	return Pos{Generation: p.Generation, Index: p.Index}
+	return Pos{Index: p.Index}
 }
 
 // Checksum computes a running SQLite checksum over a byte slice.
@@ -394,63 +377,28 @@ func removeTmpFiles(root string) error {
 	})
 }
 
-// IsGenerationName returns true if s is the correct length and is only lowercase hex characters.
-func IsGenerationName(s string) bool {
-	if len(s) != GenerationNameLen {
-		return false
-	}
-	for _, ch := range s {
-		if !isHexChar(ch) {
-			return false
-		}
-	}
-	return true
-}
-
-// GenerationsPath returns the path to a generation root directory.
-func GenerationsPath(root string) string {
-	return path.Join(root, "generations")
-}
-
-// GenerationPath returns the path to a generation's root directory.
-func GenerationPath(root, generation string) (string, error) {
-	dir := GenerationsPath(root)
-	if generation == "" {
-		return "", fmt.Errorf("generation required")
-	}
-	return path.Join(dir, generation), nil
-}
-
-// SnapshotsPath returns the path to a generation's snapshot directory.
-func SnapshotsPath(root, generation string) (string, error) {
-	dir, err := GenerationPath(root, generation)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(dir, "snapshots"), nil
+// SnapshotsPath returns the path to a snapshot directory.
+func SnapshotsPath(root string) (string, error) {
+	return path.Join(root, "snapshots"), nil
 }
 
 // SnapshotPath returns the path to an uncompressed snapshot file.
-func SnapshotPath(root, generation string, index int) (string, error) {
-	dir, err := SnapshotsPath(root, generation)
+func SnapshotPath(root string, index int) (string, error) {
+	dir, err := SnapshotsPath(root)
 	if err != nil {
 		return "", err
 	}
 	return path.Join(dir, FormatSnapshotPath(index)), nil
 }
 
-// WALPath returns the path to a generation's WAL directory
-func WALPath(root, generation string) (string, error) {
-	dir, err := GenerationPath(root, generation)
-	if err != nil {
-		return "", err
-	}
-	return path.Join(dir, "wal"), nil
+// WALPath returns the path to a WAL directory
+func WALPath(root string) (string, error) {
+	return path.Join(root, "wal"), nil
 }
 
 // WALSegmentPath returns the path to a WAL segment file.
-func WALSegmentPath(root, generation string, index int, offset int64) (string, error) {
-	dir, err := WALPath(root, generation)
+func WALSegmentPath(root string, index int, offset int64) (string, error) {
+	dir, err := WALPath(root)
 	if err != nil {
 		return "", err
 	}
@@ -534,11 +482,6 @@ func FormatWALSegmentPath(index int, offset int64) string {
 }
 
 var walSegmentPathRegex = regexp.MustCompile(`^([0-9a-f]{8})(?:_([0-9a-f]{8}))\.wal\.lz4$`)
-
-// isHexChar returns true if ch is a lowercase hex character.
-func isHexChar(ch rune) bool {
-	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')
-}
 
 func assert(condition bool, message string) {
 	if !condition {
