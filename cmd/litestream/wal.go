@@ -19,7 +19,6 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-wal", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	replicaName := fs.String("replica", "", "replica name")
-	generation := fs.String("generation", "", "generation name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -78,43 +77,30 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "replica\tgeneration\tindex\toffset\tsize\tcreated")
+	fmt.Fprintln(w, "replica\tindex\toffset\tsize\tcreated")
 	for _, r := range replicas {
-		var generations []string
-		if *generation != "" {
-			generations = []string{*generation}
-		} else {
-			if generations, err = r.Client.Generations(ctx); err != nil {
-				r.Logger().Error("cannot determine generations", "error", err)
-				continue
+		if err := func() error {
+			itr, err := r.Client.WALSegments(ctx)
+			if err != nil {
+				return err
 			}
-		}
+			defer itr.Close()
 
-		for _, generation := range generations {
-			if err := func() error {
-				itr, err := r.Client.WALSegments(ctx, generation)
-				if err != nil {
-					return err
-				}
-				defer itr.Close()
+			for itr.Next() {
+				info := itr.WALSegment()
 
-				for itr.Next() {
-					info := itr.WALSegment()
-
-					fmt.Fprintf(w, "%s\t%s\t%x\t%d\t%d\t%s\n",
-						r.Name(),
-						info.Generation,
-						info.Index,
-						info.Offset,
-						info.Size,
-						info.CreatedAt.Format(time.RFC3339),
-					)
-				}
-				return itr.Close()
-			}(); err != nil {
-				r.Logger().Error("cannot fetch wal segments", "error", err)
-				continue
+				fmt.Fprintf(w, "%s\t%x\t%d\t%d\t%s\n",
+					r.Name(),
+					info.Index,
+					info.Offset,
+					info.Size,
+					info.CreatedAt.Format(time.RFC3339),
+				)
 			}
+			return itr.Close()
+		}(); err != nil {
+			r.Logger().Error("cannot fetch wal segments", "error", err)
+			continue
 		}
 	}
 
@@ -144,16 +130,13 @@ Arguments:
 	-replica NAME
 	    Optional, filter by a specific replica.
 
-	-generation NAME
-	    Optional, filter by a specific generation.
-
 Examples:
 
 	# List all WAL segments for a database.
 	$ litestream wal /path/to/db
 
-	# List all WAL segments on S3 for a specific generation.
-	$ litestream wal -replica s3 -generation xxxxxxxx /path/to/db
+	# List all WAL segments on S3
+	$ litestream wal -replica s3 /path/to/db
 
 	# List all WAL segments for replica URL.
 	$ litestream wal s3://mybkt/db

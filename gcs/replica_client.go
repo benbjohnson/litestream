@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -59,53 +58,15 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	return nil
 }
 
-// Generations returns a list of available generation names.
-func (c *ReplicaClient) Generations(ctx context.Context) ([]string, error) {
-	if err := c.Init(ctx); err != nil {
-		return nil, err
-	}
-
-	// Construct query to only pull generation directory names.
-	query := &storage.Query{
-		Delimiter: "/",
-		Prefix:    litestream.GenerationsPath(c.Path) + "/",
-	}
-
-	// Loop over results and only build list of generation-formatted names.
-	it := c.bkt.Objects(ctx, query)
-	var generations []string
-	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		} else if err != nil {
-			return nil, err
-		}
-
-		name := path.Base(strings.TrimSuffix(attrs.Prefix, "/"))
-		if !litestream.IsGenerationName(name) {
-			continue
-		}
-		generations = append(generations, name)
-	}
-
-	return generations, nil
-}
-
-// DeleteGeneration deletes all snapshots & WAL segments within a generation.
-func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string) error {
+// DeleteAll deletes all snapshots & WAL segments.
+func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	dir, err := litestream.GenerationPath(c.Path, generation)
-	if err != nil {
-		return fmt.Errorf("cannot determine generation path: %w", err)
-	}
-
-	// Iterate over every object in generation and delete it.
+	// Iterate over every object and delete it.
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
-	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"}); ; {
+	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: c.Path + "/"}); ; {
 		attrs, err := it.Next()
 		if err == iterator.Done {
 			break
@@ -121,30 +82,30 @@ func (c *ReplicaClient) DeleteGeneration(ctx context.Context, generation string)
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
-	// log.Printf("%s(%s): retainer: deleting generation: %s", r.db.Path(), r.Name(), generation)
+	// log.Printf("%s(%s): retainer: deleting", r.db.Path(), r.Name())
 
 	return nil
 }
 
-// Snapshots returns an iterator over all available snapshots for a generation.
-func (c *ReplicaClient) Snapshots(ctx context.Context, generation string) (litestream.SnapshotIterator, error) {
+// Snapshots returns an iterator over all available snapshots.
+func (c *ReplicaClient) Snapshots(ctx context.Context) (litestream.SnapshotIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	dir, err := litestream.SnapshotsPath(c.Path, generation)
+	dir, err := litestream.SnapshotsPath(c.Path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshots path: %w", err)
 	}
-	return newSnapshotIterator(generation, c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
+	return newSnapshotIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
 }
 
 // WriteSnapshot writes LZ4 compressed data from rd to the object storage.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+func (c *ReplicaClient) WriteSnapshot(ctx context.Context, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.Path, index)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -163,23 +124,22 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, generation string, in
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	// log.Printf("%s(%s): snapshot: creating %s/%08x t=%s", r.db.Path(), r.Name(), generation, index, time.Since(startTime).Truncate(time.Millisecond))
+	// log.Printf("%s(%s): snapshot: creating %08x t=%s", r.db.Path(), r.Name(),  index, time.Since(startTime).Truncate(time.Millisecond))
 
 	return litestream.SnapshotInfo{
-		Generation: generation,
-		Index:      index,
-		Size:       n,
-		CreatedAt:  startTime.UTC(),
+		Index:     index,
+		Size:      n,
+		CreatedAt: startTime.UTC(),
 	}, nil
 }
 
-// SnapshotReader returns a reader for snapshot data at the given generation/index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+// SnapshotReader returns a reader for snapshot data at the given index.
+func (c *ReplicaClient) SnapshotReader(ctx context.Context, index int) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.Path, index)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -197,13 +157,13 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, generation string, i
 	return r, nil
 }
 
-// DeleteSnapshot deletes a snapshot with the given generation & index.
-func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, index int) error {
+// DeleteSnapshot deletes a snapshot with the given index.
+func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, generation, index)
+	key, err := litestream.SnapshotPath(c.Path, index)
 	if err != nil {
 		return fmt.Errorf("cannot determine snapshot path: %w", err)
 	}
@@ -216,16 +176,16 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, generation string, i
 	return nil
 }
 
-// WALSegments returns an iterator over all available WAL files for a generation.
-func (c *ReplicaClient) WALSegments(ctx context.Context, generation string) (litestream.WALSegmentIterator, error) {
+// WALSegments returns an iterator over all available WAL files.
+func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	dir, err := litestream.WALPath(c.Path, generation)
+	dir, err := litestream.WALPath(c.Path)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal path: %w", err)
 	}
-	return newWALSegmentIterator(generation, c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
+	return newWALSegmentIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
@@ -234,7 +194,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 		return info, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -254,11 +214,10 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
 	return litestream.WALSegmentInfo{
-		Generation: pos.Generation,
-		Index:      pos.Index,
-		Offset:     pos.Offset,
-		Size:       n,
-		CreatedAt:  startTime.UTC(),
+		Index:     pos.Index,
+		Offset:    pos.Offset,
+		Size:      n,
+		CreatedAt: startTime.UTC(),
 	}, nil
 }
 
@@ -269,7 +228,7 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 		return nil, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+	key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
 	}
@@ -294,7 +253,7 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	}
 
 	for _, pos := range a {
-		key, err := litestream.WALSegmentPath(c.Path, pos.Generation, pos.Index, pos.Offset)
+		key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
 		if err != nil {
 			return fmt.Errorf("cannot determine wal segment path: %w", err)
 		}
@@ -309,17 +268,14 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 }
 
 type snapshotIterator struct {
-	generation string
-
 	it   *storage.ObjectIterator
 	info litestream.SnapshotInfo
 	err  error
 }
 
-func newSnapshotIterator(generation string, it *storage.ObjectIterator) *snapshotIterator {
+func newSnapshotIterator(it *storage.ObjectIterator) *snapshotIterator {
 	return &snapshotIterator{
-		generation: generation,
-		it:         it,
+		it: it,
 	}
 }
 
@@ -351,10 +307,9 @@ func (itr *snapshotIterator) Next() bool {
 
 		// Store current snapshot and return.
 		itr.info = litestream.SnapshotInfo{
-			Generation: itr.generation,
-			Index:      index,
-			Size:       attrs.Size,
-			CreatedAt:  attrs.Created.UTC(),
+			Index:     index,
+			Size:      attrs.Size,
+			CreatedAt: attrs.Created.UTC(),
 		}
 		return true
 	}
@@ -365,17 +320,14 @@ func (itr *snapshotIterator) Err() error { return itr.err }
 func (itr *snapshotIterator) Snapshot() litestream.SnapshotInfo { return itr.info }
 
 type walSegmentIterator struct {
-	generation string
-
 	it   *storage.ObjectIterator
 	info litestream.WALSegmentInfo
 	err  error
 }
 
-func newWALSegmentIterator(generation string, it *storage.ObjectIterator) *walSegmentIterator {
+func newWALSegmentIterator(it *storage.ObjectIterator) *walSegmentIterator {
 	return &walSegmentIterator{
-		generation: generation,
-		it:         it,
+		it: it,
 	}
 }
 
@@ -407,11 +359,10 @@ func (itr *walSegmentIterator) Next() bool {
 
 		// Store current snapshot and return.
 		itr.info = litestream.WALSegmentInfo{
-			Generation: itr.generation,
-			Index:      index,
-			Offset:     offset,
-			Size:       attrs.Size,
-			CreatedAt:  attrs.Created.UTC(),
+			Index:     index,
+			Offset:    offset,
+			Size:      attrs.Size,
+			CreatedAt: attrs.Created.UTC(),
 		}
 		return true
 	}
