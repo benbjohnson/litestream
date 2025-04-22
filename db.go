@@ -5,17 +5,14 @@ import (
 	"context"
 	"database/sql"
 	"encoding/binary"
-	"encoding/hex"
 	"errors"
 	"fmt"
 	"hash/crc64"
 	"io"
 	"log/slog"
 	"math"
-	"math/rand"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -35,7 +32,6 @@ const (
 )
 
 // MaxIndex is the maximum possible WAL index.
-// If this index is reached then a new generation will be started.
 const MaxIndex = 0x7FFFFFFF
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -172,45 +168,35 @@ func (db *DB) SetMetaPath(mp string) {
 	db.metaPath = mp
 }
 
-// GenerationNamePath returns the path of the name of the current generation.
-func (db *DB) GenerationNamePath() string {
-	return filepath.Join(db.metaPath, "generation")
-}
-
-// GenerationPath returns the path of a single generation.
-// Panics if generation is blank.
-func (db *DB) GenerationPath(generation string) string {
-	assert(generation != "", "generation name required")
-	return filepath.Join(db.metaPath, "generations", generation)
-}
+// TODO(gen): Refactor to simply be metaPath. Was GenerationPath().
+// func (db *DB) MetaPath2() string {	return db.metaPath}
 
 // ShadowWALDir returns the path of the shadow wal directory.
-// Panics if generation is blank.
-func (db *DB) ShadowWALDir(generation string) string {
-	return filepath.Join(db.GenerationPath(generation), "wal")
+func (db *DB) ShadowWALDir() string {
+	return filepath.Join(db.metaPath, "wal")
 }
 
 // ShadowWALPath returns the path of a single shadow WAL file.
-// Panics if generation is blank or index is negative.
-func (db *DB) ShadowWALPath(generation string, index int) string {
+// Panics if index is negative.
+func (db *DB) ShadowWALPath(index int) string {
 	assert(index >= 0, "shadow wal index cannot be negative")
-	return filepath.Join(db.ShadowWALDir(generation), FormatWALPath(index))
+	return filepath.Join(db.ShadowWALDir(), FormatWALPath(index))
 }
 
-// CurrentShadowWALPath returns the path to the last shadow WAL in a generation.
-func (db *DB) CurrentShadowWALPath(generation string) (string, error) {
-	index, _, err := db.CurrentShadowWALIndex(generation)
+// CurrentShadowWALPath returns the path to the last shadow WAL.
+func (db *DB) CurrentShadowWALPath() (string, error) {
+	index, _, err := db.CurrentShadowWALIndex()
 	if err != nil {
 		return "", err
 	}
-	return db.ShadowWALPath(generation, index), nil
+	return db.ShadowWALPath(index), nil
 }
 
 // CurrentShadowWALIndex returns the current WAL index & total size.
-func (db *DB) CurrentShadowWALIndex(generation string) (index int, size int64, err error) {
-	des, err := os.ReadDir(filepath.Join(db.GenerationPath(generation), "wal"))
+func (db *DB) CurrentShadowWALIndex() (index int, size int64, err error) {
+	des, err := os.ReadDir(filepath.Join(db.metaPath, "wal"))
 	if os.IsNotExist(err) {
-		return 0, 0, nil // no wal files written for generation
+		return 0, 0, nil // no wal files written
 	} else if err != nil {
 		return 0, 0, err
 	}
@@ -257,26 +243,19 @@ func (db *DB) Replica(name string) *Replica {
 
 // Pos returns the current position of the database.
 func (db *DB) Pos() (Pos, error) {
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return Pos{}, err
-	} else if generation == "" {
-		return Pos{}, nil
-	}
-
-	index, _, err := db.CurrentShadowWALIndex(generation)
+	index, _, err := db.CurrentShadowWALIndex()
 	if err != nil {
 		return Pos{}, err
 	}
 
-	fi, err := os.Stat(db.ShadowWALPath(generation, index))
+	fi, err := os.Stat(db.ShadowWALPath(index))
 	if os.IsNotExist(err) {
-		return Pos{Generation: generation, Index: index}, nil
+		return Pos{Index: index}, nil
 	} else if err != nil {
 		return Pos{}, err
 	}
 
-	return Pos{Generation: generation, Index: index, Offset: frameAlign(fi.Size(), db.pageSize)}, nil
+	return Pos{Index: index, Offset: frameAlign(fi.Size(), db.pageSize)}, nil
 }
 
 // Notify returns a channel that closes when the shadow WAL changes.
@@ -332,7 +311,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
-		if e := db.Sync(ctx); e != nil && err == nil {
+		if e := db.Sync(ctx); e != nil {
 			err = e
 		}
 	}
@@ -483,13 +462,11 @@ func (db *DB) init() (err error) {
 
 	// If we have an existing shadow WAL, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		db.Logger.Warn("init: cannot determine last wal position, clearing generation", "error", err)
-		if err := os.Remove(db.GenerationNamePath()); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove generation name: %w", err)
-		}
+		// TODO(gen): Handle header mismatch
+		panic(fmt.Sprintf("init: cannot determine last wal position, clearing generation: %s", err))
 	}
 
-	// Clean up previous generations.
+	// Clean up replicated WAL files.
 	if err := db.clean(); err != nil {
 		return fmt.Errorf("clean: %w", err)
 	}
@@ -504,16 +481,8 @@ func (db *DB) init() (err error) {
 
 // verifyHeadersMatch returns true if the primary WAL and last shadow WAL header match.
 func (db *DB) verifyHeadersMatch() error {
-	// Determine current generation.
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return err
-	} else if generation == "" {
-		return nil
-	}
-
-	// Find current generation & latest shadow WAL.
-	shadowWALPath, err := db.CurrentShadowWALPath(generation)
+	// Find latest shadow WAL.
+	shadowWALPath, err := db.CurrentShadowWALPath()
 	if err != nil {
 		return fmt.Errorf("cannot determine current shadow wal path: %w", err)
 	}
@@ -538,56 +507,17 @@ func (db *DB) verifyHeadersMatch() error {
 	return nil
 }
 
-// clean removes old generations & WAL files.
+// clean removes old WAL files.
 func (db *DB) clean() error {
-	if err := db.cleanGenerations(); err != nil {
-		return err
-	}
 	return db.cleanWAL()
-}
-
-// cleanGenerations removes old generations.
-func (db *DB) cleanGenerations() error {
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return err
-	}
-
-	dir := filepath.Join(db.metaPath, "generations")
-	fis, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	for _, fi := range fis {
-		// Skip the current generation.
-		if filepath.Base(fi.Name()) == generation {
-			continue
-		}
-
-		// Delete all other generations.
-		if err := os.RemoveAll(filepath.Join(dir, fi.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 // cleanWAL removes WAL files that have been replicated.
 func (db *DB) cleanWAL() error {
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return err
-	}
-
 	// Determine lowest index that's been replicated to all replicas.
 	min := -1
 	for _, r := range db.Replicas {
 		pos := r.Pos()
-		if pos.Generation != generation {
-			pos = Pos{} // different generation, reset index to zero
-		}
 		if min == -1 || pos.Index < min {
 			min = pos.Index
 		}
@@ -599,8 +529,8 @@ func (db *DB) cleanWAL() error {
 	}
 	min-- // Keep an extra WAL file.
 
-	// Remove all WAL files for the generation before the lowest index.
-	dir := db.ShadowWALDir(generation)
+	// Remove all WAL files before the lowest index.
+	dir := db.ShadowWALDir()
 	fis, err := os.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return nil
@@ -654,68 +584,6 @@ func (db *DB) releaseReadLock() error {
 	return err
 }
 
-// CurrentGeneration returns the name of the generation saved to the "generation"
-// file in the meta data directory. Returns empty string if none exists.
-func (db *DB) CurrentGeneration() (string, error) {
-	buf, err := os.ReadFile(db.GenerationNamePath())
-	if os.IsNotExist(err) {
-		return "", nil
-	} else if err != nil {
-		return "", err
-	}
-
-	// TODO: Verify if generation directory exists. If not, delete name file.
-
-	generation := strings.TrimSpace(string(buf))
-	if len(generation) != GenerationNameLen {
-		return "", nil
-	}
-	return generation, nil
-}
-
-// createGeneration starts a new generation by creating the generation
-// directory, snapshotting to each replica, and updating the current
-// generation name.
-func (db *DB) createGeneration() (string, error) {
-	// Generate random generation hex name.
-	buf := make([]byte, GenerationNameLen/2)
-	_, _ = rand.New(rand.NewSource(time.Now().UnixNano())).Read(buf)
-	generation := hex.EncodeToString(buf)
-
-	// Generate new directory.
-	dir := filepath.Join(db.metaPath, "generations", generation)
-	if err := internal.MkdirAll(dir, db.dirInfo); err != nil {
-		return "", err
-	}
-
-	// Initialize shadow WAL with copy of header.
-	if _, err := db.initShadowWALFile(db.ShadowWALPath(generation, 0)); err != nil {
-		return "", fmt.Errorf("initialize shadow wal: %w", err)
-	}
-
-	// Atomically write generation name as current generation.
-	generationNamePath := db.GenerationNamePath()
-	mode := os.FileMode(0600)
-	if db.fileInfo != nil {
-		mode = db.fileInfo.Mode()
-	}
-	if err := os.WriteFile(generationNamePath+".tmp", []byte(generation+"\n"), mode); err != nil {
-		return "", fmt.Errorf("write generation temp file: %w", err)
-	}
-	uid, gid := internal.Fileinfo(db.fileInfo)
-	_ = os.Chown(generationNamePath+".tmp", uid, gid)
-	if err := os.Rename(generationNamePath+".tmp", generationNamePath); err != nil {
-		return "", fmt.Errorf("rename generation file: %w", err)
-	}
-
-	// Remove old generations.
-	if err := db.clean(); err != nil {
-		return "", err
-	}
-
-	return generation, nil
-}
-
 // Sync copies pending data from the WAL to the shadow WAL.
 func (db *DB) Sync(ctx context.Context) (err error) {
 	db.mu.Lock()
@@ -745,8 +613,8 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}
 
 	// Verify our last sync matches the current state of the WAL.
-	// This ensures that we have an existing generation & that the last sync
-	// position of the real WAL hasn't been overwritten by another process.
+	// This ensures that the last sync position of the real WAL hasn't
+	// been overwritten by another process.
 	info, err := db.verify()
 	if err != nil {
 		return fmt.Errorf("cannot verify wal state: %w", err)
@@ -758,18 +626,14 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 
 	// If we are unable to verify the WAL state then we start a new generation.
 	if info.reason != "" {
-		// Start new generation & notify user via log message.
-		if info.generation, err = db.createGeneration(); err != nil {
-			return fmt.Errorf("create generation: %w", err)
-		}
-		db.Logger.Info("sync: new generation", "generation", info.generation, "reason", info.reason)
+		// TODO(gen): Handle sync issue that previously restarted generation
+		panic(fmt.Sprintf("unable to verify wal state: %q", info.reason))
 
 		// Clear shadow wal info.
-		info.shadowWALPath = db.ShadowWALPath(info.generation, 0)
+		info.shadowWALPath = db.ShadowWALPath(0)
 		info.shadowWALSize = WALHeaderSize
 		info.restart = false
 		info.reason = ""
-
 	}
 
 	// Synchronize real WAL with current shadow WAL.
@@ -796,7 +660,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	if checkpoint {
 		changed = true
 
-		if err := db.checkpoint(ctx, info.generation, checkpointMode); err != nil {
+		if err := db.checkpoint(ctx, checkpointMode); err != nil {
 			return fmt.Errorf("checkpoint: mode=%v err=%w", checkpointMode, err)
 		}
 	}
@@ -808,7 +672,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 
 	// Compute current index and total shadow WAL size.
 	// This is only for metrics so we ignore any errors that occur.
-	index, size, _ := db.CurrentShadowWALIndex(info.generation)
+	index, size, _ := db.CurrentShadowWALIndex()
 	db.shadowWALIndexGauge.Set(float64(index))
 	db.shadowWALSizeGauge.Set(float64(size))
 
@@ -836,19 +700,9 @@ func (db *DB) ensureWALExists() (err error) {
 }
 
 // verify ensures the current shadow WAL state matches where it left off from
-// the real WAL. Returns generation & WAL sync information. If info.reason is
-// not blank, verification failed and a new generation should be started.
+// the real WAL. Returns WAL sync information. If info.reason is not blank,
+// verification failed.
 func (db *DB) verify() (info syncInfo, err error) {
-	// Look up existing generation.
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return info, fmt.Errorf("cannot find current generation: %w", err)
-	} else if generation == "" {
-		info.reason = "no generation exists"
-		return info, nil
-	}
-	info.generation = generation
-
 	// Determine total bytes of real DB for metrics.
 	fi, err := os.Stat(db.Path())
 	if err != nil {
@@ -867,14 +721,14 @@ func (db *DB) verify() (info syncInfo, err error) {
 	db.walSizeGauge.Set(float64(fi.Size()))
 
 	// Open shadow WAL to copy append to.
-	index, _, err := db.CurrentShadowWALIndex(info.generation)
+	index, _, err := db.CurrentShadowWALIndex()
 	if err != nil {
 		return info, fmt.Errorf("cannot determine shadow WAL index: %w", err)
 	} else if index >= MaxIndex {
 		info.reason = "max index exceeded"
 		return info, nil
 	}
-	info.shadowWALPath = db.ShadowWALPath(generation, index)
+	info.shadowWALPath = db.ShadowWALPath(index)
 
 	// Determine shadow WAL current size.
 	fi, err = os.Stat(info.shadowWALPath)
@@ -909,7 +763,6 @@ func (db *DB) verify() (info syncInfo, err error) {
 	}
 
 	// If we only have a header then ensure header matches.
-	// Otherwise we need to start a new generation.
 	if info.shadowWALSize == WALHeaderSize && info.restart {
 		info.reason = "wal header only, mismatched"
 		return info, nil
@@ -932,7 +785,6 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 type syncInfo struct {
-	generation    string    // generation name
 	dbModTime     time.Time // last modified date of real DB file
 	walSize       int64     // size of real WAL file
 	walModTime    time.Time // last modified date of real WAL file
@@ -1183,7 +1035,7 @@ func (db *DB) ShadowWALReader(pos Pos) (r *ShadowWALReader, err error) {
 
 // shadowWALReader opens a file reader for a shadow WAL file at a given position.
 func (db *DB) shadowWALReader(pos Pos) (r *ShadowWALReader, err error) {
-	filename := db.ShadowWALPath(pos.Generation, pos.Index)
+	filename := db.ShadowWALPath(pos.Index)
 
 	f, err := os.Open(filename)
 	if err != nil {
@@ -1299,24 +1151,19 @@ func readLastChecksumFrom(f *os.File, pageSize int) (uint32, uint32, error) {
 func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return fmt.Errorf("cannot determine generation: %w", err)
-	}
-	return db.checkpoint(ctx, generation, mode)
+	return db.checkpoint(ctx, mode)
 }
 
 // checkpoint performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
-func (db *DB) checkpoint(ctx context.Context, generation, mode string) error {
+func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	// Try getting a checkpoint lock, will fail during snapshots.
 	if !db.chkMu.TryLock() {
 		return nil
 	}
 	defer db.chkMu.Unlock()
 
-	shadowWALPath, err := db.CurrentShadowWALPath(generation)
+	shadowWALPath, err := db.CurrentShadowWALPath()
 	if err != nil {
 		return err
 	}
@@ -1452,12 +1299,11 @@ func (db *DB) monitor() {
 	}
 }
 
-// CalcRestoreTarget returns a replica & generation to restore from based on opt criteria.
-func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Replica, string, error) {
+// CalcRestoreTarget returns a replica to restore from based on opt criteria.
+func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Replica, error) {
 	var target struct {
-		replica    *Replica
-		generation string
-		updatedAt  time.Time
+		replica   *Replica
+		updatedAt time.Time
 	}
 
 	for _, r := range db.Replicas {
@@ -1466,9 +1312,9 @@ func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Repli
 			continue
 		}
 
-		generation, updatedAt, err := r.CalcRestoreTarget(ctx, opt)
+		updatedAt, err := r.CalcRestoreTarget(ctx, opt)
 		if err != nil {
-			return nil, "", err
+			return nil, err
 		}
 
 		// Use the latest replica if we have multiple candidates.
@@ -1476,13 +1322,13 @@ func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Repli
 			continue
 		}
 
-		target.replica, target.generation, target.updatedAt = r, generation, updatedAt
+		target.replica, target.updatedAt = r, updatedAt
 	}
-	return target.replica, target.generation, nil
+	return target.replica, nil
 }
 
 // applyWAL performs a truncating checkpoint on the given database.
-func applyWAL(ctx context.Context, index int, dbPath string) error {
+func applyWAL(_ context.Context, index int, dbPath string) error {
 	// Copy WAL file from it's staging path to the correct "-wal" location.
 	if err := os.Rename(fmt.Sprintf("%s-%08x-wal", dbPath, index), dbPath+"-wal"); err != nil {
 		return err
@@ -1521,15 +1367,8 @@ func (db *DB) CRC64(ctx context.Context) (uint64, Pos, error) {
 		return 0, Pos{}, os.ErrNotExist
 	}
 
-	generation, err := db.CurrentGeneration()
-	if err != nil {
-		return 0, Pos{}, fmt.Errorf("cannot find current generation: %w", err)
-	} else if generation == "" {
-		return 0, Pos{}, fmt.Errorf("no current generation")
-	}
-
 	// Force a RESTART checkpoint to ensure the database is at the start of the WAL.
-	if err := db.checkpoint(ctx, generation, CheckpointModeRestart); err != nil {
+	if err := db.checkpoint(ctx, CheckpointModeRestart); err != nil {
 		return 0, Pos{}, err
 	}
 
@@ -1576,10 +1415,6 @@ type RestoreOptions struct {
 	// Specific replica to restore from.
 	// If blank, all replicas are considered.
 	ReplicaName string
-
-	// Specific generation to restore from.
-	// If blank, all generations considered.
-	Generation string
 
 	// Specific index to restore from.
 	// Set to math.MaxInt32 to ignore index.
