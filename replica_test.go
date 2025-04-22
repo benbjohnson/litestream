@@ -15,8 +15,7 @@ import (
 
 func nextIndex(pos litestream.Pos) litestream.Pos {
 	return litestream.Pos{
-		Generation: pos.Generation,
-		Index:      pos.Index + 1,
+		Index: pos.Index + 1,
 	}
 }
 
@@ -39,7 +38,7 @@ func TestReplica_Sync(t *testing.T) {
 	db, sqldb := MustOpenDBs(t)
 	defer MustCloseDBs(t, db, sqldb)
 
-	// Issue initial database sync to setup generation.
+	// Issue initial database sync.
 	if err := db.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
@@ -56,16 +55,6 @@ func TestReplica_Sync(t *testing.T) {
 
 	if err := r.Sync(context.Background()); err != nil {
 		t.Fatal(err)
-	}
-
-	// Verify client generation matches database.
-	generations, err := c.Generations(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	} else if got, want := len(generations), 1; got != want {
-		t.Fatalf("len(generations)=%v, want %v", got, want)
-	} else if got, want := generations[0], dpos.Generation; got != want {
-		t.Fatalf("generations[0]=%v, want %v", got, want)
 	}
 
 	// Verify we synced checkpoint page to WAL.

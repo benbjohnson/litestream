@@ -24,7 +24,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
-	fs.StringVar(&opt.Generation, "generation", "", "generation name")
 	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
@@ -46,7 +45,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	// Determine replica & generation to restore from.
+	// Determine replica to restore from.
 	var r *litestream.Replica
 	if isURL(fs.Arg(0)) {
 		if *configPath != "" {
@@ -72,13 +71,11 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Return an error if no matching targets found.
 	// If optional flag set, return success. Useful for automated recovery.
-	if opt.Generation == "" {
-		if *ifReplicaExists {
-			slog.Info("no matching backups found")
-			return nil
-		}
-		return fmt.Errorf("no matching backups found")
+	if *ifReplicaExists {
+		slog.Info("no matching backups found")
+		return nil
 	}
+	return fmt.Errorf("no matching backups found")
 
 	return r.Restore(ctx, opt)
 }
@@ -102,7 +99,7 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	if err != nil {
 		return nil, err
 	}
-	opt.Generation, _, err = r.CalcRestoreTarget(ctx, *opt)
+	_, err = r.CalcRestoreTarget(ctx, *opt)
 	return r, err
 }
 
@@ -137,12 +134,11 @@ func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath 
 		return nil, errSkipDBExists
 	}
 
-	// Determine the appropriate replica & generation to restore from,
-	r, generation, err := db.CalcRestoreTarget(ctx, *opt)
+	// Determine the appropriate replica to restore from,
+	r, err := db.CalcRestoreTarget(ctx, *opt)
 	if err != nil {
 		return nil, err
 	}
-	opt.Generation = generation
 
 	return r, nil
 }
@@ -170,10 +166,6 @@ Arguments:
 	-replica NAME
 	    Restore from a specific replica.
 	    Defaults to replica with latest data.
-
-	-generation NAME
-	    Restore from a specific generation.
-	    Defaults to generation with latest data.
 
 	-index NUM
 	    Restore up to a specific hex-encoded WAL index (inclusive).
@@ -209,11 +201,8 @@ Examples:
 	# Restore latest replica for database to new /tmp directory
 	$ litestream restore -o /tmp/db /path/to/db
 
-	# Restore database from latest generation on S3.
+	# Restore database from S3.
 	$ litestream restore -replica s3 /path/to/db
-
-	# Restore database from specific generation on S3.
-	$ litestream restore -replica s3 -generation xxxxxxxx /path/to/db
 
 `[1:],
 		DefaultConfigPath(),
