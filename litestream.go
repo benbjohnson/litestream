@@ -41,6 +41,12 @@ var (
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
+// SQLite WAL constants
+const (
+	WALHeaderChecksumOffset      = 24
+	WALFrameHeaderChecksumOffset = 16
+)
+
 var (
 	// LogWriter is the destination writer for all logging.
 	LogWriter = os.Stdout

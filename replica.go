@@ -19,6 +19,7 @@ import (
 	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -37,7 +38,7 @@ type Replica struct {
 	name string
 
 	mu  sync.RWMutex
-	pos Pos // current replicated position
+	pos ltx.Pos // current replicated position
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -50,9 +51,6 @@ type Replica struct {
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
-
-	// Frequency to create new snapshots.
-	SnapshotInterval time.Duration
 
 	// Time to keep snapshots and related WAL files.
 	// Database is snapshotted after interval, if needed, and older WAL files are discarded.
@@ -122,10 +120,9 @@ func (r *Replica) Start(ctx context.Context) error {
 	ctx, r.cancel = context.WithCancel(ctx)
 
 	// Start goroutine to replicate data.
-	r.wg.Add(4)
+	r.wg.Add(3)
 	go func() { defer r.wg.Done(); r.monitor(ctx) }()
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
-	go func() { defer r.wg.Done(); r.snapshotter(ctx) }()
 	go func() { defer r.wg.Done(); r.validator(ctx) }()
 
 	return nil
@@ -156,7 +153,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	defer func() {
 		if err != nil {
 			r.mu.Lock()
-			r.pos = Pos{}
+			r.pos = ltx.Pos{}
 			r.mu.Unlock()
 		}
 	}()
@@ -338,109 +335,56 @@ func (r *Replica) syncWAL(ctx context.Context) (err error) {
 	return nil
 }
 
-// snapshotN returns the number of snapshots.
-func (r *Replica) snapshotN(ctx context.Context) (int, error) {
-	itr, err := r.Client.Snapshots(ctx)
+// calcPos returns the last position saved to the replica.
+func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
+	// Determine last LTX file saved.
+	minTXID, maxTXID, err := r.maxLTXFile(ctx, 0)
 	if err != nil {
-		return 0, err
-	}
-	defer itr.Close()
-
-	var n int
-	for itr.Next() {
-		n++
-	}
-	return n, itr.Close()
-}
-
-// calcPos returns the last position for the given generation.
-func (r *Replica) calcPos(ctx context.Context) (pos Pos, err error) {
-	// Fetch last snapshot. Return error if no snapshots exist.
-	snapshot, err := r.maxSnapshot(ctx)
-	if err != nil {
-		return pos, fmt.Errorf("max snapshot: %w", err)
-	} else if snapshot == nil {
-		return pos, fmt.Errorf("no snapshot available")
-	}
-
-	// Determine last WAL segment available. Use snapshot if none exist.
-	segment, err := r.maxWALSegment(ctx)
-	if err != nil {
-		return pos, fmt.Errorf("max wal segment: %w", err)
-	} else if segment == nil {
-		return Pos{Index: snapshot.Index}, nil
+		return pos, fmt.Errorf("max ltx file: %w", err)
+	} else if maxTXID == nil {
+		return ltx.Pos{}, nil
 	}
 
 	// Read segment to determine size to add to offset.
-	rd, err := r.Client.WALSegmentReader(ctx, segment.Pos())
+	f, err := r.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID)
 	if err != nil {
-		return pos, fmt.Errorf("wal segment reader: %w", err)
+		return pos, fmt.Errorf("open ltx file: %w", err)
 	}
-	defer rd.Close()
+	defer f.Close()
 
-	if len(r.AgeIdentities) > 0 {
-		drd, err := age.Decrypt(rd, r.AgeIdentities...)
-		if err != nil {
-			return pos, err
-		}
-
-		rd = io.NopCloser(drd)
+	dec := ltx.NewDecoder(f)
+	if err := dec.Verify(); err != nil {
+		return ltx.Pos{}, fmt.Errorf("verify ltx file: %w", err)
 	}
 
-	n, err := io.Copy(io.Discard, lz4.NewReader(rd))
-	if err != nil {
-		return pos, err
-	}
-
-	// Return the position at the end of the last WAL segment.
-	return Pos{
-		Index:  segment.Index,
-		Offset: segment.Offset + n,
-	}, nil
+	return dec.PostApplyPos(), nil
 }
 
-// maxSnapshot returns the last snapshot.
-func (r *Replica) maxSnapshot(ctx context.Context) (*SnapshotInfo, error) {
-	itr, err := r.Client.Snapshots(ctx)
+// maxLTXFile returns the min & max TXID of the last LTX file for a given level.
+func (r *Replica) maxWALSegment(ctx context.Context, level int) (minTXID, maxTXID ltx.TXID, err error) {
+	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
-		return nil, err
+		return 0, 0, err
 	}
 	defer itr.Close()
 
-	var max *SnapshotInfo
 	for itr.Next() {
-		if info := itr.Snapshot(); max == nil || info.Index > max.Index {
-			max = &info
+		if itr.MaxTXID() > maxTXID {
+			minTXID, maxTXID = itr.MinTXID(), itr.MaxTXID()
 		}
 	}
-	return max, itr.Close()
-}
-
-// maxWALSegment returns the highest WAL segment.
-func (r *Replica) maxWALSegment(ctx context.Context) (*WALSegmentInfo, error) {
-	itr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	var max *WALSegmentInfo
-	for itr.Next() {
-		if info := itr.WALSegment(); max == nil || info.Index > max.Index || (info.Index == max.Index && info.Offset > max.Offset) {
-			max = &info
-		}
-	}
-	return max, itr.Close()
+	return minTXID, maxTXID, itr.Close()
 }
 
 // Pos returns the current replicated position.
 // Returns a zero value if the current position cannot be determined.
-func (r *Replica) Pos() Pos {
+func (r *Replica) Pos() ltx.Pos {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.pos
 }
 
+/*
 // Snapshots returns a list of all snapshots.
 func (r *Replica) Snapshots(ctx context.Context) ([]SnapshotInfo, error) {
 	var a []SnapshotInfo
@@ -563,59 +507,42 @@ func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
 	logger.Info("snapshot written", "position", pos.String(), "elapsed", time.Since(startTime).String(), "sz", info.Size)
 	return info, nil
 }
+*/
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
 // Older snapshots and WAL files are then removed.
 func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
-	// Obtain list of snapshots that are within the retention period.
-	snapshots, err := r.Snapshots(ctx)
-	if err != nil {
-		return fmt.Errorf("snapshots: %w", err)
-	}
-	retained := FilterSnapshotsAfter(snapshots, time.Now().Add(-r.Retention))
+	panic("TODO(ltx): Re-implement after multi-level compaction")
 
-	// If no retained snapshots exist, create a new snapshot.
-	if len(retained) == 0 {
-		snapshot, err := r.Snapshot(ctx)
+	/*
+		// Obtain list of snapshots that are within the retention period.
+		snapshots, err := r.Snapshots(ctx)
 		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
+			return fmt.Errorf("snapshots: %w", err)
 		}
-		retained = append(retained, snapshot)
-	}
+		retained := FilterSnapshotsAfter(snapshots, time.Now().Add(-r.Retention))
 
-	// Delete unretained snapshots & WAL files.
-	snapshot := FindMinSnapshot(retained)
-
-	// Otherwise remove all earlier snapshots & WAL segments.
-	if err := r.deleteSnapshotsBeforeIndex(ctx, snapshot.Index); err != nil {
-		return fmt.Errorf("delete snapshots before index: %w", err)
-	} else if err := r.deleteWALSegmentsBeforeIndex(ctx, snapshot.Index); err != nil {
-		return fmt.Errorf("delete wal segments before index: %w", err)
-	}
-
-	return nil
-}
-
-func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, index int) error {
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return fmt.Errorf("fetch snapshots: %w", err)
-	}
-	defer itr.Close()
-
-	for itr.Next() {
-		info := itr.Snapshot()
-		if info.Index >= index {
-			continue
+		// If no retained snapshots exist, create a new snapshot.
+		if len(retained) == 0 {
+			snapshot, err := r.Snapshot(ctx)
+			if err != nil {
+				return fmt.Errorf("snapshot: %w", err)
+			}
+			retained = append(retained, snapshot)
 		}
 
-		if err := r.Client.DeleteSnapshot(ctx, info.Index); err != nil {
-			return fmt.Errorf("delete snapshot %08x: %w", info.Index, err)
-		}
-		r.Logger().Info("snapshot deleted", "index", index)
-	}
+		// Delete unretained snapshots & WAL files.
+		snapshot := FindMinSnapshot(retained)
 
-	return itr.Close()
+		// Otherwise remove all earlier snapshots & WAL segments.
+		if err := r.deleteSnapshotsBeforeIndex(ctx, snapshot.Index); err != nil {
+			return fmt.Errorf("delete snapshots before index: %w", err)
+		} else if err := r.deleteWALSegmentsBeforeIndex(ctx, snapshot.Index); err != nil {
+			return fmt.Errorf("delete wal segments before index: %w", err)
+		}
+
+		return nil
+	*/
 }
 
 func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, index int) error {

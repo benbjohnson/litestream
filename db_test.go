@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/superfly/ltx"
 )
 
 func TestDB_Path(t *testing.T) {
@@ -53,54 +54,6 @@ func TestDB_ShadowWALPath(t *testing.T) {
 	if got, want := db.ShadowWALPath(1000), `/tmp/.db-litestream/wal/000003e8.wal`; got != want {
 		t.Fatalf("ShadowWALPath()=%v, want %v", got, want)
 	}
-}
-
-// Ensure we can check the last modified time of the real database and its WAL.
-func TestDB_UpdatedAt(t *testing.T) {
-	t.Run("ErrNotExist", func(t *testing.T) {
-		db := MustOpenDB(t)
-		defer MustCloseDB(t, db)
-		if _, err := db.UpdatedAt(); !os.IsNotExist(err) {
-			t.Fatalf("unexpected error: %#v", err)
-		}
-	})
-
-	t.Run("DB", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-
-		if t0, err := db.UpdatedAt(); err != nil {
-			t.Fatal(err)
-		} else if time.Since(t0) > 10*time.Second {
-			t.Fatalf("unexpected updated at time: %s", t0)
-		}
-	})
-
-	t.Run("WAL", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-
-		t0, err := db.UpdatedAt()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		sleepTime := 100 * time.Millisecond
-		if os.Getenv("CI") != "" {
-			sleepTime = 1 * time.Second
-		}
-		time.Sleep(sleepTime)
-
-		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
-			t.Fatal(err)
-		}
-
-		if t1, err := db.UpdatedAt(); err != nil {
-			t.Fatal(err)
-		} else if !t1.After(t0) {
-			t.Fatalf("expected newer updated at time: %s > %s", t1, t0)
-		}
-	})
 }
 
 // Ensure we can compute a checksum on the real database.
@@ -571,7 +524,7 @@ func TestDB_Sync(t *testing.T) {
 		// Ensure position is now on the second index.
 		if pos, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos.Index, 1; got != want {
+		} else if got, want := pos.TXID, ltx.TXID(1); got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
 	})
