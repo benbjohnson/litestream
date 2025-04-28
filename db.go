@@ -652,10 +652,12 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}
 
 	// Compute current index and total shadow WAL size.
-	// This is only for metrics so we ignore any errors that occur.
-	index, size, _ := db.CurrentShadowWALIndex()
-	db.shadowWALIndexGauge.Set(float64(index))
-	db.shadowWALSizeGauge.Set(float64(size))
+	pos, err := db.Pos()
+	if err != nil {
+		return fmt.Errorf("pos: %w", err)
+	}
+	db.txIDGauge.Set(float64(pos.TXID))
+	// db.shadowWALSizeGauge.Set(float64(size))
 
 	// Notify replicas of WAL changes.
 	if changed {
@@ -680,7 +682,7 @@ func (db *DB) ensureWALExists() (err error) {
 	return err
 }
 
-// verify ensures the current shadow WAL state matches where it left off from
+// verify ensures the current LTX state matches where it left off from
 // the real WAL. Returns WAL sync information. If info.reason is not blank,
 // verification failed.
 func (db *DB) verify() (info syncInfo, err error) {
@@ -722,11 +724,11 @@ func (db *DB) verify() (info syncInfo, err error) {
 	if err := dec.DecodeHeader(); err != nil {
 		return info, fmt.Errorf("deocde ltx file: %w", err)
 	}
-	info.shadowWALSize = dec.Header().WALSize
+	info.ltxWALSize = dec.Header().WALSize
 
-	// If shadow WAL is larger than real WAL then the WAL has been truncated
+	// If LTX WAL offset is larger than real WAL then the WAL has been truncated
 	// so we cannot determine our last state.
-	if info.shadowWALSize > info.walSize {
+	if info.ltxWALSize > info.walSize {
 		info.reason = "wal truncated by another process"
 		return info, nil
 	}
@@ -744,14 +746,14 @@ func (db *DB) verify() (info syncInfo, err error) {
 	}
 
 	// If we only have a header then ensure header matches.
-	if /*info.shadowWALSize == WALHeaderSize &&*/ info.restart {
+	if /*info.ltxWALSize == WALHeaderSize &&*/ info.restart {
 		info.reason = "wal header only, mismatched"
 		return info, nil
 	}
 
 	// Verify last page exists in latest LTX file.
-	/*if info.shadowWALSize > WALHeaderSize {*/
-	/*offset := info.shadowWALSize - int64(db.pageSize+WALFrameHeaderSize)*/
+	/*if info.ltxWALSize > WALHeaderSize {*/
+	/*offset := info.ltxWALSize - int64(db.pageSize+WALFrameHeaderSize)*/
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	buf, err := readWALFileAt(db.WALPath(), dec.Header().WALSize-frameSize, frameSize)
 	if err != nil {
@@ -784,82 +786,93 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 type syncInfo struct {
-	dbModTime     time.Time // last modified date of real DB file
-	walSize       int64     // size of real WAL file
-	walModTime    time.Time // last modified date of real WAL file
-	shadowWALPath string    // name of last shadow WAL file
-	shadowWALSize int64     // size of last shadow WAL file
-	restart       bool      // if true, real WAL header does not match shadow WAL
-	reason        string    // if non-blank, reason for sync failure
+	dbModTime  time.Time // last modified date of real DB file
+	walSize    int64     // size of real WAL file
+	walModTime time.Time // last modified date of real WAL file
+	ltxPath    string    // name of latest LTX file
+	ltxWALSize int64     // WAL offset from latest LTX file
+	restart    bool      // if true, real WAL salt does not match LTX
+	reason     string    // if non-blank, reason for sync failure
 }
 
 // syncWAL copies pending bytes from the real WAL to LTX.
 func (db *DB) syncWAL(info syncInfo) (origSize int64, newSize int64, err error) {
-	// Copy WAL starting from end of latest LTX. Exit if no new shadow WAL needed.
-	origSize, newSize, err = db.copyToLTX(info.ltxPath)
+	// TODO: Read WAL transactions since last LTX offset.
+	// TODO: Check if the beginning has
+
+	filename := db.LTXPath(0, info.txid, info.txid)
+	logger := db.Logger.With("filename", filename)
+	logger.Debug("syncWAL")
+
+	walFile, err := os.Open(db.WALPath())
 	if err != nil {
-		return origSize, newSize, fmt.Errorf("cannot copy to ltx: %w", err)
-	} else if !info.restart {
-		return origSize, newSize, nil // If no restart required, exit.
+		return 0, 0, err
 	}
+	defer walFile.Close()
 
-	// Parse TXID of current LTX file.
-	dir, base := filepath.Split(info.shadowWALPath)
-	mihx, err := ltx.ParseFilename(base)
+	fi, err := walFile.Stat()
 	if err != nil {
-		return 0, 0, fmt.Errorf("cannot parse shadow wal filename: %s", base)
+		return 0, 0, err
 	}
+	origWALSize = frameAlign(fi.Size(), db.pageSize)
 
-	// Start a new shadow WAL file with next index.
-	newShadowWALPath := filepath.Join(dir, FormatWALPath(index+1))
-	newSize, err = db.initShadowWALFile(newShadowWALPath)
+	rd := NewWALReader(walFile)
+	if err := rd.ReadHeader(); err != nil {
+		return 0, 0, fmt.Errorf("read wal header: %w", err)
+	}
+	pageMap, sz, commit, err := rd.PageMap()
 	if err != nil {
-		return 0, 0, fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
-	}
-	return origSize, newSize, nil
-}
-
-func (db *DB) initShadowWALFile(filename string) (int64, error) {
-	hdr, err := readWALHeader(db.WALPath())
-	if err != nil {
-		return 0, fmt.Errorf("read header: %w", err)
+		return 0, 0, fmt.Errorf("page map: %w", err)
 	}
 
-	// Determine byte order for checksumming from header magic.
-	bo, err := headerByteOrder(hdr)
-	if err != nil {
-		return 0, err
-	}
-
-	// Verify checksum.
-	s0 := binary.BigEndian.Uint32(hdr[24:])
-	s1 := binary.BigEndian.Uint32(hdr[28:])
-	if v0, v1 := Checksum(bo, 0, 0, hdr[:24]); v0 != s0 || v1 != s1 {
-		return 0, fmt.Errorf("invalid header checksum: (%x,%x) != (%x,%x)", v0, v1, s0, s1)
-	}
-
-	// Write header to new WAL shadow file.
 	mode := os.FileMode(0600)
 	if fi := db.fileInfo; fi != nil {
 		mode = fi.Mode()
 	}
-	if err := internal.MkdirAll(filepath.Dir(filename), db.dirInfo); err != nil {
-		return 0, err
-	} else if err := os.WriteFile(filename, hdr, mode); err != nil {
-		return 0, err
+
+	tmpFilename := filename + ".tmp"
+	w, err := os.OpenFile(tmpFilename, os.O_RDWR, mode)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer func() { _ = os.Remove(tmpFilename) }()
+	defer func() { _ = w.Close() }()
+
+	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
+		return 0, 0, err
 	}
 	uid, gid := internal.Fileinfo(db.fileInfo)
-	_ = os.Chown(filename, uid, gid)
+	_ = os.Chown(tmpFilename, uid, gid)
 
-	// Copy as much shadow WAL as available.
-	_, newSize, err := db.copyToShadowWAL(filename)
-	if err != nil {
-		return 0, fmt.Errorf("cannot copy to new shadow wal: %w", err)
+	enc := ltx.NewEncoder(w)
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4,
+		PageSize:  pageSize,
+		Commit:    commit,
+		MinTXID:   info.txid,
+		MaxTXID:   info.txid,
+		Timestamp: time.Now().UnixMilli(),
+		WALOffset: info.walOffset,
+		WALSize:   sz,
+		WALSalt1:  rd.salt1,
+		WALSalt2:  rd.salt2,
+	}); err != nil {
+		return 0, 0, fmt.Errorf("encode ltx header: %w", err)
 	}
-	return newSize, nil
+
+	data := make([]byte, pageSize)
+	for {
+		// TODO: Read source page using page map
+		// TODO: Write page to LTX file.
+	}
+
+	// TODO: Sync & close LTX file, atomically write to final destination.
+
+	return origSize, newSize, nil
 }
 
-func (db *DB) copyToShadowWAL(filename string) (origWalSize int64, newSize int64, err error) {
+func (db *DB) copyToLTX(filename string) (origWalSize int64, newSize int64, err error) {
 	logger := db.Logger.With("filename", filename)
 	logger.Debug("copy-shadow")
 
@@ -887,13 +900,19 @@ func (db *DB) copyToShadowWAL(filename string) (origWalSize int64, newSize int64
 	}
 	origSize := frameAlign(fi.Size(), db.pageSize)
 
-	// Read shadow WAL header to determine byte order for checksum & salt.
-	hdr := make([]byte, WALHeaderSize)
-	if _, err := io.ReadFull(w, hdr); err != nil {
-		return 0, 0, fmt.Errorf("read header: %w", err)
-	}
-	hsalt0 := binary.BigEndian.Uint32(hdr[16:])
-	hsalt1 := binary.BigEndian.Uint32(hdr[20:])
+	// TODO(ltx): Read salt & offset from previous LTX file.
+	// TODO(ltx): If there is another transaction to read, continue reading.
+	// TODO(ltx): If are no additional transactions, check if salt has changed at beginning and read transactions from there.
+
+	// Read LTX salt to determine byte order for checksum & salt.
+	/*
+		hdr := make([]byte, WALHeaderSize)
+		if _, err := io.ReadFull(w, hdr); err != nil {
+			return 0, 0, fmt.Errorf("read header: %w", err)
+		}
+		hsalt0 := binary.BigEndian.Uint32(hdr[16:])
+		hsalt1 := binary.BigEndian.Uint32(hdr[20:])
+	*/
 
 	bo, err := headerByteOrder(hdr)
 	if err != nil {
@@ -906,7 +925,7 @@ func (db *DB) copyToShadowWAL(filename string) (origWalSize int64, newSize int64
 		return 0, 0, fmt.Errorf("last checksum: %w", err)
 	}
 
-	// Write to a temporary shadow file.
+	// Write to a temporary LTX file.
 	tempFilename := filename + ".tmp"
 	defer os.Remove(tempFilename)
 
@@ -919,9 +938,10 @@ func (db *DB) copyToShadowWAL(filename string) (origWalSize int64, newSize int64
 	// Seek to correct position on real wal.
 	if _, err := r.Seek(origSize, io.SeekStart); err != nil {
 		return 0, 0, fmt.Errorf("real wal seek: %w", err)
-	} else if _, err := w.Seek(origSize, io.SeekStart); err != nil {
-		return 0, 0, fmt.Errorf("shadow wal seek: %w", err)
 	}
+	//else if _, err := w.Seek(origSize, io.SeekStart); err != nil {
+	//	return 0, 0, fmt.Errorf("shadow wal seek: %w", err)
+	//}
 
 	// Read through WAL from last position to find the page of the last
 	// committed transaction.
