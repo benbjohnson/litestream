@@ -136,12 +136,12 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 
 	// Fetch bucket location, if possible. Must be bucket owner.
 	// This call can return a nil location which means it's in us-east-1.
-	if out, err := s3.New(sess).HeadBucketWithContext(ctx, &s3.HeadBucketInput{
+	if out, err := s3.New(sess).GetBucketLocation(&s3.GetBucketLocationInput{
 		Bucket: aws.String(bucket),
 	}); err != nil {
 		return "", err
-	} else if out.BucketRegion != nil {
-		return *out.BucketRegion, nil
+	} else if out.LocationConstraint != nil {
+		return *out.LocationConstraint, nil
 	}
 	return DefaultRegion, nil
 }
