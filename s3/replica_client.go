@@ -289,7 +289,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
 }
 
 // WALSegments returns an iterator over all available WAL files.
-func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
+func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.LTXFileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -297,7 +297,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentI
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.LTXFileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -320,7 +320,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
-	return litestream.WALSegmentInfo{
+	return litestream.LTXFileInfo{
 		Index:     pos.Index,
 		Offset:    pos.Offset,
 		Size:      rc.N(),
@@ -499,19 +499,19 @@ func (itr *snapshotIterator) Snapshot() litestream.SnapshotInfo {
 type walSegmentIterator struct {
 	client *ReplicaClient
 
-	ch     chan litestream.WALSegmentInfo
+	ch     chan litestream.LTXFileInfo
 	g      errgroup.Group
 	ctx    context.Context
 	cancel func()
 
-	info litestream.WALSegmentInfo
+	info litestream.LTXFileInfo
 	err  error
 }
 
 func newWALSegmentIterator(ctx context.Context, client *ReplicaClient) *walSegmentIterator {
 	itr := &walSegmentIterator{
 		client: client,
-		ch:     make(chan litestream.WALSegmentInfo),
+		ch:     make(chan litestream.LTXFileInfo),
 	}
 
 	itr.ctx, itr.cancel = context.WithCancel(ctx)
@@ -543,7 +543,7 @@ func (itr *walSegmentIterator) fetch() error {
 				continue
 			}
 
-			info := litestream.WALSegmentInfo{
+			info := litestream.LTXFileInfo{
 				Index:     index,
 				Offset:    offset,
 				Size:      aws.Int64Value(obj.Size),
@@ -594,7 +594,7 @@ func (itr *walSegmentIterator) Next() bool {
 
 func (itr *walSegmentIterator) Err() error { return itr.err }
 
-func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
+func (itr *walSegmentIterator) WALSegment() litestream.LTXFileInfo {
 	return itr.info
 }
 

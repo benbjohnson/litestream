@@ -177,7 +177,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
 }
 
 // WALSegments returns an iterator over all available WAL files.
-func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
+func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.LTXFileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -189,7 +189,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentI
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.LTXFileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -213,7 +213,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	return litestream.WALSegmentInfo{
+	return litestream.LTXFileInfo{
 		Index:     pos.Index,
 		Offset:    pos.Offset,
 		Size:      n,
@@ -321,7 +321,7 @@ func (itr *snapshotIterator) Snapshot() litestream.SnapshotInfo { return itr.inf
 
 type walSegmentIterator struct {
 	it   *storage.ObjectIterator
-	info litestream.WALSegmentInfo
+	info litestream.LTXFileInfo
 	err  error
 }
 
@@ -358,7 +358,7 @@ func (itr *walSegmentIterator) Next() bool {
 		}
 
 		// Store current snapshot and return.
-		itr.info = litestream.WALSegmentInfo{
+		itr.info = litestream.LTXFileInfo{
 			Index:     index,
 			Offset:    offset,
 			Size:      attrs.Size,
@@ -370,7 +370,7 @@ func (itr *walSegmentIterator) Next() bool {
 
 func (itr *walSegmentIterator) Err() error { return itr.err }
 
-func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
+func (itr *walSegmentIterator) WALSegment() litestream.LTXFileInfo {
 	return itr.info
 }
 

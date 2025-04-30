@@ -145,17 +145,19 @@ func (r *WALReader) ReadFrame(data []byte) (pgno, commit uint32, err error) {
 
 // PageMap reads all committed frames until the end of the file and returns a
 // map of pgno to offset of the latest version of each page. Also returns the
-// final database size, in pages.
-func (r *WALReader) PageMap() (m map[uint32]int64, commit uint32, err error) {
+// size of the wal segment read, and the final database size, in pages.
+func (r *WALReader) PageMap() (m map[uint32]int64, size int64, commit uint32, err error) {
+	startOffset := r.Offset()
+
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
 	for {
 		pgno, fcommit, err := r.ReadFrame(data)
 		if err == io.EOF {
-			return m, commit, nil
+			return nil, 0, 0, nil
 		} else if err != nil {
-			return m, commit, err
+			return m, r.Offset() - startOffset, commit, err
 		}
 
 		// Update latest offset for the page for this transaction.

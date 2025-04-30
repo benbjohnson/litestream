@@ -2,7 +2,6 @@ package litestream
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"hash/crc64"
 	"io"
@@ -210,158 +209,155 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 }
 
 func (r *Replica) syncWAL(ctx context.Context) (err error) {
-	rd, err := r.db.ShadowWALReader(r.Pos())
-	if err == io.EOF {
-		return err
-	} else if err != nil {
-		return fmt.Errorf("replica wal reader: %w", err)
-	}
-	defer rd.Close()
+	panic("TODO(ltx): Implement syncWAL")
 
-	// Copy shadow WAL to client write via io.Pipe().
-	pr, pw := io.Pipe()
-	defer func() { _ = pw.CloseWithError(err) }()
-
-	// Obtain initial position from shadow reader.
-	// It may have moved to the next index if previous position was at the end.
-	pos := rd.Pos()
-	initialPos := pos
-	startTime := time.Now()
-	var bytesWritten int
-
-	logger := r.Logger()
-	logger.Info("write wal segment", "position", initialPos.String())
-
-	// Copy through pipe into client from the starting position.
-	var g errgroup.Group
-	g.Go(func() error {
-		_, err := r.Client.WriteWALSegment(ctx, pos, pr)
-
-		// Always close pipe reader to signal writers.
-		if e := pr.CloseWithError(err); err == nil {
-			return e
-		}
-
-		return err
-	})
-
-	var ew io.WriteCloser = pw
-
-	// Add encryption if we have recipients.
-	if len(r.AgeRecipients) > 0 {
-		var err error
-		ew, err = age.Encrypt(pw, r.AgeRecipients...)
-		if err != nil {
+	/*
+		rd, err := r.db.ShadowWALReader(r.Pos())
+		if err == io.EOF {
 			return err
-		}
-		defer ew.Close()
-	}
-
-	// Wrap writer to LZ4 compress.
-	zw := lz4.NewWriter(ew)
-
-	// Track total WAL bytes written to replica client.
-	walBytesCounter := replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name())
-
-	// Copy header if at offset zero.
-	var psalt uint64 // previous salt value
-	if pos := rd.Pos(); pos.Offset == 0 {
-		buf := make([]byte, WALHeaderSize)
-		if _, err := io.ReadFull(rd, buf); err != nil {
-			return err
-		}
-
-		psalt = binary.BigEndian.Uint64(buf[16:24])
-
-		n, err := zw.Write(buf)
-		if err != nil {
-			return err
-		}
-		walBytesCounter.Add(float64(n))
-		bytesWritten += n
-	}
-
-	// Copy frames.
-	for {
-		pos := rd.Pos()
-		assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
-
-		buf := make([]byte, WALFrameHeaderSize+r.db.pageSize)
-		if _, err := io.ReadFull(rd, buf); err == io.EOF {
-			break
 		} else if err != nil {
+			return fmt.Errorf("replica wal reader: %w", err)
+		}
+		defer rd.Close()
+
+		// Copy shadow WAL to client write via io.Pipe().
+		pr, pw := io.Pipe()
+		defer func() { _ = pw.CloseWithError(err) }()
+
+		// Obtain initial position from shadow reader.
+		// It may have moved to the next index if previous position was at the end.
+		pos := rd.Pos()
+		initialPos := pos
+		startTime := time.Now()
+		var bytesWritten int
+
+		logger := r.Logger()
+		logger.Info("write wal segment", "position", initialPos.String())
+
+		// Copy through pipe into client from the starting position.
+		var g errgroup.Group
+		g.Go(func() error {
+			_, err := r.Client.WriteWALSegment(ctx, pos, pr)
+
+			// Always close pipe reader to signal writers.
+			if e := pr.CloseWithError(err); err == nil {
+				return e
+			}
+
+			return err
+		})
+
+		var ew io.WriteCloser = pw
+
+		// Wrap writer to LZ4 compress.
+		zw := lz4.NewWriter(ew)
+
+		// Track total WAL bytes written to replica client.
+		walBytesCounter := replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name())
+
+		// Copy header if at offset zero.
+		var psalt uint64 // previous salt value
+		if pos := rd.Pos(); pos.Offset == 0 {
+			buf := make([]byte, WALHeaderSize)
+			if _, err := io.ReadFull(rd, buf); err != nil {
+				return err
+			}
+
+			psalt = binary.BigEndian.Uint64(buf[16:24])
+
+			n, err := zw.Write(buf)
+			if err != nil {
+				return err
+			}
+			walBytesCounter.Add(float64(n))
+			bytesWritten += n
+		}
+
+		// Copy frames.
+		for {
+			pos := rd.Pos()
+			assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
+
+			buf := make([]byte, WALFrameHeaderSize+r.db.pageSize)
+			if _, err := io.ReadFull(rd, buf); err == io.EOF {
+				break
+			} else if err != nil {
+				return err
+			}
+
+			// Verify salt matches the previous frame/header read.
+			salt := binary.BigEndian.Uint64(buf[8:16])
+			if psalt != 0 && psalt != salt {
+				return fmt.Errorf("replica salt mismatch: %s", pos.String())
+			}
+			psalt = salt
+
+			n, err := zw.Write(buf)
+			if err != nil {
+				return err
+			}
+			walBytesCounter.Add(float64(n))
+			bytesWritten += n
+		}
+
+		// Flush LZ4 writer, encryption writer and close pipe.
+		if err := zw.Close(); err != nil {
+			return err
+		} else if err := ew.Close(); err != nil {
+			return err
+		} else if err := pw.Close(); err != nil {
 			return err
 		}
 
-		// Verify salt matches the previous frame/header read.
-		salt := binary.BigEndian.Uint64(buf[8:16])
-		if psalt != 0 && psalt != salt {
-			return fmt.Errorf("replica salt mismatch: %s", pos.String())
+		// Wait for client to finish write.
+		if err := g.Wait(); err != nil {
+			return fmt.Errorf("client write: %w", err)
 		}
-		psalt = salt
 
-		n, err := zw.Write(buf)
-		if err != nil {
-			return err
-		}
-		walBytesCounter.Add(float64(n))
-		bytesWritten += n
-	}
+		// Save last replicated position.
+		r.mu.Lock()
+		r.pos = rd.Pos()
+		r.mu.Unlock()
 
-	// Flush LZ4 writer, encryption writer and close pipe.
-	if err := zw.Close(); err != nil {
-		return err
-	} else if err := ew.Close(); err != nil {
-		return err
-	} else if err := pw.Close(); err != nil {
-		return err
-	}
+		// Track current position
+		replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
+		replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
-	// Wait for client to finish write.
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("client write: %w", err)
-	}
-
-	// Save last replicated position.
-	r.mu.Lock()
-	r.pos = rd.Pos()
-	r.mu.Unlock()
-
-	// Track current position
-	replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
-	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
-
-	logger.Info("wal segment written", "position", initialPos.String(), "elapsed", time.Since(startTime).String(), "sz", bytesWritten)
-	return nil
+		logger.Info("wal segment written", "position", initialPos.String(), "elapsed", time.Since(startTime).String(), "sz", bytesWritten)
+		return nil
+	*/
 }
 
 // calcPos returns the last position saved to the replica.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
-	// Determine last LTX file saved.
-	minTXID, maxTXID, err := r.maxLTXFile(ctx, 0)
-	if err != nil {
-		return pos, fmt.Errorf("max ltx file: %w", err)
-	} else if maxTXID == nil {
-		return ltx.Pos{}, nil
-	}
+	panic("TODO: Implement Replica.calcPos()")
+	/*
+		// Determine last LTX file saved.
+		minTXID, maxTXID, err := r.maxLTXFile(ctx, 0)
+		if err != nil {
+			return pos, fmt.Errorf("max ltx file: %w", err)
+		} else if maxTXID == nil {
+			return ltx.Pos{}, nil
+		}
 
-	// Read segment to determine size to add to offset.
-	f, err := r.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID)
-	if err != nil {
-		return pos, fmt.Errorf("open ltx file: %w", err)
-	}
-	defer f.Close()
+		// Read segment to determine size to add to offset.
+		f, err := r.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID)
+		if err != nil {
+			return pos, fmt.Errorf("open ltx file: %w", err)
+		}
+		defer f.Close()
 
-	dec := ltx.NewDecoder(f)
-	if err := dec.Verify(); err != nil {
-		return ltx.Pos{}, fmt.Errorf("verify ltx file: %w", err)
-	}
+		dec := ltx.NewDecoder(f)
+		if err := dec.Verify(); err != nil {
+			return ltx.Pos{}, fmt.Errorf("verify ltx file: %w", err)
+		}
 
-	return dec.PostApplyPos(), nil
+		return dec.PostApplyPos(), nil
+	*/
 }
 
 // maxLTXFile returns the min & max TXID of the last LTX file for a given level.
-func (r *Replica) maxWALSegment(ctx context.Context, level int) (minTXID, maxTXID ltx.TXID, err error) {
+func (r *Replica) maxLTXFile(ctx context.Context, level int) (minTXID, maxTXID ltx.TXID, err error) {
 	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
 		return 0, 0, err
@@ -637,53 +633,6 @@ func (r *Replica) retainer(ctx context.Context) {
 		case <-ticker.C:
 			if err := r.EnforceRetention(ctx); err != nil {
 				r.Logger().Error("retainer error", "error", err)
-				continue
-			}
-		}
-	}
-}
-
-// snapshotter runs in a separate goroutine and handles snapshotting.
-func (r *Replica) snapshotter(ctx context.Context) {
-	if r.SnapshotInterval <= 0 {
-		return
-	}
-
-	logger := r.Logger()
-	if pos, err := r.db.Pos(); err != nil {
-		logger.Error("snapshotter cannot determine position", "error", err)
-	} else if !pos.IsZero() {
-		if snapshot, err := r.maxSnapshot(ctx); err != nil {
-			logger.Error("snapshotter cannot determine latest snapshot", "error", err)
-		} else if snapshot != nil {
-			nextSnapshot := r.SnapshotInterval - time.Since(snapshot.CreatedAt)
-			if nextSnapshot < 0 {
-				nextSnapshot = 0
-			}
-
-			logger.Info("snapshot interval adjusted", "previous", snapshot.CreatedAt.Format(time.RFC3339), "next", nextSnapshot.String())
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(nextSnapshot):
-				if _, err := r.Snapshot(ctx); err != nil {
-					logger.Error("snapshotter error", "error", err)
-				}
-			}
-		}
-	}
-
-	ticker := time.NewTicker(r.SnapshotInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if _, err := r.Snapshot(ctx); err != nil {
-				r.Logger().Error("snapshotter error", "error", err)
 				continue
 			}
 		}
@@ -1183,12 +1132,12 @@ func (r *Replica) walSegmentMap(ctx context.Context, minIndex, maxIndex int, max
 	}
 	defer itr.Close()
 
-	a := []WALSegmentInfo{}
+	a := []LTXFileInfo{}
 	for itr.Next() {
 		a = append(a, itr.WALSegment())
 	}
 
-	sort.Sort(WALSegmentInfoSlice(a))
+	sort.Sort(LTXFileInfoSlice(a))
 
 	m := make(map[int][]int64)
 	for _, info := range a {

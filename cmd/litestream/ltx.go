@@ -11,12 +11,12 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-// WALCommand represents a command to list WAL files for a database.
-type WALCommand struct{}
+// LTXCommand represents a command to list LTX files for a database.
+type LTXCommand struct{}
 
 // Run executes the command.
-func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
-	fs := flag.NewFlagSet("litestream-wal", flag.ContinueOnError)
+func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
+	fs := flag.NewFlagSet("litestream-ltx", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
@@ -77,29 +77,29 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "replica\tindex\toffset\tsize\tcreated")
+	fmt.Fprintln(w, "replica\tmin_txid\tmax_txid\tsize\tcreated")
 	for _, r := range replicas {
 		if err := func() error {
-			itr, err := r.Client.WALSegments(ctx)
+			itr, err := r.Client.LTXFiles(ctx, 0)
 			if err != nil {
 				return err
 			}
 			defer itr.Close()
 
 			for itr.Next() {
-				info := itr.WALSegment()
+				info := itr.Item()
 
 				fmt.Fprintf(w, "%s\t%x\t%d\t%d\t%s\n",
 					r.Name(),
-					info.Index,
-					info.Offset,
+					info.MinTXID,
+					info.MaxTXID,
 					info.Size,
 					info.CreatedAt.Format(time.RFC3339),
 				)
 			}
 			return itr.Close()
 		}(); err != nil {
-			r.Logger().Error("cannot fetch wal segments", "error", err)
+			r.Logger().Error("cannot fetch ltx files", "error", err)
 			continue
 		}
 	}
@@ -108,15 +108,15 @@ func (c *WALCommand) Run(ctx context.Context, args []string) (err error) {
 }
 
 // Usage prints the help screen to STDOUT.
-func (c *WALCommand) Usage() {
+func (c *LTXCommand) Usage() {
 	fmt.Printf(`
-The wal command lists all wal segments available for a database.
+The wal command lists all ltx files available for a database.
 
 Usage:
 
-	litestream wal [arguments] DB_PATH
+	litestream ltx [arguments] DB_PATH
 
-	litestream wal [arguments] REPLICA_URL
+	litestream ltx [arguments] REPLICA_URL
 
 Arguments:
 
@@ -132,14 +132,14 @@ Arguments:
 
 Examples:
 
-	# List all WAL segments for a database.
-	$ litestream wal /path/to/db
+	# List all LTX files for a database.
+	$ litestream ltx /path/to/db
 
-	# List all WAL segments on S3
-	$ litestream wal -replica s3 /path/to/db
+	# List all LTX files on S3
+	$ litestream ltx -replica s3 /path/to/db
 
-	# List all WAL segments for replica URL.
-	$ litestream wal s3://mybkt/db
+	# List all LTX files for replica URL.
+	$ litestream ltx s3://mybkt/db
 
 `[1:],
 		DefaultConfigPath(),

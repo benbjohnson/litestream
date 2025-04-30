@@ -282,7 +282,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) (err erro
 }
 
 // WALSegments returns an iterator over all available WAL files.
-func (c *ReplicaClient) WALSegments(ctx context.Context) (_ litestream.WALSegmentIterator, err error) {
+func (c *ReplicaClient) WALSegments(ctx context.Context) (_ litestream.LTXFileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -297,20 +297,20 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (_ litestream.WALSegmen
 
 	fis, err := sftpClient.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return litestream.NewWALSegmentInfoSliceIterator(nil), nil
+		return litestream.NewLTXFileInfoSliceIterator(nil), nil
 	} else if err != nil {
 		return nil, err
 	}
 
 	// Iterate over every file and convert to metadata.
-	infos := make([]litestream.WALSegmentInfo, 0, len(fis))
+	infos := make([]litestream.LTXFileInfo, 0, len(fis))
 	for _, fi := range fis {
 		index, offset, err := litestream.ParseWALSegmentPath(path.Base(fi.Name()))
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, litestream.WALSegmentInfo{
+		infos = append(infos, litestream.LTXFileInfo{
 			Index:     index,
 			Offset:    offset,
 			Size:      fi.Size(),
@@ -318,11 +318,11 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (_ litestream.WALSegmen
 		})
 	}
 
-	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
+	return litestream.NewLTXFileInfoSliceIterator(infos), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.LTXFileInfo, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -356,7 +356,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	return litestream.WALSegmentInfo{
+	return litestream.LTXFileInfo{
 		Index:     pos.Index,
 		Offset:    pos.Offset,
 		Size:      n,

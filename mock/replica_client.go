@@ -15,8 +15,8 @@ type ReplicaClient struct {
 	WriteSnapshotFunc     func(ctx context.Context, index int, r io.Reader) (litestream.SnapshotInfo, error)
 	DeleteSnapshotFunc    func(ctx context.Context, index int) error
 	SnapshotReaderFunc    func(ctx context.Context, index int) (io.ReadCloser, error)
-	WALSegmentsFunc       func(ctx context.Context) (litestream.WALSegmentIterator, error)
-	WriteWALSegmentFunc   func(ctx context.Context, pos litestream.Pos, r io.Reader) (litestream.WALSegmentInfo, error)
+	WALSegmentsFunc       func(ctx context.Context) (litestream.LTXFileIterator, error)
+	WriteWALSegmentFunc   func(ctx context.Context, pos litestream.Pos, r io.Reader) (litestream.LTXFileInfo, error)
 	DeleteWALSegmentsFunc func(ctx context.Context, a []litestream.Pos) error
 	WALSegmentReaderFunc  func(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error)
 }
@@ -43,11 +43,11 @@ func (c *ReplicaClient) SnapshotReader(ctx context.Context, index int) (io.ReadC
 	return c.SnapshotReaderFunc(ctx, index)
 }
 
-func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
+func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.LTXFileIterator, error) {
 	return c.WALSegmentsFunc(ctx)
 }
 
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, r io.Reader) (litestream.WALSegmentInfo, error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, r io.Reader) (litestream.LTXFileInfo, error) {
 	return c.WriteWALSegmentFunc(ctx, pos, r)
 }
 

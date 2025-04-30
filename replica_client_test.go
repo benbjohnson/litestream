@@ -202,13 +202,13 @@ func TestReplicaClient_WALs(t *testing.T) {
 		defer itr.Close()
 
 		// Read all WAL segment files into a slice so they can be sorted.
-		a, err := litestream.SliceWALSegmentIterator(itr)
+		a, err := litestream.SliceLTXFileIterator(itr)
 		if err != nil {
 			t.Fatal(err)
 		} else if got, want := len(a), 3; got != want {
 			t.Fatalf("len=%v, want %v", got, want)
 		}
-		sort.Sort(litestream.WALSegmentInfoSlice(a))
+		sort.Sort(litestream.LTXFileInfoSlice(a))
 
 		// Verify first WAL segment metadata.
 		if got, want := a[0].Index, 2; got != want {

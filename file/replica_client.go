@@ -197,7 +197,7 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
 }
 
 // WALSegments returns an iterator over all available WAL files.
-func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
+func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.LTXFileIterator, error) {
 	dir, err := c.WALDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal path: %w", err)
@@ -205,7 +205,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentI
 
 	f, err := os.Open(dir)
 	if os.IsNotExist(err) {
-		return litestream.NewWALSegmentInfoSliceIterator(nil), nil
+		return litestream.NewLTXFileInfoSliceIterator(nil), nil
 	} else if err != nil {
 		return nil, err
 	}
@@ -217,7 +217,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentI
 	}
 
 	// Iterate over every file and convert to metadata.
-	infos := make([]litestream.WALSegmentInfo, 0, len(fis))
+	infos := make([]litestream.LTXFileInfo, 0, len(fis))
 	for _, fi := range fis {
 		// Parse index from filename.
 		index, offset, err := litestream.ParseWALSegmentPath(fi.Name())
@@ -225,7 +225,7 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentI
 			continue
 		}
 
-		infos = append(infos, litestream.WALSegmentInfo{
+		infos = append(infos, litestream.LTXFileInfo{
 			Index:     index,
 			Offset:    offset,
 			Size:      fi.Size(),
@@ -233,11 +233,11 @@ func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentI
 		})
 	}
 
-	return litestream.NewWALSegmentInfoSliceIterator(infos), nil
+	return litestream.NewLTXFileInfoSliceIterator(infos), nil
 }
 
 // WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
+func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.LTXFileInfo, err error) {
 	filename, err := c.WALSegmentPath(pos.Index, pos.Offset)
 	if err != nil {
 		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
@@ -273,7 +273,7 @@ func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos,
 	if err != nil {
 		return info, err
 	}
-	info = litestream.WALSegmentInfo{
+	info = litestream.LTXFileInfo{
 		Index:     pos.Index,
 		Offset:    pos.Offset,
 		Size:      fi.Size(),
