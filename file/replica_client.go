@@ -198,6 +198,8 @@ func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
 
 // WALSegments returns an iterator over all available WAL files.
 func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.LTXFileIterator, error) {
+	// TODO(ltx): Must return sorted by name.
+
 	dir, err := c.WALDir()
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine wal path: %w", err)

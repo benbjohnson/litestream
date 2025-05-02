@@ -12,7 +12,6 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +23,7 @@ import (
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/superfly/ltx"
 	"gopkg.in/yaml.v2"
 )
 
@@ -748,23 +748,23 @@ func expand(s string) (string, error) {
 	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
 }
 
-// indexVar allows the flag package to parse index flags as 4-byte hexadecimal values.
-type indexVar int
+// txidVar allows the flag package to parse index flags as hex-formatted TXIDs
+type txidVar ltx.TXID
 
 // Ensure type implements interface.
-var _ flag.Value = (*indexVar)(nil)
+var _ flag.Value = (*txidVar)(nil)
 
 // String returns an 8-character hexadecimal value.
-func (v *indexVar) String() string {
-	return fmt.Sprintf("%08x", int(*v))
+func (v *txidVar) String() string {
+	return ltx.TXID(*v).String()
 }
 
 // Set parses s into an integer from a hexadecimal value.
-func (v *indexVar) Set(s string) error {
-	i, err := strconv.ParseInt(s, 16, 32)
+func (v *txidVar) Set(s string) error {
+	txID, err := ltx.ParseTXID(s)
 	if err != nil {
-		return fmt.Errorf("invalid hexadecimal format")
+		return fmt.Errorf("invalid txid format")
 	}
-	*v = indexVar(i)
+	*v = txidVar(txID)
 	return nil
 }

@@ -6,20 +6,15 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
 	"filippo.io/age"
-	"github.com/benbjohnson/litestream/internal"
-	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
-	"golang.org/x/sync/errgroup"
 )
 
 // Default replica settings.
@@ -365,8 +360,9 @@ func (r *Replica) maxLTXFile(ctx context.Context, level int) (minTXID, maxTXID l
 	defer itr.Close()
 
 	for itr.Next() {
-		if itr.MaxTXID() > maxTXID {
-			minTXID, maxTXID = itr.MinTXID(), itr.MaxTXID()
+		info := itr.Item()
+		if info.MaxTXID > maxTXID {
+			minTXID, maxTXID = info.MinTXID, info.MaxTXID
 		}
 	}
 	return minTXID, maxTXID, itr.Close()
@@ -541,20 +537,20 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 	*/
 }
 
-func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, index int) error {
-	itr, err := r.Client.WALSegments(ctx)
+func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID) error {
+	itr, err := r.Client.LTXFiles(ctx, level)
 	if err != nil {
-		return fmt.Errorf("fetch wal segments: %w", err)
+		return fmt.Errorf("fetch ltx files: %w", err)
 	}
 	defer itr.Close()
 
-	var a []Pos
+	var a []*LTXFileInfo
 	for itr.Next() {
-		info := itr.WALSegment()
-		if info.Index >= index {
+		info := itr.Item()
+		if info.MinTXID >= txID {
 			continue
 		}
-		a = append(a, info.Pos())
+		a = append(a, info)
 	}
 	if err := itr.Close(); err != nil {
 		return err
@@ -564,11 +560,15 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, index int) e
 		return nil
 	}
 
-	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
+	if err := r.Client.DeleteLTXFiles(ctx, level, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
 
-	r.Logger().Info("wal segmented deleted before", "index", index, "n", len(a))
+	r.Logger().Info("ltx files deleted before",
+		slog.Int("level", level),
+		slog.String("txID", txID.String()),
+		slog.Int("n", len(a)))
+
 	return nil
 }
 
@@ -695,7 +695,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	if err := r.Restore(ctx, RestoreOptions{
 		OutputPath:  restorePath,
 		ReplicaName: r.Name(),
-		Index:       pos.Index - 1,
+		TXID:        pos.TXID - 1,
 	}); err != nil {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
@@ -737,7 +737,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 }
 
 // waitForReplica blocks until replica reaches at least the given position.
-func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
+func (r *Replica) waitForReplica(ctx context.Context, pos ltx.Pos) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -764,19 +764,8 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 			continue
 		}
 
-		// TODO(gen): ???
-		/*
-			// Exit if the generation has changed while waiting as there will be
-			// no further progress on the old generation.
-			if curr.Generation != pos.Generation {
-				return fmt.Errorf("generation changed")
-			}
-		*/
-
 		ready := true
-		if curr.Index < pos.Index {
-			ready = false
-		} else if curr.Index == pos.Index && curr.Offset < pos.Offset {
+		if curr.TXID < pos.TXID {
 			ready = false
 		}
 
@@ -790,67 +779,34 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 	}
 }
 
-// CreatedAt returns the earliest creation time of any snapshot.
-// Returns zero time if no snapshots exist.
+// CreatedAt returns the earliest creation time of any LTX file.
+// Returns zero time if no LTX files exist.
 func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 	var min time.Time
 
-	itr, err := r.Client.Snapshots(ctx)
+	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
 		return min, err
 	}
 	defer itr.Close()
 
-	for itr.Next() {
-		if info := itr.Snapshot(); min.IsZero() || info.CreatedAt.Before(min) {
-			min = info.CreatedAt
-		}
+	if itr.Next() {
+		min = itr.Item().CreatedAt
 	}
 	return min, itr.Close()
 }
 
 // TimeBounds returns the creation time & last updated time.
-// Returns zero time if no snapshots or WAL segments exist.
+// Returns zero time if LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
-	// Iterate over snapshots.
-	sitr, err := r.Client.Snapshots(ctx)
+	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
 		return createdAt, updatedAt, err
 	}
-	defer sitr.Close()
+	defer itr.Close()
 
-	minIndex, maxIndex := -1, -1
-	for sitr.Next() {
-		info := sitr.Snapshot()
-		if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
-			createdAt = info.CreatedAt
-		}
-		if updatedAt.IsZero() || info.CreatedAt.After(updatedAt) {
-			updatedAt = info.CreatedAt
-		}
-		if minIndex == -1 || info.Index < minIndex {
-			minIndex = info.Index
-		}
-		if info.Index > maxIndex {
-			maxIndex = info.Index
-		}
-	}
-	if err := sitr.Close(); err != nil {
-		return createdAt, updatedAt, err
-	}
-
-	// Iterate over WAL segments.
-	witr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return createdAt, updatedAt, err
-	}
-	defer witr.Close()
-
-	for witr.Next() {
-		info := witr.WALSegment()
-		if info.Index < minIndex || info.Index > maxIndex {
-			continue
-		}
+	for itr.Next() {
+		info := itr.Item()
 		if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
 			createdAt = info.CreatedAt
 		}
@@ -858,11 +814,7 @@ func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Tim
 			updatedAt = info.CreatedAt
 		}
 	}
-	if err := witr.Close(); err != nil {
-		return createdAt, updatedAt, err
-	}
-
-	return createdAt, updatedAt, nil
+	return createdAt, updatedAt, itr.Close()
 }
 
 // CalcRestoreTarget returns a target time restore from.
@@ -890,366 +842,183 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
 func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
-	// Validate options.
-	if opt.OutputPath == "" {
-		return fmt.Errorf("output path required")
-	} else if opt.Index != math.MaxInt32 && !opt.Timestamp.IsZero() {
-		return fmt.Errorf("cannot specify index & timestamp to restore")
-	}
+	panic("TODO: Implement Replica.Restore() for LTX")
 
-	// Ensure output path does not already exist.
-	if _, err := os.Stat(opt.OutputPath); err == nil {
-		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
-	} else if err != nil && !os.IsNotExist(err) {
-		return err
-	}
+	/*
 
-	// Find lastest snapshot that occurs before timestamp or index.
-	var minWALIndex int
-	if opt.Index < math.MaxInt32 {
-		if minWALIndex, err = r.SnapshotIndexByIndex(ctx, opt.Index); err != nil {
-			return fmt.Errorf("cannot find snapshot index: %w", err)
+		// Validate options.
+		if opt.OutputPath == "" {
+			return fmt.Errorf("output path required")
+		} else if opt.TXID != 0 && !opt.Timestamp.IsZero() {
+			return fmt.Errorf("cannot specify index & timestamp to restore")
 		}
-	} else {
-		if minWALIndex, err = r.SnapshotIndexAt(ctx, opt.Timestamp); err != nil {
-			return fmt.Errorf("cannot find snapshot index by timestamp: %w", err)
-		}
-	}
 
-	// Compute list of offsets for each WAL index.
-	walSegmentMap, err := r.walSegmentMap(ctx, minWALIndex, opt.Index, opt.Timestamp)
-	if err != nil {
-		return fmt.Errorf("cannot find max wal index for restore: %w", err)
-	}
-
-	// Find the maximum WAL index that occurs before timestamp.
-	maxWALIndex := -1
-	for index := range walSegmentMap {
-		if index > maxWALIndex {
-			maxWALIndex = index
-		}
-	}
-
-	// Ensure that we found the specific index, if one was specified.
-	if opt.Index != math.MaxInt32 && opt.Index != maxWALIndex {
-		return fmt.Errorf("unable to locate index %d, highest index was %d", opt.Index, maxWALIndex)
-	}
-
-	// If no WAL files were found, mark this as a snapshot-only restore.
-	snapshotOnly := maxWALIndex == -1
-
-	// Initialize starting position.
-	pos := Pos{Index: minWALIndex}
-	tmpPath := opt.OutputPath + ".tmp"
-
-	// Copy snapshot to output path.
-	r.Logger().Info("restoring snapshot", "index", minWALIndex, "path", tmpPath)
-	if err := r.restoreSnapshot(ctx, pos.Index, tmpPath); err != nil {
-		return fmt.Errorf("cannot restore snapshot: %w", err)
-	}
-
-	// If no WAL files available, move snapshot to final path & exit early.
-	if snapshotOnly {
-		r.Logger().Info("snapshot only, finalizing database")
-		return os.Rename(tmpPath, opt.OutputPath)
-	}
-
-	// Begin processing WAL files.
-	r.Logger().Info("restoring wal files", "index_min", minWALIndex, "index_max", maxWALIndex)
-
-	// Fill input channel with all WAL indexes to be loaded in order.
-	// Verify every index has at least one offset.
-	ch := make(chan int, maxWALIndex-minWALIndex+1)
-	for index := minWALIndex; index <= maxWALIndex; index++ {
-		if len(walSegmentMap[index]) == 0 {
-			return fmt.Errorf("missing WAL index: %08x", index)
-		}
-		ch <- index
-	}
-	close(ch)
-
-	// Track load state for each WAL.
-	var mu sync.Mutex
-	cond := sync.NewCond(&mu)
-	walStates := make([]walRestoreState, maxWALIndex-minWALIndex+1)
-
-	parallelism := opt.Parallelism
-	if parallelism < 1 {
-		parallelism = 1
-	}
-
-	// Download WAL files to disk in parallel.
-	g, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < parallelism; i++ {
-		g.Go(func() error {
-			for {
-				select {
-				case <-ctx.Done():
-					cond.Broadcast()
-					return err
-				case index, ok := <-ch:
-					if !ok {
-						cond.Broadcast()
-						return nil
-					}
-
-					startTime := time.Now()
-
-					err := r.downloadWAL(ctx, index, walSegmentMap[index], tmpPath)
-					if err != nil {
-						err = fmt.Errorf("cannot download wal %08x: %w", index, err)
-					}
-
-					// Mark index as ready-to-apply and notify applying code.
-					mu.Lock()
-					walStates[index-minWALIndex] = walRestoreState{ready: true, err: err}
-					mu.Unlock()
-					cond.Broadcast()
-
-					// Returning the error here will cancel the other goroutines.
-					if err != nil {
-						return err
-					}
-
-					r.Logger().Info("downloaded wal",
-						"index", index,
-						"elapsed", time.Since(startTime).String(),
-					)
-				}
-			}
-		})
-	}
-
-	// Apply WAL files in order as they are ready.
-	for index := minWALIndex; index <= maxWALIndex; index++ {
-		// Wait until next WAL file is ready to apply.
-		mu.Lock()
-		for !walStates[index-minWALIndex].ready {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			cond.Wait()
-		}
-		if err := walStates[index-minWALIndex].err; err != nil {
+		// Ensure output path does not already exist.
+		if _, err := os.Stat(opt.OutputPath); err == nil {
+			return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
+		} else if err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		mu.Unlock()
 
-		// Apply WAL to database file.
-		startTime := time.Now()
-		if err = applyWAL(ctx, index, tmpPath); err != nil {
-			return fmt.Errorf("cannot apply wal: %w", err)
+		// Find lastest snapshot that occurs before timestamp or index.
+		var minWALIndex int
+		if opt.TXID != 0 {
+			if minWALIndex, err = r.SnapshotIndexByIndex(ctx, opt.Index); err != nil {
+				return fmt.Errorf("cannot find snapshot index: %w", err)
+			}
+		} else {
+			if minWALIndex, err = r.SnapshotIndexAt(ctx, opt.Timestamp); err != nil {
+				return fmt.Errorf("cannot find snapshot index by timestamp: %w", err)
+			}
 		}
-		r.Logger().Info("applied wal", "index", index, "elapsed", time.Since(startTime).String())
-	}
 
-	// Ensure all goroutines finish. All errors should have been handled during
-	// the processing of WAL files but this ensures that all processing is done.
-	if err := g.Wait(); err != nil {
-		return err
-	}
+		// Compute list of offsets for each WAL index.
+		walSegmentMap, err := r.walSegmentMap(ctx, minWALIndex, opt.Index, opt.Timestamp)
+		if err != nil {
+			return fmt.Errorf("cannot find max wal index for restore: %w", err)
+		}
 
-	// Copy file to final location.
-	r.Logger().Info("renaming database from temporary location")
-	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
-		return err
-	}
+		// Find the maximum WAL index that occurs before timestamp.
+		maxWALIndex := -1
+		for index := range walSegmentMap {
+			if index > maxWALIndex {
+				maxWALIndex = index
+			}
+		}
 
-	return nil
+		// Ensure that we found the specific index, if one was specified.
+		if opt.Index != math.MaxInt32 && opt.Index != maxWALIndex {
+			return fmt.Errorf("unable to locate index %d, highest index was %d", opt.Index, maxWALIndex)
+		}
+
+		// If no WAL files were found, mark this as a snapshot-only restore.
+		snapshotOnly := maxWALIndex == -1
+
+		// Initialize starting position.
+		pos := Pos{Index: minWALIndex}
+		tmpPath := opt.OutputPath + ".tmp"
+
+		// Copy snapshot to output path.
+		r.Logger().Info("restoring snapshot", "index", minWALIndex, "path", tmpPath)
+		if err := r.restoreSnapshot(ctx, pos.Index, tmpPath); err != nil {
+			return fmt.Errorf("cannot restore snapshot: %w", err)
+		}
+
+		// If no WAL files available, move snapshot to final path & exit early.
+		if snapshotOnly {
+			r.Logger().Info("snapshot only, finalizing database")
+			return os.Rename(tmpPath, opt.OutputPath)
+		}
+
+		// Begin processing WAL files.
+		r.Logger().Info("restoring wal files", "index_min", minWALIndex, "index_max", maxWALIndex)
+
+		// Fill input channel with all WAL indexes to be loaded in order.
+		// Verify every index has at least one offset.
+		ch := make(chan int, maxWALIndex-minWALIndex+1)
+		for index := minWALIndex; index <= maxWALIndex; index++ {
+			if len(walSegmentMap[index]) == 0 {
+				return fmt.Errorf("missing WAL index: %08x", index)
+			}
+			ch <- index
+		}
+		close(ch)
+
+		// Track load state for each WAL.
+		var mu sync.Mutex
+		cond := sync.NewCond(&mu)
+		walStates := make([]walRestoreState, maxWALIndex-minWALIndex+1)
+
+		parallelism := opt.Parallelism
+		if parallelism < 1 {
+			parallelism = 1
+		}
+
+		// Download WAL files to disk in parallel.
+		g, ctx := errgroup.WithContext(ctx)
+		for i := 0; i < parallelism; i++ {
+			g.Go(func() error {
+				for {
+					select {
+					case <-ctx.Done():
+						cond.Broadcast()
+						return err
+					case index, ok := <-ch:
+						if !ok {
+							cond.Broadcast()
+							return nil
+						}
+
+						startTime := time.Now()
+
+						err := r.downloadWAL(ctx, index, walSegmentMap[index], tmpPath)
+						if err != nil {
+							err = fmt.Errorf("cannot download wal %08x: %w", index, err)
+						}
+
+						// Mark index as ready-to-apply and notify applying code.
+						mu.Lock()
+						walStates[index-minWALIndex] = walRestoreState{ready: true, err: err}
+						mu.Unlock()
+						cond.Broadcast()
+
+						// Returning the error here will cancel the other goroutines.
+						if err != nil {
+							return err
+						}
+
+						r.Logger().Info("downloaded wal",
+							"index", index,
+							"elapsed", time.Since(startTime).String(),
+						)
+					}
+				}
+			})
+		}
+
+		// Apply WAL files in order as they are ready.
+		for index := minWALIndex; index <= maxWALIndex; index++ {
+			// Wait until next WAL file is ready to apply.
+			mu.Lock()
+			for !walStates[index-minWALIndex].ready {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				cond.Wait()
+			}
+			if err := walStates[index-minWALIndex].err; err != nil {
+				return err
+			}
+			mu.Unlock()
+
+			// Apply WAL to database file.
+			startTime := time.Now()
+			if err = applyWAL(ctx, index, tmpPath); err != nil {
+				return fmt.Errorf("cannot apply wal: %w", err)
+			}
+			r.Logger().Info("applied wal", "index", index, "elapsed", time.Since(startTime).String())
+		}
+
+		// Ensure all goroutines finish. All errors should have been handled during
+		// the processing of WAL files but this ensures that all processing is done.
+		if err := g.Wait(); err != nil {
+			return err
+		}
+
+		// Copy file to final location.
+		r.Logger().Info("renaming database from temporary location")
+		if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
+			return err
+		}
+
+		return nil
+	*/
+
 }
 
 type walRestoreState struct {
 	ready bool
 	err   error
-}
-
-// SnapshotIndexAt returns the highest index for a snapshot that occurs before timestamp.
-// If timestamp is zero, returns the latest snapshot.
-func (r *Replica) SnapshotIndexAt(ctx context.Context, timestamp time.Time) (int, error) {
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer itr.Close()
-
-	snapshotIndex := -1
-	var max time.Time
-	for itr.Next() {
-		snapshot := itr.Snapshot()
-		if !timestamp.IsZero() && snapshot.CreatedAt.After(timestamp) {
-			continue // after timestamp, skip
-		}
-
-		// Use snapshot if it newer.
-		if max.IsZero() || snapshot.CreatedAt.After(max) {
-			snapshotIndex, max = snapshot.Index, snapshot.CreatedAt
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return 0, err
-	} else if snapshotIndex == -1 {
-		return 0, ErrNoSnapshots
-	}
-	return snapshotIndex, nil
-}
-
-// SnapshotIndexbyIndex returns the highest index for a snapshot that occurs
-// before a given index. If index is MaxInt32, returns the latest snapshot.
-func (r *Replica) SnapshotIndexByIndex(ctx context.Context, index int) (int, error) {
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer itr.Close()
-
-	snapshotIndex := -1
-	for itr.Next() {
-		snapshot := itr.Snapshot()
-
-		if index < math.MaxInt32 && snapshot.Index > index {
-			continue // after index, skip
-		}
-
-		// Use snapshot if it newer.
-		if snapshotIndex == -1 || snapshot.Index >= snapshotIndex {
-			snapshotIndex = snapshot.Index
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return 0, err
-	} else if snapshotIndex == -1 {
-		return 0, ErrNoSnapshots
-	}
-	return snapshotIndex, nil
-}
-
-// walSegmentMap returns a map of WAL indices to their segments.
-// Filters by a max timestamp or a max index.
-func (r *Replica) walSegmentMap(ctx context.Context, minIndex, maxIndex int, maxTimestamp time.Time) (map[int][]int64, error) {
-	itr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	a := []LTXFileInfo{}
-	for itr.Next() {
-		a = append(a, itr.WALSegment())
-	}
-
-	sort.Sort(LTXFileInfoSlice(a))
-
-	m := make(map[int][]int64)
-	for _, info := range a {
-		// Exit if we go past the max timestamp or index.
-		if !maxTimestamp.IsZero() && info.CreatedAt.After(maxTimestamp) {
-			break // after max timestamp, skip
-		} else if info.Index > maxIndex {
-			break // after max index, skip
-		} else if info.Index < minIndex {
-			continue // before min index, continue
-		}
-
-		// Verify offsets are added in order.
-		offsets := m[info.Index]
-		if len(offsets) == 0 && info.Offset != 0 {
-			return nil, fmt.Errorf("missing initial wal segment: index=%08x offset=%d", info.Index, info.Offset)
-		} else if len(offsets) > 0 && offsets[len(offsets)-1] >= info.Offset {
-			return nil, fmt.Errorf("wal segments out of order: index=%08x offsets=(%d,%d)", info.Index, offsets[len(offsets)-1], info.Offset)
-		}
-
-		// Append to the end of the WAL file.
-		m[info.Index] = append(offsets, info.Offset)
-	}
-	return m, itr.Close()
-}
-
-// restoreSnapshot copies a snapshot from the replica to a file.
-func (r *Replica) restoreSnapshot(ctx context.Context, index int, filename string) error {
-	// Determine the user/group & mode based on the DB, if available.
-	var fileInfo, dirInfo os.FileInfo
-	if db := r.DB(); db != nil {
-		fileInfo, dirInfo = db.fileInfo, db.dirInfo
-	}
-
-	if err := internal.MkdirAll(filepath.Dir(filename), dirInfo); err != nil {
-		return err
-	}
-
-	f, err := internal.CreateFile(filename, fileInfo)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	rd, err := r.Client.SnapshotReader(ctx, index)
-	if err != nil {
-		return err
-	}
-	defer rd.Close()
-
-	if len(r.AgeIdentities) > 0 {
-		drd, err := age.Decrypt(rd, r.AgeIdentities...)
-		if err != nil {
-			return err
-		}
-
-		rd = io.NopCloser(drd)
-	}
-
-	if _, err := io.Copy(f, lz4.NewReader(rd)); err != nil {
-		return err
-	} else if err := f.Sync(); err != nil {
-		return err
-	}
-	return f.Close()
-}
-
-// downloadWAL copies a WAL file from the replica to a local copy next to the DB.
-// The WAL is later applied by applyWAL(). This function can be run in parallel
-// to download multiple WAL files simultaneously.
-func (r *Replica) downloadWAL(ctx context.Context, index int, offsets []int64, dbPath string) (err error) {
-	// Determine the user/group & mode based on the DB, if available.
-	var fileInfo os.FileInfo
-	if db := r.DB(); db != nil {
-		fileInfo = db.fileInfo
-	}
-
-	// Open readers for every segment in the WAL file, in order.
-	var readers []io.Reader
-	for _, offset := range offsets {
-		rd, err := r.Client.WALSegmentReader(ctx, Pos{Index: index, Offset: offset})
-		if err != nil {
-			return err
-		}
-		defer rd.Close()
-
-		if len(r.AgeIdentities) > 0 {
-			drd, err := age.Decrypt(rd, r.AgeIdentities...)
-			if err != nil {
-				return err
-			}
-
-			rd = io.NopCloser(drd)
-		}
-
-		readers = append(readers, lz4.NewReader(rd))
-	}
-
-	// Open handle to destination WAL path.
-	f, err := internal.CreateFile(fmt.Sprintf("%s-%08x-wal", dbPath, index), fileInfo)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Combine segments together and copy WAL to target path.
-	if _, err := io.Copy(f, io.MultiReader(readers...)); err != nil {
-		return err
-	} else if err := f.Close(); err != nil {
-		return err
-	}
-	return nil
 }
 
 // Replica metrics.

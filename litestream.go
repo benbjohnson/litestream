@@ -74,12 +74,12 @@ type LTXFileIterator interface {
 	Err() error
 
 	// Returns metadata for the currently positioned LTX file.
-	Item() LTXFileInfo
+	Item() *LTXFileInfo
 }
 
 // SliceLTXFileIterator returns all LTX files from an iterator as a slice.
-func SliceLTXFileIterator(itr LTXFileIterator) ([]LTXFileInfo, error) {
-	var a []LTXFileInfo
+func SliceLTXFileIterator(itr LTXFileIterator) ([]*LTXFileInfo, error) {
+	var a []*LTXFileInfo
 	for itr.Next() {
 		a = append(a, itr.Item())
 	}
@@ -91,11 +91,11 @@ var _ LTXFileIterator = (*LTXFileInfoSliceIterator)(nil)
 // LTXFileInfoSliceIterator represents an iterator for iterating over a slice of LTX files.
 type LTXFileInfoSliceIterator struct {
 	init bool
-	a    []LTXFileInfo
+	a    []*LTXFileInfo
 }
 
 // NewLTXFileInfoSliceIterator returns a new instance of LTXFileInfoSliceIterator.
-func NewLTXFileInfoSliceIterator(a []LTXFileInfo) *LTXFileInfoSliceIterator {
+func NewLTXFileInfoSliceIterator(a []*LTXFileInfo) *LTXFileInfoSliceIterator {
 	return &LTXFileInfoSliceIterator{a: a}
 }
 
@@ -116,9 +116,9 @@ func (itr *LTXFileInfoSliceIterator) Next() bool {
 func (itr *LTXFileInfoSliceIterator) Err() error { return nil }
 
 // LTXFile returns the metadata from the currently positioned wal segment.
-func (itr *LTXFileInfoSliceIterator) Item() LTXFileInfo {
+func (itr *LTXFileInfoSliceIterator) Item() *LTXFileInfo {
 	if len(itr.a) == 0 {
-		return LTXFileInfo{}
+		return nil
 	}
 	return itr.a[0]
 }

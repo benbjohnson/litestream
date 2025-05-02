@@ -24,7 +24,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
-	fs.Var((*indexVar)(&opt.Index), "index", "wal index")
+	fs.Var((*txidVar)(&opt.TXID), "txid", "transaction ID")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")

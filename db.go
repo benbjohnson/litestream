@@ -10,7 +10,6 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1183,9 +1182,9 @@ type RestoreOptions struct {
 	// If blank, all replicas are considered.
 	ReplicaName string
 
-	// Specific index to restore from.
-	// Set to math.MaxInt32 to ignore index.
-	Index int
+	// Specific transaction to restore to.
+	// If zero, TXID is ignored.
+	TXID ltx.TXID
 
 	// Point-in-time to restore database.
 	// If zero, database restore to most recent state available.
@@ -1198,7 +1197,6 @@ type RestoreOptions struct {
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.
 func NewRestoreOptions() RestoreOptions {
 	return RestoreOptions{
-		Index:       math.MaxInt32,
 		Parallelism: DefaultRestoreParallelism,
 	}
 }
