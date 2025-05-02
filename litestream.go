@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"cmp"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -95,7 +97,15 @@ type LTXFileInfoSliceIterator struct {
 }
 
 // NewLTXFileInfoSliceIterator returns a new instance of LTXFileInfoSliceIterator.
+// This function will sort the slice in place before returning the iterator.
 func NewLTXFileInfoSliceIterator(a []*LTXFileInfo) *LTXFileInfoSliceIterator {
+	slices.SortFunc(a, func(x, y *LTXFileInfo) int {
+		if v := cmp.Compare(x.Level, y.Level); v != 0 {
+			return v
+		}
+		return cmp.Compare(x.MinTXID, y.MinTXID)
+	})
+
 	return &LTXFileInfoSliceIterator{a: a}
 }
 
@@ -240,8 +250,8 @@ func LTXLevelDir(root string, level int) string {
 }
 
 // LTXFilePath returns the path to a single LTX file.
-func LTXFilePath(root string, level int, minTXID, maxTXID ltx.TXID) (string, error) {
-	return path.Join(LTXLevelDir(root, level), ltx.FormatFilename(minTXID, maxTXID)), nil
+func LTXFilePath(root string, level int, minTXID, maxTXID ltx.TXID) string {
+	return path.Join(LTXLevelDir(root, level), ltx.FormatFilename(minTXID, maxTXID))
 }
 
 func assert(condition bool, message string) {

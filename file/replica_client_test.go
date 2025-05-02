@@ -19,66 +19,6 @@ func TestReplicaClient_Type(t *testing.T) {
 	}
 }
 
-func TestReplicaClient_SnapshotsDir(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := file.NewReplicaClient("/foo").SnapshotsDir(); err != nil {
-			t.Fatal(err)
-		} else if want := "/foo/generations/0123456701234567/snapshots"; got != want {
-			t.Fatalf("SnapshotsDir()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoPath", func(t *testing.T) {
-		if _, err := file.NewReplicaClient("").SnapshotsDir(); err == nil || err.Error() != `file replica path required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_SnapshotPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := file.NewReplicaClient("/foo").SnapshotPath(1000); err != nil {
-			t.Fatal(err)
-		} else if want := "/foo/snapshots/000003e8.snapshot.lz4"; got != want {
-			t.Fatalf("SnapshotPath()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoPath", func(t *testing.T) {
-		if _, err := file.NewReplicaClient("").SnapshotPath(1000); err == nil || err.Error() != `file replica path required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_WALDir(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := file.NewReplicaClient("/foo").WALDir(); err != nil {
-			t.Fatal(err)
-		} else if want := "/foo/wal"; got != want {
-			t.Fatalf("WALDir()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoPath", func(t *testing.T) {
-		if _, err := file.NewReplicaClient("").WALDir(); err == nil || err.Error() != `file replica path required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
-func TestReplicaClient_WALSegmentPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := file.NewReplicaClient("/foo").WALSegmentPath(1000, 1001); err != nil {
-			t.Fatal(err)
-		} else if want := "/foo/wal/000003e8_000003e9.wal.lz4"; got != want {
-			t.Fatalf("WALPath()=%v, want %v", got, want)
-		}
-	})
-	t.Run("ErrNoPath", func(t *testing.T) {
-		if _, err := file.NewReplicaClient("").WALSegmentPath(1000, 0); err == nil || err.Error() != `file replica path required` {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-}
-
 /*
 func TestReplica_Sync(t *testing.T) {
 	// Ensure replica can successfully sync after DB has sync'd.
