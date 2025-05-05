@@ -104,10 +104,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
-	key, err := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine ltx file path: %w", err)
-	}
+	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
@@ -139,11 +136,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		return nil, err
 	}
 
-	key, err := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine ltx file path: %w", err)
-	}
-
+	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 	blobURL := c.containerURL.NewBlobURL(key)
 	resp, err := blobURL.Download(ctx, 0, 0, azblob.BlobAccessConditions{}, false, azblob.ClientProvidedKeyOptions{})
 	if isNotExists(err) {
@@ -159,25 +152,21 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 // DeleteLTXFiles deletes LTX files.
-func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, level int, a []*litestream.LTXFileInfo) error {
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*litestream.LTXFileInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	for i := range a {
-		key, err := litestream.LTXFilePath(c.Path, level, a[i].MaxTXID, a[i].MaxTXID)
-		if err != nil {
-			return fmt.Errorf("cannot determine ltx path: %w", err)
-		}
-
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
-
+	for _, info := range a {
+		key := litestream.LTXFilePath(c.Path, info.Level, info.MaxTXID, info.MaxTXID)
 		blobURL := c.containerURL.NewBlobURL(key)
 		if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
 			continue
 		} else if err != nil {
 			return fmt.Errorf("cannot delete ltx file %q: %w", key, err)
 		}
+
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	return nil
