@@ -133,7 +133,7 @@ func (itr *LTXFileInfoSliceIterator) Item() *LTXFileInfo {
 	return itr.a[0]
 }
 
-// LTXFileInfo represents file information about a WAL segment file.
+// LTXFileInfo represents file information about an LTX file.
 type LTXFileInfo struct {
 	Level     int
 	MinTXID   ltx.TXID
@@ -142,7 +142,7 @@ type LTXFileInfo struct {
 	CreatedAt time.Time
 }
 
-// Pos returns the WAL position when the segment was made.
+// Pos returns the position of the LTX file.
 func (info *LTXFileInfo) Pos() ltx.Pos {
 	return ltx.Pos{TXID: info.MaxTXID}
 }

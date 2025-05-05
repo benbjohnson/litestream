@@ -560,7 +560,7 @@ func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID
 		return nil
 	}
 
-	if err := r.Client.DeleteLTXFiles(ctx, level, a); err != nil {
+	if err := r.Client.DeleteLTXFiles(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
 
