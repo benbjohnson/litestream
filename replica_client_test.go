@@ -18,6 +18,7 @@ import (
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/superfly/ltx"
 )
 
 var (
@@ -208,7 +209,7 @@ func TestReplicaClient_WALs(t *testing.T) {
 		} else if got, want := len(a), 3; got != want {
 			t.Fatalf("len=%v, want %v", got, want)
 		}
-		sort.Sort(litestream.LTXFileInfoSlice(a))
+		sort.Sort(ltx.LTXFileInfoSlice(a))
 
 		// Verify first WAL segment metadata.
 		if got, want := a[0].Index, 2; got != want {

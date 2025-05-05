@@ -13,7 +13,7 @@ type ReplicaClient interface {
 	Type() string
 
 	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
-	LTXFiles(ctx context.Context, level int) (LTXFileIterator, error)
+	LTXFiles(ctx context.Context, level int) (ltx.LTXFileIterator, error)
 
 	// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
 	// Returns an os.ErrNotFound error if the LTX file does not exist.
@@ -21,10 +21,10 @@ type ReplicaClient interface {
 
 	// WriteLTXFile writes an LTX file to the replica.
 	// Returns metadata for the written file.
-	WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*LTXFileInfo, error)
+	WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.LTXFileInfo, error)
 
 	// DeleteLTXFiles deletes one or more LTX files.
-	DeleteLTXFiles(ctx context.Context, a []*LTXFileInfo) error
+	DeleteLTXFiles(ctx context.Context, a []*ltx.LTXFileInfo) error
 
 	// DeleteAll deletes all files.
 	DeleteAll(ctx context.Context) error

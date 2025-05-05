@@ -1,7 +1,6 @@
 package litestream
 
 import (
-	"cmp"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -10,10 +9,8 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
@@ -61,104 +58,6 @@ func init() {
 			return nil
 		},
 	})
-}
-
-// LTXFileIterator represents an iterator over a collection of LTX files.
-type LTXFileIterator interface {
-	io.Closer
-
-	// Prepares the next LTX file for reading with the Item() method.
-	// Returns true if another item is available. Returns false if no more
-	// items are available or if an error occured.
-	Next() bool
-
-	// Returns an error that occurred during iteration.
-	Err() error
-
-	// Returns metadata for the currently positioned LTX file.
-	Item() *LTXFileInfo
-}
-
-// SliceLTXFileIterator returns all LTX files from an iterator as a slice.
-func SliceLTXFileIterator(itr LTXFileIterator) ([]*LTXFileInfo, error) {
-	var a []*LTXFileInfo
-	for itr.Next() {
-		a = append(a, itr.Item())
-	}
-	return a, itr.Close()
-}
-
-var _ LTXFileIterator = (*LTXFileInfoSliceIterator)(nil)
-
-// LTXFileInfoSliceIterator represents an iterator for iterating over a slice of LTX files.
-type LTXFileInfoSliceIterator struct {
-	init bool
-	a    []*LTXFileInfo
-}
-
-// NewLTXFileInfoSliceIterator returns a new instance of LTXFileInfoSliceIterator.
-// This function will sort the slice in place before returning the iterator.
-func NewLTXFileInfoSliceIterator(a []*LTXFileInfo) *LTXFileInfoSliceIterator {
-	slices.SortFunc(a, func(x, y *LTXFileInfo) int {
-		if v := cmp.Compare(x.Level, y.Level); v != 0 {
-			return v
-		}
-		return cmp.Compare(x.MinTXID, y.MinTXID)
-	})
-
-	return &LTXFileInfoSliceIterator{a: a}
-}
-
-// Close always returns nil.
-func (itr *LTXFileInfoSliceIterator) Close() error { return nil }
-
-// Next moves to the next wal segment. Returns true if another segment is available.
-func (itr *LTXFileInfoSliceIterator) Next() bool {
-	if !itr.init {
-		itr.init = true
-		return len(itr.a) > 0
-	}
-	itr.a = itr.a[1:]
-	return len(itr.a) > 0
-}
-
-// Err always returns nil.
-func (itr *LTXFileInfoSliceIterator) Err() error { return nil }
-
-// LTXFile returns the metadata from the currently positioned wal segment.
-func (itr *LTXFileInfoSliceIterator) Item() *LTXFileInfo {
-	if len(itr.a) == 0 {
-		return nil
-	}
-	return itr.a[0]
-}
-
-// LTXFileInfo represents file information about an LTX file.
-type LTXFileInfo struct {
-	Level     int
-	MinTXID   ltx.TXID
-	MaxTXID   ltx.TXID
-	Size      int64
-	CreatedAt time.Time
-}
-
-// Pos returns the position of the LTX file.
-func (info *LTXFileInfo) Pos() ltx.Pos {
-	return ltx.Pos{TXID: info.MaxTXID}
-}
-
-// LTXFileInfoSlice represents a slice of WAL segment metadata.
-type LTXFileInfoSlice []LTXFileInfo
-
-func (a LTXFileInfoSlice) Len() int { return len(a) }
-
-func (a LTXFileInfoSlice) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
-
-func (a LTXFileInfoSlice) Less(i, j int) bool {
-	if a[i].Level != a[j].Level {
-		return a[i].Level < a[j].Level
-	}
-	return a[i].MinTXID < a[j].MinTXID
 }
 
 // Checksum computes a running SQLite checksum over a byte slice.
