@@ -197,7 +197,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIte
 }
 
 // WriteLTXFile writes an LTX file from rd into a remote location.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.LTXFileInfo, err error) {
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -225,7 +225,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
-	return &ltx.LTXFileInfo{
+	return &ltx.FileInfo{
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
@@ -258,7 +258,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 // DeleteLTXFiles deletes a set of LTX files.
-func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.LTXFileInfo) error {
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
@@ -299,12 +299,12 @@ type ltxFileIterator struct {
 	client *ReplicaClient
 	level  int
 
-	ch     chan *ltx.LTXFileInfo
+	ch     chan *ltx.FileInfo
 	g      errgroup.Group
 	ctx    context.Context
 	cancel func()
 
-	info *ltx.LTXFileInfo
+	info *ltx.FileInfo
 	err  error
 }
 
@@ -312,7 +312,7 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int) *
 	itr := &ltxFileIterator{
 		client: client,
 		level:  level,
-		ch:     make(chan *ltx.LTXFileInfo),
+		ch:     make(chan *ltx.FileInfo),
 	}
 
 	itr.ctx, itr.cancel = context.WithCancel(ctx)
@@ -341,7 +341,7 @@ func (itr *ltxFileIterator) fetch() error {
 				continue
 			}
 
-			info := &ltx.LTXFileInfo{
+			info := &ltx.FileInfo{
 				Level:     itr.level,
 				MinTXID:   minTXID,
 				MaxTXID:   maxTXID,
@@ -393,7 +393,7 @@ func (itr *ltxFileIterator) Next() bool {
 
 func (itr *ltxFileIterator) Err() error { return itr.err }
 
-func (itr *ltxFileIterator) Item() *ltx.LTXFileInfo {
+func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 	return itr.info
 }
 

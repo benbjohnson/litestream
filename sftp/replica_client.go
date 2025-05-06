@@ -153,7 +153,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (_ ltx.LTXFileIterator, err error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (_ ltx.FileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -164,20 +164,20 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (_ ltx.LTXFileI
 	dir := litestream.LTXLevelDir(c.Path, level)
 	fis, err := sftpClient.ReadDir(dir)
 	if os.IsNotExist(err) {
-		return ltx.NewLTXFileInfoSliceIterator(nil), nil
+		return ltx.NewFileInfoSliceIterator(nil), nil
 	} else if err != nil {
 		return nil, err
 	}
 
 	// Iterate over every file and convert to metadata.
-	infos := make([]*ltx.LTXFileInfo, 0, len(fis))
+	infos := make([]*ltx.FileInfo, 0, len(fis))
 	for _, fi := range fis {
 		minTXID, maxTXID, err := ltx.ParseFilename(path.Base(fi.Name()))
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, &ltx.LTXFileInfo{
+		infos = append(infos, &ltx.FileInfo{
 			Level:     level,
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
@@ -186,11 +186,11 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (_ ltx.LTXFileI
 		})
 	}
 
-	return ltx.NewLTXFileInfoSliceIterator(infos), nil
+	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
 // WriteLTXFile writes a LTX file from rd into a remote file.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.LTXFileInfo, err error) {
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -221,7 +221,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	return &ltx.LTXFileInfo{
+	return &ltx.FileInfo{
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
@@ -252,7 +252,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
-func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.LTXFileInfo) (err error) {
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)

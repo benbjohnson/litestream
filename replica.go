@@ -544,7 +544,7 @@ func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID
 	}
 	defer itr.Close()
 
-	var a []*ltx.LTXFileInfo
+	var a []*ltx.FileInfo
 	for itr.Next() {
 		info := itr.Item()
 		if info.MinTXID >= txID {

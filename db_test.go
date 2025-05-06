@@ -42,20 +42,6 @@ func TestDB_MetaPath(t *testing.T) {
 	})
 }
 
-func TestDB_ShadowWALDir(t *testing.T) {
-	db := litestream.NewDB("/tmp/db")
-	if got, want := db.ShadowWALDir(), `/tmp/.db-litestream/wal`; got != want {
-		t.Fatalf("ShadowWALDir()=%v, want %v", got, want)
-	}
-}
-
-func TestDB_ShadowWALPath(t *testing.T) {
-	db := litestream.NewDB("/tmp/db")
-	if got, want := db.ShadowWALPath(1000), `/tmp/.db-litestream/wal/000003e8.wal`; got != want {
-		t.Fatalf("ShadowWALPath()=%v, want %v", got, want)
-	}
-}
-
 // Ensure we can compute a checksum on the real database.
 func TestDB_CRC64(t *testing.T) {
 	t.Run("ErrNotExist", func(t *testing.T) {
@@ -130,15 +116,15 @@ func TestDB_Sync(t *testing.T) {
 		fi, err := os.Stat(db.WALPath())
 		if err != nil {
 			t.Fatal(err)
+		} else if fi.Size() == 0 {
+			t.Fatal("expected wal")
 		}
 
 		// Ensure position now available.
 		if pos, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos.Index, 0; got != want {
+		} else if got, want := pos.TXID, ltx.TXID(1); got != want {
 			t.Fatalf("pos.Index=%v, want %v", got, want)
-		} else if got, want := pos.Offset, fi.Size(); got != want {
-			t.Fatalf("pos.Offset=%v, want %v", got, want)
 		}
 	})
 
@@ -172,10 +158,8 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		} else if pos1, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos1.Index, pos0.Index; got != want {
-			t.Fatalf("Index=%v, want %v", got, want)
-		} else if got, want := pos1.Offset, pos0.Offset+4096+litestream.WALFrameHeaderSize; got != want {
-			t.Fatalf("Offset=%v, want %v", got, want)
+		} else if got, want := pos1.TXID, pos0.TXID; got != want {
+			t.Fatalf("TXID=%v, want %v", got, want)
 		}
 	})
 
@@ -279,194 +263,6 @@ func TestDB_Sync(t *testing.T) {
 		}
 	})
 
-	// Ensure DB can handle a mismatched header-only and start new generation.
-	t.Run("WALHeaderMismatch", func(t *testing.T) {
-		t.Skip("TODO(gen)")
-
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-
-		// Execute a query to force a write to the WAL and then sync.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
-			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		// Grab initial position & close.
-		pos0, err := db.Pos()
-		if err != nil {
-			t.Fatal(err)
-		} else if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		// Read existing file, update header checksum, and write back only header
-		// to simulate a header with a mismatched checksum.
-		shadowWALPath := db.ShadowWALPath(pos0.Index)
-		if buf, err := os.ReadFile(shadowWALPath); err != nil {
-			t.Fatal(err)
-		} else if err := os.WriteFile(shadowWALPath, append(buf[:litestream.WALHeaderSize-8], 0, 0, 0, 0, 0, 0, 0, 0), 0600); err != nil {
-			t.Fatal(err)
-		}
-
-		// Reopen managed database & ensure sync will still work.
-		db = MustOpenDBAt(t, db.Path())
-		defer MustCloseDB(t, db)
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		/*
-			// Verify a new generation was started.
-			if pos1, err := db.Pos(); err != nil {
-				t.Fatal(err)
-			} else if pos0.Generation == pos1.Generation {
-				t.Fatal("expected new generation")
-			}
-		*/
-	})
-
-	// Ensure DB can handle partial shadow WAL header write.
-	t.Run("PartialShadowWALHeader", func(t *testing.T) {
-		t.Skip("TODO(gen): LTX will be atomically written")
-
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-
-		// Execute a query to force a write to the WAL and then sync.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
-			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		pos0, err := db.Pos()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Close & truncate shadow WAL to simulate a partial header write.
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if err := os.Truncate(db.ShadowWALPath(pos0.Index), litestream.WALHeaderSize-1); err != nil {
-			t.Fatal(err)
-		}
-
-		// Reopen managed database & ensure sync will still work.
-		db = MustOpenDBAt(t, db.Path())
-		defer MustCloseDB(t, db)
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		/*
-			// Verify a new generation was started.
-			if pos1, err := db.Pos(); err != nil {
-				t.Fatal(err)
-			} else if pos0.Generation == pos1.Generation {
-				t.Fatal("expected new generation")
-			}
-		*/
-	})
-
-	// Ensure DB can handle partial shadow WAL writes.
-	t.Run("PartialShadowWALFrame", func(t *testing.T) {
-		t.Skip("TODO(gen): LTX will be atomically written")
-
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-
-		// Execute a query to force a write to the WAL and then sync.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
-			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		pos0, err := db.Pos()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Obtain current shadow WAL size.
-		fi, err := os.Stat(db.ShadowWALPath(pos0.Index))
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Close & truncate shadow WAL to simulate a partial frame write.
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if err := os.Truncate(db.ShadowWALPath(pos0.Index), fi.Size()-1); err != nil {
-			t.Fatal(err)
-		}
-
-		// Reopen managed database & ensure sync will still work.
-		db = MustOpenDBAt(t, db.Path())
-		defer MustCloseDB(t, db)
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		// Verify same generation is kept.
-		if pos1, err := db.Pos(); err != nil {
-			t.Fatal(err)
-		} else if got, want := pos1, pos0; got != want {
-			t.Fatalf("Pos()=%s want %s", got, want)
-		}
-
-		// Ensure shadow WAL has recovered.
-		if fi0, err := os.Stat(db.ShadowWALPath(pos0.Index)); err != nil {
-			t.Fatal(err)
-		} else if got, want := fi0.Size(), fi.Size(); got != want {
-			t.Fatalf("Size()=%v, want %v", got, want)
-		}
-	})
-
-	// Ensure DB can handle a generation directory with a missing shadow WAL.
-	t.Run("NoShadowWAL", func(t *testing.T) {
-		t.Skip("TODO(gen): Implement with LTX")
-
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
-
-		// Execute a query to force a write to the WAL and then sync.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
-			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		pos0, err := db.Pos()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Close & delete shadow WAL to simulate dir created but not WAL.
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		} else if err := os.Remove(db.ShadowWALPath(pos0.Index)); err != nil {
-			t.Fatal(err)
-		}
-
-		// Reopen managed database & ensure sync will still work.
-		db = MustOpenDBAt(t, db.Path())
-		defer MustCloseDB(t, db)
-		if err := db.Sync(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-
-		// Verify new generation created but index/offset the same.
-		if pos1, err := db.Pos(); err != nil {
-			t.Fatal(err)
-		} else if got, want := pos1.Index, pos0.Index; got != want {
-			t.Fatalf("Index=%v want %v", got, want)
-		} else if got, want := pos1.Offset, pos0.Offset; got != want {
-			t.Fatalf("Offset=%v want %v", got, want)
-		}
-	})
-
 	// Ensure DB checkpoints after minimum number of pages.
 	t.Run("MinCheckpointPageN", func(t *testing.T) {
 		db, sqldb := MustOpenDBs(t)
@@ -494,7 +290,7 @@ func TestDB_Sync(t *testing.T) {
 		// Ensure position is now on the second index.
 		if pos, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos.Index, 1; got != want {
+		} else if got, want := pos.TXID, ltx.TXID(1); got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
 	})

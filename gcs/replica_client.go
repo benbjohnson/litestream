@@ -89,7 +89,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -98,7 +98,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIte
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.LTXFileInfo, err error) {
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
@@ -119,7 +119,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	return &ltx.LTXFileInfo{
+	return &ltx.FileInfo{
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
@@ -151,7 +151,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 // DeleteLTXFiles deletes a set of LTX files.
-func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.LTXFileInfo) error {
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
@@ -170,7 +170,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.LTXFileInfo
 type ltxFileIterator struct {
 	it    *storage.ObjectIterator
 	level int
-	info  *ltx.LTXFileInfo
+	info  *ltx.FileInfo
 	err   error
 }
 
@@ -208,7 +208,7 @@ func (itr *ltxFileIterator) Next() bool {
 		}
 
 		// Store current snapshot and return.
-		itr.info = &ltx.LTXFileInfo{
+		itr.info = &ltx.FileInfo{
 			Level:     itr.level,
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
@@ -221,7 +221,7 @@ func (itr *ltxFileIterator) Next() bool {
 
 func (itr *ltxFileIterator) Err() error { return itr.err }
 
-func (itr *ltxFileIterator) Item() *ltx.LTXFileInfo {
+func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 	return itr.info
 }
 

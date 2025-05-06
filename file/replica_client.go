@@ -59,10 +59,10 @@ func (c *ReplicaClient) LTXFilePath(level int, minTXID, maxTXID ltx.TXID) string
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
 	f, err := os.Open(c.LTXLevelDir(level))
 	if os.IsNotExist(err) {
-		return ltx.NewLTXFileInfoSliceIterator(nil), nil
+		return ltx.NewFileInfoSliceIterator(nil), nil
 	} else if err != nil {
 		return nil, err
 	}
@@ -74,14 +74,14 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIte
 	}
 
 	// Iterate over every file and convert to metadata.
-	infos := make([]*ltx.LTXFileInfo, 0, len(fis))
+	infos := make([]*ltx.FileInfo, 0, len(fis))
 	for _, fi := range fis {
 		minTXID, maxTXID, err := ltx.ParseFilename(fi.Name())
 		if err != nil {
 			continue
 		}
 
-		infos = append(infos, &ltx.LTXFileInfo{
+		infos = append(infos, &ltx.FileInfo{
 			Level:     level,
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
@@ -90,7 +90,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.LTXFileIte
 		})
 	}
 
-	return ltx.NewLTXFileInfoSliceIterator(infos), nil
+	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
 // OpenLTXFile returns a reader for an LTX file at the given position.
@@ -100,7 +100,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 // WriteLTXFile writes an LTX file to disk.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.LTXFileInfo, err error) {
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 
 	var fileInfo, dirInfo os.FileInfo
 	if db := c.db(); db != nil {
@@ -135,7 +135,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err != nil {
 		return nil, err
 	}
-	info = &ltx.LTXFileInfo{
+	info = &ltx.FileInfo{
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
@@ -152,7 +152,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 }
 
 // DeleteLTXFiles deletes LTX files.
-func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.LTXFileInfo) error {
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	for _, info := range a {
 		filename := c.LTXFilePath(info.Level, info.MinTXID, info.MaxTXID)
 

@@ -13,12 +13,6 @@ import (
 	"github.com/pierrec/lz4/v4"
 )
 
-func nextIndex(pos litestream.Pos) litestream.Pos {
-	return litestream.Pos{
-		Index: pos.Index + 1,
-	}
-}
-
 func TestReplica_Name(t *testing.T) {
 	t.Run("WithName", func(t *testing.T) {
 		if got, want := litestream.NewReplica(nil, "NAME").Name(), "NAME"; got != want {
@@ -58,7 +52,7 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Verify we synced checkpoint page to WAL.
-	if r, err := c.WALSegmentReader(context.Background(), nextIndex(dpos)); err != nil {
+	if r, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID+1, dpos.TXID+1); err != nil {
 		t.Fatal(err)
 	} else if b, err := io.ReadAll(lz4.NewReader(r)); err != nil {
 		t.Fatal(err)
@@ -97,7 +91,7 @@ func TestReplica_Sync(t *testing.T) {
 	// Verify WAL matches replica WAL.
 	if b0, err := os.ReadFile(db.Path() + "-wal"); err != nil {
 		t.Fatal(err)
-	} else if r, err := c.WALSegmentReader(context.Background(), dpos.Truncate()); err != nil {
+	} else if r, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID, dpos.TXID); err != nil {
 		t.Fatal(err)
 	} else if b1, err := io.ReadAll(lz4.NewReader(r)); err != nil {
 		t.Fatal(err)
