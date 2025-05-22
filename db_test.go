@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"context"
 	"database/sql"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,14 +15,14 @@ import (
 )
 
 func TestDB_Path(t *testing.T) {
-	db := litestream.NewDB("/tmp/db")
+	db := newDB(t, "/tmp/db")
 	if got, want := db.Path(), `/tmp/db`; got != want {
 		t.Fatalf("Path()=%v, want %v", got, want)
 	}
 }
 
 func TestDB_WALPath(t *testing.T) {
-	db := litestream.NewDB("/tmp/db")
+	db := newDB(t, "/tmp/db")
 	if got, want := db.WALPath(), `/tmp/db-wal`; got != want {
 		t.Fatalf("WALPath()=%v, want %v", got, want)
 	}
@@ -29,13 +30,13 @@ func TestDB_WALPath(t *testing.T) {
 
 func TestDB_MetaPath(t *testing.T) {
 	t.Run("Absolute", func(t *testing.T) {
-		db := litestream.NewDB("/tmp/db")
+		db := newDB(t, "/tmp/db")
 		if got, want := db.MetaPath(), `/tmp/.db-litestream`; got != want {
 			t.Fatalf("MetaPath()=%v, want %v", got, want)
 		}
 	})
 	t.Run("Relative", func(t *testing.T) {
-		db := litestream.NewDB("db")
+		db := newDB(t, "db")
 		if got, want := db.MetaPath(), `.db-litestream`; got != want {
 			t.Fatalf("MetaPath()=%v, want %v", got, want)
 		}
@@ -56,14 +57,19 @@ func TestDB_CRC64(t *testing.T) {
 		db, sqldb := MustOpenDBs(t)
 		defer MustCloseDBs(t, db, sqldb)
 
+		t.Log("sync database")
+
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
+		t.Log("compute crc64")
 
 		chksum0, _, err := db.CRC64(context.Background())
 		if err != nil {
 			t.Fatal(err)
 		}
+
+		t.Log("issue change")
 
 		// Issue change that is applied to the WAL. Checksum should not change.
 		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
@@ -74,10 +80,14 @@ func TestDB_CRC64(t *testing.T) {
 			t.Fatal("expected different checksum event after WAL change")
 		}
 
+		t.Log("checkpointing database")
+
 		// Checkpoint change into database. Checksum should change.
 		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
 			t.Fatal(err)
 		}
+
+		t.Log("compute crc64 again")
 
 		if chksum2, _, err := db.CRC64(context.Background()); err != nil {
 			t.Fatal(err)
@@ -326,6 +336,14 @@ func TestDB_Sync(t *testing.T) {
 	})
 }
 
+func newDB(tb testing.TB, path string) *litestream.DB {
+	db := litestream.NewDB(path)
+	db.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	return db
+}
+
 // MustOpenDBs returns a new instance of a DB & associated SQL DB.
 func MustOpenDBs(tb testing.TB) (*litestream.DB, *sql.DB) {
 	tb.Helper()
@@ -349,7 +367,7 @@ func MustOpenDB(tb testing.TB) *litestream.DB {
 // MustOpenDBAt returns a new instance of a DB for a given path.
 func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
-	db := litestream.NewDB(path)
+	db := newDB(tb, path)
 	db.MonitorInterval = 0 // disable background goroutine
 	if err := db.Open(); err != nil {
 		tb.Fatal(err)

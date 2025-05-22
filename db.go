@@ -230,6 +230,8 @@ func (db *DB) Pos() (ltx.Pos, error) {
 	minTXID, maxTXID, err := db.MaxLTX()
 	if err != nil {
 		return ltx.Pos{}, err
+	} else if minTXID == 0 {
+		return ltx.Pos{}, nil // no replication yet
 	}
 
 	f, err := os.Open(db.LTXPath(0, minTXID, maxTXID))
@@ -427,9 +429,9 @@ func (db *DB) init() (err error) {
 		return err
 	}
 
-	// If we have an existing shadow WAL, ensure the headers match.
+	// If we have an existing replication files, ensure the headers match.
 	if err := db.verifyHeadersMatch(); err != nil {
-		panic(fmt.Sprintf("init: cannot determine last wal position, clearing generation: %s", err))
+		return fmt.Errorf("init: cannot determine last wal position: %w", err)
 	}
 
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
@@ -447,6 +449,8 @@ func (db *DB) verifyHeadersMatch() error {
 	pos, err := db.Pos()
 	if err != nil {
 		return fmt.Errorf("cannot determine position: %w", err)
+	} else if pos.TXID == 0 {
+		return nil // no replication performed yet
 	}
 
 	hdr0, err := readWALHeader(db.WALPath())
@@ -579,27 +583,8 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
-	// Verify our last sync matches the current state of the WAL.
-	// This ensures that the last sync position of the real WAL hasn't
-	// been overwritten by another process.
-	info, err := db.verify()
-	if err != nil {
-		return fmt.Errorf("cannot verify wal state: %w", err)
-	}
-	db.Logger.Debug("sync", "info", &info)
-
-	if info.ok {
-		slog.Debug("sync incremental")
-
-		if err := db.syncIncremental(ctx, info.offset); err != nil {
-			return fmt.Errorf("sync incremental: %w", err)
-		}
-	} else {
-		slog.Debug("sync full", slog.String("reason", info.reason))
-
-		if err := db.syncFull(ctx); err != nil {
-			return fmt.Errorf("sync full: %w", err)
-		}
+	if err := db.verifyAndSync(ctx, false); err != nil {
+		return err
 	}
 
 	/*
@@ -648,6 +633,21 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	return nil
 }
 
+func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) error {
+	// Verify our last sync matches the current state of the WAL.
+	// This ensures that the last sync position of the real WAL hasn't
+	// been overwritten by another process.
+	info, err := db.verify()
+	if err != nil {
+		return fmt.Errorf("cannot verify wal state: %w", err)
+	}
+
+	if err := db.sync(ctx, checkpointing, info); err != nil {
+		return fmt.Errorf("sync: %w", err)
+	}
+	return nil
+}
+
 // ensureWALExists checks that the real WAL exists and has a header.
 func (db *DB) ensureWALExists() (err error) {
 	// Exit early if WAL header exists.
@@ -663,11 +663,13 @@ func (db *DB) ensureWALExists() (err error) {
 // verify ensures the current LTX state matches where it left off from
 // the real WAL. Check info.ok if verification was successful.
 func (db *DB) verify() (info syncInfo, err error) {
+	info.snapshotting = true
+
 	pos, err := db.Pos()
 	if err != nil {
 		return info, fmt.Errorf("pos: %w", err)
 	} else if pos.TXID == 0 {
-		info.ok = true
+		info.offset = WALHeaderSize
 		return info, nil // first sync
 	}
 
@@ -683,6 +685,8 @@ func (db *DB) verify() (info syncInfo, err error) {
 		return info, fmt.Errorf("decode ltx file: %w", err)
 	}
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
+	info.salt1 = dec.Header().WALSalt1
+	info.salt2 = dec.Header().WALSalt2
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated
 	// so we cannot determine our last state.
@@ -707,11 +711,16 @@ func (db *DB) verify() (info syncInfo, err error) {
 		}
 	*/
 
-	// Verify last page exists in latest LTX file.
-	/*if info.ltxWALSize > WALHeaderSize {*/
-	/*offset := info.ltxWALSize - int64(db.pageSize+WALFrameHeaderSize)*/
+	// If offset is at the beginning of the first page, we can't check for previous page.
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
-	buf, err := readWALFileAt(db.WALPath(), info.offset-frameSize, frameSize)
+	prevWALOffset := info.offset - frameSize
+	if prevWALOffset <= 0 {
+		info.snapshotting = false
+		return info, nil
+	}
+
+	// Verify last page exists in latest LTX file.
+	buf, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
 	if err != nil {
 		return info, fmt.Errorf("cannot read last synced wal page: %w", err)
 	}
@@ -741,22 +750,21 @@ func (db *DB) verify() (info syncInfo, err error) {
 		}
 	}
 
-	info.ok = true
+	info.snapshotting = false
 
 	return info, nil
 }
 
 type syncInfo struct {
-	offset int64  // end of the previous LTX read
-	ok     bool   // if true, wal verification successful
-	reason string // reason for verification failure
+	offset       int64 // end of the previous LTX read
+	salt1        uint32
+	salt2        uint32
+	snapshotting bool   // if true, a full snapshot is required
+	reason       string // reason for snapshot
 }
 
-// syncIncremental copies pending bytes from the real WAL to LTX.
-func (db *DB) syncIncremental(ctx context.Context, walOffset int64) error {
-	// TODO: Read WAL transactions since last LTX offset.
-	// TODO: Check if the beginning has
-
+// sync copies pending bytes from the real WAL to LTX.
+func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error {
 	// Determine the next sequential transaction ID.
 	pos, err := db.Pos()
 	if err != nil {
@@ -765,8 +773,25 @@ func (db *DB) syncIncremental(ctx context.Context, walOffset int64) error {
 	txID := pos.TXID + 1
 
 	filename := db.LTXPath(0, txID, txID)
-	logger := db.Logger.With("filename", filename)
-	logger.Debug("syncWAL")
+	db.Logger.Debug("sync",
+		"txid", txID.String(),
+		"checkpointing", checkpointing,
+		"offset", info.offset,
+		"snapshotting", info.snapshotting,
+		"reason", info.reason)
+
+	// Prevent internal checkpoints during sync. Ignore if already in a checkpoint.
+	if !checkpointing {
+		db.chkMu.Lock()
+		defer db.chkMu.Unlock()
+	}
+
+	fi, err := db.f.Stat()
+	if err != nil {
+		return err
+	}
+	mode := fi.Mode()
+	commit := uint32(fi.Size() / int64(db.pageSize))
 
 	walFile, err := os.Open(db.WALPath())
 	if err != nil {
@@ -774,42 +799,50 @@ func (db *DB) syncIncremental(ctx context.Context, walOffset int64) error {
 	}
 	defer walFile.Close()
 
-	rd := NewWALReader(walFile)
-	if err := rd.ReadHeader(); err != nil {
-		return fmt.Errorf("read wal header: %w", err)
+	var rd *WALReader
+	if info.offset == WALHeaderSize {
+		db.Logger.Debug("hello")
+		rd = NewWALReader(walFile, db.Logger)
+		if err := rd.ReadHeader(); err != nil {
+			return fmt.Errorf("read wal header: %w", err)
+		}
+	} else {
+		if rd, err = NewWALReaderWithOffset(walFile, info.offset, info.salt1, info.salt2, db.Logger); err != nil {
+			return fmt.Errorf("new wal reader with offset: %w", err)
+		}
 	}
 
 	// Build a mapping of changed page numbers and their latest content.
-	pageMap, sz, commit, err := rd.PageMap()
+	pageMap, sz, walCommit, err := rd.PageMap()
 	if err != nil {
 		return fmt.Errorf("page map: %w", err)
 	}
-
-	// Create an ordered list of page numbers since the LTX encoder requires it.
-	pgnos := make([]uint32, 0, len(pageMap))
-	for pgno := range pageMap {
-		pgnos = append(pgnos, pgno)
-	}
-	slices.Sort(pgnos)
-
-	mode := os.FileMode(0600)
-	if fi := db.fileInfo; fi != nil {
-		mode = fi.Mode()
+	if walCommit > 0 {
+		commit = walCommit
 	}
 
 	tmpFilename := filename + ".tmp"
-	ltxFile, err := os.OpenFile(tmpFilename, os.O_RDWR, mode)
-	if err != nil {
+	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
 		return err
+	}
+
+	ltxFile, err := os.OpenFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	if err != nil {
+		return fmt.Errorf("open temp ltx file: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpFilename) }()
 	defer func() { _ = ltxFile.Close() }()
 
-	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
-		return err
-	}
 	uid, gid := internal.Fileinfo(db.fileInfo)
 	_ = os.Chown(tmpFilename, uid, gid)
+
+	db.Logger.Debug("encode header",
+		"txid", txID.String(),
+		"commit", commit,
+		"walOffset", info.offset,
+		"walSize", sz,
+		"salt1", rd.salt1,
+		"salt2", rd.salt2)
 
 	enc := ltx.NewEncoder(ltxFile)
 	if err := enc.EncodeHeader(ltx.Header{
@@ -820,7 +853,7 @@ func (db *DB) syncIncremental(ctx context.Context, walOffset int64) error {
 		MinTXID:   txID,
 		MaxTXID:   txID,
 		Timestamp: time.Now().UnixMilli(),
-		WALOffset: walOffset,
+		WALOffset: info.offset,
 		WALSize:   sz,
 		WALSalt1:  rd.salt1,
 		WALSalt2:  rd.salt2,
@@ -828,20 +861,15 @@ func (db *DB) syncIncremental(ctx context.Context, walOffset int64) error {
 		return fmt.Errorf("encode ltx header: %w", err)
 	}
 
-	data := make([]byte, db.pageSize)
-	for _, pgno := range pgnos {
-		offset := pageMap[pgno]
-
-		// Read source page using page map.
-		if n, err := walFile.ReadAt(data, offset); err != nil {
-			return fmt.Errorf("read page (pgno %d @ %d): %w", pgno, offset, err)
-		} else if n != len(data) {
-			return fmt.Errorf("short page read (pgno %d @ %d)", pgno, offset)
+	// If we need a full snapshot, then copy from the database & WAL.
+	// Otherwise, just copy incrementally from the WAL.
+	if info.snapshotting {
+		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+			return fmt.Errorf("write ltx from db: %w", err)
 		}
-
-		// Write page to LTX encoder.
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
-			return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
+	} else {
+		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap); err != nil {
+			return fmt.Errorf("write ltx from db: %w", err)
 		}
 	}
 
@@ -866,14 +894,72 @@ func (db *DB) syncIncremental(ctx context.Context, walOffset int64) error {
 	return nil
 }
 
-// syncFull creates a differential transaction based on the state of the local
-// database and the state of the latest remote snapshot. This allows transactions
-// to continue monotonically even if we lose track of local WAL state.
-func (db *DB) syncFull(ctx context.Context) error {
-	panic("implement syncFull()")
-	// TODO(ltx): Build page map of current WAL
-	// TODO(ltx): Stream latest snapshot from latest replica
-	// TODO(ltx): Write LTX file of any pages which differ between local & remote state
+func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+	lockPgno := ltx.LockPgno(uint32(db.pageSize))
+	data := make([]byte, db.pageSize)
+
+	for pgno := uint32(1); pgno <= commit; pgno++ {
+		if pgno == lockPgno {
+			continue
+		}
+
+		// If page exists in the WAL, read from there.
+		if offset, ok := pageMap[pgno]; ok {
+			db.Logger.Debug("encode page from wal", "offset", offset, "pgno", pgno)
+
+			if n, err := walFile.ReadAt(data, offset); err != nil {
+				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
+			} else if n != len(data) {
+				return fmt.Errorf("short read page %d @ %d", pgno, offset)
+			}
+			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+				return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
+			}
+			continue
+		}
+
+		offset := int64(pgno) * int64(db.pageSize)
+		db.Logger.Debug("encode page from database", "offset", offset, "pgno", pgno)
+
+		// Otherwise read directly from the database file.
+		if _, err := db.f.ReadAt(data, offset); err != nil {
+			return fmt.Errorf("read database page %d: %w", pgno, err)
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+			return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
+		}
+	}
+
+	return nil
+}
+
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
+	// Create an ordered list of page numbers since the LTX encoder requires it.
+	pgnos := make([]uint32, 0, len(pageMap))
+	for pgno := range pageMap {
+		pgnos = append(pgnos, pgno)
+	}
+	slices.Sort(pgnos)
+
+	data := make([]byte, db.pageSize)
+	for _, pgno := range pgnos {
+		offset := pageMap[pgno]
+
+		db.Logger.Debug("encode page from wal", "offset", offset, "pgno", pgno)
+
+		// Read source page using page map.
+		if n, err := walFile.ReadAt(data, offset); err != nil {
+			return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
+		} else if n != len(data) {
+			return fmt.Errorf("short read page %d @ %d", pgno, offset)
+		}
+
+		// Write page to LTX encoder.
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+			return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
+		}
+	}
+	return nil
 }
 
 // Checkpoint performs a checkpoint on the WAL file.
@@ -886,83 +972,63 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 // checkpoint performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, mode string) error {
-	panic("Implement: checkpoint()")
-	/*
-		// Try getting a checkpoint lock, will fail during snapshots.
-		if !db.chkMu.TryLock() {
-			return nil
-		}
-		defer db.chkMu.Unlock()
-
-		shadowWALPath, err := db.CurrentShadowWALPath()
-		if err != nil {
-			return err
-		}
-
-		// Read WAL header before checkpoint to check if it has been restarted.
-		hdr, err := readWALHeader(db.WALPath())
-		if err != nil {
-			return err
-		}
-
-		// Copy shadow WAL before checkpoint to copy as much as possible.
-		if _, _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
-			return fmt.Errorf("cannot copy to end of shadow wal before checkpoint: %w", err)
-		}
-
-		// Execute checkpoint and immediately issue a write to the WAL to ensure
-		// a new page is written.
-		if err := db.execCheckpoint(mode); err != nil {
-			return err
-		} else if _, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
-			return err
-		}
-
-		// If WAL hasn't been restarted, exit.
-		if other, err := readWALHeader(db.WALPath()); err != nil {
-			return err
-		} else if bytes.Equal(hdr, other) {
-			return nil
-		}
-
-		// Start a transaction. This will be promoted immediately after.
-		tx, err := db.db.Begin()
-		if err != nil {
-			return fmt.Errorf("begin: %w", err)
-		}
-		defer func() { _ = rollback(tx) }()
-
-		// Insert into the lock table to promote to a write tx. The lock table
-		// insert will never actually occur because our tx will be rolled back,
-		// however, it will ensure our tx grabs the write lock. Unfortunately,
-		// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
-		if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-			return fmt.Errorf("_litestream_lock: %w", err)
-		}
-
-		// Copy the end of the previous WAL before starting a new shadow WAL.
-		if _, _, err := db.copyToShadowWAL(shadowWALPath); err != nil {
-			return fmt.Errorf("cannot copy to end of shadow wal: %w", err)
-		}
-
-		// Parse index of current shadow WAL file.
-		index, err := ParseWALPath(shadowWALPath)
-		if err != nil {
-			return fmt.Errorf("cannot parse shadow wal filename: %s", shadowWALPath)
-		}
-
-		// Start a new shadow WAL file with next index.
-		newShadowWALPath := filepath.Join(filepath.Dir(shadowWALPath), FormatWALPath(index+1))
-		if _, err := db.initShadowWALFile(newShadowWALPath); err != nil {
-			return fmt.Errorf("cannot init shadow wal file: name=%s err=%w", newShadowWALPath, err)
-		}
-
-		// Release write lock before checkpointing & exiting.
-		if err := tx.Rollback(); err != nil {
-			return fmt.Errorf("rollback post-checkpoint tx: %w", err)
-		}
+	// Try getting a checkpoint lock, will fail during snapshots.
+	if !db.chkMu.TryLock() {
 		return nil
-	*/
+	}
+	defer db.chkMu.Unlock()
+
+	// Read WAL header before checkpoint to check if it has been restarted.
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return err
+	}
+
+	// Copy end of WAL before checkpoint to copy as much as possible.
+	if err := db.verifyAndSync(ctx, true); err != nil {
+		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+	}
+
+	// Execute checkpoint and immediately issue a write to the WAL to ensure
+	// a new page is written.
+	if err := db.execCheckpoint(mode); err != nil {
+		return err
+	} else if _, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
+		return err
+	}
+
+	// If WAL hasn't been restarted, exit.
+	if other, err := readWALHeader(db.WALPath()); err != nil {
+		return err
+	} else if bytes.Equal(hdr, other) {
+		return nil
+	}
+
+	// Start a transaction. This will be promoted immediately after.
+	tx, err := db.db.Begin()
+	if err != nil {
+		return fmt.Errorf("begin: %w", err)
+	}
+	defer func() { _ = rollback(tx) }()
+
+	// Insert into the lock table to promote to a write tx. The lock table
+	// insert will never actually occur because our tx will be rolled back,
+	// however, it will ensure our tx grabs the write lock. Unfortunately,
+	// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
+	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+		return fmt.Errorf("_litestream_lock: %w", err)
+	}
+
+	// Copy anything that may have occurred after the checkpoint.
+	if err := db.verifyAndSync(ctx, true); err != nil {
+		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
+	}
+
+	// Release write lock before exiting.
+	if err := tx.Rollback(); err != nil {
+		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
+	}
+	return nil
 }
 
 func (db *DB) execCheckpoint(mode string) (err error) {
@@ -1119,19 +1185,6 @@ func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
 		return 0, pos, err
 	}
 	return h.Sum64(), pos, nil
-}
-
-// BeginSnapshot takes an internal snapshot lock preventing checkpoints.
-//
-// When calling this the caller must also call EndSnapshot() once the snapshot
-// is finished.
-func (db *DB) BeginSnapshot() {
-	db.chkMu.Lock()
-}
-
-// EndSnapshot releases the internal snapshot lock that prevents checkpoints.
-func (db *DB) EndSnapshot() {
-	db.chkMu.Unlock()
 }
 
 // frameAlign returns a frame-aligned offset.

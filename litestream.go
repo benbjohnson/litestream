@@ -145,7 +145,7 @@ func LTXDir(root string) string {
 
 // LTXLevelDir returns the path to an LTX level directory
 func LTXLevelDir(root string, level int) string {
-	return path.Join(LTXDir(root), "levels", strconv.Itoa(level))
+	return path.Join(LTXDir(root), strconv.Itoa(level))
 }
 
 // LTXFilePath returns the path to a single LTX file.

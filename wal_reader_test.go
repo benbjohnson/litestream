@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"io"
+	"log/slog"
 	"os"
 	"testing"
 
@@ -18,7 +19,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Initialize reader with header info.
-		r := litestream.NewWALReader(bytes.NewReader(b))
+		r := litestream.NewWALReader(bytes.NewReader(b), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		} else if got, want := r.PageSize(), uint32(4096); got != want {
@@ -79,7 +80,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Initialize reader with header info.
-		r := litestream.NewWALReader(bytes.NewReader(b))
+		r := litestream.NewWALReader(bytes.NewReader(b), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		} else if got, want := r.PageSize(), uint32(4096); got != want {
@@ -113,7 +114,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Initialize reader with header info.
-		r := litestream.NewWALReader(bytes.NewReader(b))
+		r := litestream.NewWALReader(bytes.NewReader(b), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		} else if got, want := r.PageSize(), uint32(4096); got != want {
@@ -140,21 +141,21 @@ func TestWALReader(t *testing.T) {
 	})
 
 	t.Run("ZeroLength", func(t *testing.T) {
-		r := litestream.NewWALReader(bytes.NewReader(nil))
+		r := litestream.NewWALReader(bytes.NewReader(nil), slog.Default())
 		if err := r.ReadHeader(); err != io.EOF {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
 	t.Run("PartialHeader", func(t *testing.T) {
-		r := litestream.NewWALReader(bytes.NewReader(make([]byte, 10)))
+		r := litestream.NewWALReader(bytes.NewReader(make([]byte, 10)), slog.Default())
 		if err := r.ReadHeader(); err != io.EOF {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
 	t.Run("BadMagic", func(t *testing.T) {
-		r := litestream.NewWALReader(bytes.NewReader(make([]byte, 32)))
+		r := litestream.NewWALReader(bytes.NewReader(make([]byte, 32)), slog.Default())
 		if err := r.ReadHeader(); err == nil || err.Error() != `invalid wal header magic: 0` {
 			t.Fatalf("unexpected error: %#v", err)
 		}
@@ -166,7 +167,7 @@ func TestWALReader(t *testing.T) {
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-		r := litestream.NewWALReader(bytes.NewReader(data))
+		r := litestream.NewWALReader(bytes.NewReader(data), slog.Default())
 		if err := r.ReadHeader(); err != io.EOF {
 			t.Fatalf("unexpected error: %#v", err)
 		}
@@ -178,7 +179,7 @@ func TestWALReader(t *testing.T) {
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x15, 0x7b, 0x20, 0x92, 0xbb, 0xf8, 0x34, 0x1d}
-		r := litestream.NewWALReader(bytes.NewReader(data))
+		r := litestream.NewWALReader(bytes.NewReader(data), slog.Default())
 		if err := r.ReadHeader(); err == nil || err.Error() != `unsupported wal version: 1` {
 			t.Fatalf("unexpected error: %#v", err)
 		}
@@ -191,7 +192,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Initialize reader with header info.
-		r := litestream.NewWALReader(bytes.NewReader(b))
+		r := litestream.NewWALReader(bytes.NewReader(b), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		}
@@ -206,7 +207,7 @@ func TestWALReader(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r := litestream.NewWALReader(bytes.NewReader(b[:40]))
+		r := litestream.NewWALReader(bytes.NewReader(b[:40]), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		} else if _, _, err := r.ReadFrame(make([]byte, 4096)); err != io.EOF {
@@ -220,7 +221,7 @@ func TestWALReader(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r := litestream.NewWALReader(bytes.NewReader(b[:56]))
+		r := litestream.NewWALReader(bytes.NewReader(b[:56]), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		} else if _, _, err := r.ReadFrame(make([]byte, 4096)); err != io.EOF {
@@ -234,7 +235,7 @@ func TestWALReader(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r := litestream.NewWALReader(bytes.NewReader(b[:1000]))
+		r := litestream.NewWALReader(bytes.NewReader(b[:1000]), slog.Default())
 		if err := r.ReadHeader(); err != nil {
 			t.Fatal(err)
 		} else if _, _, err := r.ReadFrame(make([]byte, 4096)); err != io.EOF {
