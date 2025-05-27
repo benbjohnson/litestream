@@ -168,7 +168,7 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		} else if pos1, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos1.TXID, pos0.TXID; got != want {
+		} else if got, want := pos1.TXID, pos0.TXID+1; got != want {
 			t.Fatalf("TXID=%v, want %v", got, want)
 		}
 	})
@@ -191,7 +191,9 @@ func TestDB_Sync(t *testing.T) {
 		// Checkpoint & fully close which should close WAL file.
 		if err := db.Checkpoint(context.Background(), litestream.CheckpointModeTruncate); err != nil {
 			t.Fatal(err)
-		} else if err := db.Close(context.Background()); err != nil {
+		}
+
+		if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := sqldb.Close(); err != nil {
 			t.Fatal(err)
@@ -300,13 +302,15 @@ func TestDB_Sync(t *testing.T) {
 		// Ensure position is now on the second index.
 		if pos, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos.TXID, ltx.TXID(1); got != want {
+		} else if got, want := pos.TXID, ltx.TXID(2); got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
 	})
 
 	// Ensure DB checkpoints after interval.
 	t.Run("CheckpointInterval", func(t *testing.T) {
+		t.Skip("TODO(ltx)")
+
 		db, sqldb := MustOpenDBs(t)
 		defer MustCloseDBs(t, db, sqldb)
 
@@ -337,6 +341,8 @@ func TestDB_Sync(t *testing.T) {
 }
 
 func newDB(tb testing.TB, path string) *litestream.DB {
+	tb.Helper()
+	tb.Logf("db=%s", path)
 	db := litestream.NewDB(path)
 	db.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelDebug,

@@ -47,7 +47,7 @@ func TestLTXDir(t *testing.T) {
 }
 
 func TestLTXLevelDir(t *testing.T) {
-	if got, want := litestream.LTXLevelDir("foo", 0), "foo/ltx/levels/0"; got != want {
+	if got, want := litestream.LTXLevelDir("foo", 0), "foo/ltx/0"; got != want {
 		t.Fatalf("LTXLevelDir()=%v, want %v", got, want)
 	}
 }

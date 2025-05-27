@@ -10,6 +10,7 @@ import (
 	"path"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -89,20 +90,20 @@ func TestReplicaClient_LTX(t *testing.T) {
 		a, err := ltx.SliceFileIterator(itr)
 		if err != nil {
 			t.Fatal(err)
-		} else if got, want := len(a), 3; got != want {
+		} else if got, want := len(a), 4; got != want {
 			t.Fatalf("len=%v, want %v", got, want)
 		}
 
-		if got, want := a[0], (&ltx.FileInfo{MinTXID: 1, MaxTXID: 1, Size: 5}); got != want {
+		if got, want := stripLTXFileInfo(a[0]), (&ltx.FileInfo{MinTXID: 1, MaxTXID: 1, Size: 0}); *got != *want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
-		if got, want := a[0], (&ltx.FileInfo{MinTXID: 2, MaxTXID: 3, Size: 5}); got != want {
+		if got, want := stripLTXFileInfo(a[1]), (&ltx.FileInfo{MinTXID: 2, MaxTXID: 3, Size: 5}); *got != *want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
-		if got, want := a[0], (&ltx.FileInfo{MinTXID: 4, MaxTXID: 8, Size: 5}); got != want {
+		if got, want := stripLTXFileInfo(a[2]), (&ltx.FileInfo{MinTXID: 4, MaxTXID: 8, Size: 2}); *got != *want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
-		if got, want := a[0], (&ltx.FileInfo{MinTXID: 9, MaxTXID: 9, Size: 5}); got != want {
+		if got, want := stripLTXFileInfo(a[3]), (&ltx.FileInfo{MinTXID: 9, MaxTXID: 9, Size: 3}); *got != *want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
 
@@ -162,7 +163,7 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		r, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(1))
+		r, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -317,4 +318,10 @@ func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
 			tb.Fatalf("cannot cleanup sftp: %s", err)
 		}
 	}
+}
+
+func stripLTXFileInfo(info *ltx.FileInfo) *ltx.FileInfo {
+	other := *info
+	other.CreatedAt = time.Time{}
+	return &other
 }

@@ -27,10 +27,13 @@ type WALReader struct {
 }
 
 // NewWALReader returns a new instance of WALReader.
-func NewWALReader(rd io.ReaderAt, logger *slog.Logger) *WALReader {
+func NewWALReader(rd io.ReaderAt, logger *slog.Logger) (*WALReader, error) {
 	r := &WALReader{r: rd, logger: logger}
 	r.logger.Debug("NewWALReader")
-	return r
+	if err := r.readHeader(); err != nil {
+		return nil, err
+	}
+	return r, nil
 }
 
 // NewWALReaderWithOffset returns a new instance of WALReader at a given offset.
@@ -50,7 +53,7 @@ func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, l
 	r := &WALReader{r: rd, logger: logger}
 
 	// Read header to determine page size & byte order.
-	if err := r.ReadHeader(); err != nil {
+	if err := r.readHeader(); err != nil {
 		return nil, fmt.Errorf("read header: %w", err)
 	}
 
@@ -67,7 +70,7 @@ func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, l
 	// Read previous page to load checksum.
 	r.frameN--
 	if _, _, err := r.readFrame(make([]byte, r.pageSize), false); err != nil {
-		return nil, fmt.Errorf("read prev frame: %w", err)
+		return nil, &PrevFrameMismatchError{Err: err}
 	}
 
 	return r, nil
@@ -85,8 +88,8 @@ func (r *WALReader) Offset() int64 {
 	return WALHeaderSize + ((int64(r.frameN) - 1) * (WALFrameHeaderSize + int64(r.pageSize)))
 }
 
-// ReadHeader reads the WAL header into the reader. Returns io.EOF if WAL is invalid.
-func (r *WALReader) ReadHeader() error {
+// readHeader reads the WAL header into the reader. Returns io.EOF if WAL is invalid.
+func (r *WALReader) readHeader() error {
 	// If we have a partial WAL, then mark WAL as done.
 	hdr := make([]byte, WALHeaderSize)
 	if n, err := r.r.ReadAt(hdr, 0); n < len(hdr) {
@@ -152,7 +155,7 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 	// Read WAL frame header.
 	hdr := make([]byte, WALFrameHeaderSize)
 	if n, err := r.r.ReadAt(hdr, offset); n != len(hdr) {
-		r.logger.Debug("invalid wal frame", "reason", "short frame header", "offset", offset)
+		r.logger.Debug("invalid wal frame", "reason", "short frame header", "offset", offset, "n", n)
 		return 0, 0, io.EOF
 	} else if err != nil {
 		return 0, 0, err
@@ -160,7 +163,7 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 
 	// Read WAL page data.
 	if n, err := r.r.ReadAt(data, offset+WALFrameHeaderSize); n != len(data) {
-		r.logger.Debug("invalid wal frame", "reason", "short frame data", "offset", offset)
+		r.logger.Debug("invalid wal frame", "reason", "short frame data", "offset", offset, "n", n)
 		return 0, 0, io.EOF
 	} else if err != nil {
 		return 0, 0, err
@@ -203,8 +206,6 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 // map of pgno to offset of the latest version of each page. Also returns the
 // size of the wal segment read, and the final database size, in pages.
 func (r *WALReader) PageMap() (m map[uint32]int64, size int64, commit uint32, err error) {
-	origOffset := r.Offset()
-
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
@@ -233,7 +234,7 @@ func (r *WALReader) PageMap() (m map[uint32]int64, size int64, commit uint32, er
 	// If full transactions available, return the original offset.
 	if len(m) == 0 {
 		r.logger.Debug("no transactions in page map")
-		return m, origOffset, 0, nil
+		return m, 0, 0, nil
 	}
 
 	// Compute the lowest & highest page offsets.
@@ -264,4 +265,16 @@ func WALChecksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) 
 		s1 += bo.Uint32(b[i+4:]) + s0
 	}
 	return s0, s1
+}
+
+type PrevFrameMismatchError struct {
+	Err error
+}
+
+func (e *PrevFrameMismatchError) Error() string {
+	return fmt.Sprintf("prev frame mismatch: %s", e.Err)
+}
+
+func (e *PrevFrameMismatchError) Unwrap() error {
+	return e.Err
 }

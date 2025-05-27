@@ -429,10 +429,15 @@ func (db *DB) init() (err error) {
 		return err
 	}
 
-	// If we have an existing replication files, ensure the headers match.
-	if err := db.verifyHeadersMatch(); err != nil {
-		return fmt.Errorf("init: cannot determine last wal position: %w", err)
+	// Ensure WAL has at least one frame in it.
+	if err := db.ensureWALExists(); err != nil {
+		return fmt.Errorf("ensure wal exists: %w", err)
 	}
+
+	// If we have an existing replication files, ensure the headers match.
+	//if err := db.verifyHeadersMatch(); err != nil {
+	//	return fmt.Errorf("cannot determine last wal position: %w", err)
+	//}
 
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
 
@@ -444,20 +449,21 @@ func (db *DB) init() (err error) {
 	return nil
 }
 
-// verifyHeadersMatch returns true if the primary WAL and last shadow WAL header match.
+/*
+// verifyHeadersMatch returns an error if
 func (db *DB) verifyHeadersMatch() error {
 	pos, err := db.Pos()
 	if err != nil {
-		return fmt.Errorf("cannot determine position: %w", err)
+		return false, fmt.Errorf("cannot determine position: %w", err)
 	} else if pos.TXID == 0 {
-		return nil // no replication performed yet
+		return true, nil // no replication performed yet
 	}
 
 	hdr0, err := readWALHeader(db.WALPath())
 	if os.IsNotExist(err) {
-		return fmt.Errorf("no primary wal: %w", err)
+		return false, fmt.Errorf("no wal: %w", err)
 	} else if err != nil {
-		return fmt.Errorf("primary wal header: %w", err)
+		return false, fmt.Errorf("read wal header: %w", err)
 	}
 	salt1 := binary.BigEndian.Uint32(hdr0[16:])
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
@@ -465,20 +471,25 @@ func (db *DB) verifyHeadersMatch() error {
 	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
 	f, err := os.Open(ltxPath)
 	if err != nil {
-		return fmt.Errorf("open ltx path: %w", err)
+		return false, fmt.Errorf("open ltx path: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.DecodeHeader(); err != nil {
-		return fmt.Errorf("decode ltx header: %w", err)
+		return false, fmt.Errorf("decode ltx header: %w", err)
 	}
 	hdr1 := dec.Header()
 	if salt1 != hdr1.WALSalt1 || salt2 != hdr1.WALSalt2 {
-		return fmt.Errorf("salt mismatch (%x,%x) <> (%x,%x) on %s", salt1, salt2, hdr1.WALSalt1, hdr1.WALSalt2, ltxPath)
+		db.Logger.Debug("salt mismatch",
+			"path", ltxPath,
+			"wal", [2]uint32{salt1, salt2},
+			"ltx", [2]uint32{hdr1.WALSalt1, hdr1.WALSalt2})
+		return false, nil
 	}
-	return nil
+	return true, nil
 }
+*/
 
 // cleanWAL removes WAL files that have been replicated.
 // TODO(ltx): Move to a background goroutine.
@@ -697,19 +708,24 @@ func (db *DB) verify() (info syncInfo, err error) {
 		return info, nil
 	}
 
-	/*
-		// Compare WAL headers. Start a new shadow WAL if they are mismatched.
-		hdr0, err := readWALHeader(db.WALPath())
-		if err != nil {
-			return info, fmt.Errorf("cannot read wal header: %w", err)
-		}
-		salt1 := binary.BigEndian.Uint32(hdr0[16:])
-		salt2 := binary.BigEndian.Uint32(hdr0[20:])
+	// Compare WAL headers. Restart from beginning of WAL if different.
+	hdr0, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return info, fmt.Errorf("cannot read wal header: %w", err)
+	}
+	salt1 := binary.BigEndian.Uint32(hdr0[16:])
+	salt2 := binary.BigEndian.Uint32(hdr0[20:])
 
-		if salt1 != dec.Header().WALSalt1 || salt2 != dec.Header().WALSalt2 {
-			info.restart = true
-		}
-	*/
+	if salt1 != dec.Header().WALSalt1 || salt2 != dec.Header().WALSalt2 {
+		db.Logger.Debug("wal restarted",
+			"salt1", salt1,
+			"salt2", salt2)
+
+		info.offset = WALHeaderSize
+		info.salt1, info.salt2 = salt1, salt2
+		info.snapshotting = false
+		return info, nil
+	}
 
 	// If offset is at the beginning of the first page, we can't check for previous page.
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
@@ -728,31 +744,42 @@ func (db *DB) verify() (info syncInfo, err error) {
 	fsalt1 := binary.BigEndian.Uint32(buf[8:])
 	fsalt2 := binary.BigEndian.Uint32(buf[12:])
 
-	pageData := make([]byte, db.pageSize)
-	for {
-		var pageHdr ltx.PageHeader
-		if err := dec.DecodePage(&pageHdr, pageData); err == io.EOF {
-			break
-		} else if err != nil {
-			return info, fmt.Errorf("decode ltx page: %w", err)
-		}
-		if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
-			info.reason = "frame salt mismatch, wal overwritten by another process"
-			return info, nil
-		}
-		if pgno != pageHdr.Pgno {
-			info.reason = "pgno mismatch, wal overwritten by another process"
-			return info, nil
-		}
-		if !bytes.Equal(buf[WALFrameHeaderSize:], pageData) {
-			info.reason = "page data mismatch, wal overwritten by another process"
-			return info, nil
-		}
+	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
+		info.reason = "frame salt mismatch, wal overwritten by another process"
+		return info, nil
+	}
+
+	// Verify that the last page in the WAL exists in the last LTX file.
+	if ok, err := db.ltxDecoderContains(dec, pgno, buf[WALFrameHeaderSize:]); err != nil {
+		return info, fmt.Errorf("ltx contains: %w", err)
+	} else if !ok {
+		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
+		return info, nil
 	}
 
 	info.snapshotting = false
 
 	return info, nil
+}
+
+func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
+	buf := make([]byte, dec.Header().PageSize)
+	for {
+		var hdr ltx.PageHeader
+		if err := dec.DecodePage(&hdr, buf); err == io.EOF {
+			return false, nil
+		} else if err != nil {
+			return false, fmt.Errorf("decode ltx page: %w", err)
+		}
+
+		if pgno != hdr.Pgno {
+			continue
+		}
+		if !bytes.Equal(data, buf) {
+			continue
+		}
+		return true, nil
+	}
 }
 
 type syncInfo struct {
@@ -801,13 +828,18 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 
 	var rd *WALReader
 	if info.offset == WALHeaderSize {
-		db.Logger.Debug("hello")
-		rd = NewWALReader(walFile, db.Logger)
-		if err := rd.ReadHeader(); err != nil {
-			return fmt.Errorf("read wal header: %w", err)
+		if rd, err = NewWALReader(walFile, db.Logger); err != nil {
+			return fmt.Errorf("new wal reader: %w", err)
 		}
 	} else {
-		if rd, err = NewWALReaderWithOffset(walFile, info.offset, info.salt1, info.salt2, db.Logger); err != nil {
+		// If we cannot verify the previous frame
+		var pfmError *PrevFrameMismatchError
+		if rd, err = NewWALReaderWithOffset(walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
+			db.Logger.Debug("prev frame mismatch, snapshotting", "err", pfmError.Err)
+			if rd, err = NewWALReader(walFile, db.Logger); err != nil {
+				return fmt.Errorf("new wal reader, after reset")
+			}
+		} else if err != nil {
 			return fmt.Errorf("new wal reader with offset: %w", err)
 		}
 	}
@@ -907,18 +939,19 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 		if offset, ok := pageMap[pgno]; ok {
 			db.Logger.Debug("encode page from wal", "offset", offset, "pgno", pgno)
 
-			if n, err := walFile.ReadAt(data, offset); err != nil {
+			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
 				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
 			} else if n != len(data) {
 				return fmt.Errorf("short read page %d @ %d", pgno, offset)
 			}
+
 			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 				return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
 			}
 			continue
 		}
 
-		offset := int64(pgno) * int64(db.pageSize)
+		offset := int64(pgno-1) * int64(db.pageSize)
 		db.Logger.Debug("encode page from database", "offset", offset, "pgno", pgno)
 
 		// Otherwise read directly from the database file.
@@ -948,7 +981,7 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 		db.Logger.Debug("encode page from wal", "offset", offset, "pgno", pgno)
 
 		// Read source page using page map.
-		if n, err := walFile.ReadAt(data, offset); err != nil {
+		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
 			return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
 		} else if n != len(data) {
 			return fmt.Errorf("short read page %d @ %d", pgno, offset)
