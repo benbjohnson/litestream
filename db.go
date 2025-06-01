@@ -1158,29 +1158,6 @@ func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Repli
 	return target.replica, nil
 }
 
-// applyWAL performs a truncating checkpoint on the given database.
-func applyWAL(_ context.Context, index int, dbPath string) error {
-	// Copy WAL file from it's staging path to the correct "-wal" location.
-	if err := os.Rename(fmt.Sprintf("%s-%08x-wal", dbPath, index), dbPath+"-wal"); err != nil {
-		return err
-	}
-
-	// Open SQLite database and force a truncating checkpoint.
-	d, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return err
-	}
-	defer d.Close()
-
-	var row [3]int
-	if err := d.QueryRow(`PRAGMA wal_checkpoint(TRUNCATE);`).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return err
-	} else if row[0] != 0 {
-		return fmt.Errorf("truncation checkpoint failed during restore (%d,%d,%d)", row[0], row[1], row[2])
-	}
-	return d.Close()
-}
-
 // CRC64 returns a CRC-64 ISO checksum of the database and its current position.
 //
 // This function obtains a read lock so it prevents syncs from occurring until
