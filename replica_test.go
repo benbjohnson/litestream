@@ -1,16 +1,13 @@
 package litestream_test
 
 import (
-	"bytes"
 	"context"
-	"io"
-	"os"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/mock"
-	"github.com/pierrec/lz4/v4"
+	"github.com/superfly/ltx"
 )
 
 func TestReplica_Name(t *testing.T) {
@@ -32,6 +29,8 @@ func TestReplica_Sync(t *testing.T) {
 	db, sqldb := MustOpenDBs(t)
 	defer MustCloseDBs(t, db, sqldb)
 
+	t.Log("initial sync")
+
 	// Issue initial database sync.
 	if err := db.Sync(context.Background()); err != nil {
 		t.Fatal(err)
@@ -43,6 +42,8 @@ func TestReplica_Sync(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Logf("position after sync: %s", dpos.String())
+
 	c := file.NewReplicaClient(t.TempDir())
 	r := litestream.NewReplica(db, "")
 	c.Replica, r.Client = r, c
@@ -51,15 +52,22 @@ func TestReplica_Sync(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	t.Logf("second sync")
+
 	// Verify we synced checkpoint page to WAL.
-	if r, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID+1, dpos.TXID+1); err != nil {
+	rd, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID, dpos.TXID)
+	if err != nil {
 		t.Fatal(err)
-	} else if b, err := io.ReadAll(lz4.NewReader(r)); err != nil {
+	}
+	defer func() { _ = rd.Close() }()
+
+	dec := ltx.NewDecoder(rd)
+	if err := dec.Verify(); err != nil {
 		t.Fatal(err)
-	} else if err := r.Close(); err != nil {
+	} else if err := rd.Close(); err != nil {
 		t.Fatal(err)
-	} else if len(b) == db.PageSize() {
-		t.Fatalf("wal mismatch: len(%d), len(%d)", len(b), db.PageSize())
+	} else if got, want := int(dec.Header().PageSize), db.PageSize(); got != want {
+		t.Fatalf("page size: %d, want %d", got, want)
 	}
 
 	// Reset WAL so the next write will only write out the segment we are checking.
@@ -88,16 +96,5 @@ func TestReplica_Sync(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify WAL matches replica WAL.
-	if b0, err := os.ReadFile(db.Path() + "-wal"); err != nil {
-		t.Fatal(err)
-	} else if r, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID, dpos.TXID); err != nil {
-		t.Fatal(err)
-	} else if b1, err := io.ReadAll(lz4.NewReader(r)); err != nil {
-		t.Fatal(err)
-	} else if err := r.Close(); err != nil {
-		t.Fatal(err)
-	} else if !bytes.Equal(b0, b1) {
-		t.Fatalf("wal mismatch: len(%d), len(%d)", len(b0), len(b1))
-	}
+	// TODO(ltx): Restore snapshot and verify
 }

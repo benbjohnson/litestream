@@ -152,6 +152,15 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		}
 	}()
 
+	// Calculate current replica position, if unknown.
+	if r.Pos().IsZero() {
+		pos, err := r.calcPos(ctx)
+		if err != nil {
+			return fmt.Errorf("calc pos: %w", err)
+		}
+		r.SetPos(pos)
+	}
+
 	// Find current position of database.
 	dpos, err := r.db.Pos()
 	if err != nil {
@@ -160,195 +169,46 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("no position, waiting for data")
 	}
 
-	r.Logger().Debug("replica sync", "position", dpos.String())
+	r.Logger().Debug("replica sync", "txid", dpos.TXID.String())
 
-	// TODO(gen): Figure out how to resnapshot
-	/*
-		// Create a new snapshot and update the current replica position if
-		// the generation on the database has changed.
-		if r.Pos().Generation != generation {
-			// Create snapshot if no snapshots exist for generation.
-			snapshotN, err := r.snapshotN(ctx, generation)
-			if err != nil {
-				return err
-			} else if snapshotN == 0 {
-				if info, err := r.Snapshot(ctx); err != nil {
-					return err
-				} else if info.Generation != generation {
-					return fmt.Errorf("generation changed during snapshot, exiting sync")
-				}
-			}
-
-			pos, err := r.calcPos(ctx)
-			if err != nil {
-				return fmt.Errorf("cannot determine replica position: %s", err)
-			}
-
-			r.Logger().Debug("replica sync: calc new pos", "position", pos.String())
-			r.mu.Lock()
-			r.pos = pos
-			r.mu.Unlock()
-		}
-	*/
-
-	// Read all WAL files since the last position.
-	for {
-		if err = r.syncWAL(ctx); err == io.EOF {
-			break
-		} else if err != nil {
+	// Replicate all L0 LTX files since last replica position.
+	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+		if err = r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return err
 		}
+		r.SetPos(ltx.Pos{TXID: txID})
 	}
 
 	return nil
 }
 
-func (r *Replica) syncWAL(ctx context.Context) (err error) {
-	panic("TODO(ltx): Implement syncWAL")
+func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (err error) {
+	filename := r.db.LTXPath(level, minTXID, maxTXID)
+	f, err := os.Open(filename)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
 
-	/*
-		rd, err := r.db.ShadowWALReader(r.Pos())
-		if err == io.EOF {
-			return err
-		} else if err != nil {
-			return fmt.Errorf("replica wal reader: %w", err)
-		}
-		defer rd.Close()
+	if _, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f); err != nil {
+		return fmt.Errorf("write ltx file: %w", err)
+	}
+	r.Logger().Debug("ltx file uploaded", "filename", filename, "minTXID", minTXID, "maxTXID", maxTXID)
 
-		// Copy shadow WAL to client write via io.Pipe().
-		pr, pw := io.Pipe()
-		defer func() { _ = pw.CloseWithError(err) }()
+	// Track current position
+	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
+	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
-		// Obtain initial position from shadow reader.
-		// It may have moved to the next index if previous position was at the end.
-		pos := rd.Pos()
-		initialPos := pos
-		startTime := time.Now()
-		var bytesWritten int
-
-		logger := r.Logger()
-		logger.Info("write wal segment", "position", initialPos.String())
-
-		// Copy through pipe into client from the starting position.
-		var g errgroup.Group
-		g.Go(func() error {
-			_, err := r.Client.WriteWALSegment(ctx, pos, pr)
-
-			// Always close pipe reader to signal writers.
-			if e := pr.CloseWithError(err); err == nil {
-				return e
-			}
-
-			return err
-		})
-
-		var ew io.WriteCloser = pw
-
-		// Wrap writer to LZ4 compress.
-		zw := lz4.NewWriter(ew)
-
-		// Track total WAL bytes written to replica client.
-		walBytesCounter := replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name())
-
-		// Copy header if at offset zero.
-		var psalt uint64 // previous salt value
-		if pos := rd.Pos(); pos.Offset == 0 {
-			buf := make([]byte, WALHeaderSize)
-			if _, err := io.ReadFull(rd, buf); err != nil {
-				return err
-			}
-
-			psalt = binary.BigEndian.Uint64(buf[16:24])
-
-			n, err := zw.Write(buf)
-			if err != nil {
-				return err
-			}
-			walBytesCounter.Add(float64(n))
-			bytesWritten += n
-		}
-
-		// Copy frames.
-		for {
-			pos := rd.Pos()
-			assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
-
-			buf := make([]byte, WALFrameHeaderSize+r.db.pageSize)
-			if _, err := io.ReadFull(rd, buf); err == io.EOF {
-				break
-			} else if err != nil {
-				return err
-			}
-
-			// Verify salt matches the previous frame/header read.
-			salt := binary.BigEndian.Uint64(buf[8:16])
-			if psalt != 0 && psalt != salt {
-				return fmt.Errorf("replica salt mismatch: %s", pos.String())
-			}
-			psalt = salt
-
-			n, err := zw.Write(buf)
-			if err != nil {
-				return err
-			}
-			walBytesCounter.Add(float64(n))
-			bytesWritten += n
-		}
-
-		// Flush LZ4 writer, encryption writer and close pipe.
-		if err := zw.Close(); err != nil {
-			return err
-		} else if err := ew.Close(); err != nil {
-			return err
-		} else if err := pw.Close(); err != nil {
-			return err
-		}
-
-		// Wait for client to finish write.
-		if err := g.Wait(); err != nil {
-			return fmt.Errorf("client write: %w", err)
-		}
-
-		// Save last replicated position.
-		r.mu.Lock()
-		r.pos = rd.Pos()
-		r.mu.Unlock()
-
-		// Track current position
-		replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
-		replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
-
-		logger.Info("wal segment written", "position", initialPos.String(), "elapsed", time.Since(startTime).String(), "sz", bytesWritten)
-		return nil
-	*/
+	return nil
 }
 
-// calcPos returns the last position saved to the replica.
+// calcPos returns the last position saved to the replica for level 0.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
-	panic("TODO: Implement Replica.calcPos()")
-	/*
-		// Determine last LTX file saved.
-		minTXID, maxTXID, err := r.maxLTXFile(ctx, 0)
-		if err != nil {
-			return pos, fmt.Errorf("max ltx file: %w", err)
-		} else if maxTXID == nil {
-			return ltx.Pos{}, nil
-		}
-
-		// Read segment to determine size to add to offset.
-		f, err := r.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID)
-		if err != nil {
-			return pos, fmt.Errorf("open ltx file: %w", err)
-		}
-		defer f.Close()
-
-		dec := ltx.NewDecoder(f)
-		if err := dec.Verify(); err != nil {
-			return ltx.Pos{}, fmt.Errorf("verify ltx file: %w", err)
-		}
-
-		return dec.PostApplyPos(), nil
-	*/
+	_, maxTXID, err := r.maxLTXFile(ctx, 0)
+	if err != nil {
+		return pos, fmt.Errorf("max ltx file: %w", err)
+	}
+	return ltx.Pos{TXID: maxTXID}, nil
 }
 
 // maxLTXFile returns the min & max TXID of the last LTX file for a given level.
@@ -376,130 +236,12 @@ func (r *Replica) Pos() ltx.Pos {
 	return r.pos
 }
 
-/*
-// Snapshots returns a list of all snapshots.
-func (r *Replica) Snapshots(ctx context.Context) ([]SnapshotInfo, error) {
-	var a []SnapshotInfo
-
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	other, err := SliceSnapshotIterator(itr)
-	if err != nil {
-		return nil, err
-	}
-	a = append(a, other...)
-
-	if err := itr.Close(); err != nil {
-		return nil, err
-	}
-
-	sort.Sort(SnapshotInfoSlice(a))
-
-	return a, nil
+// SetPos sets the current replicated position.
+func (r *Replica) SetPos(pos ltx.Pos) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.pos = pos
 }
-
-// Snapshot copies the entire database to the replica path.
-func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
-	if r.db == nil || r.db.db == nil {
-		return info, fmt.Errorf("no database available")
-	}
-
-	r.muf.Lock()
-	defer r.muf.Unlock()
-
-	// Issue a passive checkpoint to flush any pages to disk before snapshotting.
-	if err := r.db.Checkpoint(ctx, CheckpointModePassive); err != nil {
-		return info, fmt.Errorf("pre-snapshot checkpoint: %w", err)
-	}
-
-	// Prevent internal checkpoints during snapshot.
-	r.db.BeginSnapshot()
-	defer r.db.EndSnapshot()
-
-	// Acquire a read lock on the database during snapshot to prevent external checkpoints.
-	tx, err := r.db.db.Begin()
-	if err != nil {
-		return info, err
-	} else if _, err := tx.ExecContext(ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
-		_ = tx.Rollback()
-		return info, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Obtain current position.
-	pos, err := r.db.Pos()
-	if err != nil {
-		return info, fmt.Errorf("cannot determine db position: %w", err)
-	}
-	// TODO(gen): ???
-	//else if pos.IsZero() {
-	//	return info, ErrNoGeneration
-	//}
-
-	// Open db file descriptor, if not already open, & position at beginning.
-	if r.f == nil {
-		if r.f, err = os.Open(r.db.Path()); err != nil {
-			return info, err
-		}
-	}
-	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
-		return info, err
-	}
-
-	// Use a pipe to convert the LZ4 writer to a reader.
-	pr, pw := io.Pipe()
-
-	// Copy the database file to the LZ4 writer in a separate goroutine.
-	var g errgroup.Group
-	g.Go(func() error {
-		// We need to ensure the pipe is closed.
-		defer pw.Close()
-
-		var wc io.WriteCloser = pw
-
-		// Add encryption if we have recipients.
-		if len(r.AgeRecipients) > 0 {
-			var err error
-			wc, err = age.Encrypt(pw, r.AgeRecipients...)
-			if err != nil {
-				pw.CloseWithError(err)
-				return err
-			}
-			defer wc.Close()
-		}
-
-		zr := lz4.NewWriter(wc)
-		defer zr.Close()
-
-		if _, err := io.Copy(zr, r.f); err != nil {
-			pw.CloseWithError(err)
-			return err
-		} else if err := zr.Close(); err != nil {
-			pw.CloseWithError(err)
-			return err
-		}
-		return wc.Close()
-	})
-
-	logger := r.Logger()
-	logger.Info("write snapshot", "position", pos.String())
-
-	startTime := time.Now()
-	// Delegate write to client & wait for writer goroutine to finish.
-	if info, err = r.Client.WriteSnapshot(ctx, pos.Index, pr); err != nil {
-		return info, err
-	} else if err := g.Wait(); err != nil {
-		return info, err
-	}
-
-	logger.Info("snapshot written", "position", pos.String(), "elapsed", time.Since(startTime).String(), "sz", info.Size)
-	return info, nil
-}
-*/
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
 // Older snapshots and WAL files are then removed.
