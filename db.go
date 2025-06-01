@@ -753,6 +753,7 @@ func (db *DB) verify() (info syncInfo, err error) {
 	if ok, err := db.ltxDecoderContains(dec, pgno, buf[WALFrameHeaderSize:]); err != nil {
 		return info, fmt.Errorf("ltx contains: %w", err)
 	} else if !ok {
+		db.Logger.Debug("cannot find last page in last ltx file", "pgno", pgno)
 		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
@@ -763,6 +764,9 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
+	println("dbg/src", pgno)
+	println(internal.Hexdump(data))
+
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
@@ -772,12 +776,18 @@ func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bo
 			return false, fmt.Errorf("decode ltx page: %w", err)
 		}
 
+		println("dbg/ltx", hdr.Pgno)
+		println(internal.Hexdump(buf))
+
 		if pgno != hdr.Pgno {
+			println("dbg/mismatch.pgno")
 			continue
 		}
 		if !bytes.Equal(data, buf) {
+			println("dbg/mismatch.data")
 			continue
 		}
+		println("dbg/ok")
 		return true, nil
 	}
 }
