@@ -639,8 +639,6 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	db.notify = make(chan struct{})
 	// }
 
-	db.Logger.Debug("sync: ok")
-
 	return nil
 }
 
@@ -764,9 +762,6 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
-	println("dbg/src", pgno)
-	println(internal.Hexdump(data))
-
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
@@ -776,18 +771,12 @@ func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bo
 			return false, fmt.Errorf("decode ltx page: %w", err)
 		}
 
-		println("dbg/ltx", hdr.Pgno)
-		println(internal.Hexdump(buf))
-
 		if pgno != hdr.Pgno {
-			println("dbg/mismatch.pgno")
 			continue
 		}
 		if !bytes.Equal(data, buf) {
-			println("dbg/mismatch.data")
 			continue
 		}
-		println("dbg/ok")
 		return true, nil
 	}
 }
@@ -813,8 +802,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	db.Logger.Debug("sync",
 		"txid", txID.String(),
 		"checkpointing", checkpointing,
-		"offset", info.offset,
 		"snapshotting", info.snapshotting,
+		"offset", info.offset,
+		"salt", [2]uint32{info.salt1, info.salt2},
 		"reason", info.reason)
 
 	// Prevent internal checkpoints during sync. Ignore if already in a checkpoint.
@@ -861,6 +851,12 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	}
 	if walCommit > 0 {
 		commit = walCommit
+	}
+
+	// Exit if we have no new WAL pages and we aren't snapshotting.
+	if !info.snapshotting && sz == 0 {
+		db.Logger.Debug("sync: skip", "reason", "no new wal pages")
+		return nil
 	}
 
 	tmpFilename := filename + ".tmp"
@@ -932,6 +928,8 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	if err := os.Rename(tmpFilename, filename); err != nil {
 		return fmt.Errorf("rename ltx file: %w", err)
 	}
+
+	db.Logger.Debug("sync: ok")
 
 	return nil
 }

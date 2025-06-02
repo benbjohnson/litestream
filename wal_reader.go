@@ -40,11 +40,6 @@ func NewWALReader(rd io.ReaderAt, logger *slog.Logger) (*WALReader, error) {
 // Salt must match or else no frames will be returned. Checksum calculated from
 // from previous page.
 func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, logger *slog.Logger) (*WALReader, error) {
-	logger.Debug("NewWALReaderWithOffset",
-		"offset", offset,
-		"salt1", salt1,
-		"salt2", salt2)
-
 	// Ensure we are not starting on the first page since we need to read the previous.
 	if offset <= WALHeaderSize {
 		return nil, fmt.Errorf("offset (%d) must be greater than the wal header size (%d)", offset, WALHeaderSize)
@@ -127,14 +122,6 @@ func (r *WALReader) readHeader() error {
 	r.salt2 = binary.BigEndian.Uint32(hdr[20:])
 	r.chksum1, r.chksum2 = chksum1, chksum2
 
-	r.logger.Debug("WALReader.ReadHeader",
-		"pageSize", r.pageSize,
-		"seq", r.seq,
-		"salt1", r.salt1,
-		"salt2", r.salt2,
-		"chksum1", r.chksum1,
-		"chksum2", r.chksum2)
-
 	return nil
 }
 
@@ -155,7 +142,6 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 	// Read WAL frame header.
 	hdr := make([]byte, WALFrameHeaderSize)
 	if n, err := r.r.ReadAt(hdr, offset); n != len(hdr) {
-		r.logger.Debug("invalid wal frame", "reason", "short frame header", "offset", offset, "n", n)
 		return 0, 0, io.EOF
 	} else if err != nil {
 		return 0, 0, err
@@ -163,7 +149,6 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 
 	// Read WAL page data.
 	if n, err := r.r.ReadAt(data, offset+WALFrameHeaderSize); n != len(data) {
-		r.logger.Debug("invalid wal frame", "reason", "short frame data", "offset", offset, "n", n)
 		return 0, 0, io.EOF
 	} else if err != nil {
 		return 0, 0, err
@@ -173,7 +158,6 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 	salt1 := binary.BigEndian.Uint32(hdr[8:])
 	salt2 := binary.BigEndian.Uint32(hdr[12:])
 	if r.salt1 != salt1 || r.salt2 != salt2 {
-		r.logger.Debug("invalid wal frame", "reason", "salt mismatch", "offset", offset)
 		return 0, 0, io.EOF
 	}
 
@@ -185,7 +169,6 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 		r.chksum1, r.chksum2 = WALChecksum(r.bo, r.chksum1, r.chksum2, hdr[:8]) // frame header
 		r.chksum1, r.chksum2 = WALChecksum(r.bo, r.chksum1, r.chksum2, data)    // frame data
 		if r.chksum1 != chksum1 || r.chksum2 != chksum2 {
-			r.logger.Debug("invalid wal frame", "reason", "checksum mismatch", "offset", offset)
 			return 0, 0, io.EOF
 		}
 	} else {
@@ -194,8 +177,6 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 
 	pgno = binary.BigEndian.Uint32(hdr[0:])
 	commit = binary.BigEndian.Uint32(hdr[4:])
-
-	r.logger.Debug("read frame", "frameN", r.frameN, "pgno", pgno, "commit", commit)
 
 	r.frameN++
 
@@ -233,7 +214,6 @@ func (r *WALReader) PageMap() (m map[uint32]int64, size int64, commit uint32, er
 
 	// If full transactions available, return the original offset.
 	if len(m) == 0 {
-		r.logger.Debug("no transactions in page map")
 		return m, 0, 0, nil
 	}
 
