@@ -613,7 +613,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	for itr.Next() {
 		info := itr.Item()
-		if info.MinTXID > opt.TXID {
+		if opt.TXID > info.MinTXID {
 			break
 		}
 
@@ -629,6 +629,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		rdrs = append(rdrs, f)
 	}
 
+	if len(rdrs) == 0 {
+		return fmt.Errorf("no matching backup files available")
+	}
+
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
 	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
@@ -639,9 +643,17 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	c := ltx.NewCompactor(f, rdrs)
-	if err := c.Compact(ctx); err != nil {
-		return fmt.Errorf("compact ltx files: %w", err)
+	pr, pw := io.Pipe()
+
+	go func() {
+		c := ltx.NewCompactor(pw, rdrs)
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		_ = pw.CloseWithError(c.Compact(ctx))
+	}()
+
+	dec := ltx.NewDecoder(pr)
+	if err := dec.DecodeDatabaseTo(f); err != nil {
+		return fmt.Errorf("decode database: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {

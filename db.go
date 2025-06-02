@@ -121,7 +121,7 @@ func NewDB(path string) *DB {
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
 		BusyTimeout:        DefaultBusyTimeout,
-		Logger:             slog.With("db", path),
+		Logger:             slog.With("db", filepath.Base(path)),
 	}
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -801,10 +801,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	filename := db.LTXPath(0, txID, txID)
 	db.Logger.Debug("sync",
 		"txid", txID.String(),
-		"checkpointing", checkpointing,
-		"snapshotting", info.snapshotting,
+		"chkpt", checkpointing,
+		"snap", info.snapshotting,
 		"offset", info.offset,
-		"salt", [2]uint32{info.salt1, info.salt2},
 		"reason", info.reason)
 
 	// Prevent internal checkpoints during sync. Ignore if already in a checkpoint.
