@@ -2,24 +2,19 @@ package litestream
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"hash/crc64"
 	"io"
 	"log/slog"
-	"math"
 	"os"
 	"path/filepath"
-	"sort"
 	"sync"
 	"time"
 
 	"filippo.io/age"
-	"github.com/benbjohnson/litestream/internal"
-	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"golang.org/x/sync/errgroup"
+	"github.com/superfly/ltx"
 )
 
 // Default replica settings.
@@ -37,7 +32,7 @@ type Replica struct {
 	name string
 
 	mu  sync.RWMutex
-	pos Pos // current replicated position
+	pos ltx.Pos // current replicated position
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -50,9 +45,6 @@ type Replica struct {
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
-
-	// Frequency to create new snapshots.
-	SnapshotInterval time.Duration
 
 	// Time to keep snapshots and related WAL files.
 	// Database is snapshotted after interval, if needed, and older WAL files are discarded.
@@ -122,10 +114,9 @@ func (r *Replica) Start(ctx context.Context) error {
 	ctx, r.cancel = context.WithCancel(ctx)
 
 	// Start goroutine to replicate data.
-	r.wg.Add(4)
+	r.wg.Add(3)
 	go func() { defer r.wg.Done(); r.monitor(ctx) }()
 	go func() { defer r.wg.Done(); r.retainer(ctx) }()
-	go func() { defer r.wg.Done(); r.snapshotter(ctx) }()
 	go func() { defer r.wg.Done(); r.validator(ctx) }()
 
 	return nil
@@ -156,10 +147,19 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	defer func() {
 		if err != nil {
 			r.mu.Lock()
-			r.pos = Pos{}
+			r.pos = ltx.Pos{}
 			r.mu.Unlock()
 		}
 	}()
+
+	// Calculate current replica position, if unknown.
+	if r.Pos().IsZero() {
+		pos, err := r.calcPos(ctx)
+		if err != nil {
+			return fmt.Errorf("calc pos: %w", err)
+		}
+		r.SetPos(pos)
+	}
 
 	// Find current position of database.
 	dpos, err := r.db.Pos()
@@ -169,469 +169,131 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("no position, waiting for data")
 	}
 
-	r.Logger().Debug("replica sync", "position", dpos.String())
+	r.Logger().Debug("replica sync", "txid", dpos.TXID.String())
 
-	// TODO(gen): Figure out how to resnapshot
-	/*
-		// Create a new snapshot and update the current replica position if
-		// the generation on the database has changed.
-		if r.Pos().Generation != generation {
-			// Create snapshot if no snapshots exist for generation.
-			snapshotN, err := r.snapshotN(ctx, generation)
-			if err != nil {
-				return err
-			} else if snapshotN == 0 {
-				if info, err := r.Snapshot(ctx); err != nil {
-					return err
-				} else if info.Generation != generation {
-					return fmt.Errorf("generation changed during snapshot, exiting sync")
-				}
-			}
-
-			pos, err := r.calcPos(ctx)
-			if err != nil {
-				return fmt.Errorf("cannot determine replica position: %s", err)
-			}
-
-			r.Logger().Debug("replica sync: calc new pos", "position", pos.String())
-			r.mu.Lock()
-			r.pos = pos
-			r.mu.Unlock()
-		}
-	*/
-
-	// Read all WAL files since the last position.
-	for {
-		if err = r.syncWAL(ctx); err == io.EOF {
-			break
-		} else if err != nil {
+	// Replicate all L0 LTX files since last replica position.
+	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+		if err = r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return err
 		}
+		r.SetPos(ltx.Pos{TXID: txID})
 	}
 
 	return nil
 }
 
-func (r *Replica) syncWAL(ctx context.Context) (err error) {
-	rd, err := r.db.ShadowWALReader(r.Pos())
-	if err == io.EOF {
-		return err
-	} else if err != nil {
-		return fmt.Errorf("replica wal reader: %w", err)
-	}
-	defer rd.Close()
-
-	// Copy shadow WAL to client write via io.Pipe().
-	pr, pw := io.Pipe()
-	defer func() { _ = pw.CloseWithError(err) }()
-
-	// Obtain initial position from shadow reader.
-	// It may have moved to the next index if previous position was at the end.
-	pos := rd.Pos()
-	initialPos := pos
-	startTime := time.Now()
-	var bytesWritten int
-
-	logger := r.Logger()
-	logger.Info("write wal segment", "position", initialPos.String())
-
-	// Copy through pipe into client from the starting position.
-	var g errgroup.Group
-	g.Go(func() error {
-		_, err := r.Client.WriteWALSegment(ctx, pos, pr)
-
-		// Always close pipe reader to signal writers.
-		if e := pr.CloseWithError(err); err == nil {
-			return e
-		}
-
-		return err
-	})
-
-	var ew io.WriteCloser = pw
-
-	// Add encryption if we have recipients.
-	if len(r.AgeRecipients) > 0 {
-		var err error
-		ew, err = age.Encrypt(pw, r.AgeRecipients...)
-		if err != nil {
-			return err
-		}
-		defer ew.Close()
-	}
-
-	// Wrap writer to LZ4 compress.
-	zw := lz4.NewWriter(ew)
-
-	// Track total WAL bytes written to replica client.
-	walBytesCounter := replicaWALBytesCounterVec.WithLabelValues(r.db.Path(), r.Name())
-
-	// Copy header if at offset zero.
-	var psalt uint64 // previous salt value
-	if pos := rd.Pos(); pos.Offset == 0 {
-		buf := make([]byte, WALHeaderSize)
-		if _, err := io.ReadFull(rd, buf); err != nil {
-			return err
-		}
-
-		psalt = binary.BigEndian.Uint64(buf[16:24])
-
-		n, err := zw.Write(buf)
-		if err != nil {
-			return err
-		}
-		walBytesCounter.Add(float64(n))
-		bytesWritten += n
-	}
-
-	// Copy frames.
-	for {
-		pos := rd.Pos()
-		assert(pos.Offset == frameAlign(pos.Offset, r.db.pageSize), "shadow wal reader not frame aligned")
-
-		buf := make([]byte, WALFrameHeaderSize+r.db.pageSize)
-		if _, err := io.ReadFull(rd, buf); err == io.EOF {
-			break
-		} else if err != nil {
-			return err
-		}
-
-		// Verify salt matches the previous frame/header read.
-		salt := binary.BigEndian.Uint64(buf[8:16])
-		if psalt != 0 && psalt != salt {
-			return fmt.Errorf("replica salt mismatch: %s", pos.String())
-		}
-		psalt = salt
-
-		n, err := zw.Write(buf)
-		if err != nil {
-			return err
-		}
-		walBytesCounter.Add(float64(n))
-		bytesWritten += n
-	}
-
-	// Flush LZ4 writer, encryption writer and close pipe.
-	if err := zw.Close(); err != nil {
-		return err
-	} else if err := ew.Close(); err != nil {
-		return err
-	} else if err := pw.Close(); err != nil {
+func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (err error) {
+	filename := r.db.LTXPath(level, minTXID, maxTXID)
+	f, err := os.Open(filename)
+	if err != nil {
 		return err
 	}
+	defer func() { _ = f.Close() }()
 
-	// Wait for client to finish write.
-	if err := g.Wait(); err != nil {
-		return fmt.Errorf("client write: %w", err)
+	if _, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f); err != nil {
+		return fmt.Errorf("write ltx file: %w", err)
 	}
-
-	// Save last replicated position.
-	r.mu.Lock()
-	r.pos = rd.Pos()
-	r.mu.Unlock()
+	r.Logger().Debug("ltx file uploaded", "filename", filename, "minTXID", minTXID, "maxTXID", maxTXID)
 
 	// Track current position
-	replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
-	replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
+	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
+	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
-	logger.Info("wal segment written", "position", initialPos.String(), "elapsed", time.Since(startTime).String(), "sz", bytesWritten)
 	return nil
 }
 
-// snapshotN returns the number of snapshots.
-func (r *Replica) snapshotN(ctx context.Context) (int, error) {
-	itr, err := r.Client.Snapshots(ctx)
+// calcPos returns the last position saved to the replica for level 0.
+func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
+	_, maxTXID, err := r.maxLTXFile(ctx, 0)
 	if err != nil {
-		return 0, err
+		return pos, fmt.Errorf("max ltx file: %w", err)
+	}
+	return ltx.Pos{TXID: maxTXID}, nil
+}
+
+// maxLTXFile returns the min & max TXID of the last LTX file for a given level.
+func (r *Replica) maxLTXFile(ctx context.Context, level int) (minTXID, maxTXID ltx.TXID, err error) {
+	itr, err := r.Client.LTXFiles(ctx, level)
+	if err != nil {
+		return 0, 0, err
 	}
 	defer itr.Close()
 
-	var n int
 	for itr.Next() {
-		n++
-	}
-	return n, itr.Close()
-}
-
-// calcPos returns the last position for the given generation.
-func (r *Replica) calcPos(ctx context.Context) (pos Pos, err error) {
-	// Fetch last snapshot. Return error if no snapshots exist.
-	snapshot, err := r.maxSnapshot(ctx)
-	if err != nil {
-		return pos, fmt.Errorf("max snapshot: %w", err)
-	} else if snapshot == nil {
-		return pos, fmt.Errorf("no snapshot available")
-	}
-
-	// Determine last WAL segment available. Use snapshot if none exist.
-	segment, err := r.maxWALSegment(ctx)
-	if err != nil {
-		return pos, fmt.Errorf("max wal segment: %w", err)
-	} else if segment == nil {
-		return Pos{Index: snapshot.Index}, nil
-	}
-
-	// Read segment to determine size to add to offset.
-	rd, err := r.Client.WALSegmentReader(ctx, segment.Pos())
-	if err != nil {
-		return pos, fmt.Errorf("wal segment reader: %w", err)
-	}
-	defer rd.Close()
-
-	if len(r.AgeIdentities) > 0 {
-		drd, err := age.Decrypt(rd, r.AgeIdentities...)
-		if err != nil {
-			return pos, err
-		}
-
-		rd = io.NopCloser(drd)
-	}
-
-	n, err := io.Copy(io.Discard, lz4.NewReader(rd))
-	if err != nil {
-		return pos, err
-	}
-
-	// Return the position at the end of the last WAL segment.
-	return Pos{
-		Index:  segment.Index,
-		Offset: segment.Offset + n,
-	}, nil
-}
-
-// maxSnapshot returns the last snapshot.
-func (r *Replica) maxSnapshot(ctx context.Context) (*SnapshotInfo, error) {
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	var max *SnapshotInfo
-	for itr.Next() {
-		if info := itr.Snapshot(); max == nil || info.Index > max.Index {
-			max = &info
+		info := itr.Item()
+		if info.MaxTXID > maxTXID {
+			minTXID, maxTXID = info.MinTXID, info.MaxTXID
 		}
 	}
-	return max, itr.Close()
-}
-
-// maxWALSegment returns the highest WAL segment.
-func (r *Replica) maxWALSegment(ctx context.Context) (*WALSegmentInfo, error) {
-	itr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	var max *WALSegmentInfo
-	for itr.Next() {
-		if info := itr.WALSegment(); max == nil || info.Index > max.Index || (info.Index == max.Index && info.Offset > max.Offset) {
-			max = &info
-		}
-	}
-	return max, itr.Close()
+	return minTXID, maxTXID, itr.Close()
 }
 
 // Pos returns the current replicated position.
 // Returns a zero value if the current position cannot be determined.
-func (r *Replica) Pos() Pos {
+func (r *Replica) Pos() ltx.Pos {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.pos
 }
 
-// Snapshots returns a list of all snapshots.
-func (r *Replica) Snapshots(ctx context.Context) ([]SnapshotInfo, error) {
-	var a []SnapshotInfo
-
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	other, err := SliceSnapshotIterator(itr)
-	if err != nil {
-		return nil, err
-	}
-	a = append(a, other...)
-
-	if err := itr.Close(); err != nil {
-		return nil, err
-	}
-
-	sort.Sort(SnapshotInfoSlice(a))
-
-	return a, nil
-}
-
-// Snapshot copies the entire database to the replica path.
-func (r *Replica) Snapshot(ctx context.Context) (info SnapshotInfo, err error) {
-	if r.db == nil || r.db.db == nil {
-		return info, fmt.Errorf("no database available")
-	}
-
-	r.muf.Lock()
-	defer r.muf.Unlock()
-
-	// Issue a passive checkpoint to flush any pages to disk before snapshotting.
-	if err := r.db.Checkpoint(ctx, CheckpointModePassive); err != nil {
-		return info, fmt.Errorf("pre-snapshot checkpoint: %w", err)
-	}
-
-	// Prevent internal checkpoints during snapshot.
-	r.db.BeginSnapshot()
-	defer r.db.EndSnapshot()
-
-	// Acquire a read lock on the database during snapshot to prevent external checkpoints.
-	tx, err := r.db.db.Begin()
-	if err != nil {
-		return info, err
-	} else if _, err := tx.ExecContext(ctx, `SELECT COUNT(1) FROM _litestream_seq;`); err != nil {
-		_ = tx.Rollback()
-		return info, err
-	}
-	defer func() { _ = tx.Rollback() }()
-
-	// Obtain current position.
-	pos, err := r.db.Pos()
-	if err != nil {
-		return info, fmt.Errorf("cannot determine db position: %w", err)
-	}
-	// TODO(gen): ???
-	//else if pos.IsZero() {
-	//	return info, ErrNoGeneration
-	//}
-
-	// Open db file descriptor, if not already open, & position at beginning.
-	if r.f == nil {
-		if r.f, err = os.Open(r.db.Path()); err != nil {
-			return info, err
-		}
-	}
-	if _, err := r.f.Seek(0, io.SeekStart); err != nil {
-		return info, err
-	}
-
-	// Use a pipe to convert the LZ4 writer to a reader.
-	pr, pw := io.Pipe()
-
-	// Copy the database file to the LZ4 writer in a separate goroutine.
-	var g errgroup.Group
-	g.Go(func() error {
-		// We need to ensure the pipe is closed.
-		defer pw.Close()
-
-		var wc io.WriteCloser = pw
-
-		// Add encryption if we have recipients.
-		if len(r.AgeRecipients) > 0 {
-			var err error
-			wc, err = age.Encrypt(pw, r.AgeRecipients...)
-			if err != nil {
-				pw.CloseWithError(err)
-				return err
-			}
-			defer wc.Close()
-		}
-
-		zr := lz4.NewWriter(wc)
-		defer zr.Close()
-
-		if _, err := io.Copy(zr, r.f); err != nil {
-			pw.CloseWithError(err)
-			return err
-		} else if err := zr.Close(); err != nil {
-			pw.CloseWithError(err)
-			return err
-		}
-		return wc.Close()
-	})
-
-	logger := r.Logger()
-	logger.Info("write snapshot", "position", pos.String())
-
-	startTime := time.Now()
-	// Delegate write to client & wait for writer goroutine to finish.
-	if info, err = r.Client.WriteSnapshot(ctx, pos.Index, pr); err != nil {
-		return info, err
-	} else if err := g.Wait(); err != nil {
-		return info, err
-	}
-
-	logger.Info("snapshot written", "position", pos.String(), "elapsed", time.Since(startTime).String(), "sz", info.Size)
-	return info, nil
+// SetPos sets the current replicated position.
+func (r *Replica) SetPos(pos ltx.Pos) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	r.pos = pos
 }
 
 // EnforceRetention forces a new snapshot once the retention interval has passed.
 // Older snapshots and WAL files are then removed.
 func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
-	// Obtain list of snapshots that are within the retention period.
-	snapshots, err := r.Snapshots(ctx)
-	if err != nil {
-		return fmt.Errorf("snapshots: %w", err)
-	}
-	retained := FilterSnapshotsAfter(snapshots, time.Now().Add(-r.Retention))
+	panic("TODO(ltx): Re-implement after multi-level compaction")
 
-	// If no retained snapshots exist, create a new snapshot.
-	if len(retained) == 0 {
-		snapshot, err := r.Snapshot(ctx)
+	/*
+		// Obtain list of snapshots that are within the retention period.
+		snapshots, err := r.Snapshots(ctx)
 		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
+			return fmt.Errorf("snapshots: %w", err)
 		}
-		retained = append(retained, snapshot)
-	}
+		retained := FilterSnapshotsAfter(snapshots, time.Now().Add(-r.Retention))
 
-	// Delete unretained snapshots & WAL files.
-	snapshot := FindMinSnapshot(retained)
+		// If no retained snapshots exist, create a new snapshot.
+		if len(retained) == 0 {
+			snapshot, err := r.Snapshot(ctx)
+			if err != nil {
+				return fmt.Errorf("snapshot: %w", err)
+			}
+			retained = append(retained, snapshot)
+		}
 
-	// Otherwise remove all earlier snapshots & WAL segments.
-	if err := r.deleteSnapshotsBeforeIndex(ctx, snapshot.Index); err != nil {
-		return fmt.Errorf("delete snapshots before index: %w", err)
-	} else if err := r.deleteWALSegmentsBeforeIndex(ctx, snapshot.Index); err != nil {
-		return fmt.Errorf("delete wal segments before index: %w", err)
-	}
+		// Delete unretained snapshots & WAL files.
+		snapshot := FindMinSnapshot(retained)
 
-	return nil
+		// Otherwise remove all earlier snapshots & WAL segments.
+		if err := r.deleteSnapshotsBeforeIndex(ctx, snapshot.Index); err != nil {
+			return fmt.Errorf("delete snapshots before index: %w", err)
+		} else if err := r.deleteWALSegmentsBeforeIndex(ctx, snapshot.Index); err != nil {
+			return fmt.Errorf("delete wal segments before index: %w", err)
+		}
+
+		return nil
+	*/
 }
 
-func (r *Replica) deleteSnapshotsBeforeIndex(ctx context.Context, index int) error {
-	itr, err := r.Client.Snapshots(ctx)
+/*
+func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID) error {
+	itr, err := r.Client.LTXFiles(ctx, level)
 	if err != nil {
-		return fmt.Errorf("fetch snapshots: %w", err)
+		return fmt.Errorf("fetch ltx files: %w", err)
 	}
 	defer itr.Close()
 
+	var a []*ltx.FileInfo
 	for itr.Next() {
-		info := itr.Snapshot()
-		if info.Index >= index {
+		info := itr.Item()
+		if info.MinTXID >= txID {
 			continue
 		}
-
-		if err := r.Client.DeleteSnapshot(ctx, info.Index); err != nil {
-			return fmt.Errorf("delete snapshot %08x: %w", info.Index, err)
-		}
-		r.Logger().Info("snapshot deleted", "index", index)
-	}
-
-	return itr.Close()
-}
-
-func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, index int) error {
-	itr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return fmt.Errorf("fetch wal segments: %w", err)
-	}
-	defer itr.Close()
-
-	var a []Pos
-	for itr.Next() {
-		info := itr.WALSegment()
-		if info.Index >= index {
-			continue
-		}
-		a = append(a, info.Pos())
+		a = append(a, info)
 	}
 	if err := itr.Close(); err != nil {
 		return err
@@ -641,13 +303,18 @@ func (r *Replica) deleteWALSegmentsBeforeIndex(ctx context.Context, index int) e
 		return nil
 	}
 
-	if err := r.Client.DeleteWALSegments(ctx, a); err != nil {
+	if err := r.Client.DeleteLTXFiles(ctx, a); err != nil {
 		return fmt.Errorf("delete wal segments: %w", err)
 	}
 
-	r.Logger().Info("wal segmented deleted before", "index", index, "n", len(a))
+	r.Logger().Info("ltx files deleted before",
+		slog.Int("level", level),
+		slog.String("txID", txID.String()),
+		slog.Int("n", len(a)))
+
 	return nil
 }
+*/
 
 // monitor runs in a separate goroutine and continuously replicates the DB.
 func (r *Replica) monitor(ctx context.Context) {
@@ -716,53 +383,6 @@ func (r *Replica) retainer(ctx context.Context) {
 	}
 }
 
-// snapshotter runs in a separate goroutine and handles snapshotting.
-func (r *Replica) snapshotter(ctx context.Context) {
-	if r.SnapshotInterval <= 0 {
-		return
-	}
-
-	logger := r.Logger()
-	if pos, err := r.db.Pos(); err != nil {
-		logger.Error("snapshotter cannot determine position", "error", err)
-	} else if !pos.IsZero() {
-		if snapshot, err := r.maxSnapshot(ctx); err != nil {
-			logger.Error("snapshotter cannot determine latest snapshot", "error", err)
-		} else if snapshot != nil {
-			nextSnapshot := r.SnapshotInterval - time.Since(snapshot.CreatedAt)
-			if nextSnapshot < 0 {
-				nextSnapshot = 0
-			}
-
-			logger.Info("snapshot interval adjusted", "previous", snapshot.CreatedAt.Format(time.RFC3339), "next", nextSnapshot.String())
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(nextSnapshot):
-				if _, err := r.Snapshot(ctx); err != nil {
-					logger.Error("snapshotter error", "error", err)
-				}
-			}
-		}
-	}
-
-	ticker := time.NewTicker(r.SnapshotInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if _, err := r.Snapshot(ctx); err != nil {
-				r.Logger().Error("snapshotter error", "error", err)
-				continue
-			}
-		}
-	}
-}
-
 // validator runs in a separate goroutine and handles periodic validation.
 func (r *Replica) validator(ctx context.Context) {
 	// Initialize counters since validation occurs infrequently.
@@ -819,7 +439,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 	if err := r.Restore(ctx, RestoreOptions{
 		OutputPath:  restorePath,
 		ReplicaName: r.Name(),
-		Index:       pos.Index - 1,
+		TXID:        pos.TXID - 1,
 	}); err != nil {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
@@ -861,7 +481,7 @@ func (r *Replica) Validate(ctx context.Context) error {
 }
 
 // waitForReplica blocks until replica reaches at least the given position.
-func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
+func (r *Replica) waitForReplica(ctx context.Context, pos ltx.Pos) error {
 	ticker := time.NewTicker(500 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -888,19 +508,8 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 			continue
 		}
 
-		// TODO(gen): ???
-		/*
-			// Exit if the generation has changed while waiting as there will be
-			// no further progress on the old generation.
-			if curr.Generation != pos.Generation {
-				return fmt.Errorf("generation changed")
-			}
-		*/
-
 		ready := true
-		if curr.Index < pos.Index {
-			ready = false
-		} else if curr.Index == pos.Index && curr.Offset < pos.Offset {
+		if curr.TXID < pos.TXID {
 			ready = false
 		}
 
@@ -914,67 +523,34 @@ func (r *Replica) waitForReplica(ctx context.Context, pos Pos) error {
 	}
 }
 
-// CreatedAt returns the earliest creation time of any snapshot.
-// Returns zero time if no snapshots exist.
+// CreatedAt returns the earliest creation time of any LTX file.
+// Returns zero time if no LTX files exist.
 func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 	var min time.Time
 
-	itr, err := r.Client.Snapshots(ctx)
+	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
 		return min, err
 	}
 	defer itr.Close()
 
-	for itr.Next() {
-		if info := itr.Snapshot(); min.IsZero() || info.CreatedAt.Before(min) {
-			min = info.CreatedAt
-		}
+	if itr.Next() {
+		min = itr.Item().CreatedAt
 	}
 	return min, itr.Close()
 }
 
 // TimeBounds returns the creation time & last updated time.
-// Returns zero time if no snapshots or WAL segments exist.
+// Returns zero time if LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
-	// Iterate over snapshots.
-	sitr, err := r.Client.Snapshots(ctx)
+	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
 		return createdAt, updatedAt, err
 	}
-	defer sitr.Close()
+	defer itr.Close()
 
-	minIndex, maxIndex := -1, -1
-	for sitr.Next() {
-		info := sitr.Snapshot()
-		if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
-			createdAt = info.CreatedAt
-		}
-		if updatedAt.IsZero() || info.CreatedAt.After(updatedAt) {
-			updatedAt = info.CreatedAt
-		}
-		if minIndex == -1 || info.Index < minIndex {
-			minIndex = info.Index
-		}
-		if info.Index > maxIndex {
-			maxIndex = info.Index
-		}
-	}
-	if err := sitr.Close(); err != nil {
-		return createdAt, updatedAt, err
-	}
-
-	// Iterate over WAL segments.
-	witr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return createdAt, updatedAt, err
-	}
-	defer witr.Close()
-
-	for witr.Next() {
-		info := witr.WALSegment()
-		if info.Index < minIndex || info.Index > maxIndex {
-			continue
-		}
+	for itr.Next() {
+		info := itr.Item()
 		if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
 			createdAt = info.CreatedAt
 		}
@@ -982,11 +558,7 @@ func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Tim
 			updatedAt = info.CreatedAt
 		}
 	}
-	if err := witr.Close(); err != nil {
-		return createdAt, updatedAt, err
-	}
-
-	return createdAt, updatedAt, nil
+	return createdAt, updatedAt, itr.Close()
 }
 
 // CalcRestoreTarget returns a target time restore from.
@@ -1017,388 +589,92 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
 		return fmt.Errorf("output path required")
-	} else if opt.Index != math.MaxInt32 && !opt.Timestamp.IsZero() {
+	} else if opt.TXID != 0 && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot specify index & timestamp to restore")
 	}
 
 	// Ensure output path does not already exist.
 	if _, err := os.Stat(opt.OutputPath); err == nil {
 		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
-	} else if err != nil && !os.IsNotExist(err) {
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 
-	// Find lastest snapshot that occurs before timestamp or index.
-	var minWALIndex int
-	if opt.Index < math.MaxInt32 {
-		if minWALIndex, err = r.SnapshotIndexByIndex(ctx, opt.Index); err != nil {
-			return fmt.Errorf("cannot find snapshot index: %w", err)
-		}
-	} else {
-		if minWALIndex, err = r.SnapshotIndexAt(ctx, opt.Timestamp); err != nil {
-			return fmt.Errorf("cannot find snapshot index by timestamp: %w", err)
-		}
-	}
-
-	// Compute list of offsets for each WAL index.
-	walSegmentMap, err := r.walSegmentMap(ctx, minWALIndex, opt.Index, opt.Timestamp)
+	// Fetch every LTX file from TXID 1 to target TXID or timestamp.
+	itr, err := r.Client.LTXFiles(ctx, 0)
 	if err != nil {
-		return fmt.Errorf("cannot find max wal index for restore: %w", err)
+		return fmt.Errorf("cannot list ltx files: %w", err)
 	}
 
-	// Find the maximum WAL index that occurs before timestamp.
-	maxWALIndex := -1
-	for index := range walSegmentMap {
-		if index > maxWALIndex {
-			maxWALIndex = index
+	var rdrs []io.Reader
+	defer func() {
+		for _, rd := range rdrs {
+			_ = rd.(io.Closer).Close()
 		}
-	}
+	}()
 
-	// Ensure that we found the specific index, if one was specified.
-	if opt.Index != math.MaxInt32 && opt.Index != maxWALIndex {
-		return fmt.Errorf("unable to locate index %d, highest index was %d", opt.Index, maxWALIndex)
-	}
-
-	// If no WAL files were found, mark this as a snapshot-only restore.
-	snapshotOnly := maxWALIndex == -1
-
-	// Initialize starting position.
-	pos := Pos{Index: minWALIndex}
-	tmpPath := opt.OutputPath + ".tmp"
-
-	// Copy snapshot to output path.
-	r.Logger().Info("restoring snapshot", "index", minWALIndex, "path", tmpPath)
-	if err := r.restoreSnapshot(ctx, pos.Index, tmpPath); err != nil {
-		return fmt.Errorf("cannot restore snapshot: %w", err)
-	}
-
-	// If no WAL files available, move snapshot to final path & exit early.
-	if snapshotOnly {
-		r.Logger().Info("snapshot only, finalizing database")
-		return os.Rename(tmpPath, opt.OutputPath)
-	}
-
-	// Begin processing WAL files.
-	r.Logger().Info("restoring wal files", "index_min", minWALIndex, "index_max", maxWALIndex)
-
-	// Fill input channel with all WAL indexes to be loaded in order.
-	// Verify every index has at least one offset.
-	ch := make(chan int, maxWALIndex-minWALIndex+1)
-	for index := minWALIndex; index <= maxWALIndex; index++ {
-		if len(walSegmentMap[index]) == 0 {
-			return fmt.Errorf("missing WAL index: %08x", index)
-		}
-		ch <- index
-	}
-	close(ch)
-
-	// Track load state for each WAL.
-	var mu sync.Mutex
-	cond := sync.NewCond(&mu)
-	walStates := make([]walRestoreState, maxWALIndex-minWALIndex+1)
-
-	parallelism := opt.Parallelism
-	if parallelism < 1 {
-		parallelism = 1
-	}
-
-	// Download WAL files to disk in parallel.
-	g, ctx := errgroup.WithContext(ctx)
-	for i := 0; i < parallelism; i++ {
-		g.Go(func() error {
-			for {
-				select {
-				case <-ctx.Done():
-					cond.Broadcast()
-					return err
-				case index, ok := <-ch:
-					if !ok {
-						cond.Broadcast()
-						return nil
-					}
-
-					startTime := time.Now()
-
-					err := r.downloadWAL(ctx, index, walSegmentMap[index], tmpPath)
-					if err != nil {
-						err = fmt.Errorf("cannot download wal %08x: %w", index, err)
-					}
-
-					// Mark index as ready-to-apply and notify applying code.
-					mu.Lock()
-					walStates[index-minWALIndex] = walRestoreState{ready: true, err: err}
-					mu.Unlock()
-					cond.Broadcast()
-
-					// Returning the error here will cancel the other goroutines.
-					if err != nil {
-						return err
-					}
-
-					r.Logger().Info("downloaded wal",
-						"index", index,
-						"elapsed", time.Since(startTime).String(),
-					)
-				}
-			}
-		})
-	}
-
-	// Apply WAL files in order as they are ready.
-	for index := minWALIndex; index <= maxWALIndex; index++ {
-		// Wait until next WAL file is ready to apply.
-		mu.Lock()
-		for !walStates[index-minWALIndex].ready {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			cond.Wait()
-		}
-		if err := walStates[index-minWALIndex].err; err != nil {
-			return err
-		}
-		mu.Unlock()
-
-		// Apply WAL to database file.
-		startTime := time.Now()
-		if err = applyWAL(ctx, index, tmpPath); err != nil {
-			return fmt.Errorf("cannot apply wal: %w", err)
-		}
-		r.Logger().Info("applied wal", "index", index, "elapsed", time.Since(startTime).String())
-	}
-
-	// Ensure all goroutines finish. All errors should have been handled during
-	// the processing of WAL files but this ensures that all processing is done.
-	if err := g.Wait(); err != nil {
-		return err
-	}
-
-	// Copy file to final location.
-	r.Logger().Info("renaming database from temporary location")
-	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-type walRestoreState struct {
-	ready bool
-	err   error
-}
-
-// SnapshotIndexAt returns the highest index for a snapshot that occurs before timestamp.
-// If timestamp is zero, returns the latest snapshot.
-func (r *Replica) SnapshotIndexAt(ctx context.Context, timestamp time.Time) (int, error) {
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer itr.Close()
-
-	snapshotIndex := -1
-	var max time.Time
 	for itr.Next() {
-		snapshot := itr.Snapshot()
-		if !timestamp.IsZero() && snapshot.CreatedAt.After(timestamp) {
-			continue // after timestamp, skip
+		info := itr.Item()
+		if opt.TXID > info.MinTXID {
+			break
 		}
 
-		// Use snapshot if it newer.
-		if max.IsZero() || snapshot.CreatedAt.After(max) {
-			snapshotIndex, max = snapshot.Index, snapshot.CreatedAt
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return 0, err
-	} else if snapshotIndex == -1 {
-		return 0, ErrNoSnapshots
-	}
-	return snapshotIndex, nil
-}
+		// TODO(ltx): Check that timestamp is within bounds, if specified
 
-// SnapshotIndexbyIndex returns the highest index for a snapshot that occurs
-// before a given index. If index is MaxInt32, returns the latest snapshot.
-func (r *Replica) SnapshotIndexByIndex(ctx context.Context, index int) (int, error) {
-	itr, err := r.Client.Snapshots(ctx)
-	if err != nil {
-		return 0, err
-	}
-	defer itr.Close()
+		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-	snapshotIndex := -1
-	for itr.Next() {
-		snapshot := itr.Snapshot()
-
-		if index < math.MaxInt32 && snapshot.Index > index {
-			continue // after index, skip
-		}
-
-		// Use snapshot if it newer.
-		if snapshotIndex == -1 || snapshot.Index >= snapshotIndex {
-			snapshotIndex = snapshot.Index
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return 0, err
-	} else if snapshotIndex == -1 {
-		return 0, ErrNoSnapshots
-	}
-	return snapshotIndex, nil
-}
-
-// walSegmentMap returns a map of WAL indices to their segments.
-// Filters by a max timestamp or a max index.
-func (r *Replica) walSegmentMap(ctx context.Context, minIndex, maxIndex int, maxTimestamp time.Time) (map[int][]int64, error) {
-	itr, err := r.Client.WALSegments(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer itr.Close()
-
-	a := []WALSegmentInfo{}
-	for itr.Next() {
-		a = append(a, itr.WALSegment())
-	}
-
-	sort.Sort(WALSegmentInfoSlice(a))
-
-	m := make(map[int][]int64)
-	for _, info := range a {
-		// Exit if we go past the max timestamp or index.
-		if !maxTimestamp.IsZero() && info.CreatedAt.After(maxTimestamp) {
-			break // after max timestamp, skip
-		} else if info.Index > maxIndex {
-			break // after max index, skip
-		} else if info.Index < minIndex {
-			continue // before min index, continue
-		}
-
-		// Verify offsets are added in order.
-		offsets := m[info.Index]
-		if len(offsets) == 0 && info.Offset != 0 {
-			return nil, fmt.Errorf("missing initial wal segment: index=%08x offset=%d", info.Index, info.Offset)
-		} else if len(offsets) > 0 && offsets[len(offsets)-1] >= info.Offset {
-			return nil, fmt.Errorf("wal segments out of order: index=%08x offsets=(%d,%d)", info.Index, offsets[len(offsets)-1], info.Offset)
-		}
-
-		// Append to the end of the WAL file.
-		m[info.Index] = append(offsets, info.Offset)
-	}
-	return m, itr.Close()
-}
-
-// restoreSnapshot copies a snapshot from the replica to a file.
-func (r *Replica) restoreSnapshot(ctx context.Context, index int, filename string) error {
-	// Determine the user/group & mode based on the DB, if available.
-	var fileInfo, dirInfo os.FileInfo
-	if db := r.DB(); db != nil {
-		fileInfo, dirInfo = db.fileInfo, db.dirInfo
-	}
-
-	if err := internal.MkdirAll(filepath.Dir(filename), dirInfo); err != nil {
-		return err
-	}
-
-	f, err := internal.CreateFile(filename, fileInfo)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	rd, err := r.Client.SnapshotReader(ctx, index)
-	if err != nil {
-		return err
-	}
-	defer rd.Close()
-
-	if len(r.AgeIdentities) > 0 {
-		drd, err := age.Decrypt(rd, r.AgeIdentities...)
+		// Add file to be compacted.
+		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID)
 		if err != nil {
-			return err
+			return fmt.Errorf("open ltx file: %w", err)
 		}
-
-		rd = io.NopCloser(drd)
+		rdrs = append(rdrs, f)
 	}
 
-	if _, err := io.Copy(f, lz4.NewReader(rd)); err != nil {
-		return err
-	} else if err := f.Sync(); err != nil {
-		return err
-	}
-	return f.Close()
-}
-
-// downloadWAL copies a WAL file from the replica to a local copy next to the DB.
-// The WAL is later applied by applyWAL(). This function can be run in parallel
-// to download multiple WAL files simultaneously.
-func (r *Replica) downloadWAL(ctx context.Context, index int, offsets []int64, dbPath string) (err error) {
-	// Determine the user/group & mode based on the DB, if available.
-	var fileInfo os.FileInfo
-	if db := r.DB(); db != nil {
-		fileInfo = db.fileInfo
+	if len(rdrs) == 0 {
+		return fmt.Errorf("no matching backup files available")
 	}
 
-	// Open readers for every segment in the WAL file, in order.
-	var readers []io.Reader
-	for _, offset := range offsets {
-		rd, err := r.Client.WALSegmentReader(ctx, Pos{Index: index, Offset: offset})
-		if err != nil {
-			return err
-		}
-		defer rd.Close()
+	// Output to temp file & atomically rename.
+	tmpOutputPath := opt.OutputPath + ".tmp"
+	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
 
-		if len(r.AgeIdentities) > 0 {
-			drd, err := age.Decrypt(rd, r.AgeIdentities...)
-			if err != nil {
-				return err
-			}
-
-			rd = io.NopCloser(drd)
-		}
-
-		readers = append(readers, lz4.NewReader(rd))
-	}
-
-	// Open handle to destination WAL path.
-	f, err := internal.CreateFile(fmt.Sprintf("%s-%08x-wal", dbPath, index), fileInfo)
+	f, err := os.Create(tmpOutputPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("create temp database path: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
-	// Combine segments together and copy WAL to target path.
-	if _, err := io.Copy(f, io.MultiReader(readers...)); err != nil {
+	pr, pw := io.Pipe()
+
+	go func() {
+		c := ltx.NewCompactor(pw, rdrs)
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		_ = pw.CloseWithError(c.Compact(ctx))
+	}()
+
+	dec := ltx.NewDecoder(pr)
+	if err := dec.DecodeDatabaseTo(f); err != nil {
+		return fmt.Errorf("decode database: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
 		return err
 	} else if err := f.Close(); err != nil {
 		return err
 	}
+
+	// Copy file to final location.
+	r.Logger().Debug("renaming database from temporary location")
+	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
+		return err
+	}
+
 	return nil
 }
 
 // Replica metrics.
 var (
-	replicaWALBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "wal_bytes",
-		Help:      "The number wal bytes written",
-	}, []string{"db", "name"})
-
-	replicaWALIndexGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "wal_index",
-		Help:      "The current WAL index",
-	}, []string{"db", "name"})
-
-	replicaWALOffsetGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "wal_offset",
-		Help:      "The current WAL offset",
-	}, []string{"db", "name"})
-
 	replicaValidationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",

@@ -12,6 +12,7 @@ import (
 	"cloud.google.com/go/storage"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/superfly/ltx"
 	"google.golang.org/api/iterator"
 )
 
@@ -20,7 +21,7 @@ const ReplicaClientType = "gcs"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
-// ReplicaClient is a client for writing snapshots & WAL segments to disk.
+// ReplicaClient is a client for writing LTX files to Google Cloud Storage.
 type ReplicaClient struct {
 	mu     sync.Mutex
 	client *storage.Client       // gcs client
@@ -58,7 +59,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	return nil
 }
 
-// DeleteAll deletes all snapshots & WAL segments.
+// DeleteAll deletes all LTX files.
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	if err := c.Init(ctx); err != nil {
 		return err
@@ -87,28 +88,22 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	return nil
 }
 
-// Snapshots returns an iterator over all available snapshots.
-func (c *ReplicaClient) Snapshots(ctx context.Context) (litestream.SnapshotIterator, error) {
+// LTXFiles returns an iterator over all available LTX files for a level.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	dir, err := litestream.SnapshotsPath(c.Path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshots path: %w", err)
-	}
-	return newSnapshotIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
+	dir := litestream.LTXLevelDir(c.Path, level)
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"}), level), nil
 }
 
-// WriteSnapshot writes LZ4 compressed data from rd to the object storage.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+// WriteLTXFile writes an LTX file from rd to a remote path.
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, index)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 	startTime := time.Now()
 
 	w := c.bkt.Object(key).NewWriter(ctx)
@@ -124,114 +119,23 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, index int, rd io.Read
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
 
-	// log.Printf("%s(%s): snapshot: creating %08x t=%s", r.db.Path(), r.Name(),  index, time.Since(startTime).Truncate(time.Millisecond))
-
-	return litestream.SnapshotInfo{
-		Index:     index,
+	return &ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
 		Size:      n,
 		CreatedAt: startTime.UTC(),
 	}, nil
 }
 
-// SnapshotReader returns a reader for snapshot data at the given index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, index int) (io.ReadCloser, error) {
-	if err := c.Init(ctx); err != nil {
-		return nil, err
-	}
-
-	key, err := litestream.SnapshotPath(c.Path, index)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
-
-	r, err := c.bkt.Object(key).NewReader(ctx)
-	if isNotExists(err) {
-		return nil, os.ErrNotExist
-	} else if err != nil {
-		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(r.Attrs.Size))
-
-	return r, nil
-}
-
-// DeleteSnapshot deletes a snapshot with the given index.
-func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
-	if err := c.Init(ctx); err != nil {
-		return err
-	}
-
-	key, err := litestream.SnapshotPath(c.Path, index)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
-
-	if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
-		return fmt.Errorf("cannot delete snapshot %q: %w", key, err)
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
-	return nil
-}
-
-// WALSegments returns an iterator over all available WAL files.
-func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
-	if err := c.Init(ctx); err != nil {
-		return nil, err
-	}
-	dir, err := litestream.WALPath(c.Path)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal path: %w", err)
-	}
-	return newWALSegmentIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"})), nil
-}
-
-// WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
-	if err := c.Init(ctx); err != nil {
-		return info, err
-	}
-
-	key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
-	startTime := time.Now()
-
-	w := c.bkt.Object(key).NewWriter(ctx)
-	defer w.Close()
-
-	n, err := io.Copy(w, rd)
-	if err != nil {
-		return info, err
-	} else if err := w.Close(); err != nil {
-		return info, err
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(n))
-
-	return litestream.WALSegmentInfo{
-		Index:     pos.Index,
-		Offset:    pos.Offset,
-		Size:      n,
-		CreatedAt: startTime.UTC(),
-	}, nil
-}
-
-// WALSegmentReader returns a reader for a section of WAL data at the given index.
+// OpenLTXFile returns a reader for a given LTX file.
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
+	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
 	r, err := c.bkt.Object(key).NewReader(ctx)
 	if isNotExists(err) {
@@ -246,20 +150,16 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 	return r, nil
 }
 
-// DeleteWALSegments deletes WAL segments with at the given positions.
-func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Pos) error {
+// DeleteLTXFiles deletes a set of LTX files.
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	for _, pos := range a {
-		key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
-		if err != nil {
-			return fmt.Errorf("cannot determine wal segment path: %w", err)
-		}
-
+	for _, info := range a {
+		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 		if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
-			return fmt.Errorf("cannot delete wal segment %q: %w", key, err)
+			return fmt.Errorf("cannot delete ltx file %q: %w", key, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
@@ -267,75 +167,25 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	return nil
 }
 
-type snapshotIterator struct {
-	it   *storage.ObjectIterator
-	info litestream.SnapshotInfo
-	err  error
+type ltxFileIterator struct {
+	it    *storage.ObjectIterator
+	level int
+	info  *ltx.FileInfo
+	err   error
 }
 
-func newSnapshotIterator(it *storage.ObjectIterator) *snapshotIterator {
-	return &snapshotIterator{
-		it: it,
+func newLTXFileIterator(it *storage.ObjectIterator, level int) *ltxFileIterator {
+	return &ltxFileIterator{
+		it:    it,
+		level: level,
 	}
 }
 
-func (itr *snapshotIterator) Close() (err error) {
+func (itr *ltxFileIterator) Close() (err error) {
 	return itr.err
 }
 
-func (itr *snapshotIterator) Next() bool {
-	// Exit if an error has already occurred.
-	if itr.err != nil {
-		return false
-	}
-
-	for {
-		// Fetch next object.
-		attrs, err := itr.it.Next()
-		if err == iterator.Done {
-			return false
-		} else if err != nil {
-			itr.err = err
-			return false
-		}
-
-		// Parse index, otherwise skip to the next object.
-		index, err := litestream.ParseSnapshotPath(path.Base(attrs.Name))
-		if err != nil {
-			continue
-		}
-
-		// Store current snapshot and return.
-		itr.info = litestream.SnapshotInfo{
-			Index:     index,
-			Size:      attrs.Size,
-			CreatedAt: attrs.Created.UTC(),
-		}
-		return true
-	}
-}
-
-func (itr *snapshotIterator) Err() error { return itr.err }
-
-func (itr *snapshotIterator) Snapshot() litestream.SnapshotInfo { return itr.info }
-
-type walSegmentIterator struct {
-	it   *storage.ObjectIterator
-	info litestream.WALSegmentInfo
-	err  error
-}
-
-func newWALSegmentIterator(it *storage.ObjectIterator) *walSegmentIterator {
-	return &walSegmentIterator{
-		it: it,
-	}
-}
-
-func (itr *walSegmentIterator) Close() (err error) {
-	return itr.err
-}
-
-func (itr *walSegmentIterator) Next() bool {
+func (itr *ltxFileIterator) Next() bool {
 	// Exit if an error has already occurred.
 	if itr.err != nil {
 		return false
@@ -352,15 +202,16 @@ func (itr *walSegmentIterator) Next() bool {
 		}
 
 		// Parse index & offset, otherwise skip to the next object.
-		index, offset, err := litestream.ParseWALSegmentPath(path.Base(attrs.Name))
+		minTXID, maxTXID, err := ltx.ParseFilename(path.Base(attrs.Name))
 		if err != nil {
 			continue
 		}
 
 		// Store current snapshot and return.
-		itr.info = litestream.WALSegmentInfo{
-			Index:     index,
-			Offset:    offset,
+		itr.info = &ltx.FileInfo{
+			Level:     itr.level,
+			MinTXID:   minTXID,
+			MaxTXID:   maxTXID,
 			Size:      attrs.Size,
 			CreatedAt: attrs.Created.UTC(),
 		}
@@ -368,9 +219,9 @@ func (itr *walSegmentIterator) Next() bool {
 	}
 }
 
-func (itr *walSegmentIterator) Err() error { return itr.err }
+func (itr *ltxFileIterator) Err() error { return itr.err }
 
-func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
+func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 	return itr.info
 }
 
