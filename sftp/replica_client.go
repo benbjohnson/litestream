@@ -124,7 +124,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	var dirs []string
 	walker := sftpClient.Walk(c.Path)
 	for walker.Step() {
-		if err := walker.Err(); err != nil {
+		if err := walker.Err(); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
 			return fmt.Errorf("cannot walk path %q: %w", walker.Path(), err)
 		}
 		if walker.Stat().IsDir() {
