@@ -180,8 +180,6 @@ func (db *DB) LTXLevelDir(level int) string {
 // Panics if level or either txn ID is negative.
 func (db *DB) LTXPath(level int, minTXID, maxTXID ltx.TXID) string {
 	assert(level >= 0, "level cannot be negative")
-	assert(minTXID >= 0, "min txid cannot be negative")
-	assert(maxTXID >= 0, "max txid cannot be negative")
 	return filepath.Join(db.LTXLevelDir(level), ltx.FormatFilename(minTXID, maxTXID))
 }
 
@@ -490,45 +488,6 @@ func (db *DB) verifyHeadersMatch() error {
 	return true, nil
 }
 */
-
-// cleanWAL removes WAL files that have been replicated.
-// TODO(ltx): Move to a background goroutine.
-func (db *DB) cleanWAL() error {
-	// Determine lowest txn that's been replicated to all replicas.
-	var min ltx.TXID
-	for _, r := range db.Replicas {
-		pos := r.Pos()
-		if min == 0 || pos.TXID < min {
-			min = pos.TXID
-		}
-	}
-
-	// Skip if our lowest index is too small.
-	if min <= 0 {
-		return nil
-	}
-	min-- // Always keep an extra WAL file.
-
-	// Remove all WAL files before the lowest index.
-	dir := db.LTXLevelDir(0)
-	fis, err := os.ReadDir(dir)
-	if os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
-		return err
-	}
-	for _, fi := range fis {
-		if _, maxTXID, err := ltx.ParseFilename(fi.Name()); err != nil {
-			continue
-		} else if maxTXID >= min {
-			continue
-		}
-		if err := os.Remove(filepath.Join(dir, fi.Name())); err != nil {
-			return err
-		}
-	}
-	return nil
-}
 
 // acquireReadLock begins a read transaction on the database to prevent checkpointing.
 func (db *DB) acquireReadLock() error {
@@ -933,7 +892,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	return nil
 }
 
-func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromDB(_ context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
 
@@ -973,7 +932,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromWAL(_ context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
 	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
@@ -1204,41 +1163,6 @@ func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
 	return h.Sum64(), pos, nil
 }
 
-// frameAlign returns a frame-aligned offset.
-// Returns zero if offset is less than the WAL header size.
-func frameAlign(offset int64, pageSize int) int64 {
-	assert(offset >= 0, "frameAlign(): offset must be non-negative")
-	assert(pageSize >= 0, "frameAlign(): page size must be non-negative")
-
-	if offset < WALHeaderSize {
-		return 0
-	}
-
-	frameSize := WALFrameHeaderSize + int64(pageSize)
-	frameN := (offset - WALHeaderSize) / frameSize
-	return (frameN * frameSize) + WALHeaderSize
-}
-
-func readLastChecksumFrom(f *os.File, pageSize int) (uint32, uint32, error) {
-	// Determine the byte offset of the checksum for the header (if no pages
-	// exist) or for the last page (if at least one page exists).
-	offset := int64(WALHeaderChecksumOffset)
-	if fi, err := f.Stat(); err != nil {
-		return 0, 0, err
-	} else if sz := frameAlign(fi.Size(), pageSize); fi.Size() > WALHeaderSize {
-		offset = sz - int64(pageSize) - WALFrameHeaderSize + WALFrameHeaderChecksumOffset
-	}
-
-	// Read big endian checksum.
-	b := make([]byte, 8)
-	if n, err := f.ReadAt(b, offset); err != nil {
-		return 0, 0, err
-	} else if n != len(b) {
-		return 0, 0, io.ErrUnexpectedEOF
-	}
-	return binary.BigEndian.Uint32(b[0:]), binary.BigEndian.Uint32(b[4:]), nil
-}
-
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.
 const DefaultRestoreParallelism = 8
 
@@ -1323,15 +1247,3 @@ var (
 		Help: "Time spent checkpointing WAL, in seconds",
 	}, []string{"db", "mode"})
 )
-
-func headerByteOrder(hdr []byte) (binary.ByteOrder, error) {
-	magic := binary.BigEndian.Uint32(hdr[0:])
-	switch magic {
-	case 0x377f0682:
-		return binary.LittleEndian, nil
-	case 0x377f0683:
-		return binary.BigEndian, nil
-	default:
-		return nil, fmt.Errorf("invalid wal header magic: %x", magic)
-	}
-}

@@ -213,7 +213,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 
 // maxLTXFile returns the min & max TXID of the last LTX file for a given level.
 func (r *Replica) maxLTXFile(ctx context.Context, level int) (minTXID, maxTXID ltx.TXID, err error) {
-	itr, err := r.Client.LTXFiles(ctx, 0)
+	itr, err := r.Client.LTXFiles(ctx, level)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -279,6 +279,7 @@ func (r *Replica) EnforceRetention(ctx context.Context) (err error) {
 	*/
 }
 
+/*
 func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID) error {
 	itr, err := r.Client.LTXFiles(ctx, level)
 	if err != nil {
@@ -313,6 +314,7 @@ func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID
 
 	return nil
 }
+*/
 
 // monitor runs in a separate goroutine and continuously replicates the DB.
 func (r *Replica) monitor(ctx context.Context) {
@@ -594,7 +596,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Ensure output path does not already exist.
 	if _, err := os.Stat(opt.OutputPath); err == nil {
 		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
-	} else if err != nil && !os.IsNotExist(err) {
+	} else if !os.IsNotExist(err) {
 		return err
 	}
 
@@ -671,34 +673,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	return nil
 }
 
-type walRestoreState struct {
-	ready bool
-	err   error
-}
-
 // Replica metrics.
 var (
-	replicaWALBytesCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "wal_bytes",
-		Help:      "The number wal bytes written",
-	}, []string{"db", "name"})
-
-	replicaWALIndexGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "wal_index",
-		Help:      "The current WAL index",
-	}, []string{"db", "name"})
-
-	replicaWALOffsetGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "wal_offset",
-		Help:      "The current WAL offset",
-	}, []string{"db", "name"})
-
 	replicaValidationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "litestream",
 		Subsystem: "replica",

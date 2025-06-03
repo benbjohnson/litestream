@@ -80,11 +80,6 @@ const (
 	WALFrameHeaderSize = 24
 )
 
-// calcWALSize returns the size of the WAL, in bytes, for a given number of pages.
-func calcWALSize(pageSize int, n int) int64 {
-	return int64(WALHeaderSize + ((WALFrameHeaderSize + pageSize) * n))
-}
-
 // rollback rolls back tx. Ignores already-rolled-back errors.
 func rollback(tx *sql.Tx) error {
 	if err := tx.Rollback(); err != nil && !strings.Contains(err.Error(), `transaction has already been committed or rolled back`) {
