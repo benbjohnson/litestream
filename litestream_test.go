@@ -7,6 +7,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	_ "github.com/mattn/go-sqlite3"
+	"github.com/superfly/ltx"
 )
 
 func TestChecksum(t *testing.T) {
@@ -39,54 +40,21 @@ func TestChecksum(t *testing.T) {
 		}
 	})
 }
-
-func TestSnapshotsPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := litestream.SnapshotsPath("foo"); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/snapshots"; got != want {
-			t.Fatalf("SnapshotsPath()=%v, want %v", got, want)
-		}
-	})
-}
-
-func TestSnapshotPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := litestream.SnapshotPath("foo", 1000); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/snapshots/000003e8.snapshot.lz4"; got != want {
-			t.Fatalf("SnapshotPath()=%v, want %v", got, want)
-		}
-	})
-}
-
-func TestWALPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := litestream.WALPath("foo"); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/wal"; got != want {
-			t.Fatalf("WALPath()=%v, want %v", got, want)
-		}
-	})
-}
-
-func TestWALSegmentPath(t *testing.T) {
-	t.Run("OK", func(t *testing.T) {
-		if got, err := litestream.WALSegmentPath("foo", 1000, 1001); err != nil {
-			t.Fatal(err)
-		} else if want := "foo/wal/000003e8_000003e9.wal.lz4"; got != want {
-			t.Fatalf("WALPath()=%v, want %v", got, want)
-		}
-	})
-}
-
-func TestFindMinSnapshot(t *testing.T) {
-	infos := []litestream.SnapshotInfo{
-		{Index: 0},
-		{Index: 24},
+func TestLTXDir(t *testing.T) {
+	if got, want := litestream.LTXDir("foo"), "foo/ltx"; got != want {
+		t.Fatalf("LTXDir()=%v, want %v", got, want)
 	}
-	if got, want := litestream.FindMinSnapshot(infos), &infos[0]; got != want {
-		t.Fatalf("info=%#v, want %#v", got, want)
+}
+
+func TestLTXLevelDir(t *testing.T) {
+	if got, want := litestream.LTXLevelDir("foo", 0), "foo/ltx/0"; got != want {
+		t.Fatalf("LTXLevelDir()=%v, want %v", got, want)
+	}
+}
+
+func LTXFilePath(t *testing.T) {
+	if got, want := litestream.LTXFilePath("foo", 0, ltx.TXID(100), ltx.TXID(200)), "-"; got != want {
+		t.Fatalf("LTXPath()=%v, want %v", got, want)
 	}
 }
 

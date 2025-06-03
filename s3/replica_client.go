@@ -21,6 +21,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -35,7 +36,7 @@ const DefaultRegion = "us-east-1"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
-// ReplicaClient is a client for writing snapshots & WAL segments to disk.
+// ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
 	mu       sync.Mutex
 	s3       *s3.S3 // s3 service
@@ -146,7 +147,7 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 	return DefaultRegion, nil
 }
 
-// DeleteAll deletes all snapshots & WAL segments.
+// DeleteAll deletes all LTX files.
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	if err := c.Init(ctx); err != nil {
 		return err
@@ -195,24 +196,21 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	return nil
 }
 
-// Snapshots returns an iterator over all available snapshots.
-func (c *ReplicaClient) Snapshots(ctx context.Context) (litestream.SnapshotIterator, error) {
+// LTXFiles returns an iterator over all available LTX files.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newSnapshotIterator(ctx, c), nil
+	return newLTXFileIterator(ctx, c, level), nil
 }
 
-// WriteSnapshot writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteSnapshot(ctx context.Context, index int, rd io.Reader) (info litestream.SnapshotInfo, err error) {
+// WriteLTXFile writes an LTX file from rd into a remote location.
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	if err := c.Init(ctx); err != nil {
 		return info, err
 	}
 
-	key, err := litestream.SnapshotPath(c.Path, index)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
+	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
@@ -227,119 +225,23 @@ func (c *ReplicaClient) WriteSnapshot(ctx context.Context, index int, rd io.Read
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
 	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
-	// log.Printf("%s(%s): snapshot: creating %08x t=%s", r.db.Path(), r.Name(),  index, time.Since(startTime).Truncate(time.Millisecond))
-
-	return litestream.SnapshotInfo{
-		Index:     index,
+	return &ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
 		Size:      rc.N(),
 		CreatedAt: startTime.UTC(),
 	}, nil
 }
 
-// SnapshotReader returns a reader for snapshot data at the given index.
-func (c *ReplicaClient) SnapshotReader(ctx context.Context, index int) (io.ReadCloser, error) {
-	if err := c.Init(ctx); err != nil {
-		return nil, err
-	}
-
-	key, err := litestream.SnapshotPath(c.Path, index)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
-
-	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(c.Bucket),
-		Key:    aws.String(key),
-	})
-	if isNotExists(err) {
-		return nil, os.ErrNotExist
-	} else if err != nil {
-		return nil, err
-	}
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
-
-	return out.Body, nil
-}
-
-// DeleteSnapshot deletes a snapshot with the given index.
-func (c *ReplicaClient) DeleteSnapshot(ctx context.Context, index int) error {
-	if err := c.Init(ctx); err != nil {
-		return err
-	}
-
-	key, err := litestream.SnapshotPath(c.Path, index)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshot path: %w", err)
-	}
-
-	out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
-		Bucket: aws.String(c.Bucket),
-		Delete: &s3.Delete{Objects: []*s3.ObjectIdentifier{{Key: &key}}, Quiet: aws.Bool(true)},
-	})
-	if err != nil {
-		return err
-	}
-	if err := deleteOutputError(out); err != nil {
-		return err
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
-	return nil
-}
-
-// WALSegments returns an iterator over all available WAL files.
-func (c *ReplicaClient) WALSegments(ctx context.Context) (litestream.WALSegmentIterator, error) {
-	if err := c.Init(ctx); err != nil {
-		return nil, err
-	}
-	return newWALSegmentIterator(ctx, c), nil
-}
-
-// WriteWALSegment writes LZ4 compressed data from rd into a file on disk.
-func (c *ReplicaClient) WriteWALSegment(ctx context.Context, pos litestream.Pos, rd io.Reader) (info litestream.WALSegmentInfo, err error) {
-	if err := c.Init(ctx); err != nil {
-		return info, err
-	}
-
-	key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
-	if err != nil {
-		return info, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
-	startTime := time.Now()
-
-	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-		Bucket: aws.String(c.Bucket),
-		Key:    aws.String(key),
-		Body:   rc,
-	}); err != nil {
-		return info, err
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
-
-	return litestream.WALSegmentInfo{
-		Index:     pos.Index,
-		Offset:    pos.Offset,
-		Size:      rc.N(),
-		CreatedAt: startTime.UTC(),
-	}, nil
-}
-
-// WALSegmentReader returns a reader for a section of WAL data at the given index.
+// OpenLTXFile returns a reader for an LTX file
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos) (io.ReadCloser, error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine wal segment path: %w", err)
-	}
-
+	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
@@ -355,8 +257,8 @@ func (c *ReplicaClient) WALSegmentReader(ctx context.Context, pos litestream.Pos
 	return out.Body, nil
 }
 
-// DeleteWALSegments deletes WAL segments with at the given positions.
-func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Pos) error {
+// DeleteLTXFiles deletes a set of LTX files.
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
@@ -368,12 +270,9 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 			n = len(a)
 		}
 
-		// Generate a batch of object IDs for deleting the WAL segments.
-		for i, pos := range a[:n] {
-			key, err := litestream.WALSegmentPath(c.Path, pos.Index, pos.Offset)
-			if err != nil {
-				return fmt.Errorf("cannot determine wal segment path: %w", err)
-			}
+		// Generate a batch of object IDs for deleting the LTX files.
+		for i, info := range a[:n] {
+			key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 			objIDs[i] = &s3.ObjectIdentifier{Key: &key}
 		}
 
@@ -396,22 +295,24 @@ func (c *ReplicaClient) DeleteWALSegments(ctx context.Context, a []litestream.Po
 	return nil
 }
 
-type snapshotIterator struct {
+type ltxFileIterator struct {
 	client *ReplicaClient
+	level  int
 
-	ch     chan litestream.SnapshotInfo
+	ch     chan *ltx.FileInfo
 	g      errgroup.Group
 	ctx    context.Context
 	cancel func()
 
-	info litestream.SnapshotInfo
+	info *ltx.FileInfo
 	err  error
 }
 
-func newSnapshotIterator(ctx context.Context, client *ReplicaClient) *snapshotIterator {
-	itr := &snapshotIterator{
+func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int) *ltxFileIterator {
+	itr := &ltxFileIterator{
 		client: client,
-		ch:     make(chan litestream.SnapshotInfo),
+		level:  level,
+		ch:     make(chan *ltx.FileInfo),
 	}
 
 	itr.ctx, itr.cancel = context.WithCancel(ctx)
@@ -421,13 +322,10 @@ func newSnapshotIterator(ctx context.Context, client *ReplicaClient) *snapshotIt
 }
 
 // fetch runs in a separate goroutine to fetch pages of objects and stream them to a channel.
-func (itr *snapshotIterator) fetch() error {
+func (itr *ltxFileIterator) fetch() error {
 	defer close(itr.ch)
 
-	dir, err := litestream.SnapshotsPath(itr.client.Path)
-	if err != nil {
-		return fmt.Errorf("cannot determine snapshots path: %w", err)
-	}
+	dir := litestream.LTXLevelDir(itr.client.Path, itr.level)
 
 	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
 		Bucket:    aws.String(itr.client.Bucket),
@@ -438,114 +336,15 @@ func (itr *snapshotIterator) fetch() error {
 
 		for _, obj := range page.Contents {
 			key := path.Base(aws.StringValue(obj.Key))
-			index, err := litestream.ParseSnapshotPath(key)
+			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
 				continue
 			}
 
-			info := litestream.SnapshotInfo{
-				Index:     index,
-				Size:      aws.Int64Value(obj.Size),
-				CreatedAt: obj.LastModified.UTC(),
-			}
-
-			select {
-			case <-itr.ctx.Done():
-			case itr.ch <- info:
-			}
-		}
-		return true
-	})
-}
-
-func (itr *snapshotIterator) Close() (err error) {
-	err = itr.err
-
-	// Cancel context and wait for error group to finish.
-	itr.cancel()
-	if e := itr.g.Wait(); e != nil && err == nil {
-		err = e
-	}
-
-	return err
-}
-
-func (itr *snapshotIterator) Next() bool {
-	// Exit if an error has already occurred.
-	if itr.err != nil {
-		return false
-	}
-
-	// Return false if context was canceled or if there are no more snapshots.
-	// Otherwise fetch the next snapshot and store it on the iterator.
-	select {
-	case <-itr.ctx.Done():
-		return false
-	case info, ok := <-itr.ch:
-		if !ok {
-			return false
-		}
-		itr.info = info
-		return true
-	}
-}
-
-func (itr *snapshotIterator) Err() error { return itr.err }
-
-func (itr *snapshotIterator) Snapshot() litestream.SnapshotInfo {
-	return itr.info
-}
-
-type walSegmentIterator struct {
-	client *ReplicaClient
-
-	ch     chan litestream.WALSegmentInfo
-	g      errgroup.Group
-	ctx    context.Context
-	cancel func()
-
-	info litestream.WALSegmentInfo
-	err  error
-}
-
-func newWALSegmentIterator(ctx context.Context, client *ReplicaClient) *walSegmentIterator {
-	itr := &walSegmentIterator{
-		client: client,
-		ch:     make(chan litestream.WALSegmentInfo),
-	}
-
-	itr.ctx, itr.cancel = context.WithCancel(ctx)
-	itr.g.Go(itr.fetch)
-
-	return itr
-}
-
-// fetch runs in a separate goroutine to fetch pages of objects and stream them to a channel.
-func (itr *walSegmentIterator) fetch() error {
-	defer close(itr.ch)
-
-	dir, err := litestream.WALPath(itr.client.Path)
-	if err != nil {
-		return fmt.Errorf("cannot determine wal path: %w", err)
-	}
-
-	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
-		Bucket:    aws.String(itr.client.Bucket),
-		Prefix:    aws.String(dir + "/"),
-		Delimiter: aws.String("/"),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
-
-		for _, obj := range page.Contents {
-			key := path.Base(aws.StringValue(obj.Key))
-			index, offset, err := litestream.ParseWALSegmentPath(key)
-			if err != nil {
-				continue
-			}
-
-			info := litestream.WALSegmentInfo{
-				Index:     index,
-				Offset:    offset,
+			info := &ltx.FileInfo{
+				Level:     itr.level,
+				MinTXID:   minTXID,
+				MaxTXID:   maxTXID,
 				Size:      aws.Int64Value(obj.Size),
 				CreatedAt: obj.LastModified.UTC(),
 			}
@@ -560,7 +359,7 @@ func (itr *walSegmentIterator) fetch() error {
 	})
 }
 
-func (itr *walSegmentIterator) Close() (err error) {
+func (itr *ltxFileIterator) Close() (err error) {
 	err = itr.err
 
 	// Cancel context and wait for error group to finish.
@@ -572,7 +371,7 @@ func (itr *walSegmentIterator) Close() (err error) {
 	return err
 }
 
-func (itr *walSegmentIterator) Next() bool {
+func (itr *ltxFileIterator) Next() bool {
 	// Exit if an error has already occurred.
 	if itr.err != nil {
 		return false
@@ -592,9 +391,9 @@ func (itr *walSegmentIterator) Next() bool {
 	}
 }
 
-func (itr *walSegmentIterator) Err() error { return itr.err }
+func (itr *ltxFileIterator) Err() error { return itr.err }
 
-func (itr *walSegmentIterator) WALSegment() litestream.WALSegmentInfo {
+func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 	return itr.info
 }
 
