@@ -3,6 +3,7 @@ package s3
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -13,12 +14,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	s3manager "github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/superfly/ltx"
@@ -39,7 +40,7 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
 	mu       sync.Mutex
-	s3       *s3.S3 // s3 service
+	s3       *s3.Client
 	uploader *s3manager.Uploader
 
 	// AWS authentication keys.
@@ -88,63 +89,59 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Create new AWS session.
-	config := c.config()
-	if region != "" {
-		config.Region = aws.String(region)
+	// Create new AWS conf.
+	conf, err := c.config(ctx, region)
+	if err != nil {
+		return err
 	}
 
-	sess, err := session.NewSession(config)
-	if err != nil {
-		return fmt.Errorf("cannot create aws session: %w", err)
-	}
-	c.s3 = s3.New(sess)
-	c.uploader = s3manager.NewUploader(sess)
+	c.s3 = s3.NewFromConfig(conf)
+	c.uploader = s3manager.NewUploader(c.s3)
 	return nil
 }
 
 // config returns the AWS configuration. Uses the default credential chain
 // unless a key/secret are explicitly set.
-func (c *ReplicaClient) config() *aws.Config {
-	config := &aws.Config{}
+func (c *ReplicaClient) config(ctx context.Context, region string) (aws.Config, error) {
+	var conf aws.Config
+	var err error
+
+	conf, err = config.LoadDefaultConfig(ctx)
+	if err != nil {
+		return conf, err
+	}
 
 	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
+		conf.Credentials = credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, "")
 	}
 	if c.Endpoint != "" {
-		config.Endpoint = aws.String(c.Endpoint)
-	}
-	if c.ForcePathStyle {
-		config.S3ForcePathStyle = aws.Bool(c.ForcePathStyle)
+		conf.BaseEndpoint = aws.String(c.Endpoint)
 	}
 	if c.SkipVerify {
-		config.HTTPClient = &http.Client{Transport: &http.Transport{
+		conf.HTTPClient = &http.Client{Transport: &http.Transport{
 			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
 		}}
 	}
+	if region != "" {
+		conf.Region = region
+	}
 
-	return config
+	return conf, nil
 }
 
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
-	// Connect to US standard region to fetch info.
-	config := c.config()
-	config.Region = aws.String(DefaultRegion)
-	sess, err := session.NewSession(config)
+	conf, err := c.config(ctx, "")
 	if err != nil {
 		return "", err
 	}
 
-	// Fetch bucket location, if possible. Must be bucket owner.
-	// This call can return a nil location which means it's in us-east-1.
-	if out, err := s3.New(sess).HeadBucketWithContext(ctx, &s3.HeadBucketInput{
-		Bucket: aws.String(bucket),
-	}); err != nil {
+	s3client := s3.NewFromConfig(conf)
+	bucketLocation, err := s3client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{Bucket: &bucket})
+	if err != nil {
 		return "", err
-	} else if out.BucketRegion != nil {
-		return *out.BucketRegion, nil
 	}
-	return DefaultRegion, nil
+
+	return string(bucketLocation.LocationConstraint), nil
 }
 
 // DeleteAll deletes all LTX files.
@@ -154,19 +151,20 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	}
 
 	// Collect all files.
-	var objIDs []*s3.ObjectIdentifier
-	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
+	p := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
 		Bucket: aws.String(c.Bucket),
 		Prefix: aws.String(c.Path),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
+	})
 
-		for _, obj := range page.Contents {
-			objIDs = append(objIDs, &s3.ObjectIdentifier{Key: obj.Key})
+	var objIDs []s3types.ObjectIdentifier
+	for p.HasMorePages() {
+		page, err := p.NextPage(ctx)
+		if err != nil {
+			return err
 		}
-		return true
-	}); err != nil {
-		return err
+		for _, obj := range page.Contents {
+			objIDs = append(objIDs, s3types.ObjectIdentifier{Key: obj.Key})
+		}
 	}
 
 	// Delete all files in batches.
@@ -176,9 +174,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			n = len(objIDs)
 		}
 
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &s3types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return err
@@ -214,7 +212,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	startTime := time.Now()
 
 	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
+	if _, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 		Body:   rc,
@@ -242,7 +240,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 	})
@@ -252,7 +250,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		return nil, err
 	}
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.ToInt64(out.ContentLength)))
 
 	return out.Body, nil
 }
@@ -263,7 +261,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		return err
 	}
 
-	objIDs := make([]*s3.ObjectIdentifier, MaxKeys)
+	objIDs := make([]s3types.ObjectIdentifier, MaxKeys)
 	for len(a) > 0 {
 		n := MaxKeys
 		if len(a) < n {
@@ -273,13 +271,13 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		// Generate a batch of object IDs for deleting the LTX files.
 		for i, info := range a[:n] {
 			key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
-			objIDs[i] = &s3.ObjectIdentifier{Key: &key}
+			objIDs[i] = s3types.ObjectIdentifier{Key: &key}
 		}
 
 		// Delete S3 objects in bulk.
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &s3types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return err
@@ -333,15 +331,21 @@ func (itr *ltxFileIterator) fetch() error {
 		prefix += itr.seek.String()
 	}
 
-	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
+	p := s3.NewListObjectsV2Paginator(itr.client.s3, &s3.ListObjectsV2Input{
 		Bucket:    aws.String(itr.client.Bucket),
 		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
+	})
+
+	for p.HasMorePages() {
+		page, err := p.NextPage(itr.ctx)
+		if err != nil {
+			return err
+		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
 		for _, obj := range page.Contents {
-			key := path.Base(aws.StringValue(obj.Key))
+			key := path.Base(aws.ToString(obj.Key))
 			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
 				continue
@@ -351,18 +355,19 @@ func (itr *ltxFileIterator) fetch() error {
 				Level:     itr.level,
 				MinTXID:   minTXID,
 				MaxTXID:   maxTXID,
-				Size:      aws.Int64Value(obj.Size),
+				Size:      aws.ToInt64(obj.Size),
 				CreatedAt: obj.LastModified.UTC(),
 			}
 
 			select {
 			case <-itr.ctx.Done():
-				return false
+				return nil
 			case itr.ch <- info:
 			}
 		}
-		return true
-	})
+	}
+
+	return nil
 }
 
 func (itr *ltxFileIterator) Close() (err error) {
@@ -461,12 +466,12 @@ var (
 )
 
 func isNotExists(err error) bool {
-	switch err := err.(type) {
-	case awserr.Error:
-		return err.Code() == `NoSuchKey`
-	default:
+	if err == nil {
 		return false
 	}
+	var e1 *s3types.NotFound
+	var e2 *s3types.NoSuchKey
+	return errors.As(err, &e1) || errors.As(err, &e2)
 }
 
 func deleteOutputError(out *s3.DeleteObjectsOutput) error {
@@ -474,9 +479,9 @@ func deleteOutputError(out *s3.DeleteObjectsOutput) error {
 	case 0:
 		return nil
 	case 1:
-		return fmt.Errorf("deleting object %s: %s - %s", aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message))
+		return fmt.Errorf("deleting object %s: %s - %s", aws.ToString(out.Errors[0].Key), aws.ToString(out.Errors[0].Code), aws.ToString(out.Errors[0].Message))
 	default:
 		return fmt.Errorf("%d errors occurred deleting objects, %s: %s - (%s (and %d others)",
-			len(out.Errors), aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message), len(out.Errors)-1)
+			len(out.Errors), aws.ToString(out.Errors[0].Key), aws.ToString(out.Errors[0].Code), aws.ToString(out.Errors[0].Message), len(out.Errors)-1)
 	}
 }
