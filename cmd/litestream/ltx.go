@@ -18,7 +18,6 @@ type LTXCommand struct{}
 func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-ltx", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
-	replicaName := fs.String("replica", "", "replica name")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -28,7 +27,6 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("too many arguments")
 	}
 
-	var db *litestream.DB
 	var r *litestream.Replica
 	if isURL(fs.Arg(0)) {
 		if *configPath != "" {
@@ -49,62 +47,46 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Lookup database from configuration file by path.
-		if path, err := expand(fs.Arg(0)); err != nil {
+		path, err := expand(fs.Arg(0))
+		if err != nil {
 			return err
-		} else if dbc := config.DBConfig(path); dbc == nil {
+		}
+		dbc := config.DBConfig(path)
+		if dbc == nil {
 			return fmt.Errorf("database not found in config: %s", path)
-		} else if db, err = NewDBFromConfig(dbc); err != nil {
+		}
+
+		db, err := NewDBFromConfig(dbc)
+		if err != nil {
 			return err
+		} else if db.Replica == nil {
+			return fmt.Errorf("database has no replica")
 		}
-
-		// Filter by replica, if specified.
-		if *replicaName != "" {
-			if r = db.Replica(*replicaName); r == nil {
-				return fmt.Errorf("replica %q not found for database %q", *replicaName, db.Path())
-			}
-		}
-	}
-
-	// Find WAL files by db or replica.
-	var replicas []*litestream.Replica
-	if r != nil {
-		replicas = []*litestream.Replica{r}
-	} else {
-		replicas = db.Replicas
+		r = db.Replica
 	}
 
 	// List all WAL files.
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "replica\tmin_txid\tmax_txid\tsize\tcreated")
-	for _, r := range replicas {
-		if err := func() error {
-			itr, err := r.Client.LTXFiles(ctx, 0)
-			if err != nil {
-				return err
-			}
-			defer itr.Close()
-
-			for itr.Next() {
-				info := itr.Item()
-
-				fmt.Fprintf(w, "%s\t%x\t%d\t%d\t%s\n",
-					r.Name(),
-					info.MinTXID,
-					info.MaxTXID,
-					info.Size,
-					info.CreatedAt.Format(time.RFC3339),
-				)
-			}
-			return itr.Close()
-		}(); err != nil {
-			r.Logger().Error("cannot fetch ltx files", "error", err)
-			continue
-		}
+	fmt.Fprintln(w, "min_txid\tmax_txid\tsize\tcreated")
+	itr, err := r.Client.LTXFiles(ctx, 0)
+	if err != nil {
+		return err
 	}
+	defer itr.Close()
 
-	return nil
+	for itr.Next() {
+		info := itr.Item()
+
+		fmt.Fprintf(w, "%x\t%d\t%d\t%s\n",
+			info.MinTXID,
+			info.MaxTXID,
+			info.Size,
+			info.CreatedAt.Format(time.RFC3339),
+		)
+	}
+	return itr.Close()
 }
 
 // Usage prints the help screen to STDOUT.
