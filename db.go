@@ -98,9 +98,9 @@ type DB struct {
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
 
-	// List of replicas for the database.
+	// Remote replica for the database.
 	// Must be set before calling Open().
-	Replicas []*Replica
+	Replica *Replica
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
@@ -213,16 +213,6 @@ func (db *DB) DirInfo() os.FileInfo {
 	return db.dirInfo
 }
 
-// Replica returns a replica by name.
-func (db *DB) Replica(name string) *Replica {
-	for _, r := range db.Replicas {
-		if r.Name() == name {
-			return r
-		}
-	}
-	return nil
-}
-
 // Pos returns the current replication position of the database.
 func (db *DB) Pos() (ltx.Pos, error) {
 	minTXID, maxTXID, err := db.MaxLTX()
@@ -267,15 +257,6 @@ func (db *DB) Open() (err error) {
 		return fmt.Errorf("minimum checkpoint page count required")
 	}
 
-	// Validate that all replica names are unique.
-	m := make(map[string]struct{})
-	for _, r := range db.Replicas {
-		if _, ok := m[r.Name()]; ok {
-			return fmt.Errorf("duplicate replica name: %q", r.Name())
-		}
-		m[r.Name()] = struct{}{}
-	}
-
 	// Clear old temporary files that my have been left from a crash.
 	if err := removeTmpFiles(db.metaPath); err != nil {
 		return fmt.Errorf("cannot remove tmp files: %w", err)
@@ -304,13 +285,13 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	}
 
 	// Ensure replicas perform a final sync and stop replicating.
-	for _, r := range db.Replicas {
+	if db.Replica != nil {
 		if db.db != nil {
-			if e := r.Sync(ctx); e != nil && err == nil {
+			if e := db.Replica.Sync(ctx); e != nil && err == nil {
 				err = e
 			}
 		}
-		r.Stop(true)
+		db.Replica.Stop(true)
 	}
 
 	// Release the read lock to allow other applications to handle checkpointing.
@@ -440,8 +421,8 @@ func (db *DB) init() (err error) {
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
 
 	// Start replication.
-	for _, r := range db.Replicas {
-		r.Start(db.ctx)
+	if db.Replica != nil {
+		db.Replica.Start(db.ctx)
 	}
 
 	return nil
@@ -1094,34 +1075,6 @@ func (db *DB) monitor() {
 			db.Logger.Error("sync error", "error", err)
 		}
 	}
-}
-
-// CalcRestoreTarget returns a replica to restore from based on opt criteria.
-func (db *DB) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (*Replica, error) {
-	var target struct {
-		replica   *Replica
-		updatedAt time.Time
-	}
-
-	for _, r := range db.Replicas {
-		// Skip replica if it does not match filter.
-		if opt.ReplicaName != "" && r.Name() != opt.ReplicaName {
-			continue
-		}
-
-		updatedAt, err := r.CalcRestoreTarget(ctx, opt)
-		if err != nil {
-			return nil, err
-		}
-
-		// Use the latest replica if we have multiple candidates.
-		if !updatedAt.After(target.updatedAt) {
-			continue
-		}
-
-		target.replica, target.updatedAt = r, updatedAt
-	}
-	return target.replica, nil
 }
 
 // CRC64 returns a CRC-64 ISO checksum of the database and its current position.
