@@ -137,13 +137,7 @@ func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath 
 		return nil, errSkipDBExists
 	}
 
-	// Determine the appropriate replica to restore from,
-	r, err := db.CalcRestoreTarget(ctx, *opt)
-	if err != nil {
-		return nil, err
-	}
-
-	return r, nil
+	return db.Replica, nil
 }
 
 // Usage prints the help screen to STDOUT.

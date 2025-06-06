@@ -292,7 +292,8 @@ type DBConfig struct {
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	MaxCheckpointPageN *int           `yaml:"max-checkpoint-page-count"`
 
-	Replicas []*ReplicaConfig `yaml:"replicas"`
+	Replica  *ReplicaConfig   `yaml:"replica"`
+	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
 }
 
 // NewDBFromConfig instantiates a DB based on a configuration.
@@ -325,14 +326,29 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 		db.MaxCheckpointPageN = *dbc.MaxCheckpointPageN
 	}
 
-	// Instantiate and attach replicas.
-	for _, rc := range dbc.Replicas {
-		r, err := NewReplicaFromConfig(rc, db)
-		if err != nil {
-			return nil, err
-		}
-		db.Replicas = append(db.Replicas, r)
+	// Instantiate and attach replica.
+	// v0.3.x and before supported multiple replicas but that was dropped to
+	// ensure there's a single remote data authority.
+	if dbc.Replica == nil && len(dbc.Replicas) == 0 {
+		return nil, fmt.Errorf("must specify replica for database")
+	} else if dbc.Replica != nil && len(dbc.Replicas) > 0 {
+		return nil, fmt.Errorf("cannot specify 'replica' and 'replicas' on a database")
+	} else if len(dbc.Replicas) > 1 {
+		return nil, fmt.Errorf("multiple replicas on a single database are no longer supported")
 	}
+
+	var rc *ReplicaConfig
+	if dbc.Replica != nil {
+		rc = dbc.Replica
+	} else {
+		rc = dbc.Replicas[0]
+	}
+
+	r, err := NewReplicaFromConfig(rc, db)
+	if err != nil {
+		return nil, err
+	}
+	db.Replica = r
 
 	return db, nil
 }
@@ -340,7 +356,7 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 // ReplicaConfig represents the configuration for a single replica in a database.
 type ReplicaConfig struct {
 	Type                   string         `yaml:"type"` // "file", "s3"
-	Name                   string         `yaml:"name"` // name of replica, optional.
+	Name                   string         `yaml:"name"` // Deprecated
 	Path                   string         `yaml:"path"`
 	URL                    string         `yaml:"url"`
 	Retention              *time.Duration `yaml:"retention"`
