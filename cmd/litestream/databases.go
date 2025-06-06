@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"strings"
 	"text/tabwriter"
 )
 
@@ -43,15 +42,9 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 			return err
 		}
 
-		var replicaNames []string
-		for _, r := range db.Replicas {
-			replicaNames = append(replicaNames, r.Name())
-		}
-
 		fmt.Fprintf(w, "%s\t%s\n",
 			db.Path(),
-			strings.Join(replicaNames, ","),
-		)
+			db.Replica.Name())
 	}
 
 	return nil
