@@ -80,7 +80,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		itr, err := c.LTXFiles(context.Background(), 0)
+		itr, err := c.LTXFiles(context.Background(), 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -115,7 +115,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 	RunWithReplicaClient(t, "NoWALs", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Parallel()
 
-		itr, err := c.LTXFiles(context.Background(), 0)
+		itr, err := c.LTXFiles(context.Background(), 0, 0)
 		if err != nil {
 			t.Fatal(err)
 		}

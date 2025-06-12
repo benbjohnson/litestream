@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"context"
 	"database/sql"
+	"hash/crc64"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -340,6 +341,158 @@ func TestDB_Sync(t *testing.T) {
 	})
 }
 
+func TestDB_Compact(t *testing.T) {
+	// Ensure that raw L0 transactions can be compacted into the first level.
+	t.Run("L1", func(t *testing.T) {
+		db, sqldb := MustOpenDBs(t)
+		defer MustCloseDBs(t, db, sqldb)
+		db.Replica = litestream.NewReplica(db)
+		db.Replica.Client = NewFileReplicaClient(t)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Replica.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		info, err := db.Compact(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.Level, 1; got != want {
+			t.Fatalf("Level=%v, want %v", got, want)
+		}
+		if got, want := info.MinTXID, ltx.TXID(1); got != want {
+			t.Fatalf("MinTXID=%s, want %s", got, want)
+		}
+		if got, want := info.MaxTXID, ltx.TXID(2); got != want {
+			t.Fatalf("MaxTXID=%s, want %s", got, want)
+		}
+		if info.Size == 0 {
+			t.Fatalf("expected non-zero size")
+		}
+	})
+
+	// Ensure that higher level compactions pull from the correct levels.
+	t.Run("L2+", func(t *testing.T) {
+		db, sqldb := MustOpenDBs(t)
+		defer MustCloseDBs(t, db, sqldb)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		}
+
+		// TXID 2
+		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Replica.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Compact to L1:1-2
+		if info, err := db.Compact(t.Context(), 1); err != nil {
+			t.Fatal(err)
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000002.ltx`; got != want {
+			t.Fatalf("Filename=%s, want %s", got, want)
+		}
+
+		// TXID 3
+		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Replica.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Compact to L1:3-3
+		if info, err := db.Compact(t.Context(), 1); err != nil {
+			t.Fatal(err)
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000003-0000000000000003.ltx`; got != want {
+			t.Fatalf("Filename=%s, want %s", got, want)
+		}
+
+		// Compact to L2:1-3
+		if info, err := db.Compact(t.Context(), 2); err != nil {
+			t.Fatal(err)
+		} else if got, want := info.Level, 2; got != want {
+			t.Fatalf("Level=%v, want %v", got, want)
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000003.ltx`; got != want {
+			t.Fatalf("Filename=%s, want %s", got, want)
+		}
+	})
+}
+
+func TestDB_Snapshot(t *testing.T) {
+	db, sqldb := MustOpenDBs(t)
+	defer MustCloseDBs(t, db, sqldb)
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = NewFileReplicaClient(t)
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := db.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000002.ltx`; got != want {
+		t.Fatalf("Filename=%s, want %s", got, want)
+	}
+
+	// Calculate local checksum
+	chksum0, _, err := db.CRC64(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Fetch remote LTX snapshot file and ensure it matches the checksum of the local database.
+	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	h := crc64.New(crc64.MakeTable(crc64.ISO))
+	if err := ltx.NewDecoder(rc).DecodeDatabaseTo(h); err != nil {
+		t.Fatal(err)
+	} else if got, want := h.Sum64(), chksum0; got != want {
+		t.Fatal("snapshot checksum mismatch")
+	}
+}
+
 func newDB(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
 	tb.Logf("db=%s", path)
@@ -375,6 +528,9 @@ func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
 	db := newDB(tb, path)
 	db.MonitorInterval = 0 // disable background goroutine
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = NewFileReplicaClient(tb)
+	db.Replica.MonitorEnabled = false // disable background goroutine
 	if err := db.Open(); err != nil {
 		tb.Fatal(err)
 	}
@@ -384,7 +540,7 @@ func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 // MustCloseDB closes db and removes its parent directory.
 func MustCloseDB(tb testing.TB, db *litestream.DB) {
 	tb.Helper()
-	if err := db.Close(context.Background()); err != nil && !strings.Contains(err.Error(), `database is closed`) {
+	if err := db.Close(context.Background()); err != nil && !strings.Contains(err.Error(), `database is closed`) && !strings.Contains(err.Error(), `file already closed`) {
 		tb.Fatal(err)
 	} else if err := os.RemoveAll(filepath.Dir(db.Path())); err != nil {
 		tb.Fatal(err)

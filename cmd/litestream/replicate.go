@@ -28,8 +28,8 @@ type ReplicateCommand struct {
 
 	Config Config
 
-	// List of managed databases specified in the config.
-	DBs []*litestream.DB
+	// Manages the set of databases & compaction levels.
+	Store *litestream.Store
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -92,24 +92,23 @@ func (c *ReplicateCommand) Run() (err error) {
 		slog.Error("no databases specified in configuration")
 	}
 
+	var dbs []*litestream.DB
 	for _, dbConfig := range c.Config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {
 			return err
 		}
-
-		// Open database & attach to program.
-		if err := db.Open(); err != nil {
-			return err
-		}
-		c.DBs = append(c.DBs, db)
+		dbs = append(dbs, db)
 	}
 
+	levels := c.Config.CompactionLevels()
+	c.Store = litestream.NewStore(dbs, levels)
+
 	// Notify user that initialization is done.
-	for _, db := range c.DBs {
+	for _, db := range c.Store.DBs() {
 		r := db.Replica
 		slog.Info("initialized db", "path", db.Path())
-		slog := slog.With("name", r.Name(), "type", r.Client.Type(), "sync-interval", r.SyncInterval)
+		slog := slog.With("type", r.Client.Type(), "sync-interval", r.SyncInterval)
 		switch client := r.Client.(type) {
 		case *file.ReplicaClient:
 			slog.Info("replicating to", "path", client.Path())
@@ -166,13 +165,8 @@ func (c *ReplicateCommand) Run() (err error) {
 
 // Close closes all open databases.
 func (c *ReplicateCommand) Close() (err error) {
-	for _, db := range c.DBs {
-		if e := db.Close(context.Background()); e != nil {
-			db.Logger.Error("error closing db", "error", e)
-			if err == nil {
-				err = e
-			}
-		}
+	if e := c.Store.Close(); e != nil {
+		slog.Error("failed to close database", "error", e)
 	}
 	return err
 }
