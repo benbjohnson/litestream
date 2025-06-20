@@ -12,7 +12,7 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 type ReplicaClient struct {
 	DeleteAllFunc      func(ctx context.Context) error
-	LTXFilesFunc       func(ctx context.Context, level int) (ltx.FileIterator, error)
+	LTXFilesFunc       func(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
 	OpenLTXFileFunc    func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error)
 	WriteLTXFileFunc   func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
 	DeleteLTXFilesFunc func(ctx context.Context, a []*ltx.FileInfo) error
@@ -24,8 +24,8 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	return c.DeleteAllFunc(ctx)
 }
 
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
-	return c.LTXFilesFunc(ctx, level)
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+	return c.LTXFilesFunc(ctx, level, seek)
 }
 
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {

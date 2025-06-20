@@ -13,7 +13,8 @@ type ReplicaClient interface {
 	Type() string
 
 	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
-	LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error)
+	// If seek is specified, the iterator start from the given TXID or the next available if not found.
+	LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
 
 	// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
 	// Returns an os.ErrNotFound error if the LTX file does not exist.

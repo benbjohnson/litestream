@@ -59,7 +59,7 @@ func (c *ReplicaClient) LTXFilePath(level int, minTXID, maxTXID ltx.TXID) string
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
 	f, err := os.Open(c.LTXLevelDir(level))
 	if os.IsNotExist(err) {
 		return ltx.NewFileInfoSliceIterator(nil), nil
@@ -78,6 +78,8 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterat
 	for _, fi := range fis {
 		minTXID, maxTXID, err := ltx.ParseFilename(fi.Name())
 		if err != nil {
+			continue
+		} else if minTXID < seek {
 			continue
 		}
 
@@ -101,7 +103,6 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 // WriteLTXFile writes an LTX file to disk.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
-
 	var fileInfo, dirInfo os.FileInfo
 	if db := c.db(); db != nil {
 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
@@ -126,12 +127,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err := f.Sync(); err != nil {
 		return nil, err
 	}
-	if err := f.Close(); err != nil {
-		return nil, err
-	}
 
 	// Build metadata.
-	fi, err := os.Stat(filename + ".tmp")
+	fi, err := f.Stat()
 	if err != nil {
 		return nil, err
 	}
@@ -141,6 +139,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MaxTXID:   maxTXID,
 		Size:      fi.Size(),
 		CreatedAt: fi.ModTime().UTC(),
+	}
+
+	if err := f.Close(); err != nil {
+		return nil, err
 	}
 
 	// Move LTX file to final path when it has been written & synced to disk.
