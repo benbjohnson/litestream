@@ -43,7 +43,13 @@ type DB struct {
 	rtx      *sql.Tx       // long running read transaction
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
-	chkMu    sync.Mutex    // checkpoint lock
+	chkMu    sync.RWMutex  // checkpoint lock
+
+	// last file info for each level
+	maxLTXFileInfos struct {
+		sync.Mutex
+		m map[int]*ltx.FileInfo
+	}
 
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
@@ -123,6 +129,7 @@ func NewDB(path string) *DB {
 		BusyTimeout:        DefaultBusyTimeout,
 		Logger:             slog.With("db", filepath.Base(path)),
 	}
+	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
 	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
@@ -748,8 +755,8 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 
 	// Prevent internal checkpoints during sync. Ignore if already in a checkpoint.
 	if !checkpointing {
-		db.chkMu.Lock()
-		defer db.chkMu.Unlock()
+		db.chkMu.RLock()
+		defer db.chkMu.RUnlock()
 	}
 
 	fi, err := db.f.Stat()
@@ -873,7 +880,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	return nil
 }
 
-func (db *DB) writeLTXFromDB(_ context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
 
@@ -882,9 +889,16 @@ func (db *DB) writeLTXFromDB(_ context.Context, enc *ltx.Encoder, walFile *os.Fi
 			continue
 		}
 
+		// Check if the caller has canceled during processing.
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
+		}
+
 		// If page exists in the WAL, read from there.
 		if offset, ok := pageMap[pgno]; ok {
-			db.Logger.Debug("encode page from wal", "offset", offset, "pgno", pgno)
+			db.Logger.Debug("encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno)
 
 			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
 				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
@@ -925,7 +939,7 @@ func (db *DB) writeLTXFromWAL(_ context.Context, enc *ltx.Encoder, walFile *os.F
 	for _, pgno := range pgnos {
 		offset := pageMap[pgno]
 
-		db.Logger.Debug("encode page from wal", "offset", offset, "pgno", pgno)
+		db.Logger.Debug("encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno)
 
 		// Read source page using page map.
 		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
@@ -1057,6 +1071,183 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 	return nil
 }
 
+// SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
+func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+	pos, err := db.Pos()
+	if err != nil {
+		return pos, nil, fmt.Errorf("pos: %w", err)
+	}
+
+	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
+
+	// Prevent internal checkpoints during sync.
+	db.chkMu.RLock()
+	defer db.chkMu.RUnlock()
+
+	// TODO(ltx): Read database size from database header.
+
+	fi, err := db.f.Stat()
+	if err != nil {
+		return pos, nil, err
+	}
+	commit := uint32(fi.Size() / int64(db.pageSize))
+
+	// Execute encoding in a separate goroutine so the caller can initialize before reading.
+	pr, pw := io.Pipe()
+	go func() {
+		walFile, err := os.Open(db.WALPath())
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+		defer walFile.Close()
+
+		rd, err := NewWALReader(walFile, db.Logger)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
+			return
+		}
+
+		// Build a mapping of changed page numbers and their latest content.
+		pageMap, sz, walCommit, err := rd.PageMap()
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("page map: %w", err))
+			return
+		}
+		if walCommit > 0 {
+			commit = walCommit
+		}
+
+		db.Logger.Debug("encode snapshot header",
+			"txid", pos.TXID.String(),
+			"commit", commit,
+			"walOffset", rd.Offset(),
+			"walSize", sz,
+			"salt1", rd.salt1,
+			"salt2", rd.salt2)
+
+		enc := ltx.NewEncoder(pw)
+		if err := enc.EncodeHeader(ltx.Header{
+			Version:   ltx.Version,
+			Flags:     ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4,
+			PageSize:  uint32(db.pageSize),
+			Commit:    commit,
+			MinTXID:   1,
+			MaxTXID:   pos.TXID,
+			Timestamp: time.Now().UnixMilli(),
+			WALOffset: rd.Offset(),
+			WALSize:   sz,
+			WALSalt1:  rd.salt1,
+			WALSalt2:  rd.salt2,
+		}); err != nil {
+			pw.CloseWithError(fmt.Errorf("encode ltx snapshot header: %w", err))
+			return
+		}
+
+		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
+			return
+		}
+
+		if err := enc.Close(); err != nil {
+			pw.CloseWithError(fmt.Errorf("close ltx snapshot encoder: %w", err))
+			return
+		}
+		_ = pw.Close()
+	}()
+
+	return pos, pr, nil
+}
+
+// Compact performs a compaction of the LTX file at the previous level into dstLevel.
+// Returns metadata for the newly written compaction file. Returns ErrNoCompaction
+// if no new files are available to be compacted.
+func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
+	srcLevel := dstLevel - 1
+
+	prevMaxInfo, err := db.Replica.MaxLTXFileInfo(ctx, dstLevel)
+	if err != nil {
+		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
+	}
+	seekTXID := prevMaxInfo.MaxTXID + 1
+
+	// Collect files after last compaction.
+	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID)
+	if err != nil {
+		return nil, fmt.Errorf("source ltx files after %s: %w", seekTXID, err)
+	}
+	defer itr.Close()
+
+	// Ensure all readers are closed by the end, even if an error occurs.
+	var rdrs []io.Reader
+	defer func() {
+		for _, rd := range rdrs {
+			_ = rd.(io.Closer).Close()
+		}
+	}()
+
+	// Build a list of input files to compact from.
+	var minTXID, maxTXID ltx.TXID
+	for itr.Next() {
+		info := itr.Item()
+
+		// Track TXID bounds of all files being compacted.
+		if minTXID == 0 || info.MinTXID < minTXID {
+			minTXID = info.MinTXID
+		}
+		if maxTXID == 0 || info.MaxTXID > maxTXID {
+			maxTXID = info.MaxTXID
+		}
+
+		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID)
+		if err != nil {
+			return nil, fmt.Errorf("open ltx file: %w", err)
+		}
+		rdrs = append(rdrs, f)
+	}
+	if len(rdrs) == 0 {
+		return nil, ErrNoCompaction
+	}
+
+	// Stream compaction to destination in level.
+	pr, pw := io.Pipe()
+	go func() {
+		c := ltx.NewCompactor(pw, rdrs)
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		_ = pw.CloseWithError(c.Compact(ctx))
+	}()
+
+	info, err := db.Replica.Client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	if err != nil {
+		return nil, fmt.Errorf("write ltx file: %w", err)
+	}
+
+	// Cache last metadata for the level.
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m[dstLevel] = info
+	db.maxLTXFileInfos.Unlock()
+
+	return info, nil
+}
+
+// SnapshotDB writes a snapshot to the replica for the current position of the database.
+func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
+	pos, r, err := db.SnapshotReader(ctx)
+	if err != nil {
+		return nil, err
+	}
+	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
+	if err != nil {
+		return info, err
+	}
+
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m[SnapshotLevel] = info
+	db.maxLTXFileInfos.Unlock()
+
+	return info, nil
+}
+
 // monitor runs in a separate goroutine and monitors the database & WAL.
 func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)
@@ -1114,6 +1305,26 @@ func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
 		return 0, pos, err
 	}
 	return h.Sum64(), pos, nil
+}
+
+// MaxLTXFileInfo returns the metadata for the last LTX file in a level.
+// If cached, it will returned the local copy. Otherwise, it fetches from the replica.
+func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+
+	info, ok := db.maxLTXFileInfos.m[level]
+	if ok {
+		return *info, nil
+	}
+
+	remoteInfo, err := db.Replica.MaxLTXFileInfo(ctx, level)
+	if err != nil {
+		return ltx.FileInfo{}, fmt.Errorf("cannot determine L%d max ltx file for %q: %w", level, db.Path(), err)
+	}
+
+	db.maxLTXFileInfos.m[level] = &remoteInfo
+	return remoteInfo, nil
 }
 
 // DefaultRestoreParallelism is the default parallelism when downloading WAL files.

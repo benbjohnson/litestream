@@ -28,8 +28,7 @@ const (
 // The replica manages periodic synchronization and maintaining the current
 // replica position.
 type Replica struct {
-	db   *DB
-	name string
+	db *DB
 
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
@@ -65,10 +64,9 @@ type Replica struct {
 	AgeRecipients []age.Recipient
 }
 
-func NewReplica(db *DB, name string) *Replica {
+func NewReplica(db *DB) *Replica {
 	r := &Replica{
 		db:     db,
-		name:   name,
 		cancel: func() {},
 
 		SyncInterval:           DefaultSyncInterval,
@@ -80,21 +78,13 @@ func NewReplica(db *DB, name string) *Replica {
 	return r
 }
 
-// Name returns the name of the replica.
-func (r *Replica) Name() string {
-	if r.name == "" && r.Client != nil {
-		return r.Client.Type()
-	}
-	return r.name
-}
-
 // Logger returns the DB sub-logger for this replica.
 func (r *Replica) Logger() *slog.Logger {
 	logger := slog.Default()
 	if r.db != nil {
 		logger = r.db.Logger
 	}
-	return logger.With("replica", r.Name())
+	return logger.With("replica", r.Client.Type())
 }
 
 // DB returns a reference to the database the replica is attached to, if any.
@@ -204,28 +194,29 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 
 // calcPos returns the last position saved to the replica for level 0.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
-	_, maxTXID, err := r.maxLTXFile(ctx, 0)
+	info, err := r.MaxLTXFileInfo(ctx, 0)
 	if err != nil {
 		return pos, fmt.Errorf("max ltx file: %w", err)
 	}
-	return ltx.Pos{TXID: maxTXID}, nil
+	return ltx.Pos{TXID: info.MaxTXID}, nil
 }
 
-// maxLTXFile returns the min & max TXID of the last LTX file for a given level.
-func (r *Replica) maxLTXFile(ctx context.Context, level int) (minTXID, maxTXID ltx.TXID, err error) {
-	itr, err := r.Client.LTXFiles(ctx, level)
+// MaxLTXFileInfo returns metadata about the last LTX file for a given level.
+// Retuns nil if no files exist for the level.
+func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileInfo, err error) {
+	itr, err := r.Client.LTXFiles(ctx, level, 0)
 	if err != nil {
-		return 0, 0, err
+		return info, err
 	}
 	defer itr.Close()
 
 	for itr.Next() {
-		info := itr.Item()
-		if info.MaxTXID > maxTXID {
-			minTXID, maxTXID = info.MinTXID, info.MaxTXID
+		item := itr.Item()
+		if item.MaxTXID > info.MaxTXID {
+			info = *item
 		}
 	}
-	return minTXID, maxTXID, itr.Close()
+	return info, itr.Close()
 }
 
 // Pos returns the current replicated position.
@@ -387,7 +378,7 @@ func (r *Replica) retainer(ctx context.Context) {
 func (r *Replica) validator(ctx context.Context) {
 	// Initialize counters since validation occurs infrequently.
 	for _, status := range []string{"ok", "error"} {
-		replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), r.Name(), status).Add(0)
+		replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), status).Add(0)
 	}
 
 	// Exit validation if interval is not set.
@@ -437,9 +428,8 @@ func (r *Replica) Validate(ctx context.Context) error {
 
 	restorePath := filepath.Join(tmpdir, "replica")
 	if err := r.Restore(ctx, RestoreOptions{
-		OutputPath:  restorePath,
-		ReplicaName: r.Name(),
-		TXID:        pos.TXID - 1,
+		OutputPath: restorePath,
+		TXID:       pos.TXID - 1,
 	}); err != nil {
 		return fmt.Errorf("cannot restore: %w", err)
 	}
@@ -468,11 +458,11 @@ func (r *Replica) Validate(ctx context.Context) error {
 
 	// Validate checksums match.
 	if mismatch {
-		replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), r.Name(), "error").Inc()
+		replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), "error").Inc()
 		return ErrChecksumMismatch
 	}
 
-	replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), r.Name(), "ok").Inc()
+	replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), "ok").Inc()
 
 	if err := os.RemoveAll(tmpdir); err != nil {
 		return fmt.Errorf("cannot remove temporary validation directory: %w", err)
@@ -528,7 +518,7 @@ func (r *Replica) waitForReplica(ctx context.Context, pos ltx.Pos) error {
 func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 	var min time.Time
 
-	itr, err := r.Client.LTXFiles(ctx, 0)
+	itr, err := r.Client.LTXFiles(ctx, 0, 0)
 	if err != nil {
 		return min, err
 	}
@@ -543,7 +533,7 @@ func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 // TimeBounds returns the creation time & last updated time.
 // Returns zero time if LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
-	itr, err := r.Client.LTXFiles(ctx, 0)
+	itr, err := r.Client.LTXFiles(ctx, 0, 0)
 	if err != nil {
 		return createdAt, updatedAt, err
 	}
@@ -601,7 +591,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	// Fetch every LTX file from TXID 1 to target TXID or timestamp.
-	itr, err := r.Client.LTXFiles(ctx, 0)
+	itr, err := r.Client.LTXFiles(ctx, 0, 0)
 	if err != nil {
 		return fmt.Errorf("cannot list ltx files: %w", err)
 	}
@@ -680,5 +670,5 @@ var (
 		Subsystem: "replica",
 		Name:      "validation_total",
 		Help:      "The number of validations performed",
-	}, []string{"db", "name", "status"})
+	}, []string{"db", "status"})
 )

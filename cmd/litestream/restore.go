@@ -107,7 +107,7 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(ctx context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	// Load configuration.
 	config, err := ReadConfigFile(configPath, expandEnv)
 	if err != nil {
