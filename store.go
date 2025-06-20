@@ -1,0 +1,211 @@
+package litestream
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"slices"
+	"sync"
+	"time"
+
+	"github.com/superfly/ltx"
+)
+
+var (
+	// ErrNoCompaction is returned when no new files are available from the previous level.
+	ErrNoCompaction = errors.New("no compaction")
+
+	// ErrCompactionTooEarly is returned when a compaction is attempted too soon
+	// since the last compaction time. This is used to prevent frequent
+	// re-compaction when restarting the process.
+	ErrCompactionTooEarly = errors.New("compaction too early")
+)
+
+// Store defaults
+const (
+	DefaultSnapshotInterval  = 24 * time.Hour
+	DefaultSnapshotRetention = 24 * time.Hour
+)
+
+// Store represents the top-level container for databases.
+//
+// It manages async background tasks like compactions so that the system
+// is not overloaded by too many concurrent tasks.
+type Store struct {
+	mu     sync.Mutex
+	dbs    []*DB
+	levels CompactionLevels
+
+	wg     sync.WaitGroup
+	ctx    context.Context
+	cancel func()
+
+	// The frequency of snapshots.
+	SnapshotInterval time.Duration
+	// The duration of time that snapshots are kept before being deleted.
+	SnapshotRetention time.Duration
+
+	// If true, compaction is run in the background according to compaction levels.
+	CompactionMonitorEnabled bool
+}
+
+func NewStore(dbs []*DB, levels CompactionLevels) *Store {
+	s := &Store{
+		dbs:    dbs,
+		levels: levels,
+
+		SnapshotInterval:         DefaultSnapshotInterval,
+		SnapshotRetention:        DefaultSnapshotRetention,
+		CompactionMonitorEnabled: true,
+	}
+	s.ctx, s.cancel = context.WithCancel(context.Background())
+	return s
+}
+
+func (s *Store) Open(ctx context.Context) error {
+	if err := s.levels.Validate(); err != nil {
+		return err
+	}
+
+	for _, db := range s.dbs {
+		if err := db.Open(); err != nil {
+			return err
+		}
+	}
+
+	// Start monitors for compactions & snapshots.
+	if s.CompactionMonitorEnabled {
+		for _, lvl := range s.levels {
+			lvl := lvl
+			if lvl.Level == 0 {
+				continue
+			}
+			go func() {
+				defer s.wg.Done()
+				s.monitorCompactionLevel(s.ctx, lvl)
+			}()
+		}
+
+		go func() {
+			defer s.wg.Done()
+			s.monitorCompactionLevel(s.ctx, s.SnapshotLevel())
+		}()
+	}
+
+	return nil
+}
+
+func (s *Store) Close() (err error) {
+	for _, db := range s.dbs {
+		if e := db.Close(context.Background()); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	// Cancel and wait for background tasks to complete.
+	s.cancel()
+	s.wg.Wait()
+
+	return err
+}
+
+func (s *Store) DBs() []*DB {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.dbs)
+}
+
+// SnapshotLevel returns a pseudo compaction level based on snapshot settings.
+func (s *Store) SnapshotLevel() *CompactionLevel {
+	return &CompactionLevel{
+		Level:     SnapshotLevel,
+		Interval:  s.SnapshotInterval,
+		Retention: s.SnapshotRetention,
+	}
+}
+
+func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel) {
+	// Start first compaction immediately to check for any missed compactions from shutdown
+	timer := time.NewTimer(time.Nanosecond)
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			break LOOP
+
+		case <-timer.C:
+			// Reset timer before we start compactions so we don't delay it
+			// from long compactions.
+			timer = time.NewTimer(time.Until(lvl.NextCompactionAt(time.Now())))
+
+			for _, db := range s.DBs() {
+				if _, err := s.CompactDB(ctx, db, lvl); errors.Is(err, ErrNoCompaction) {
+					slog.Debug("no compaction", "path", db.Path())
+					continue
+				} else if errors.Is(err, ErrCompactionTooEarly) {
+					slog.Debug("recently compacted, skipping", "path", db.Path())
+					continue
+				} else if err != nil {
+					slog.Error("compaction failed", "error", err)
+					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
+				}
+			}
+		}
+	}
+}
+
+// CompactDB performs a compaction or snapshot for a given database on a single destination level.
+// This function will only proceed if a compaction has not occurred before the last compaction time.
+func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	dstLevel := lvl.Level
+
+	// Ensure we are not re-compacting before the most recent compaction time.
+	prevCompactionAt := lvl.PrevCompactionAt(time.Now())
+	dstInfo, err := db.MaxLTXFileInfo(ctx, dstLevel)
+	if err != nil {
+		return nil, fmt.Errorf("fetch dst level info: %w", err)
+	} else if dstInfo.CreatedAt.After(prevCompactionAt) {
+		return nil, ErrCompactionTooEarly
+	}
+
+	// Shortcut if this is a snapshot since we are not pulling from a previous level.
+	if dstLevel == SnapshotLevel {
+		info, err := db.Snapshot(ctx)
+		if err != nil {
+			return info, err
+		}
+		slog.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
+		return info, nil
+	}
+
+	// Fetch latest LTX files for both the source & destination so we can see if we need to make progress.
+	srcLevel := s.levels.PrevLevel(dstLevel)
+	srcInfo, err := db.MaxLTXFileInfo(ctx, srcLevel)
+	if err != nil {
+		return nil, fmt.Errorf("fetch src level info: %w", err)
+	}
+
+	// Skip if there are no new files to compact.
+	if srcInfo.MaxTXID <= dstInfo.MinTXID {
+		return nil, ErrNoCompaction
+	}
+
+	info, err := db.Compact(ctx, dstLevel)
+	if err != nil {
+		return info, err
+	}
+
+	slog.InfoContext(ctx, "compaction complete",
+		"level", dstLevel,
+		slog.Group("txid",
+			"min", info.MinTXID.String(),
+			"max", info.MaxTXID.String(),
+		),
+		"size", info.Size,
+	)
+
+	return info, nil
+}

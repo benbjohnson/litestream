@@ -197,11 +197,11 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newLTXFileIterator(ctx, c, level), nil
+	return newLTXFileIterator(ctx, c, level, seek), nil
 }
 
 // WriteLTXFile writes an LTX file from rd into a remote location.
@@ -298,6 +298,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 type ltxFileIterator struct {
 	client *ReplicaClient
 	level  int
+	seek   ltx.TXID
 
 	ch     chan *ltx.FileInfo
 	g      errgroup.Group
@@ -308,10 +309,11 @@ type ltxFileIterator struct {
 	err  error
 }
 
-func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int) *ltxFileIterator {
+func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
 	itr := &ltxFileIterator{
 		client: client,
 		level:  level,
+		seek:   seek,
 		ch:     make(chan *ltx.FileInfo),
 	}
 
@@ -326,10 +328,14 @@ func (itr *ltxFileIterator) fetch() error {
 	defer close(itr.ch)
 
 	dir := litestream.LTXLevelDir(itr.client.Path, itr.level)
+	prefix := dir + "/"
+	if itr.seek != 0 {
+		prefix += itr.seek.String()
+	}
 
 	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
 		Bucket:    aws.String(itr.client.Bucket),
-		Prefix:    aws.String(dir + "/"),
+		Prefix:    aws.String(prefix),
 		Delimiter: aws.String("/"),
 	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()

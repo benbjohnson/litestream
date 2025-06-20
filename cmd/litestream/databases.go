@@ -35,7 +35,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
-	fmt.Fprintln(w, "path\treplicas")
+	fmt.Fprintln(w, "path\treplica")
 	for _, dbConfig := range config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {
@@ -44,7 +44,7 @@ func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
 
 		fmt.Fprintf(w, "%s\t%s\n",
 			db.Path(),
-			db.Replica.Name())
+			db.Replica.Client.Type())
 	}
 
 	return nil
