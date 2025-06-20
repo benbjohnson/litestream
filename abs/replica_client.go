@@ -91,11 +91,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newLTXFileIterator(ctx, c, level), nil
+	return newLTXFileIterator(ctx, c, level, seek), nil
 }
 
 // WriteLTXFile writes an LTX file to remote storage.
@@ -206,6 +206,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 type ltxFileIterator struct {
 	client *ReplicaClient
 	level  int
+	seek   ltx.TXID
 
 	ch     chan ltx.FileInfo
 	g      errgroup.Group
@@ -216,10 +217,11 @@ type ltxFileIterator struct {
 	err  error
 }
 
-func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int) *ltxFileIterator {
+func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
 	itr := &ltxFileIterator{
 		client: client,
 		level:  level,
+		seek:   seek,
 		ch:     make(chan ltx.FileInfo),
 	}
 
@@ -234,12 +236,16 @@ func (itr *ltxFileIterator) fetch() error {
 	defer close(itr.ch)
 
 	dir := litestream.LTXLevelDir(itr.client.Path, itr.level)
+	prefix := dir + "/"
+	if itr.seek != 0 {
+		prefix += itr.seek.String()
+	}
 
 	var marker azblob.Marker
 	for marker.NotDone() {
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: dir + "/"})
+		resp, err := itr.client.containerURL.ListBlobsFlatSegment(itr.ctx, marker, azblob.ListBlobsSegmentOptions{Prefix: prefix})
 		if err != nil {
 			return err
 		}

@@ -89,12 +89,18 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
+
 	dir := litestream.LTXLevelDir(c.Path, level)
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: dir + "/"}), level), nil
+	prefix := dir + "/"
+	if seek != 0 {
+		prefix += seek.String()
+	}
+
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), level), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.

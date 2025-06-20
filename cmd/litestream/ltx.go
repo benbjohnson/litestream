@@ -70,7 +70,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	defer w.Flush()
 
 	fmt.Fprintln(w, "min_txid\tmax_txid\tsize\tcreated")
-	itr, err := r.Client.LTXFiles(ctx, 0)
+	itr, err := r.Client.LTXFiles(ctx, 0, 0)
 	if err != nil {
 		return err
 	}

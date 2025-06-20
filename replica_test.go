@@ -6,24 +6,8 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/mock"
 	"github.com/superfly/ltx"
 )
-
-func TestReplica_Name(t *testing.T) {
-	t.Run("WithName", func(t *testing.T) {
-		if got, want := litestream.NewReplica(nil, "NAME").Name(), "NAME"; got != want {
-			t.Fatalf("Name()=%v, want %v", got, want)
-		}
-	})
-	t.Run("WithoutName", func(t *testing.T) {
-		r := litestream.NewReplica(nil, "")
-		r.Client = &mock.ReplicaClient{}
-		if got, want := r.Name(), "mock"; got != want {
-			t.Fatalf("Name()=%v, want %v", got, want)
-		}
-	})
-}
 
 func TestReplica_Sync(t *testing.T) {
 	db, sqldb := MustOpenDBs(t)
@@ -45,7 +29,7 @@ func TestReplica_Sync(t *testing.T) {
 	t.Logf("position after sync: %s", dpos.String())
 
 	c := file.NewReplicaClient(t.TempDir())
-	r := litestream.NewReplica(db, "")
+	r := litestream.NewReplica(db)
 	c.Replica, r.Client = r, c
 
 	if err := r.Sync(context.Background()); err != nil {
