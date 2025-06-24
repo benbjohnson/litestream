@@ -13,6 +13,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
+	"github.com/benbjohnson/litestream/cmd/litestream/mcp"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
@@ -30,6 +31,11 @@ type ReplicateCommand struct {
 
 	// List of managed databases specified in the config.
 	DBs []*litestream.DB
+
+	// MCP server options
+	MCPEnabled bool
+	MCPPort    int
+	MCP        *mcp.Server
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -43,6 +49,8 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
 	configPath, noExpandEnv := registerConfigFlag(fs)
+	mcpFlag := fs.Bool("mcp", false, "Enable MCP server (agent mode)")
+	mcpPortFlag := fs.Int("mcp-port", 8080, "Port for MCP server (default 8080)")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -73,10 +81,18 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			return err
 		}
 	}
+	c.Config.ConfigPath = *configPath
 
 	// Override config exec command, if specified.
 	if *execFlag != "" {
 		c.Config.Exec = *execFlag
+	}
+
+	// Merge MCP flags/config
+	c.MCPEnabled = c.Config.MCPEnabled || *mcpFlag
+	c.MCPPort = c.Config.MCPPort
+	if *mcpPortFlag != 8080 {
+		c.MCPPort = *mcpPortFlag
 	}
 
 	return nil
@@ -86,6 +102,15 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 func (c *ReplicateCommand) Run() (err error) {
 	// Display version information.
 	slog.Info("litestream", "version", Version)
+
+	// Start MCP server if enabled
+	if c.MCPEnabled {
+		c.MCP, err = mcp.New(context.Background(), c.Config.ConfigPath)
+		if err != nil {
+			return err
+		}
+		go c.MCP.Start(c.MCPPort)
+	}
 
 	// Setup databases.
 	if len(c.Config.DBs) == 0 {
@@ -175,35 +200,38 @@ func (c *ReplicateCommand) Close() (err error) {
 			}
 		}
 	}
+	if c.MCPEnabled {
+		if err := c.MCP.Close(); err != nil {
+			slog.Error("error closing MCP server", "error", err)
+		}
+	}
 	return err
 }
 
 // Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
-	fmt.Printf(`
-The replicate command starts a server to monitor & replicate databases.
-You can specify your database & replicas in a configuration file or you can
-replicate a single database file by specifying its path and its replicas in the
-command line arguments.
+	fmt.Print(`
+The replicate command runs a server to replicate databases.
 
 Usage:
 
 	litestream replicate [arguments]
 
-	litestream replicate [arguments] DB_PATH REPLICA_URL [REPLICA_URL...]
-
 Arguments:
 
-	-config PATH
-	    Specifies the configuration file.
-	    Defaults to %s
-
-	-exec CMD
-	    Executes a subcommand. Litestream will exit when the child
-	    process exits. Useful for simple process management.
-
+	-mcp
+	    Enable the MCP server for remote control and monitoring.
+	-mcp-port
+	    Port to run the MCP server on (default: 8080).
+	-config
+	    Path to the configuration file.
 	-no-expand-env
-	    Disables environment variable expansion in configuration file.
+	    Do not expand environment variables in config.
 
-`[1:], DefaultConfigPath())
+Examples:
+
+	# Run replication and enable MCP server on port 8080.
+	$ litestream replicate -mcp -mcp-port 8080
+
+`)
 }

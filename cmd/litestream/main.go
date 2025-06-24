@@ -35,6 +35,8 @@ var (
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
 
+const DefaultMCPPort = 8080
+
 func main() {
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
@@ -172,6 +174,14 @@ type Config struct {
 
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
+
+	// MCP server options
+	MCPEnabled bool `yaml:"mcp-enabled"`
+	MCPPort    int  `yaml:"mcp-port"`
+
+	// Path to the config file
+	// This is only used internally to pass the config path to the MCP tool
+	ConfigPath string `yaml:"-"`
 }
 
 // LoggingConfig configures logging.
@@ -197,7 +207,9 @@ func (c *Config) propagateGlobalSettings() {
 
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
-	return Config{}
+	return Config{
+		MCPPort: DefaultMCPPort,
+	}
 }
 
 // DBConfig returns database configuration by path.
@@ -422,19 +434,19 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	case "s3":
-		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
+		if r.Client, err = newS3ReplicaClientFromConfig(c); err != nil {
 			return nil, err
 		}
 	case "gcs":
-		if r.Client, err = newGCSReplicaClientFromConfig(c, r); err != nil {
+		if r.Client, err = newGCSReplicaClientFromConfig(c); err != nil {
 			return nil, err
 		}
 	case "abs":
-		if r.Client, err = newABSReplicaClientFromConfig(c, r); err != nil {
+		if r.Client, err = newABSReplicaClientFromConfig(c); err != nil {
 			return nil, err
 		}
 	case "sftp":
-		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
+		if r.Client, err = newSFTPReplicaClientFromConfig(c); err != nil {
 			return nil, err
 		}
 	default:
@@ -476,7 +488,7 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 }
 
 // newS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
-func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s3.ReplicaClient, err error) {
+func newS3ReplicaClientFromConfig(c *ReplicaConfig) (_ *s3.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for s3 replica")
@@ -539,7 +551,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *s
 }
 
 // newGCSReplicaClientFromConfig returns a new instance of gcs.ReplicaClient built from config.
-func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *gcs.ReplicaClient, err error) {
+func newGCSReplicaClientFromConfig(c *ReplicaConfig) (_ *gcs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for gcs replica")
@@ -578,7 +590,7 @@ func newGCSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 }
 
 // newABSReplicaClientFromConfig returns a new instance of abs.ReplicaClient built from config.
-func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *abs.ReplicaClient, err error) {
+func newABSReplicaClientFromConfig(c *ReplicaConfig) (_ *abs.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for abs replica")
@@ -621,7 +633,7 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *
 }
 
 // newSFTPReplicaClientFromConfig returns a new instance of sftp.ReplicaClient built from config.
-func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ *sftp.ReplicaClient, err error) {
+func newSFTPReplicaClientFromConfig(c *ReplicaConfig) (_ *sftp.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for sftp replica")
@@ -670,7 +682,7 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	return client, nil
 }
 
-// applyLitestreamEnv copies "LITESTREAM" prefixed environment variables to
+// applyLitestreamEnv copies "LITESTEAM" prefixed environment variables to
 // their AWS counterparts as the "AWS" prefix can be confusing when using a
 // non-AWS S3-compatible service.
 func applyLitestreamEnv() {
