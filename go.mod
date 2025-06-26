@@ -64,3 +64,5 @@ require (
 	google.golang.org/grpc v1.60.1 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 )
+
+replace github.com/superfly/ltx => ../../superfly/ltx

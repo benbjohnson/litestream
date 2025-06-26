@@ -20,6 +20,9 @@ var (
 	// since the last compaction time. This is used to prevent frequent
 	// re-compaction when restarting the process.
 	ErrCompactionTooEarly = errors.New("compaction too early")
+
+	// ErrTxNotAvailable is returned when a transaction does not exist.
+	ErrTxNotAvailable = errors.New("transaction not available")
 )
 
 // Store defaults
