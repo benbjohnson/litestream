@@ -78,6 +78,12 @@ func NewReplica(db *DB) *Replica {
 	return r
 }
 
+func NewReplicaWithClient(db *DB, client ReplicaClient) *Replica {
+	r := NewReplica(db)
+	r.Client = client
+	return r
+}
+
 // Logger returns the DB sub-logger for this replica.
 func (r *Replica) Logger() *slog.Logger {
 	logger := slog.Default()
@@ -661,6 +667,57 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	return nil
+}
+
+// CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
+func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID) ([]*ltx.FileInfo, error) {
+	var infos ltx.FileInfoSlice
+	logger := r.Logger().With("target", txID)
+
+	// Start with latest snapshot before target TXID.
+	if a, err := FindLTXFiles(ctx, r.Client, SnapshotLevel, func(info *ltx.FileInfo) (bool, error) {
+		return info.MaxTXID <= txID, nil
+	}); err != nil {
+		return nil, err
+	} else if len(a) > 0 {
+		logger.Debug("found snapshot before target TXID", "snapshot", a[len(a)-1].MaxTXID)
+		infos = append(infos, a[len(a)-1])
+	}
+
+	// Starting from the highest compaction level, collect all paths after the
+	// latest TXID for each level. Compactions are based on the previous level's
+	// TXID granularity so the TXIDs should align between compaction levels.
+	const maxLevel = SnapshotLevel - 1
+	for level := maxLevel; level >= 0; level-- {
+		a, err := FindLTXFiles(ctx, r.Client, level, func(info *ltx.FileInfo) (bool, error) {
+			return info.MinTXID > infos.MaxTXID() && info.MaxTXID <= txID, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		// Append each storage path to the list
+		for i := range a {
+			// Ensure TXIDs are contiguous between each paths.
+			if infos.MaxTXID()+1 != a[i].MinTXID {
+				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",
+					infos.MaxTXID().String(), ltx.FormatFilename(a[i].MinTXID, a[i].MaxTXID))
+			}
+
+			logger.Debug("matching LTX file for restore",
+				"filename", ltx.FormatFilename(a[len(a)-1].MinTXID, a[len(a)-1].MaxTXID))
+			infos = append(infos, a[i])
+		}
+	}
+
+	// Return an error if we are unable to find any set of LTX files before
+	// target TXID. This shouldn't happen under normal circumstances. Only if
+	// lower level LTX files are removed before a snapshot has occurred.
+	if len(infos) == 0 {
+		return nil, ErrTxNotAvailable
+	}
+
+	return infos, nil
 }
 
 // Replica metrics.

@@ -2,10 +2,13 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"io"
 
 	"github.com/superfly/ltx"
 )
+
+var ErrStopIter = errors.New("stop iterator")
 
 // ReplicaClient represents client to connect to a Replica.
 type ReplicaClient interface {
@@ -29,4 +32,34 @@ type ReplicaClient interface {
 
 	// DeleteAll deletes all files.
 	DeleteAll(ctx context.Context) error
+}
+
+// FindLTXFiles returns a list of files that match filter.
+func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
+	itr, err := client.LTXFiles(ctx, level, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = itr.Close() }()
+
+	var a []*ltx.FileInfo
+	for itr.Next() {
+		item := itr.Item()
+
+		match, err := filter(item)
+		if match {
+			a = append(a, item)
+		}
+
+		if err == ErrStopIter {
+			break
+		} else if err != nil {
+			return a, err
+		}
+	}
+
+	if err := itr.Close(); err != nil {
+		return nil, err
+	}
+	return a, nil
 }
