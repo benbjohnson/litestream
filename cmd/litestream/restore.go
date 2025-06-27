@@ -23,7 +23,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
-	fs.StringVar(&opt.ReplicaName, "replica", "", "replica name")
 	fs.Var((*txidVar)(&opt.TXID), "txid", "transaction ID")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
@@ -159,10 +158,6 @@ Arguments:
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
-
-	-replica NAME
-	    Restore from a specific replica.
-	    Defaults to replica with latest data.
 
 	-index NUM
 	    Restore up to a specific hex-encoded WAL index (inclusive).
