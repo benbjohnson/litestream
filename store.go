@@ -20,6 +20,9 @@ var (
 	// since the last compaction time. This is used to prevent frequent
 	// re-compaction when restarting the process.
 	ErrCompactionTooEarly = errors.New("compaction too early")
+
+	// ErrTxNotAvailable is returned when a transaction does not exist.
+	ErrTxNotAvailable = errors.New("transaction not available")
 )
 
 // Store defaults
@@ -81,12 +84,14 @@ func (s *Store) Open(ctx context.Context) error {
 			if lvl.Level == 0 {
 				continue
 			}
+			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
 				s.monitorCompactionLevel(s.ctx, lvl)
 			}()
 		}
 
+		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			s.monitorCompactionLevel(s.ctx, s.SnapshotLevel())

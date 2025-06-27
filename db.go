@@ -1336,10 +1336,6 @@ type RestoreOptions struct {
 	// If blank, the original DB path is used.
 	OutputPath string
 
-	// Specific replica to restore from.
-	// If blank, all replicas are considered.
-	ReplicaName string
-
 	// Specific transaction to restore to.
 	// If zero, TXID is ignored.
 	TXID ltx.TXID
