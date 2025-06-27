@@ -2,10 +2,13 @@ package litestream_test
 
 import (
 	"context"
+	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 )
 
 func TestStore_CompactDB(t *testing.T) {
@@ -91,4 +94,101 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
+}
+
+func TestStore_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	db := newDB(t, filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 100 * time.Millisecond
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = file.NewReplicaClient(t.TempDir())
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := MustOpenSQLDB(t, db.Path())
+	defer MustCloseSQLDB(t, sqldb)
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: 200 * time.Millisecond},
+		{Level: 2, Interval: 500 * time.Millisecond},
+	})
+	store.SnapshotInterval = 1 * time.Second
+	if err := store.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	// Create initial table
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run test for a fixed duration.
+	done := make(chan struct{})
+	time.AfterFunc(10*time.Second, func() { close(done) })
+
+	// Start goroutine to continuously insert records
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-t.Context().Done():
+				return
+			case <-done:
+				return
+			case <-ticker.C:
+				if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (val) VALUES (?);`, time.Now().String()); err != nil {
+					t.Errorf("insert error: %v", err)
+					return
+				}
+			}
+		}
+	}()
+
+	// Periodically snapshot, restore and validate
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+
+	for i := 0; ; i++ {
+		select {
+		case <-t.Context().Done():
+			return
+		case <-done:
+			return
+		case <-ticker.C:
+			// Restore database to a temporary location.
+			outputPath := filepath.Join(t.TempDir(), fmt.Sprintf("restore-%d.db", i))
+			if err := db.Replica.Restore(t.Context(), litestream.RestoreOptions{
+				OutputPath: outputPath,
+			}); err != nil {
+				t.Fatal(err)
+			}
+
+			func() {
+				restoreDB := MustOpenSQLDB(t, outputPath)
+				defer MustCloseSQLDB(t, restoreDB)
+
+				var result string
+				if err := restoreDB.QueryRowContext(t.Context(), `PRAGMA integrity_check;`).Scan(&result); err != nil {
+					t.Fatal(err)
+				} else if result != "ok" {
+					t.Fatalf("integrity check failed: %s", result)
+				}
+
+				var count int
+				if err := restoreDB.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM t`).Scan(&count); err != nil {
+					t.Fatal(err)
+				} else if count == 0 {
+					t.Fatal("no records found in restored database")
+				}
+				t.Logf("restored database: %d records", count)
+			}()
+		}
+	}
 }

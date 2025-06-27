@@ -84,12 +84,14 @@ func (s *Store) Open(ctx context.Context) error {
 			if lvl.Level == 0 {
 				continue
 			}
+			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
 				s.monitorCompactionLevel(s.ctx, lvl)
 			}()
 		}
 
+		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
 			s.monitorCompactionLevel(s.ctx, s.SnapshotLevel())
