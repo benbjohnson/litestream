@@ -6,9 +6,6 @@ on:
       - synchronize
       - reopened
 
-env:
-  GO_VERSION: "1.21"
-
 name: Commit
 jobs:
   lint:
@@ -17,9 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: |
           go install golang.org/x/tools/cmd/goimports@latest
@@ -36,9 +33,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: |
           go build ./cmd/litestream/
@@ -55,9 +52,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: go env
 
@@ -65,22 +62,22 @@ jobs:
 
       - run: go test -v ./...
 
-#  long-running-test:
-#    name: Run Long Running Unit Test
-#    runs-on: ubuntu-latest
-#    steps:
-#      - uses: actions/checkout@v2
-#      - uses: actions/setup-go@v2
-#        with:
-#          go-version: '1.20'
-#      - uses: actions/cache@v2
-#        with:
-#          path: ~/go/pkg/mod
-#          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
-#          restore-keys: ${{ inputs.os }}-go-
-#
-#      - run: go install ./cmd/litestream
-#      - run: go test -v -run=TestCmd_Replicate_LongRunning ./integration -long-running-duration 1m
+  #  long-running-test:
+  #    name: Run Long Running Unit Test
+  #    runs-on: ubuntu-latest
+  #    steps:
+  #      - uses: actions/checkout@v2
+  #      - uses: actions/setup-go@v2
+  #        with:
+  #          go-version: '1.20'
+  #      - uses: actions/cache@v2
+  #        with:
+  #          path: ~/go/pkg/mod
+  #          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
+  #          restore-keys: ${{ inputs.os }}-go-
+  #
+  #      - run: go install ./cmd/litestream
+  #      - run: go test -v -run=TestCmd_Replicate_LongRunning ./integration -long-running-duration 1m
 
   s3-mock-test:
     name: Run S3 Mock Tests
@@ -91,13 +88,13 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
-#         cache: 'pip'
+          python-version: "3.12"
+
       - run: pip install moto[s3,server]
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: go env
 
@@ -115,9 +112,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: go env
 
@@ -146,18 +143,18 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: go env
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration gcs
+      - run: go test -v ./replica_client_test.go -integration gs
         env:
-          GOOGLE_APPLICATION_CREDENTIALS:  /opt/gcp.json
-          LITESTREAM_GCS_BUCKET:           integration.litestream.io
+          GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp.json
+          LITESTREAM_GS_BUCKET: integration.litestream.io
 
   abs-integration-test:
     name: Run Azure Blob Store Integration Tests
@@ -169,9 +166,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: go env
 
@@ -179,9 +176,9 @@ jobs:
 
       - run: go test -v ./replica_client_test.go -integration abs
         env:
-          LITESTREAM_ABS_ACCOUNT_NAME:     ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
-          LITESTREAM_ABS_ACCOUNT_KEY:      ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
-          LITESTREAM_ABS_BUCKET:           integration
+          LITESTREAM_ABS_ACCOUNT_NAME: ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY: ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET: integration
 
   sftp-integration-test:
     name: Run SFTP Integration Tests
@@ -213,9 +210,9 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-go@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version-file: "go.mod"
 
       - run: go env
 
@@ -223,7 +220,7 @@ jobs:
 
       - run: go test -v ./replica_client_test.go -integration sftp
         env:
-          LITESTREAM_SFTP_HOST:     "localhost:2222"
-          LITESTREAM_SFTP_USER:     "root"
+          LITESTREAM_SFTP_HOST: "localhost:2222"
+          LITESTREAM_SFTP_USER: "root"
           LITESTREAM_SFTP_KEY_PATH: /test/id_ed25519
-          LITESTREAM_SFTP_PATH:     /test/data
+          LITESTREAM_SFTP_PATH: /test/data
