@@ -3,7 +3,11 @@ on:
     types:
       - created
 
-name: release (linux)
+permissions:
+  contents: write
+  id-token: write
+
+name: Release (linux)
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11,32 +15,27 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            cc:   gcc
+            cc: gcc
           - arch: arm64
-            cc:   aarch64-linux-gnu-gcc
+            cc: aarch64-linux-gnu-gcc
           - arch: arm
-            arm:  6
-            cc:   arm-linux-gnueabi-gcc
+            arm: 6
+            cc: arm-linux-gnueabi-gcc
           - arch: arm
-            arm:  7
-            cc:   arm-linux-gnueabihf-gcc
+            arm: 7
+            cc: arm-linux-gnueabihf-gcc
 
     env:
-      GOOS:   linux
+      GOOS: linux
       GOARCH: ${{ matrix.arch }}
-      GOARM:  ${{ matrix.arm }}
-      CC:     ${{ matrix.cc }}
+      GOARM: ${{ matrix.arm }}
+      CC: ${{ matrix.cc }}
 
     steps:
-      - uses: actions/checkout@v2
-      - uses: actions/setup-go@v2
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
-
-      - id: release
-        uses: bruceadams/get-release@v1.2.2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
+          go-version-file: "go.mod"
 
       - name: Install cross-compilers
         run: |
@@ -53,29 +52,15 @@ jobs:
           rm -rf dist
           mkdir -p dist
           cp etc/litestream.yml etc/litestream.service dist
-          cat etc/nfpm.yml | LITESTREAM_VERSION=${{ steps.release.outputs.tag_name }} envsubst > dist/nfpm.yml
-          CGO_ENABLED=1 go build -ldflags "-s -w -extldflags "-static" -X 'main.Version=${{ steps.release.outputs.tag_name }}'" -tags osusergo,netgo,sqlite_omit_load_extension -o dist/litestream ./cmd/litestream
+          cat etc/nfpm.yml | LITESTREAM_VERSION=${{ github.event.release.tag_name }} envsubst > dist/nfpm.yml
+          CGO_ENABLED=1 go build -ldflags "-s -w -extldflags "-static" -X 'main.Version=${{ github.event.release.tag_name }}'" -tags osusergo,netgo,sqlite_omit_load_extension -o dist/litestream ./cmd/litestream
 
           cd dist
-          tar -czvf litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.tar.gz litestream
-          ../nfpm pkg --config nfpm.yml --packager deb --target litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.deb
+          tar -czvf litestream-${{ github.event.release.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.tar.gz litestream
+          ../nfpm pkg --config nfpm.yml --packager deb --target litestream-${{ github.event.release.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.deb
 
-      - name: Upload release tarball
-        uses: actions/upload-release-asset@v1.0.2
+      - name: publish the release binaries as a part of the Github release
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} ./dist/litestream-*
         env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.tar.gz
-          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload debian package
-        uses: actions/upload-release-asset@v1.0.2
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          upload_url: ${{ steps.release.outputs.upload_url }}
-          asset_path: ./dist/litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.deb
-          asset_name: litestream-${{ steps.release.outputs.tag_name }}-${{ env.GOOS }}-${{ env.GOARCH }}${{ env.GOARM }}.deb
-          asset_content_type: application/octet-stream
+          GH_TOKEN: ${{ github.token }}
