@@ -1,4 +1,4 @@
-FROM golang:1.23 as builder
+FROM golang:1.24 as builder
 
 WORKDIR /src/litestream
 COPY . .
@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 	go build -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o /usr/local/bin/litestream ./cmd/litestream
 
 
-FROM alpine:3.20
+FROM alpine:3.22
 COPY --from=builder /usr/local/bin/litestream /usr/local/bin/litestream
 ENTRYPOINT ["/usr/local/bin/litestream"]
 CMD []
