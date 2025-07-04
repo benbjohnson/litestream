@@ -3,10 +3,6 @@ on:
     types:
       - published
 
-permissions:
-  contents: write
-  id-token: write
-
 name: Release (Docker)
 jobs:
   docker:
@@ -28,7 +24,7 @@ jobs:
       - id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/litestream
+          images: litestream/litestream
           tags: |
             type=ref,event=branch
             type=ref,event=pr
