@@ -14,7 +14,6 @@ func NewServer(configPath string) *server.MCPServer {
 	server.AddTool(InfoTool(configPath))
 	server.AddTool(DatabasesTool(configPath))
 	server.AddTool(GenerationsTool(configPath))
-	server.AddTool(ReplicateTool(configPath))
 	server.AddTool(RestoreTool(configPath))
 	server.AddTool(SnapshotsTool(configPath))
 	return server

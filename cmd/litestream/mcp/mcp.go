@@ -2,7 +2,6 @@ package mcp
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -32,8 +31,7 @@ func New(ctx context.Context, configPath string) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) Start(port int) {
-	addr := fmt.Sprintf(":%d", port)
+func (s *Server) Start(addr string) {
 	s.httpServer = &http.Server{
 		Addr:    addr,
 		Handler: s.mux,

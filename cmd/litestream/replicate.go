@@ -32,10 +32,8 @@ type ReplicateCommand struct {
 	// List of managed databases specified in the config.
 	DBs []*litestream.DB
 
-	// MCP server options
-	MCPEnabled bool
-	MCPPort    int
-	MCP        *mcp.Server
+	// MCP server
+	MCP *mcp.Server
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -49,8 +47,6 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
 	configPath, noExpandEnv := registerConfigFlag(fs)
-	mcpFlag := fs.Bool("mcp", false, "Enable MCP server (agent mode)")
-	mcpPortFlag := fs.Int("mcp-port", 8080, "Port for MCP server (default 8080)")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -88,13 +84,6 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 		c.Config.Exec = *execFlag
 	}
 
-	// Merge MCP flags/config
-	c.MCPEnabled = c.Config.MCPEnabled || *mcpFlag
-	c.MCPPort = c.Config.MCPPort
-	if *mcpPortFlag != 8080 {
-		c.MCPPort = *mcpPortFlag
-	}
-
 	return nil
 }
 
@@ -104,12 +93,12 @@ func (c *ReplicateCommand) Run() (err error) {
 	slog.Info("litestream", "version", Version)
 
 	// Start MCP server if enabled
-	if c.MCPEnabled {
+	if c.Config.MCPEnabled {
 		c.MCP, err = mcp.New(context.Background(), c.Config.ConfigPath)
 		if err != nil {
 			return err
 		}
-		go c.MCP.Start(c.MCPPort)
+		go c.MCP.Start(c.Config.MCPAddr)
 	}
 
 	// Setup databases.
@@ -200,7 +189,7 @@ func (c *ReplicateCommand) Close() (err error) {
 			}
 		}
 	}
-	if c.MCPEnabled {
+	if c.Config.MCPEnabled {
 		if err := c.MCP.Close(); err != nil {
 			slog.Error("error closing MCP server", "error", err)
 		}
@@ -210,28 +199,30 @@ func (c *ReplicateCommand) Close() (err error) {
 
 // Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
-	fmt.Print(`
-The replicate command runs a server to replicate databases.
+	fmt.Printf(`
+The replicate command starts a server to monitor & replicate databases.
+You can specify your database & replicas in a configuration file or you can
+replicate a single database file by specifying its path and its replicas in the
+command line arguments.
 
 Usage:
 
 	litestream replicate [arguments]
 
+	litestream replicate [arguments] DB_PATH REPLICA_URL [REPLICA_URL...]
+
 Arguments:
 
-	-mcp
-	    Enable the MCP server for remote control and monitoring.
-	-mcp-port
-	    Port to run the MCP server on (default: 8080).
-	-config
-	    Path to the configuration file.
+	-config PATH
+	    Specifies the configuration file.
+	    Defaults to %s
+
+	-exec CMD
+	    Executes a subcommand. Litestream will exit when the child
+	    process exits. Useful for simple process management.
+
 	-no-expand-env
-	    Do not expand environment variables in config.
+	    Disables environment variable expansion in configuration file.
 
-Examples:
-
-	# Run replication and enable MCP server on port 8080.
-	$ litestream replicate -mcp -mcp-port 8080
-
-`)
+`[1:], DefaultConfigPath())
 }

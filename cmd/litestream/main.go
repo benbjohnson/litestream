@@ -35,7 +35,7 @@ var (
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
 
-const DefaultMCPPort = 8080
+const DefaultMCPAddr = "localhost:8080"
 
 func main() {
 	m := NewMain()
@@ -176,8 +176,8 @@ type Config struct {
 	Logging LoggingConfig `yaml:"logging"`
 
 	// MCP server options
-	MCPEnabled bool `yaml:"mcp-enabled"`
-	MCPPort    int  `yaml:"mcp-port"`
+	MCPEnabled bool   `yaml:"mcp-enabled"`
+	MCPAddr    string `yaml:"mcp-addr"`
 
 	// Path to the config file
 	// This is only used internally to pass the config path to the MCP tool
@@ -208,7 +208,7 @@ func (c *Config) propagateGlobalSettings() {
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
 	return Config{
-		MCPPort: DefaultMCPPort,
+		MCPAddr: DefaultMCPAddr,
 	}
 }
 
@@ -682,7 +682,7 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig) (_ *sftp.ReplicaClient, er
 	return client, nil
 }
 
-// applyLitestreamEnv copies "LITESTEAM" prefixed environment variables to
+// applyLitestreamEnv copies "LITESTREAM" prefixed environment variables to
 // their AWS counterparts as the "AWS" prefix can be confusing when using a
 // non-AWS S3-compatible service.
 func applyLitestreamEnv() {
