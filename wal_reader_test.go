@@ -2,6 +2,7 @@ package litestream_test
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"log/slog"
 	"os"
@@ -29,7 +30,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read first frame.
-		if pgno, commit, err := r.ReadFrame(buf); err != nil {
+		if pgno, commit, err := r.ReadFrame(context.Background(), buf); err != nil {
 			t.Fatal(err)
 		} else if got, want := pgno, uint32(1); got != want {
 			t.Fatalf("pgno=%d, want %d", got, want)
@@ -42,7 +43,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read second frame. End of transaction.
-		if pgno, commit, err := r.ReadFrame(buf); err != nil {
+		if pgno, commit, err := r.ReadFrame(context.Background(), buf); err != nil {
 			t.Fatal(err)
 		} else if got, want := pgno, uint32(2); got != want {
 			t.Fatalf("pgno=%d, want %d", got, want)
@@ -55,7 +56,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read third frame.
-		if pgno, commit, err := r.ReadFrame(buf); err != nil {
+		if pgno, commit, err := r.ReadFrame(context.Background(), buf); err != nil {
 			t.Fatal(err)
 		} else if got, want := pgno, uint32(2); got != want {
 			t.Fatalf("pgno=%d, want %d", got, want)
@@ -67,7 +68,7 @@ func TestWALReader(t *testing.T) {
 			t.Fatalf("Offset()=%d, want %d", got, want)
 		}
 
-		if _, _, err := r.ReadFrame(buf); err != io.EOF {
+		if _, _, err := r.ReadFrame(context.Background(), buf); err != io.EOF {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -90,7 +91,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read first frame.
-		if pgno, commit, err := r.ReadFrame(buf); err != nil {
+		if pgno, commit, err := r.ReadFrame(context.Background(), buf); err != nil {
 			t.Fatal(err)
 		} else if got, want := pgno, uint32(1); got != want {
 			t.Fatalf("pgno=%d, want %d", got, want)
@@ -101,7 +102,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read second frame. Salt has been altered so it doesn't match header.
-		if _, _, err := r.ReadFrame(buf); err != io.EOF {
+		if _, _, err := r.ReadFrame(context.Background(), buf); err != io.EOF {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -124,7 +125,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read first frame.
-		if pgno, commit, err := r.ReadFrame(buf); err != nil {
+		if pgno, commit, err := r.ReadFrame(context.Background(), buf); err != nil {
 			t.Fatal(err)
 		} else if got, want := pgno, uint32(1); got != want {
 			t.Fatalf("pgno=%d, want %d", got, want)
@@ -135,7 +136,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read second frame. Checksum has been altered so it doesn't match.
-		if _, _, err := r.ReadFrame(buf); err != io.EOF {
+		if _, _, err := r.ReadFrame(context.Background(), buf); err != io.EOF {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -196,7 +197,7 @@ func TestWALReader(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if _, _, err := r.ReadFrame(make([]byte, 512)); err == nil || err.Error() != `WALReader.ReadFrame(): buffer size (512) must match page size (4096)` {
+		if _, _, err := r.ReadFrame(context.Background(), make([]byte, 512)); err == nil || err.Error() != `WALReader.ReadFrame(): buffer size (512) must match page size (4096)` {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -210,7 +211,7 @@ func TestWALReader(t *testing.T) {
 		r, err := litestream.NewWALReader(bytes.NewReader(b[:40]), slog.Default())
 		if err != nil {
 			t.Fatal(err)
-		} else if _, _, err := r.ReadFrame(make([]byte, 4096)); err != io.EOF {
+		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); err != io.EOF {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -224,7 +225,7 @@ func TestWALReader(t *testing.T) {
 		r, err := litestream.NewWALReader(bytes.NewReader(b[:56]), slog.Default())
 		if err != nil {
 			t.Fatal(err)
-		} else if _, _, err := r.ReadFrame(make([]byte, 4096)); err != io.EOF {
+		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); err != io.EOF {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -238,7 +239,7 @@ func TestWALReader(t *testing.T) {
 		r, err := litestream.NewWALReader(bytes.NewReader(b[:1000]), slog.Default())
 		if err != nil {
 			t.Fatal(err)
-		} else if _, _, err := r.ReadFrame(make([]byte, 4096)); err != io.EOF {
+		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); err != io.EOF {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
