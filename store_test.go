@@ -101,8 +101,10 @@ func TestStore_Integration(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
+	const factor = 10
+
 	db := newDB(t, filepath.Join(t.TempDir(), "db"))
-	db.MonitorInterval = 100 * time.Millisecond
+	db.MonitorInterval = factor * 100 * time.Millisecond
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
 	if err := db.Open(); err != nil {
@@ -113,10 +115,10 @@ func TestStore_Integration(t *testing.T) {
 
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
-		{Level: 1, Interval: 200 * time.Millisecond},
-		{Level: 2, Interval: 500 * time.Millisecond},
+		{Level: 1, Interval: factor * 200 * time.Millisecond},
+		{Level: 2, Interval: factor * 500 * time.Millisecond},
 	})
-	store.SnapshotInterval = 1 * time.Second
+	store.SnapshotInterval = factor * 1 * time.Second
 	if err := store.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +135,7 @@ func TestStore_Integration(t *testing.T) {
 
 	// Start goroutine to continuously insert records
 	go func() {
-		ticker := time.NewTicker(10 * time.Millisecond)
+		ticker := time.NewTicker(factor * 10 * time.Millisecond)
 		defer ticker.Stop()
 
 		for {
@@ -152,7 +154,7 @@ func TestStore_Integration(t *testing.T) {
 	}()
 
 	// Periodically snapshot, restore and validate
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(factor * 500 * time.Millisecond)
 	defer ticker.Stop()
 
 	for i := 0; ; i++ {

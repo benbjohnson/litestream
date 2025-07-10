@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -29,7 +30,6 @@ type WALReader struct {
 // NewWALReader returns a new instance of WALReader.
 func NewWALReader(rd io.ReaderAt, logger *slog.Logger) (*WALReader, error) {
 	r := &WALReader{r: rd, logger: logger}
-	r.logger.Debug("NewWALReader")
 	if err := r.readHeader(); err != nil {
 		return nil, err
 	}
@@ -64,7 +64,7 @@ func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, l
 
 	// Read previous page to load checksum.
 	r.frameN--
-	if _, _, err := r.readFrame(make([]byte, r.pageSize), false); err != nil {
+	if _, _, err := r.readFrame(context.Background(), make([]byte, r.pageSize), false); err != nil {
 		return nil, &PrevFrameMismatchError{Err: err}
 	}
 
@@ -127,11 +127,11 @@ func (r *WALReader) readHeader() error {
 
 // ReadFrame reads the next frame from the WAL and returns the page number.
 // Returns io.EOF at the end of the valid WAL.
-func (r *WALReader) ReadFrame(data []byte) (pgno, commit uint32, err error) {
-	return r.readFrame(data, true)
+func (r *WALReader) ReadFrame(ctx context.Context, data []byte) (pgno, commit uint32, err error) {
+	return r.readFrame(ctx, data, true)
 }
 
-func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit uint32, err error) {
+func (r *WALReader) readFrame(_ context.Context, data []byte, verifyChecksum bool) (pgno, commit uint32, err error) {
 	if len(data) != int(r.pageSize) {
 		return 0, 0, fmt.Errorf("WALReader.ReadFrame(): buffer size (%d) must match page size (%d)", len(data), r.pageSize)
 	}
@@ -186,12 +186,12 @@ func (r *WALReader) readFrame(data []byte, verifyChecksum bool) (pgno, commit ui
 // PageMap reads all committed frames until the end of the file and returns a
 // map of pgno to offset of the latest version of each page. Also returns the
 // size of the wal segment read, and the final database size, in pages.
-func (r *WALReader) PageMap() (m map[uint32]int64, size int64, commit uint32, err error) {
+func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, size int64, commit uint32, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
 	for i := 0; ; i++ {
-		pgno, fcommit, err := r.ReadFrame(data)
+		pgno, fcommit, err := r.ReadFrame(ctx, data)
 		if err == io.EOF {
 			break
 		} else if err != nil {
@@ -231,7 +231,7 @@ func (r *WALReader) PageMap() (m map[uint32]int64, size int64, commit uint32, er
 	// Extend to the end of the last frame read.
 	end += WALFrameHeaderSize + int64(r.pageSize)
 
-	r.logger.Debug("page map complete", "n", len(m), "start", start, "end", end, "commit", commit)
+	r.logger.Log(ctx, LevelTrace, "page map complete", "n", len(m), "start", start, "end", end, "commit", commit)
 	return m, end - start, commit, nil
 }
 
