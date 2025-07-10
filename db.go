@@ -467,7 +467,7 @@ func (db *DB) verifyHeadersMatch() error {
 	}
 	hdr1 := dec.Header()
 	if salt1 != hdr1.WALSalt1 || salt2 != hdr1.WALSalt2 {
-		db.Logger.Debug("salt mismatch",
+		db.Logger.Log(LevelTrace, "salt mismatch",
 			"path", ltxPath,
 			"wal", [2]uint32{salt1, salt2},
 			"ltx", [2]uint32{hdr1.WALSalt1, hdr1.WALSalt2})
@@ -593,7 +593,7 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) error {
 	// Verify our last sync matches the current state of the WAL.
 	// This ensures that the last sync position of the real WAL hasn't
 	// been overwritten by another process.
-	info, err := db.verify()
+	info, err := db.verify(ctx)
 	if err != nil {
 		return fmt.Errorf("cannot verify wal state: %w", err)
 	}
@@ -618,7 +618,7 @@ func (db *DB) ensureWALExists() (err error) {
 
 // verify ensures the current LTX state matches where it left off from
 // the real WAL. Check info.ok if verification was successful.
-func (db *DB) verify() (info syncInfo, err error) {
+func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	info.snapshotting = true
 
 	pos, err := db.Pos()
@@ -662,7 +662,7 @@ func (db *DB) verify() (info syncInfo, err error) {
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
 
 	if salt1 != dec.Header().WALSalt1 || salt2 != dec.Header().WALSalt2 {
-		db.Logger.Debug("wal restarted",
+		db.Logger.Log(ctx, LevelTrace, "wal restarted",
 			"salt1", salt1,
 			"salt2", salt2)
 
@@ -698,7 +698,7 @@ func (db *DB) verify() (info syncInfo, err error) {
 	if ok, err := db.ltxDecoderContains(dec, pgno, buf[WALFrameHeaderSize:]); err != nil {
 		return info, fmt.Errorf("ltx contains: %w", err)
 	} else if !ok {
-		db.Logger.Debug("cannot find last page in last ltx file", "pgno", pgno)
+		db.Logger.Log(ctx, LevelTrace, "cannot find last page in last ltx file", "pgno", pgno)
 		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
@@ -709,6 +709,8 @@ func (db *DB) verify() (info syncInfo, err error) {
 }
 
 func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
+	println("dbg/ltxDecoderContains", pgno, "\n", internal.Hexdump(data))
+
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
@@ -719,9 +721,11 @@ func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bo
 		}
 
 		if pgno != hdr.Pgno {
+			println("dbg/ltxDecoderContains.ltx", pgno, "!=", hdr.Pgno)
 			continue
 		}
 		if !bytes.Equal(data, buf) {
+			println("dbg/ltxDecoderContains.data.mismatch\n", internal.Hexdump(data))
 			continue
 		}
 		return true, nil
@@ -781,7 +785,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		// If we cannot verify the previous frame
 		var pfmError *PrevFrameMismatchError
 		if rd, err = NewWALReaderWithOffset(walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
-			db.Logger.Debug("prev frame mismatch, snapshotting", "err", pfmError.Err)
+			db.Logger.Log(ctx, LevelTrace, "prev frame mismatch, snapshotting", "err", pfmError.Err)
 			if rd, err = NewWALReader(walFile, db.Logger); err != nil {
 				return fmt.Errorf("new wal reader, after reset")
 			}
@@ -791,7 +795,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	}
 
 	// Build a mapping of changed page numbers and their latest content.
-	pageMap, sz, walCommit, err := rd.PageMap()
+	pageMap, sz, walCommit, err := rd.PageMap(ctx)
 	if err != nil {
 		return fmt.Errorf("page map: %w", err)
 	}
@@ -801,7 +805,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 
 	// Exit if we have no new WAL pages and we aren't snapshotting.
 	if !info.snapshotting && sz == 0 {
-		db.Logger.Debug("sync: skip", "reason", "no new wal pages")
+		db.Logger.Log(ctx, LevelTrace, "sync: skip", "reason", "no new wal pages")
 		return nil
 	}
 
@@ -820,7 +824,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	uid, gid := internal.Fileinfo(db.fileInfo)
 	_ = os.Chown(tmpFilename, uid, gid)
 
-	db.Logger.Debug("encode header",
+	db.Logger.Log(ctx, LevelTrace, "encode header",
 		"txid", txID.String(),
 		"commit", commit,
 		"walOffset", info.offset,
@@ -875,7 +879,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		return fmt.Errorf("rename ltx file: %w", err)
 	}
 
-	db.Logger.Debug("sync: ok")
+	db.Logger.Debug("db sync", "status", "ok")
 
 	return nil
 }
@@ -898,7 +902,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 
 		// If page exists in the WAL, read from there.
 		if offset, ok := pageMap[pgno]; ok {
-			db.Logger.Debug("encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno)
+			db.Logger.Log(ctx, LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno)
 
 			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
 				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
@@ -913,7 +917,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 		}
 
 		offset := int64(pgno-1) * int64(db.pageSize)
-		db.Logger.Debug("encode page from database", "offset", offset, "pgno", pgno)
+		db.Logger.Log(ctx, LevelTrace, "encode page from database", "offset", offset, "pgno", pgno)
 
 		// Otherwise read directly from the database file.
 		if _, err := db.f.ReadAt(data, offset); err != nil {
@@ -927,7 +931,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(_ context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
 	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
@@ -939,7 +943,7 @@ func (db *DB) writeLTXFromWAL(_ context.Context, enc *ltx.Encoder, walFile *os.F
 	for _, pgno := range pgnos {
 		offset := pageMap[pgno]
 
-		db.Logger.Debug("encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno)
+		db.Logger.Log(ctx, LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno)
 
 		// Read source page using page map.
 		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
@@ -1109,7 +1113,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		}
 
 		// Build a mapping of changed page numbers and their latest content.
-		pageMap, sz, walCommit, err := rd.PageMap()
+		pageMap, sz, walCommit, err := rd.PageMap(ctx)
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("page map: %w", err))
 			return
