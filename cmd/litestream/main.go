@@ -277,12 +277,17 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	}
 
 	logOptions := slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level:       slog.LevelInfo,
+		ReplaceAttr: replaceAttr,
 	}
 
 	switch strings.ToUpper(config.Logging.Level) {
+	case "TRACE":
+		logOptions.Level = litestream.LevelTrace
 	case "DEBUG":
 		logOptions.Level = slog.LevelDebug
+	case "INFO":
+		logOptions.Level = slog.LevelInfo
 	case "WARN", "WARNING":
 		logOptions.Level = slog.LevelWarn
 	case "ERROR":
@@ -301,6 +306,13 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	slog.SetDefault(slog.New(logHandler))
 
 	return config, nil
+}
+
+func replaceAttr(groups []string, a slog.Attr) slog.Attr {
+	if a.Key == slog.LevelKey && a.Value.Any().(slog.Level) == litestream.LevelTrace {
+		a.Value = slog.StringValue("TRACE")
+	}
+	return a
 }
 
 // CompactionLevelConfig the configuration for a single level of compaction.
