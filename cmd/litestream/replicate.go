@@ -13,7 +13,6 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/cmd/litestream/mcp"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
@@ -33,7 +32,7 @@ type ReplicateCommand struct {
 	DBs []*litestream.DB
 
 	// MCP server
-	MCP *mcp.Server
+	MCP *MCPServer
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -93,8 +92,8 @@ func (c *ReplicateCommand) Run() (err error) {
 	slog.Info("litestream", "version", Version)
 
 	// Start MCP server if enabled
-	if c.Config.MCPEnabled {
-		c.MCP, err = mcp.New(context.Background(), c.Config.ConfigPath)
+	if c.Config.MCPAddr != "" {
+		c.MCP, err = NewMCP(context.Background(), c.Config.ConfigPath)
 		if err != nil {
 			return err
 		}
@@ -189,7 +188,7 @@ func (c *ReplicateCommand) Close() (err error) {
 			}
 		}
 	}
-	if c.Config.MCPEnabled {
+	if c.Config.MCPAddr != "" {
 		if err := c.MCP.Close(); err != nil {
 			slog.Error("error closing MCP server", "error", err)
 		}

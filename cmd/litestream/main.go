@@ -35,8 +35,6 @@ var (
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
 
-const DefaultMCPAddr = "localhost:8080"
-
 func main() {
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
@@ -176,8 +174,7 @@ type Config struct {
 	Logging LoggingConfig `yaml:"logging"`
 
 	// MCP server options
-	MCPEnabled bool   `yaml:"mcp-enabled"`
-	MCPAddr    string `yaml:"mcp-addr"`
+	MCPAddr string `yaml:"mcp-addr"`
 
 	// Path to the config file
 	// This is only used internally to pass the config path to the MCP tool
@@ -207,9 +204,7 @@ func (c *Config) propagateGlobalSettings() {
 
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
-	return Config{
-		MCPAddr: DefaultMCPAddr,
-	}
+	return Config{}
 }
 
 // DBConfig returns database configuration by path.
