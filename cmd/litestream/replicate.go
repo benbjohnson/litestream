@@ -103,6 +103,11 @@ func (c *ReplicateCommand) Run() (err error) {
 
 	levels := c.Config.CompactionLevels()
 	c.Store = litestream.NewStore(dbs, levels)
+	c.Store.SnapshotInterval = c.Config.Snapshot.Interval
+	c.Store.SnapshotRetention = c.Config.Snapshot.Retention
+	if err := c.Store.Open(context.Background()); err != nil {
+		return fmt.Errorf("cannot open store: %w", err)
+	}
 
 	// Notify user that initialization is done.
 	for _, db := range c.Store.DBs() {

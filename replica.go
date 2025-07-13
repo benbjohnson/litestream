@@ -596,11 +596,14 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
-	// Fetch every LTX file from TXID 1 to target TXID or timestamp.
-	itr, err := r.Client.LTXFiles(ctx, 0, 0)
+	infos, err := r.CalcRestorePlan(ctx, opt.TXID, opt.Timestamp)
 	if err != nil {
-		return fmt.Errorf("cannot list ltx files: %w", err)
+		return fmt.Errorf("cannot calc restore plan: %w", err)
+	} else if len(infos) == 0 {
+		return fmt.Errorf("no matching backup files available")
 	}
+
+	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
 	var rdrs []io.Reader
 	defer func() {
@@ -609,14 +612,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		}
 	}()
 
-	for itr.Next() {
-		info := itr.Item()
-		if opt.TXID > info.MinTXID {
-			break
-		}
-
-		// TODO(ltx): Check that timestamp is within bounds, if specified
-
+	for _, info := range infos {
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		// Add file to be compacted.
@@ -670,17 +666,26 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 }
 
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
-func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID) ([]*ltx.FileInfo, error) {
+func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp time.Time) ([]*ltx.FileInfo, error) {
+	if txID != 0 && !timestamp.IsZero() {
+		return nil, fmt.Errorf("cannot specify both TXID & timestamp to restore")
+	}
+
 	var infos ltx.FileInfoSlice
 	logger := r.Logger().With("target", txID)
 
-	// Start with latest snapshot before target TXID.
+	// Start with latest snapshot before target TXID or timestamp.
 	if a, err := FindLTXFiles(ctx, r.Client, SnapshotLevel, func(info *ltx.FileInfo) (bool, error) {
-		return info.MaxTXID <= txID, nil
+		if txID != 0 {
+			return info.MaxTXID <= txID, nil
+		} else if !timestamp.IsZero() {
+			return info.CreatedAt.Before(timestamp), nil
+		}
+		return true, nil
 	}); err != nil {
 		return nil, err
 	} else if len(a) > 0 {
-		logger.Debug("found snapshot before target TXID", "snapshot", a[len(a)-1].MaxTXID)
+		logger.Debug("found snapshot before target TXID or timestamp", "snapshot", a[len(a)-1].MaxTXID)
 		infos = append(infos, a[len(a)-1])
 	}
 
@@ -689,24 +694,36 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID) ([]*ltx.Fi
 	// TXID granularity so the TXIDs should align between compaction levels.
 	const maxLevel = SnapshotLevel - 1
 	for level := maxLevel; level >= 0; level-- {
+		r.Logger().Debug("finding ltx files for level", "level", level)
+
 		a, err := FindLTXFiles(ctx, r.Client, level, func(info *ltx.FileInfo) (bool, error) {
-			return info.MinTXID > infos.MaxTXID() && info.MaxTXID <= txID, nil
+			if info.MinTXID <= infos.MaxTXID() { // skip if already included in previous levels
+				return false, nil
+			}
+
+			// Filter by TXID or timestamp, if specified.
+			if txID != 0 {
+				return info.MaxTXID <= txID, nil
+			} else if !timestamp.IsZero() {
+				return info.CreatedAt.Before(timestamp), nil
+			}
+			return true, nil
 		})
 		if err != nil {
 			return nil, err
 		}
 
 		// Append each storage path to the list
-		for i := range a {
+		for _, info := range a {
 			// Ensure TXIDs are contiguous between each paths.
-			if infos.MaxTXID()+1 != a[i].MinTXID {
+			if infos.MaxTXID()+1 != info.MinTXID {
 				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",
-					infos.MaxTXID().String(), ltx.FormatFilename(a[i].MinTXID, a[i].MaxTXID))
+					infos.MaxTXID().String(), ltx.FormatFilename(info.MinTXID, info.MaxTXID))
 			}
 
 			logger.Debug("matching LTX file for restore",
-				"filename", ltx.FormatFilename(a[len(a)-1].MinTXID, a[len(a)-1].MaxTXID))
-			infos = append(infos, a[i])
+				"filename", ltx.FormatFilename(info.MinTXID, info.MaxTXID))
+			infos = append(infos, info)
 		}
 	}
 
