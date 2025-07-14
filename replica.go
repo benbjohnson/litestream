@@ -697,7 +697,7 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 		r.Logger().Debug("finding ltx files for level", "level", level)
 
 		a, err := FindLTXFiles(ctx, r.Client, level, func(info *ltx.FileInfo) (bool, error) {
-			if info.MinTXID <= infos.MaxTXID() { // skip if already included in previous levels
+			if info.MaxTXID <= infos.MaxTXID() { // skip if already included in previous levels
 				return false, nil
 			}
 
@@ -716,7 +716,7 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 		// Append each storage path to the list
 		for _, info := range a {
 			// Ensure TXIDs are contiguous between each paths.
-			if infos.MaxTXID()+1 != info.MinTXID {
+			if !ltx.IsContiguous(infos.MaxTXID(), info.MinTXID, info.MaxTXID) {
 				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",
 					infos.MaxTXID().String(), ltx.FormatFilename(info.MinTXID, info.MaxTXID))
 			}
