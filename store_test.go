@@ -101,7 +101,7 @@ func TestStore_Integration(t *testing.T) {
 		t.Skip("skipping integration test in short mode")
 	}
 
-	const factor = 10
+	const factor = 1
 
 	db := newDB(t, filepath.Join(t.TempDir(), "db"))
 	db.MonitorInterval = factor * 100 * time.Millisecond

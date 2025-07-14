@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // WALReader wraps an io.Reader and parses SQLite WAL frames.
@@ -185,8 +187,8 @@ func (r *WALReader) readFrame(_ context.Context, data []byte, verifyChecksum boo
 
 // PageMap reads all committed frames until the end of the file and returns a
 // map of pgno to offset of the latest version of each page. Also returns the
-// size of the wal segment read, and the final database size, in pages.
-func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, size int64, commit uint32, err error) {
+// max offset of the wal segment read, and the final database size, in pages.
+func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset int64, commit uint32, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
@@ -217,12 +219,9 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, size int64
 		return m, 0, 0, nil
 	}
 
-	// Compute the lowest & highest page offsets.
-	var start, end int64
+	// Compute the highest page offsets.
+	var end int64
 	for _, offset := range m {
-		if start == 0 || offset < start {
-			start = offset
-		}
 		if end == 0 || offset > end {
 			end = offset
 		}
@@ -231,8 +230,8 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, size int64
 	// Extend to the end of the last frame read.
 	end += WALFrameHeaderSize + int64(r.pageSize)
 
-	r.logger.Log(ctx, LevelTrace, "page map complete", "n", len(m), "start", start, "end", end, "commit", commit)
-	return m, end - start, commit, nil
+	r.logger.Log(ctx, internal.LevelTrace, "page map complete", "n", len(m), "end", end, "commit", commit)
+	return m, end, commit, nil
 }
 
 // WALChecksum computes a running SQLite WAL checksum over a byte slice.

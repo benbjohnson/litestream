@@ -104,7 +104,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			return ltx.NewFileInfoSliceIterator(nil), nil
 		}
 
-		plan, err := r.CalcRestorePlan(context.Background(), 10)
+		plan, err := r.CalcRestorePlan(context.Background(), 10, time.Time{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -145,7 +145,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			}
 		}
 
-		plan, err := r.CalcRestorePlan(context.Background(), 10)
+		plan, err := r.CalcRestorePlan(context.Background(), 10, time.Time{})
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -184,7 +184,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			}
 		}
 
-		_, err := r.CalcRestorePlan(context.Background(), 10)
+		_, err := r.CalcRestorePlan(context.Background(), 10, time.Time{})
 		if err == nil || err.Error() != `non-contiguous transaction files: prev=0000000000000005 filename=0000000000000008-0000000000000009.ltx` {
 			t.Fatalf("unexpected error: %q", err)
 		}
@@ -204,7 +204,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			}
 		}
 
-		_, err := r.CalcRestorePlan(context.Background(), 5)
+		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
 		if err != litestream.ErrTxNotAvailable {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
@@ -217,7 +217,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 		r := litestream.NewReplicaWithClient(db, &c)
 
-		_, err := r.CalcRestorePlan(context.Background(), 5)
+		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
 		if err != litestream.ErrTxNotAvailable {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
