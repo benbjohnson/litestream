@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -49,8 +48,6 @@ var (
 	// LogFlags are the flags passed to log.New().
 	LogFlags = 0
 )
-
-const LevelTrace = slog.Level(slog.LevelDebug - 4)
 
 func init() {
 	sql.Register("litestream-sqlite3", &sqlite3.SQLiteDriver{

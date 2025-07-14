@@ -20,6 +20,7 @@ import (
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	_ "github.com/mattn/go-sqlite3"
@@ -157,6 +158,9 @@ type Config struct {
 	// Only includes L1 through the last non-snapshot level.
 	Levels []*CompactionLevelConfig `yaml:"levels"`
 
+	// Snapshot configuration
+	Snapshot SnapshotConfig `yaml:"snapshot"`
+
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
 
@@ -170,6 +174,12 @@ type Config struct {
 
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
+}
+
+// SnapshotConfig configures snapshots.
+type SnapshotConfig struct {
+	Interval  time.Duration `yaml:"interval"`
+	Retention time.Duration `yaml:"retention"`
 }
 
 // LoggingConfig configures logging.
@@ -271,12 +281,12 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 
 	logOptions := slog.HandlerOptions{
 		Level:       slog.LevelInfo,
-		ReplaceAttr: replaceAttr,
+		ReplaceAttr: internal.ReplaceAttr,
 	}
 
 	switch strings.ToUpper(config.Logging.Level) {
 	case "TRACE":
-		logOptions.Level = litestream.LevelTrace
+		logOptions.Level = internal.LevelTrace
 	case "DEBUG":
 		logOptions.Level = slog.LevelDebug
 	case "INFO":
@@ -299,13 +309,6 @@ func ReadConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	slog.SetDefault(slog.New(logHandler))
 
 	return config, nil
-}
-
-func replaceAttr(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.LevelKey && a.Value.Any().(slog.Level) == litestream.LevelTrace {
-		a.Value = slog.StringValue("TRACE")
-	}
-	return a
 }
 
 // CompactionLevelConfig the configuration for a single level of compaction.

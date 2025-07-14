@@ -131,6 +131,8 @@ func (s *Store) SnapshotLevel() *CompactionLevel {
 }
 
 func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel) {
+	slog.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
+
 	// Start first compaction immediately to check for any missed compactions from shutdown
 	timer := time.NewTimer(time.Nanosecond)
 
@@ -148,13 +150,13 @@ LOOP:
 
 			for _, db := range s.DBs() {
 				if _, err := s.CompactDB(ctx, db, lvl); errors.Is(err, ErrNoCompaction) {
-					slog.Debug("no compaction", "path", db.Path())
+					slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 					continue
 				} else if errors.Is(err, ErrCompactionTooEarly) {
-					slog.Debug("recently compacted, skipping", "path", db.Path())
+					slog.Debug("recently compacted, skipping", "level", lvl.Level, "path", db.Path())
 					continue
 				} else if err != nil {
-					slog.Error("compaction failed", "error", err)
+					slog.Error("compaction failed", "level", lvl.Level, "error", err)
 					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
 				}
 			}

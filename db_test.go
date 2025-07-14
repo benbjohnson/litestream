@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"context"
 	"database/sql"
+	"flag"
 	"hash/crc64"
 	"log/slog"
 	"os"
@@ -12,8 +13,11 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 	"github.com/superfly/ltx"
 )
+
+var logLevel = flag.String("log.level", "debug", "")
 
 func TestDB_Path(t *testing.T) {
 	db := newDB(t, "/tmp/db")
@@ -496,9 +500,16 @@ func TestDB_Snapshot(t *testing.T) {
 func newDB(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
 	tb.Logf("db=%s", path)
+
+	level := slog.LevelDebug
+	if strings.ToLower(*logLevel) == "trace" {
+		level = internal.LevelTrace
+	}
+
 	db := litestream.NewDB(path)
 	db.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
+		Level:       level,
+		ReplaceAttr: internal.ReplaceAttr,
 	}))
 	return db
 }
