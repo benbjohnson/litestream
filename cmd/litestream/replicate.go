@@ -30,6 +30,9 @@ type ReplicateCommand struct {
 
 	// List of managed databases specified in the config.
 	DBs []*litestream.DB
+
+	// MCP server
+	MCP *MCPServer
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -73,6 +76,7 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			return err
 		}
 	}
+	c.Config.ConfigPath = *configPath
 
 	// Override config exec command, if specified.
 	if *execFlag != "" {
@@ -86,6 +90,15 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 func (c *ReplicateCommand) Run() (err error) {
 	// Display version information.
 	slog.Info("litestream", "version", Version)
+
+	// Start MCP server if enabled
+	if c.Config.MCPAddr != "" {
+		c.MCP, err = NewMCP(context.Background(), c.Config.ConfigPath)
+		if err != nil {
+			return err
+		}
+		go c.MCP.Start(c.Config.MCPAddr)
+	}
 
 	// Setup databases.
 	if len(c.Config.DBs) == 0 {
@@ -173,6 +186,11 @@ func (c *ReplicateCommand) Close() (err error) {
 			if err == nil {
 				err = e
 			}
+		}
+	}
+	if c.Config.MCPAddr != "" {
+		if err := c.MCP.Close(); err != nil {
+			slog.Error("error closing MCP server", "error", err)
 		}
 	}
 	return err
