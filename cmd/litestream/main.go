@@ -376,8 +376,9 @@ type ReplicaConfig struct {
 
 	// Encryption identities and recipients
 	Age struct {
-		Identities []string `yaml:"identities"`
-		Recipients []string `yaml:"recipients"`
+		IdentityFiles []string `yaml:"identity-files"`
+		Identities    []string `yaml:"identities"`
+		Recipients    []string `yaml:"recipients"`
 	} `yaml:"age"`
 }
 
@@ -404,6 +405,19 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	}
 	if v := c.ValidationInterval; v != nil {
 		r.ValidationInterval = *v
+	}
+	for _, path := range c.Age.IdentityFiles {
+		buf, err := os.ReadFile(path)
+		if err != nil {
+		  return nil, err
+		}
+
+		identities, err := age.ParseIdentities(strings.NewReader(string(buf)))
+		if err != nil {
+		  return nil, err
+		}
+
+		r.AgeIdentities = append(r.AgeIdentities, identities...)
 	}
 	for _, str := range c.Age.Identities {
 		identities, err := age.ParseIdentities(strings.NewReader(str))
