@@ -1353,7 +1353,7 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 		info := itr.Item()
 		lastInfo = info
 
-		// If this snapshot is before the retention timestamp, mark it for deletion.
+		// If this file's maxTXID is below the target TXID, mark it for deletion.
 		if info.MaxTXID < txID {
 			deleted = append(deleted, info)
 			continue
