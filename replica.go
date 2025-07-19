@@ -10,8 +10,6 @@ import (
 	"time"
 
 	"filippo.io/age"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
 )
 
@@ -333,49 +331,6 @@ func (r *Replica) monitor(ctx context.Context) {
 	}
 }
 
-// waitForReplica blocks until replica reaches at least the given position.
-func (r *Replica) waitForReplica(ctx context.Context, pos ltx.Pos) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	timer := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	once := make(chan struct{}, 1)
-	once <- struct{}{}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return fmt.Errorf("replica wait exceeded timeout")
-		case <-ticker.C:
-		case <-once: // immediate on first check
-		}
-
-		// Obtain current position of replica, check if past target position.
-		curr := r.Pos()
-		if curr.IsZero() {
-			r.Logger().Info("validator: no replica position available")
-			continue
-		}
-
-		ready := true
-		if curr.TXID < pos.TXID {
-			ready = false
-		}
-
-		// If not ready, restart loop.
-		if !ready {
-			continue
-		}
-
-		// Current position at or after target position.
-		return nil
-	}
-}
-
 // CreatedAt returns the earliest creation time of any LTX file.
 // Returns zero time if no LTX files exist.
 func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
@@ -593,13 +548,3 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 
 	return infos, nil
 }
-
-// Replica metrics.
-var (
-	replicaValidationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "validation_total",
-		Help:      "The number of validations performed",
-	}, []string{"db", "status"})
-)

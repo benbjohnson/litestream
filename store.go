@@ -130,9 +130,8 @@ func (s *Store) DBs() []*DB {
 // SnapshotLevel returns a pseudo compaction level based on snapshot settings.
 func (s *Store) SnapshotLevel() *CompactionLevel {
 	return &CompactionLevel{
-		Level:     SnapshotLevel,
-		Interval:  s.SnapshotInterval,
-		Retention: s.SnapshotRetention,
+		Level:    SnapshotLevel,
+		Interval: s.SnapshotInterval,
 	}
 }
 

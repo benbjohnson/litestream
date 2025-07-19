@@ -216,9 +216,8 @@ func (c *Config) CompactionLevels() litestream.CompactionLevels {
 
 	for i, lvl := range c.Levels {
 		levels = append(levels, &litestream.CompactionLevel{
-			Level:     i + 1,
-			Interval:  lvl.Interval,
-			Retention: lvl.Retention,
+			Level:    i + 1,
+			Interval: lvl.Interval,
 		})
 	}
 
