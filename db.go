@@ -1284,6 +1284,72 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	return info, nil
 }
 
+// EnforceRetention enforces retention of the database by removing old LTX files.
+func (db *DB) EnforceRetention(ctx context.Context, level int, timestamp time.Time) (err error) {
+	var minSnapshotTXID ltx.TXID
+	if level != SnapshotLevel {
+		minSnapshotTXID, err = db.MinSnapshotTXID(ctx)
+		if err != nil {
+			return fmt.Errorf("fetch min snapshot transaction ID: %w", err)
+		}
+	}
+
+	db.Logger.Debug("enforcing retention", "level", level, "timestamp", timestamp, "minSnapshotTXID", minSnapshotTXID)
+
+	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0)
+	if err != nil {
+		return fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var infos []*ltx.FileInfo
+	var lastInfo *ltx.FileInfo
+	for itr.Next() {
+		info := itr.Item()
+		// Remove file if it is older than the oldest snapshot or before the retention timestamp.
+		if info.MaxTXID <= minSnapshotTXID || info.CreatedAt.Before(timestamp) {
+			infos = append(infos, info)
+		}
+		lastInfo = info
+	}
+
+	// If this is the snapshot level, we need to ensure that at least one snapshot exists.
+	if level == SnapshotLevel && len(infos) > 0 && infos[len(infos)-1] == lastInfo {
+		infos = infos[:len(infos)-1]
+	}
+
+	// Remove old files in batches.
+	for i := 0; i < len(infos); i += 100 {
+		end := i + 100
+		if end > len(infos) {
+			end = len(infos)
+		}
+
+		for _, info := range infos[i:end] {
+			db.Logger.Debug("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
+		}
+
+		if err := db.Replica.Client.DeleteLTXFiles(ctx, infos[i:end]); err != nil {
+			return fmt.Errorf("remove ltx files: %w", err)
+		}
+	}
+	return nil
+}
+
+// MinSnapshotTXID returns the transaction ID of the oldest snapshot.
+func (db *DB) MinSnapshotTXID(ctx context.Context) (ltx.TXID, error) {
+	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0)
+	if err != nil {
+		return 0, fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	if itr.Next() {
+		return itr.Item().MaxTXID, nil
+	}
+	return 0, nil
+}
+
 // monitor runs in a separate goroutine and monitors the database & WAL.
 func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)

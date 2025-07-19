@@ -29,6 +29,9 @@ var (
 const (
 	DefaultSnapshotInterval  = 24 * time.Hour
 	DefaultSnapshotRetention = 24 * time.Hour
+
+	DefaultRetention              = 24 * time.Hour
+	DefaultRetentionCheckInterval = 1 * time.Hour
 )
 
 // Store represents the top-level container for databases.
@@ -79,11 +82,13 @@ func (s *Store) Open(ctx context.Context) error {
 
 	// Start monitors for compactions & snapshots.
 	if s.CompactionMonitorEnabled {
+		// Start compaction monitors for all levels except L0.
 		for _, lvl := range s.levels {
 			lvl := lvl
 			if lvl.Level == 0 {
 				continue
 			}
+
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
@@ -91,6 +96,7 @@ func (s *Store) Open(ctx context.Context) error {
 			}()
 		}
 
+		// Start snapshot monitor for snapshots.
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -149,6 +155,7 @@ LOOP:
 			timer = time.NewTimer(time.Until(lvl.NextCompactionAt(time.Now())))
 
 			for _, db := range s.DBs() {
+				// First attempt to compact the database.
 				if _, err := s.CompactDB(ctx, db, lvl); errors.Is(err, ErrNoCompaction) {
 					slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 					continue
@@ -158,6 +165,20 @@ LOOP:
 				} else if err != nil {
 					slog.Error("compaction failed", "level", lvl.Level, "error", err)
 					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
+				}
+
+				// If successful, enforce retention to remove old LTX files.
+				if err := db.EnforceRetention(ctx, lvl.Level, time.Now().Add(-lvl.Retention)); err != nil {
+					slog.Error("enforce retention failed", "level", lvl.Level, "error", err)
+					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
+				}
+
+				// We should also enforce retention for L0 on the same schedule as L1.
+				if lvl.Level == 1 {
+					if err := db.EnforceRetention(ctx, 0, time.Now().Add(-lvl.Retention)); err != nil {
+						slog.Error("enforce retention failed", "level", 0, "error", err)
+						time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
+					}
 				}
 			}
 		}
