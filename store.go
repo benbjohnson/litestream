@@ -167,16 +167,10 @@ LOOP:
 					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
 				}
 
-				// If successful, enforce retention to remove old LTX files.
-				if err := db.EnforceRetention(ctx, lvl.Level, time.Now().Add(-lvl.Retention)); err != nil {
-					slog.Error("enforce retention failed", "level", lvl.Level, "error", err)
-					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
-				}
-
-				// We should also enforce retention for L0 on the same schedule as L1.
-				if lvl.Level == 1 {
-					if err := db.EnforceRetention(ctx, 0, time.Now().Add(-lvl.Retention)); err != nil {
-						slog.Error("enforce retention failed", "level", 0, "error", err)
+				// Each time we snapshot, clean up everything before the oldest snapshot.
+				if lvl.Level == SnapshotLevel {
+					if err := s.EnforceSnapshotRetention(ctx, db); err != nil {
+						slog.Error("retention enforcement failed", "error", err)
 						time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
 					}
 				}
@@ -236,4 +230,28 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	)
 
 	return info, nil
+}
+
+// EnforceSnapshotRetention removes old snapshots by timestamp and then
+// cleans up all lower levels based on minimum snapshot TXID.
+func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
+	// Enforce retention for the snapshot level.
+	minSnapshotTXID, err := db.EnforceSnapshotRetention(ctx, time.Now().Add(-s.SnapshotRetention))
+	if err != nil {
+		return fmt.Errorf("enforce snapshot retention: %w", err)
+	}
+
+	// We should also enforce retention for L0 on the same schedule as L1.
+	for _, lvl := range s.levels {
+		// Skip L0 since it is enforced on a more frequent basis.
+		if lvl.Level == 0 {
+			continue
+		}
+
+		if err := db.EnforceRetentionByTXID(ctx, lvl.Level, minSnapshotTXID); err != nil {
+			return fmt.Errorf("enforce L%d retention: %w", lvl.Level, err)
+		}
+	}
+
+	return nil
 }

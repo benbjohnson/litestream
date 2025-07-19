@@ -543,8 +543,10 @@ func TestDB_EnforceRetention(t *testing.T) {
 
 	// Enforce retention to remove older snapshots
 	retentionTime := time.Now().Add(-150 * time.Millisecond)
-	if err := db.EnforceRetention(context.Background(), litestream.SnapshotLevel, retentionTime); err != nil {
+	if minSnapshotTXID, err := db.EnforceSnapshotRetention(context.Background(), retentionTime); err != nil {
 		t.Fatal(err)
+	} else if got, want := minSnapshotTXID, ltx.TXID(4); got != want {
+		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
 	}
 
 	// Verify snapshots after retention
