@@ -1367,7 +1367,7 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 
 	// Remove all files marked for deletion.
 	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
+		db.Logger.Info("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
 	}
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
