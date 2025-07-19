@@ -29,6 +29,9 @@ var (
 const (
 	DefaultSnapshotInterval  = 24 * time.Hour
 	DefaultSnapshotRetention = 24 * time.Hour
+
+	DefaultRetention              = 24 * time.Hour
+	DefaultRetentionCheckInterval = 1 * time.Hour
 )
 
 // Store represents the top-level container for databases.
@@ -79,11 +82,13 @@ func (s *Store) Open(ctx context.Context) error {
 
 	// Start monitors for compactions & snapshots.
 	if s.CompactionMonitorEnabled {
+		// Start compaction monitors for all levels except L0.
 		for _, lvl := range s.levels {
 			lvl := lvl
 			if lvl.Level == 0 {
 				continue
 			}
+
 			s.wg.Add(1)
 			go func() {
 				defer s.wg.Done()
@@ -91,6 +96,7 @@ func (s *Store) Open(ctx context.Context) error {
 			}()
 		}
 
+		// Start snapshot monitor for snapshots.
 		s.wg.Add(1)
 		go func() {
 			defer s.wg.Done()
@@ -124,9 +130,8 @@ func (s *Store) DBs() []*DB {
 // SnapshotLevel returns a pseudo compaction level based on snapshot settings.
 func (s *Store) SnapshotLevel() *CompactionLevel {
 	return &CompactionLevel{
-		Level:     SnapshotLevel,
-		Interval:  s.SnapshotInterval,
-		Retention: s.SnapshotRetention,
+		Level:    SnapshotLevel,
+		Interval: s.SnapshotInterval,
 	}
 }
 
@@ -149,6 +154,7 @@ LOOP:
 			timer = time.NewTimer(time.Until(lvl.NextCompactionAt(time.Now())))
 
 			for _, db := range s.DBs() {
+				// First attempt to compact the database.
 				if _, err := s.CompactDB(ctx, db, lvl); errors.Is(err, ErrNoCompaction) {
 					slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 					continue
@@ -158,6 +164,14 @@ LOOP:
 				} else if err != nil {
 					slog.Error("compaction failed", "level", lvl.Level, "error", err)
 					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
+				}
+
+				// Each time we snapshot, clean up everything before the oldest snapshot.
+				if lvl.Level == SnapshotLevel {
+					if err := s.EnforceSnapshotRetention(ctx, db); err != nil {
+						slog.Error("retention enforcement failed", "error", err)
+						time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
+					}
 				}
 			}
 		}
@@ -215,4 +229,28 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	)
 
 	return info, nil
+}
+
+// EnforceSnapshotRetention removes old snapshots by timestamp and then
+// cleans up all lower levels based on minimum snapshot TXID.
+func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
+	// Enforce retention for the snapshot level.
+	minSnapshotTXID, err := db.EnforceSnapshotRetention(ctx, time.Now().Add(-s.SnapshotRetention))
+	if err != nil {
+		return fmt.Errorf("enforce snapshot retention: %w", err)
+	}
+
+	// We should also enforce retention for L0 on the same schedule as L1.
+	for _, lvl := range s.levels {
+		// Skip L0 since it is enforced on a more frequent basis.
+		if lvl.Level == 0 {
+			continue
+		}
+
+		if err := db.EnforceRetentionByTXID(ctx, lvl.Level, minSnapshotTXID); err != nil {
+			return fmt.Errorf("enforce L%d retention: %w", lvl.Level, err)
+		}
+	}
+
+	return nil
 }

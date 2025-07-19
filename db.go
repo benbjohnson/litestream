@@ -1263,6 +1263,13 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	db.maxLTXFileInfos.m[dstLevel] = info
 	db.maxLTXFileInfos.Unlock()
 
+	// If this is L1, clean up L0 files that are below the minTXID.
+	if dstLevel == 1 {
+		if err := db.EnforceRetentionByTXID(ctx, 0, maxTXID); err != nil {
+			db.Logger.Error("enforce L0 retention", "error", err)
+		}
+	}
+
 	return info, nil
 }
 
@@ -1282,6 +1289,91 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	db.maxLTXFileInfos.Unlock()
 
 	return info, nil
+}
+
+// EnforceSnapshotRetention enforces retention of the snapshot level in the database by timestamp.
+func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time) (minSnapshotTXID ltx.TXID, err error) {
+	db.Logger.Debug("enforcing snapshot retention", "timestamp", timestamp)
+
+	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0)
+	if err != nil {
+		return 0, fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var deleted []*ltx.FileInfo
+	var lastInfo *ltx.FileInfo
+	for itr.Next() {
+		info := itr.Item()
+		lastInfo = info
+
+		// If this snapshot is before the retention timestamp, mark it for deletion.
+		if info.CreatedAt.Before(timestamp) {
+			deleted = append(deleted, info)
+			continue
+		}
+
+		// Track the lowest snapshot TXID so we can enforce retention in lower levels.
+		// This is only tracked for snapshots not marked for deletion.
+		if minSnapshotTXID == 0 || info.MaxTXID < minSnapshotTXID {
+			minSnapshotTXID = info.MaxTXID
+		}
+	}
+
+	// If this is the snapshot level, we need to ensure that at least one snapshot exists.
+	if len(deleted) > 0 && deleted[len(deleted)-1] == lastInfo {
+		deleted = deleted[:len(deleted)-1]
+	}
+
+	// Remove all files marked for deletion.
+	for _, info := range deleted {
+		db.Logger.Info("deleting ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
+	}
+	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+		return 0, fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	return minSnapshotTXID, nil
+}
+
+// EnforceRetentionByTXID enforces retention so that any LTX files below
+// the target TXID are deleted. Always keep at least one file.
+func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) (err error) {
+	db.Logger.Debug("enforcing retention", "level", level, "txid", txID)
+
+	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0)
+	if err != nil {
+		return fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var deleted []*ltx.FileInfo
+	var lastInfo *ltx.FileInfo
+	for itr.Next() {
+		info := itr.Item()
+		lastInfo = info
+
+		// If this file's maxTXID is below the target TXID, mark it for deletion.
+		if info.MaxTXID < txID {
+			deleted = append(deleted, info)
+			continue
+		}
+	}
+
+	// Ensure we don't delete the last file.
+	if len(deleted) > 0 && deleted[len(deleted)-1] == lastInfo {
+		deleted = deleted[:len(deleted)-1]
+	}
+
+	// Remove all files marked for deletion.
+	for _, info := range deleted {
+		db.Logger.Info("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
+	}
+	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+		return fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	return nil
 }
 
 // monitor runs in a separate goroutine and monitors the database & WAL.

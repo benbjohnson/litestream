@@ -3,25 +3,19 @@ package litestream
 import (
 	"context"
 	"fmt"
-	"hash/crc64"
 	"io"
 	"log/slog"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 
 	"filippo.io/age"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
 )
 
 // Default replica settings.
 const (
-	DefaultSyncInterval           = 1 * time.Second
-	DefaultRetention              = 24 * time.Hour
-	DefaultRetentionCheckInterval = 1 * time.Hour
+	DefaultSyncInterval = 1 * time.Second
 )
 
 // Replica connects a database to a replication destination via a ReplicaClient.
@@ -45,16 +39,6 @@ type Replica struct {
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
 
-	// Time to keep snapshots and related WAL files.
-	// Database is snapshotted after interval, if needed, and older WAL files are discarded.
-	Retention time.Duration
-
-	// Time between checks for retention.
-	RetentionCheckInterval time.Duration
-
-	// Time between validation checks.
-	ValidationInterval time.Duration
-
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
@@ -69,10 +53,8 @@ func NewReplica(db *DB) *Replica {
 		db:     db,
 		cancel: func() {},
 
-		SyncInterval:           DefaultSyncInterval,
-		Retention:              DefaultRetention,
-		RetentionCheckInterval: DefaultRetentionCheckInterval,
-		MonitorEnabled:         true,
+		SyncInterval:   DefaultSyncInterval,
+		MonitorEnabled: true,
 	}
 
 	return r
@@ -110,10 +92,8 @@ func (r *Replica) Start(ctx context.Context) error {
 	ctx, r.cancel = context.WithCancel(ctx)
 
 	// Start goroutine to replicate data.
-	r.wg.Add(3)
+	r.wg.Add(1)
 	go func() { defer r.wg.Done(); r.monitor(ctx) }()
-	go func() { defer r.wg.Done(); r.retainer(ctx) }()
-	go func() { defer r.wg.Done(); r.validator(ctx) }()
 
 	return nil
 }
@@ -351,174 +331,6 @@ func (r *Replica) monitor(ctx context.Context) {
 	}
 }
 
-// retainer runs in a separate goroutine and handles retention.
-func (r *Replica) retainer(ctx context.Context) {
-	// Disable retention enforcement if retention period is non-positive.
-	if r.Retention <= 0 {
-		return
-	}
-
-	// Ensure check interval is not longer than retention period.
-	checkInterval := r.RetentionCheckInterval
-	if checkInterval > r.Retention {
-		checkInterval = r.Retention
-	}
-
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := r.EnforceRetention(ctx); err != nil {
-				r.Logger().Error("retainer error", "error", err)
-				continue
-			}
-		}
-	}
-}
-
-// validator runs in a separate goroutine and handles periodic validation.
-func (r *Replica) validator(ctx context.Context) {
-	// Initialize counters since validation occurs infrequently.
-	for _, status := range []string{"ok", "error"} {
-		replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), status).Add(0)
-	}
-
-	// Exit validation if interval is not set.
-	if r.ValidationInterval <= 0 {
-		return
-	}
-
-	ticker := time.NewTicker(r.ValidationInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if err := r.Validate(ctx); err != nil {
-				r.Logger().Error("validation error", "error", err)
-				continue
-			}
-		}
-	}
-}
-
-// Validate restores the most recent data from a replica and validates
-// that the resulting database matches the current database.
-func (r *Replica) Validate(ctx context.Context) error {
-	db := r.DB()
-
-	// Restore replica to a temporary directory.
-	tmpdir, err := os.MkdirTemp("", "*-litestream")
-	if err != nil {
-		return err
-	}
-	defer os.RemoveAll(tmpdir)
-
-	// Compute checksum of primary database under lock. This prevents a
-	// sync from occurring and the database will not be written.
-	chksum0, pos, err := db.CRC64(ctx)
-	if err != nil {
-		return fmt.Errorf("cannot compute checksum: %w", err)
-	}
-
-	// Wait until replica catches up to position.
-	if err := r.waitForReplica(ctx, pos); err != nil {
-		return fmt.Errorf("cannot wait for replica: %w", err)
-	}
-
-	restorePath := filepath.Join(tmpdir, "replica")
-	if err := r.Restore(ctx, RestoreOptions{
-		OutputPath: restorePath,
-		TXID:       pos.TXID - 1,
-	}); err != nil {
-		return fmt.Errorf("cannot restore: %w", err)
-	}
-
-	// Open file handle for restored database.
-	// NOTE: This open is ok as the restored database is not managed by litestream.
-	f, err := os.Open(restorePath)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-
-	// Read entire file into checksum.
-	h := crc64.New(crc64.MakeTable(crc64.ISO))
-	if _, err := io.Copy(h, f); err != nil {
-		return err
-	}
-	chksum1 := h.Sum64()
-
-	status := "ok"
-	mismatch := chksum0 != chksum1
-	if mismatch {
-		status = "mismatch"
-	}
-	r.Logger().Info("validator", "status", status, "db", fmt.Sprintf("%016x", chksum0), "replica", fmt.Sprintf("%016x", chksum1), "position", pos.String())
-
-	// Validate checksums match.
-	if mismatch {
-		replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), "error").Inc()
-		return ErrChecksumMismatch
-	}
-
-	replicaValidationTotalCounterVec.WithLabelValues(r.db.Path(), "ok").Inc()
-
-	if err := os.RemoveAll(tmpdir); err != nil {
-		return fmt.Errorf("cannot remove temporary validation directory: %w", err)
-	}
-	return nil
-}
-
-// waitForReplica blocks until replica reaches at least the given position.
-func (r *Replica) waitForReplica(ctx context.Context, pos ltx.Pos) error {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-
-	timer := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-
-	once := make(chan struct{}, 1)
-	once <- struct{}{}
-
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
-			return fmt.Errorf("replica wait exceeded timeout")
-		case <-ticker.C:
-		case <-once: // immediate on first check
-		}
-
-		// Obtain current position of replica, check if past target position.
-		curr := r.Pos()
-		if curr.IsZero() {
-			r.Logger().Info("validator: no replica position available")
-			continue
-		}
-
-		ready := true
-		if curr.TXID < pos.TXID {
-			ready = false
-		}
-
-		// If not ready, restart loop.
-		if !ready {
-			continue
-		}
-
-		// Current position at or after target position.
-		return nil
-	}
-}
-
 // CreatedAt returns the earliest creation time of any LTX file.
 // Returns zero time if no LTX files exist.
 func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
@@ -736,13 +548,3 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 
 	return infos, nil
 }
-
-// Replica metrics.
-var (
-	replicaValidationTotalCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Namespace: "litestream",
-		Subsystem: "replica",
-		Name:      "validation_total",
-		Help:      "The number of validations performed",
-	}, []string{"db", "status"})
-)

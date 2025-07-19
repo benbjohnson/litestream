@@ -15,7 +15,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.19
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/superfly/ltx v0.3.17
+	github.com/superfly/ltx v0.3.18
 	golang.org/x/crypto v0.17.0
 	golang.org/x/sync v0.5.0
 	golang.org/x/sys v0.15.0

@@ -16,9 +16,6 @@ type CompactionLevel struct {
 
 	// The frequency that the level is compacted from the previous level.
 	Interval time.Duration
-
-	// The duration that files in this level are stored.
-	Retention time.Duration
 }
 
 // PrevCompactionAt returns the time when the last compaction occurred.

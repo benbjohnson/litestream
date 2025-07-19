@@ -497,6 +497,80 @@ func TestDB_Snapshot(t *testing.T) {
 	}
 }
 
+func TestDB_EnforceRetention(t *testing.T) {
+	db, sqldb := MustOpenDBs(t)
+	defer MustCloseDBs(t, db, sqldb)
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = NewFileReplicaClient(t)
+
+	// Create table and sync initial state
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create multiple snapshots with delays to test retention
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := db.Snapshot(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Sleep between snapshots to create time differences
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Get list of snapshots before retention
+	itr, err := db.Replica.Client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeCount int
+	for itr.Next() {
+		beforeCount++
+	}
+	itr.Close()
+
+	if beforeCount != 3 {
+		t.Fatalf("expected 3 snapshots before retention, got %d", beforeCount)
+	}
+
+	// Enforce retention to remove older snapshots
+	retentionTime := time.Now().Add(-150 * time.Millisecond)
+	if minSnapshotTXID, err := db.EnforceSnapshotRetention(context.Background(), retentionTime); err != nil {
+		t.Fatal(err)
+	} else if got, want := minSnapshotTXID, ltx.TXID(4); got != want {
+		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
+	}
+
+	// Verify snapshots after retention
+	itr, err = db.Replica.Client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var afterCount int
+	for itr.Next() {
+		afterCount++
+	}
+	itr.Close()
+
+	// Should have at least one snapshot remaining
+	if afterCount < 1 {
+		t.Fatal("expected at least 1 snapshot after retention")
+	}
+
+	// Should have fewer snapshots than before
+	if afterCount >= beforeCount {
+		t.Fatalf("expected fewer snapshots after retention, before=%d after=%d", beforeCount, afterCount)
+	}
+}
+
 func newDB(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
 	tb.Logf("db=%s", path)
