@@ -24,8 +24,7 @@ GitHub.
 
 ## Acknowledgements
 
-While the Litestream project does not accept external code patches, many
-of the most valuable contributions are in the forms of testing, feedback, and
+Many of the most valuable contributions are in the forms of testing, feedback, and
 documentation. These help harden software and streamline usage for other users.
 
 I want to give special thanks to individuals who invest much of their time and 
