@@ -23,6 +23,7 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/joho/godotenv"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
 	"gopkg.in/yaml.v2"
@@ -56,6 +57,14 @@ func NewMain() *Main {
 
 // Run executes the program.
 func (m *Main) Run(ctx context.Context, args []string) (err error) {
+	// Load environment variables from .env file
+	if _, err := os.Stat(".env"); err == nil {
+		err = godotenv.Load(".env")
+		if err != nil {
+			return fmt.Errorf("error loading .env file: %w", err)
+		}
+	}
+
 	// Execute replication command if running as a Windows service.
 	if isService, err := isWindowsService(); err != nil {
 		return err
