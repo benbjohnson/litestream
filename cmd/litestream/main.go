@@ -429,6 +429,7 @@ type ReplicaConfig struct {
 	User     string `yaml:"user"`
 	Password string `yaml:"password"`
 	KeyPath  string `yaml:"key-path"`
+	HostKey  string `yaml:"host-key"`
 
 	// Encryption identities and recipients
 	Age struct {
@@ -718,6 +719,7 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Password = password
 	client.Path = path
 	client.KeyPath = c.KeyPath
+	client.HostKey = c.HostKey
 	return client, nil
 }
 
