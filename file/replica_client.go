@@ -2,16 +2,13 @@ package file
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"time"
-
-	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/superfly/ltx"
 )
 
 // ReplicaClientType is the client type for this package.
@@ -118,21 +115,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	// Write LTX file to temporary file next to destination path.
-	// Use a unique suffix that includes process ID and timestamp to avoid conflicts
-	// and to signal that this file is actively being written.
-	tmpFilename := fmt.Sprintf("%s.writing-%d-%d.tmp", filename, os.Getpid(), time.Now().UnixNano())
-	f, err := internal.CreateFile(tmpFilename, fileInfo)
+	f, err := internal.CreateFile(filename+".tmp", fileInfo)
 	if err != nil {
 		return nil, err
 	}
-	defer func() {
-		// Always close the file
-		f.Close()
-		// Clean up temp file if we didn't successfully rename it
-		if err != nil {
-			os.Remove(tmpFilename)
-		}
-	}()
+	defer f.Close()
 
 	if _, err := io.Copy(f, rd); err != nil {
 		return nil, err
@@ -154,21 +141,13 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		CreatedAt: fi.ModTime().UTC(),
 	}
 
-	// Don't close the file yet - keep it open to prevent deletion
-	// This prevents removeTmpFiles from deleting it while we're working
-
-	// Rename while file is still open - this works on Unix systems
-	// and prevents the race condition where cleanup deletes the file
-	// between close and rename
-	if err := os.Rename(tmpFilename, filename); err != nil {
-		return nil, fmt.Errorf("rename ltx file: %w", err)
+	if err := f.Close(); err != nil {
+		return nil, err
 	}
 
-	// Now we can safely close the file after rename succeeded
-	if err := f.Close(); err != nil {
-		// File was already renamed, so this is not a critical error
-		// Log it but don't fail the operation
-		return info, nil
+	// Move LTX file to final path when it has been written & synced to disk.
+	if err := os.Rename(filename+".tmp", filename); err != nil {
+		return nil, err
 	}
 
 	return info, nil

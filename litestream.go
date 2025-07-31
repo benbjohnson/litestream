@@ -120,7 +120,6 @@ func readWALFileAt(filename string, offset, n int64) ([]byte, error) {
 }
 
 // removeTmpFiles recursively finds and removes .tmp files.
-// It skips files with .writing- prefix as those are actively being written.
 func removeTmpFiles(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -130,12 +129,6 @@ func removeTmpFiles(root string) error {
 		} else if !strings.HasSuffix(path, ".tmp") {
 			return nil // skip non-temp files
 		}
-
-		// Skip files that are actively being written (contain .writing- in the name)
-		if strings.Contains(filepath.Base(path), ".writing-") {
-			return nil
-		}
-
 		return os.Remove(path)
 	})
 }
