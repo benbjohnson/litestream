@@ -41,6 +41,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcpServer.AddTool(GenerationsTool(configPath))
 	mcpServer.AddTool(RestoreTool(configPath))
 	mcpServer.AddTool(SnapshotsTool(configPath))
+	mcpServer.AddTool(LTXTool(configPath))
 
 	s.mux = http.NewServeMux()
 	s.mux.Handle("/", httplog.Logger(server.NewStreamableHTTPServer(mcpServer)))
@@ -324,9 +325,9 @@ func VersionTool() (mcp.Tool, server.ToolHandlerFunc) {
 	}
 }
 
-func WALTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
-	tool := mcp.NewTool("litestream_wal",
-		mcp.WithDescription("List all WAL files for a database or replica."),
+func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
+	tool := mcp.NewTool("litestream_ltx",
+		mcp.WithDescription("List all LTX files for a database or replica."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 		mcp.WithString("replica", mcp.Description("Replica name to filter by. Optional.")),
@@ -334,7 +335,7 @@ func WALTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"wal"}
+		args := []string{"ltx"}
 		config := configPath
 		if configVal, err := req.RequireString("config"); err == nil {
 			config = configVal
