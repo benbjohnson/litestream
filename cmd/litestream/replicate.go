@@ -59,6 +59,9 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
 
+		// Initialize config with defaults when using command-line arguments
+		c.Config = DefaultConfig()
+
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
 			syncInterval := litestream.DefaultSyncInterval
