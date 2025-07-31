@@ -1,3 +1,10 @@
 .DS_Store
 /dist
 .vscode
+
+# Claude-related files
+.claude/
+CLAUDE.md
+
+# Binary
+litestream
