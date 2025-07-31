@@ -19,10 +19,11 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/s3"
 	"github.com/aws/aws-sdk-go/service/s3/s3manager"
-	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.

@@ -17,10 +17,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default DB settings.

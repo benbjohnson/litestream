@@ -11,10 +11,11 @@ import (
 	"time"
 
 	"github.com/Azure/azure-storage-blob-go/azblob"
-	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.

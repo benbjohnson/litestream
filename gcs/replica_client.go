@@ -10,10 +10,11 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/superfly/ltx"
 	"google.golang.org/api/iterator"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.

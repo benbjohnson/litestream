@@ -16,6 +16,10 @@ import (
 	"time"
 
 	"filippo.io/age"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/superfly/ltx"
+	"gopkg.in/yaml.v2"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
@@ -23,9 +27,6 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
-	_ "github.com/mattn/go-sqlite3"
-	"github.com/superfly/ltx"
-	"gopkg.in/yaml.v2"
 )
 
 // Build information.
