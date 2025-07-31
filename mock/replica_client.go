@@ -4,8 +4,9 @@ import (
 	"context"
 	"io"
 
-	"github.com/benbjohnson/litestream"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
