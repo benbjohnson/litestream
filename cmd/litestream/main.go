@@ -119,7 +119,11 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
+	case "ltx":
+		return (&LTXCommand{}).Run(ctx, args)
 	case "wal":
+		// Deprecated: Keep for backward compatibility
+		fmt.Fprintln(os.Stderr, "Warning: 'wal' command is deprecated, please use 'ltx' instead")
 		return (&LTXCommand{}).Run(ctx, args)
 	default:
 		if cmd == "" || cmd == "help" || strings.HasPrefix(cmd, "-") {
@@ -142,10 +146,10 @@ Usage:
 The commands are:
 
 	databases    list databases specified in config file
+	ltx          list available LTX files for a database
 	replicate    runs a server to replicate databases
 	restore      recovers database backup from a replica
 	version      prints the binary version
-	wal          list available WAL files for a database
 `[1:])
 }
 
