@@ -2,6 +2,7 @@ package file
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -146,8 +147,37 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	// Move LTX file to final path when it has been written & synced to disk.
-	if err := os.Rename(filename+".tmp", filename); err != nil {
-		return nil, err
+	tmpFilename := filename + ".tmp"
+
+	// Sync directory to ensure file metadata is persisted
+	dir := filepath.Dir(tmpFilename)
+	if d, err := os.Open(dir); err == nil {
+		defer d.Close() // Ensure cleanup on error paths
+		if err := d.Sync(); err != nil {
+			return nil, fmt.Errorf("sync directory: %w", err)
+		}
+		if err := d.Close(); err != nil {
+			return nil, fmt.Errorf("close directory: %w", err)
+		}
+	}
+
+	// Verify temporary file exists before attempting rename
+	if _, err := os.Stat(tmpFilename); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("temporary file disappeared before rename: %w", err)
+		}
+		return nil, fmt.Errorf("cannot stat temporary file: %w", err)
+	}
+
+	if err := os.Rename(tmpFilename, filename); err != nil {
+		// If rename fails, check if source file still exists
+		if _, statErr := os.Stat(tmpFilename); statErr != nil {
+			if os.IsNotExist(statErr) {
+				// The temporary file was removed by something else
+				return nil, fmt.Errorf("temporary file removed during rename operation: %w", err)
+			}
+		}
+		return nil, fmt.Errorf("rename ltx file: %w", err)
 	}
 
 	return info, nil
