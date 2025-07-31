@@ -3,27 +3,31 @@ package s3
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/awserr"
-	"github.com/aws/aws-sdk-go/aws/credentials"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/s3"
-	"github.com/aws/aws-sdk-go/service/s3/s3manager"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/credentials"
+	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.
@@ -37,11 +41,41 @@ const DefaultRegion = "us-east-1"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
+// customEndpointResolver implements the EndpointResolverV2 interface for custom endpoints
+type customEndpointResolver struct {
+	endpoint string
+}
+
+func (r *customEndpointResolver) ResolveEndpoint(ctx context.Context, params s3.EndpointParameters) (smithyendpoints.Endpoint, error) {
+	// For debugging
+	// fmt.Printf("ResolveEndpoint called with bucket: %v\n", aws.ToString(params.Bucket))
+	
+	u, err := url.Parse(r.endpoint)
+	if err != nil {
+		return smithyendpoints.Endpoint{}, fmt.Errorf("invalid endpoint URL: %w", err)
+	}
+	
+	// Create the endpoint with proper settings
+	ep := smithyendpoints.Endpoint{
+		URI:     *u,
+		Headers: http.Header{},
+	}
+	
+	// Set properties based on the endpoint
+	if u.Scheme == "http" {
+		// This tells the SDK to use HTTP instead of HTTPS
+		// For HTTP endpoints, we don't need special properties
+		// The SDK will handle it based on the URI scheme
+	}
+	
+	return ep, nil
+}
+
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
 	mu       sync.Mutex
-	s3       *s3.S3 // s3 service
-	uploader *s3manager.Uploader
+	s3       *s3.Client // s3 service
+	uploader *manager.Uploader
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -89,395 +123,505 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Create new AWS session.
-	config := c.config()
-	if region != "" {
-		config.Region = aws.String(region)
-	}
-
-	sess, err := session.NewSession(config)
-	if err != nil {
-		return fmt.Errorf("cannot create aws session: %w", err)
-	}
-	c.s3 = s3.New(sess)
-	c.uploader = s3manager.NewUploader(sess)
-	return nil
-}
-
-// config returns the AWS configuration. Uses the default credential chain
-// unless a key/secret are explicitly set.
-func (c *ReplicaClient) config() *aws.Config {
-	config := &aws.Config{}
-
-	if c.AccessKeyID != "" || c.SecretAccessKey != "" {
-		config.Credentials = credentials.NewStaticCredentials(c.AccessKeyID, c.SecretAccessKey, "")
-	}
-	if c.Endpoint != "" {
-		config.Endpoint = aws.String(c.Endpoint)
-	}
-	if c.ForcePathStyle {
-		config.S3ForcePathStyle = aws.Bool(c.ForcePathStyle)
-	}
+	// Create custom HTTP client if needed
+	var httpClient *http.Client
 	if c.SkipVerify {
-		config.HTTPClient = &http.Client{Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		}}
+		httpClient = &http.Client{
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				DialContext: (&net.Dialer{
+					Timeout:   30 * time.Second,
+					KeepAlive: 30 * time.Second,
+				}).DialContext,
+				ForceAttemptHTTP2:     true,
+				MaxIdleConns:          100,
+				IdleConnTimeout:       90 * time.Second,
+				TLSHandshakeTimeout:   10 * time.Second,
+				ExpectContinueTimeout: 1 * time.Second,
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
 	}
 
-	return config
-}
+	// Build configuration options
+	configOpts := []func(*config.LoadOptions) error{
+		config.WithRegion(region),
+		// Use adaptive retry mode for better resilience
+		config.WithRetryMode(aws.RetryModeAdaptive),
+		config.WithRetryMaxAttempts(3),
+	}
 
-func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
-	// Connect to US standard region to fetch info.
-	config := c.config()
-	config.Region = aws.String(DefaultRegion)
-	sess, err := session.NewSession(config)
+	// Add custom HTTP client if needed
+	if httpClient != nil {
+		configOpts = append(configOpts, config.WithHTTPClient(httpClient))
+	}
+
+	// Add static credentials if provided
+	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
+		configOpts = append(configOpts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, ""),
+		))
+	}
+
+	// Load AWS configuration
+	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("cannot load aws config: %w", err)
 	}
 
-	// Fetch bucket location, if possible. Must be bucket owner.
-	// This call can return a nil location which means it's in us-east-1.
-	if out, err := s3.New(sess).GetBucketLocation(&s3.GetBucketLocationInput{
-		Bucket: aws.String(bucket),
-	}); err != nil {
-		return "", err
-	} else if out.LocationConstraint != nil {
-		return *out.LocationConstraint, nil
-	}
-	return DefaultRegion, nil
-}
-
-// DeleteAll deletes all LTX files.
-func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
-	if err := c.Init(ctx); err != nil {
-		return err
+	// Create S3 client options
+	s3Opts := []func(*s3.Options){
+		func(o *s3.Options) {
+			o.UsePathStyle = c.ForcePathStyle
+		},
 	}
 
-	// Collect all files.
-	var objIDs []*s3.ObjectIdentifier
-	if err := c.s3.ListObjectsPagesWithContext(ctx, &s3.ListObjectsInput{
-		Bucket: aws.String(c.Bucket),
-		Prefix: aws.String(c.Path),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
-
-		for _, obj := range page.Contents {
-			objIDs = append(objIDs, &s3.ObjectIdentifier{Key: obj.Key})
-		}
-		return true
-	}); err != nil {
-		return err
-	}
-
-	// Delete all files in batches.
-	for len(objIDs) > 0 {
-		n := MaxKeys
-		if len(objIDs) < n {
-			n = len(objIDs)
-		}
-
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
-			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+	// Add custom endpoint if specified
+	if c.Endpoint != "" {
+		s3Opts = append(s3Opts, func(o *s3.Options) {
+			// For MinIO and other S3-compatible services, we can use BaseEndpoint
+			// with DisableHTTPS when the endpoint starts with http://
+			o.BaseEndpoint = aws.String(c.Endpoint)
+			if strings.HasPrefix(c.Endpoint, "http://") {
+				o.EndpointOptions.DisableHTTPS = true
+			}
+			// Alternative: Use custom endpoint resolver for more control
+			// o.EndpointResolverV2 = &customEndpointResolver{endpoint: c.Endpoint}
 		})
-		if err != nil {
-			return err
-		}
-		if err := deleteOutputError(out); err != nil {
-			return err
-		}
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
-
-		objIDs = objIDs[n:]
 	}
 
-	// log.Printf("%s(%s): retainer: deleting: %s", r.db.Path(), r.Name())
+	// Create S3 client
+	c.s3 = s3.NewFromConfig(cfg, s3Opts...)
+	c.uploader = manager.NewUploader(c.s3)
 
 	return nil
 }
 
-// LTXFiles returns an iterator over all available LTX files.
+// findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
+func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
+	// Build a config with credentials but no region
+	configOpts := []func(*config.LoadOptions) error{}
+
+	// Add static credentials if provided
+	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
+		configOpts = append(configOpts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, ""),
+		))
+	}
+
+	// Load AWS configuration
+	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
+	if err != nil {
+		return "", fmt.Errorf("cannot load aws config for region lookup: %w", err)
+	}
+
+	// Use us-east-1 for initial region lookup
+	cfg.Region = "us-east-1"
+
+	// Create S3 client options
+	s3Opts := []func(*s3.Options){}
+
+	// If we have a custom endpoint, configure it for region lookup
+	if c.Endpoint != "" {
+		s3Opts = append(s3Opts, func(o *s3.Options) {
+			o.UsePathStyle = c.ForcePathStyle
+			o.BaseEndpoint = aws.String(c.Endpoint)
+			if strings.HasPrefix(c.Endpoint, "http://") {
+				o.EndpointOptions.DisableHTTPS = true
+			}
+		})
+	}
+
+	client := s3.NewFromConfig(cfg, s3Opts...)
+
+	// Get bucket location
+	out, err := client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
+		Bucket: aws.String(bucket),
+	})
+	if err != nil {
+		return "", err
+	}
+
+	// Convert location constraint to region
+	if out.LocationConstraint == "" {
+		return "us-east-1", nil
+	}
+	return string(out.LocationConstraint), nil
+}
+
+// LTXFiles returns an iterator over all LTX files on the replica for the given level.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newLTXFileIterator(ctx, c, level, seek), nil
+	return newFileIterator(ctx, c, level, seek), nil
 }
 
-// WriteLTXFile writes an LTX file from rd into a remote location.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
-	if err := c.Init(ctx); err != nil {
-		return info, err
-	}
-
-	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
-
-	rc := internal.NewReadCounter(rd)
-	if _, err := c.uploader.UploadWithContext(ctx, &s3manager.UploadInput{
-		Bucket: aws.String(c.Bucket),
-		Key:    aws.String(key),
-		Body:   rc,
-	}); err != nil {
-		return info, err
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
-
-	return &ltx.FileInfo{
-		Level:     level,
-		MinTXID:   minTXID,
-		MaxTXID:   maxTXID,
-		Size:      rc.N(),
-		CreatedAt: startTime.UTC(),
-	}, nil
-}
-
-// OpenLTXFile returns a reader for an LTX file
-// Returns os.ErrNotExist if no matching index/offset is found.
+// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	out, err := c.s3.GetObjectWithContext(ctx, &s3.GetObjectInput{
+	// Build the key from the file info
+	filename := ltx.FormatFilename(minTXID, maxTXID)
+	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 	})
-	if isNotExists(err) {
-		return nil, os.ErrNotExist
-	} else if err != nil {
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
 		return nil, err
 	}
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(aws.Int64Value(out.ContentLength)))
-
 	return out.Body, nil
 }
 
-// DeleteLTXFiles deletes a set of LTX files.
+// WriteLTXFile writes an LTX file to the replica.
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	filename := ltx.FormatFilename(minTXID, maxTXID)
+	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+	out, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+		Body:   r,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	// Build file info from the uploaded file
+	info := &ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		CreatedAt: time.Now(),
+	}
+
+	// Log upload if logger is available
+	if out.ETag != nil {
+		// S3 upload successful
+	}
+
+	return info, nil
+}
+
+// DeleteLTXFiles deletes one or more LTX files.
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	objIDs := make([]*s3.ObjectIdentifier, MaxKeys)
-	for len(a) > 0 {
-		n := MaxKeys
-		if len(a) < n {
-			n = len(a)
+	if len(a) == 0 {
+		return nil
+	}
+
+	// Convert file infos to object identifiers
+	objIDs := make([]types.ObjectIdentifier, 0, len(a))
+	for _, info := range a {
+		filename := ltx.FormatFilename(info.MinTXID, info.MaxTXID)
+		key := c.Path + "/" + fmt.Sprintf("%04x/%s", info.Level, filename)
+		objIDs = append(objIDs, types.ObjectIdentifier{Key: aws.String(key)})
+	}
+
+	// Delete in batches
+	for len(objIDs) > 0 {
+		n := len(objIDs)
+		if n > MaxKeys {
+			n = MaxKeys
 		}
 
-		// Generate a batch of object IDs for deleting the LTX files.
-		for i, info := range a[:n] {
-			key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
-			objIDs[i] = &s3.ObjectIdentifier{Key: &key}
-		}
-
-		// Delete S3 objects in bulk.
-		out, err := c.s3.DeleteObjectsWithContext(ctx, &s3.DeleteObjectsInput{
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &s3.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
 			return err
-		}
-		if err := deleteOutputError(out); err != nil {
+		} else if err := deleteOutputError(out); err != nil {
 			return err
 		}
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 
-		a = a[n:]
+		objIDs = objIDs[n:]
 	}
 
 	return nil
 }
 
-type ltxFileIterator struct {
+// DeleteAll deletes all files.
+func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+
+	var objIDs []types.ObjectIdentifier
+
+	// Create paginator for listing objects
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(c.Path + "/"),
+	})
+
+	// Iterate through all pages
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return err
+		}
+
+		// Collect object identifiers
+		for _, obj := range page.Contents {
+			objIDs = append(objIDs, types.ObjectIdentifier{Key: obj.Key})
+		}
+	}
+
+	// Delete all collected objects in batches
+	for len(objIDs) > 0 {
+		n := len(objIDs)
+		if n > MaxKeys {
+			n = MaxKeys
+		}
+
+		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
+			Bucket: aws.String(c.Bucket),
+			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+		})
+		if err != nil {
+			return err
+		} else if err := deleteOutputError(out); err != nil {
+			return err
+		}
+
+		objIDs = objIDs[n:]
+	}
+
+	return nil
+}
+
+// fileIterator represents an iterator over LTX files in S3.
+type fileIterator struct {
+	ctx    context.Context
+	cancel context.CancelFunc
 	client *ReplicaClient
 	level  int
 	seek   ltx.TXID
 
-	ch     chan *ltx.FileInfo
-	g      errgroup.Group
-	ctx    context.Context
-	cancel func()
+	paginator *s3.ListObjectsV2Paginator
+	page      *s3.ListObjectsV2Output
+	pageIndex int
 
-	info *ltx.FileInfo
-	err  error
+	g      errgroup.Group
+	closed bool
+	err    error
+	info   *ltx.FileInfo
 }
 
-func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
-	itr := &ltxFileIterator{
+func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *fileIterator {
+	ctx, cancel := context.WithCancel(ctx)
+
+	itr := &fileIterator{
+		ctx:    ctx,
+		cancel: cancel,
 		client: client,
 		level:  level,
 		seek:   seek,
-		ch:     make(chan *ltx.FileInfo),
 	}
 
-	itr.ctx, itr.cancel = context.WithCancel(ctx)
-	itr.g.Go(itr.fetch)
+	// Create paginator for listing objects with level prefix
+	prefix := client.Path + "/" + fmt.Sprintf("%04x/", level)
+	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(client.Bucket),
+		Prefix: aws.String(prefix),
+	})
 
 	return itr
 }
 
-// fetch runs in a separate goroutine to fetch pages of objects and stream them to a channel.
-func (itr *ltxFileIterator) fetch() error {
-	defer close(itr.ch)
+// Close stops iteration.
+func (itr *fileIterator) Close() (err error) {
+	itr.closed = true
+	itr.cancel()
+	return itr.g.Wait()
+}
 
-	dir := litestream.LTXLevelDir(itr.client.Path, itr.level)
-	prefix := dir + "/"
-	if itr.seek != 0 {
-		prefix += itr.seek.String()
+// Next returns the next file. Returns false when no more files are available.
+func (itr *fileIterator) Next() bool {
+	if itr.closed || itr.err != nil {
+		return false
 	}
 
-	return itr.client.s3.ListObjectsPagesWithContext(itr.ctx, &s3.ListObjectsInput{
-		Bucket:    aws.String(itr.client.Bucket),
-		Prefix:    aws.String(prefix),
-		Delimiter: aws.String("/"),
-	}, func(page *s3.ListObjectsOutput, lastPage bool) bool {
-		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
+	// Process objects until we find a valid LTX file
+	for {
+		// Load next page if needed
+		if itr.page == nil || itr.pageIndex >= len(itr.page.Contents) {
+			if !itr.paginator.HasMorePages() {
+				return false
+			}
 
-		for _, obj := range page.Contents {
-			key := path.Base(aws.StringValue(obj.Key))
+			var err error
+			itr.page, err = itr.paginator.NextPage(itr.ctx)
+			if err != nil {
+				itr.err = err
+				return false
+			}
+			itr.pageIndex = 0
+		}
+
+		// Process current object
+		if itr.pageIndex < len(itr.page.Contents) {
+			obj := itr.page.Contents[itr.pageIndex]
+			itr.pageIndex++
+
+			// Extract file info from key
+			key := path.Base(aws.ToString(obj.Key))
 			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
+				continue // Skip non-LTX files
+			}
+
+			// Build file info
+			info := &ltx.FileInfo{
+				Level:   itr.level,
+				MinTXID: minTXID,
+				MaxTXID: maxTXID,
+			}
+
+			// Skip if below seek TXID
+			if info.MinTXID < itr.seek {
 				continue
 			}
 
-			info := &ltx.FileInfo{
-				Level:     itr.level,
-				MinTXID:   minTXID,
-				MaxTXID:   maxTXID,
-				Size:      aws.Int64Value(obj.Size),
-				CreatedAt: obj.LastModified.UTC(),
+			// Skip if wrong level
+			if info.Level != itr.level {
+				continue
 			}
 
-			select {
-			case <-itr.ctx.Done():
-				return false
-			case itr.ch <- info:
-			}
+			// Set file info
+			info.Size = aws.ToInt64(obj.Size)
+			info.CreatedAt = aws.ToTime(obj.LastModified)
+			itr.info = info
+			return true
 		}
-		return true
-	})
-}
-
-func (itr *ltxFileIterator) Close() (err error) {
-	err = itr.err
-
-	// Cancel context and wait for error group to finish.
-	itr.cancel()
-	if e := itr.g.Wait(); e != nil && err == nil {
-		err = e
-	}
-
-	return err
-}
-
-func (itr *ltxFileIterator) Next() bool {
-	// Exit if an error has already occurred.
-	if itr.err != nil {
-		return false
-	}
-
-	// Return false if context was canceled or if there are no more segments.
-	// Otherwise fetch the next segment and store it on the iterator.
-	select {
-	case <-itr.ctx.Done():
-		return false
-	case info, ok := <-itr.ch:
-		if !ok {
-			return false
-		}
-		itr.info = info
-		return true
 	}
 }
 
-func (itr *ltxFileIterator) Err() error { return itr.err }
-
-func (itr *ltxFileIterator) Item() *ltx.FileInfo {
+// Item returns the metadata for the current file.
+func (itr *fileIterator) Item() *ltx.FileInfo {
 	return itr.info
 }
 
-// ParseHost extracts data from a hostname depending on the service provider.
-func ParseHost(s string) (bucket, region, endpoint string, forcePathStyle bool) {
-	// Extract port if one is specified.
-	host, port, err := net.SplitHostPort(s)
+// Err returns any error that occurred during iteration.
+func (itr *fileIterator) Err() error {
+	return itr.err
+}
+
+// ParseURL parses an S3 URL into its host and path parts.
+// If endpoint is set, it can override the host.
+func ParseURL(s, endpoint string) (bucket, region, key string, err error) {
+	u, err := url.Parse(s)
 	if err != nil {
-		host = s
+		return "", "", "", err
 	}
 
-	// Default to path-based URLs, except for with AWS S3 itself.
-	forcePathStyle = true
+	if u.Scheme != "s3" {
+		return "", "", "", fmt.Errorf("invalid s3 url scheme")
+	}
 
-	// Extract fields from provider-specific host formats.
-	scheme := "https"
-	if a := localhostRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], "us-east-1"
-		scheme, endpoint = "http", "localhost"
-	} else if a := backblazeRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], a[2]
-		endpoint = fmt.Sprintf("s3.%s.backblazeb2.com", region)
-	} else if a := filebaseRegex.FindStringSubmatch(host); a != nil {
-		bucket, endpoint = a[1], "s3.filebase.com"
-	} else if a := digitalOceanRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], a[2]
-		endpoint = fmt.Sprintf("%s.digitaloceanspaces.com", region)
-	} else if a := scalewayRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], a[2]
+	// Special handling for filebase.com
+	if u.Host == "filebase.com" {
+		parts := strings.SplitN(strings.TrimPrefix(u.Path, "/"), "/", 2)
+		if len(parts) == 0 {
+			return "", "", "", fmt.Errorf("s3 bucket required")
+		}
+		bucket = parts[0]
+		if len(parts) > 1 {
+			key = parts[1]
+		}
+		return bucket, "", key, nil
+	}
+
+	// For other hosts, check if it's a special endpoint
+	bucket, region, _, _ = ParseHost(u.Host)
+	if bucket == "" {
+		bucket = u.Host
+	}
+
+	key = strings.TrimPrefix(u.Path, "/")
+	return bucket, region, key, nil
+}
+
+// ParseHost parses the host/endpoint for an S3-like storage system.
+// Endpoints: https://docs.aws.amazon.com/general/latest/gr/s3.html
+func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle bool) {
+	// Check for MinIO-style hosts (bucket.host:port)
+	if strings.Contains(host, ":") && !strings.Contains(host, ".com") {
+		parts := strings.SplitN(host, ".", 2)
+		if len(parts) == 2 {
+			// Extract bucket from bucket.host:port format
+			bucket = parts[0]
+			endpoint = "http://" + parts[1]
+			return bucket, "us-east-1", endpoint, true
+		}
+		// No bucket in host, just host:port
+		return "", "", "http://" + host, true
+	}
+
+	// Check common object storage providers
+	if a := digitaloceanRegex.FindStringSubmatch(host); len(a) > 1 {
+		region = a[2]
+		return "", region, fmt.Sprintf("https://%s.digitaloceanspaces.com", region), false
+	} else if a := backblazeRegex.FindStringSubmatch(host); len(a) > 1 {
+		region = a[2]
+		bucket = a[1]
+		endpoint = fmt.Sprintf("https://s3.%s.backblazeb2.com", region)
+		return bucket, region, endpoint, true
+	} else if a := filebaseRegex.FindStringSubmatch(host); len(a) > 1 {
+		bucket = a[1]
+		endpoint = "s3.filebase.com"
+		return bucket, "", endpoint, false
+	} else if a := scalewayRegex.FindStringSubmatch(host); len(a) > 1 {
+		region = a[2]
+		bucket = a[1]
 		endpoint = fmt.Sprintf("s3.%s.scw.cloud", region)
-	} else if a := linodeRegex.FindStringSubmatch(host); a != nil {
-		bucket, region = a[1], a[2]
-		endpoint = fmt.Sprintf("%s.linodeobjects.com", region)
-	} else {
-		bucket = host
-		forcePathStyle = false
+		return bucket, region, endpoint, false
 	}
 
-	// Add port back to endpoint, if available.
-	if endpoint != "" && port != "" {
-		endpoint = net.JoinHostPort(endpoint, port)
-	}
-
-	// Prepend scheme to endpoint.
-	if endpoint != "" {
-		endpoint = scheme + "://" + endpoint
-	}
-
-	return bucket, region, endpoint, forcePathStyle
+	// For standard S3, the host is the bucket name
+	return host, "", "", false
 }
 
 var (
-	localhostRegex    = regexp.MustCompile(`^(?:(.+)\.)?localhost$`)
+	digitaloceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
 	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
 	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
-	digitalOceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
 	scalewayRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.scw\.cloud$`)
-	linodeRegex       = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.linodeobjects.com$`)
 )
 
 func isNotExists(err error) bool {
-	switch err := err.(type) {
-	case awserr.Error:
-		return err.Code() == `NoSuchKey`
-	default:
-		return false
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "NoSuchKey"
 	}
+	return false
 }
 
 func deleteOutputError(out *s3.DeleteObjectsOutput) error {
-	switch len(out.Errors) {
-	case 0:
+	if len(out.Errors) == 0 {
 		return nil
-	case 1:
-		return fmt.Errorf("deleting object %s: %s - %s", aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message))
-	default:
-		return fmt.Errorf("%d errors occurred deleting objects, %s: %s - (%s (and %d others)",
-			len(out.Errors), aws.StringValue(out.Errors[0].Key), aws.StringValue(out.Errors[0].Code), aws.StringValue(out.Errors[0].Message), len(out.Errors)-1)
 	}
+
+	// Build generic error
+	var b strings.Builder
+	b.WriteString("failed to delete files:")
+	for _, err := range out.Errors {
+		fmt.Fprintf(&b, "\n%s: %s", aws.ToString(err.Key), aws.ToString(err.Message))
+	}
+	return errors.New(b.String())
 }
