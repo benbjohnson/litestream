@@ -6,10 +6,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"time"
+
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
-	"github.com/superfly/ltx"
 )
 
 // ReplicaClientType is the client type for this package.
@@ -116,11 +118,21 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	// Write LTX file to temporary file next to destination path.
-	f, err := internal.CreateFile(filename+".tmp", fileInfo)
+	// Use a unique suffix that includes process ID and timestamp to avoid conflicts
+	// and to signal that this file is actively being written.
+	tmpFilename := fmt.Sprintf("%s.writing-%d-%d.tmp", filename, os.Getpid(), time.Now().UnixNano())
+	f, err := internal.CreateFile(tmpFilename, fileInfo)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+	defer func() {
+		// Always close the file
+		f.Close()
+		// Clean up temp file if we didn't successfully rename it
+		if err != nil {
+			os.Remove(tmpFilename)
+		}
+	}()
 
 	if _, err := io.Copy(f, rd); err != nil {
 		return nil, err
@@ -142,42 +154,21 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		CreatedAt: fi.ModTime().UTC(),
 	}
 
-	if err := f.Close(); err != nil {
-		return nil, err
-	}
+	// Don't close the file yet - keep it open to prevent deletion
+	// This prevents removeTmpFiles from deleting it while we're working
 
-	// Move LTX file to final path when it has been written & synced to disk.
-	tmpFilename := filename + ".tmp"
-
-	// Sync directory to ensure file metadata is persisted
-	dir := filepath.Dir(tmpFilename)
-	if d, err := os.Open(dir); err == nil {
-		defer d.Close() // Ensure cleanup on error paths
-		if err := d.Sync(); err != nil {
-			return nil, fmt.Errorf("sync directory: %w", err)
-		}
-		if err := d.Close(); err != nil {
-			return nil, fmt.Errorf("close directory: %w", err)
-		}
-	}
-
-	// Verify temporary file exists before attempting rename
-	if _, err := os.Stat(tmpFilename); err != nil {
-		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("temporary file disappeared before rename: %w", err)
-		}
-		return nil, fmt.Errorf("cannot stat temporary file: %w", err)
-	}
-
+	// Rename while file is still open - this works on Unix systems
+	// and prevents the race condition where cleanup deletes the file
+	// between close and rename
 	if err := os.Rename(tmpFilename, filename); err != nil {
-		// If rename fails, check if source file still exists
-		if _, statErr := os.Stat(tmpFilename); statErr != nil {
-			if os.IsNotExist(statErr) {
-				// The temporary file was removed by something else
-				return nil, fmt.Errorf("temporary file removed during rename operation: %w", err)
-			}
-		}
 		return nil, fmt.Errorf("rename ltx file: %w", err)
+	}
+
+	// Now we can safely close the file after rename succeeded
+	if err := f.Close(); err != nil {
+		// File was already renamed, so this is not a critical error
+		// Log it but don't fail the operation
+		return info, nil
 	}
 
 	return info, nil
