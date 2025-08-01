@@ -23,7 +23,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
-	smithyendpoints "github.com/aws/smithy-go/endpoints"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
 
@@ -40,36 +39,6 @@ const MaxKeys = 1000
 const DefaultRegion = "us-east-1"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
-
-// customEndpointResolver implements the EndpointResolverV2 interface for custom endpoints
-type customEndpointResolver struct {
-	endpoint string
-}
-
-func (r *customEndpointResolver) ResolveEndpoint(ctx context.Context, params s3.EndpointParameters) (smithyendpoints.Endpoint, error) {
-	// For debugging
-	// fmt.Printf("ResolveEndpoint called with bucket: %v\n", aws.ToString(params.Bucket))
-	
-	u, err := url.Parse(r.endpoint)
-	if err != nil {
-		return smithyendpoints.Endpoint{}, fmt.Errorf("invalid endpoint URL: %w", err)
-	}
-	
-	// Create the endpoint with proper settings
-	ep := smithyendpoints.Endpoint{
-		URI:     *u,
-		Headers: http.Header{},
-	}
-	
-	// Set properties based on the endpoint
-	if u.Scheme == "http" {
-		// This tells the SDK to use HTTP instead of HTTPS
-		// For HTTP endpoints, we don't need special properties
-		// The SDK will handle it based on the URI scheme
-	}
-	
-	return ep, nil
-}
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
@@ -187,8 +156,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 			if strings.HasPrefix(c.Endpoint, "http://") {
 				o.EndpointOptions.DisableHTTPS = true
 			}
-			// Alternative: Use custom endpoint resolver for more control
-			// o.EndpointResolverV2 = &customEndpointResolver{endpoint: c.Endpoint}
 		})
 	}
 
