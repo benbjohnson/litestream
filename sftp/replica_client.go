@@ -11,11 +11,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/pkg/sftp"
 	"github.com/superfly/ltx"
 	"golang.org/x/crypto/ssh"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.

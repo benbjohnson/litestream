@@ -5,10 +5,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/superfly/ltx"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/mock"
-	"github.com/superfly/ltx"
 )
 
 func TestReplica_Sync(t *testing.T) {

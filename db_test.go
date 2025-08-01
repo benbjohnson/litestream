@@ -12,9 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/superfly/ltx"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
-	"github.com/superfly/ltx"
 )
 
 var logLevel = flag.String("log.level", "debug", "")
