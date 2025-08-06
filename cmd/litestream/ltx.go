@@ -92,7 +92,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 // Usage prints the help screen to STDOUT.
 func (c *LTXCommand) Usage() {
 	fmt.Printf(`
-The wal command lists all ltx files available for a database.
+The ltx command lists all LTX files available for a database.
 
 Usage:
 

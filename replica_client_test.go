@@ -12,13 +12,14 @@ import (
 	"testing"
 	"time"
 
+	"github.com/superfly/ltx"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gcs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
-	"github.com/superfly/ltx"
 )
 
 var (
