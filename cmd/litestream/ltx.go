@@ -79,7 +79,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	for itr.Next() {
 		info := itr.Item()
 
-		fmt.Fprintf(w, "%x\t%d\t%d\t%s\n",
+		fmt.Fprintf(w, "%s\t%s\t%d\t%s\n",
 			info.MinTXID,
 			info.MaxTXID,
 			info.Size,
