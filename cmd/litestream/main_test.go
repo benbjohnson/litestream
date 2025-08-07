@@ -7,7 +7,7 @@ import (
 
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/s3"
 )
 
@@ -162,11 +162,11 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 	})
 }
 
-func TestNewGCSReplicaFromConfig(t *testing.T) {
-	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "gcs://foo/bar"}, nil)
+func TestNewGSReplicaFromConfig(t *testing.T) {
+	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "gs://foo/bar"}, nil)
 	if err != nil {
 		t.Fatal(err)
-	} else if client, ok := r.Client.(*gcs.ReplicaClient); !ok {
+	} else if client, ok := r.Client.(*gs.ReplicaClient); !ok {
 		t.Fatal("unexpected replica type")
 	} else if got, want := client.Bucket, "foo"; got != want {
 		t.Fatalf("Bucket=%s, want %s", got, want)

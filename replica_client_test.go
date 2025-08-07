@@ -17,7 +17,7 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gcs"
+	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -42,8 +42,8 @@ var (
 
 // Google cloud storage settings
 var (
-	gcsBucket = flag.String("gcs-bucket", os.Getenv("LITESTREAM_GCS_BUCKET"), "")
-	gcsPath   = flag.String("gcs-path", os.Getenv("LITESTREAM_GCS_PATH"), "")
+	gsBucket = flag.String("gs-bucket", os.Getenv("LITESTREAM_GS_BUCKET"), "")
+	gsPath   = flag.String("gs-path", os.Getenv("LITESTREAM_GS_PATH"), "")
 )
 
 // Azure blob storage settings
@@ -236,8 +236,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewFileReplicaClient(tb)
 	case s3.ReplicaClientType:
 		return NewS3ReplicaClient(tb)
-	case gcs.ReplicaClientType:
-		return NewGCSReplicaClient(tb)
+	case gs.ReplicaClientType:
+		return NewGSReplicaClient(tb)
 	case abs.ReplicaClientType:
 		return NewABSReplicaClient(tb)
 	case sftp.ReplicaClientType:
@@ -270,13 +270,13 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	return c
 }
 
-// NewGCSReplicaClient returns a new client for integration testing.
-func NewGCSReplicaClient(tb testing.TB) *gcs.ReplicaClient {
+// NewGSReplicaClient returns a new client for integration testing.
+func NewGSReplicaClient(tb testing.TB) *gs.ReplicaClient {
 	tb.Helper()
 
-	c := gcs.NewReplicaClient()
-	c.Bucket = *gcsBucket
-	c.Path = path.Join(*gcsPath, fmt.Sprintf("%016x", rand.Uint64()))
+	c := gs.NewReplicaClient()
+	c.Bucket = *gsBucket
+	c.Path = path.Join(*gsPath, fmt.Sprintf("%016x", rand.Uint64()))
 	return c
 }
 

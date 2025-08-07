@@ -51,12 +51,12 @@ func NewReplicaClient() *ReplicaClient {
 	}
 }
 
-// Type returns "gcs" as the client type.
+// Type returns "sftp" as the client type.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
-// Init initializes the connection to GCS. No-op if already initialized.
+// Init initializes the connection to SFTP. No-op if already initialized.
 func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
