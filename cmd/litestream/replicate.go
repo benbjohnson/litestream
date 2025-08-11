@@ -120,8 +120,14 @@ func (c *ReplicateCommand) Run() (err error) {
 
 	levels := c.Config.CompactionLevels()
 	c.Store = litestream.NewStore(dbs, levels)
-	c.Store.SnapshotInterval = c.Config.Snapshot.Interval
-	c.Store.SnapshotRetention = c.Config.Snapshot.Retention
+	// Only override default snapshot interval if explicitly set in config
+	if c.Config.Snapshot.Interval != nil {
+		c.Store.SnapshotInterval = *c.Config.Snapshot.Interval
+	}
+	// Only override default snapshot retention if explicitly set in config
+	if c.Config.Snapshot.Retention != nil {
+		c.Store.SnapshotRetention = *c.Config.Snapshot.Retention
+	}
 	if err := c.Store.Open(context.Background()); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
