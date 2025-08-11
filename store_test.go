@@ -194,3 +194,22 @@ func TestStore_Integration(t *testing.T) {
 		}
 	}
 }
+
+// TestStore_SnapshotInterval_Default ensures that the default snapshot interval
+// is preserved when not explicitly set (regression test for issue #689).
+func TestStore_SnapshotInterval_Default(t *testing.T) {
+	// Create a store with no databases and no levels
+	store := litestream.NewStore(nil, nil)
+
+	// Verify default snapshot interval is set
+	if store.SnapshotInterval != litestream.DefaultSnapshotInterval {
+		t.Errorf("expected default snapshot interval of %v, got %v",
+			litestream.DefaultSnapshotInterval, store.SnapshotInterval)
+	}
+
+	// Verify default is 24 hours
+	if store.SnapshotInterval != 24*time.Hour {
+		t.Errorf("expected default snapshot interval of 24h, got %v",
+			store.SnapshotInterval)
+	}
+}
