@@ -52,7 +52,7 @@ jobs:
             echo "ref_name=branch ${{ github.ref_name }}" >> $GITHUB_OUTPUT
             echo "::notice::Testing current branch ${{ github.ref_name }}"
           fi
-      
+
       - name: Validate inputs
         run: |
           if [ "${{ github.event.inputs.test_s3 }}" != "true" ] && \
@@ -61,7 +61,7 @@ jobs:
             echo "::error::At least one test type must be selected"
             exit 1
           fi
-          
+
           echo "### Test Configuration" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Target:** ${{ steps.get-ref.outputs.ref_name }}" >> $GITHUB_STEP_SUMMARY
@@ -201,9 +201,9 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Target: ${{ needs.setup.outputs.ref_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          
+
           echo "### Integration Tests" >> $GITHUB_STEP_SUMMARY
-          
+
           if [ "${{ needs.s3-integration.result }}" == "success" ]; then
             echo "✅ **S3 (AWS):** Passed" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ needs.s3-integration.result }}" == "failure" ]; then
@@ -211,7 +211,7 @@ jobs:
           elif [ "${{ needs.s3-integration.result }}" == "skipped" ]; then
             echo "⏭️ **S3 (AWS):** Skipped" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           if [ "${{ needs.gcs-integration.result }}" == "success" ]; then
             echo "✅ **Google Cloud Storage:** Passed" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ needs.gcs-integration.result }}" == "failure" ]; then
@@ -219,7 +219,7 @@ jobs:
           elif [ "${{ needs.gcs-integration.result }}" == "skipped" ]; then
             echo "⏭️ **Google Cloud Storage:** Skipped" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           if [ "${{ needs.abs-integration.result }}" == "success" ]; then
             echo "✅ **Azure Blob Storage:** Passed" >> $GITHUB_STEP_SUMMARY
           elif [ "${{ needs.abs-integration.result }}" == "failure" ]; then
@@ -227,7 +227,7 @@ jobs:
           elif [ "${{ needs.abs-integration.result }}" == "skipped" ]; then
             echo "⏭️ **Azure Blob Storage:** Skipped" >> $GITHUB_STEP_SUMMARY
           fi
-          
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
@@ -241,27 +241,27 @@ jobs:
           script: |
             const pr_number = ${{ github.event.inputs.pr_number }};
             const run_url = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
-            
+
             // Build status emoji based on results
             let statusEmoji = '✅';
             const failedJobs = [];
-            
+
             if ('${{ needs.s3-integration.result }}' === 'failure') failedJobs.push('S3');
             if ('${{ needs.gcs-integration.result }}' === 'failure') failedJobs.push('GCS');
             if ('${{ needs.abs-integration.result }}' === 'failure') failedJobs.push('Azure');
-            
+
             if (failedJobs.length > 0) {
               statusEmoji = '❌';
             }
-            
+
             let body = `${statusEmoji} **Manual integration tests** have been run by @${{ github.actor }}\n\n`;
-            
+
             if (failedJobs.length > 0) {
               body += `Failed jobs: ${failedJobs.join(', ')}\n\n`;
             }
-            
+
             body += `[View test results](${run_url})`;
-            
+
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
