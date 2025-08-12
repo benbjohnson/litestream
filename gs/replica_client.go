@@ -1,4 +1,4 @@
-package gcs
+package gs
 
 import (
 	"context"
@@ -18,17 +18,17 @@ import (
 )
 
 // ReplicaClientType is the client type for this package.
-const ReplicaClientType = "gcs"
+const ReplicaClientType = "gs"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Google Cloud Storage.
 type ReplicaClient struct {
 	mu     sync.Mutex
-	client *storage.Client       // gcs client
-	bkt    *storage.BucketHandle // gcs bucket handle
+	client *storage.Client       // gs client
+	bkt    *storage.BucketHandle // gs bucket handle
 
-	// GCS bucket information
+	// GS bucket information
 	Bucket string
 	Path   string
 }
@@ -38,12 +38,12 @@ func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{}
 }
 
-// Type returns "gcs" as the client type.
+// Type returns "gs" as the client type.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
-// Init initializes the connection to GCS. No-op if already initialized.
+// Init initializes the connection to GS. No-op if already initialized.
 func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
