@@ -581,7 +581,7 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 	// Use the standard test helpers
 	db, sqldb := MustOpenDBs(t)
 	defer MustCloseDBs(t, db, sqldb)
-	
+
 	// Enable monitoring to trigger background operations
 	db.MonitorInterval = 10 * time.Millisecond
 
@@ -593,45 +593,45 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 	// Start multiple goroutines to trigger concurrent map access
 	var wg sync.WaitGroup
 	ctx := context.Background()
-	
+
 	// Number of concurrent operations
 	const numGoroutines = 10
-	
+
 	// Channel to signal start
 	start := make(chan struct{})
-	
+
 	for i := 0; i < numGoroutines; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
-			
+
 			// Wait for signal to start all goroutines simultaneously
 			<-start
-			
+
 			// Perform operations that trigger map access
 			for j := 0; j < 5; j++ {
 				// This triggers sync() which had unprotected map access
 				if _, err := sqldb.Exec(`INSERT INTO t (value) VALUES (?)`, "test"); err != nil {
 					t.Logf("Goroutine %d: insert error: %v", id, err)
 				}
-				
+
 				// Trigger Sync manually which accesses the map
 				if err := db.Sync(ctx); err != nil {
 					t.Logf("Goroutine %d: sync error: %v", id, err)
 				}
-				
+
 				// Small delay to allow race to manifest
 				time.Sleep(time.Millisecond)
 			}
 		}(i)
 	}
-	
+
 	// Additional goroutine for snapshot operations
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		<-start
-		
+
 		for i := 0; i < 3; i++ {
 			// This triggers Snapshot() which has protected map access
 			if _, err := db.Snapshot(ctx); err != nil {
@@ -640,13 +640,13 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 			time.Sleep(5 * time.Millisecond)
 		}
 	}()
-	
+
 	// Start all goroutines
 	close(start)
-	
+
 	// Wait for completion
 	wg.Wait()
-	
+
 	t.Log("Test completed without race condition")
 }
 
