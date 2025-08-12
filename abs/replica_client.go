@@ -209,12 +209,12 @@ type ltxFileIterator struct {
 	level  int
 	seek   ltx.TXID
 
-	ch     chan ltx.FileInfo
+	ch     chan *ltx.FileInfo
 	g      errgroup.Group
 	ctx    context.Context
 	cancel func()
 
-	info ltx.FileInfo
+	info *ltx.FileInfo
 	err  error
 }
 
@@ -223,7 +223,7 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 		client: client,
 		level:  level,
 		seek:   seek,
-		ch:     make(chan ltx.FileInfo),
+		ch:     make(chan *ltx.FileInfo),
 	}
 
 	itr.ctx, itr.cancel = context.WithCancel(ctx)
@@ -259,7 +259,7 @@ func (itr *ltxFileIterator) fetch() error {
 				continue
 			}
 
-			info := ltx.FileInfo{
+			info := &ltx.FileInfo{
 				Level:     itr.level,
 				MinTXID:   minTXID,
 				MaxTXID:   maxTXID,
@@ -311,7 +311,7 @@ func (itr *ltxFileIterator) Next() bool {
 func (itr *ltxFileIterator) Err() error { return itr.err }
 
 func (itr *ltxFileIterator) Item() *ltx.FileInfo {
-	return &itr.info
+	return itr.info
 }
 
 func isNotExists(err error) bool {
