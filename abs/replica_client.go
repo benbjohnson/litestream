@@ -159,7 +159,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	}
 
 	for _, info := range a {
-		key := litestream.LTXFilePath(c.Path, info.Level, info.MaxTXID, info.MaxTXID)
+		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 		blobURL := c.containerURL.NewBlobURL(key)
 		if _, err := blobURL.Delete(ctx, azblob.DeleteSnapshotsOptionNone, azblob.BlobAccessConditions{}); isNotExists(err) {
 			continue
