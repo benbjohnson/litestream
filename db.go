@@ -1105,7 +1105,7 @@ func (db *DB) execCheckpoint(mode string) (err error) {
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	if db.pageSize == 0 {
+	if db.PageSize() == 0 {
 		return ltx.Pos{}, nil, fmt.Errorf("page size not initialized yet")
 	}
 
