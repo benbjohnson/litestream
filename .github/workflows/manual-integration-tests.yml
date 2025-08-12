@@ -1,0 +1,270 @@
+name: Manual Integration Tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'Pull Request number to test (optional)'
+        required: false
+        type: string
+      branch:
+        description: 'Branch name to test (optional, ignored if PR number is provided)'
+        required: false
+        type: string
+        default: ''
+      test_s3:
+        description: 'Run S3 integration tests (AWS)'
+        required: false
+        default: true
+        type: boolean
+      test_gcs:
+        description: 'Run Google Cloud Storage integration tests'
+        required: false
+        default: false
+        type: boolean
+      test_abs:
+        description: 'Run Azure Blob Storage integration tests'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  setup:
+    name: Setup and Validation
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.get-ref.outputs.ref }}
+      ref_name: ${{ steps.get-ref.outputs.ref_name }}
+    steps:
+      - name: Determine checkout ref
+        id: get-ref
+        run: |
+          if [ -n "${{ github.event.inputs.pr_number }}" ]; then
+            echo "ref=refs/pull/${{ github.event.inputs.pr_number }}/head" >> $GITHUB_OUTPUT
+            echo "ref_name=PR #${{ github.event.inputs.pr_number }}" >> $GITHUB_OUTPUT
+            echo "::notice::Testing PR #${{ github.event.inputs.pr_number }}"
+          elif [ -n "${{ github.event.inputs.branch }}" ]; then
+            echo "ref=refs/heads/${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
+            echo "ref_name=branch ${{ github.event.inputs.branch }}" >> $GITHUB_OUTPUT
+            echo "::notice::Testing branch ${{ github.event.inputs.branch }}"
+          else
+            echo "ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+            echo "ref_name=branch ${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            echo "::notice::Testing current branch ${{ github.ref_name }}"
+          fi
+      
+      - name: Validate inputs
+        run: |
+          if [ "${{ github.event.inputs.test_s3 }}" != "true" ] && \
+             [ "${{ github.event.inputs.test_gcs }}" != "true" ] && \
+             [ "${{ github.event.inputs.test_abs }}" != "true" ]; then
+            echo "::error::At least one test type must be selected"
+            exit 1
+          fi
+          
+          echo "### Test Configuration" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Target:** ${{ steps.get-ref.outputs.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Integration Tests:**" >> $GITHUB_STEP_SUMMARY
+          echo "- S3 (AWS): ${{ github.event.inputs.test_s3 }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Google Cloud Storage: ${{ github.event.inputs.test_gcs }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Azure Blob Storage: ${{ github.event.inputs.test_abs }}" >> $GITHUB_STEP_SUMMARY
+
+  s3-integration:
+    name: S3 Integration Tests (AWS)
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event.inputs.test_s3 == 'true'
+    concurrency:
+      group: integration-test-s3-manual
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration s3
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: s3-test-results
+          path: |
+            *.log
+            test-results/
+
+  gcs-integration:
+    name: Google Cloud Storage Integration Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event.inputs.test_gcs == 'true'
+    concurrency:
+      group: integration-test-gcp-manual
+      cancel-in-progress: false
+    steps:
+      - name: Extract GCP credentials
+        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration gs
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp.json
+          LITESTREAM_GS_BUCKET: integration.litestream.io
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gcs-test-results
+          path: |
+            *.log
+            test-results/
+
+  abs-integration:
+    name: Azure Blob Storage Integration Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event.inputs.test_abs == 'true'
+    concurrency:
+      group: integration-test-abs-manual
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration abs
+        env:
+          LITESTREAM_ABS_ACCOUNT_NAME: ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY: ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET: integration
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: abs-test-results
+          path: |
+            *.log
+            test-results/
+
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [setup, s3-integration, gcs-integration, abs-integration]
+    if: always()
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+
+      - name: Generate summary
+        run: |
+          echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Target: ${{ needs.setup.outputs.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "### Integration Tests" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.s3-integration.result }}" == "success" ]; then
+            echo "✅ **S3 (AWS):** Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.s3-integration.result }}" == "failure" ]; then
+            echo "❌ **S3 (AWS):** Failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.s3-integration.result }}" == "skipped" ]; then
+            echo "⏭️ **S3 (AWS):** Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.gcs-integration.result }}" == "success" ]; then
+            echo "✅ **Google Cloud Storage:** Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.gcs-integration.result }}" == "failure" ]; then
+            echo "❌ **Google Cloud Storage:** Failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.gcs-integration.result }}" == "skipped" ]; then
+            echo "⏭️ **Google Cloud Storage:** Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.abs-integration.result }}" == "success" ]; then
+            echo "✅ **Azure Blob Storage:** Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.abs-integration.result }}" == "failure" ]; then
+            echo "❌ **Azure Blob Storage:** Failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.abs-integration.result }}" == "skipped" ]; then
+            echo "⏭️ **Azure Blob Storage:** Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Run ID:** [${{ github.run_id }}](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on PR (if applicable)
+        if: github.event.inputs.pr_number != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const pr_number = ${{ github.event.inputs.pr_number }};
+            const run_url = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+            
+            // Build status emoji based on results
+            let statusEmoji = '✅';
+            const failedJobs = [];
+            
+            if ('${{ needs.s3-integration.result }}' === 'failure') failedJobs.push('S3');
+            if ('${{ needs.gcs-integration.result }}' === 'failure') failedJobs.push('GCS');
+            if ('${{ needs.abs-integration.result }}' === 'failure') failedJobs.push('Azure');
+            
+            if (failedJobs.length > 0) {
+              statusEmoji = '❌';
+            }
+            
+            let body = `${statusEmoji} **Manual integration tests** have been run by @${{ github.actor }}\n\n`;
+            
+            if (failedJobs.length > 0) {
+              body += `Failed jobs: ${failedJobs.join(', ')}\n\n`;
+            }
+            
+            body += `[View test results](${run_url})`;
+            
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr_number,
+              body: body
+            });
