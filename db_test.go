@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -570,6 +571,83 @@ func TestDB_EnforceRetention(t *testing.T) {
 	if afterCount >= beforeCount {
 		t.Fatalf("expected fewer snapshots after retention, before=%d after=%d", beforeCount, afterCount)
 	}
+}
+
+// TestDB_ConcurrentMapWrite tests for race conditions in maxLTXFileInfos map access.
+// This test specifically targets the concurrent map write issue found in db.go
+// where sync() method writes to the map without proper locking.
+// Run with: go test -race -run TestDB_ConcurrentMapWrite
+func TestDB_ConcurrentMapWrite(t *testing.T) {
+	// Use the standard test helpers
+	db, sqldb := MustOpenDBs(t)
+	defer MustCloseDBs(t, db, sqldb)
+
+	// Enable monitoring to trigger background operations
+	db.MonitorInterval = 10 * time.Millisecond
+
+	// Create a table
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start multiple goroutines to trigger concurrent map access
+	var wg sync.WaitGroup
+	ctx := context.Background()
+
+	// Number of concurrent operations
+	const numGoroutines = 10
+
+	// Channel to signal start
+	start := make(chan struct{})
+
+	for i := 0; i < numGoroutines; i++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+
+			// Wait for signal to start all goroutines simultaneously
+			<-start
+
+			// Perform operations that trigger map access
+			for j := 0; j < 5; j++ {
+				// This triggers sync() which had unprotected map access
+				if _, err := sqldb.Exec(`INSERT INTO t (value) VALUES (?)`, "test"); err != nil {
+					t.Logf("Goroutine %d: insert error: %v", id, err)
+				}
+
+				// Trigger Sync manually which accesses the map
+				if err := db.Sync(ctx); err != nil {
+					t.Logf("Goroutine %d: sync error: %v", id, err)
+				}
+
+				// Small delay to allow race to manifest
+				time.Sleep(time.Millisecond)
+			}
+		}(i)
+	}
+
+	// Additional goroutine for snapshot operations
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+
+		for i := 0; i < 3; i++ {
+			// This triggers Snapshot() which has protected map access
+			if _, err := db.Snapshot(ctx); err != nil {
+				t.Logf("Snapshot error: %v", err)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}()
+
+	// Start all goroutines
+	close(start)
+
+	// Wait for completion
+	wg.Wait()
+
+	t.Log("Test completed without race condition")
 }
 
 func newDB(tb testing.TB, path string) *litestream.DB {
