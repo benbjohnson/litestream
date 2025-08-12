@@ -890,11 +890,14 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 
 	// Atomically rename file to final path.
 	if err := os.Rename(tmpFilename, filename); err != nil {
+		db.maxLTXFileInfos.Lock()
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
+		db.maxLTXFileInfos.Unlock()
 		return fmt.Errorf("rename ltx file: %w", err)
 	}
 
 	// Update file info cache for L0.
+	db.maxLTXFileInfos.Lock()
 	db.maxLTXFileInfos.m[0] = &ltx.FileInfo{
 		Level:     0,
 		MinTXID:   txID,
@@ -902,6 +905,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		CreatedAt: time.Now(),
 		Size:      enc.N(),
 	}
+	db.maxLTXFileInfos.Unlock()
 
 	db.Logger.Debug("db sync", "status", "ok")
 
