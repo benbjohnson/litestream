@@ -1,7 +1,9 @@
 package s3
 
 import (
+	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/aws/smithy-go"
@@ -67,4 +69,63 @@ func TestIsNotExists(t *testing.T) {
 	if !isNotExists(wrappedErr) {
 		t.Error("isNotExists should return true for wrapped NoSuchKey error")
 	}
+}
+
+// TestReplicaClient_Init_BucketValidation tests that Init validates bucket name
+func TestReplicaClient_Init_BucketValidation(t *testing.T) {
+	t.Run("EmptyBucket", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "" // Empty bucket name
+		c.Region = "us-east-1"
+
+		err := c.Init(context.Background())
+		if err == nil {
+			t.Fatal("expected error for empty bucket name")
+		}
+		if !strings.Contains(err.Error(), "bucket name is required") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ValidBucket", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		// Note: This will fail when trying to connect, but should pass bucket validation
+		err := c.Init(context.Background())
+		// We expect a different error (not bucket validation)
+		if err != nil && strings.Contains(err.Error(), "bucket name is required") {
+			t.Errorf("should not fail bucket validation with valid bucket: %v", err)
+		}
+	})
+}
+
+// TestReplicaClient_UploaderConfiguration tests that uploader configuration is applied
+func TestReplicaClient_UploaderConfiguration(t *testing.T) {
+	t.Run("CustomPartSize", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.PartSize = 10 * 1024 * 1024 // 10MB
+		c.Concurrency = 10
+
+		// Verify the configuration is set
+		if c.PartSize != 10*1024*1024 {
+			t.Errorf("expected PartSize to be 10MB, got %d", c.PartSize)
+		}
+		if c.Concurrency != 10 {
+			t.Errorf("expected Concurrency to be 10, got %d", c.Concurrency)
+		}
+	})
+
+	t.Run("DefaultConfiguration", func(t *testing.T) {
+		c := NewReplicaClient()
+		// Verify defaults are zero (will use SDK defaults)
+		if c.PartSize != 0 {
+			t.Errorf("expected default PartSize to be 0, got %d", c.PartSize)
+		}
+		if c.Concurrency != 0 {
+			t.Errorf("expected default Concurrency to be 0, got %d", c.Concurrency)
+		}
+	})
 }

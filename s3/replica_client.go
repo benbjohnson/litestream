@@ -24,7 +24,6 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/superfly/ltx"
-	"golang.org/x/sync/errgroup"
 
 	"github.com/benbjohnson/litestream"
 )
@@ -57,6 +56,10 @@ type ReplicaClient struct {
 	Endpoint       string
 	ForcePathStyle bool
 	SkipVerify     bool
+
+	// Upload configuration
+	PartSize    int64 // Part size for multipart uploads (default: 5MB)
+	Concurrency int   // Number of concurrent parts to upload (default: 5)
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -76,6 +79,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	if c.s3 != nil {
 		return nil
+	}
+
+	// Validate required configuration
+	if c.Bucket == "" {
+		return fmt.Errorf("s3: bucket name is required")
 	}
 
 	// Look up region if not specified and no endpoint is used.
@@ -161,7 +169,20 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Create S3 client
 	c.s3 = s3.NewFromConfig(cfg, s3Opts...)
-	c.uploader = manager.NewUploader(c.s3)
+
+	// Configure uploader with custom options if specified
+	uploaderOpts := []func(*manager.Uploader){}
+	if c.PartSize > 0 {
+		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
+			u.PartSize = c.PartSize
+		})
+	}
+	if c.Concurrency > 0 {
+		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
+			u.Concurrency = c.Concurrency
+		})
+	}
+	c.uploader = manager.NewUploader(c.s3, uploaderOpts...)
 
 	return nil
 }
@@ -243,7 +264,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		if isNotExists(err) {
 			return nil, os.ErrNotExist
 		}
-		return nil, err
+		return nil, fmt.Errorf("get object %s: %w", key, err)
 	}
 	return out.Body, nil
 }
@@ -262,7 +283,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		Body:   r,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("upload to %s: %w", key, err)
 	}
 
 	// Build file info from the uploaded file
@@ -273,9 +294,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		CreatedAt: time.Now(),
 	}
 
-	// Log upload if logger is available
-	if out.ETag != nil {
-		// S3 upload successful
+	// ETag indicates successful upload
+	if out.ETag == nil {
+		return nil, fmt.Errorf("upload failed: no ETag returned")
 	}
 
 	return info, nil
@@ -301,17 +322,14 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 	// Delete in batches
 	for len(objIDs) > 0 {
-		n := len(objIDs)
-		if n > MaxKeys {
-			n = MaxKeys
-		}
+		n := min(len(objIDs), MaxKeys)
 
 		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
 			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("delete batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
 			return err
 		}
@@ -340,7 +358,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return err
+			return fmt.Errorf("list objects page: %w", err)
 		}
 
 		// Collect object identifiers
@@ -351,17 +369,14 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 	// Delete all collected objects in batches
 	for len(objIDs) > 0 {
-		n := len(objIDs)
-		if n > MaxKeys {
-			n = MaxKeys
-		}
+		n := min(len(objIDs), MaxKeys)
 
 		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
 			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return err
+			return fmt.Errorf("delete all batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
 			return err
 		}
@@ -384,7 +399,6 @@ type fileIterator struct {
 	page      *s3.ListObjectsV2Output
 	pageIndex int
 
-	g      errgroup.Group
 	closed bool
 	err    error
 	info   *ltx.FileInfo
@@ -415,7 +429,7 @@ func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek
 func (itr *fileIterator) Close() (err error) {
 	itr.closed = true
 	itr.cancel()
-	return itr.g.Wait()
+	return nil
 }
 
 // Next returns the next file. Returns false when no more files are available.
