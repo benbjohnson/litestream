@@ -23,6 +23,8 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
@@ -104,6 +106,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	var httpClient *http.Client
 	if c.SkipVerify {
 		httpClient = &http.Client{
+			Timeout: 24 * time.Hour, // Match Azure's 24 hour timeout
 			Transport: &http.Transport{
 				Proxy: http.ProxyFromEnvironment,
 				DialContext: (&net.Dialer{
@@ -120,22 +123,32 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 				},
 			},
 		}
+	} else {
+		// Set default HTTP client with 24 hour timeout for long-running operations
+		httpClient = &http.Client{
+			Timeout: 24 * time.Hour,
+		}
 	}
 
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
-		// Use adaptive retry mode for better resilience
+		// Use adaptive retry mode for better resilience with 24 hour timeout
+		// This matches Azure's approach for long-running operations
 		config.WithRetryMode(aws.RetryModeAdaptive),
-		config.WithRetryMaxAttempts(3),
+		config.WithRetryMaxAttempts(10), // Increase retry attempts for resilience
 	}
 
-	// Add custom HTTP client if needed
-	if httpClient != nil {
-		configOpts = append(configOpts, config.WithHTTPClient(httpClient))
-	}
+	// Add HTTP client with proper timeout
+	configOpts = append(configOpts, config.WithHTTPClient(httpClient))
 
-	// Add static credentials if provided
+	// Add static credentials if provided, otherwise use default credential chain
+	// Default credential chain includes:
+	// - Environment variables (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY)
+	// - Shared credentials file (~/.aws/credentials)
+	// - EC2 Instance Profile credentials
+	// - ECS Task Role credentials
+	// - Web Identity Token credentials (for EKS)
 	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
 		configOpts = append(configOpts, config.WithCredentialsProvider(
 			credentials.NewStaticCredentialsProvider(c.AccessKeyID, c.SecretAccessKey, ""),
@@ -152,6 +165,23 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	s3Opts := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
+			// Add User-Agent for telemetry (similar to Azure's ApplicationID)
+			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+				return stack.Build.Add(
+					middleware.BuildMiddlewareFunc(
+						"LitestreamUserAgent",
+						func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+							out middleware.BuildOutput, metadata middleware.Metadata, err error,
+						) {
+							if req, ok := in.Request.(*smithyhttp.Request); ok {
+								req.Header.Add("User-Agent", "litestream")
+							}
+							return next.HandleBuild(ctx, in)
+						},
+					),
+					middleware.After,
+				)
+			})
 		},
 	}
 
