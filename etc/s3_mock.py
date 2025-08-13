@@ -25,7 +25,7 @@ server.start()
 s3 = boto3.client(
     "s3",
     aws_access_key_id=env["LITESTREAM_S3_ACCESS_KEY_ID"],
-    aws_secret_access_key=["LITESTREAM_S3_SECRET_ACCESS_KEY"],
+    aws_secret_access_key=env["LITESTREAM_S3_SECRET_ACCESS_KEY"],
     endpoint_url=env["LITESTREAM_S3_ENDPOINT"]
 ).create_bucket(Bucket=env["LITESTREAM_S3_BUCKET"])
 
