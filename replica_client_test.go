@@ -348,13 +348,19 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 		s3Client.PartSize = 5 * 1024 * 1024 // 5MB parts
 		s3Client.Concurrency = 3            // 3 concurrent parts
 
-		// Create a 4MB test file. We use 4MB instead of a larger file to avoid
-		// triggering multipart uploads which have a known issue with moto mock server.
-		// Moto issue #8762: composite checksums don't have the -X suffix, causing
-		// AWS SDK v2 checksum validation to fail.
+		// Determine file size based on whether we're testing against moto or real S3
+		// Moto has issue #8762 where composite checksums for multipart uploads
+		// don't have the -X suffix, causing checksum validation to fail.
 		// Reference: https://github.com/getmoto/moto/issues/8762
-		// This still tests that our configuration is properly set.
-		size := 4 * 1024 * 1024
+		size := 10 * 1024 * 1024 // 10MB - triggers multipart upload
+
+		// If we're using moto (localhost endpoint), use smaller file to avoid multipart
+		if s3Client.Endpoint != "" && strings.Contains(s3Client.Endpoint, "127.0.0.1") {
+			size = 4 * 1024 * 1024 // 4MB - avoids multipart upload with moto
+			t.Log("Using 4MB file size to work around moto multipart checksum issue")
+		} else {
+			t.Log("Using 10MB file size to test multipart upload")
+		}
 		data := make([]byte, size)
 		for i := range data {
 			data[i] = byte(i % 256)
