@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -354,8 +355,8 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 			data[i] = byte(i % 256)
 		}
 
-		// Upload the large file
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100), strings.NewReader(string(data))); err != nil {
+		// Upload the large file using bytes.Reader to avoid string conversion issues
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100), bytes.NewReader(data)); err != nil {
 			t.Fatalf("failed to write large file: %v", err)
 		}
 
@@ -373,6 +374,11 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 
 		if len(buf) != size {
 			t.Errorf("size mismatch: got %d, want %d", len(buf), size)
+		}
+
+		// Verify the data matches what we uploaded
+		if !bytes.Equal(buf, data) {
+			t.Errorf("data mismatch: uploaded and downloaded data do not match")
 		}
 	})
 }
