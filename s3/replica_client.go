@@ -102,31 +102,27 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Create custom HTTP client if needed
-	var httpClient *http.Client
+	// Create HTTP client with 24 hour timeout for long-running operations
+	httpClient := &http.Client{
+		Timeout: 24 * time.Hour,
+	}
+
+	// Configure transport for insecure connections if needed
 	if c.SkipVerify {
-		httpClient = &http.Client{
-			Timeout: 24 * time.Hour, // Match Azure's 24 hour timeout
-			Transport: &http.Transport{
-				Proxy: http.ProxyFromEnvironment,
-				DialContext: (&net.Dialer{
-					Timeout:   30 * time.Second,
-					KeepAlive: 30 * time.Second,
-				}).DialContext,
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
-				IdleConnTimeout:       90 * time.Second,
-				TLSHandshakeTimeout:   10 * time.Second,
-				ExpectContinueTimeout: 1 * time.Second,
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
+		httpClient.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
 			},
-		}
-	} else {
-		// Set default HTTP client with 24 hour timeout for long-running operations
-		httpClient = &http.Client{
-			Timeout: 24 * time.Hour,
 		}
 	}
 
@@ -186,16 +182,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 
 	// Add custom endpoint if specified
-	if c.Endpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			// For MinIO and other S3-compatible services, we can use BaseEndpoint
-			// with DisableHTTPS when the endpoint starts with http://
-			o.BaseEndpoint = aws.String(c.Endpoint)
-			if strings.HasPrefix(c.Endpoint, "http://") {
-				o.EndpointOptions.DisableHTTPS = true
-			}
-		})
-	}
+	c.configureEndpoint(&s3Opts)
 
 	// Create S3 client
 	c.s3 = s3.NewFromConfig(cfg, s3Opts...)
@@ -217,6 +204,20 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	return nil
 }
 
+// configureEndpoint adds custom endpoint configuration to S3 client options if needed.
+func (c *ReplicaClient) configureEndpoint(opts *[]func(*s3.Options)) {
+	if c.Endpoint != "" {
+		*opts = append(*opts, func(o *s3.Options) {
+			o.UsePathStyle = c.ForcePathStyle
+			o.BaseEndpoint = aws.String(c.Endpoint)
+			// For MinIO and other S3-compatible services
+			if strings.HasPrefix(c.Endpoint, "http://") {
+				o.EndpointOptions.DisableHTTPS = true
+			}
+		})
+	}
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Build a config with credentials but no region
@@ -235,22 +236,14 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 		return "", fmt.Errorf("cannot load aws config for region lookup: %w", err)
 	}
 
-	// Use us-east-1 for initial region lookup
-	cfg.Region = "us-east-1"
+	// Use default region for initial region lookup
+	cfg.Region = DefaultRegion
 
 	// Create S3 client options
 	s3Opts := []func(*s3.Options){}
 
-	// If we have a custom endpoint, configure it for region lookup
-	if c.Endpoint != "" {
-		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.UsePathStyle = c.ForcePathStyle
-			o.BaseEndpoint = aws.String(c.Endpoint)
-			if strings.HasPrefix(c.Endpoint, "http://") {
-				o.EndpointOptions.DisableHTTPS = true
-			}
-		})
-	}
+	// Configure custom endpoint for region lookup
+	c.configureEndpoint(&s3Opts)
 
 	client := s3.NewFromConfig(cfg, s3Opts...)
 
@@ -264,7 +257,7 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 
 	// Convert location constraint to region
 	if out.LocationConstraint == "" {
-		return "us-east-1", nil
+		return DefaultRegion, nil
 	}
 	return string(out.LocationConstraint), nil
 }
@@ -578,7 +571,7 @@ func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle boo
 			// Extract bucket from bucket.host:port format
 			bucket = parts[0]
 			endpoint = "http://" + parts[1]
-			return bucket, "us-east-1", endpoint, true
+			return bucket, DefaultRegion, endpoint, true
 		}
 		// No bucket in host, just host:port
 		return "", "", "http://" + host, true
