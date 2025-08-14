@@ -106,7 +106,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Check if we have explicit credentials or should use default credential chain
 	accountKey := c.AccountKey
 	if accountKey == "" {
-		slog.Debug("no account key provided, using environment variable")
 		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
 	}
 
@@ -114,6 +113,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	var client *azblob.Client
 	if accountKey != "" && c.AccountName != "" {
 		// Use shared key authentication (existing behavior)
+		slog.Debug("using shared key authentication")
 		credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
 		if err != nil {
 			return fmt.Errorf("abs: cannot create shared key credential: %w", err)
@@ -122,7 +122,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		if err != nil {
 			return fmt.Errorf("abs: cannot create azure blob client with shared key: %w", err)
 		}
-		slog.Debug("using shared key authentication")
 	} else {
 		// Use default credential chain (similar to AWS SDK default credential chain)
 		// This includes:
@@ -130,6 +129,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		// - Managed Identity (for Azure VMs, App Service, etc.)
 		// - Azure CLI credentials
 		// - Visual Studio Code credentials
+		slog.Debug("using default credential chain (managed identity, Azure CLI, environment variables, etc.)")
 		credential, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
 			return fmt.Errorf("abs: cannot create default azure credential: %w", err)
@@ -138,7 +138,6 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		if err != nil {
 			return fmt.Errorf("abs: cannot create azure blob client with default credential: %w", err)
 		}
-		slog.Debug("using default credential chain")
 	}
 
 	c.client = client
