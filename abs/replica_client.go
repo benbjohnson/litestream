@@ -116,11 +116,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		// Use shared key authentication (existing behavior)
 		credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
 		if err != nil {
-			return fmt.Errorf("cannot create shared key credential: %w", err)
+			return fmt.Errorf("abs: cannot create shared key credential: %w", err)
 		}
 		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, credential, clientOptions)
 		if err != nil {
-			return fmt.Errorf("cannot create azure blob client with shared key: %w", err)
+			return fmt.Errorf("abs: cannot create azure blob client with shared key: %w", err)
 		}
 		slog.Debug("using shared key authentication")
 	} else {
@@ -132,11 +132,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		// - Visual Studio Code credentials
 		credential, err := azidentity.NewDefaultAzureCredential(nil)
 		if err != nil {
-			return fmt.Errorf("cannot create default azure credential: %w", err)
+			return fmt.Errorf("abs: cannot create default azure credential: %w", err)
 		}
 		client, err = azblob.NewClient(endpoint, credential, clientOptions)
 		if err != nil {
-			return fmt.Errorf("cannot create azure blob client with default credential: %w", err)
+			return fmt.Errorf("abs: cannot create azure blob client with default credential: %w", err)
 		}
 		slog.Debug("using default credential chain")
 	}
@@ -172,7 +172,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		AccessTier: to.Ptr(blob.AccessTierHot), // Use Hot tier as default
 	})
 	if err != nil {
-		return nil, fmt.Errorf("cannot upload ltx file %q: %w", key, err)
+		return nil, fmt.Errorf("abs: cannot upload ltx file %q: %w", key, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
@@ -199,7 +199,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {
-		return nil, fmt.Errorf("cannot start new reader for %q: %w", key, err)
+		return nil, fmt.Errorf("abs: cannot start new reader for %q: %w", key, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
@@ -220,7 +220,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		if isNotExists(err) {
 			continue
 		} else if err != nil {
-			return fmt.Errorf("cannot delete ltx file %q: %w", key, err)
+			return fmt.Errorf("abs: cannot delete ltx file %q: %w", key, err)
 		}
 
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -250,7 +250,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 		resp, err := pager.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("cannot list blobs: %w", err)
+			return fmt.Errorf("abs: cannot list blobs: %w", err)
 		}
 
 		for _, item := range resp.Segment.BlobItems {
@@ -260,7 +260,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			if isNotExists(err) {
 				continue
 			} else if err != nil {
-				return fmt.Errorf("cannot delete blob %q: %w", *item.Name, err)
+				return fmt.Errorf("abs: cannot delete blob %q: %w", *item.Name, err)
 			}
 		}
 	}
@@ -348,7 +348,7 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 
 	resp, err := itr.pager.NextPage(itr.ctx)
 	if err != nil {
-		itr.err = fmt.Errorf("cannot list blobs: %w", err)
+		itr.err = fmt.Errorf("abs: cannot list blobs: %w", err)
 		return false
 	}
 
