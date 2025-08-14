@@ -13,6 +13,7 @@ import (
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/policy"
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore/runtime"
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
@@ -270,7 +271,7 @@ type ltxFileIterator struct {
 	level  int
 	seek   ltx.TXID
 
-	pager     interface{} // Azure SDK pager - stored as interface{} to avoid type dependency
+	pager     *runtime.Pager[azblob.ListBlobsFlatResponse]
 	pageItems []*ltx.FileInfo
 	pageIndex int
 
@@ -335,70 +336,52 @@ func (itr *ltxFileIterator) Next() bool {
 
 // loadNextPage loads the next page of blobs and extracts valid LTX files
 func (itr *ltxFileIterator) loadNextPage() bool {
-	// Cast pager to the interface we need
-	type Pager interface {
-		More() bool
-		NextPage(context.Context) (interface{}, error)
-	}
-
-	pager, ok := itr.pager.(Pager)
-	if !ok {
-		itr.err = fmt.Errorf("invalid pager type")
-		return false
-	}
-
-	if !pager.More() {
+	if !itr.pager.More() {
 		return false
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 
-	resp, err := pager.NextPage(itr.ctx)
+	resp, err := itr.pager.NextPage(itr.ctx)
 	if err != nil {
 		itr.err = fmt.Errorf("cannot list blobs: %w", err)
 		return false
 	}
 
-	// Extract blob items directly from the response using the same pattern as DeleteAll method
+	// Extract blob items directly from the response
 	itr.pageItems = nil
 	itr.pageIndex = 0
 
-	// Use the same pattern as DeleteAll method - directly work with the response
-	if azResp, ok := resp.(*azblob.ListBlobsFlatResponse); ok {
-		for _, item := range azResp.Segment.BlobItems {
-			key := path.Base(*item.Name)
-			minTXID, maxTXID, err := ltx.ParseFilename(key)
-			if err != nil {
-				continue // Skip non-LTX files
-			}
-
-			// Build file info
-			info := &ltx.FileInfo{
-				Level:     itr.level,
-				MinTXID:   minTXID,
-				MaxTXID:   maxTXID,
-				Size:      *item.Properties.ContentLength,
-				CreatedAt: item.Properties.CreationTime.UTC(),
-			}
-
-			// Skip if below seek TXID
-			if info.MinTXID < itr.seek {
-				continue
-			}
-
-			// Skip if wrong level
-			if info.Level != itr.level {
-				continue
-			}
-
-			itr.pageItems = append(itr.pageItems, info)
+	for _, item := range resp.Segment.BlobItems {
+		key := path.Base(*item.Name)
+		minTXID, maxTXID, err := ltx.ParseFilename(key)
+		if err != nil {
+			continue // Skip non-LTX files
 		}
-	} else {
-		itr.err = fmt.Errorf("unexpected response type")
-		return false
+
+		// Build file info
+		info := &ltx.FileInfo{
+			Level:     itr.level,
+			MinTXID:   minTXID,
+			MaxTXID:   maxTXID,
+			Size:      *item.Properties.ContentLength,
+			CreatedAt: item.Properties.CreationTime.UTC(),
+		}
+
+		// Skip if below seek TXID
+		if info.MinTXID < itr.seek {
+			continue
+		}
+
+		// Skip if wrong level
+		if info.Level != itr.level {
+			continue
+		}
+
+		itr.pageItems = append(itr.pageItems, info)
 	}
 
-	return len(itr.pageItems) > 0 || pager.More()
+	return len(itr.pageItems) > 0 || itr.pager.More()
 }
 
 func (itr *ltxFileIterator) Err() error { return itr.err }
