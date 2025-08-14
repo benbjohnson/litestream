@@ -82,12 +82,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	if c.KeyPath != "" {
 		buf, err := os.ReadFile(c.KeyPath)
 		if err != nil {
-			return nil, fmt.Errorf("cannot read sftp key path: %w", err)
+			return nil, fmt.Errorf("sftp: cannot read sftp key path: %w", err)
 		}
 
 		signer, err := ssh.ParsePrivateKey(buf)
 		if err != nil {
-			return nil, fmt.Errorf("cannot parse sftp key path: %w", err)
+			return nil, fmt.Errorf("sftp: cannot parse sftp key path: %w", err)
 		}
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 	}
@@ -128,7 +128,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 		if err := walker.Err(); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
-			return fmt.Errorf("cannot walk path %q: %w", walker.Path(), err)
+			return fmt.Errorf("sftp: cannot walk path %q: %w", walker.Path(), err)
 		}
 		if walker.Stat().IsDir() {
 			dirs = append(dirs, walker.Path())
@@ -136,7 +136,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 		}
 
 		if err := sftpClient.Remove(walker.Path()); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cannot delete file %q: %w", walker.Path(), err)
+			return fmt.Errorf("sftp: cannot delete file %q: %w", walker.Path(), err)
 		}
 
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -146,7 +146,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	for i := len(dirs) - 1; i >= 0; i-- {
 		filename := dirs[i]
 		if err := sftpClient.RemoveDirectory(filename); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cannot delete directory %q: %w", filename, err)
+			return fmt.Errorf("sftp: cannot delete directory %q: %w", filename, err)
 		}
 	}
 
@@ -207,12 +207,12 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	startTime := time.Now()
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
-		return nil, fmt.Errorf("cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
+		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
 	}
 
 	f, err := sftpClient.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open snapshot file for writing: %w", err)
+		return nil, fmt.Errorf("sftp: cannot open snapshot file for writing: %w", err)
 	}
 	defer f.Close()
 
@@ -268,7 +268,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 		if err := sftpClient.Remove(filename); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("cannot delete ltx file %q: %w", filename, err)
+			return fmt.Errorf("sftp: cannot delete ltx file %q: %w", filename, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
@@ -286,7 +286,7 @@ func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
 	}
 
 	if err := sftpClient.RemoveDirectory(c.Path); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("cannot delete path: %w", err)
+		return fmt.Errorf("sftp: cannot delete path: %w", err)
 	}
 	return nil
 }
