@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -325,4 +326,117 @@ func stripLTXFileInfo(info *ltx.FileInfo) *ltx.FileInfo {
 	other := *info
 	other.CreatedAt = time.Time{}
 	return &other
+}
+
+// TestReplicaClient_S3_UploaderConfig tests S3 uploader configuration for large files
+func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
+	// Only run for S3 integration tests
+	if !strings.Contains(*integration, "s3") {
+		t.Skip("Skipping S3-specific uploader config test")
+	}
+
+	RunWithReplicaClient(t, "LargeFileWithCustomConfig", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Parallel()
+
+		// Type assert to S3 client to set custom config
+		s3Client, ok := c.(*s3.ReplicaClient)
+		if !ok {
+			t.Skip("Not an S3 client")
+		}
+
+		// Set custom upload configuration
+		s3Client.PartSize = 5 * 1024 * 1024 // 5MB parts
+		s3Client.Concurrency = 3            // 3 concurrent parts
+
+		// Determine file size based on whether we're testing against moto or real S3
+		// Moto has issue #8762 where composite checksums for multipart uploads
+		// don't have the -X suffix, causing checksum validation to fail.
+		// Reference: https://github.com/getmoto/moto/issues/8762
+		size := 10 * 1024 * 1024 // 10MB - triggers multipart upload
+
+		// If we're using moto (localhost endpoint), use smaller file to avoid multipart
+		if s3Client.Endpoint != "" && strings.Contains(s3Client.Endpoint, "127.0.0.1") {
+			size = 4 * 1024 * 1024 // 4MB - avoids multipart upload with moto
+			t.Log("Using 4MB file size to work around moto multipart checksum issue")
+		} else {
+			t.Log("Using 10MB file size to test multipart upload")
+		}
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+
+		// Upload the file using bytes.Reader to avoid string conversion issues
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100), bytes.NewReader(data)); err != nil {
+			t.Fatalf("failed to write large file: %v", err)
+		}
+
+		// Read it back and verify size
+		r, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100))
+		if err != nil {
+			t.Fatalf("failed to open large file: %v", err)
+		}
+		defer r.Close()
+
+		buf, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("failed to read large file: %v", err)
+		}
+
+		if len(buf) != size {
+			t.Errorf("size mismatch: got %d, want %d", len(buf), size)
+		}
+
+		// Verify the data matches what we uploaded
+		if !bytes.Equal(buf, data) {
+			t.Errorf("data mismatch: uploaded and downloaded data do not match")
+		}
+	})
+}
+
+// TestReplicaClient_S3_ErrorContext tests that S3 errors include helpful context
+func TestReplicaClient_S3_ErrorContext(t *testing.T) {
+	// Only run for S3 integration tests
+	if !strings.Contains(*integration, "s3") {
+		t.Skip("Skipping S3-specific error context test")
+	}
+
+	RunWithReplicaClient(t, "ErrorContext", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Parallel()
+
+		// Test OpenLTXFile with non-existent file
+		_, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(999), ltx.TXID(999))
+		if err == nil {
+			t.Fatal("expected error for non-existent file")
+		}
+
+		// Should return os.ErrNotExist for S3 NoSuchKey
+		if !os.IsNotExist(err) {
+			t.Errorf("expected os.ErrNotExist, got %v", err)
+		}
+	})
+}
+
+// TestReplicaClient_S3_BucketValidation tests bucket validation in S3 client
+func TestReplicaClient_S3_BucketValidation(t *testing.T) {
+	// Only run for S3 integration tests
+	if !strings.Contains(*integration, "s3") {
+		t.Skip("Skipping S3-specific bucket validation test")
+	}
+
+	// Create a new S3 client with empty bucket
+	c := s3.NewReplicaClient()
+	c.AccessKeyID = *s3AccessKeyID
+	c.SecretAccessKey = *s3SecretAccessKey
+	c.Region = *s3Region
+	c.Bucket = "" // Empty bucket name
+
+	// Should fail with bucket validation error
+	err := c.Init(context.Background())
+	if err == nil {
+		t.Fatal("expected error for empty bucket name")
+	}
+	if !strings.Contains(err.Error(), "bucket name is required") {
+		t.Errorf("expected bucket validation error, got: %v", err)
+	}
 }
