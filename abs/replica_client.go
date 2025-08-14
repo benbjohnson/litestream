@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"path"
@@ -79,9 +80,33 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		endpoint = fmt.Sprintf("https://%s.blob.core.windows.net", c.AccountName)
 	}
 
+	// Configure client options with retry policy
+	clientOptions := &azblob.ClientOptions{
+		ClientOptions: azcore.ClientOptions{
+			Retry: policy.RetryOptions{
+				MaxRetries:    10,
+				RetryDelay:    time.Second,
+				MaxRetryDelay: 30 * time.Second,
+				TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
+				StatusCodes: []int{
+					http.StatusRequestTimeout,
+					http.StatusTooManyRequests,
+					http.StatusInternalServerError,
+					http.StatusBadGateway,
+					http.StatusServiceUnavailable,
+					http.StatusGatewayTimeout,
+				},
+			},
+			Telemetry: policy.TelemetryOptions{
+				ApplicationID: "litestream",
+			},
+		},
+	}
+
 	// Check if we have explicit credentials or should use default credential chain
 	accountKey := c.AccountKey
 	if accountKey == "" {
+		slog.Debug("no account key provided, using environment variable")
 		accountKey = os.Getenv("LITESTREAM_AZURE_ACCOUNT_KEY")
 	}
 
@@ -93,30 +118,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		if err != nil {
 			return fmt.Errorf("cannot create shared key credential: %w", err)
 		}
-		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, credential, &azblob.ClientOptions{
-			ClientOptions: azcore.ClientOptions{
-				Retry: policy.RetryOptions{
-					MaxRetries:    10,
-					RetryDelay:    time.Second,
-					MaxRetryDelay: 30 * time.Second,
-					TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
-					StatusCodes: []int{
-						http.StatusRequestTimeout,
-						http.StatusTooManyRequests,
-						http.StatusInternalServerError,
-						http.StatusBadGateway,
-						http.StatusServiceUnavailable,
-						http.StatusGatewayTimeout,
-					},
-				},
-				Telemetry: policy.TelemetryOptions{
-					ApplicationID: "litestream",
-				},
-			},
-		})
+		client, err = azblob.NewClientWithSharedKeyCredential(endpoint, credential, clientOptions)
 		if err != nil {
 			return fmt.Errorf("cannot create azure blob client with shared key: %w", err)
 		}
+		slog.Debug("using shared key authentication")
 	} else {
 		// Use default credential chain (similar to AWS SDK default credential chain)
 		// This includes:
@@ -128,30 +134,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		if err != nil {
 			return fmt.Errorf("cannot create default azure credential: %w", err)
 		}
-		client, err = azblob.NewClient(endpoint, credential, &azblob.ClientOptions{
-			ClientOptions: azcore.ClientOptions{
-				Retry: policy.RetryOptions{
-					MaxRetries:    10,
-					RetryDelay:    time.Second,
-					MaxRetryDelay: 30 * time.Second,
-					TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
-					StatusCodes: []int{
-						http.StatusRequestTimeout,
-						http.StatusTooManyRequests,
-						http.StatusInternalServerError,
-						http.StatusBadGateway,
-						http.StatusServiceUnavailable,
-						http.StatusGatewayTimeout,
-					},
-				},
-				Telemetry: policy.TelemetryOptions{
-					ApplicationID: "litestream",
-				},
-			},
-		})
+		client, err = azblob.NewClient(endpoint, credential, clientOptions)
 		if err != nil {
 			return fmt.Errorf("cannot create azure blob client with default credential: %w", err)
 		}
+		slog.Debug("using default credential chain")
 	}
 
 	c.client = client
