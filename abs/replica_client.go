@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -98,7 +99,15 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 					MaxRetries:    10,
 					RetryDelay:    time.Second,
 					MaxRetryDelay: 30 * time.Second,
-					TryTimeout:    24 * time.Hour, // Support long-running operations
+					TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
+					StatusCodes: []int{
+						http.StatusRequestTimeout,
+						http.StatusTooManyRequests,
+						http.StatusInternalServerError,
+						http.StatusBadGateway,
+						http.StatusServiceUnavailable,
+						http.StatusGatewayTimeout,
+					},
 				},
 				Telemetry: policy.TelemetryOptions{
 					ApplicationID: "litestream",
@@ -125,7 +134,15 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 					MaxRetries:    10,
 					RetryDelay:    time.Second,
 					MaxRetryDelay: 30 * time.Second,
-					TryTimeout:    24 * time.Hour, // Support long-running operations
+					TryTimeout:    15 * time.Minute, // Reasonable timeout for blob operations
+					StatusCodes: []int{
+						http.StatusRequestTimeout,
+						http.StatusTooManyRequests,
+						http.StatusInternalServerError,
+						http.StatusBadGateway,
+						http.StatusServiceUnavailable,
+						http.StatusGatewayTimeout,
+					},
 				},
 				Telemetry: policy.TelemetryOptions{
 					ApplicationID: "litestream",
