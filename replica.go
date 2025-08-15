@@ -420,7 +420,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	rdrs := make([]io.Reader, 0, len(infos))
 	defer func() {
 		for _, rd := range rdrs {
-			_ = rd.(io.Closer).Close()
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
 		}
 	}()
 

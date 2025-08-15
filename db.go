@@ -1223,7 +1223,9 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	var rdrs []io.Reader
 	defer func() {
 		for _, rd := range rdrs {
-			_ = rd.(io.Closer).Close()
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
 		}
 	}()
 
