@@ -235,7 +235,12 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 	// List all objects in the store
 	objectList, err := c.objectStore.List(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to list objects: %w", err)
+		// NATS returns "no objects found" when bucket is empty, treat as empty list
+		if strings.Contains(err.Error(), "no objects found") {
+			objectList = nil // Empty list
+		} else {
+			return nil, fmt.Errorf("failed to list objects: %w", err)
+		}
 	}
 
 	var fileInfos []*ltx.FileInfo
@@ -347,7 +352,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	// List all objects in the bucket
 	objectList, err := c.objectStore.List(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to list all objects: %w", err)
+		// NATS returns "no objects found" when bucket is empty, treat as empty list
+		if strings.Contains(err.Error(), "no objects found") {
+			objectList = nil // Empty list, nothing to delete
+		} else {
+			return fmt.Errorf("failed to list all objects: %w", err)
+		}
 	}
 
 	for _, objInfo := range objectList {
