@@ -79,7 +79,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		if err := c.bkt.Object(attrs.Name).Delete(ctx); isNotExists(err) {
 			continue
 		} else if err != nil {
-			return fmt.Errorf("cannot delete object %q: %w", attrs.Name, err)
+			return fmt.Errorf("gs: cannot delete object %q: %w", attrs.Name, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
@@ -166,7 +166,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	for _, info := range a {
 		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 		if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
-			return fmt.Errorf("cannot delete ltx file %q: %w", key, err)
+			return fmt.Errorf("gs: cannot delete ltx file %q: %w", key, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}

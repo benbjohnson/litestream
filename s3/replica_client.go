@@ -95,7 +95,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	if region == "" {
 		if c.Endpoint == "" {
 			if region, err = c.findBucketRegion(ctx, c.Bucket); err != nil {
-				return fmt.Errorf("cannot lookup bucket region: %w", err)
+				return fmt.Errorf("s3: cannot lookup bucket region: %w", err)
 			}
 		} else {
 			region = DefaultRegion // default for non-S3 object stores
@@ -154,7 +154,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Load AWS configuration
 	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
 	if err != nil {
-		return fmt.Errorf("cannot load aws config: %w", err)
+		return fmt.Errorf("s3: cannot load aws config: %w", err)
 	}
 
 	// Create S3 client options
@@ -233,7 +233,7 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 	// Load AWS configuration
 	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
 	if err != nil {
-		return "", fmt.Errorf("cannot load aws config for region lookup: %w", err)
+		return "", fmt.Errorf("s3: cannot load aws config for region lookup: %w", err)
 	}
 
 	// Use default region for initial region lookup
@@ -287,7 +287,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		if isNotExists(err) {
 			return nil, os.ErrNotExist
 		}
-		return nil, fmt.Errorf("get object %s: %w", key, err)
+		return nil, fmt.Errorf("s3: get object %s: %w", key, err)
 	}
 	return out.Body, nil
 }
@@ -306,7 +306,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		Body:   r,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("upload to %s: %w", key, err)
+		return nil, fmt.Errorf("s3: upload to %s: %w", key, err)
 	}
 
 	// Build file info from the uploaded file
@@ -319,7 +319,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	// ETag indicates successful upload
 	if out.ETag == nil {
-		return nil, fmt.Errorf("upload failed: no ETag returned")
+		return nil, fmt.Errorf("s3: upload failed: no ETag returned")
 	}
 
 	return info, nil
@@ -352,7 +352,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return fmt.Errorf("delete batch of %d objects: %w", n, err)
+			return fmt.Errorf("s3: delete batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
 			return err
 		}
@@ -381,7 +381,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			return fmt.Errorf("list objects page: %w", err)
+			return fmt.Errorf("s3: list objects page: %w", err)
 		}
 
 		// Collect object identifiers
@@ -399,7 +399,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			return fmt.Errorf("delete all batch of %d objects: %w", n, err)
+			return fmt.Errorf("s3: delete all batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
 			return err
 		}
@@ -535,14 +535,14 @@ func ParseURL(s, endpoint string) (bucket, region, key string, err error) {
 	}
 
 	if u.Scheme != "s3" {
-		return "", "", "", fmt.Errorf("invalid s3 url scheme")
+		return "", "", "", fmt.Errorf("s3: invalid url scheme")
 	}
 
 	// Special handling for filebase.com
 	if u.Host == "filebase.com" {
 		parts := strings.SplitN(strings.TrimPrefix(u.Path, "/"), "/", 2)
 		if len(parts) == 0 {
-			return "", "", "", fmt.Errorf("s3 bucket required")
+			return "", "", "", fmt.Errorf("s3: bucket required")
 		}
 		bucket = parts[0]
 		if len(parts) > 1 {
