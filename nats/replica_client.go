@@ -16,6 +16,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.
@@ -35,6 +36,7 @@ type ReplicaClient struct {
 	// Configuration
 	URL        string   // NATS server URL
 	BucketName string   // Object store bucket name
+	Path       string   // Base path for LTX files within the bucket
 	JWT        string   // JWT token for authentication
 	Seed       string   // Seed for JWT authentication
 	Creds      string   // Credentials file path
@@ -98,7 +100,7 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 }
 
 // connect establishes a connection to NATS server with proper configuration.
-func (c *ReplicaClient) connect(ctx context.Context) error {
+func (c *ReplicaClient) connect(_ context.Context) error {
 	opts := []nats.Option{
 		nats.MaxReconnects(c.MaxReconnects),
 		nats.ReconnectWait(c.ReconnectWait),
@@ -136,7 +138,8 @@ func (c *ReplicaClient) connect(ctx context.Context) error {
 		}
 	}
 
-	// Connection will use the provided context for cancellation
+	// Note: NATS Connect doesn't directly support context cancellation during connection
+	// The context parameter is preserved for potential future use
 
 	url := c.URL
 	if url == "" {
@@ -192,38 +195,35 @@ func (c *ReplicaClient) Close() error {
 
 // ltxPath returns the object path for an LTX file.
 func (c *ReplicaClient) ltxPath(level int, minTXID, maxTXID ltx.TXID) string {
-	return fmt.Sprintf("ltx/level-%d/%016x-%016x.ltx", level, uint64(minTXID), uint64(maxTXID))
+	return litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 }
 
 // parseLTXPath parses an LTX object path and returns level, minTXID, and maxTXID.
 func (c *ReplicaClient) parseLTXPath(objPath string) (level int, minTXID, maxTXID ltx.TXID, err error) {
+	// Remove the base path prefix if present
+	if c.Path != "" && strings.HasPrefix(objPath, c.Path+"/") {
+		objPath = strings.TrimPrefix(objPath, c.Path+"/")
+	}
+
+	// Expected format: "ltx/<level>/<minTXID>-<maxTXID>.ltx"
 	parts := strings.Split(objPath, "/")
-	if len(parts) != 3 || parts[0] != "ltx" {
+	if len(parts) < 3 || parts[0] != "ltx" {
 		return 0, 0, 0, fmt.Errorf("invalid ltx path: %s", objPath)
 	}
 
-	levelStr := strings.TrimPrefix(parts[1], "level-")
-	if level, err = strconv.Atoi(levelStr); err != nil {
+	// Parse level
+	if level, err = strconv.Atoi(parts[1]); err != nil {
 		return 0, 0, 0, fmt.Errorf("invalid level in path %s: %w", objPath, err)
 	}
 
-	filename := strings.TrimSuffix(parts[2], ".ltx")
-	txidParts := strings.Split(filename, "-")
-	if len(txidParts) != 2 {
-		return 0, 0, 0, fmt.Errorf("invalid txid format in path %s", objPath)
-	}
-
-	minTXIDVal, err := strconv.ParseUint(txidParts[0], 16, 64)
+	// Parse filename (minTXID-maxTXID.ltx)
+	filename := parts[2]
+	minTXIDVal, maxTXIDVal, err := ltx.ParseFilename(filename)
 	if err != nil {
-		return 0, 0, 0, fmt.Errorf("invalid minTXID in path %s: %w", objPath, err)
+		return 0, 0, 0, fmt.Errorf("invalid filename in path %s: %w", objPath, err)
 	}
 
-	maxTXIDVal, err := strconv.ParseUint(txidParts[1], 16, 64)
-	if err != nil {
-		return 0, 0, 0, fmt.Errorf("invalid maxTXID in path %s: %w", objPath, err)
-	}
-
-	return level, ltx.TXID(minTXIDVal), ltx.TXID(maxTXIDVal), nil
+	return level, minTXIDVal, maxTXIDVal, nil
 }
 
 // LTXFiles returns an iterator of all LTX files on the replica for a given level.
@@ -233,6 +233,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 	}
 
 	// List all objects in the store
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 	objectList, err := c.objectStore.List(ctx)
 	if err != nil {
 		// NATS returns "no objects found" when bucket is empty, treat as empty list
@@ -244,7 +245,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 	}
 
 	var fileInfos []*ltx.FileInfo
-	prefix := fmt.Sprintf("ltx/level-%d/", level)
+	prefix := litestream.LTXLevelDir(c.Path, level) + "/"
 
 	for _, objInfo := range objectList {
 		// Filter by level prefix
@@ -298,6 +299,10 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		return nil, fmt.Errorf("failed to get object %s: %w", objectPath, err)
 	}
 
+	// Record metrics
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
+	// Note: We can't get the size from NATS object reader directly, so we skip bytes counter
+
 	return objectResult, nil
 }
 
@@ -308,19 +313,28 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	objectPath := c.ltxPath(level, minTXID, maxTXID)
+	startTime := time.Now()
+
+	// Wrap reader to count bytes
+	rc := internal.NewReadCounter(r)
 
 	objectInfo, err := c.objectStore.Put(ctx, jetstream.ObjectMeta{
 		Name: objectPath,
-	}, r)
+	}, rc)
 	if err != nil {
 		return nil, fmt.Errorf("failed to put object %s: %w", objectPath, err)
 	}
 
+	// Record metrics
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(objectInfo.Size))
+
 	return &ltx.FileInfo{
-		Level:   level,
-		MinTXID: minTXID,
-		MaxTXID: maxTXID,
-		Size:    int64(objectInfo.Size),
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Size:      int64(objectInfo.Size),
+		CreatedAt: startTime.UTC(),
 	}, nil
 }
 
@@ -338,6 +352,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 				return fmt.Errorf("failed to delete object %s: %w", objectPath, err)
 			}
 		}
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	return nil
@@ -366,6 +381,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 				return fmt.Errorf("failed to delete object %s: %w", objInfo.Name, err)
 			}
 		}
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
 	}
 
 	return nil

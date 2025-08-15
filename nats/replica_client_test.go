@@ -23,9 +23,9 @@ func TestReplicaClient_ltxPath(t *testing.T) {
 		maxTXID ltx.TXID
 		want    string
 	}{
-		{0, ltx.TXID(0x1000), ltx.TXID(0x2000), "ltx/level-0/0000000000001000-0000000000002000.ltx"},
-		{1, ltx.TXID(0xabcd), ltx.TXID(0xef01), "ltx/level-1/000000000000abcd-000000000000ef01.ltx"},
-		{255, ltx.TXID(0xffffffffffffffff), ltx.TXID(0xffffffffffffffff), "ltx/level-255/ffffffffffffffff-ffffffffffffffff.ltx"},
+		{0, ltx.TXID(0x1000), ltx.TXID(0x2000), "ltx/0/0000000000001000-0000000000002000.ltx"},
+		{1, ltx.TXID(0xabcd), ltx.TXID(0xef01), "ltx/1/000000000000abcd-000000000000ef01.ltx"},
+		{255, ltx.TXID(0xffffffffffffffff), ltx.TXID(0xffffffffffffffff), "ltx/255/ffffffffffffffff-ffffffffffffffff.ltx"},
 	}
 
 	for _, test := range tests {
@@ -46,14 +46,14 @@ func TestReplicaClient_parseLTXPath(t *testing.T) {
 		wantErr bool
 	}{
 		{
-			path:    "ltx/level-0/0000000000001000-0000000000002000.ltx",
+			path:    "ltx/0/0000000000001000-0000000000002000.ltx",
 			level:   0,
 			minTXID: ltx.TXID(0x1000),
 			maxTXID: ltx.TXID(0x2000),
 			wantErr: false,
 		},
 		{
-			path:    "ltx/level-1/000000000000abcd-000000000000ef01.ltx",
+			path:    "ltx/1/000000000000abcd-000000000000ef01.ltx",
 			level:   1,
 			minTXID: ltx.TXID(0xabcd),
 			maxTXID: ltx.TXID(0xef01),
@@ -64,11 +64,11 @@ func TestReplicaClient_parseLTXPath(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			path:    "ltx/level-x/invalid-invalid.ltx",
+			path:    "ltx/x/invalid-invalid.ltx",
 			wantErr: true,
 		},
 		{
-			path:    "ltx/level-0/invalid.ltx",
+			path:    "ltx/0/invalid.ltx",
 			wantErr: true,
 		},
 	}
