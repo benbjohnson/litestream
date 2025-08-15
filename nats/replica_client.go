@@ -244,8 +244,8 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 		}
 	}
 
-	var fileInfos []*ltx.FileInfo
 	prefix := litestream.LTXLevelDir(c.Path, level) + "/"
+	fileInfos := make([]*ltx.FileInfo, 0, len(objectList))
 
 	for _, objInfo := range objectList {
 		// Filter by level prefix

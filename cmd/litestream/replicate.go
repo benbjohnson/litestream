@@ -110,7 +110,7 @@ func (c *ReplicateCommand) Run() (err error) {
 		slog.Error("no databases specified in configuration")
 	}
 
-	var dbs []*litestream.DB
+	dbs := make([]*litestream.DB, 0, len(c.Config.DBs))
 	for _, dbConfig := range c.Config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {

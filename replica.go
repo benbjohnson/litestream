@@ -417,7 +417,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
-	var rdrs []io.Reader
+	rdrs := make([]io.Reader, 0, len(infos))
 	defer func() {
 		for _, rd := range rdrs {
 			_ = rd.(io.Closer).Close()
