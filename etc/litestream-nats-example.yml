@@ -1,0 +1,72 @@
+# Example Litestream configuration file with NATS JetStream Object Store replica
+#
+# This configuration demonstrates how to use NATS JetStream Object Store as a
+# replication destination for Litestream.
+#
+# NATS JetStream Object Store provides distributed, persistent object storage
+# with features like:
+# - Automatic chunking for large objects
+# - Configurable replication and storage types
+# - Built-in deduplication and compression
+# - Multi-tenancy and security
+
+# Database configuration
+dbs:
+  - path: /var/lib/db1.db
+    replica:
+      # NATS replica configuration
+      type: nats
+
+      # NATS server URL - can also be specified as "url: nats://server:port/bucket"
+      url: nats://nats.example.com:4222
+
+      # Object store bucket name (required)
+      # IMPORTANT: Bucket must be pre-created using NATS CLI or API
+      # Example: nats object add litestream-backups --size=10G --replicas=3
+      bucket: litestream-backups
+
+      # Authentication options (choose one method)
+
+      # JWT authentication (recommended for production)
+      jwt: /path/to/user.jwt
+      seed: /path/to/user.nk
+
+      # Or credentials file
+      # creds: /path/to/user.creds
+
+      # Or NKey authentication
+      # nkey: /path/to/user.nk
+
+      # Or username/password (not recommended for production)
+      # username: myuser
+      # password: mypassword
+
+      # Or token authentication
+      # token: mytoken
+
+      # TLS configuration
+      tls: true
+      # root-cas:
+      #   - /path/to/ca-cert.pem
+
+      # Connection options (optional, defaults shown)
+      max-reconnects: -1  # -1 for unlimited
+      reconnect-wait: 2s
+      timeout: 10s
+
+      # Standard litestream replica options
+      sync-interval: 1s
+
+      # Age encryption (optional)
+      age:
+        identities:
+          - /path/to/age-identity.txt
+        recipients:
+          - age1ql3z7hjy54pw3hyww5ayyfg7zqgvc7w3j2elw8zmrj2kg5sfn9aqmcac8p
+
+# Multiple databases can be configured
+  - path: /var/lib/db2.db
+    replica:
+      # Alternative URL format that includes bucket name
+      url: nats://nats.example.com:4222/myapp-backups
+      creds: /path/to/user.creds

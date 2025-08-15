@@ -26,6 +26,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -559,6 +560,19 @@ type ReplicaConfig struct {
 	Password string `yaml:"password"`
 	KeyPath  string `yaml:"key-path"`
 
+	// NATS settings
+	JWT           string         `yaml:"jwt"`
+	Seed          string         `yaml:"seed"`
+	Creds         string         `yaml:"creds"`
+	NKey          string         `yaml:"nkey"`
+	Username      string         `yaml:"username"`
+	Token         string         `yaml:"token"`
+	TLS           bool           `yaml:"tls"`
+	RootCAs       []string       `yaml:"root-cas"`
+	MaxReconnects *int           `yaml:"max-reconnects"`
+	ReconnectWait *time.Duration `yaml:"reconnect-wait"`
+	Timeout       *time.Duration `yaml:"timeout"`
+
 	// Encryption identities and recipients
 	Age struct {
 		Identities []string `yaml:"identities"`
@@ -615,6 +629,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		}
 	case "sftp":
 		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case "nats":
+		if r.Client, err = newNATSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	default:
@@ -847,6 +865,72 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Password = password
 	client.Path = path
 	client.KeyPath = c.KeyPath
+	return client, nil
+}
+
+// newNATSReplicaClientFromConfig returns a new instance of nats.ReplicaClient built from config.
+func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *nats.ReplicaClient, err error) {
+	// Parse URL if provided to extract bucket name and server URL
+	var url, bucket string
+	if c.URL != "" {
+		scheme, host, path, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, fmt.Errorf("invalid NATS URL: %w", err)
+		}
+		if scheme != "nats" {
+			return nil, fmt.Errorf("invalid scheme for NATS replica: %s", scheme)
+		}
+
+		// Reconstruct URL without bucket path
+		if host != "" {
+			url = fmt.Sprintf("nats://%s", host)
+		}
+
+		// Extract bucket name from path
+		if path != "" {
+			bucket = strings.Trim(path, "/")
+		}
+	}
+
+	// Use bucket from config if not extracted from URL
+	if bucket == "" {
+		bucket = c.Bucket
+	}
+
+	// Ensure required settings are set
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for NATS replica")
+	}
+
+	// Build replica client
+	client := nats.NewReplicaClient()
+	client.URL = url
+	client.BucketName = bucket
+
+	// Set authentication options
+	client.JWT = c.JWT
+	client.Seed = c.Seed
+	client.Creds = c.Creds
+	client.NKey = c.NKey
+	client.Username = c.Username
+	client.Password = c.Password
+	client.Token = c.Token
+
+	// Set TLS options
+	client.TLS = c.TLS
+	client.RootCAs = c.RootCAs
+
+	// Set connection options with defaults
+	if c.MaxReconnects != nil {
+		client.MaxReconnects = *c.MaxReconnects
+	}
+	if c.ReconnectWait != nil {
+		client.ReconnectWait = *c.ReconnectWait
+	}
+	if c.Timeout != nil {
+		client.Timeout = *c.Timeout
+	}
+
 	return client, nil
 }
 

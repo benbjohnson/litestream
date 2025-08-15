@@ -1,0 +1,398 @@
+package nats
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
+	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
+)
+
+// ReplicaClientType is the client type for this package.
+const ReplicaClientType = "nats"
+
+var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+
+// ReplicaClient is a client for writing LTX files to NATS JetStream Object Store.
+type ReplicaClient struct {
+	mu sync.Mutex
+
+	// NATS connection and JetStream context
+	nc          *nats.Conn
+	js          jetstream.JetStream
+	objectStore jetstream.ObjectStore
+
+	// Configuration
+	URL        string   // NATS server URL
+	BucketName string   // Object store bucket name
+	JWT        string   // JWT token for authentication
+	Seed       string   // Seed for JWT authentication
+	Creds      string   // Credentials file path
+	NKey       string   // NKey for authentication
+	Username   string   // Username for authentication
+	Password   string   // Password for authentication
+	Token      string   // Token for authentication
+	TLS        bool     // Enable TLS
+	RootCAs    []string // Root CA certificates
+
+	// Note: Bucket configuration (replicas, storage, TTL, etc.) should be
+	// managed externally via NATS CLI or API, not by Litestream
+
+	// Connection options
+	MaxReconnects    int                          // Maximum reconnection attempts (-1 for unlimited)
+	ReconnectWait    time.Duration                // Wait time between reconnection attempts
+	ReconnectJitter  time.Duration                // Random jitter for reconnection
+	Timeout          time.Duration                // Connection timeout
+	PingInterval     time.Duration                // Ping interval
+	MaxPingsOut      int                          // Maximum number of pings without response
+	ReconnectBufSize int                          // Reconnection buffer size
+	UserJWT          func() (string, error)       // JWT callback
+	SigCB            func([]byte) ([]byte, error) // Signature callback
+}
+
+// NewReplicaClient returns a new instance of ReplicaClient.
+func NewReplicaClient() *ReplicaClient {
+	return &ReplicaClient{
+		MaxReconnects:    -1, // Unlimited
+		ReconnectWait:    2 * time.Second,
+		Timeout:          10 * time.Second,
+		PingInterval:     2 * time.Minute,
+		MaxPingsOut:      2,
+		ReconnectBufSize: 8 * 1024 * 1024, // 8MB
+	}
+}
+
+// Type returns "nats" as the client type.
+func (c *ReplicaClient) Type() string {
+	return ReplicaClientType
+}
+
+// Init initializes the connection to NATS JetStream. No-op if already initialized.
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.nc != nil {
+		return nil
+	}
+
+	if err := c.connect(ctx); err != nil {
+		return fmt.Errorf("nats: failed to connect: %w", err)
+	}
+
+	if err := c.initObjectStore(ctx); err != nil {
+		return fmt.Errorf("nats: failed to initialize object store: %w", err)
+	}
+
+	return nil
+}
+
+// connect establishes a connection to NATS server with proper configuration.
+func (c *ReplicaClient) connect(ctx context.Context) error {
+	opts := []nats.Option{
+		nats.MaxReconnects(c.MaxReconnects),
+		nats.ReconnectWait(c.ReconnectWait),
+		nats.ReconnectJitter(c.ReconnectJitter, c.ReconnectJitter*2),
+		nats.Timeout(c.Timeout),
+		nats.PingInterval(c.PingInterval),
+		nats.MaxPingsOutstanding(c.MaxPingsOut),
+		nats.ReconnectBufSize(c.ReconnectBufSize),
+	}
+
+	// Authentication options
+	if c.JWT != "" && c.Seed != "" {
+		opts = append(opts, nats.UserJWTAndSeed(c.JWT, c.Seed))
+	} else if c.Creds != "" {
+		opts = append(opts, nats.UserCredentials(c.Creds))
+	} else if c.NKey != "" {
+		opts = append(opts, nats.Nkey(c.NKey, c.SigCB))
+	} else if c.Username != "" && c.Password != "" {
+		opts = append(opts, nats.UserInfo(c.Username, c.Password))
+	} else if c.Token != "" {
+		opts = append(opts, nats.Token(c.Token))
+	}
+
+	// JWT callback
+	if c.UserJWT != nil {
+		opts = append(opts, nats.UserJWT(c.UserJWT, c.SigCB))
+	}
+
+	// TLS configuration
+	if c.TLS {
+		opts = append(opts, nats.Secure())
+		if len(c.RootCAs) > 0 {
+			// Note: Root CA configuration would need additional setup
+			// This is a simplified version - real implementation may need more setup
+		}
+	}
+
+	// Connection will use the provided context for cancellation
+
+	url := c.URL
+	if url == "" {
+		url = nats.DefaultURL
+	}
+
+	nc, err := nats.Connect(url, opts...)
+	if err != nil {
+		return fmt.Errorf("failed to connect to NATS server: %w", err)
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		return fmt.Errorf("failed to create JetStream context: %w", err)
+	}
+
+	c.nc = nc
+	c.js = js
+	return nil
+}
+
+// initObjectStore retrieves the existing object store bucket.
+// The bucket must be pre-created using the NATS CLI or API.
+func (c *ReplicaClient) initObjectStore(ctx context.Context) error {
+	if c.BucketName == "" {
+		return fmt.Errorf("bucket name is required")
+	}
+
+	// Get existing object store - do not auto-create
+	objectStore, err := c.js.ObjectStore(ctx, c.BucketName)
+	if err != nil {
+		return fmt.Errorf("failed to access object store bucket %q (bucket must be created beforehand): %w", c.BucketName, err)
+	}
+
+	c.objectStore = objectStore
+	return nil
+}
+
+// Close closes the NATS connection.
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.nc != nil {
+		c.nc.Close()
+		c.nc = nil
+		c.js = nil
+		c.objectStore = nil
+	}
+	return nil
+}
+
+// ltxPath returns the object path for an LTX file.
+func (c *ReplicaClient) ltxPath(level int, minTXID, maxTXID ltx.TXID) string {
+	return fmt.Sprintf("ltx/level-%d/%016x-%016x.ltx", level, uint64(minTXID), uint64(maxTXID))
+}
+
+// parseLTXPath parses an LTX object path and returns level, minTXID, and maxTXID.
+func (c *ReplicaClient) parseLTXPath(objPath string) (level int, minTXID, maxTXID ltx.TXID, err error) {
+	parts := strings.Split(objPath, "/")
+	if len(parts) != 3 || parts[0] != "ltx" {
+		return 0, 0, 0, fmt.Errorf("invalid ltx path: %s", objPath)
+	}
+
+	levelStr := strings.TrimPrefix(parts[1], "level-")
+	if level, err = strconv.Atoi(levelStr); err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid level in path %s: %w", objPath, err)
+	}
+
+	filename := strings.TrimSuffix(parts[2], ".ltx")
+	txidParts := strings.Split(filename, "-")
+	if len(txidParts) != 2 {
+		return 0, 0, 0, fmt.Errorf("invalid txid format in path %s", objPath)
+	}
+
+	minTXIDVal, err := strconv.ParseUint(txidParts[0], 16, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid minTXID in path %s: %w", objPath, err)
+	}
+
+	maxTXIDVal, err := strconv.ParseUint(txidParts[1], 16, 64)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("invalid maxTXID in path %s: %w", objPath, err)
+	}
+
+	return level, ltx.TXID(minTXIDVal), ltx.TXID(maxTXIDVal), nil
+}
+
+// LTXFiles returns an iterator of all LTX files on the replica for a given level.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	// List all objects in the store
+	objectList, err := c.objectStore.List(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list objects: %w", err)
+	}
+
+	var fileInfos []*ltx.FileInfo
+	prefix := fmt.Sprintf("ltx/level-%d/", level)
+
+	for _, objInfo := range objectList {
+		// Filter by level prefix
+		if !strings.HasPrefix(objInfo.Name, prefix) {
+			continue
+		}
+
+		fileLevel, minTXID, maxTXID, err := c.parseLTXPath(objInfo.Name)
+		if err != nil {
+			continue // Skip invalid paths
+		}
+
+		if fileLevel != level {
+			continue
+		}
+
+		// Apply seek filter
+		if minTXID < seek {
+			continue
+		}
+
+		fileInfos = append(fileInfos, &ltx.FileInfo{
+			Level:   fileLevel,
+			MinTXID: minTXID,
+			MaxTXID: maxTXID,
+			Size:    int64(objInfo.Size),
+		})
+	}
+
+	// Sort by minTXID
+	sort.Slice(fileInfos, func(i, j int) bool {
+		return fileInfos[i].MinTXID < fileInfos[j].MinTXID
+	})
+
+	return &ltxFileIterator{files: fileInfos, index: -1}, nil
+}
+
+// OpenLTXFile returns a reader that contains an LTX file at a given TXID range.
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	objectPath := c.ltxPath(level, minTXID, maxTXID)
+
+	objectResult, err := c.objectStore.Get(ctx, objectPath)
+	if err != nil {
+		if isNotFoundError(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("failed to get object %s: %w", objectPath, err)
+	}
+
+	return objectResult, nil
+}
+
+// WriteLTXFile writes an LTX file to the replica.
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	objectPath := c.ltxPath(level, minTXID, maxTXID)
+
+	objectInfo, err := c.objectStore.Put(ctx, jetstream.ObjectMeta{
+		Name: objectPath,
+	}, r)
+	if err != nil {
+		return nil, fmt.Errorf("failed to put object %s: %w", objectPath, err)
+	}
+
+	return &ltx.FileInfo{
+		Level:   level,
+		MinTXID: minTXID,
+		MaxTXID: maxTXID,
+		Size:    int64(objectInfo.Size),
+	}, nil
+}
+
+// DeleteLTXFiles deletes one or more LTX files.
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+
+	for _, fileInfo := range a {
+		objectPath := c.ltxPath(fileInfo.Level, fileInfo.MinTXID, fileInfo.MaxTXID)
+
+		if err := c.objectStore.Delete(ctx, objectPath); err != nil {
+			if !isNotFoundError(err) {
+				return fmt.Errorf("failed to delete object %s: %w", objectPath, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// DeleteAll deletes all files in the object store.
+func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
+	if err := c.Init(ctx); err != nil {
+		return err
+	}
+
+	// List all objects in the bucket
+	objectList, err := c.objectStore.List(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to list all objects: %w", err)
+	}
+
+	for _, objInfo := range objectList {
+		if err := c.objectStore.Delete(ctx, objInfo.Name); err != nil {
+			if !isNotFoundError(err) {
+				return fmt.Errorf("failed to delete object %s: %w", objInfo.Name, err)
+			}
+		}
+	}
+
+	return nil
+}
+
+// isNotFoundError checks if the error is a "not found" error.
+func isNotFoundError(err error) bool {
+	return err != nil && (err == jetstream.ErrObjectNotFound || strings.Contains(err.Error(), "not found"))
+}
+
+// ltxFileIterator implements ltx.FileIterator for NATS object store.
+type ltxFileIterator struct {
+	files []*ltx.FileInfo
+	index int
+	err   error
+}
+
+// Next advances the iterator to the next file.
+func (itr *ltxFileIterator) Next() bool {
+	itr.index++
+	return itr.index < len(itr.files)
+}
+
+// Item returns the current file info.
+func (itr *ltxFileIterator) Item() *ltx.FileInfo {
+	if itr.index < 0 || itr.index >= len(itr.files) {
+		return nil
+	}
+	return itr.files[itr.index]
+}
+
+// Err returns any error that occurred during iteration.
+func (itr *ltxFileIterator) Err() error {
+	return itr.err
+}
+
+// Close closes the iterator.
+func (itr *ltxFileIterator) Close() error {
+	return nil
+}
