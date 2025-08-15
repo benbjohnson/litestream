@@ -19,6 +19,7 @@ import (
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -62,6 +63,15 @@ var (
 	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
 	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
 	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
+)
+
+// NATS settings
+var (
+	natsURL      = flag.String("nats-url", os.Getenv("LITESTREAM_NATS_URL"), "")
+	natsBucket   = flag.String("nats-bucket", os.Getenv("LITESTREAM_NATS_BUCKET"), "")
+	natsCreds    = flag.String("nats-creds", os.Getenv("LITESTREAM_NATS_CREDS"), "")
+	natsUsername = flag.String("nats-username", os.Getenv("LITESTREAM_NATS_USERNAME"), "")
+	natsPassword = flag.String("nats-password", os.Getenv("LITESTREAM_NATS_PASSWORD"), "")
 )
 
 func TestReplicaClient_LTX(t *testing.T) {
@@ -243,6 +253,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewABSReplicaClient(tb)
 	case sftp.ReplicaClientType:
 		return NewSFTPReplicaClient(tb)
+	case nats.ReplicaClientType:
+		return NewNATSReplicaClient(tb)
 	default:
 		tb.Fatalf("invalid replica client type: %q", typ)
 		return nil
@@ -303,6 +315,19 @@ func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
 	c.Password = *sftpPassword
 	c.KeyPath = *sftpKeyPath
 	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
+	return c
+}
+
+// NewNATSReplicaClient returns a new client for integration testing.
+func NewNATSReplicaClient(tb testing.TB) *nats.ReplicaClient {
+	tb.Helper()
+
+	c := nats.NewReplicaClient()
+	c.URL = *natsURL
+	c.BucketName = *natsBucket
+	c.Creds = *natsCreds
+	c.Username = *natsUsername
+	c.Password = *natsPassword
 	return c
 }
 
