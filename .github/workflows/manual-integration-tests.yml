@@ -31,11 +31,6 @@ on:
         required: false
         default: false
         type: boolean
-      test_nats:
-        description: 'Run NATS JetStream integration tests'
-        required: false
-        default: false
-        type: boolean
 
 jobs:
   setup:
@@ -66,8 +61,7 @@ jobs:
         run: |
           if [ "${{ github.event.inputs.test_s3 }}" != "true" ] && \
              [ "${{ github.event.inputs.test_gcs }}" != "true" ] && \
-             [ "${{ github.event.inputs.test_abs }}" != "true" ] && \
-             [ "${{ github.event.inputs.test_nats }}" != "true" ]; then
+             [ "${{ github.event.inputs.test_abs }}" != "true" ]; then
             echo "::error::At least one test type must be selected"
             exit 1
           fi
@@ -80,7 +74,6 @@ jobs:
           echo "- S3 (AWS): ${{ github.event.inputs.test_s3 }}" >> $GITHUB_STEP_SUMMARY
           echo "- Google Cloud Storage: ${{ github.event.inputs.test_gcs }}" >> $GITHUB_STEP_SUMMARY
           echo "- Azure Blob Storage: ${{ github.event.inputs.test_abs }}" >> $GITHUB_STEP_SUMMARY
-          echo "- NATS JetStream: ${{ github.event.inputs.test_nats }}" >> $GITHUB_STEP_SUMMARY
 
   s3-integration:
     name: S3 Integration Tests (AWS)
@@ -214,90 +207,10 @@ jobs:
             *.log
             test-results/
 
-  nats-integration:
-    name: NATS JetStream Integration Tests
-    runs-on: ubuntu-latest
-    needs: setup
-    if: github.event.inputs.test_nats == 'true'
-    concurrency:
-      group: integration-test-nats-manual
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.setup.outputs.ref }}
-
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: "go.mod"
-
-      - name: Start NATS Server with JetStream
-        run: |
-          docker run -d \
-            --name nats-test \
-            -p 4222:4222 \
-            -p 8222:8222 \
-            nats:latest \
-            -js \
-            -DV
-
-          # Wait for NATS to be ready
-          echo "Waiting for NATS server to be ready..."
-          for i in {1..30}; do
-            if nc -z localhost 4222; then
-              echo "NATS server is ready"
-              break
-            fi
-            echo "Waiting for NATS server... ($i/30)"
-            sleep 1
-          done
-
-      - name: Create NATS Object Store Bucket
-        run: |
-          # Install NATS CLI - get latest version
-          NATS_VERSION=$(curl -s https://api.github.com/repos/nats-io/natscli/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
-          wget "https://github.com/nats-io/natscli/releases/download/v${NATS_VERSION}/nats-${NATS_VERSION}-linux-amd64.zip" -O nats.zip
-          unzip nats.zip
-          sudo mv "nats-${NATS_VERSION}-linux-amd64/nats" /usr/local/bin/
-          sudo chmod +x /usr/local/bin/nats
-
-          # Create the object store bucket
-          nats object add litestream-test --max-bucket-size=100M --replicas=1
-
-      - run: go env
-
-      - run: go install ./cmd/litestream
-
-      - run: go test -v ./replica_client_test.go -integration nats
-        env:
-          LITESTREAM_NATS_URL: "nats://localhost:4222"
-          LITESTREAM_NATS_BUCKET: "litestream-test"
-
-      - name: Cleanup
-        if: always()
-        run: |
-          docker stop nats-test || true
-          docker rm nats-test || true
-
-      - name: Create test results directory
-        if: always()
-        run: |
-          mkdir -p test-results
-          echo "Test completed at $(date)" > test-results/nats-test.log
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: nats-test-results
-          path: |
-            *.log
-            test-results/
-
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [setup, s3-integration, gcs-integration, abs-integration, nats-integration]
+    needs: [setup, s3-integration, gcs-integration, abs-integration]
     if: always()
     steps:
       - name: Download all artifacts
@@ -337,14 +250,6 @@ jobs:
             echo "⏭️ **Azure Blob Storage:** Skipped" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ "${{ needs.nats-integration.result }}" == "success" ]; then
-            echo "✅ **NATS JetStream:** Passed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.nats-integration.result }}" == "failure" ]; then
-            echo "❌ **NATS JetStream:** Failed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.nats-integration.result }}" == "skipped" ]; then
-            echo "⏭️ **NATS JetStream:** Skipped" >> $GITHUB_STEP_SUMMARY
-          fi
-
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
@@ -367,7 +272,6 @@ jobs:
             if ('${{ needs.s3-integration.result }}' === 'failure') failedJobs.push('S3');
             if ('${{ needs.gcs-integration.result }}' === 'failure') failedJobs.push('GCS');
             if ('${{ needs.abs-integration.result }}' === 'failure') failedJobs.push('Azure');
-            if ('${{ needs.nats-integration.result }}' === 'failure') failedJobs.push('NATS');
 
             if (failedJobs.length > 0) {
               statusEmoji = '❌';
