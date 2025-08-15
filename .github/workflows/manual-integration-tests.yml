@@ -254,10 +254,11 @@ jobs:
 
       - name: Create NATS Object Store Bucket
         run: |
-          # Install NATS CLI
-          curl -L https://github.com/nats-io/natscli/releases/latest/download/nats-linux-amd64.zip -o nats.zip
+          # Install NATS CLI - get latest version
+          NATS_VERSION=$(curl -s https://api.github.com/repos/nats-io/natscli/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          wget "https://github.com/nats-io/natscli/releases/download/v${NATS_VERSION}/nats-${NATS_VERSION}-linux-amd64.zip" -O nats.zip
           unzip nats.zip
-          sudo mv nats /usr/local/bin/
+          sudo mv "nats-${NATS_VERSION}-linux-amd64/nats" /usr/local/bin/
           sudo chmod +x /usr/local/bin/nats
 
           # Create the object store bucket
