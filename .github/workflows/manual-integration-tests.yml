@@ -262,7 +262,7 @@ jobs:
           sudo chmod +x /usr/local/bin/nats
 
           # Create the object store bucket
-          nats object add litestream-test --size=100M --replicas=1
+          nats object add litestream-test --max-bucket-size=100M --replicas=1
 
       - run: go env
 
