@@ -102,6 +102,64 @@ jobs:
 
       - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration s3
 
+  nats-docker-test:
+    name: Run NATS Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Start NATS Server with JetStream
+        run: |
+          docker run -d \
+            --name nats-test \
+            -p 4222:4222 \
+            -p 8222:8222 \
+            nats:latest \
+            -js \
+            -DV
+
+          # Wait for NATS to be ready
+          echo "Waiting for NATS server to be ready..."
+          for i in {1..30}; do
+            if nc -z localhost 4222; then
+              echo "NATS server is ready"
+              break
+            fi
+            echo "Waiting for NATS server... ($i/30)"
+            sleep 1
+          done
+
+      - name: Create NATS Object Store Bucket
+        run: |
+          # Install NATS CLI
+          curl -L https://github.com/nats-io/natscli/releases/latest/download/nats-linux-amd64.zip -o nats.zip
+          unzip nats.zip
+          sudo mv nats /usr/local/bin/
+          sudo chmod +x /usr/local/bin/nats
+
+          # Create the object store bucket
+          nats object add litestream-test --size=100M --replicas=1
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration nats
+        env:
+          LITESTREAM_NATS_URL: "nats://localhost:4222"
+          LITESTREAM_NATS_BUCKET: "litestream-test"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop nats-test || true
+          docker rm nats-test || true
+
   s3-integration-test:
     name: Run S3 Integration Tests
     runs-on: ubuntu-latest

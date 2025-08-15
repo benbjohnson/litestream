@@ -5,6 +5,7 @@ This document provides instructions for testing the NATS replica client implemen
 ## Prerequisites
 
 1. Install NATS server (or use Docker):
+
 ```bash
 # Using Docker
 docker run -p 4222:4222 -p 8222:8222 nats:latest -js
@@ -15,6 +16,7 @@ brew install nats-server  # macOS
 ```
 
 2. Install NATS CLI tools:
+
 ```bash
 brew install nats-io/nats-tools/nats  # macOS
 # or download from https://github.com/nats-io/natscli/releases
@@ -112,6 +114,7 @@ docker rm nats-test
 ### JWT/NKey Authentication
 
 1. Generate credentials:
+
 ```bash
 # Create an operator
 nsc add operator TestOperator
@@ -127,6 +130,7 @@ nsc generate creds -n TestUser > user.creds
 ```
 
 2. Configure Litestream:
+
 ```yaml
 dbs:
   - path: /tmp/test.db
@@ -140,6 +144,7 @@ dbs:
 ### Username/Password Authentication
 
 1. Create a NATS server config with auth:
+
 ```conf
 # nats-auth.conf
 jetstream: enabled
@@ -151,11 +156,13 @@ authorization {
 ```
 
 2. Start NATS with config:
+
 ```bash
 nats-server -c nats-auth.conf
 ```
 
 3. Configure Litestream:
+
 ```yaml
 dbs:
   - path: /tmp/test.db
