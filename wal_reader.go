@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -194,7 +195,7 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	data := make([]byte, r.pageSize)
 	for i := 0; ; i++ {
 		pgno, fcommit, err := r.ReadFrame(ctx, data)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
 			return nil, 0, 0, err

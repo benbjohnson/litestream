@@ -713,7 +713,7 @@ func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bo
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
-		if err := dec.DecodePage(&hdr, buf); err == io.EOF {
+		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
 			return false, nil
 		} else if err != nil {
 			return false, fmt.Errorf("decode ltx page: %w", err)

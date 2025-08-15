@@ -2,6 +2,7 @@ package litestream_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -47,13 +48,13 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 
 		// Re-compacting immediately should return an error that it's too soon.
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != litestream.ErrCompactionTooEarly {
+		if _, err := s.CompactDB(t.Context(), db0, levels[1]); !errors.Is(err, litestream.ErrCompactionTooEarly) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 
 		// Re-compacting after the interval should show that there is nothing to compact.
 		time.Sleep(levels[1].Interval)
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != litestream.ErrNoCompaction {
+		if _, err := s.CompactDB(t.Context(), db0, levels[1]); !errors.Is(err, litestream.ErrNoCompaction) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})

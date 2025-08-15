@@ -2,6 +2,7 @@ package litestream_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -206,7 +207,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 
 		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
-		if err != litestream.ErrTxNotAvailable {
+		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
 	})
@@ -219,7 +220,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		r := litestream.NewReplicaWithClient(db, &c)
 
 		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
-		if err != litestream.ErrTxNotAvailable {
+		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
 	})
