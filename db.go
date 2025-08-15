@@ -375,7 +375,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	// Enable WAL and ensure it is set. New mode should be returned on success:
 	// https://www.sqlite.org/pragma.html#pragma_journal_mode
 	var mode string
-	if err := db.db.QueryRow(`PRAGMA journal_mode = wal;`).Scan(&mode); err != nil {
+	if err := db.db.QueryRowContext(ctx, `PRAGMA journal_mode = wal;`).Scan(&mode); err != nil {
 		return err
 	} else if mode != "wal" {
 		return fmt.Errorf("enable wal failed, mode=%q", mode)
@@ -388,13 +388,13 @@ func (db *DB) init(ctx context.Context) (err error) {
 
 	// Create a table to force writes to the WAL when empty.
 	// There should only ever be one row with id=1.
-	if _, err := db.db.Exec(`CREATE TABLE IF NOT EXISTS _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);`); err != nil {
+	if _, err := db.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _litestream_seq (id INTEGER PRIMARY KEY, seq INTEGER);`); err != nil {
 		return fmt.Errorf("create _litestream_seq table: %w", err)
 	}
 
 	// Create a lock table to force write locks during sync.
 	// The sync write transaction always rolls back so no data should be in this table.
-	if _, err := db.db.Exec(`CREATE TABLE IF NOT EXISTS _litestream_lock (id INTEGER);`); err != nil {
+	if _, err := db.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS _litestream_lock (id INTEGER);`); err != nil {
 		return fmt.Errorf("create _litestream_lock table: %w", err)
 	}
 
@@ -405,7 +405,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Read page size.
-	if err := db.db.QueryRow(`PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
+	if err := db.db.QueryRowContext(ctx, `PRAGMA page_size;`).Scan(&db.pageSize); err != nil {
 		return fmt.Errorf("read page size: %w", err)
 	} else if db.pageSize <= 0 {
 		return fmt.Errorf("invalid db page size: %d", db.pageSize)
@@ -417,7 +417,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Ensure WAL has at least one frame in it.
-	if err := db.ensureWALExists(); err != nil {
+	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
@@ -485,7 +485,7 @@ func (db *DB) acquireReadLock(ctx context.Context) error {
 	}
 
 	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.Begin()
+	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
@@ -538,7 +538,7 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}()
 
 	// Ensure WAL has at least one frame in it.
-	if err := db.ensureWALExists(); err != nil {
+	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
@@ -606,14 +606,14 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) error {
 }
 
 // ensureWALExists checks that the real WAL exists and has a header.
-func (db *DB) ensureWALExists() (err error) {
+func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	// Exit early if WAL header exists.
 	if fi, err := os.Stat(db.WALPath()); err == nil && fi.Size() >= WALHeaderSize {
 		return nil
 	}
 
 	// Otherwise create transaction that updates the internal litestream table.
-	_, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
+	_, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
 	return err
 }
 
@@ -1019,7 +1019,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	// a new page is written.
 	if err := db.execCheckpoint(ctx, mode); err != nil {
 		return err
-	} else if _, err = db.db.Exec(`INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
+	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
 		return err
 	}
 
@@ -1031,7 +1031,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Start a transaction. This will be promoted immediately after.
-	tx, err := db.db.Begin()
+	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
 	}
@@ -1090,7 +1090,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
 	var row [3]int
-	if err := db.db.QueryRow(rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
+	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
 		return err
 	}
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
