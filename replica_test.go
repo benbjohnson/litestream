@@ -63,7 +63,7 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Execute a query to write something into the truncated WAL.
-	if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -73,7 +73,7 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Save position after sync, it should be after our write.
-	dpos, err = db.Pos()
+	_, err = db.Pos()
 	if err != nil {
 		t.Fatal(err)
 	}

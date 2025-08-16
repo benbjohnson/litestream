@@ -1,7 +1,6 @@
 package litestream_test
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -30,16 +29,16 @@ func TestStore_CompactDB(t *testing.T) {
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		defer s.Close()
+		defer s.Close(t.Context())
 
-		if _, err := sqldb0.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb0.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Sync(context.Background()); err != nil {
+		} else if err := db0.Sync(t.Context()); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Replica.Sync(context.Background()); err != nil {
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -73,16 +72,16 @@ func TestStore_CompactDB(t *testing.T) {
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		defer s.Close()
+		defer s.Close(t.Context())
 
-		if _, err := sqldb0.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb0.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Sync(context.Background()); err != nil {
+		} else if err := db0.Sync(t.Context()); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Replica.Sync(context.Background()); err != nil {
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -123,10 +122,10 @@ func TestStore_Integration(t *testing.T) {
 	if err := store.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer store.Close(t.Context())
 
 	// Create initial table
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
 		t.Fatal(err)
 	}
 

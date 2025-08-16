@@ -790,7 +790,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	} else {
 		// If we cannot verify the previous frame
 		var pfmError *PrevFrameMismatchError
-		if rd, err = NewWALReaderWithOffset(walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
+		if rd, err = NewWALReaderWithOffset(ctx, walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
 			db.Logger.Log(ctx, internal.LevelTrace, "prev frame mismatch, snapshotting", "err", pfmError.Err)
 			info.offset = WALHeaderSize
 			if rd, err = NewWALReader(walFile, db.Logger); err != nil {

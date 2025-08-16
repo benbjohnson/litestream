@@ -114,7 +114,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Setup signal handler.
 		signalCh := signalChan()
 
-		if err := c.Run(); err != nil {
+		if err := c.Run(ctx); err != nil {
 			return err
 		}
 
@@ -139,7 +139,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Gracefully close.
-		if e := c.Close(); e != nil && err == nil {
+		if e := c.Close(ctx); e != nil && err == nil {
 			err = e
 		}
 		slog.Info("litestream shut down")

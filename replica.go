@@ -188,7 +188,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
-// Retuns nil if no files exist for the level.
+// Returns nil if no files exist for the level.
 func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileInfo, err error) {
 	itr, err := r.Client.LTXFiles(ctx, level, 0)
 	if err != nil {

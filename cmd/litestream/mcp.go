@@ -66,7 +66,7 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// Close attemps to gracefully shutdown the server.
+// Close attempts to gracefully shutdown the server.
 func (s *MCPServer) Close() error {
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()

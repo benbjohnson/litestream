@@ -99,13 +99,13 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 }
 
 // Run loads all databases specified in the configuration.
-func (c *ReplicateCommand) Run() (err error) {
+func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	// Display version information.
 	slog.Info("litestream", "version", Version, "level", c.Config.Logging.Level)
 
 	// Start MCP server if enabled
 	if c.Config.MCPAddr != "" {
-		c.MCP, err = NewMCP(context.Background(), c.Config.ConfigPath)
+		c.MCP, err = NewMCP(ctx, c.Config.ConfigPath)
 		if err != nil {
 			return err
 		}
@@ -136,7 +136,7 @@ func (c *ReplicateCommand) Run() (err error) {
 	if c.Config.Snapshot.Retention != nil {
 		c.Store.SnapshotRetention = *c.Config.Snapshot.Retention
 	}
-	if err := c.Store.Open(context.Background()); err != nil {
+	if err := c.Store.Open(ctx); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
@@ -188,7 +188,7 @@ func (c *ReplicateCommand) Run() (err error) {
 			return fmt.Errorf("cannot parse exec command: %w", err)
 		}
 
-		c.cmd = exec.Command(execArgs[0], execArgs[1:]...)
+		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
 		c.cmd.Env = os.Environ()
 		c.cmd.Stdout = os.Stdout
 		c.cmd.Stderr = os.Stderr
@@ -202,8 +202,8 @@ func (c *ReplicateCommand) Run() (err error) {
 }
 
 // Close closes all open databases.
-func (c *ReplicateCommand) Close() error {
-	if err := c.Store.Close(); err != nil {
+func (c *ReplicateCommand) Close(ctx context.Context) error {
+	if err := c.Store.Close(ctx); err != nil {
 		slog.Error("failed to close database", "error", err)
 	}
 	if c.Config.MCPAddr != "" {
