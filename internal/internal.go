@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-const LevelTrace = slog.Level(slog.LevelDebug - 4)
+const LevelTrace = slog.LevelDebug - 4
 
 // ReadCloser wraps a reader to also attach a separate closer.
 type ReadCloser struct {
