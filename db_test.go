@@ -683,6 +683,7 @@ func MustCloseDBs(tb testing.TB, db *litestream.DB, sqldb *sql.DB) {
 
 // MustOpenDB returns a new instance of a DB.
 func MustOpenDB(tb testing.TB) *litestream.DB {
+	tb.Helper()
 	dir := tb.TempDir()
 	return MustOpenDBAt(tb, filepath.Join(dir, "db"))
 }
