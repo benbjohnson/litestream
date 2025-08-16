@@ -3,12 +3,16 @@ package main_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"filippo.io/age"
+
+	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
@@ -621,4 +625,229 @@ func TestConfig_DefaultValues(t *testing.T) {
 	} else if *config.Snapshot.Retention != 24*time.Hour {
 		t.Errorf("expected default snapshot retention of 24h, got %v", *config.Snapshot.Retention)
 	}
+}
+
+func TestReplicaConfig_AgeIdentityFiles(t *testing.T) {
+	t.Run("ValidIdentityFile", func(t *testing.T) {
+		// Create a temporary directory for test files
+		dir := t.TempDir()
+
+		// Create a test database
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		// Generate a test age identity
+		identity, err := age.GenerateX25519Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Write identity to file with secure permissions
+		identityPath := filepath.Join(dir, "identity.key")
+		identityContent := identity.String() + "\n"
+		if err := os.WriteFile(identityPath, []byte(identityContent), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create replica config with identity file
+		config := &main.ReplicaConfig{
+			URL: "file:///tmp/replica",
+		}
+		config.Age.IdentityFiles = []string{identityPath}
+
+		// Create replica from config
+		replica, err := main.NewReplicaFromConfig(config, db)
+		if err != nil {
+			t.Fatalf("failed to create replica: %v", err)
+		}
+
+		// Verify identity was loaded
+		if len(replica.AgeIdentities) != 1 {
+			t.Errorf("expected 1 identity, got %d", len(replica.AgeIdentities))
+		}
+	})
+
+	t.Run("MultipleIdentityFiles", func(t *testing.T) {
+		dir := t.TempDir()
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		// Create multiple identity files
+		var paths []string
+		for i := range 3 {
+			identity, err := age.GenerateX25519Identity()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			path := filepath.Join(dir, fmt.Sprintf("identity%d.key", i))
+			if err := os.WriteFile(path, []byte(identity.String()+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			paths = append(paths, path)
+		}
+
+		// Create replica config
+		config := &main.ReplicaConfig{
+			URL: "file:///tmp/replica",
+		}
+		config.Age.IdentityFiles = paths
+
+		// Create replica from config
+		replica, err := main.NewReplicaFromConfig(config, db)
+		if err != nil {
+			t.Fatalf("failed to create replica: %v", err)
+		}
+
+		// Verify all identities were loaded
+		if len(replica.AgeIdentities) != 3 {
+			t.Errorf("expected 3 identities, got %d", len(replica.AgeIdentities))
+		}
+	})
+
+	t.Run("NonExistentFile", func(t *testing.T) {
+		dir := t.TempDir()
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		config := &main.ReplicaConfig{
+			URL: "file:///tmp/replica",
+		}
+		config.Age.IdentityFiles = []string{"/nonexistent/identity.key"}
+
+		// Should fail with appropriate error
+		_, err := main.NewReplicaFromConfig(config, db)
+		if err == nil {
+			t.Error("expected error for nonexistent file")
+		}
+		if !strings.Contains(err.Error(), "cannot open identity file") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("MalformedIdentityFile", func(t *testing.T) {
+		dir := t.TempDir()
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		// Write invalid identity content
+		invalidPath := filepath.Join(dir, "invalid.key")
+		if err := os.WriteFile(invalidPath, []byte("not-a-valid-age-identity\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		config := &main.ReplicaConfig{
+			URL: "file:///tmp/replica",
+		}
+		config.Age.IdentityFiles = []string{invalidPath}
+
+		// Should fail with parse error
+		_, err := main.NewReplicaFromConfig(config, db)
+		if err == nil {
+			t.Error("expected error for malformed identity")
+		}
+		if !strings.Contains(err.Error(), "cannot parse identities") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("EmptyIdentityFile", func(t *testing.T) {
+		dir := t.TempDir()
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		// Create empty file with secure permissions
+		emptyPath := filepath.Join(dir, "empty.key")
+		if err := os.WriteFile(emptyPath, []byte(""), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		config := &main.ReplicaConfig{
+			URL: "file:///tmp/replica",
+		}
+		config.Age.IdentityFiles = []string{emptyPath}
+
+		// Should fail as no identities found
+		_, err := main.NewReplicaFromConfig(config, db)
+		if err == nil {
+			t.Error("expected error for empty identity file")
+		}
+		if !strings.Contains(err.Error(), "no secret keys found") && !strings.Contains(err.Error(), "cannot parse identities") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("MixedIdentityFilesAndInline", func(t *testing.T) {
+		dir := t.TempDir()
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		// Create file identity
+		fileIdentity, err := age.GenerateX25519Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		identityPath := filepath.Join(dir, "identity.key")
+		if err := os.WriteFile(identityPath, []byte(fileIdentity.String()+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create inline identity
+		inlineIdentity, err := age.GenerateX25519Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		config := &main.ReplicaConfig{
+			URL: "file:///tmp/replica",
+		}
+		config.Age.IdentityFiles = []string{identityPath}
+		config.Age.Identities = []string{inlineIdentity.String()}
+
+		// Should load both identities (with deprecation warning for inline)
+		replica, err := main.NewReplicaFromConfig(config, db)
+		if err != nil {
+			t.Fatalf("failed to create replica: %v", err)
+		}
+
+		// Verify both identities were loaded
+		if len(replica.AgeIdentities) != 2 {
+			t.Errorf("expected 2 identities, got %d", len(replica.AgeIdentities))
+		}
+	})
+
+	t.Run("RecipientHandling", func(t *testing.T) {
+		dir := t.TempDir()
+		db := litestream.NewDB(filepath.Join(dir, "test.db"))
+
+		// Generate identity and get its recipient
+		identity, err := age.GenerateX25519Identity()
+		if err != nil {
+			t.Fatal(err)
+		}
+		recipient := identity.Recipient().String()
+
+		// Write identity to file
+		identityPath := filepath.Join(dir, "identity.key")
+		if err := os.WriteFile(identityPath, []byte(identity.String()+"\n"), 0600); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create config with both identity file and recipient
+		interval := 10 * time.Second
+		config := &main.ReplicaConfig{
+			URL:          "file:///tmp/replica",
+			SyncInterval: &interval,
+		}
+		config.Age.IdentityFiles = []string{identityPath}
+		config.Age.Recipients = []string{recipient}
+
+		// Create replica from config
+		replica, err := main.NewReplicaFromConfig(config, db)
+		if err != nil {
+			t.Fatalf("failed to create replica: %v", err)
+		}
+
+		// Verify both identity and recipient were loaded
+		if len(replica.AgeIdentities) != 1 {
+			t.Errorf("expected 1 identity, got %d", len(replica.AgeIdentities))
+		}
+		if len(replica.AgeRecipients) != 1 {
+			t.Errorf("expected 1 recipient, got %d", len(replica.AgeRecipients))
+		}
+	})
 }

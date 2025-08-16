@@ -6,7 +6,7 @@ toolchain go1.24.3
 
 require (
 	cloud.google.com/go/storage v1.36.0
-	filippo.io/age v1.1.1
+	filippo.io/age v1.2.1
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.2
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.11.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.2

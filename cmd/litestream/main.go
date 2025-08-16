@@ -575,8 +575,9 @@ type ReplicaConfig struct {
 
 	// Encryption identities and recipients
 	Age struct {
-		Identities []string `yaml:"identities"`
-		Recipients []string `yaml:"recipients"`
+		IdentityFiles []string `yaml:"identity-files"`
+		Identities    []string `yaml:"identities"`
+		Recipients    []string `yaml:"recipients"`
 	} `yaml:"age"`
 }
 
@@ -591,6 +592,30 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	r := litestream.NewReplica(db)
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
+	}
+	for _, path := range c.Age.IdentityFiles {
+		// Open file directly to pass to ParseIdentities
+		// This is more efficient than ReadFile + string conversion and respects
+		// the age library's internal 16MB size limit
+		file, err := os.Open(path)
+		if err != nil {
+			return nil, fmt.Errorf("cannot open identity file %q: %w", path, err)
+		}
+		defer file.Close()
+
+		// Parse identities using the file handle directly
+		identities, err := age.ParseIdentities(file)
+		if err != nil {
+			return nil, fmt.Errorf("cannot parse identities from %q: %w", path, err)
+		}
+
+		r.AgeIdentities = append(r.AgeIdentities, identities...)
+	}
+	// Handle legacy inline identities (deprecated)
+	if len(c.Age.Identities) > 0 {
+		slog.Warn("Using 'identities' field with inline keys is deprecated and insecure",
+			"recommendation", "Use 'identity-files' to reference key files instead",
+			"docs", "https://github.com/benbjohnson/litestream/blob/main/docs/encryption.md")
 	}
 	for _, str := range c.Age.Identities {
 		identities, err := age.ParseIdentities(strings.NewReader(str))
