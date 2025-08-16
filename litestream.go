@@ -35,7 +35,7 @@ var (
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 )
 
-// SQLite WAL constants
+// SQLite WAL constants.
 const (
 	WALHeaderChecksumOffset      = 24
 	WALFrameHeaderChecksumOffset = 16
@@ -135,12 +135,12 @@ func removeTmpFiles(root string) error {
 	})
 }
 
-// LTXDir returns the path to an LTX directory
+// LTXDir returns the path to an LTX directory.
 func LTXDir(root string) string {
 	return path.Join(root, "ltx")
 }
 
-// LTXLevelDir returns the path to an LTX level directory
+// LTXLevelDir returns the path to an LTX level directory.
 func LTXLevelDir(root string, level int) string {
 	return path.Join(LTXDir(root), strconv.Itoa(level))
 }
