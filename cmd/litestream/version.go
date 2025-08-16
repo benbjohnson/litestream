@@ -10,7 +10,7 @@ import (
 type VersionCommand struct{}
 
 // Run executes the command.
-func (c *VersionCommand) Run(ctx context.Context, args []string) (err error) {
+func (c *VersionCommand) Run(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-version", flag.ContinueOnError)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {

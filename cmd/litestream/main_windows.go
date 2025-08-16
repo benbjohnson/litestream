@@ -68,7 +68,7 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 	}
 
 	// Execute replication command.
-	if err := c.Run(); err != nil {
+	if err := c.Run(s.ctx); err != nil {
 		slog.Error("cannot replicate", "error", err)
 		statusCh <- svc.Status{State: svc.StopPending}
 		return true, 2
@@ -82,7 +82,7 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 		case req := <-r:
 			switch req.Cmd {
 			case svc.Stop:
-				c.Close()
+				c.Close(s.ctx)
 				statusCh <- svc.Status{State: svc.StopPending}
 				return false, windows.NO_ERROR
 			case svc.Interrogate:

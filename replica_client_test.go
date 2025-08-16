@@ -76,6 +76,7 @@ var (
 
 func TestReplicaClient_LTX(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		// Write files out of order to check for sorting.
@@ -125,6 +126,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 	})
 
 	RunWithReplicaClient(t, "NoWALs", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		itr, err := c.LTXFiles(context.Background(), 0, 0)
@@ -141,6 +143,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 
 func TestReplicaClient_WriteLTXFile(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), strings.NewReader(`foobar`)); err != nil {
@@ -170,6 +173,7 @@ func TestReplicaClient_WriteLTXFile(t *testing.T) {
 
 func TestReplicaClient_OpenLTXFile(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), strings.NewReader(`foobar`)); err != nil {
 			t.Fatal(err)
@@ -189,6 +193,7 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 	})
 
 	RunWithReplicaClient(t, "ErrNotFound", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(1)); !os.IsNotExist(err) {
@@ -199,6 +204,7 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 
 func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), strings.NewReader(`foo`)); err != nil {
@@ -361,6 +367,7 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 	}
 
 	RunWithReplicaClient(t, "LargeFileWithCustomConfig", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		// Type assert to S3 client to set custom config
@@ -427,6 +434,7 @@ func TestReplicaClient_S3_ErrorContext(t *testing.T) {
 	}
 
 	RunWithReplicaClient(t, "ErrorContext", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
 		t.Parallel()
 
 		// Test OpenLTXFile with non-existent file

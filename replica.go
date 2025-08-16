@@ -149,7 +149,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
-		if err = r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
@@ -188,7 +188,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
-// Retuns nil if no files exist for the level.
+// Returns nil if no files exist for the level.
 func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileInfo, err error) {
 	itr, err := r.Client.LTXFiles(ctx, level, 0)
 	if err != nil {
@@ -417,10 +417,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
-	var rdrs []io.Reader
+	rdrs := make([]io.Reader, 0, len(infos))
 	defer func() {
 		for _, rd := range rdrs {
-			_ = rd.(io.Closer).Close()
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
 		}
 	}()
 
@@ -470,11 +472,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Copy file to final location.
 	r.Logger().Debug("renaming database from temporary location")
-	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
-		return err
-	}
-
-	return nil
+	return os.Rename(tmpOutputPath, opt.OutputPath)
 }
 
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.

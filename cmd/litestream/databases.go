@@ -12,7 +12,7 @@ import (
 type DatabasesCommand struct{}
 
 // Run executes the command.
-func (c *DatabasesCommand) Run(ctx context.Context, args []string) (err error) {
+func (c *DatabasesCommand) Run(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-databases", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage

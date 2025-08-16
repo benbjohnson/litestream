@@ -2,6 +2,7 @@ package litestream_test
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -62,7 +63,7 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Execute a query to write something into the truncated WAL.
-	if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -72,7 +73,7 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// Save position after sync, it should be after our write.
-	dpos, err = db.Pos()
+	_, err = db.Pos()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +207,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 
 		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
-		if err != litestream.ErrTxNotAvailable {
+		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
 	})
@@ -219,7 +220,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		r := litestream.NewReplicaWithClient(db, &c)
 
 		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
-		if err != litestream.ErrTxNotAvailable {
+		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
 	})

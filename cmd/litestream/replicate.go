@@ -44,7 +44,7 @@ func NewReplicateCommand() *ReplicateCommand {
 }
 
 // ParseFlags parses the CLI flags and loads the configuration file.
-func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
+func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
 	configPath, noExpandEnv := registerConfigFlag(fs)
@@ -54,9 +54,22 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	}
 
 	// Load configuration or use CLI args to build db/replica.
-	if fs.NArg() == 1 {
+	switch fs.NArg() {
+	case 0:
+		// No arguments provided, use config file
+		if *configPath == "" {
+			*configPath = DefaultConfigPath()
+		}
+		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
+			return err
+		}
+
+	case 1:
+		// Only database path provided, missing replica URL
 		return fmt.Errorf("must specify at least one replica URL for %s", fs.Arg(0))
-	} else if fs.NArg() > 1 {
+
+	default:
+		// Database path and replica URLs provided via CLI
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
@@ -73,14 +86,8 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			})
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
-	} else {
-		if *configPath == "" {
-			*configPath = DefaultConfigPath()
-		}
-		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
-			return err
-		}
 	}
+
 	c.Config.ConfigPath = *configPath
 
 	// Override config exec command, if specified.
@@ -92,13 +99,13 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 }
 
 // Run loads all databases specified in the configuration.
-func (c *ReplicateCommand) Run() (err error) {
+func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	// Display version information.
 	slog.Info("litestream", "version", Version, "level", c.Config.Logging.Level)
 
 	// Start MCP server if enabled
 	if c.Config.MCPAddr != "" {
-		c.MCP, err = NewMCP(context.Background(), c.Config.ConfigPath)
+		c.MCP, err = NewMCP(ctx, c.Config.ConfigPath)
 		if err != nil {
 			return err
 		}
@@ -110,7 +117,7 @@ func (c *ReplicateCommand) Run() (err error) {
 		slog.Error("no databases specified in configuration")
 	}
 
-	var dbs []*litestream.DB
+	dbs := make([]*litestream.DB, 0, len(c.Config.DBs))
 	for _, dbConfig := range c.Config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {
@@ -129,7 +136,7 @@ func (c *ReplicateCommand) Run() (err error) {
 	if c.Config.Snapshot.Retention != nil {
 		c.Store.SnapshotRetention = *c.Config.Snapshot.Retention
 	}
-	if err := c.Store.Open(context.Background()); err != nil {
+	if err := c.Store.Open(ctx); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
@@ -137,22 +144,22 @@ func (c *ReplicateCommand) Run() (err error) {
 	for _, db := range c.Store.DBs() {
 		r := db.Replica
 		slog.Info("initialized db", "path", db.Path())
-		slog := slog.With("type", r.Client.Type(), "sync-interval", r.SyncInterval)
+		slogWith := slog.With("type", r.Client.Type(), "sync-interval", r.SyncInterval)
 		switch client := r.Client.(type) {
 		case *file.ReplicaClient:
-			slog.Info("replicating to", "path", client.Path())
+			slogWith.Info("replicating to", "path", client.Path())
 		case *s3.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region, "endpoint", client.Endpoint)
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region, "endpoint", client.Endpoint)
 		case *gs.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
 		case *abs.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
 		case *sftp.ReplicaClient:
-			slog.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
+			slogWith.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
 		case *nats.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.BucketName, "url", client.URL)
+			slogWith.Info("replicating to", "bucket", client.BucketName, "url", client.URL)
 		default:
-			slog.Info("replicating to")
+			slogWith.Info("replicating to")
 		}
 	}
 
@@ -181,7 +188,7 @@ func (c *ReplicateCommand) Run() (err error) {
 			return fmt.Errorf("cannot parse exec command: %w", err)
 		}
 
-		c.cmd = exec.Command(execArgs[0], execArgs[1:]...)
+		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
 		c.cmd.Env = os.Environ()
 		c.cmd.Stdout = os.Stdout
 		c.cmd.Stderr = os.Stderr
@@ -195,16 +202,16 @@ func (c *ReplicateCommand) Run() (err error) {
 }
 
 // Close closes all open databases.
-func (c *ReplicateCommand) Close() (err error) {
-	if e := c.Store.Close(); e != nil {
-		slog.Error("failed to close database", "error", e)
+func (c *ReplicateCommand) Close(ctx context.Context) error {
+	if err := c.Store.Close(ctx); err != nil {
+		slog.Error("failed to close database", "error", err)
 	}
 	if c.Config.MCPAddr != "" {
 		if err := c.MCP.Close(); err != nil {
 			slog.Error("error closing MCP server", "error", err)
 		}
 	}
-	return err
+	return nil
 }
 
 // Usage prints the help screen to STDOUT.

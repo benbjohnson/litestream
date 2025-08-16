@@ -107,9 +107,9 @@ func (s *Store) Open(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) Close() (err error) {
+func (s *Store) Close(ctx context.Context) (err error) {
 	for _, db := range s.dbs {
-		if e := db.Close(context.Background()); e != nil && err == nil {
+		if e := db.Close(ctx); e != nil && err == nil {
 			err = e
 		}
 	}

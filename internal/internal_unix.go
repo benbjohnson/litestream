@@ -13,7 +13,10 @@ func Fileinfo(fi os.FileInfo) (uid, gid int) {
 	if fi == nil {
 		return -1, -1
 	}
-	stat := fi.Sys().(*syscall.Stat_t)
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1, -1
+	}
 	return int(stat.Uid), int(stat.Gid)
 }
 

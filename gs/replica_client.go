@@ -2,6 +2,7 @@ package gs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -70,7 +71,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "LIST").Inc()
 	for it := c.bkt.Objects(ctx, &storage.Query{Prefix: c.Path + "/"}); ; {
 		attrs, err := it.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			break
 		} else if err != nil {
 			return err
@@ -201,7 +202,7 @@ func (itr *ltxFileIterator) Next() bool {
 	for {
 		// Fetch next object.
 		attrs, err := itr.it.Next()
-		if err == iterator.Done {
+		if errors.Is(err, iterator.Done) {
 			return false
 		} else if err != nil {
 			itr.err = err
@@ -233,5 +234,5 @@ func (itr *ltxFileIterator) Item() *ltx.FileInfo {
 }
 
 func isNotExists(err error) bool {
-	return err == storage.ErrObjectNotExist
+	return errors.Is(err, storage.ErrObjectNotExist)
 }

@@ -1,7 +1,7 @@
 package litestream_test
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -29,16 +29,16 @@ func TestStore_CompactDB(t *testing.T) {
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		defer s.Close()
+		defer s.Close(t.Context())
 
-		if _, err := sqldb0.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb0.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Sync(context.Background()); err != nil {
+		} else if err := db0.Sync(t.Context()); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Replica.Sync(context.Background()); err != nil {
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -47,13 +47,13 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 
 		// Re-compacting immediately should return an error that it's too soon.
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != litestream.ErrCompactionTooEarly {
+		if _, err := s.CompactDB(t.Context(), db0, levels[1]); !errors.Is(err, litestream.ErrCompactionTooEarly) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 
 		// Re-compacting after the interval should show that there is nothing to compact.
 		time.Sleep(levels[1].Interval)
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != litestream.ErrNoCompaction {
+		if _, err := s.CompactDB(t.Context(), db0, levels[1]); !errors.Is(err, litestream.ErrNoCompaction) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -72,16 +72,16 @@ func TestStore_CompactDB(t *testing.T) {
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
-		defer s.Close()
+		defer s.Close(t.Context())
 
-		if _, err := sqldb0.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb0.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Sync(context.Background()); err != nil {
+		} else if err := db0.Sync(t.Context()); err != nil {
 			t.Fatal(err)
-		} else if err := db0.Replica.Sync(context.Background()); err != nil {
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -90,7 +90,7 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 
 		// Re-compacting immediately should return an error that there's nothing to compact.
-		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != litestream.ErrCompactionTooEarly {
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrCompactionTooEarly) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -122,10 +122,10 @@ func TestStore_Integration(t *testing.T) {
 	if err := store.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	defer store.Close()
+	defer store.Close(t.Context())
 
 	// Create initial table
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
 		t.Fatal(err)
 	}
 

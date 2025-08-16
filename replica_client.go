@@ -51,7 +51,7 @@ func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, filter f
 			a = append(a, item)
 		}
 
-		if err == ErrStopIter {
+		if errors.Is(err, ErrStopIter) {
 			break
 		} else if err != nil {
 			return a, err

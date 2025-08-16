@@ -68,7 +68,7 @@ func (e *ConfigValidationError) Unwrap() error {
 
 func main() {
 	m := NewMain()
-	if err := m.Run(context.Background(), os.Args[1:]); err == flag.ErrHelp || err == errStop {
+	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
 		os.Exit(1)
 	} else if err != nil {
 		slog.Error("failed to run", "error", err)
@@ -114,7 +114,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Setup signal handler.
 		signalCh := signalChan()
 
-		if err := c.Run(); err != nil {
+		if err := c.Run(ctx); err != nil {
 			return err
 		}
 
@@ -139,7 +139,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Gracefully close.
-		if e := c.Close(); e != nil && err == nil {
+		if e := c.Close(ctx); e != nil && err == nil {
 			err = e
 		}
 		slog.Info("litestream shut down")
@@ -330,9 +330,9 @@ func (c *Config) CompactionLevels() litestream.CompactionLevels {
 }
 
 // DBConfig returns database configuration by path.
-func (c *Config) DBConfig(path string) *DBConfig {
+func (c *Config) DBConfig(configPath string) *DBConfig {
 	for _, dbConfig := range c.DBs {
-		if dbConfig.Path == path {
+		if dbConfig.Path == configPath {
 			return dbConfig
 		}
 	}
@@ -477,13 +477,13 @@ type DBConfig struct {
 
 // NewDBFromConfig instantiates a DB based on a configuration.
 func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
-	path, err := expand(dbc.Path)
+	configPath, err := expand(dbc.Path)
 	if err != nil {
 		return nil, err
 	}
 
 	// Initialize database with given path.
-	db := litestream.NewDB(path)
+	db := litestream.NewDB(configPath)
 
 	// Override default database settings if specified in configuration.
 	if dbc.MetaPath != nil {
@@ -508,11 +508,12 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	// Instantiate and attach replica.
 	// v0.3.x and before supported multiple replicas but that was dropped to
 	// ensure there's a single remote data authority.
-	if dbc.Replica == nil && len(dbc.Replicas) == 0 {
+	switch {
+	case dbc.Replica == nil && len(dbc.Replicas) == 0:
 		return nil, fmt.Errorf("must specify replica for database")
-	} else if dbc.Replica != nil && len(dbc.Replicas) > 0 {
+	case dbc.Replica != nil && len(dbc.Replicas) > 0:
 		return nil, fmt.Errorf("cannot specify 'replica' and 'replicas' on a database")
-	} else if len(dbc.Replicas) > 1 {
+	case len(dbc.Replicas) > 1:
 		return nil, fmt.Errorf("multiple replicas on a single database are no longer supported")
 	}
 
@@ -649,26 +650,26 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 		return nil, fmt.Errorf("cannot specify url & path for file replica")
 	}
 
-	// Parse path from URL, if specified.
-	path := c.Path
+	// Parse configPath from URL, if specified.
+	configPath := c.Path
 	if c.URL != "" {
-		if _, _, path, err = ParseReplicaURL(c.URL); err != nil {
+		if _, _, configPath, err = ParseReplicaURL(c.URL); err != nil {
 			return nil, err
 		}
 	}
 
 	// Ensure path is set explicitly or derived from URL field.
-	if path == "" {
+	if configPath == "" {
 		return nil, fmt.Errorf("file replica path required")
 	}
 
 	// Expand home prefix and return absolute path.
-	if path, err = expand(path); err != nil {
+	if configPath, err = expand(configPath); err != nil {
 		return nil, err
 	}
 
 	// Instantiate replica and apply time fields, if set.
-	client := file.NewReplicaClient(path)
+	client := file.NewReplicaClient(configPath)
 	client.Replica = r
 	return client, nil
 }
@@ -682,7 +683,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		return nil, fmt.Errorf("cannot specify url & bucket for s3 replica")
 	}
 
-	bucket, path := c.Bucket, c.Path
+	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
 
 	// Use path style if an endpoint is explicitly set. This works because the
@@ -701,8 +702,8 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		ubucket, uregion, uendpoint, uforcePathStyle := s3.ParseHost(host)
 
 		// Only apply URL parts to field that have not been overridden.
-		if path == "" {
-			path = upath
+		if configPath == "" {
+			configPath = upath
 		}
 		if bucket == "" {
 			bucket = ubucket
@@ -728,7 +729,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.AccessKeyID = c.AccessKeyID
 	client.SecretAccessKey = c.SecretAccessKey
 	client.Bucket = bucket
-	client.Path = path
+	client.Path = configPath
 	client.Region = region
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
@@ -745,7 +746,7 @@ func newGSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *g
 		return nil, fmt.Errorf("cannot specify url & bucket for gs replica")
 	}
 
-	bucket, path := c.Bucket, c.Path
+	bucket, configPath := c.Bucket, c.Path
 
 	// Apply settings from URL, if specified.
 	if c.URL != "" {
@@ -755,8 +756,8 @@ func newGSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *g
 		}
 
 		// Only apply URL parts to field that have not been overridden.
-		if path == "" {
-			path = upath
+		if configPath == "" {
+			configPath = upath
 		}
 		if bucket == "" {
 			bucket = uhost
@@ -771,7 +772,7 @@ func newGSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *g
 	// Build replica.
 	client := gs.NewReplicaClient()
 	client.Bucket = bucket
-	client.Path = path
+	client.Path = configPath
 	return client, nil
 }
 
@@ -873,7 +874,7 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	// Parse URL if provided to extract bucket name and server URL
 	var url, bucket string
 	if c.URL != "" {
-		scheme, host, path, err := ParseReplicaURL(c.URL)
+		scheme, host, bucketPath, err := ParseReplicaURL(c.URL)
 		if err != nil {
 			return nil, fmt.Errorf("invalid NATS URL: %w", err)
 		}
@@ -887,8 +888,8 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 		}
 
 		// Extract bucket name from path
-		if path != "" {
-			bucket = strings.Trim(path, "/")
+		if bucketPath != "" {
+			bucket = strings.Trim(bucketPath, "/")
 		}
 	}
 
