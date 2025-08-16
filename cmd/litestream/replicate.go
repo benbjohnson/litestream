@@ -44,7 +44,7 @@ func NewReplicateCommand() *ReplicateCommand {
 }
 
 // ParseFlags parses the CLI flags and loads the configuration file.
-func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err error) {
+func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
 	configPath, noExpandEnv := registerConfigFlag(fs)
@@ -202,16 +202,16 @@ func (c *ReplicateCommand) Run() (err error) {
 }
 
 // Close closes all open databases.
-func (c *ReplicateCommand) Close() (err error) {
-	if e := c.Store.Close(); e != nil {
-		slog.Error("failed to close database", "error", e)
+func (c *ReplicateCommand) Close() error {
+	if err := c.Store.Close(); err != nil {
+		slog.Error("failed to close database", "error", err)
 	}
 	if c.Config.MCPAddr != "" {
 		if err := c.MCP.Close(); err != nil {
 			slog.Error("error closing MCP server", "error", err)
 		}
 	}
-	return err
+	return nil
 }
 
 // Usage prints the help screen to STDOUT.

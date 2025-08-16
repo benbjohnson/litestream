@@ -472,11 +472,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Copy file to final location.
 	r.Logger().Debug("renaming database from temporary location")
-	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
-		return err
-	}
-
-	return nil
+	return os.Rename(tmpOutputPath, opt.OutputPath)
 }
 
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
