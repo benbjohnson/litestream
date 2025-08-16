@@ -113,18 +113,18 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 	}
 
 	// Authentication options
-	if c.JWT != "" && c.Seed != "" {
+	switch {
+	case c.JWT != "" && c.Seed != "":
 		opts = append(opts, nats.UserJWTAndSeed(c.JWT, c.Seed))
-	} else if c.Creds != "" {
+	case c.Creds != "":
 		opts = append(opts, nats.UserCredentials(c.Creds))
-	} else if c.NKey != "" {
+	case c.NKey != "":
 		opts = append(opts, nats.Nkey(c.NKey, c.SigCB))
-	} else if c.Username != "" && c.Password != "" {
+	case c.Username != "" && c.Password != "":
 		opts = append(opts, nats.UserInfo(c.Username, c.Password))
-	} else if c.Token != "" {
+	case c.Token != "":
 		opts = append(opts, nats.Token(c.Token))
 	}
-
 	// JWT callback
 	if c.UserJWT != nil {
 		opts = append(opts, nats.UserJWT(c.UserJWT, c.SigCB))

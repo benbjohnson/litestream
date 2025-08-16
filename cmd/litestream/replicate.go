@@ -54,9 +54,22 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 	}
 
 	// Load configuration or use CLI args to build db/replica.
-	if fs.NArg() == 1 {
+	switch fs.NArg() {
+	case 0:
+		// No arguments provided, use config file
+		if *configPath == "" {
+			*configPath = DefaultConfigPath()
+		}
+		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
+			return err
+		}
+
+	case 1:
+		// Only database path provided, missing replica URL
 		return fmt.Errorf("must specify at least one replica URL for %s", fs.Arg(0))
-	} else if fs.NArg() > 1 {
+
+	default:
+		// Database path and replica URLs provided via CLI
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
@@ -73,14 +86,8 @@ func (c *ReplicateCommand) ParseFlags(ctx context.Context, args []string) (err e
 			})
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
-	} else {
-		if *configPath == "" {
-			*configPath = DefaultConfigPath()
-		}
-		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
-			return err
-		}
 	}
+
 	c.Config.ConfigPath = *configPath
 
 	// Override config exec command, if specified.
@@ -137,22 +144,22 @@ func (c *ReplicateCommand) Run() (err error) {
 	for _, db := range c.Store.DBs() {
 		r := db.Replica
 		slog.Info("initialized db", "path", db.Path())
-		slog := slog.With("type", r.Client.Type(), "sync-interval", r.SyncInterval)
+		slogWith := slog.With("type", r.Client.Type(), "sync-interval", r.SyncInterval)
 		switch client := r.Client.(type) {
 		case *file.ReplicaClient:
-			slog.Info("replicating to", "path", client.Path())
+			slogWith.Info("replicating to", "path", client.Path())
 		case *s3.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region, "endpoint", client.Endpoint)
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region, "endpoint", client.Endpoint)
 		case *gs.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path)
 		case *abs.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "endpoint", client.Endpoint)
 		case *sftp.ReplicaClient:
-			slog.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
+			slogWith.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
 		case *nats.ReplicaClient:
-			slog.Info("replicating to", "bucket", client.BucketName, "url", client.URL)
+			slogWith.Info("replicating to", "bucket", client.BucketName, "url", client.URL)
 		default:
-			slog.Info("replicating to")
+			slogWith.Info("replicating to")
 		}
 	}
 

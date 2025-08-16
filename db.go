@@ -422,9 +422,9 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// If we have an existing replication files, ensure the headers match.
-	//if err := db.verifyHeadersMatch(); err != nil {
-	//	return fmt.Errorf("cannot determine last wal position: %w", err)
-	//}
+	// if err := db.verifyHeadersMatch(); err != nil {
+	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
+	// }
 
 	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
 

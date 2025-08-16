@@ -131,11 +131,8 @@ func MkdirAll(path string, fi os.FileInfo) error {
 }
 
 func ReplaceAttr(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.LevelKey {
-		switch a.Value.Any() {
-		case LevelTrace:
-			a.Value = slog.StringValue("TRACE")
-		}
+	if a.Key == slog.LevelKey && a.Value.Any() == LevelTrace {
+		a.Value = slog.StringValue("TRACE")
 	}
 	return a
 }

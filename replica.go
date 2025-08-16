@@ -149,7 +149,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
-		if err = r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})

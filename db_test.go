@@ -655,7 +655,7 @@ func newDB(tb testing.TB, path string) *litestream.DB {
 	tb.Logf("db=%s", path)
 
 	level := slog.LevelDebug
-	if strings.ToLower(*logLevel) == "trace" {
+	if strings.EqualFold(*logLevel, "trace") {
 		level = internal.LevelTrace
 	}
 

@@ -122,14 +122,16 @@ func readWALFileAt(filename string, offset, n int64) ([]byte, error) {
 // removeTmpFiles recursively finds and removes .tmp files.
 func removeTmpFiles(root string) error {
 	return filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
+		switch {
+		case err != nil:
 			return nil // skip errored files
-		} else if info.IsDir() {
+		case info.IsDir():
 			return nil // skip directories
-		} else if !strings.HasSuffix(path, ".tmp") {
+		case !strings.HasSuffix(path, ".tmp"):
 			return nil // skip non-temp files
+		default:
+			return os.Remove(path)
 		}
-		return os.Remove(path)
 	})
 }
 
