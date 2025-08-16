@@ -50,8 +50,9 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 
 func (s *MCPServer) Start(addr string) {
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: s.mux,
+		Addr:              addr,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go func() {
 		slog.Info("Starting MCP Streamable HTTP server", "addr", addr)
