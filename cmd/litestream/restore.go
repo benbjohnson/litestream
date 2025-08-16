@@ -50,7 +50,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
-		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); err == errSkipDBExists {
+		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
@@ -60,7 +60,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); err == errSkipDBExists {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {

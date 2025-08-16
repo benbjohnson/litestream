@@ -2,6 +2,7 @@ package nats
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -389,7 +390,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 // isNotFoundError checks if the error is a "not found" error.
 func isNotFoundError(err error) bool {
-	return err != nil && (err == jetstream.ErrObjectNotFound || strings.Contains(err.Error(), "not found"))
+	return err != nil && (errors.Is(err, jetstream.ErrObjectNotFound) || strings.Contains(err.Error(), "not found"))
 }
 
 // ltxFileIterator implements ltx.FileIterator for NATS object store.

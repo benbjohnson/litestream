@@ -91,7 +91,7 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 
 		// Re-compacting immediately should return an error that there's nothing to compact.
-		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != litestream.ErrCompactionTooEarly {
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrCompactionTooEarly) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
