@@ -293,9 +293,48 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 func NewGSReplicaClient(tb testing.TB) *gs.ReplicaClient {
 	tb.Helper()
 
+	// Log diagnostic information for debugging
+	tb.Logf("GCS Integration Test Setup:")
+	credsSet := "not set"
+	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
+		credsSet = "set"
+	}
+	tb.Logf("  GOOGLE_APPLICATION_CREDENTIALS: %s", credsSet)
+	tb.Logf("  LITESTREAM_GS_BUCKET: %s", *gsBucket)
+	tb.Logf("  LITESTREAM_GS_PATH: %s", *gsPath)
+
 	c := gs.NewReplicaClient()
 	c.Bucket = *gsBucket
 	c.Path = path.Join(*gsPath, fmt.Sprintf("%016x", rand.Uint64()))
+
+	// Test basic connectivity and project info
+	ctx := context.Background()
+	if err := c.Init(ctx); err != nil {
+		tb.Logf("GCS client initialization failed: %v", err)
+		tb.Logf("This may indicate credential or project issues")
+		return c // Return anyway to let the actual test show the detailed error
+	}
+	tb.Logf("GCS client initialized successfully")
+
+	// Try to get bucket attributes to validate access
+	if attrs, err := c.GetBucketHandle().Attrs(ctx); err != nil {
+		tb.Logf("Failed to get bucket attributes for %s: %v", *gsBucket, err)
+		tb.Logf("This may indicate the bucket doesn't exist or insufficient permissions")
+
+		// Additional diagnostic: check if we can at least connect to GCP
+		// by trying to list buckets in the default project (will fail gracefully)
+		tb.Logf("Attempting basic GCP connectivity test...")
+		if bucketIt := c.GetClient().Buckets(ctx, ""); bucketIt != nil {
+			if _, listErr := bucketIt.Next(); listErr != nil {
+				tb.Logf("Basic GCP connectivity test failed: %v", listErr)
+			} else {
+				tb.Logf("Basic GCP connectivity works, but target bucket not accessible")
+			}
+		}
+	} else {
+		tb.Logf("Bucket %s exists in project %d, location: %s", attrs.Name, attrs.ProjectNumber, attrs.Location)
+	}
+
 	return c
 }
 

@@ -44,6 +44,16 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
+// GetBucketHandle returns the internal bucket handle for diagnostic purposes.
+func (c *ReplicaClient) GetBucketHandle() *storage.BucketHandle {
+	return c.bkt
+}
+
+// GetClient returns the internal storage client for diagnostic purposes.
+func (c *ReplicaClient) GetClient() *storage.Client {
+	return c.client
+}
+
 // Init initializes the connection to GS. No-op if already initialized.
 func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.mu.Lock()
@@ -54,7 +64,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 
 	if c.client, err = storage.NewClient(ctx); err != nil {
-		return err
+		return fmt.Errorf("failed to create GCS client (bucket: %s): %w", c.Bucket, err)
 	}
 	c.bkt = c.client.Bucket(c.Bucket)
 
@@ -74,7 +84,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		if errors.Is(err, iterator.Done) {
 			break
 		} else if err != nil {
-			return err
+			return fmt.Errorf("failed to list objects in GCS bucket %s (path: %s): %w", c.Bucket, c.Path, err)
 		}
 
 		if err := c.bkt.Object(attrs.Name).Delete(ctx); isNotExists(err) {
