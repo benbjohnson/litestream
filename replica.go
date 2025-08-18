@@ -408,7 +408,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
-	infos, err := r.CalcRestorePlan(ctx, opt.TXID, opt.Timestamp)
+	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	} else if len(infos) == 0 {
@@ -430,7 +430,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		// Add file to be compacted.
-		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID)
+		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return fmt.Errorf("open ltx file: %w", err)
 		}
@@ -454,8 +454,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		c := ltx.NewCompactor(pw, rdrs)
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		c, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
@@ -476,16 +480,17 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 }
 
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
-func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp time.Time) ([]*ltx.FileInfo, error) {
+func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, timestamp time.Time, logger *slog.Logger) ([]*ltx.FileInfo, error) {
 	if txID != 0 && !timestamp.IsZero() {
 		return nil, fmt.Errorf("cannot specify both TXID & timestamp to restore")
 	}
 
 	var infos ltx.FileInfoSlice
-	logger := r.Logger().With("target", txID)
+	logger = logger.With("target", txID)
 
 	// Start with latest snapshot before target TXID or timestamp.
-	if a, err := FindLTXFiles(ctx, r.Client, SnapshotLevel, func(info *ltx.FileInfo) (bool, error) {
+	if a, err := FindLTXFiles(ctx, client, SnapshotLevel, func(info *ltx.FileInfo) (bool, error) {
+		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
 		if txID != 0 {
 			return info.MaxTXID <= txID, nil
 		} else if !timestamp.IsZero() {
@@ -504,9 +509,9 @@ func (r *Replica) CalcRestorePlan(ctx context.Context, txID ltx.TXID, timestamp 
 	// TXID granularity so the TXIDs should align between compaction levels.
 	const maxLevel = SnapshotLevel - 1
 	for level := maxLevel; level >= 0; level-- {
-		r.Logger().Debug("finding ltx files for level", "level", level)
+		logger.Debug("finding ltx files for level", "level", level)
 
-		a, err := FindLTXFiles(ctx, r.Client, level, func(info *ltx.FileInfo) (bool, error) {
+		a, err := FindLTXFiles(ctx, client, level, func(info *ltx.FileInfo) (bool, error) {
 			if info.MaxTXID <= infos.MaxTXID() { // skip if already included in previous levels
 				return false, nil
 			}

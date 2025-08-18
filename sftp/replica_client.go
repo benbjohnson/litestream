@@ -237,7 +237,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 // OpenLTXFile returns a reader for an LTX file.
 // Returns os.ErrNotExist if no matching position is found.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (_ io.ReadCloser, err error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -246,13 +246,22 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	}
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	f, err := sftpClient.Open(filename)
+	f, err := sftpClient.OpenFile(filename, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
 
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
+
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
+	if size > 0 {
+		return internal.LimitReadCloser(f, size), nil
+	}
 	return f, nil
 }
 

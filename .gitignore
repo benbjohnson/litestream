@@ -1,4 +1,5 @@
 .DS_Store
+/cmd/litestream-vfs/litestream-vfs.h
 /dist
 .vscode
 

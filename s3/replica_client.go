@@ -28,6 +28,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // ReplicaClientType is the client type for this package.
@@ -270,10 +271,18 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 	return newFileIterator(ctx, c, level, seek), nil
 }
 
-// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+// OpenLTXFile returns a reader for an LTX file
+// Returns os.ErrNotExist if no matching index/offset is found.
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
+	}
+
+	var rangeStr string
+	if size > 0 {
+		rangeStr = fmt.Sprintf("bytes=%d-%d", offset, offset+size-1)
+	} else {
+		rangeStr = fmt.Sprintf("bytes=%d-", offset)
 	}
 
 	// Build the key from the file info
@@ -282,6 +291,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
+		Range:  aws.String(rangeStr),
 	})
 	if err != nil {
 		if isNotExists(err) {
@@ -298,12 +308,14 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
+	rc := internal.NewReadCounter(r)
+
 	filename := ltx.FormatFilename(minTXID, maxTXID)
 	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
 	out, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
-		Body:   r,
+		Body:   rc,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("s3: upload to %s: %w", key, err)
@@ -314,8 +326,12 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
+		Size:      rc.N(),
 		CreatedAt: time.Now(),
 	}
+
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
 
 	// ETag indicates successful upload
 	if out.ETag == nil {

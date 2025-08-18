@@ -23,12 +23,14 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/superfly/ltx v0.3.18
+	github.com/superfly/ltx v0.4.0
 	golang.org/x/crypto v0.41.0
 	golang.org/x/sys v0.35.0
 	google.golang.org/api v0.154.0
 	gopkg.in/yaml.v2 v2.4.0
 )
+
+require golang.org/x/sync v0.16.0 // indirect
 
 require (
 	cloud.google.com/go v0.111.0 // indirect
@@ -77,6 +79,7 @@ require (
 	github.com/prometheus/client_model v0.5.0 // indirect
 	github.com/prometheus/common v0.45.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
+	github.com/psanford/sqlite3vfs v0.0.0-20240315230605-24e1d98cf361 // direct
 	github.com/spf13/cast v1.7.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.opencensus.io v0.24.0 // indirect
@@ -87,7 +90,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.21.0 // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/oauth2 v0.15.0 // indirect
-	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/text v0.28.0 // indirect
 	golang.org/x/time v0.5.0 // indirect
 	golang.org/x/xerrors v0.0.0-20231012003039-104605ab7028 // indirect

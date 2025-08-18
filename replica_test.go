@@ -42,7 +42,7 @@ func TestReplica_Sync(t *testing.T) {
 	t.Logf("second sync")
 
 	// Verify we synced checkpoint page to WAL.
-	rd, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID, dpos.TXID)
+	rd, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID, dpos.TXID, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,7 +106,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			return ltx.NewFileInfoSliceIterator(nil), nil
 		}
 
-		plan, err := r.CalcRestorePlan(context.Background(), 10, time.Time{})
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -147,7 +147,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			}
 		}
 
-		plan, err := r.CalcRestorePlan(context.Background(), 10, time.Time{})
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -186,7 +186,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			}
 		}
 
-		_, err := r.CalcRestorePlan(context.Background(), 10, time.Time{})
+		_, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
 		if err == nil || err.Error() != `non-contiguous transaction files: prev=0000000000000005 filename=0000000000000008-0000000000000009.ltx` {
 			t.Fatalf("unexpected error: %q", err)
 		}
@@ -206,7 +206,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			}
 		}
 
-		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
+		_, err := litestream.CalcRestorePlan(context.Background(), r.Client, 5, time.Time{}, r.Logger())
 		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
@@ -219,7 +219,7 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 		r := litestream.NewReplicaWithClient(db, &c)
 
-		_, err := r.CalcRestorePlan(context.Background(), 5, time.Time{})
+		_, err := litestream.CalcRestorePlan(context.Background(), r.Client, 5, time.Time{}, r.Logger())
 		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}

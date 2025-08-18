@@ -188,13 +188,18 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 // OpenLTXFile returns a reader for an LTX file.
 // Returns os.ErrNotExist if no matching min/max TXID is not found.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, nil)
+	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, azblob.DownloadStreamOptions{
+		Range: &azblob.HTTPRange{
+			Offset: offset,
+			Count:  size,
+		},
+	})
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {
