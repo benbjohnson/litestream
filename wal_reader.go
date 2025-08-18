@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -41,7 +42,7 @@ func NewWALReader(rd io.ReaderAt, logger *slog.Logger) (*WALReader, error) {
 // NewWALReaderWithOffset returns a new instance of WALReader at a given offset.
 // Salt must match or else no frames will be returned. Checksum calculated from
 // from previous page.
-func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, logger *slog.Logger) (*WALReader, error) {
+func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, salt1, salt2 uint32, logger *slog.Logger) (*WALReader, error) {
 	// Ensure we are not starting on the first page since we need to read the previous.
 	if offset <= WALHeaderSize {
 		return nil, fmt.Errorf("offset (%d) must be greater than the wal header size (%d)", offset, WALHeaderSize)
@@ -66,7 +67,7 @@ func NewWALReaderWithOffset(rd io.ReaderAt, offset int64, salt1, salt2 uint32, l
 
 	// Read previous page to load checksum.
 	r.frameN--
-	if _, _, err := r.readFrame(context.Background(), make([]byte, r.pageSize), false); err != nil {
+	if _, _, err := r.readFrame(ctx, make([]byte, r.pageSize), false); err != nil {
 		return nil, &PrevFrameMismatchError{Err: err}
 	}
 
@@ -194,7 +195,7 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	data := make([]byte, r.pageSize)
 	for i := 0; ; i++ {
 		pgno, fcommit, err := r.ReadFrame(ctx, data)
-		if err == io.EOF {
+		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
 			return nil, 0, 0, err

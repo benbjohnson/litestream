@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
 
-const LevelTrace = slog.Level(slog.LevelDebug - 4)
+const LevelTrace = slog.LevelDebug - 4
 
 // ReadCloser wraps a reader to also attach a separate closer.
 type ReadCloser struct {
@@ -131,11 +131,8 @@ func MkdirAll(path string, fi os.FileInfo) error {
 }
 
 func ReplaceAttr(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.LevelKey {
-		switch a.Value.Any() {
-		case LevelTrace:
-			a.Value = slog.StringValue("TRACE")
-		}
+	if a.Key == slog.LevelKey && a.Value.Any() == LevelTrace {
+		a.Value = slog.StringValue("TRACE")
 	}
 	return a
 }

@@ -50,8 +50,9 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 
 func (s *MCPServer) Start(addr string) {
 	s.httpServer = &http.Server{
-		Addr:    addr,
-		Handler: s.mux,
+		Addr:              addr,
+		Handler:           s.mux,
+		ReadHeaderTimeout: 30 * time.Second,
 	}
 	go func() {
 		slog.Info("Starting MCP Streamable HTTP server", "addr", addr)
@@ -65,7 +66,7 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
-// Close attemps to gracefully shutdown the server.
+// Close attempts to gracefully shutdown the server.
 func (s *MCPServer) Close() error {
 	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
 	defer cancel()

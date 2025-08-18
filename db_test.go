@@ -79,7 +79,7 @@ func TestDB_CRC64(t *testing.T) {
 		t.Log("issue change")
 
 		// Issue change that is applied to the WAL. Checksum should not change.
-		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		} else if chksum1, _, err := db.CRC64(context.Background()); err != nil {
 			t.Fatal(err)
@@ -151,7 +151,7 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
 		}
 
@@ -166,7 +166,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Insert into table.
-		if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
 			t.Fatal(err)
 		}
 
@@ -232,12 +232,12 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
 		}
 
 		// Issue initial sync and truncate WAL.
-		if err := db.Sync(context.Background()); err != nil {
+		if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -247,7 +247,7 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Fully close which should close WAL file.
-		if err := db.Close(context.Background()); err != nil {
+		if err := db.Close(t.Context()); err != nil {
 			t.Fatal(err)
 		} else if err := sqldb.Close(); err != nil {
 			t.Fatal(err)
@@ -262,7 +262,7 @@ func TestDB_Sync(t *testing.T) {
 		sqldb = MustOpenSQLDB(t, db.Path())
 		defer MustCloseSQLDB(t, sqldb)
 		for i := 0; i < 100; i++ {
-			if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+			if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -288,21 +288,21 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL and then sync.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
+		} else if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
 		// Write at least minimum number of pages to trigger rollover.
 		for i := 0; i < db.MinCheckpointPageN; i++ {
-			if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+			if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
 				t.Fatal(err)
 			}
 		}
 
 		// Sync to shadow WAL.
-		if err := db.Sync(context.Background()); err != nil {
+		if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -322,9 +322,9 @@ func TestDB_Sync(t *testing.T) {
 		defer MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL and then sync.
-		if _, err := sqldb.Exec(`CREATE TABLE foo (bar TEXT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
+		} else if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -332,9 +332,9 @@ func TestDB_Sync(t *testing.T) {
 		db.CheckpointInterval = 1 * time.Nanosecond
 
 		// Write to WAL & sync.
-		if _, err := sqldb.Exec(`INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
+		} else if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -359,18 +359,18 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
-			t.Fatal(err)
-		}
-
-		if err := db.Sync(context.Background()); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := db.Replica.Sync(context.Background()); err != nil {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -401,18 +401,18 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
 		}
 
 		// TXID 2
-		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
+		} else if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := db.Replica.Sync(context.Background()); err != nil {
+		if err := db.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -424,13 +424,13 @@ func TestDB_Compact(t *testing.T) {
 		}
 
 		// TXID 3
-		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
+		} else if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
-		if err := db.Replica.Sync(context.Background()); err != nil {
+		if err := db.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -458,15 +458,15 @@ func TestDB_Snapshot(t *testing.T) {
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = NewFileReplicaClient(t)
 
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 		t.Fatal(err)
-	} else if err := db.Sync(context.Background()); err != nil {
+	} else if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
-	if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (100)`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
 		t.Fatal(err)
-	} else if err := db.Sync(context.Background()); err != nil {
+	} else if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -506,21 +506,21 @@ func TestDB_EnforceRetention(t *testing.T) {
 	db.Replica.Client = NewFileReplicaClient(t)
 
 	// Create table and sync initial state
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INT);`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 		t.Fatal(err)
-	} else if err := db.Sync(context.Background()); err != nil {
+	} else if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
 	// Create multiple snapshots with delays to test retention
 	for i := 0; i < 3; i++ {
-		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (?)`, i); err != nil {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
 			t.Fatal(err)
-		} else if err := db.Sync(context.Background()); err != nil {
+		} else if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
-		if _, err := db.Snapshot(context.Background()); err != nil {
+		if _, err := db.Snapshot(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
@@ -529,7 +529,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Get list of snapshots before retention
-	itr, err := db.Replica.Client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0)
+	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,14 +545,14 @@ func TestDB_EnforceRetention(t *testing.T) {
 
 	// Enforce retention to remove older snapshots
 	retentionTime := time.Now().Add(-150 * time.Millisecond)
-	if minSnapshotTXID, err := db.EnforceSnapshotRetention(context.Background(), retentionTime); err != nil {
+	if minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), retentionTime); err != nil {
 		t.Fatal(err)
 	} else if got, want := minSnapshotTXID, ltx.TXID(4); got != want {
 		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
 	}
 
 	// Verify snapshots after retention
-	itr, err = db.Replica.Client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0)
+	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -586,13 +586,12 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 	db.MonitorInterval = 10 * time.Millisecond
 
 	// Create a table
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 
 	// Start multiple goroutines to trigger concurrent map access
 	var wg sync.WaitGroup
-	ctx := context.Background()
 
 	// Number of concurrent operations
 	const numGoroutines = 10
@@ -611,12 +610,12 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 			// Perform operations that trigger map access
 			for j := 0; j < 5; j++ {
 				// This triggers sync() which had unprotected map access
-				if _, err := sqldb.Exec(`INSERT INTO t (value) VALUES (?)`, "test"); err != nil {
+				if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (value) VALUES (?)`, "test"); err != nil {
 					t.Logf("Goroutine %d: insert error: %v", id, err)
 				}
 
 				// Trigger Sync manually which accesses the map
-				if err := db.Sync(ctx); err != nil {
+				if err := db.Sync(t.Context()); err != nil {
 					t.Logf("Goroutine %d: sync error: %v", id, err)
 				}
 
@@ -634,7 +633,7 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 
 		for i := 0; i < 3; i++ {
 			// This triggers Snapshot() which has protected map access
-			if _, err := db.Snapshot(ctx); err != nil {
+			if _, err := db.Snapshot(t.Context()); err != nil {
 				t.Logf("Snapshot error: %v", err)
 			}
 			time.Sleep(5 * time.Millisecond)
@@ -655,7 +654,7 @@ func newDB(tb testing.TB, path string) *litestream.DB {
 	tb.Logf("db=%s", path)
 
 	level := slog.LevelDebug
-	if strings.ToLower(*logLevel) == "trace" {
+	if strings.EqualFold(*logLevel, "trace") {
 		level = internal.LevelTrace
 	}
 
@@ -683,6 +682,7 @@ func MustCloseDBs(tb testing.TB, db *litestream.DB, sqldb *sql.DB) {
 
 // MustOpenDB returns a new instance of a DB.
 func MustOpenDB(tb testing.TB) *litestream.DB {
+	tb.Helper()
 	dir := tb.TempDir()
 	return MustOpenDBAt(tb, filepath.Join(dir, "db"))
 }
@@ -717,7 +717,7 @@ func MustOpenSQLDB(tb testing.TB, path string) *sql.DB {
 	d, err := sql.Open("sqlite3", path)
 	if err != nil {
 		tb.Fatal(err)
-	} else if _, err := d.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+	} else if _, err := d.ExecContext(context.Background(), `PRAGMA journal_mode = wal;`); err != nil {
 		tb.Fatal(err)
 	}
 	return d

@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -68,7 +69,7 @@ func TestWALReader(t *testing.T) {
 			t.Fatalf("Offset()=%d, want %d", got, want)
 		}
 
-		if _, _, err := r.ReadFrame(context.Background(), buf); err != io.EOF {
+		if _, _, err := r.ReadFrame(context.Background(), buf); !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -102,7 +103,7 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read second frame. Salt has been altered so it doesn't match header.
-		if _, _, err := r.ReadFrame(context.Background(), buf); err != io.EOF {
+		if _, _, err := r.ReadFrame(context.Background(), buf); !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
@@ -136,21 +137,21 @@ func TestWALReader(t *testing.T) {
 		}
 
 		// Read second frame. Checksum has been altered so it doesn't match.
-		if _, _, err := r.ReadFrame(context.Background(), buf); err != io.EOF {
+		if _, _, err := r.ReadFrame(context.Background(), buf); !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
 
 	t.Run("ZeroLength", func(t *testing.T) {
 		_, err := litestream.NewWALReader(bytes.NewReader(nil), slog.Default())
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
 	t.Run("PartialHeader", func(t *testing.T) {
 		_, err := litestream.NewWALReader(bytes.NewReader(make([]byte, 10)), slog.Default())
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -169,7 +170,7 @@ func TestWALReader(t *testing.T) {
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
 		_, err := litestream.NewWALReader(bytes.NewReader(data), slog.Default())
-		if err != io.EOF {
+		if !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -211,7 +212,7 @@ func TestWALReader(t *testing.T) {
 		r, err := litestream.NewWALReader(bytes.NewReader(b[:40]), slog.Default())
 		if err != nil {
 			t.Fatal(err)
-		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); err != io.EOF {
+		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -225,7 +226,7 @@ func TestWALReader(t *testing.T) {
 		r, err := litestream.NewWALReader(bytes.NewReader(b[:56]), slog.Default())
 		if err != nil {
 			t.Fatal(err)
-		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); err != io.EOF {
+		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
@@ -239,7 +240,7 @@ func TestWALReader(t *testing.T) {
 		r, err := litestream.NewWALReader(bytes.NewReader(b[:1000]), slog.Default())
 		if err != nil {
 			t.Fatal(err)
-		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); err != io.EOF {
+		} else if _, _, err := r.ReadFrame(context.Background(), make([]byte, 4096)); !errors.Is(err, io.EOF) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
