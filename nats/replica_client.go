@@ -141,12 +141,6 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 		opts = append(opts, nats.RootCAs(c.RootCAs...))
 	}
 
-	// Enable basic TLS if explicitly requested and no custom certs/CAs are specified
-	// This maintains backwards compatibility while avoiding server verification skipping
-	if c.TLS && c.ClientCert == "" && c.ClientKey == "" && len(c.RootCAs) == 0 {
-		opts = append(opts, nats.Secure())
-	}
-
 	// Note: NATS Connect doesn't directly support context cancellation during connection
 	// The context parameter is preserved for potential future use
 
