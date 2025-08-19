@@ -293,9 +293,29 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 func NewGSReplicaClient(tb testing.TB) *gs.ReplicaClient {
 	tb.Helper()
 
+	// Log basic diagnostic information for integration test troubleshooting
+	tb.Logf("GCS Integration Test Setup:")
+	credsSet := "not set"
+	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
+		credsSet = "set"
+	}
+	tb.Logf("  GOOGLE_APPLICATION_CREDENTIALS: %s", credsSet)
+	tb.Logf("  LITESTREAM_GS_BUCKET: %s", *gsBucket)
+	tb.Logf("  LITESTREAM_GS_PATH: %s", *gsPath)
+
 	c := gs.NewReplicaClient()
 	c.Bucket = *gsBucket
 	c.Path = path.Join(*gsPath, fmt.Sprintf("%016x", rand.Uint64()))
+
+	// Test basic connectivity
+	ctx := context.Background()
+	if err := c.Init(ctx); err != nil {
+		tb.Logf("GCS client initialization failed: %v", err)
+		tb.Logf("This may indicate credential or project issues")
+		return c // Return anyway to let the actual test show the detailed error
+	}
+	tb.Logf("GCS client initialized successfully")
+
 	return c
 }
 

@@ -148,7 +148,7 @@ jobs:
       - run: go test -v ./replica_client_test.go -integration gs
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp.json
-          LITESTREAM_GS_BUCKET: integration.litestream.io
+          LITESTREAM_GS_BUCKET: litestream-github-workflows
 
       - name: Create test results directory
         if: always()
