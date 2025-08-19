@@ -47,6 +47,8 @@ type ReplicaClient struct {
 	Token      string   // Token for authentication
 	TLS        bool     // Enable TLS
 	RootCAs    []string // Root CA certificates
+	ClientCert string   // Client certificate file path
+	ClientKey  string   // Client key file path
 
 	// Note: Bucket configuration (replicas, storage, TTL, etc.) should be
 	// managed externally via NATS CLI or API, not by Litestream
@@ -131,12 +133,18 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 	}
 
 	// TLS configuration
-	if c.TLS {
+	if c.ClientCert != "" && c.ClientKey != "" {
+		opts = append(opts, nats.ClientCert(c.ClientCert, c.ClientKey))
+	}
+
+	if len(c.RootCAs) > 0 {
+		opts = append(opts, nats.RootCAs(c.RootCAs...))
+	}
+
+	// Enable basic TLS if explicitly requested and no custom certs/CAs are specified
+	// This maintains backwards compatibility while avoiding server verification skipping
+	if c.TLS && c.ClientCert == "" && c.ClientKey == "" && len(c.RootCAs) == 0 {
 		opts = append(opts, nats.Secure())
-		if len(c.RootCAs) > 0 {
-			// Note: Root CA configuration would need additional setup
-			// This is a simplified version - real implementation may need more setup
-		}
 	}
 
 	// Note: NATS Connect doesn't directly support context cancellation during connection
