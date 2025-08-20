@@ -846,10 +846,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		"salt2", rd.salt2)
 
 	timestamp := time.Now()
-	enc := ltx.NewEncoder(ltxFile)
+	enc, err := ltx.NewEncoder(ltxFile)
+	if err != nil {
+		return fmt.Errorf("new ltx encoder: %w", err)
+	}
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4,
+		Flags:     ltx.HeaderFlagNoChecksum,
 		PageSize:  uint32(db.pageSize),
 		Commit:    commit,
 		MinTXID:   txID,
@@ -1167,10 +1170,14 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 			"salt1", rd.salt1,
 			"salt2", rd.salt2)
 
-		enc := ltx.NewEncoder(pw)
+		enc, err := ltx.NewEncoder(pw)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
+			return
+		}
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4,
+			Flags:     ltx.HeaderFlagNoChecksum,
 			PageSize:  uint32(db.pageSize),
 			Commit:    commit,
 			MinTXID:   1,
@@ -1242,7 +1249,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 			maxTXID = info.MaxTXID
 		}
 
-		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID)
+		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
@@ -1255,8 +1262,12 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	// Stream compaction to destination in level.
 	pr, pw := io.Pipe()
 	go func() {
-		c := ltx.NewCompactor(pw, rdrs)
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum | ltx.HeaderFlagCompressLZ4
+		c, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 

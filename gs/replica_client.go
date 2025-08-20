@@ -138,14 +138,14 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 // OpenLTXFile returns a reader for a given LTX file.
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
-	r, err := c.bkt.Object(key).NewReader(ctx)
+	r, err := c.bkt.Object(key).NewRangeReader(ctx, offset, size)
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {

@@ -62,7 +62,16 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./...
+      - run: go test -v .
+      - run: go test -v ./internal
+      - run: go test -v ./abs
+      - run: go test -v ./file
+      - run: go test -v ./gs
+      - run: go test -v ./nats
+      - run: go test -v ./s3
+      - run: go test -v ./sftp
+      - run: go test -v ./cmd/litestream
+
 
 #  long-running-test:
 #    name: Run Long Running Unit Test

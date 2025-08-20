@@ -98,8 +98,23 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 
 // OpenLTXFile returns a reader for an LTX file at the given position.
 // Returns os.ErrNotExist if no matching index/offset is found.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
-	return os.Open(c.LTXFilePath(level, minTXID, maxTXID))
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	f, err := os.Open(c.LTXFilePath(level, minTXID, maxTXID))
+	if err != nil {
+		return nil, err
+	}
+
+	if offset > 0 {
+		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			return nil, err
+		}
+	}
+
+	if size > 0 {
+		return internal.LimitReadCloser(f, size), nil
+	}
+
+	return f, nil
 }
 
 // WriteLTXFile writes an LTX file to disk.

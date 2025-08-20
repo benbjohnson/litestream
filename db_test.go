@@ -485,7 +485,7 @@ func TestDB_Snapshot(t *testing.T) {
 	}
 
 	// Fetch remote LTX snapshot file and ensure it matches the checksum of the local database.
-	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, 2)
+	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, 2, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
