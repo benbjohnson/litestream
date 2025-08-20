@@ -285,7 +285,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 }
 
 // OpenLTXFile returns a reader that contains an LTX file at a given TXID range.
-func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -303,6 +303,19 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	// Record metrics
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 	// Note: We can't get the size from NATS object reader directly, so we skip bytes counter
+
+	// If offset is non-zero then discard the beginning bytes.
+	if offset > 0 {
+		if _, err := io.CopyN(io.Discard, objectResult, offset); err != nil {
+			objectResult.Close()
+			return nil, fmt.Errorf("failed to discard offset bytes: %w", err)
+		}
+	}
+
+	// If size is non-zero then limit the reader to the size.
+	if size > 0 {
+		return internal.LimitReadCloser(objectResult, size), nil
+	}
 
 	return objectResult, nil
 }

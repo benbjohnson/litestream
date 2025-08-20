@@ -194,12 +194,13 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, azblob.DownloadStreamOptions{
-		Range: &azblob.HTTPRange{
+	resp, err := c.client.DownloadStream(ctx, c.Bucket, key, &azblob.DownloadStreamOptions{
+		Range: blob.HTTPRange{
 			Offset: offset,
 			Count:  size,
 		},
 	})
+
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {

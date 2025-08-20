@@ -424,7 +424,7 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 		}
 
 		// Read it back and verify size
-		r, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100))
+		r, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100), 0, 0)
 		if err != nil {
 			t.Fatalf("failed to open large file: %v", err)
 		}
@@ -458,7 +458,7 @@ func TestReplicaClient_S3_ErrorContext(t *testing.T) {
 		t.Parallel()
 
 		// Test OpenLTXFile with non-existent file
-		_, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(999), ltx.TXID(999))
+		_, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(999), ltx.TXID(999), 0, 0)
 		if err == nil {
 			t.Fatal("expected error for non-existent file")
 		}
