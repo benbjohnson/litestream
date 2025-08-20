@@ -15,9 +15,10 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psanford/sqlite3vfs"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/s3"
-	"github.com/psanford/sqlite3vfs"
 )
 
 func main() {}

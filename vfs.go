@@ -7,9 +7,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // VFS implements the SQLite VFS interface for Litestream.

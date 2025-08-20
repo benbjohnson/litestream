@@ -31,12 +31,12 @@ endif
 	mv dist/litestream.zip dist/litestream-${LITESTREAM_VERSION}-darwin-arm64.zip
 	openssl dgst -sha256 dist/litestream-${LITESTREAM_VERSION}-darwin-arm64.zip
 
-.PHONY: dist/litestream-vfs.so
-dist/litestream-vfs.so:
+.PHONY: vfs
+vfs:
 	mkdir -p dist
 	go build -tags SQLITE3VFS_LOADABLE_EXT,sqlite_os_trace -o dist/litestream-vfs.a -buildmode=c-archive cmd/litestream-vfs/litestream-vfs.go
-	cp dist/litestream-vfs.h cmd/litestream-vfs/litestream-vfs.h
-	gcc -framework CoreFoundation -framework Security -g -fPIC -shared -o dist/litestream-vfs.so cmd/litestream-vfs/litestream-vfs.c dist/litestream-vfs.a
+	mv dist/litestream-vfs.h src/litestream-vfs.h
+	gcc -framework CoreFoundation -framework Security -lresolv -g -fPIC -shared -o dist/litestream-vfs.so src/litestream-vfs.c dist/litestream-vfs.a
 
 .PHONY: clean
 clean:
