@@ -911,25 +911,6 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 		return nil, fmt.Errorf("client-cert and client-key must both be specified for mutual TLS authentication")
 	}
 
-	// Validate that certificate files exist if specified
-	if c.ClientCert != "" {
-		if _, err := os.Stat(c.ClientCert); os.IsNotExist(err) {
-			return nil, fmt.Errorf("client certificate file not found: %s", c.ClientCert)
-		}
-	}
-	if c.ClientKey != "" {
-		if _, err := os.Stat(c.ClientKey); os.IsNotExist(err) {
-			return nil, fmt.Errorf("client key file not found: %s", c.ClientKey)
-		}
-	}
-
-	// Validate CA certificate files exist if specified
-	for _, caFile := range c.RootCAs {
-		if _, err := os.Stat(caFile); os.IsNotExist(err) {
-			return nil, fmt.Errorf("root CA certificate file not found: %s", caFile)
-		}
-	}
-
 	// Build replica client
 	client := nats.NewReplicaClient()
 	client.URL = url
