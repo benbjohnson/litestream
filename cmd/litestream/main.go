@@ -570,6 +570,8 @@ type ReplicaConfig struct {
 	Token         string         `yaml:"token"`
 	TLS           bool           `yaml:"tls"`
 	RootCAs       []string       `yaml:"root-cas"`
+	ClientCert    string         `yaml:"client-cert"`
+	ClientKey     string         `yaml:"client-key"`
 	MaxReconnects *int           `yaml:"max-reconnects"`
 	ReconnectWait *time.Duration `yaml:"reconnect-wait"`
 	Timeout       *time.Duration `yaml:"timeout"`
@@ -903,6 +905,12 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 		return nil, fmt.Errorf("bucket required for NATS replica")
 	}
 
+	// Validate TLS configuration
+	// Both client cert and key must be specified together
+	if (c.ClientCert != "") != (c.ClientKey != "") {
+		return nil, fmt.Errorf("client-cert and client-key must both be specified for mutual TLS authentication")
+	}
+
 	// Build replica client
 	client := nats.NewReplicaClient()
 	client.URL = url
@@ -918,8 +926,9 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Token = c.Token
 
 	// Set TLS options
-	client.TLS = c.TLS
 	client.RootCAs = c.RootCAs
+	client.ClientCert = c.ClientCert
+	client.ClientKey = c.ClientKey
 
 	// Set connection options with defaults
 	if c.MaxReconnects != nil {
