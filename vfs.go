@@ -9,8 +9,6 @@ import (
 
 	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
-
-	"github.com/benbjohnson/litestream/internal"
 )
 
 // VFS implements the SQLite VFS interface for Litestream.
@@ -148,8 +146,6 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	if off == 0 {
 		p[18], p[19] = 0x01, 0x01
 	}
-
-	println(internal.Hexdump(p))
 
 	return n, nil
 }

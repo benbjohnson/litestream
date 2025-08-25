@@ -9,15 +9,16 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
-		db0, sqldb0 := MustOpenDBs(t)
-		defer MustCloseDBs(t, db0, sqldb0)
+		db0, sqldb0 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
 
-		db1, sqldb1 := MustOpenDBs(t)
-		defer MustCloseDBs(t, db1, sqldb1)
+		db1, sqldb1 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db1, sqldb1)
 
 		levels := litestream.CompactionLevels{
 			{Level: 0},
@@ -59,8 +60,8 @@ func TestStore_CompactDB(t *testing.T) {
 	})
 
 	t.Run("Snapshot", func(t *testing.T) {
-		db0, sqldb0 := MustOpenDBs(t)
-		defer MustCloseDBs(t, db0, sqldb0)
+		db0, sqldb0 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
 
 		levels := litestream.CompactionLevels{
 			{Level: 0},
@@ -103,15 +104,15 @@ func TestStore_Integration(t *testing.T) {
 
 	const factor = 1
 
-	db := newDB(t, filepath.Join(t.TempDir(), "db"))
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 	db.MonitorInterval = factor * 100 * time.Millisecond
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
-	sqldb := MustOpenSQLDB(t, db.Path())
-	defer MustCloseSQLDB(t, sqldb)
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
 
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
@@ -173,8 +174,8 @@ func TestStore_Integration(t *testing.T) {
 			}
 
 			func() {
-				restoreDB := MustOpenSQLDB(t, outputPath)
-				defer MustCloseSQLDB(t, restoreDB)
+				restoreDB := testingutil.MustOpenSQLDB(t, outputPath)
+				defer testingutil.MustCloseSQLDB(t, restoreDB)
 
 				var result string
 				if err := restoreDB.QueryRowContext(t.Context(), `PRAGMA integrity_check;`).Scan(&result); err != nil {
