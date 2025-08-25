@@ -2,13 +2,8 @@ package litestream_test
 
 import (
 	"context"
-	"database/sql"
-	"flag"
 	"hash/crc64"
-	"log/slog"
 	"os"
-	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -16,20 +11,18 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-var logLevel = flag.String("log.level", "debug", "")
-
 func TestDB_Path(t *testing.T) {
-	db := newDB(t, "/tmp/db")
+	db := testingutil.NewDB(t, "/tmp/db")
 	if got, want := db.Path(), `/tmp/db`; got != want {
 		t.Fatalf("Path()=%v, want %v", got, want)
 	}
 }
 
 func TestDB_WALPath(t *testing.T) {
-	db := newDB(t, "/tmp/db")
+	db := testingutil.NewDB(t, "/tmp/db")
 	if got, want := db.WALPath(), `/tmp/db-wal`; got != want {
 		t.Fatalf("WALPath()=%v, want %v", got, want)
 	}
@@ -37,13 +30,13 @@ func TestDB_WALPath(t *testing.T) {
 
 func TestDB_MetaPath(t *testing.T) {
 	t.Run("Absolute", func(t *testing.T) {
-		db := newDB(t, "/tmp/db")
+		db := testingutil.NewDB(t, "/tmp/db")
 		if got, want := db.MetaPath(), `/tmp/.db-litestream`; got != want {
 			t.Fatalf("MetaPath()=%v, want %v", got, want)
 		}
 	})
 	t.Run("Relative", func(t *testing.T) {
-		db := newDB(t, "db")
+		db := testingutil.NewDB(t, "db")
 		if got, want := db.MetaPath(), `.db-litestream`; got != want {
 			t.Fatalf("MetaPath()=%v, want %v", got, want)
 		}
@@ -53,16 +46,16 @@ func TestDB_MetaPath(t *testing.T) {
 // Ensure we can compute a checksum on the real database.
 func TestDB_CRC64(t *testing.T) {
 	t.Run("ErrNotExist", func(t *testing.T) {
-		db := MustOpenDB(t)
-		defer MustCloseDB(t, db)
+		db := testingutil.MustOpenDB(t)
+		defer testingutil.MustCloseDB(t, db)
 		if _, _, err := db.CRC64(context.Background()); !os.IsNotExist(err) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
 
 	t.Run("DB", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		t.Log("sync database")
 
@@ -108,8 +101,8 @@ func TestDB_CRC64(t *testing.T) {
 func TestDB_Sync(t *testing.T) {
 	// Ensure sync is skipped if no database exists.
 	t.Run("NoDB", func(t *testing.T) {
-		db := MustOpenDB(t)
-		defer MustCloseDB(t, db)
+		db := testingutil.MustOpenDB(t)
+		defer testingutil.MustCloseDB(t, db)
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
@@ -117,8 +110,8 @@ func TestDB_Sync(t *testing.T) {
 
 	// Ensure sync can successfully run on the initial sync.
 	t.Run("Initial", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
@@ -147,8 +140,8 @@ func TestDB_Sync(t *testing.T) {
 
 	// Ensure DB can keep in sync across multiple Sync() invocations.
 	t.Run("MultiSync", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL.
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
@@ -182,8 +175,8 @@ func TestDB_Sync(t *testing.T) {
 
 	// Ensure a WAL file is created if one does not already exist.
 	t.Run("NoWAL", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		// Issue initial sync and truncate WAL.
 		if err := db.Sync(context.Background()); err != nil {
@@ -212,8 +205,8 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Reopen the managed database.
-		db = MustOpenDBAt(t, db.Path())
-		defer MustCloseDB(t, db)
+		db = testingutil.MustOpenDBAt(t, db.Path())
+		defer testingutil.MustCloseDB(t, db)
 
 		// Re-sync and ensure new generation has been created.
 		if err := db.Sync(context.Background()); err != nil {
@@ -228,8 +221,8 @@ func TestDB_Sync(t *testing.T) {
 
 	// Ensure DB can start new generation if it detects it cannot verify last position.
 	t.Run("OverwritePrevPosition", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL.
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
@@ -259,8 +252,8 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Insert into table multiple times to move past old offset
-		sqldb = MustOpenSQLDB(t, db.Path())
-		defer MustCloseSQLDB(t, sqldb)
+		sqldb = testingutil.MustOpenSQLDB(t, db.Path())
+		defer testingutil.MustCloseSQLDB(t, sqldb)
 		for i := 0; i < 100; i++ {
 			if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz');`); err != nil {
 				t.Fatal(err)
@@ -268,8 +261,8 @@ func TestDB_Sync(t *testing.T) {
 		}
 
 		// Reopen the managed database.
-		db = MustOpenDBAt(t, db.Path())
-		defer MustCloseDB(t, db)
+		db = testingutil.MustOpenDBAt(t, db.Path())
+		defer testingutil.MustCloseDB(t, db)
 
 		// Re-sync and ensure new generation has been created.
 		if err := db.Sync(context.Background()); err != nil {
@@ -284,8 +277,8 @@ func TestDB_Sync(t *testing.T) {
 
 	// Ensure DB checkpoints after minimum number of pages.
 	t.Run("MinCheckpointPageN", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
@@ -318,8 +311,8 @@ func TestDB_Sync(t *testing.T) {
 	t.Run("CheckpointInterval", func(t *testing.T) {
 		t.Skip("TODO(ltx)")
 
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		// Execute a query to force a write to the WAL and then sync.
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
@@ -350,10 +343,10 @@ func TestDB_Sync(t *testing.T) {
 func TestDB_Compact(t *testing.T) {
 	// Ensure that raw L0 transactions can be compacted into the first level.
 	t.Run("L1", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 		db.Replica = litestream.NewReplica(db)
-		db.Replica.Client = NewFileReplicaClient(t)
+		db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
@@ -394,8 +387,8 @@ func TestDB_Compact(t *testing.T) {
 
 	// Ensure that higher level compactions pull from the correct levels.
 	t.Run("L2+", func(t *testing.T) {
-		db, sqldb := MustOpenDBs(t)
-		defer MustCloseDBs(t, db, sqldb)
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
 
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
@@ -453,10 +446,10 @@ func TestDB_Compact(t *testing.T) {
 }
 
 func TestDB_Snapshot(t *testing.T) {
-	db, sqldb := MustOpenDBs(t)
-	defer MustCloseDBs(t, db, sqldb)
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = NewFileReplicaClient(t)
+	db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 		t.Fatal(err)
@@ -500,10 +493,10 @@ func TestDB_Snapshot(t *testing.T) {
 }
 
 func TestDB_EnforceRetention(t *testing.T) {
-	db, sqldb := MustOpenDBs(t)
-	defer MustCloseDBs(t, db, sqldb)
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = NewFileReplicaClient(t)
+	db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 	// Create table and sync initial state
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
@@ -579,8 +572,8 @@ func TestDB_EnforceRetention(t *testing.T) {
 // Run with: go test -race -run TestDB_ConcurrentMapWrite
 func TestDB_ConcurrentMapWrite(t *testing.T) {
 	// Use the standard test helpers
-	db, sqldb := MustOpenDBs(t)
-	defer MustCloseDBs(t, db, sqldb)
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	// Enable monitoring to trigger background operations
 	db.MonitorInterval = 10 * time.Millisecond
@@ -647,86 +640,4 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 	wg.Wait()
 
 	t.Log("Test completed without race condition")
-}
-
-func newDB(tb testing.TB, path string) *litestream.DB {
-	tb.Helper()
-	tb.Logf("db=%s", path)
-
-	level := slog.LevelDebug
-	if strings.EqualFold(*logLevel, "trace") {
-		level = internal.LevelTrace
-	}
-
-	db := litestream.NewDB(path)
-	db.Logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level:       level,
-		ReplaceAttr: internal.ReplaceAttr,
-	}))
-	return db
-}
-
-// MustOpenDBs returns a new instance of a DB & associated SQL DB.
-func MustOpenDBs(tb testing.TB) (*litestream.DB, *sql.DB) {
-	tb.Helper()
-	db := MustOpenDB(tb)
-	return db, MustOpenSQLDB(tb, db.Path())
-}
-
-// MustCloseDBs closes db & sqldb and removes the parent directory.
-func MustCloseDBs(tb testing.TB, db *litestream.DB, sqldb *sql.DB) {
-	tb.Helper()
-	MustCloseDB(tb, db)
-	MustCloseSQLDB(tb, sqldb)
-}
-
-// MustOpenDB returns a new instance of a DB.
-func MustOpenDB(tb testing.TB) *litestream.DB {
-	tb.Helper()
-	dir := tb.TempDir()
-	return MustOpenDBAt(tb, filepath.Join(dir, "db"))
-}
-
-// MustOpenDBAt returns a new instance of a DB for a given path.
-func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
-	tb.Helper()
-	db := newDB(tb, path)
-	db.MonitorInterval = 0 // disable background goroutine
-	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = NewFileReplicaClient(tb)
-	db.Replica.MonitorEnabled = false // disable background goroutine
-	if err := db.Open(); err != nil {
-		tb.Fatal(err)
-	}
-	return db
-}
-
-// MustCloseDB closes db and removes its parent directory.
-func MustCloseDB(tb testing.TB, db *litestream.DB) {
-	tb.Helper()
-	if err := db.Close(context.Background()); err != nil && !strings.Contains(err.Error(), `database is closed`) && !strings.Contains(err.Error(), `file already closed`) {
-		tb.Fatal(err)
-	} else if err := os.RemoveAll(filepath.Dir(db.Path())); err != nil {
-		tb.Fatal(err)
-	}
-}
-
-// MustOpenSQLDB returns a database/sql DB.
-func MustOpenSQLDB(tb testing.TB, path string) *sql.DB {
-	tb.Helper()
-	d, err := sql.Open("sqlite3", path)
-	if err != nil {
-		tb.Fatal(err)
-	} else if _, err := d.ExecContext(context.Background(), `PRAGMA journal_mode = wal;`); err != nil {
-		tb.Fatal(err)
-	}
-	return d
-}
-
-// MustCloseSQLDB closes a database/sql DB.
-func MustCloseSQLDB(tb testing.TB, d *sql.DB) {
-	tb.Helper()
-	if err := d.Close(); err != nil {
-		tb.Fatal(err)
-	}
 }

@@ -10,12 +10,13 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestReplica_Sync(t *testing.T) {
-	db, sqldb := MustOpenDBs(t)
-	defer MustCloseDBs(t, db, sqldb)
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	t.Log("initial sync")
 
@@ -87,8 +88,8 @@ func TestReplica_Sync(t *testing.T) {
 }
 
 func TestReplica_CalcRestorePlan(t *testing.T) {
-	db, sqldb := MustOpenDBs(t)
-	defer MustCloseDBs(t, db, sqldb)
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	t.Run("SnapshotOnly", func(t *testing.T) {
 		var c mock.ReplicaClient

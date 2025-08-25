@@ -3,12 +3,9 @@ package litestream_test
 import (
 	"bytes"
 	"context"
-	"flag"
-	"fmt"
 	"io"
-	"math/rand"
 	"os"
-	"path"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -16,62 +13,8 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/abs"
-	"github.com/benbjohnson/litestream/file"
-	"github.com/benbjohnson/litestream/gs"
-	"github.com/benbjohnson/litestream/nats"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/s3"
-	"github.com/benbjohnson/litestream/sftp"
-)
-
-var (
-	// Enables integration tests.
-	integration = flag.String("integration", "file", "")
-)
-
-// S3 settings
-var (
-	// Replica client settings
-	s3AccessKeyID     = flag.String("s3-access-key-id", os.Getenv("LITESTREAM_S3_ACCESS_KEY_ID"), "")
-	s3SecretAccessKey = flag.String("s3-secret-access-key", os.Getenv("LITESTREAM_S3_SECRET_ACCESS_KEY"), "")
-	s3Region          = flag.String("s3-region", os.Getenv("LITESTREAM_S3_REGION"), "")
-	s3Bucket          = flag.String("s3-bucket", os.Getenv("LITESTREAM_S3_BUCKET"), "")
-	s3Path            = flag.String("s3-path", os.Getenv("LITESTREAM_S3_PATH"), "")
-	s3Endpoint        = flag.String("s3-endpoint", os.Getenv("LITESTREAM_S3_ENDPOINT"), "")
-	s3ForcePathStyle  = flag.Bool("s3-force-path-style", os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE") == "true", "")
-	s3SkipVerify      = flag.Bool("s3-skip-verify", os.Getenv("LITESTREAM_S3_SKIP_VERIFY") == "true", "")
-)
-
-// Google cloud storage settings
-var (
-	gsBucket = flag.String("gs-bucket", os.Getenv("LITESTREAM_GS_BUCKET"), "")
-	gsPath   = flag.String("gs-path", os.Getenv("LITESTREAM_GS_PATH"), "")
-)
-
-// Azure blob storage settings
-var (
-	absAccountName = flag.String("abs-account-name", os.Getenv("LITESTREAM_ABS_ACCOUNT_NAME"), "")
-	absAccountKey  = flag.String("abs-account-key", os.Getenv("LITESTREAM_ABS_ACCOUNT_KEY"), "")
-	absBucket      = flag.String("abs-bucket", os.Getenv("LITESTREAM_ABS_BUCKET"), "")
-	absPath        = flag.String("abs-path", os.Getenv("LITESTREAM_ABS_PATH"), "")
-)
-
-// SFTP settings
-var (
-	sftpHost     = flag.String("sftp-host", os.Getenv("LITESTREAM_SFTP_HOST"), "")
-	sftpUser     = flag.String("sftp-user", os.Getenv("LITESTREAM_SFTP_USER"), "")
-	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
-	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
-	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
-)
-
-// NATS settings
-var (
-	natsURL      = flag.String("nats-url", os.Getenv("LITESTREAM_NATS_URL"), "")
-	natsBucket   = flag.String("nats-bucket", os.Getenv("LITESTREAM_NATS_BUCKET"), "")
-	natsCreds    = flag.String("nats-creds", os.Getenv("LITESTREAM_NATS_CREDS"), "")
-	natsUsername = flag.String("nats-username", os.Getenv("LITESTREAM_NATS_USERNAME"), "")
-	natsPassword = flag.String("nats-password", os.Getenv("LITESTREAM_NATS_PASSWORD"), "")
 )
 
 func TestReplicaClient_LTX(t *testing.T) {
@@ -233,144 +176,19 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 // RunWithReplicaClient executes fn with each replica specified by the -integration flag
 func RunWithReplicaClient(t *testing.T, name string, fn func(*testing.T, litestream.ReplicaClient)) {
 	t.Run(name, func(t *testing.T) {
-		for _, typ := range strings.Split(*integration, ",") {
+		for _, typ := range testingutil.ReplicaClientTypes() {
 			t.Run(typ, func(t *testing.T) {
-				c := NewReplicaClient(t, typ)
-				defer MustDeleteAll(t, c)
+				if !testingutil.Integration() {
+					t.Skip("skipping integration test, use -integration flag to run")
+				}
+
+				c := testingutil.NewReplicaClient(t, typ)
+				defer testingutil.MustDeleteAll(t, c)
 
 				fn(t, c)
 			})
 		}
 	})
-}
-
-// NewReplicaClient returns a new client for integration testing by type name.
-func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
-	tb.Helper()
-
-	switch typ {
-	case file.ReplicaClientType:
-		return NewFileReplicaClient(tb)
-	case s3.ReplicaClientType:
-		return NewS3ReplicaClient(tb)
-	case gs.ReplicaClientType:
-		return NewGSReplicaClient(tb)
-	case abs.ReplicaClientType:
-		return NewABSReplicaClient(tb)
-	case sftp.ReplicaClientType:
-		return NewSFTPReplicaClient(tb)
-	case nats.ReplicaClientType:
-		return NewNATSReplicaClient(tb)
-	default:
-		tb.Fatalf("invalid replica client type: %q", typ)
-		return nil
-	}
-}
-
-// NewFileReplicaClient returns a new client for integration testing.
-func NewFileReplicaClient(tb testing.TB) *file.ReplicaClient {
-	tb.Helper()
-	return file.NewReplicaClient(tb.TempDir())
-}
-
-// NewS3ReplicaClient returns a new client for integration testing.
-func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
-	tb.Helper()
-
-	c := s3.NewReplicaClient()
-	c.AccessKeyID = *s3AccessKeyID
-	c.SecretAccessKey = *s3SecretAccessKey
-	c.Region = *s3Region
-	c.Bucket = *s3Bucket
-	c.Path = path.Join(*s3Path, fmt.Sprintf("%016x", rand.Uint64()))
-	c.Endpoint = *s3Endpoint
-	c.ForcePathStyle = *s3ForcePathStyle
-	c.SkipVerify = *s3SkipVerify
-	return c
-}
-
-// NewGSReplicaClient returns a new client for integration testing.
-func NewGSReplicaClient(tb testing.TB) *gs.ReplicaClient {
-	tb.Helper()
-
-	// Log basic diagnostic information for integration test troubleshooting
-	tb.Logf("GCS Integration Test Setup:")
-	credsSet := "not set"
-	if os.Getenv("GOOGLE_APPLICATION_CREDENTIALS") != "" {
-		credsSet = "set"
-	}
-	tb.Logf("  GOOGLE_APPLICATION_CREDENTIALS: %s", credsSet)
-	tb.Logf("  LITESTREAM_GS_BUCKET: %s", *gsBucket)
-	tb.Logf("  LITESTREAM_GS_PATH: %s", *gsPath)
-
-	c := gs.NewReplicaClient()
-	c.Bucket = *gsBucket
-	c.Path = path.Join(*gsPath, fmt.Sprintf("%016x", rand.Uint64()))
-
-	// Test basic connectivity
-	ctx := context.Background()
-	if err := c.Init(ctx); err != nil {
-		tb.Logf("GCS client initialization failed: %v", err)
-		tb.Logf("This may indicate credential or project issues")
-		return c // Return anyway to let the actual test show the detailed error
-	}
-	tb.Logf("GCS client initialized successfully")
-
-	return c
-}
-
-// NewABSReplicaClient returns a new client for integration testing.
-func NewABSReplicaClient(tb testing.TB) *abs.ReplicaClient {
-	tb.Helper()
-
-	c := abs.NewReplicaClient()
-	c.AccountName = *absAccountName
-	c.AccountKey = *absAccountKey
-	c.Bucket = *absBucket
-	c.Path = path.Join(*absPath, fmt.Sprintf("%016x", rand.Uint64()))
-	return c
-}
-
-// NewSFTPReplicaClient returns a new client for integration testing.
-func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
-	tb.Helper()
-
-	c := sftp.NewReplicaClient()
-	c.Host = *sftpHost
-	c.User = *sftpUser
-	c.Password = *sftpPassword
-	c.KeyPath = *sftpKeyPath
-	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
-	return c
-}
-
-// NewNATSReplicaClient returns a new client for integration testing.
-func NewNATSReplicaClient(tb testing.TB) *nats.ReplicaClient {
-	tb.Helper()
-
-	c := nats.NewReplicaClient()
-	c.URL = *natsURL
-	c.BucketName = *natsBucket
-	c.Creds = *natsCreds
-	c.Username = *natsUsername
-	c.Password = *natsPassword
-	return c
-}
-
-// MustDeleteAll deletes all objects under the client's path.
-func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
-	tb.Helper()
-
-	if err := c.DeleteAll(context.Background()); err != nil {
-		tb.Fatalf("cannot delete all: %s", err)
-	}
-
-	switch c := c.(type) {
-	case *sftp.ReplicaClient:
-		if err := c.Cleanup(context.Background()); err != nil {
-			tb.Fatalf("cannot cleanup sftp: %s", err)
-		}
-	}
 }
 
 func stripLTXFileInfo(info *ltx.FileInfo) *ltx.FileInfo {
@@ -382,7 +200,7 @@ func stripLTXFileInfo(info *ltx.FileInfo) *ltx.FileInfo {
 // TestReplicaClient_S3_UploaderConfig tests S3 uploader configuration for large files
 func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 	// Only run for S3 integration tests
-	if !strings.Contains(*integration, "s3") {
+	if !slices.Contains(testingutil.ReplicaClientTypes(), "s3") {
 		t.Skip("Skipping S3-specific uploader config test")
 	}
 
@@ -449,7 +267,7 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 // TestReplicaClient_S3_ErrorContext tests that S3 errors include helpful context
 func TestReplicaClient_S3_ErrorContext(t *testing.T) {
 	// Only run for S3 integration tests
-	if !strings.Contains(*integration, "s3") {
+	if !slices.Contains(testingutil.ReplicaClientTypes(), "s3") {
 		t.Skip("Skipping S3-specific error context test")
 	}
 
@@ -473,16 +291,13 @@ func TestReplicaClient_S3_ErrorContext(t *testing.T) {
 // TestReplicaClient_S3_BucketValidation tests bucket validation in S3 client
 func TestReplicaClient_S3_BucketValidation(t *testing.T) {
 	// Only run for S3 integration tests
-	if !strings.Contains(*integration, "s3") {
+	if !slices.Contains(testingutil.ReplicaClientTypes(), "s3") {
 		t.Skip("Skipping S3-specific bucket validation test")
 	}
 
 	// Create a new S3 client with empty bucket
-	c := s3.NewReplicaClient()
-	c.AccessKeyID = *s3AccessKeyID
-	c.SecretAccessKey = *s3SecretAccessKey
-	c.Region = *s3Region
-	c.Bucket = "" // Empty bucket name
+	c := testingutil.NewS3ReplicaClient(t)
+	c.Bucket = ""
 
 	// Should fail with bucket validation error
 	err := c.Init(context.Background())
