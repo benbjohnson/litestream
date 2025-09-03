@@ -380,7 +380,6 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Set PERSIST_WAL to prevent WAL file removal when database connections close.
-	// This replaces the ConnectHook functionality from mattn/go-sqlite3.
 	if err := db.setPersistWAL(ctx); err != nil {
 		return fmt.Errorf("set PERSIST_WAL: %w", err)
 	}
