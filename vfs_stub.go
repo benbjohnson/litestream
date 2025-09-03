@@ -1,5 +1,5 @@
-//go:build !cgo || !vfs
-// +build !cgo !vfs
+//go:build !vfs
+// +build !vfs
 
 package litestream
 
@@ -14,7 +14,7 @@ const (
 
 // VFS implements the SQLite VFS interface for Litestream.
 // It is intended to be used for read replicas that read directly from S3.
-// This is a stub implementation for builds without VFS support.
+// This is a stub implementation for builds without the 'vfs' build tag.
 type VFS struct {
 	_ ReplicaClient // unused in stub
 	_ *slog.Logger  // unused in stub
@@ -25,13 +25,13 @@ type VFS struct {
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
-	panic("VFS support requires CGO and the 'vfs' build tag")
+	panic("VFS support requires the 'vfs' build tag")
 }
 
 // VFSFile represents a single database file within the VFS.
-// This is a stub implementation for builds without VFS support.
+// This is a stub implementation for builds without the 'vfs' build tag.
 type VFSFile struct{}
 
 func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile {
-	panic("VFS support requires CGO and the 'vfs' build tag")
+	panic("VFS support requires the 'vfs' build tag")
 }

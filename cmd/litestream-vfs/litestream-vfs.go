@@ -1,5 +1,5 @@
-//go:build SQLITE3VFS_LOADABLE_EXT && cgo
-// +build SQLITE3VFS_LOADABLE_EXT,cgo
+//go:build SQLITE3VFS_LOADABLE_EXT
+// +build SQLITE3VFS_LOADABLE_EXT
 
 package main
 

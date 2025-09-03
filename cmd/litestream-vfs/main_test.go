@@ -1,5 +1,5 @@
-//go:build cgo && vfs
-// +build cgo,vfs
+//go:build vfs
+// +build vfs
 
 package main_test
 
