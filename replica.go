@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -325,7 +326,10 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
-			r.Logger().Error("monitor error", "error", err)
+			// Don't log context cancellation errors during shutdown
+			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				r.Logger().Error("monitor error", "error", err)
+			}
 			continue
 		}
 	}
