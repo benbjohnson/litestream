@@ -410,7 +410,6 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Disable autocheckpoint for litestream's connection.
-	// This prevents automatic WAL checkpointing which would interfere with replication.
 	if _, err := db.db.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
 		return fmt.Errorf("disable autocheckpoint: %w", err)
 	}
