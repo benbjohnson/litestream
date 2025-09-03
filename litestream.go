@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -12,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
+	"modernc.org/sqlite"
 )
 
 // Naming constants.
@@ -50,14 +49,10 @@ var (
 )
 
 func init() {
-	sql.Register("litestream-sqlite3", &sqlite3.SQLiteDriver{
-		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			if err := conn.SetFileControlInt("main", sqlite3.SQLITE_FCNTL_PERSIST_WAL, 1); err != nil {
-				return fmt.Errorf("cannot set file control: %w", err)
-			}
-			return nil
-		},
-	})
+	// Register a custom driver using modernc.org/sqlite.
+	// PERSIST_WAL is set via FileControl after connection (see db.setPersistWAL).
+	// This achieves the same result as mattn/go-sqlite3's ConnectHook.
+	sql.Register("litestream-sqlite3", &sqlite.Driver{})
 }
 
 // Checksum computes a running SQLite checksum over a byte slice.

@@ -1,3 +1,6 @@
+//go:build cgo && !novfs
+// +build cgo,!novfs
+
 package main_test
 
 import (

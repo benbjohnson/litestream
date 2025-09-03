@@ -28,9 +28,19 @@ require (
 	golang.org/x/sys v0.35.0
 	google.golang.org/api v0.154.0
 	gopkg.in/yaml.v2 v2.4.0
+	modernc.org/sqlite v1.38.2
 )
 
-require golang.org/x/sync v0.16.0 // indirect
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/ncruces/go-strftime v0.1.9 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
+	golang.org/x/sync v0.16.0 // indirect
+	modernc.org/libc v1.66.3 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.11.0 // indirect
+)
 
 require (
 	cloud.google.com/go v0.111.0 // indirect
@@ -70,7 +80,7 @@ require (
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
-	github.com/mattn/go-isatty v0.0.17 // indirect
+	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect

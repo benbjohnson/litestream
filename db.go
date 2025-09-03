@@ -20,6 +20,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
+	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
 )
@@ -324,6 +325,30 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	return err
 }
 
+// setPersistWAL sets the PERSIST_WAL file control on the database connection.
+// This prevents SQLite from removing the WAL file when connections close.
+func (db *DB) setPersistWAL(ctx context.Context) error {
+	conn, err := db.db.Conn(ctx)
+	if err != nil {
+		return fmt.Errorf("get connection: %w", err)
+	}
+	defer conn.Close()
+
+	return conn.Raw(func(driverConn interface{}) error {
+		fc, ok := driverConn.(sqlite.FileControl)
+		if !ok {
+			return fmt.Errorf("driver does not implement FileControl")
+		}
+
+		_, err := fc.FileControlPersistWAL("main", 1)
+		if err != nil {
+			return fmt.Errorf("FileControlPersistWAL: %w", err)
+		}
+
+		return nil
+	})
+}
+
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
 func (db *DB) init(ctx context.Context) (err error) {
@@ -350,10 +375,15 @@ func (db *DB) init(ctx context.Context) (err error) {
 	dsn := db.path
 	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeout.Milliseconds())
 
-	// Connect to SQLite database. Use the driver registered with a hook to
-	// prevent WAL files from being removed.
+	// Connect to SQLite database using our custom driver that supports PERSIST_WAL.
 	if db.db, err = sql.Open("litestream-sqlite3", dsn); err != nil {
 		return err
+	}
+
+	// Set PERSIST_WAL to prevent WAL file removal when database connections close.
+	// This replaces the ConnectHook functionality from mattn/go-sqlite3.
+	if err := db.setPersistWAL(ctx); err != nil {
+		return fmt.Errorf("set PERSIST_WAL: %w", err)
 	}
 
 	// Open long-running database file descriptor. Required for non-OFD locks.
@@ -382,6 +412,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 
 	// Disable autocheckpoint for litestream's connection.
+	// This prevents automatic WAL checkpointing which would interfere with replication.
 	if _, err := db.db.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
 		return fmt.Errorf("disable autocheckpoint: %w", err)
 	}

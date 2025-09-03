@@ -17,9 +17,9 @@ import (
 	"time"
 
 	"filippo.io/age"
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
 	"gopkg.in/yaml.v2"
+	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
