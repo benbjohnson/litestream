@@ -48,12 +48,6 @@ var (
 	LogFlags = 0
 )
 
-func init() {
-	// modernc.org/sqlite auto-registers as "sqlite" driver.
-	// We set PERSIST_WAL via FileControl after connection (see db.setPersistWAL).
-	// This achieves the same result as mattn/go-sqlite3's ConnectHook.
-}
-
 // Checksum computes a running SQLite checksum over a byte slice.
 func Checksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
 	assert(len(b)%8 == 0, "misaligned checksum byte slice")

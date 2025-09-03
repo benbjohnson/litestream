@@ -375,7 +375,6 @@ func (db *DB) init(ctx context.Context) (err error) {
 	dsn := db.path
 	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeout.Milliseconds())
 
-	// Connect to SQLite database using modernc.org/sqlite driver.
 	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
 	}
