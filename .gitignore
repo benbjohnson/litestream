@@ -9,3 +9,6 @@ CLAUDE.md
 
 # Binary
 bin/
+litestream
+litestream-vfs
+*.exe
