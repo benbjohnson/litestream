@@ -1,5 +1,5 @@
-//go:build !cgo || novfs
-// +build !cgo novfs
+//go:build !cgo || !vfs
+// +build !cgo !vfs
 
 package litestream
 
@@ -14,10 +14,10 @@ const (
 
 // VFS implements the SQLite VFS interface for Litestream.
 // It is intended to be used for read replicas that read directly from S3.
-// This is a stub implementation for builds without CGO support.
+// This is a stub implementation for builds without VFS support.
 type VFS struct {
-	client ReplicaClient
-	logger *slog.Logger
+	_ ReplicaClient // unused in stub
+	_ *slog.Logger  // unused in stub
 
 	// PollInterval is the interval at which to poll the replica client for new
 	// LTX files. The index will be fetched for the new files automatically.
@@ -25,13 +25,13 @@ type VFS struct {
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
-	panic("VFS support requires CGO and is not available in this build")
+	panic("VFS support requires CGO and the 'vfs' build tag")
 }
 
 // VFSFile represents a single database file within the VFS.
-// This is a stub implementation for builds without CGO support.
+// This is a stub implementation for builds without VFS support.
 type VFSFile struct{}
 
 func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile {
-	panic("VFS support requires CGO and is not available in this build")
+	panic("VFS support requires CGO and the 'vfs' build tag")
 }

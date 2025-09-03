@@ -1,5 +1,5 @@
-//go:build cgo && !novfs
-// +build cgo,!novfs
+//go:build cgo && vfs
+// +build cgo,vfs
 
 package litestream
 
