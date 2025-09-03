@@ -12,7 +12,7 @@ import (
 	"strings"
 
 	"github.com/superfly/ltx"
-	"modernc.org/sqlite"
+	_ "modernc.org/sqlite"
 )
 
 // Naming constants.
@@ -49,10 +49,9 @@ var (
 )
 
 func init() {
-	// Register a custom driver using modernc.org/sqlite.
-	// PERSIST_WAL is set via FileControl after connection (see db.setPersistWAL).
+	// modernc.org/sqlite auto-registers as "sqlite" driver.
+	// We set PERSIST_WAL via FileControl after connection (see db.setPersistWAL).
 	// This achieves the same result as mattn/go-sqlite3's ConnectHook.
-	sql.Register("litestream-sqlite3", &sqlite.Driver{})
 }
 
 // Checksum computes a running SQLite checksum over a byte slice.
