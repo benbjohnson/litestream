@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"testing"
 
-	_ "github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
+	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream"
 )

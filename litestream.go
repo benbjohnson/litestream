@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"path"
@@ -12,8 +11,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/mattn/go-sqlite3"
 	"github.com/superfly/ltx"
+	_ "modernc.org/sqlite"
 )
 
 // Naming constants.
@@ -48,17 +47,6 @@ var (
 	// LogFlags are the flags passed to log.New().
 	LogFlags = 0
 )
-
-func init() {
-	sql.Register("litestream-sqlite3", &sqlite3.SQLiteDriver{
-		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			if err := conn.SetFileControlInt("main", sqlite3.SQLITE_FCNTL_PERSIST_WAL, 1); err != nil {
-				return fmt.Errorf("cannot set file control: %w", err)
-			}
-			return nil
-		},
-	})
-}
 
 // Checksum computes a running SQLite checksum over a byte slice.
 func Checksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {

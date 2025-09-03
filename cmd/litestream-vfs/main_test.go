@@ -1,3 +1,6 @@
+//go:build vfs
+// +build vfs
+
 package main_test
 
 import (
