@@ -556,10 +556,11 @@ type ReplicaConfig struct {
 	AccountKey  string `yaml:"account-key"`
 
 	// SFTP settings
-	Host     string `yaml:"host"`
-	User     string `yaml:"user"`
-	Password string `yaml:"password"`
-	KeyPath  string `yaml:"key-path"`
+	Host             string `yaml:"host"`
+	User             string `yaml:"user"`
+	Password         string `yaml:"password"`
+	KeyPath          string `yaml:"key-path"`
+	ConcurrentWrites *bool  `yaml:"concurrent-writes"`
 
 	// NATS settings
 	JWT           string         `yaml:"jwt"`
@@ -868,6 +869,12 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Password = password
 	client.Path = path
 	client.KeyPath = c.KeyPath
+
+	// Set concurrent writes if specified, otherwise use default (true)
+	if c.ConcurrentWrites != nil {
+		client.ConcurrentWrites = *c.ConcurrentWrites
+	}
+
 	return client, nil
 }
 
