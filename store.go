@@ -162,14 +162,20 @@ LOOP:
 					slog.Debug("recently compacted, skipping", "level", lvl.Level, "path", db.Path())
 					continue
 				} else if err != nil {
-					slog.Error("compaction failed", "level", lvl.Level, "error", err)
+					// Don't log context cancellation errors during shutdown
+					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+						slog.Error("compaction failed", "level", lvl.Level, "error", err)
+					}
 					time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
 				}
 
 				// Each time we snapshot, clean up everything before the oldest snapshot.
 				if lvl.Level == SnapshotLevel {
 					if err := s.EnforceSnapshotRetention(ctx, db); err != nil {
-						slog.Error("retention enforcement failed", "error", err)
+						// Don't log context cancellation errors during shutdown
+						if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+							slog.Error("retention enforcement failed", "error", err)
+						}
 						time.Sleep(1 * time.Second) // wait so we don't rack up S3 charges
 					}
 				}

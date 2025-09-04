@@ -1,8 +1,12 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"io"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -225,4 +229,87 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
 	})
+}
+
+func TestReplica_ContextCancellationNoLogs(t *testing.T) {
+	// This test verifies that context cancellation errors are not logged during shutdown.
+	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded
+	// errors are filtered out in monitor functions to avoid spurious log messages.
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create a buffer to capture log output
+	var logBuffer bytes.Buffer
+
+	// Create a custom logger that writes to our buffer
+	db.Logger = slog.New(slog.NewTextHandler(&logBuffer, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+
+	// First, let's trigger a normal sync to ensure the DB is initialized
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a replica with a mock client that simulates context cancellation during Sync
+	syncCount := 0
+	mockClient := &mock.ReplicaClient{
+		LTXFilesFunc: func(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+			syncCount++
+			// First few calls succeed, then return context.Canceled
+			if syncCount <= 2 {
+				// Return an empty iterator
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+			// After initial syncs, return context.Canceled to simulate shutdown
+			return nil, context.Canceled
+		},
+		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+			// Always succeed for writes to allow normal operation
+			return &ltx.FileInfo{
+				Level:     level,
+				MinTXID:   minTXID,
+				MaxTXID:   maxTXID,
+				CreatedAt: time.Now(),
+			}, nil
+		},
+	}
+
+	r := litestream.NewReplicaWithClient(db, mockClient)
+	r.SyncInterval = 50 * time.Millisecond // Short interval for testing
+
+	// Start the replica monitoring in a goroutine
+	ctx, cancel := context.WithCancel(context.Background())
+
+	if err := r.Start(ctx); err != nil {
+		t.Fatalf("failed to start replica: %v", err)
+	}
+
+	// Give the monitor time to run several sync cycles
+	// This ensures we get both successful syncs and context cancellation errors
+	time.Sleep(200 * time.Millisecond)
+
+	// Cancel the context to trigger shutdown
+	cancel()
+
+	// Stop the replica and wait for it to finish
+	if err := r.Stop(true); err != nil {
+		t.Fatalf("failed to stop replica: %v", err)
+	}
+
+	// Check the logs
+	logs := logBuffer.String()
+
+	// We should have some debug logs from successful operations
+	if !strings.Contains(logs, "replica sync") {
+		t.Errorf("expected 'replica sync' in logs but didn't find it; logs:\n%s", logs)
+	}
+
+	// But we should NOT have "monitor error" with "context canceled"
+	if strings.Contains(logs, "monitor error") && strings.Contains(logs, "context canceled") {
+		t.Errorf("found 'monitor error' with 'context canceled' in logs when it should be filtered:\n%s", logs)
+	}
+
+	// The test passes if context.Canceled errors were properly filtered
 }

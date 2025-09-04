@@ -5,6 +5,7 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -261,7 +262,10 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 			return
 		case <-ticker.C:
 			if err := f.pollReplicaClient(ctx); err != nil {
-				f.logger.Error("cannot fetch new ltx files", "error", err)
+				// Don't log context cancellation errors during shutdown
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					f.logger.Error("cannot fetch new ltx files", "error", err)
+				}
 			}
 		}
 	}
