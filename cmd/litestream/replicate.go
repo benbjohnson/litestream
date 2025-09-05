@@ -117,13 +117,24 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		slog.Error("no databases specified in configuration")
 	}
 
-	dbs := make([]*litestream.DB, 0, len(c.Config.DBs))
+	var dbs []*litestream.DB
 	for _, dbConfig := range c.Config.DBs {
-		db, err := NewDBFromConfig(dbConfig)
-		if err != nil {
-			return err
+		// Handle directory configuration
+		if dbConfig.Directory != "" {
+			dirDbs, err := NewDBsFromDirectoryConfig(dbConfig)
+			if err != nil {
+				return err
+			}
+			dbs = append(dbs, dirDbs...)
+			slog.Info("found databases in directory", "directory", dbConfig.Directory, "count", len(dirDbs))
+		} else {
+			// Handle single database configuration
+			db, err := NewDBFromConfig(dbConfig)
+			if err != nil {
+				return err
+			}
+			dbs = append(dbs, db)
 		}
-		dbs = append(dbs, db)
 	}
 
 	levels := c.Config.CompactionLevels()

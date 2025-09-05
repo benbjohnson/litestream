@@ -1,0 +1,72 @@
+# Example configuration for replicating entire directories of SQLite databases
+# This configuration demonstrates the new directory replication feature (issue #42)
+
+# Serve metrics over HTTP on port 9090.
+addr: ":9090"
+
+dbs:
+  # Example 1: Replicate all .db files in a directory (non-recursive)
+  - directory: /var/lib/myapp/databases
+    pattern: "*.db"
+    recursive: false
+    replica:
+      type: s3
+      bucket: my-bucket
+      path: myapp/databases
+      region: us-east-1
+
+  # Example 2: Replicate all SQLite files recursively in a multi-tenant directory
+  # Perfect for multi-tenancy where each tenant has their own database
+  - directory: /var/lib/tenants
+    pattern: "*.sqlite"
+    recursive: true
+    replica:
+      type: s3
+      bucket: tenant-backups
+      path: tenants
+      region: us-west-2
+      sync-interval: 1m
+
+  # Example 3: Replicate all database files with multiple replicas
+  - directory: /data/production
+    pattern: "*.db"
+    recursive: true
+    replicas:
+      - type: s3
+        bucket: prod-backups
+        path: databases
+        region: us-east-1
+      - type: file
+        path: /backup/databases
+
+  # Example 4: Mix of directory and single file replication in same config
+  # Single database with specific settings
+  - path: /var/lib/critical/main.db
+    checkpoint-interval: 1m
+    replica:
+      type: s3
+      bucket: critical-backups
+      path: main
+      region: us-east-1
+      sync-interval: 10s
+
+  # Directory of user databases
+  - directory: /var/lib/users
+    pattern: "user_*.db"
+    recursive: false
+    checkpoint-interval: 5m
+    replica:
+      type: s3
+      bucket: user-backups
+      path: users
+      region: eu-west-1
+
+# Global S3 settings (optional)
+# These will be used as defaults for all S3 replicas unless overridden
+access-key-id: ${AWS_ACCESS_KEY_ID}
+secret-access-key: ${AWS_SECRET_ACCESS_KEY}
+
+# Logging configuration
+logging:
+  level: info
+  type: text
