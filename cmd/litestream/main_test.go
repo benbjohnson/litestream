@@ -1078,3 +1078,208 @@ dbs:
 		}
 	})
 }
+func TestFindSQLiteDatabases(t *testing.T) {
+	// Create a temporary directory using t.TempDir() - automatically cleaned up
+	tmpDir := t.TempDir()
+
+	// Create test files
+	testFiles := []struct {
+		path       string
+		isSQLite   bool
+		shouldFind bool
+	}{
+		{"test1.db", true, true},
+		{"test2.sqlite", true, true},
+		{"test3.db", false, false}, // Not a SQLite file
+		{"test.txt", false, false},
+		{"subdir/test4.db", true, true},
+		{"subdir/test5.sqlite", true, true},
+		{"subdir/deep/test6.db", true, true},
+	}
+
+	// Create test files
+	for _, tf := range testFiles {
+		fullPath := filepath.Join(tmpDir, tf.path)
+		dir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		file, err := os.Create(fullPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if tf.isSQLite {
+			// Write SQLite header
+			if _, err := file.Write([]byte("SQLite format 3\x00")); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			// Write non-SQLite content
+			if _, err := file.Write([]byte("not a sqlite file")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("non-recursive *.db pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*.db", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should only find test1.db in root directory
+		if len(dbs) != 1 {
+			t.Errorf("expected 1 database, got %d", len(dbs))
+		}
+	})
+
+	t.Run("recursive *.db pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*.db", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should find test1.db, test4.db, and test6.db
+		if len(dbs) != 3 {
+			t.Errorf("expected 3 databases, got %d", len(dbs))
+		}
+	})
+
+	t.Run("recursive *.sqlite pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*.sqlite", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should find test2.sqlite and test5.sqlite
+		if len(dbs) != 2 {
+			t.Errorf("expected 2 databases, got %d", len(dbs))
+		}
+	})
+
+	t.Run("recursive * pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should find all 5 SQLite databases
+		if len(dbs) != 5 {
+			t.Errorf("expected 5 databases, got %d", len(dbs))
+		}
+	})
+}
+
+func TestIsSQLiteDatabase(t *testing.T) {
+	// Create temporary test files using t.TempDir() - automatically cleaned up
+	tmpDir := t.TempDir()
+
+	t.Run("valid SQLite file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "valid.db")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte("SQLite format 3\x00")); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if !main.IsSQLiteDatabase(path) {
+			t.Error("expected file to be identified as SQLite database")
+		}
+	})
+
+	t.Run("invalid SQLite file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "invalid.db")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte("not a sqlite file")); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if main.IsSQLiteDatabase(path) {
+			t.Error("expected file to NOT be identified as SQLite database")
+		}
+	})
+
+	t.Run("non-existent file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "doesnotexist.db")
+		if main.IsSQLiteDatabase(path) {
+			t.Error("expected non-existent file to NOT be identified as SQLite database")
+		}
+	})
+}
+
+func TestDBConfigValidation(t *testing.T) {
+	t.Run("both path and directory specified", func(t *testing.T) {
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Path:      "/path/to/db.sqlite",
+					Directory: "/path/to/dir",
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Error("expected validation error when both path and directory are specified")
+		}
+	})
+
+	t.Run("neither path nor directory specified", func(t *testing.T) {
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Error("expected validation error when neither path nor directory are specified")
+		}
+	})
+
+	t.Run("valid path configuration", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{
+				Path: "/path/to/db.sqlite",
+			},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for valid path config: %v", err)
+		}
+	})
+
+	t.Run("valid directory configuration", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{
+				Directory: "/path/to/dir",
+				Pattern:   "*.db",
+				Recursive: true,
+			},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for valid directory config: %v", err)
+		}
+	})
+}
