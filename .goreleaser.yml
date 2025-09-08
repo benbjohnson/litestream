@@ -166,5 +166,5 @@ release:
 #       - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
 #       - AC_PASSWORD={{ .Env.AC_PASSWORD }}
 
-sboms:
-  - artifacts: archive
+# sboms:
+#   - artifacts: archive
