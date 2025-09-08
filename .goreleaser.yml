@@ -1,0 +1,170 @@
+version: 2
+
+project_name: litestream
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: litestream
+    main: ./cmd/litestream
+    binary: litestream
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+      - arm
+    goarm:
+      - "6"
+      - "7"
+    ldflags:
+      - -s -w -X main.Version={{.Version}}
+    ignore:
+      - goos: windows
+        goarch: arm
+      - goos: darwin
+        goarch: arm
+
+archives:
+  - id: main
+    format: tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    name_template: >-
+      {{ .ProjectName }}-
+      {{- .Version }}-
+      {{- .Os }}-
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+    files:
+      - etc/litestream.yml
+      - etc/litestream.service
+      - README.md
+      - LICENSE
+
+nfpms:
+  - vendor: Litestream
+    homepage: https://litestream.io
+    maintainer: Litestream Contributors <benbjohnson@yahoo.com>
+    description: Streaming replication for SQLite databases
+    license: Apache 2.0
+    formats:
+      - deb
+      - rpm
+    contents:
+      - src: etc/litestream.yml
+        dst: /etc/litestream.yml
+        type: config
+      - src: etc/litestream.service
+        dst: /lib/systemd/system/litestream.service
+        type: config
+    bindir: /usr/bin
+    file_name_template: >-
+      {{ .ProjectName }}-
+      {{- .Version }}-
+      {{- .Os }}-
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+      {{- if .Arm }}v{{ .Arm }}{{ end }}
+
+brews:
+  - name: litestream
+    homepage: https://litestream.io
+    description: Streaming replication for SQLite databases
+    license: Apache-2.0
+    repository:
+      owner: benbjohnson
+      name: homebrew-litestream
+      branch: main
+    directory: Formula
+    install: |
+      bin.install "litestream"
+      etc.install "etc/litestream.yml" => "litestream.yml"
+    test: |
+      system "#{bin}/litestream", "version"
+    commit_author:
+      name: goreleaser
+      email: bot@goreleaser.com
+
+checksum:
+  name_template: 'checksums.txt'
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ .Tag }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
+      - '^chore:'
+      - 'Merge pull request'
+      - 'Merge branch'
+
+release:
+  github:
+    owner: benbjohnson
+    name: litestream
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## Platform Support
+
+    ⚠️ **Windows Notice**: Windows binaries are provided for convenience but Windows is NOT an officially supported platform. Use at your own risk. Community contributions for Windows improvements are welcome.
+
+    ✅ **Supported Platforms**: Linux (amd64, arm64, armv6, armv7), macOS (amd64, arm64)
+
+    ## Installation
+
+    ### Homebrew (macOS and Linux)
+    ```bash
+    brew tap benbjohnson/litestream
+    brew install litestream
+    ```
+
+    ### Debian/Ubuntu
+    Download the `.deb` file for your architecture and install:
+    ```bash
+    sudo dpkg -i litestream-*.deb
+    ```
+
+    ### RPM-based systems
+    Download the `.rpm` file for your architecture and install:
+    ```bash
+    sudo rpm -i litestream-*.rpm
+    ```
+
+    ### Binary installation
+    Download the appropriate archive for your platform, extract, and move to your PATH.
+
+# Signing configuration - uncomment after setting up certificates (see issue #733)
+# signs:
+#   - id: macos
+#     cmd: gon
+#     args:
+#       - "{{ .ProjectPath }}/gon-sign.hcl"
+#     artifacts: archive
+#     ids:
+#       - main
+#     signature: "${artifact}.zip"
+#     output: true
+#     env:
+#       - APPLE_DEVELOPER_ID_APPLICATION={{ .Env.APPLE_DEVELOPER_ID }}
+#       - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
+#       - AC_PASSWORD={{ .Env.AC_PASSWORD }}
+
+sboms:
+  - artifacts: archive

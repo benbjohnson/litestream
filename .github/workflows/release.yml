@@ -1,0 +1,140 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g., v0.3.14)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+  id-token: write
+
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install cross-compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu gcc-arm-linux-gnueabihf gcc-arm-linux-gnueabi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Import GPG key
+        if: ${{ env.GPG_PRIVATE_KEY != '' }}
+        id: import_gpg
+        uses: crazy-max/ghaction-import-gpg@v6
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
+
+  # Signing jobs - uncomment after setting up certificates (see issue #733)
+  # Instructions: https://github.com/benbjohnson/litestream/issues/733
+  #
+  # macos-sign:
+  #   runs-on: macos-latest
+  #   needs: goreleaser
+  #   strategy:
+  #     matrix:
+  #       arch: [amd64, arm64]
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Set up Go
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
+  #
+  #     - name: Download release artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: litestream-darwin-${{ matrix.arch }}
+  #         path: dist/
+  #
+  #     - name: Import Apple Developer Certificate
+  #       env:
+  #         MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+  #         MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+  #       run: |
+  #         echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+  #         security create-keychain -p actions temp.keychain
+  #         security default-keychain -s temp.keychain
+  #         security unlock-keychain -p actions temp.keychain
+  #         security import certificate.p12 -k temp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+  #         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions temp.keychain
+  #
+  #     - name: Sign and Notarize
+  #       env:
+  #         APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+  #         APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+  #         APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+  #         AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+  #       run: |
+  #         gon etc/gon-${{ matrix.arch }}.hcl
+  #
+  #     - name: Upload signed binary
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         gh release upload ${{ github.ref_name }} dist/litestream-*-darwin-${{ matrix.arch }}.zip
+  #
+  # windows-sign:
+  #   runs-on: windows-latest
+  #   needs: goreleaser
+  #   strategy:
+  #     matrix:
+  #       arch: [amd64, arm64]
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Download release artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: litestream-windows-${{ matrix.arch }}
+  #         path: dist/
+  #
+  #     - name: Sign Windows binary
+  #       env:
+  #         WINDOWS_CERTIFICATE_PFX: ${{ secrets.WINDOWS_CERTIFICATE_PFX }}
+  #         WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+  #       run: |
+  #         echo "$env:WINDOWS_CERTIFICATE_PFX" | base64 -d > cert.pfx
+  #         & signtool sign /f cert.pfx /p "$env:WINDOWS_CERTIFICATE_PASSWORD" /fd SHA256 /td SHA256 /tr http://timestamp.digicert.com dist\litestream.exe
+  #         Remove-Item cert.pfx
+  #
+  #     - name: Upload signed binary
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         gh release upload ${{ github.ref_name }} dist\litestream-*-windows-${{ matrix.arch }}.zip
