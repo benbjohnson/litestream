@@ -42,12 +42,17 @@ type ReplicaClient struct {
 	Path        string
 	KeyPath     string
 	DialTimeout time.Duration
+
+	// ConcurrentWrites enables concurrent writes for better performance.
+	// Note: This makes resuming failed transfers unsafe.
+	ConcurrentWrites bool
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
-		DialTimeout: DefaultDialTimeout,
+		DialTimeout:      DefaultDialTimeout,
+		ConcurrentWrites: true, // Default to true for better performance
 	}
 }
 
@@ -104,7 +109,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	// Wrap connection with an SFTP client.
-	if c.sftpClient, err = sftp.NewClient(c.sshClient); err != nil {
+	// Configure options based on client settings
+	opts := []sftp.ClientOption{}
+	if c.ConcurrentWrites {
+		opts = append(opts, sftp.UseConcurrentWrites(true))
+	}
+
+	if c.sftpClient, err = sftp.NewClient(c.sshClient, opts...); err != nil {
 		c.sshClient.Close()
 		c.sshClient = nil
 		return nil, err

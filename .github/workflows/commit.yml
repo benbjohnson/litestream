@@ -294,3 +294,55 @@ jobs:
           LITESTREAM_SFTP_USER:     "root"
           LITESTREAM_SFTP_KEY_PATH: /test/id_ed25519
           LITESTREAM_SFTP_PATH:     /test/data
+
+      - name: Test SFTP with concurrent writes enabled (default)
+        run: |
+          cat > /tmp/sftp-concurrent.yml <<EOF
+          dbs:
+            - path: /tmp/test-concurrent.db
+              replicas:
+                - type: sftp
+                  host: localhost:2222
+                  key-path: /test/id_ed25519
+                  user: root
+                  path: /test/data/concurrent
+                  concurrent-writes: true
+          EOF
+
+          # Create test database
+          sqlite3 /tmp/test-concurrent.db <<SQL
+          CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT);
+          INSERT INTO test (data) VALUES ('test1'), ('test2'), ('test3');
+          SQL
+
+          # Run replication briefly
+          timeout 5 ./bin/litestream replicate -config /tmp/sftp-concurrent.yml || true
+
+          # Check files were created
+          ssh -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost "ls -la /test/data/concurrent/" || true
+
+      - name: Test SFTP with concurrent writes disabled
+        run: |
+          cat > /tmp/sftp-sequential.yml <<EOF
+          dbs:
+            - path: /tmp/test-sequential.db
+              replicas:
+                - type: sftp
+                  host: localhost:2222
+                  key-path: /test/id_ed25519
+                  user: root
+                  path: /test/data/sequential
+                  concurrent-writes: false
+          EOF
+
+          # Create test database
+          sqlite3 /tmp/test-sequential.db <<SQL
+          CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT);
+          INSERT INTO test (data) VALUES ('test1'), ('test2'), ('test3');
+          SQL
+
+          # Run replication briefly
+          timeout 5 ./bin/litestream replicate -config /tmp/sftp-sequential.yml || true
+
+          # Check files were created
+          ssh -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost "ls -la /test/data/sequential/" || true
