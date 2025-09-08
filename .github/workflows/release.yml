@@ -39,6 +39,11 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      - name: Install Syft for SBOM generation
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: latest
+
       - name: Import GPG key
         if: ${{ env.GPG_PRIVATE_KEY != '' }}
         id: import_gpg
