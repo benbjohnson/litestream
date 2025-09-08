@@ -10,6 +10,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/mattn/go-shellwords"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -80,7 +81,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
 			// Check if this looks like a flag that was placed after positional arguments
-			if len(u) > 0 && u[0] == '-' {
+			if strings.HasPrefix(u, "-") {
 				return fmt.Errorf("flag %q must be positioned before DB_PATH and REPLICA_URL arguments", u)
 			}
 			syncInterval := litestream.DefaultSyncInterval
