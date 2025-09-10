@@ -134,6 +134,19 @@ func TestStore_Integration(t *testing.T) {
 	done := make(chan struct{})
 	time.AfterFunc(10*time.Second, func() { close(done) })
 
+	// Channel for insert errors
+	insertErr := make(chan error, 1)
+
+	// Check for any insert errors that occurred before shutdown
+	defer func() {
+		select {
+		case err := <-insertErr:
+			t.Fatalf("insert error during test: %v", err)
+		default:
+			// No insert errors
+		}
+	}()
+
 	// Start goroutine to continuously insert records
 	go func() {
 		ticker := time.NewTicker(factor * 10 * time.Millisecond)
@@ -147,8 +160,19 @@ func TestStore_Integration(t *testing.T) {
 				return
 			case <-ticker.C:
 				if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (val) VALUES (?);`, time.Now().String()); err != nil {
-					t.Errorf("insert error: %v", err)
-					return
+					// Check if we're shutting down
+					select {
+					case <-done:
+						// Expected during shutdown, just exit
+						return
+					default:
+						// Real error, send it
+						select {
+						case insertErr <- err:
+						default:
+						}
+						return
+					}
 				}
 			}
 		}
