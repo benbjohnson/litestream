@@ -95,8 +95,10 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 
 	syncInterval := litestream.DefaultSyncInterval
 	r, err := NewReplicaFromConfig(&ReplicaConfig{
-		URL:          replicaURL,
-		SyncInterval: &syncInterval,
+		URL: replicaURL,
+		ReplicaSettings: ReplicaSettings{
+			SyncInterval: &syncInterval,
+		},
 	}, nil)
 	if err != nil {
 		return nil, err
