@@ -290,12 +290,26 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate database configs
-	for _, db := range c.DBs {
+	for idx, db := range c.DBs {
+		// Validate that either path or directory is specified, but not both
+		if db.Path != "" && db.Directory != "" {
+			return fmt.Errorf("database config #%d: cannot specify both 'path' and 'directory'", idx+1)
+		}
+		if db.Path == "" && db.Directory == "" {
+			return fmt.Errorf("database config #%d: must specify either 'path' or 'directory'", idx+1)
+		}
+
+		// Use path or directory for identifying the config in error messages
+		dbIdentifier := db.Path
+		if dbIdentifier == "" {
+			dbIdentifier = db.Directory
+		}
+
 		// Validate sync intervals for replicas
 		if db.Replica != nil && db.Replica.SyncInterval != nil && *db.Replica.SyncInterval <= 0 {
 			return &ConfigValidationError{
 				Err:   ErrInvalidSyncInterval,
-				Field: fmt.Sprintf("dbs[%s].replica.sync-interval", db.Path),
+				Field: fmt.Sprintf("dbs[%s].replica.sync-interval", dbIdentifier),
 				Value: *db.Replica.SyncInterval,
 			}
 		}
@@ -303,7 +317,7 @@ func (c *Config) Validate() error {
 			if replica.SyncInterval != nil && *replica.SyncInterval <= 0 {
 				return &ConfigValidationError{
 					Err:   ErrInvalidSyncInterval,
-					Field: fmt.Sprintf("dbs[%s].replicas[%d].sync-interval", db.Path, i),
+					Field: fmt.Sprintf("dbs[%s].replicas[%d].sync-interval", dbIdentifier, i),
 					Value: *replica.SyncInterval,
 				}
 			}
@@ -461,9 +475,12 @@ type CompactionLevelConfig struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
-// DBConfig represents the configuration for a single database.
+// DBConfig represents the configuration for a single database or directory of databases.
 type DBConfig struct {
 	Path               string         `yaml:"path"`
+	Directory          string         `yaml:"directory"` // Directory to scan for databases
+	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
+	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
@@ -531,6 +548,107 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	db.Replica = r
 
 	return db, nil
+}
+
+// NewDBsFromDirectoryConfig scans a directory and creates DB instances for all SQLite databases found.
+func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
+	if dbc.Directory == "" {
+		return nil, fmt.Errorf("directory path is required for directory replication")
+	}
+
+	dirPath, err := expand(dbc.Directory)
+	if err != nil {
+		return nil, err
+	}
+
+	// Default pattern if not specified
+	pattern := dbc.Pattern
+	if pattern == "" {
+		pattern = "*.db"
+	}
+
+	// Find all SQLite databases in the directory
+	dbPaths, err := FindSQLiteDatabases(dirPath, pattern, dbc.Recursive)
+	if err != nil {
+		return nil, fmt.Errorf("failed to scan directory %s: %w", dirPath, err)
+	}
+
+	if len(dbPaths) == 0 {
+		return nil, fmt.Errorf("no SQLite databases found in directory %s with pattern %s", dirPath, pattern)
+	}
+
+	// Create DB instances for each found database
+	var dbs []*litestream.DB
+	for _, dbPath := range dbPaths {
+		// Create a copy of the config for each database
+		dbConfigCopy := *dbc
+		dbConfigCopy.Path = dbPath
+		dbConfigCopy.Directory = "" // Clear directory field for individual DB
+
+		db, err := NewDBFromConfig(&dbConfigCopy)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create DB for %s: %w", dbPath, err)
+		}
+		dbs = append(dbs, db)
+	}
+
+	return dbs, nil
+}
+
+// FindSQLiteDatabases recursively finds all SQLite database files in a directory.
+// Exported for testing.
+func FindSQLiteDatabases(dir string, pattern string, recursive bool) ([]string, error) {
+	var dbPaths []string
+
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		// Skip directories unless recursive
+		if info.IsDir() {
+			if !recursive && path != dir {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// Check if file matches pattern
+		matched, err := filepath.Match(pattern, filepath.Base(path))
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return nil
+		}
+
+		// Check if it's a SQLite database
+		if IsSQLiteDatabase(path) {
+			dbPaths = append(dbPaths, path)
+		}
+
+		return nil
+	})
+
+	return dbPaths, err
+}
+
+// IsSQLiteDatabase checks if a file is a SQLite database by reading its header.
+// Exported for testing.
+func IsSQLiteDatabase(path string) bool {
+	file, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+
+	// SQLite files start with "SQLite format 3\x00"
+	header := make([]byte, 16)
+	if _, err := file.Read(header); err != nil {
+		return false
+	}
+
+	return string(header) == "SQLite format 3\x00"
 }
 
 // ReplicaConfig represents the configuration for a single replica in a database.
