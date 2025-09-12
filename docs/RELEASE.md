@@ -167,6 +167,7 @@ GitHub Actions workflow for automated releases
 3. Right-click and select "Export"
 4. Save as .p12 format with a strong password
 5. Convert to base64 for GitHub secrets:
+
    ```bash
    base64 -i certificate.p12 -o certificate_base64.txt
    ```
@@ -182,6 +183,7 @@ GitHub Actions workflow for automated releases
    - Issuer ID (shown at the top of the API Keys page)
    - Key ID (shown in the key list)
 7. Convert .p8 to base64:
+
    ```bash
    base64 -i AuthKey_XXXXX.p8 -o api_key_base64.txt
    ```
@@ -213,6 +215,7 @@ Go to GitHub repository Settings → Secrets and variables → Actions:
 #### Step 7: Enable in Workflow
 
 Edit `.github/workflows/release.yml`:
+
 - Find the `macos-sign` job
 - Remove or change `if: ${{ false }}` to `if: true`
 
@@ -246,6 +249,7 @@ Run the provided script or manually create the repository:
 ```
 
 Or manually:
+
 1. Create a new repository named `homebrew-litestream` under the `benbjohnson` account
 2. Make it public
 3. Add a README and Formula directory

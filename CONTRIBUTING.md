@@ -109,6 +109,77 @@ pre-commit install
 - Ensure existing tests pass before submitting PRs
 - Integration tests require specific environment setup (see test files for details)
 
+#### Testing the 1GB Lock Page Edge Case
+
+SQLite reserves a special "lock page" at exactly 1GB (1,073,741,824 bytes)
+that cannot be written to due to file locking mechanisms, particularly on
+Windows. Litestream must skip this page during replication.
+
+**Why Test Databases >1GB?**
+
+- Ensures lock page skipping logic works correctly
+- Verifies replication doesn't break when crossing the 1GB boundary
+- Tests that restoration properly handles databases with lock pages
+- Validates LTX format handling of non-data pages
+
+##### Lock Page Calculation
+
+The lock page number varies by database page size:
+
+- 4KB pages: page 262145 (most common, ~99% of databases)
+- 8KB pages: page 131073
+- 16KB pages: page 65537
+- 32KB pages: page 32769
+
+Formula: `LockPgno = (0x40000000 / pageSize) + 1`
+
+##### Testing Approach
+
+1. Create test databases larger than 1GB:
+
+```bash
+# Create a test database with specific page size
+sqlite3 test.db "PRAGMA page_size=4096; CREATE TABLE t(data BLOB);"
+
+# Fill database to exceed 1GB (adjust iterations as needed)
+for i in {1..300000}; do
+  sqlite3 test.db "INSERT INTO t VALUES(randomblob(4000));"
+done
+
+# Verify size and page count
+sqlite3 test.db "PRAGMA page_count; PRAGMA page_size;"
+```
+
+1. Test with different page sizes:
+
+```bash
+# Test with 8KB pages
+sqlite3 test_8k.db "PRAGMA page_size=8192; CREATE TABLE t(data BLOB);"
+
+# Test with 16KB pages
+sqlite3 test_16k.db "PRAGMA page_size=16384; CREATE TABLE t(data BLOB);"
+```
+
+1. Verify lock page handling in replication:
+
+```bash
+# Configure litestream for the test database
+litestream replicate test.db s3://mybucket/test.db
+
+# Restore and verify
+litestream restore -o restored.db s3://mybucket/test.db
+
+# Check that lock page region is handled correctly
+sqlite3 restored.db "PRAGMA integrity_check;"
+```
+
+##### Automated Testing Considerations
+
+- Use sparse files where filesystem supports it to avoid disk space issues
+- Consider using in-memory databases with appropriate size limits for CI
+- Test both snapshot and incremental WAL replication across 1GB boundary
+- Verify page maps correctly skip the lock page
+
 ## Security
 
 If you discover a security vulnerability, please:
