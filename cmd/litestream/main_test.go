@@ -13,6 +13,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/s3"
+	"github.com/benbjohnson/litestream/sftp"
 )
 
 func TestOpenConfigFile(t *testing.T) {
@@ -213,6 +214,27 @@ func TestNewGSReplicaFromConfig(t *testing.T) {
 	} else if got, want := client.Bucket, "foo"; got != want {
 		t.Fatalf("Bucket=%s, want %s", got, want)
 	} else if got, want := client.Path, "bar"; got != want {
+		t.Fatalf("Path=%s, want %s", got, want)
+	}
+}
+
+func TestNewSFTPReplicaFromConfig(t *testing.T) {
+	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnK0+GdwOelXlAXdqLx/qvS7WHMr3rH7zW2+0DtmK5r"
+	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{
+		URL:     "sftp://user@example.com:2222/foo",
+		HostKey: hostKey,
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	} else if client, ok := r.Client.(*sftp.ReplicaClient); !ok {
+		t.Fatal("unexpected replica type")
+	} else if got, want := client.HostKey, hostKey; got != want {
+		t.Fatalf("HostKey=%s, want %s", got, want)
+	} else if got, want := client.Host, "example.com:2222"; got != want {
+		t.Fatalf("Host=%s, want %s", got, want)
+	} else if got, want := client.User, "user"; got != want {
+		t.Fatalf("User=%s, want %s", got, want)
+	} else if got, want := client.Path, "/foo"; got != want {
 		t.Fatalf("Path=%s, want %s", got, want)
 	}
 }
