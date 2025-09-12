@@ -113,6 +113,78 @@ jobs:
 
       - run: ./etc/s3_mock.py go test -v ./replica_client_test.go -integration s3
 
+  minio-integration-test:
+    name: Run MinIO Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Start MinIO Server
+        run: |
+          docker run -d \
+            --name minio-test \
+            -p 9000:9000 \
+            -p 9001:9001 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            quay.io/minio/minio server /data --console-address ":9001"
+
+          # Wait for MinIO to be ready
+          echo "Waiting for MinIO server to be ready..."
+          for i in {1..30}; do
+            if docker exec minio-test mc alias set local http://localhost:9000 minioadmin minioadmin 2>/dev/null; then
+              echo "MinIO server is ready"
+              break
+            fi
+            echo "Waiting for MinIO server... ($i/30)"
+            sleep 1
+          done
+
+          # Create test bucket
+          docker exec minio-test mc mb local/testbucket
+
+      - run: go install ./cmd/litestream
+
+      - name: Test Query Parameter Support
+        run: |
+          # Create test database
+          sqlite3 /tmp/test.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users (name) VALUES ('Alice'), ('Bob');"
+
+          # Test replicate with query parameters
+          export AWS_ACCESS_KEY_ID=minioadmin
+          export AWS_SECRET_ACCESS_KEY=minioadmin
+
+          # Run replication for 5 seconds
+          timeout 5 litestream replicate /tmp/test.db \
+            "s3://testbucket/test.db?endpoint=localhost:9000&forcePathStyle=true" || true
+
+          # Verify files were uploaded
+          docker exec minio-test mc ls local/testbucket/test.db/
+
+          # Test restore with query parameters
+          rm -f /tmp/restored.db
+          litestream restore -o /tmp/restored.db \
+            "s3://testbucket/test.db?endpoint=localhost:9000&forcePathStyle=true"
+
+          # Verify restored data
+          if [ "$(sqlite3 /tmp/restored.db 'SELECT COUNT(*) FROM users;')" != "2" ]; then
+            echo "ERROR: Restored database does not have expected data"
+            exit 1
+          fi
+
+          echo "MinIO integration test with query parameters passed!"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop minio-test || true
+          docker rm minio-test || true
+
   nats-docker-test:
     name: Run NATS Integration Tests
     runs-on: ubuntu-latest

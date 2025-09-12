@@ -622,3 +622,243 @@ func TestConfig_DefaultValues(t *testing.T) {
 		t.Errorf("expected default snapshot retention of 24h, got %v", *config.Snapshot.Retention)
 	}
 }
+
+func TestParseReplicaURLWithQuery(t *testing.T) {
+	t.Run("S3WithEndpoint", func(t *testing.T) {
+		url := "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-east-1&forcePathStyle=true"
+		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scheme != "s3" {
+			t.Errorf("expected scheme 's3', got %q", scheme)
+		}
+		if host != "mybucket" {
+			t.Errorf("expected host 'mybucket', got %q", host)
+		}
+		if path != "path/to/db" {
+			t.Errorf("expected path 'path/to/db', got %q", path)
+		}
+		if query.Get("endpoint") != "localhost:9000" {
+			t.Errorf("expected endpoint 'localhost:9000', got %q", query.Get("endpoint"))
+		}
+		if query.Get("region") != "us-east-1" {
+			t.Errorf("expected region 'us-east-1', got %q", query.Get("region"))
+		}
+		if query.Get("forcePathStyle") != "true" {
+			t.Errorf("expected forcePathStyle 'true', got %q", query.Get("forcePathStyle"))
+		}
+	})
+
+	t.Run("S3WithoutQuery", func(t *testing.T) {
+		url := "s3://mybucket/path/to/db"
+		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scheme != "s3" {
+			t.Errorf("expected scheme 's3', got %q", scheme)
+		}
+		if host != "mybucket" {
+			t.Errorf("expected host 'mybucket', got %q", host)
+		}
+		if path != "path/to/db" {
+			t.Errorf("expected path 'path/to/db', got %q", path)
+		}
+		if len(query) != 0 {
+			t.Errorf("expected no query parameters, got %v", query)
+		}
+	})
+
+	t.Run("FileURL", func(t *testing.T) {
+		url := "file:///path/to/db"
+		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scheme != "file" {
+			t.Errorf("expected scheme 'file', got %q", scheme)
+		}
+		if host != "" {
+			t.Errorf("expected empty host, got %q", host)
+		}
+		if path != "/path/to/db" {
+			t.Errorf("expected path '/path/to/db', got %q", path)
+		}
+		if query != nil {
+			t.Errorf("expected nil query for file URL, got %v", query)
+		}
+	})
+
+	t.Run("BackwardCompatibility", func(t *testing.T) {
+		// Test that ParseReplicaURL still works as before
+		url := "s3://mybucket/path/to/db?endpoint=localhost:9000"
+		scheme, host, path, err := main.ParseReplicaURL(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scheme != "s3" {
+			t.Errorf("expected scheme 's3', got %q", scheme)
+		}
+		if host != "mybucket" {
+			t.Errorf("expected host 'mybucket', got %q", host)
+		}
+		if path != "path/to/db" {
+			t.Errorf("expected path 'path/to/db', got %q", path)
+		}
+	})
+
+	t.Run("S3TigrisExample", func(t *testing.T) {
+		url := "s3://mybucket/db?endpoint=fly.storage.tigris.dev&region=auto"
+		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scheme != "s3" {
+			t.Errorf("expected scheme 's3', got %q", scheme)
+		}
+		if host != "mybucket" {
+			t.Errorf("expected host 'mybucket', got %q", host)
+		}
+		if path != "db" {
+			t.Errorf("expected path 'db', got %q", path)
+		}
+		if query.Get("endpoint") != "fly.storage.tigris.dev" {
+			t.Errorf("expected endpoint 'fly.storage.tigris.dev', got %q", query.Get("endpoint"))
+		}
+		if query.Get("region") != "auto" {
+			t.Errorf("expected region 'auto', got %q", query.Get("region"))
+		}
+	})
+
+	t.Run("S3WithSkipVerify", func(t *testing.T) {
+		url := "s3://mybucket/db?endpoint=self-signed.local&skipVerify=true"
+		_, _, _, query, err := main.ParseReplicaURLWithQuery(url)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if query.Get("skipVerify") != "true" {
+			t.Errorf("expected skipVerify 'true', got %q", query.Get("skipVerify"))
+		}
+	})
+}
+
+func TestNewS3ReplicaClientFromConfig(t *testing.T) {
+	t.Run("URLWithEndpointQuery", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-west-2&forcePathStyle=true&skipVerify=true",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Bucket != "mybucket" {
+			t.Errorf("expected bucket 'mybucket', got %q", client.Bucket)
+		}
+		if client.Path != "path/to/db" {
+			t.Errorf("expected path 'path/to/db', got %q", client.Path)
+		}
+		if client.Endpoint != "http://localhost:9000" {
+			t.Errorf("expected endpoint 'http://localhost:9000', got %q", client.Endpoint)
+		}
+		if client.Region != "us-west-2" {
+			t.Errorf("expected region 'us-west-2', got %q", client.Region)
+		}
+		if !client.ForcePathStyle {
+			t.Error("expected ForcePathStyle to be true")
+		}
+		if !client.SkipVerify {
+			t.Error("expected SkipVerify to be true")
+		}
+	})
+
+	t.Run("URLWithoutQuery", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket.s3.amazonaws.com/path/to/db",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Bucket != "mybucket" {
+			t.Errorf("expected bucket 'mybucket', got %q", client.Bucket)
+		}
+		if client.Path != "path/to/db" {
+			t.Errorf("expected path 'path/to/db', got %q", client.Path)
+		}
+		// Should use default AWS settings
+		if client.Endpoint != "" {
+			t.Errorf("expected empty endpoint for AWS S3, got %q", client.Endpoint)
+		}
+		if client.ForcePathStyle {
+			t.Error("expected ForcePathStyle to be false for AWS S3")
+		}
+	})
+
+	t.Run("ConfigOverridesQuery", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL:      "s3://mybucket/path?endpoint=from-query&region=us-east-1",
+			Endpoint: "from-config",
+			Region:   "us-west-1",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Config values should take precedence over query params
+		if client.Endpoint != "from-config" {
+			t.Errorf("expected endpoint from config 'from-config', got %q", client.Endpoint)
+		}
+		if client.Region != "us-west-1" {
+			t.Errorf("expected region from config 'us-west-1', got %q", client.Region)
+		}
+	})
+
+	t.Run("TigrisExample", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://my-tigris-bucket/db.sqlite?endpoint=fly.storage.tigris.dev&region=auto",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Bucket != "my-tigris-bucket" {
+			t.Errorf("expected bucket 'my-tigris-bucket', got %q", client.Bucket)
+		}
+		if client.Endpoint != "http://fly.storage.tigris.dev" {
+			t.Errorf("expected Tigris endpoint, got %q", client.Endpoint)
+		}
+		if client.Region != "auto" {
+			t.Errorf("expected region 'auto' for Tigris, got %q", client.Region)
+		}
+		if !client.ForcePathStyle {
+			t.Error("expected ForcePathStyle to be true for custom endpoint")
+		}
+	})
+
+	t.Run("HTTPSEndpoint", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?endpoint=https://secure.storage.com&region=us-east-1",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Endpoint != "https://secure.storage.com" {
+			t.Errorf("expected endpoint 'https://secure.storage.com', got %q", client.Endpoint)
+		}
+		if !client.ForcePathStyle {
+			t.Error("expected ForcePathStyle to be true for custom endpoint")
+		}
+	})
+}
