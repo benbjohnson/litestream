@@ -185,6 +185,9 @@ The commands are:
 
 // Config represents a configuration file for the litestream daemon.
 type Config struct {
+	// Global replica settings that serve as defaults for all replicas
+	ReplicaSettings `yaml:",inline"`
+
 	// Bind address for serving metrics.
 	Addr string `yaml:"addr"`
 
@@ -201,10 +204,6 @@ type Config struct {
 	// Subcommand to execute during replication.
 	// Litestream will shutdown when subcommand exits.
 	Exec string `yaml:"exec"`
-
-	// Global S3 settings
-	AccessKeyID     string `yaml:"access-key-id"`
-	SecretAccessKey string `yaml:"secret-access-key"`
 
 	// Logging
 	Logging LoggingConfig `yaml:"logging"`
@@ -230,16 +229,15 @@ type LoggingConfig struct {
 	Stderr bool   `yaml:"stderr"`
 }
 
-// propagateGlobalSettings copies global S3 settings to replica configs.
+// propagateGlobalSettings copies global replica settings to individual replica configs.
 func (c *Config) propagateGlobalSettings() {
 	for _, dbc := range c.DBs {
+		// Handle both old-style 'replicas' and new-style 'replica'
+		if dbc.Replica != nil {
+			dbc.Replica.SetDefaults(&c.ReplicaSettings)
+		}
 		for _, rc := range dbc.Replicas {
-			if rc.AccessKeyID == "" {
-				rc.AccessKeyID = c.AccessKeyID
-			}
-			if rc.SecretAccessKey == "" {
-				rc.SecretAccessKey = c.SecretAccessKey
-			}
+			rc.SetDefaults(&c.ReplicaSettings)
 		}
 	}
 }
@@ -533,12 +531,9 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	return db, nil
 }
 
-// ReplicaConfig represents the configuration for a single replica in a database.
-type ReplicaConfig struct {
-	Type               string         `yaml:"type"` // "file", "s3"
-	Name               string         `yaml:"name"` // Deprecated
-	Path               string         `yaml:"path"`
-	URL                string         `yaml:"url"`
+// ReplicaSettings contains settings shared across replica configurations.
+// These can be set globally in Config or per-replica in ReplicaConfig.
+type ReplicaSettings struct {
 	SyncInterval       *time.Duration `yaml:"sync-interval"`
 	ValidationInterval *time.Duration `yaml:"validation-interval"`
 
@@ -582,6 +577,129 @@ type ReplicaConfig struct {
 		Identities []string `yaml:"identities"`
 		Recipients []string `yaml:"recipients"`
 	} `yaml:"age"`
+}
+
+// SetDefaults merges default settings from src into the current ReplicaSettings.
+// Individual settings override defaults when already set.
+func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
+	if src == nil {
+		return
+	}
+
+	// Timing settings
+	if rs.SyncInterval == nil && src.SyncInterval != nil {
+		rs.SyncInterval = src.SyncInterval
+	}
+	if rs.ValidationInterval == nil && src.ValidationInterval != nil {
+		rs.ValidationInterval = src.ValidationInterval
+	}
+
+	// S3 settings
+	if rs.AccessKeyID == "" {
+		rs.AccessKeyID = src.AccessKeyID
+	}
+	if rs.SecretAccessKey == "" {
+		rs.SecretAccessKey = src.SecretAccessKey
+	}
+	if rs.Region == "" {
+		rs.Region = src.Region
+	}
+	if rs.Bucket == "" {
+		rs.Bucket = src.Bucket
+	}
+	if rs.Endpoint == "" {
+		rs.Endpoint = src.Endpoint
+	}
+	if rs.ForcePathStyle == nil {
+		rs.ForcePathStyle = src.ForcePathStyle
+	}
+	if src.SkipVerify {
+		rs.SkipVerify = true
+	}
+
+	// ABS settings
+	if rs.AccountName == "" {
+		rs.AccountName = src.AccountName
+	}
+	if rs.AccountKey == "" {
+		rs.AccountKey = src.AccountKey
+	}
+
+	// SFTP settings
+	if rs.Host == "" {
+		rs.Host = src.Host
+	}
+	if rs.User == "" {
+		rs.User = src.User
+	}
+	if rs.Password == "" {
+		rs.Password = src.Password
+	}
+	if rs.KeyPath == "" {
+		rs.KeyPath = src.KeyPath
+	}
+	if rs.ConcurrentWrites == nil {
+		rs.ConcurrentWrites = src.ConcurrentWrites
+	}
+
+	// NATS settings
+	if rs.JWT == "" {
+		rs.JWT = src.JWT
+	}
+	if rs.Seed == "" {
+		rs.Seed = src.Seed
+	}
+	if rs.Creds == "" {
+		rs.Creds = src.Creds
+	}
+	if rs.NKey == "" {
+		rs.NKey = src.NKey
+	}
+	if rs.Username == "" {
+		rs.Username = src.Username
+	}
+	if rs.Token == "" {
+		rs.Token = src.Token
+	}
+	if !rs.TLS {
+		rs.TLS = src.TLS
+	}
+	if len(rs.RootCAs) == 0 {
+		rs.RootCAs = src.RootCAs
+	}
+	if rs.ClientCert == "" {
+		rs.ClientCert = src.ClientCert
+	}
+	if rs.ClientKey == "" {
+		rs.ClientKey = src.ClientKey
+	}
+	if rs.MaxReconnects == nil {
+		rs.MaxReconnects = src.MaxReconnects
+	}
+	if rs.ReconnectWait == nil {
+		rs.ReconnectWait = src.ReconnectWait
+	}
+	if rs.Timeout == nil {
+		rs.Timeout = src.Timeout
+	}
+
+	// Age encryption settings
+	if len(rs.Age.Identities) == 0 {
+		rs.Age.Identities = src.Age.Identities
+	}
+	if len(rs.Age.Recipients) == 0 {
+		rs.Age.Recipients = src.Age.Recipients
+	}
+}
+
+// ReplicaConfig represents the configuration for a single replica in a database.
+type ReplicaConfig struct {
+	ReplicaSettings `yaml:",inline"`
+
+	Type string `yaml:"type"` // "file", "s3"
+	Name string `yaml:"name"` // Deprecated
+	Path string `yaml:"path"`
+	URL  string `yaml:"url"`
 }
 
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
