@@ -250,6 +250,7 @@ func DefaultConfig() Config {
 	defaultSnapshotRetention := 24 * time.Hour
 	return Config{
 		Levels: []*CompactionLevelConfig{
+			{Interval: 30 * time.Second},
 			{Interval: 5 * time.Minute},
 			{Interval: 1 * time.Hour},
 		},
