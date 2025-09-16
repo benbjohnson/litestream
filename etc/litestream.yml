@@ -4,21 +4,23 @@
 
 # dbs:
 #  - path: /path/to/primary/db            # Database to replicate from
-#    replicas:
-#      - path: /path/to/replica           # File-based replication
-#      - url:  s3://my.bucket.com/db      # S3-based replication
-#      - type: nats                       # NATS JetStream replication
-#        url: nats://nats.example.com:4222
-#        bucket: litestream-backups
-#        # Optional TLS configuration:
-#        # client-cert: /path/to/client.pem
-#        # client-key: /path/to/client.key
-#        # root-cas: [/path/to/ca.pem]
-#      - url: sftp://user@host:22/path    # SFTP-based replication
-#        key-path: /etc/litestream/sftp_key
-#        # Strongly recommended: SSH host key for verification
-#        # Get this from the server's /etc/ssh/ssh_host_*.pub file
-#        # or use `ssh-keyscan hostname`
-#        # Example formats:
-#        # host-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvvypUkBrS9RCyV//p+UFCLg8yKNtTu/ew/cV6XXAAP
-#        # host-key: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...
+#    replica:
+#      path: /path/to/replica             # File-based replication
+#      url:  s3://my.bucket.com/db        # S3-based replication
+#      type: nats                         # NATS JetStream replication
+#      url: nats://nats.example.com:4222
+#      bucket: litestream-backups
+#      # Optional TLS configuration:
+#      # client-cert: /path/to/client.pem
+#      # client-key: /path/to/client.key
+#      # root-cas: [/path/to/ca.pem]
+#  - path: /path/to/another/db
+#    replica:
+#      url: sftp://user@host:22/path      # SFTP-based replication
+#      key-path: /etc/litestream/sftp_key
+#      # Strongly recommended: SSH host key for verification
+#      # Get this from the server's /etc/ssh/ssh_host_*.pub file
+#      # or use `ssh-keyscan hostname`
+#      # Example formats:
+#      # host-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvvypUkBrS9RCyV//p+UFCLg8yKNtTu/ew/cV6XXAAP
+#      # host-key: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...
