@@ -23,7 +23,7 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/superfly/ltx v0.4.0
+	github.com/superfly/ltx v0.5.0
 	golang.org/x/crypto v0.41.0
 	golang.org/x/sys v0.35.0
 	google.golang.org/api v0.154.0
