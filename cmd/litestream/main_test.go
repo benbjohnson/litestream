@@ -560,15 +560,18 @@ dbs:
 		}
 
 		// When levels are not specified, defaults should be applied
-		if len(config.Levels) != 2 {
-			t.Fatalf("expected 2 default compaction levels, got %d", len(config.Levels))
+		if len(config.Levels) != 3 {
+			t.Fatalf("expected 3 default compaction levels, got %d", len(config.Levels))
 		}
 
-		// Check default intervals: 5m and 1h
-		if config.Levels[0].Interval != 5*time.Minute {
+		// Check default intervals: 30s, 5m and 1h
+		if config.Levels[0].Interval != 30*time.Second {
 			t.Errorf("expected default level[0] interval of 5m, got %v", config.Levels[0].Interval)
 		}
-		if config.Levels[1].Interval != 1*time.Hour {
+		if config.Levels[1].Interval != 5*time.Minute {
+			t.Errorf("expected default level[0] interval of 5m, got %v", config.Levels[0].Interval)
+		}
+		if config.Levels[2].Interval != 1*time.Hour {
 			t.Errorf("expected default level[1] interval of 1h, got %v", config.Levels[1].Interval)
 		}
 	})
