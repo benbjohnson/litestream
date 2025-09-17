@@ -32,6 +32,15 @@ go build -o bin/litestream-test ./cmd/litestream-test
 - **`test-1gb-boundary.sh`** - Tests SQLite 1GB lock page boundary handling
   - Note: Currently blocked by ltx v0.5.0 flag compatibility issue
 
+### S3 Retention Tests (NEW)
+
+- **`test-s3-retention-small-db.sh`** - Tests S3 LTX retention cleanup with 50MB database (2min retention)
+- **`test-s3-retention-large-db.sh`** - Tests S3 LTX retention cleanup with 1.5GB database crossing lock page (3min retention)
+- **`test-s3-retention-comprehensive.sh`** - Master script running both tests with comparative analysis
+- **`test-s3-retention-cleanup.sh`** - Original basic S3 retention test
+
+These scripts test that old LTX files are properly cleaned up after their retention period expires, using the local Python S3 mock for isolated testing.
+
 ## Usage
 
 All scripts are designed to be run from the repository root:
