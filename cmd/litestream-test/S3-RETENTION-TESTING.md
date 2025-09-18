@@ -7,17 +7,20 @@ This document describes the comprehensive S3 LTX file retention testing scripts 
 ## Key Focus Areas
 
 ### 1. Small Database Testing
+
 - **Database Size**: 50MB
 - **Retention Period**: 2 minutes
 - **Focus**: Basic retention behavior with minimal data
 
 ### 2. Large Database Testing (Critical)
+
 - **Database Size**: 1.5GB (crosses SQLite lock page boundary)
 - **Page Size**: 4KB (lock page at #262145)
 - **Retention Period**: 3 minutes
 - **Focus**: SQLite lock page edge case + retention cleanup at scale
 
 ### 3. Comprehensive Analysis
+
 - Side-by-side comparison of retention behavior
 - Performance metrics analysis
 - Best practices verification
@@ -93,15 +96,18 @@ This document describes the comprehensive S3 LTX file retention testing scripts 
 ## SQLite Lock Page Testing
 
 ### Why It Matters
+
 SQLite reserves a special lock page at exactly 1GB (offset 0x40000000) that cannot contain data. This creates a critical edge case that Litestream must handle correctly.
 
 ### What We Test
+
 - **Lock Page Location**: Page #262145 (with 4KB page size)
 - **Boundary Crossing**: Databases that grow beyond 1GB
 - **Replication Integrity**: Ensure lock page is properly skipped
 - **Restoration Accuracy**: Verify restored databases maintain integrity
 
 ### Lock Page Numbers by Page Size
+
 | Page Size | Lock Page # | Test Coverage |
 |-----------|-------------|---------------|
 | 4KB       | 262145      | ✅ Tested     |
@@ -112,12 +118,14 @@ SQLite reserves a special lock page at exactly 1GB (offset 0x40000000) that cann
 ## Local S3 Mock Setup
 
 ### Why Use Local Mock
+
 - **Isolation**: No external dependencies or costs
 - **Repeatability**: Consistent test environment
 - **Speed**: No network latency
 - **Safety**: No risk of affecting production data
 
 ### How It Works
+
 The tests use the existing `./etc/s3_mock.py` script which:
 1. Starts a local moto S3 server
 2. Creates a test bucket with unique name
@@ -125,6 +133,7 @@ The tests use the existing `./etc/s3_mock.py` script which:
 4. Automatically cleans up after test completion
 
 ### Environment Variables Set by Mock
+
 ```bash
 LITESTREAM_S3_ACCESS_KEY_ID="lite"
 LITESTREAM_S3_SECRET_ACCESS_KEY="stream"
@@ -136,6 +145,7 @@ LITESTREAM_S3_FORCE_PATH_STYLE="true"
 ## Test Execution Flow
 
 ### Small Database Test Flow
+
 1. **Setup**: Build binaries, check dependencies
 2. **Database Creation**: 50MB with indexed tables
 3. **Replication Start**: Begin S3 mock and Litestream
@@ -145,6 +155,7 @@ LITESTREAM_S3_FORCE_PATH_STYLE="true"
 7. **Analysis**: Generate detailed report
 
 ### Large Database Test Flow
+
 1. **Setup**: Build binaries, verify lock page calculations
 2. **Database Creation**: 1.5GB crossing lock page boundary
 3. **Replication Start**: Begin S3 mock (longer initial sync)
@@ -156,18 +167,21 @@ LITESTREAM_S3_FORCE_PATH_STYLE="true"
 ## Monitoring Retention Cleanup
 
 ### What to Look For
+
 The scripts monitor logs for these cleanup indicators:
 - **Direct**: "clean", "delete", "expire", "retention", "removed", "purge"
 - **Indirect**: "old file", "ttl", "sweep", "vacuum", "evict"
 - **LTX-specific**: "ltx.*old", "snapshot.*old", "compress", "archive"
 
 ### Expected Behavior
+
 1. **Initial Period**: LTX files accumulate normally
 2. **Retention Trigger**: Cleanup begins after retention period
 3. **Ongoing**: Old files removed, new files continue to accumulate
 4. **Stabilization**: File count stabilizes at recent files only
 
 ### Warning Signs
+
 - **No Cleanup**: Files accumulate indefinitely
 - **Cleanup Failures**: Error messages about S3 DELETE operations
 - **Retention Ignored**: Files older than retention period remain
@@ -175,17 +189,20 @@ The scripts monitor logs for these cleanup indicators:
 ## Dependencies
 
 ### Required Tools
+
 - **Go**: For building Litestream binaries
 - **Python 3**: For S3 mock server
 - **sqlite3**: For database operations
 - **bc**: For calculations
 
 ### Python Packages
+
 ```bash
 pip3 install moto boto3
 ```
 
 ### Auto-Installation
+
 The scripts automatically:
 - Build missing Litestream binaries
 - Install missing Python packages
@@ -194,18 +211,21 @@ The scripts automatically:
 ## Output and Artifacts
 
 ### Log Files
+
 - `/tmp/small-retention-test.log` - Small database replication log
 - `/tmp/large-retention-test.log` - Large database replication log
 - `/tmp/small-retention-config.yml` - Small database config
 - `/tmp/large-retention-config.yml` - Large database config
 
 ### Database Files
+
 - `/tmp/small-retention-test.db` - Small test database
 - `/tmp/large-retention-test.db` - Large test database
 - `/tmp/small-retention-restored.db` - Restored small database
 - `/tmp/large-retention-restored.db` - Restored large database
 
 ### Analysis Output
+
 Each test generates:
 - **Operation Counts**: Sync, upload, LTX operations
 - **Cleanup Indicators**: Number of cleanup-related log entries
@@ -216,6 +236,7 @@ Each test generates:
 ## Integration with Existing Framework
 
 ### Relationship to Existing Tests
+
 These tests complement the existing test infrastructure:
 
 - **`test-s3-retention-cleanup.sh`**: Original retention test (more basic)
@@ -223,6 +244,7 @@ These tests complement the existing test infrastructure:
 - **Testing Framework**: Uses `litestream-test` CLI for data generation
 
 ### Consistent Patterns
+
 - Use existing `etc/s3_mock.py` for S3 simulation
 - Follow naming conventions from existing scripts
 - Integrate with `litestream-test` populate/load/validate commands
@@ -231,6 +253,7 @@ These tests complement the existing test infrastructure:
 ## Production Validation Recommendations
 
 ### After Local Testing
+
 1. **Real S3 Testing**: Run against actual S3/GCS/Azure endpoints
 2. **Network Scenarios**: Test with network interruptions
 3. **Scale Testing**: Test with production-sized databases
@@ -238,11 +261,13 @@ These tests complement the existing test infrastructure:
 5. **Concurrent Testing**: Multiple databases simultaneously
 
 ### Retention Period Guidelines
+
 - **Local Testing**: 2-3 minutes for quick feedback
 - **Staging**: 1-2 hours for realistic behavior
 - **Production**: Days to weeks based on recovery requirements
 
 ### Monitoring in Production
+
 - **LTX File Counts**: Should stabilize after retention period
 - **Storage Growth**: Should level off, not grow indefinitely
 - **API Costs**: DELETE operations should occur regularly
@@ -252,33 +277,39 @@ These tests complement the existing test infrastructure:
 
 ### Common Issues
 
-**1. Python Dependencies Missing**
+#### 1. Python Dependencies Missing
+
 ```bash
 pip3 install moto boto3
 ```
 
-**2. Binaries Not Found**
+#### 2. Binaries Not Found
+
 ```bash
 go build -o bin/litestream ./cmd/litestream
 go build -o bin/litestream-test ./cmd/litestream-test
 ```
 
-**3. Large Database Test Slow**
+#### 3. Large Database Test Slow
+
 - Expected: 1.5GB takes time to create and replicate
 - Monitor progress in logs
 - Increase timeouts if needed
 
-**4. No Cleanup Activity Detected**
+#### 4. No Cleanup Activity Detected
+
 - May be normal: Litestream might clean up silently
 - Check S3 bucket contents manually (if using real S3)
 - Verify retention period has elapsed
 
-**5. Lock Page Boundary Not Crossed**
+#### 5. Lock Page Boundary Not Crossed
+
 - Check final page count vs. lock page number
 - Increase target database size if needed
 - Verify page size settings
 
 ### Debug Mode
+
 For more verbose output:
 ```bash
 # Enable debug logging
