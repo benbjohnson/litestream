@@ -35,6 +35,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
+		initLog(os.Stdout, "INFO", "text")
 	} else {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
