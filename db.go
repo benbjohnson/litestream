@@ -697,7 +697,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
-		info.snapshotting = false
+		info.reason = "wal salt changed"
 		return info, nil
 	}
 
@@ -705,7 +705,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	prevWALOffset := info.offset - frameSize
 	if prevWALOffset <= 0 {
-		info.snapshotting = false
+		info.reason = "wal offset before first frame"
 		return info, nil
 	}
 
@@ -771,6 +771,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 	pos, err := db.Pos()
 	if err != nil {
 		return fmt.Errorf("pos: %w", err)
+	}
+
+	// If we require a snapshot but have an existing position, reset local LTX state
+	// so that we start a new generation from transaction ID 1.
+	if info.snapshotting && pos.TXID != 0 && info.offset == WALHeaderSize {
+		if err := db.resetLTXState(); err != nil {
+			return fmt.Errorf("reset ltx state: %w", err)
+		}
+		pos = ltx.Pos{}
 	}
 	txID := pos.TXID + 1
 
@@ -940,6 +949,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 
 	db.Logger.Debug("db sync", "status", "ok")
 
+	return nil
+}
+
+// resetLTXState removes all local LTX files and clears cached metadata.
+func (db *DB) resetLTXState() error {
+	if err := os.RemoveAll(db.LTXDir()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.Unlock()
 	return nil
 }
 
