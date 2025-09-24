@@ -216,8 +216,8 @@ func (r *Replica) Pos() ltx.Pos {
 
 // SetPos sets the current replicated position.
 func (r *Replica) SetPos(pos ltx.Pos) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.pos = pos
 }
 

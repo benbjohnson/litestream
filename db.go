@@ -1277,6 +1277,17 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 			maxTXID = info.MaxTXID
 		}
 
+		// Prefer the on-disk LTX file when available so compaction is not subject
+		// to eventual consistency quirks of remote storage providers. Fallback to
+		// downloading the file from the replica client if the local copy has been
+		// removed.
+		if f, err := os.Open(db.LTXPath(srcLevel, info.MinTXID, info.MaxTXID)); err == nil {
+			rdrs = append(rdrs, f)
+			continue
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("open local ltx file: %w", err)
+		}
+
 		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
