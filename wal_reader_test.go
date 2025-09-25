@@ -245,3 +245,34 @@ func TestWALReader(t *testing.T) {
 		}
 	})
 }
+
+func TestWALReader_FrameSaltsUntil(t *testing.T) {
+	t.Run("OK", func(t *testing.T) {
+		b, err := os.ReadFile("testdata/wal-reader/frame-salts/wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := litestream.NewWALReader(bytes.NewReader(b), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		m, err := r.FrameSaltsUntil(context.Background(), [2]uint32{0x00000000, 0x00000000})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := len(m), 3; got != want {
+			t.Fatalf("len(m)=%d, want %d", got, want)
+		}
+		if _, ok := m[[2]uint32{0x1b9a294b, 0x37f91916}]; !ok {
+			t.Fatalf("salt 0 not found")
+		}
+		if _, ok := m[[2]uint32{0x1b9a294a, 0x031f195e}]; !ok {
+			t.Fatalf("salt 1 not found")
+		}
+		if _, ok := m[[2]uint32{0x1b9a2949, 0x13b3dd67}]; !ok {
+			t.Fatalf("salt 2 not found")
+		}
+	})
+}

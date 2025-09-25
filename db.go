@@ -648,6 +648,7 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 // verify ensures the current LTX state matches where it left off from
 // the real WAL. Check info.ok if verification was successful.
 func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
 	pos, err := db.Pos()
@@ -689,46 +690,53 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	}
 	salt1 := binary.BigEndian.Uint32(hdr0[16:])
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
+	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
 
-	if salt1 != dec.Header().WALSalt1 || salt2 != dec.Header().WALSalt2 {
+	// If offset is at the beginning of the first page, we can't check for previous page.
+	prevWALOffset := info.offset - frameSize
+	slog.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
+
+	if prevWALOffset == WALHeaderSize {
+		if saltMatch { // No writes occurred since last sync, salt still matches
+			info.snapshotting = false
+			return info, nil
+		}
+		// Salt has changed but we don't know if writes occurred since last sync
+		info.reason = "wal header salt reset, snapshotting"
+		return info, nil
+	} else if prevWALOffset < WALHeaderSize {
+		return info, fmt.Errorf("prev WAL offset is less than the header size: %d", prevWALOffset)
+	}
+
+	// If we can't verify the last page is in the last LTX file, then we need to snapshot.
+	lastPageMatch, err := db.lastPageMatch(ctx, dec, prevWALOffset, frameSize)
+	if err != nil {
+		return info, fmt.Errorf("last page match: %w", err)
+	} else if !lastPageMatch {
+		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
+		return info, nil
+	}
+
+	slog.Debug("verify.2", "lastPageMatch", lastPageMatch)
+
+	// Salt has changed which could indicate a FULL checkpoint.
+	// If we have a last page match, then we can assume that the WAL has not been overwritten.
+	if !saltMatch {
 		db.Logger.Log(ctx, internal.LevelTrace, "wal restarted",
 			"salt1", salt1,
 			"salt2", salt2)
 
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
-		info.snapshotting = false
-		return info, nil
-	}
 
-	// If offset is at the beginning of the first page, we can't check for previous page.
-	frameSize := int64(db.pageSize + WALFrameHeaderSize)
-	prevWALOffset := info.offset - frameSize
-	if prevWALOffset <= 0 {
-		info.snapshotting = false
-		return info, nil
-	}
+		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {dec.Header().WALSalt1, dec.Header().WALSalt2}}); err != nil {
+			return info, fmt.Errorf("detect full checkpoint: %w", err)
+		} else if detected {
+			info.reason = "full or restart checkpoint detected, snapshotting"
+		} else {
+			info.snapshotting = false
+		}
 
-	// Verify last page exists in latest LTX file.
-	buf, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
-	if err != nil {
-		return info, fmt.Errorf("cannot read last synced wal page: %w", err)
-	}
-	pgno := binary.BigEndian.Uint32(buf[0:])
-	fsalt1 := binary.BigEndian.Uint32(buf[8:])
-	fsalt2 := binary.BigEndian.Uint32(buf[12:])
-
-	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
-		info.reason = "frame salt mismatch, wal overwritten by another process"
-		return info, nil
-	}
-
-	// Verify that the last page in the WAL exists in the last LTX file.
-	if ok, err := db.ltxDecoderContains(dec, pgno, buf[WALFrameHeaderSize:]); err != nil {
-		return info, fmt.Errorf("ltx contains: %w", err)
-	} else if !ok {
-		db.Logger.Log(ctx, internal.LevelTrace, "cannot find last page in last ltx file", "pgno", pgno, "offset", prevWALOffset)
-		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
 
@@ -737,24 +745,75 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	return info, nil
 }
 
-func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
+// lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
+func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
+	if prevWALOffset <= WALHeaderSize {
+		return false, nil
+	}
+
+	frame, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
+	if err != nil {
+		return false, fmt.Errorf("cannot read last synced wal page: %w", err)
+	}
+	pgno := binary.BigEndian.Uint32(frame[0:])
+	fsalt1 := binary.BigEndian.Uint32(frame[8:])
+	fsalt2 := binary.BigEndian.Uint32(frame[12:])
+	data := frame[WALFrameHeaderSize:]
+
+	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
+		return false, nil
+	}
+
+	// Verify that the last page in the WAL exists in the last LTX file.
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
 		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
-			return false, nil
+			return false, nil // page not found in LTX file
 		} else if err != nil {
 			return false, fmt.Errorf("decode ltx page: %w", err)
 		}
 
 		if pgno != hdr.Pgno {
-			continue
+			continue // page number doesn't match
 		}
 		if !bytes.Equal(data, buf) {
-			continue
+			continue // page data doesn't match
 		}
-		return true, nil
+		return true, nil // Page matches
 	}
+}
+
+// detectFullCheckpoint attempts to detect checks if a FULL or RESTART checkpoint
+// has occurred and we may have missed some frames.
+func (db *DB) detectFullCheckpoint(ctx context.Context, knownSalts [][2]uint32) (bool, error) {
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		return false, fmt.Errorf("open wal file: %w", err)
+	}
+	defer walFile.Close()
+
+	var lastKnownSalt [2]uint32
+	if len(knownSalts) > 0 {
+		lastKnownSalt = knownSalts[len(knownSalts)-1]
+	}
+
+	rd, err := NewWALReader(walFile, db.Logger)
+	if err != nil {
+		return false, fmt.Errorf("new wal reader: %w", err)
+	}
+	m, err := rd.FrameSaltsUntil(ctx, lastKnownSalt)
+	if err != nil {
+		return false, fmt.Errorf("frame salts until: %w", err)
+	}
+
+	// Remove known salts from the map.
+	for _, salt := range knownSalts {
+		delete(m, salt)
+	}
+
+	// If we have more than one unknown salt, then we have a FULL or RESTART checkpoint.
+	return len(m) >= 1, nil
 }
 
 type syncInfo struct {
