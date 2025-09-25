@@ -424,6 +424,9 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if config.Logging.Stderr {
 		logOutput = os.Stderr
 	}
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		config.Logging.Level = v
+	}
 	initLog(logOutput, config.Logging.Level, config.Logging.Type)
 
 	return config, nil

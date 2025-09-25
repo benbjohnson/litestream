@@ -77,6 +77,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 
 		// Initialize config with defaults when using command-line arguments
 		c.Config = DefaultConfig()
+		initLog(os.Stdout, "INFO", "text")
 
 		dbConfig := &DBConfig{Path: fs.Arg(0)}
 		for _, u := range fs.Args()[1:] {
