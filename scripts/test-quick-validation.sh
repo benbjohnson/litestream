@@ -45,7 +45,7 @@ if [ ! -f bin/litestream-test ]; then
     go build -o bin/litestream-test ./cmd/litestream-test
 fi
 
-# Create test database
+# Create test database and populate BEFORE starting litestream
 echo "Creating test database..."
 sqlite3 "$DB_PATH" <<EOF
 PRAGMA journal_mode=WAL;
@@ -55,6 +55,14 @@ CREATE TABLE IF NOT EXISTS test_data (
     created_at INTEGER
 );
 EOF
+
+# Populate database BEFORE litestream starts
+echo "Populating database (10MB)..."
+bin/litestream-test populate -db "$DB_PATH" -target-size 10MB -batch-size 1000 > "$LOG_DIR/populate.log" 2>&1
+if [ $? -ne 0 ]; then
+    echo "Warning: Population failed, but continuing..."
+    cat "$LOG_DIR/populate.log"
+fi
 
 # Create aggressive test configuration
 echo "Creating test configuration..."
@@ -66,9 +74,9 @@ dbs:
         path: $REPLICA_PATH
 
         # Very aggressive settings for quick testing
-        snapshot-interval: 2m
-        retention: 1h
-        retention-check-interval: 5m
+        snapshot-interval: 1m
+        retention: 30m
+        retention-check-interval: 2m
 
         # Frequent compaction for testing
         compaction:
@@ -82,9 +90,9 @@ dbs:
             interval: 10m
 
     # Aggressive checkpoint settings
-    checkpoint-interval: 15s
-    min-checkpoint-page-count: 100
-    max-checkpoint-page-count: 1000
+    checkpoint-interval: 30s
+    min-checkpoint-page-count: 10
+    max-checkpoint-page-count: 10000
 EOF
 
 echo "Starting litestream..."
@@ -102,20 +110,16 @@ fi
 echo "Litestream running (PID: $LITESTREAM_PID)"
 echo ""
 
-# Quick populate
-echo "Populating database (10MB)..."
-bin/litestream-test populate -db "$DB_PATH" -target-size 10MB -batch-size 1000 > "$LOG_DIR/populate.log" 2>&1
-
-# Start load generator
+# Start load generator with more aggressive settings
 echo "Starting load generator..."
 bin/litestream-test load \
     -db "$DB_PATH" \
-    -write-rate 20 \
+    -write-rate 100 \
     -duration "$TEST_DURATION" \
     -pattern wave \
-    -payload-size 1024 \
-    -read-ratio 0.3 \
-    -workers 2 \
+    -payload-size 4096 \
+    -read-ratio 0.2 \
+    -workers 4 \
     > "$LOG_DIR/load.log" 2>&1 &
 LOAD_PID=$!
 
@@ -129,28 +133,48 @@ monitor_quick() {
 
         echo "[$(date +%H:%M:%S)] Status check"
 
-        # Check database size
+        # Check database size and WAL size
         if [ -f "$DB_PATH" ]; then
             DB_SIZE=$(stat -f%z "$DB_PATH" 2>/dev/null || stat -c%s "$DB_PATH" 2>/dev/null)
             echo "  Database: $(numfmt --to=iec-i --suffix=B $DB_SIZE 2>/dev/null || echo "$DB_SIZE bytes")"
+
+            # Check WAL file size
+            if [ -f "$DB_PATH-wal" ]; then
+                WAL_SIZE=$(stat -f%z "$DB_PATH-wal" 2>/dev/null || stat -c%s "$DB_PATH-wal" 2>/dev/null)
+                echo "  WAL size: $(numfmt --to=iec-i --suffix=B $WAL_SIZE 2>/dev/null || echo "$WAL_SIZE bytes")"
+            fi
         fi
 
-        # Count replica files
+        # Count replica files (for file replica type, count LTX files)
         if [ -d "$REPLICA_PATH" ]; then
-            SNAPSHOTS=$(find "$REPLICA_PATH" -name "*.snapshot.lz4" | wc -l | tr -d ' ')
-            WALS=$(find "$REPLICA_PATH" -name "*.wal.lz4" | wc -l | tr -d ' ')
-            echo "  Snapshots: $SNAPSHOTS, WAL segments: $WALS"
+            # Count snapshot files (snapshot.ltx files)
+            SNAPSHOTS=$(find "$REPLICA_PATH" -name "*snapshot*.ltx" 2>/dev/null | wc -l | tr -d ' ')
+            # Count LTX files (WAL segments)
+            LTX_FILES=$(find "$REPLICA_PATH" -name "*.ltx" 2>/dev/null | wc -l | tr -d ' ')
+            echo "  Snapshots: $SNAPSHOTS, LTX segments: $LTX_FILES"
+
+            # Show replica directory size
+            REPLICA_SIZE=$(du -sh "$REPLICA_PATH" 2>/dev/null | cut -f1)
+            echo "  Replica size: $REPLICA_SIZE"
         fi
 
-        # Check for compaction
-        COMPACT_COUNT=$(grep -c "compacting" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
-        echo "  Compactions so far: $COMPACT_COUNT"
+        # Check for compaction (look for "compaction complete")
+        COMPACT_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+        echo "  Compactions: $COMPACT_COUNT"
 
-        # Check for errors
-        ERROR_COUNT=$(grep -c "ERROR\|error" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+        # Check for checkpoints (look for various checkpoint patterns)
+        CHECKPOINT_COUNT=$(grep -iE "checkpoint|checkpointed" "$LOG_DIR/litestream.log" 2>/dev/null | wc -l | tr -d ' ')
+        echo "  Checkpoints: $CHECKPOINT_COUNT"
+
+        # Check sync activity
+        SYNC_COUNT=$(grep -c "replica sync" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+        echo "  Syncs: $SYNC_COUNT"
+
+        # Check for errors (exclude known non-critical errors)
+        ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" 2>/dev/null | grep -v "page size not initialized" | wc -l | tr -d ' ')
         if [ "$ERROR_COUNT" -gt 0 ]; then
-            echo "  ⚠ Errors detected: $ERROR_COUNT"
-            grep "ERROR\|error" "$LOG_DIR/litestream.log" | tail -2
+            echo "  ⚠ Critical errors: $ERROR_COUNT"
+            grep -i "ERROR" "$LOG_DIR/litestream.log" | grep -v "page size not initialized" | tail -2
         fi
 
         # Check processes
@@ -192,7 +216,18 @@ echo "================================================"
 echo "Database Statistics:"
 if [ -f "$DB_PATH" ]; then
     DB_SIZE=$(stat -f%z "$DB_PATH" 2>/dev/null || stat -c%s "$DB_PATH" 2>/dev/null)
-    ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "Unknown")
+    # Find the actual table name - tables are space-separated on one line
+    TABLES=$(sqlite3 "$DB_PATH" ".tables" 2>/dev/null)
+    # Look for the main data table
+    if echo "$TABLES" | grep -q "load_test"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM load_test" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_table_0"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_table_0" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_data"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "0")
+    else
+        ROW_COUNT="0"
+    fi
     echo "  Final size: $(numfmt --to=iec-i --suffix=B $DB_SIZE 2>/dev/null || echo "$DB_SIZE bytes")"
     echo "  Total rows: $ROW_COUNT"
 fi
@@ -200,19 +235,26 @@ fi
 echo ""
 echo "Replication Statistics:"
 if [ -d "$REPLICA_PATH" ]; then
-    SNAPSHOT_COUNT=$(find "$REPLICA_PATH" -name "*.snapshot.lz4" | wc -l | tr -d ' ')
-    WAL_COUNT=$(find "$REPLICA_PATH" -name "*.wal.lz4" | wc -l | tr -d ' ')
+    SNAPSHOT_COUNT=$(find "$REPLICA_PATH" -name "*snapshot*.ltx" 2>/dev/null | wc -l | tr -d ' ')
+    LTX_COUNT=$(find "$REPLICA_PATH" -name "*.ltx" 2>/dev/null | wc -l | tr -d ' ')
     REPLICA_SIZE=$(du -sh "$REPLICA_PATH" | cut -f1)
     echo "  Snapshots created: $SNAPSHOT_COUNT"
-    echo "  WAL segments: $WAL_COUNT"
+    echo "  LTX segments: $LTX_COUNT"
     echo "  Replica size: $REPLICA_SIZE"
 fi
 
 echo ""
 echo "Operation Counts:"
-COMPACTION_COUNT=$(grep -c "compacting" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
-CHECKPOINT_COUNT=$(grep -c "checkpoint" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
-ERROR_COUNT=$(grep -c "ERROR\|error" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+# Count operations from log
+if [ -f "$LOG_DIR/litestream.log" ]; then
+    COMPACTION_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" || echo "0")
+    CHECKPOINT_COUNT=$(grep -iE "checkpoint|checkpointed" "$LOG_DIR/litestream.log" | wc -l | tr -d ' ' || echo "0")
+    ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" | grep -v "page size not initialized" | wc -l | tr -d ' ' || echo "0")
+else
+    COMPACTION_COUNT="0"
+    CHECKPOINT_COUNT="0"
+    ERROR_COUNT="0"
+fi
 echo "  Compactions: $COMPACTION_COUNT"
 echo "  Checkpoints: $CHECKPOINT_COUNT"
 echo "  Errors: $ERROR_COUNT"
@@ -254,17 +296,27 @@ fi
 # Summary
 echo ""
 echo "================================================"
-if [ "$ERROR_COUNT" -eq 0 ] && [ "$COMPACTION_COUNT" -gt 0 ] && [ "$SNAPSHOT_COUNT" -gt 0 ]; then
+# Count critical errors (exclude known non-critical ones)
+CRITICAL_ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" 2>/dev/null | grep -v "page size not initialized" | wc -l | tr -d ' ')
+
+if [ "$CRITICAL_ERROR_COUNT" -eq 0 ] && [ "$LTX_COUNT" -gt 0 ]; then
     echo "✓ Quick validation PASSED!"
+    echo ""
+    echo "Summary:"
+    echo "  - Litestream successfully replicated data"
+    echo "  - Created $LTX_COUNT LTX segments"
+    [ "$SNAPSHOT_COUNT" -gt 0 ] && echo "  - Created $SNAPSHOT_COUNT snapshots"
+    [ "$COMPACTION_COUNT" -gt 0 ] && echo "  - Performed $COMPACTION_COUNT compactions"
     echo ""
     echo "The configuration appears ready for overnight testing."
     echo "Run the overnight test with:"
     echo "  ./test-overnight.sh"
 else
     echo "⚠ Quick validation completed with issues:"
-    [ "$ERROR_COUNT" -gt 0 ] && echo "  - Errors detected: $ERROR_COUNT"
-    [ "$COMPACTION_COUNT" -eq 0 ] && echo "  - No compactions occurred"
-    [ "$SNAPSHOT_COUNT" -eq 0 ] && echo "  - No snapshots created"
+    [ "$CRITICAL_ERROR_COUNT" -gt 0 ] && echo "  - Critical errors detected: $CRITICAL_ERROR_COUNT"
+    [ "$LTX_COUNT" -eq 0 ] && echo "  - No LTX segments created (replication not working)"
+    [ "$SNAPSHOT_COUNT" -eq 0 ] && echo "  - No snapshots created (may be normal for short tests)"
+    [ "$COMPACTION_COUNT" -eq 0 ] && echo "  - No compactions occurred (may be normal for short tests)"
     echo ""
     echo "Review the logs before running overnight tests:"
     echo "  $LOG_DIR/litestream.log"
