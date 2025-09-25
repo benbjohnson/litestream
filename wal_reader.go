@@ -235,6 +235,32 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	return m, end, commit, nil
 }
 
+// FrameSaltsUntil returns a set of all unique frame salts in the WAL file.
+func (r *WALReader) FrameSaltsUntil(ctx context.Context, until [2]uint32) (map[[2]uint32]struct{}, error) {
+	m := make(map[[2]uint32]struct{})
+	for offset := int64(WALHeaderSize); ; offset += int64(WALFrameHeaderSize + r.pageSize) {
+		hdr := make([]byte, WALFrameHeaderSize)
+		if n, err := r.r.ReadAt(hdr, offset); n != len(hdr) {
+			break
+		} else if err != nil {
+			return nil, err
+		}
+
+		salt1 := binary.BigEndian.Uint32(hdr[8:])
+		salt2 := binary.BigEndian.Uint32(hdr[12:])
+
+		// Track unique salts.
+		m[[2]uint32{salt1, salt2}] = struct{}{}
+
+		// Only read salts until the last one we expect.
+		if salt1 == until[0] && salt2 == until[1] {
+			break
+		}
+	}
+
+	return m, nil
+}
+
 // WALChecksum computes a running SQLite WAL checksum over a byte slice.
 func WALChecksum(bo binary.ByteOrder, s0, s1 uint32, b []byte) (uint32, uint32) {
 	assert(len(b)%8 == 0, "misaligned checksum byte slice")
