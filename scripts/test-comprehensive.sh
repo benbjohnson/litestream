@@ -183,9 +183,12 @@ monitor_comprehensive() {
 
         # Operation metrics (with delta since last check)
         if [ -f "$LOG_DIR/litestream.log" ]; then
-            CHECKPOINT_COUNT=$(($(grep -c "checkpoint" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")))
-            COMPACTION_COUNT=$(($(grep -c "compaction complete" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")))
-            SYNC_COUNT=$(($(grep -c "replica sync" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")))
+            CHECKPOINT_COUNT=$(grep -c "checkpoint" "$LOG_DIR/litestream.log" 2>/dev/null)
+            CHECKPOINT_COUNT=${CHECKPOINT_COUNT:-0}
+            COMPACTION_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" 2>/dev/null)
+            COMPACTION_COUNT=${COMPACTION_COUNT:-0}
+            SYNC_COUNT=$(grep -c "replica sync" "$LOG_DIR/litestream.log" 2>/dev/null)
+            SYNC_COUNT=${SYNC_COUNT:-0}
 
             CHECKPOINT_DELTA=$((CHECKPOINT_COUNT - last_checkpoint_count))
             COMPACTION_DELTA=$((COMPACTION_COUNT - last_compaction_count))
