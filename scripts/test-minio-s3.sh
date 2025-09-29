@@ -249,17 +249,18 @@ monitor_minio() {
             -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
             minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 
+        # Count LTX files (modern format) and snapshots
+        LTX_COUNT=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
+            -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
+            minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | grep -c "\.ltx" || echo "0")
+
         SNAPSHOT_COUNT=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
             -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
             minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | grep -c "snapshot" || echo "0")
 
-        WAL_COUNT=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
-            -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
-            minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | grep -c "wal" || echo "0")
-
         echo "    Total objects: $OBJECT_COUNT"
+        echo "    LTX segments: $LTX_COUNT"
         echo "    Snapshots: $SNAPSHOT_COUNT"
-        echo "    WAL segments: $WAL_COUNT"
 
         # Operation metrics
         if [ -f "$LOG_DIR/litestream.log" ]; then
@@ -350,17 +351,17 @@ FINAL_OBJECTS=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
     -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
     minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | wc -l | tr -d ' ' || echo "0")
 
+FINAL_LTX=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
+    -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
+    minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | grep -c "\.ltx" || echo "0")
+
 FINAL_SNAPSHOTS=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
     -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
     minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | grep -c "snapshot" || echo "0")
 
-FINAL_WALS=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
-    -e "MC_HOST_minio=http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@minio:9000" \
-    minio/mc ls "minio/${MINIO_BUCKET}/" --recursive 2>/dev/null | grep -c "wal" || echo "0")
-
 echo "  Total objects in MinIO: $FINAL_OBJECTS"
+echo "  LTX segments: $FINAL_LTX"
 echo "  Snapshots: $FINAL_SNAPSHOTS"
-echo "  WAL segments: $FINAL_WALS"
 
 # Get storage size
 STORAGE_INFO=$(docker run --rm --link "${MINIO_CONTAINER_NAME}:minio" \
@@ -395,12 +396,15 @@ RESTORE_DB="$TEST_DIR/restored.db"
 export AWS_ACCESS_KEY_ID="${MINIO_ROOT_USER}"
 export AWS_SECRET_ACCESS_KEY="${MINIO_ROOT_PASSWORD}"
 
+# Create a config file for restoration
+cat > "$TEST_DIR/restore.yml" <<EOF
+access-key-id: ${MINIO_ROOT_USER}
+secret-access-key: ${MINIO_ROOT_PASSWORD}
+EOF
+
 bin/litestream restore \
+    -config "$TEST_DIR/restore.yml" \
     -o "$RESTORE_DB" \
-    -endpoint "${MINIO_ENDPOINT}" \
-    -region "us-east-1" \
-    -force-path-style \
-    -skip-verify \
     "$S3_PATH" > "$LOG_DIR/restore.log" 2>&1
 
 if [ $? -eq 0 ]; then
