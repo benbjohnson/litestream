@@ -72,38 +72,31 @@ cat > "$CONFIG_FILE" <<EOF
 # Litestream configuration for overnight testing
 # with aggressive compaction and snapshot intervals
 
+# Snapshot every 10 minutes
+snapshot:
+  interval: 10m
+  retention: 720h    # Keep everything for analysis
+
+# Compaction settings - very frequent for testing
+levels:
+  - interval: 30s
+  - interval: 1m
+  - interval: 5m
+  - interval: 15m
+  - interval: 30m
+  - interval: 1h
+
 dbs:
   - path: $DB_PATH
-    replicas:
-      - type: file
-        path: $REPLICA_PATH
-
-        # Snapshot every 10 minutes
-        snapshot-interval: 10m
-
-        # Retention settings - keep everything for analysis
-        retention: 720h
-        retention-check-interval: 1h
-
-        # Compaction settings - very frequent for testing
-        compaction:
-          - duration: 30s
-            interval: 30s
-          - duration: 1m
-            interval: 1m
-          - duration: 5m
-            interval: 5m
-          - duration: 1h
-            interval: 15m
-          - duration: 6h
-            interval: 30m
-          - duration: 24h
-            interval: 1h
-
     # Checkpoint after every 1000 frames (frequent for testing)
     checkpoint-interval: 30s
     min-checkpoint-page-count: 1000
     max-checkpoint-page-count: 10000
+
+    replicas:
+      - type: file
+        path: $REPLICA_PATH
+        retention-check-interval: 1h
 EOF
 
 echo ""

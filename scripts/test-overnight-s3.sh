@@ -98,33 +98,31 @@ cat > "$CONFIG_FILE" <<EOF
 # access-key-id: ${AWS_ACCESS_KEY_ID}
 # secret-access-key: ${AWS_SECRET_ACCESS_KEY}
 
+# Snapshot every 10 minutes
+snapshot:
+  interval: 10m
+  retention: 720h    # Keep data for 30 days
+
+# Compaction settings - very frequent for testing
+levels:
+  - interval: 30s
+  - interval: 1m
+  - interval: 5m
+  - interval: 15m
+  - interval: 30m
+  - interval: 1h
+
 dbs:
   - path: $DB_PATH
+    # Checkpoint settings - frequent for testing
+    checkpoint-interval: 30s
+    min-checkpoint-page-count: 1000
+    max-checkpoint-page-count: 10000
+
     replicas:
       - url: ${S3_PATH}
         region: ${AWS_REGION}
-
-        # Snapshot every 10 minutes
-        snapshot-interval: 10m
-
-        # Retention settings - keep data for 30 days
-        retention: 720h
         retention-check-interval: 1h
-
-        # Compaction settings - very frequent for testing
-        compaction:
-          - duration: 30s
-            interval: 30s
-          - duration: 1m
-            interval: 1m
-          - duration: 5m
-            interval: 5m
-          - duration: 1h
-            interval: 15m
-          - duration: 6h
-            interval: 30m
-          - duration: 24h
-            interval: 1h
 
         # S3-specific settings
         force-path-style: false
@@ -133,11 +131,6 @@ dbs:
         # Optional: Server-side encryption
         # sse: AES256
         # sse-kms-key-id: your-kms-key-id
-
-    # Checkpoint settings - frequent for testing
-    checkpoint-interval: 30s
-    min-checkpoint-page-count: 1000
-    max-checkpoint-page-count: 10000
 EOF
 
 echo ""

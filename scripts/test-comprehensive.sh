@@ -76,34 +76,30 @@ fi
 # Create configuration with Ben's recommended aggressive settings
 echo "Creating test configuration with aggressive intervals..."
 cat > "$CONFIG_FILE" <<EOF
+# Aggressive snapshot settings per Ben's request
+snapshot:
+  interval: 10m      # Snapshots every 10 minutes
+  retention: 1h      # Keep data for 1 hour
+
+# Aggressive compaction levels: 30s/1m/5m/15m/30m intervals
+levels:
+  - interval: 30s
+  - interval: 1m
+  - interval: 5m
+  - interval: 15m
+  - interval: 30m
+
 dbs:
   - path: $DB_PATH
-    replicas:
-      - type: file
-        path: $REPLICA_PATH
-
-        # Aggressive settings per Ben's request
-        snapshot-interval: 10m      # Snapshots every 10 minutes
-        retention: 1h                # Keep data for 1 hour
-        retention-check-interval: 5m # Check retention every 5 minutes
-
-        # Aggressive compaction: 30s/1m/5m intervals
-        compaction:
-          - duration: 30s
-            interval: 30s
-          - duration: 1m
-            interval: 1m
-          - duration: 5m
-            interval: 5m
-          - duration: 30m
-            interval: 15m
-          - duration: 1h
-            interval: 30m
-
     # Checkpoint settings to ensure checkpoints happen
     checkpoint-interval: 1m          # Check for checkpoint every minute
     min-checkpoint-page-count: 100   # Low threshold to trigger checkpoints
     max-checkpoint-page-count: 5000  # Force checkpoint at this size
+
+    replicas:
+      - type: file
+        path: $REPLICA_PATH
+        retention-check-interval: 5m # Check retention every 5 minutes
 EOF
 
 echo "Starting litestream..."

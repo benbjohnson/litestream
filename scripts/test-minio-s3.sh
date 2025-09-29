@@ -142,37 +142,33 @@ cat > "$CONFIG_FILE" <<EOF
 access-key-id: ${MINIO_ROOT_USER}
 secret-access-key: ${MINIO_ROOT_PASSWORD}
 
+# Aggressive snapshot settings for testing
+snapshot:
+  interval: 10m      # Snapshots every 10 minutes
+  retention: 1h      # Keep data for 1 hour
+
+# Aggressive compaction levels: 30s/1m/5m/15m/30m intervals
+levels:
+  - interval: 30s
+  - interval: 1m
+  - interval: 5m
+  - interval: 15m
+  - interval: 30m
+
 dbs:
   - path: $DB_PATH
+    # Checkpoint settings
+    checkpoint-interval: 1m
+    min-checkpoint-page-count: 100
+    max-checkpoint-page-count: 5000
+
     replicas:
       - url: ${S3_PATH}
         endpoint: ${MINIO_ENDPOINT}
         region: us-east-1
         force-path-style: true
         skip-verify: true
-
-        # Aggressive settings for testing
-        snapshot-interval: 10m
-        retention: 1h
         retention-check-interval: 5m
-
-        # Aggressive compaction
-        compaction:
-          - duration: 30s
-            interval: 30s
-          - duration: 1m
-            interval: 1m
-          - duration: 5m
-            interval: 5m
-          - duration: 30m
-            interval: 15m
-          - duration: 1h
-            interval: 30m
-
-    # Checkpoint settings
-    checkpoint-interval: 1m
-    min-checkpoint-page-count: 100
-    max-checkpoint-page-count: 5000
 EOF
 
 echo "Starting litestream with MinIO backend..."
