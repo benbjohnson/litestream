@@ -58,6 +58,9 @@ jobs:
           version: latest
           args: release --clean
         env:
+          APPLE_DEVELOPER_ID: "${{ secrets.APPLE_DEVELOPER_ID }}"
+          APPLE_TEAM_ID: "${{ secrets.APPLE_TEAM_ID }}"
+          AC_PASSWORD: "${{ secrets.AC_PASSWORD }}"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
