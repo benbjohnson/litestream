@@ -86,7 +86,6 @@ brews:
       owner: benbjohnson
       name: homebrew-litestream
       branch: main
-    directory: Formula
     install: |
       bin.install "litestream"
       etc.install "etc/litestream.yml" => "litestream.yml"
