@@ -77,23 +77,23 @@ nfpms:
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
 
-brews:
-  - name: litestream
-    homepage: https://litestream.io
-    description: Streaming replication for SQLite databases
-    license: Apache-2.0
-    repository:
-      owner: benbjohnson
-      name: homebrew-litestream
-      branch: main
-    install: |
-      bin.install "litestream"
-      etc.install "etc/litestream.yml" => "litestream.yml"
-    test: |
-      system "#{bin}/litestream", "version"
-    commit_author:
-      name: goreleaser
-      email: bot@goreleaser.com
+#brews:
+#  - name: litestream
+#    homepage: https://litestream.io
+#    description: Streaming replication for SQLite databases
+#    license: Apache-2.0
+#    repository:
+#      owner: benbjohnson
+#      name: homebrew-litestream
+#      branch: main
+#      install: |
+#      bin.install "litestream"
+#      etc.install "etc/litestream.yml" => "litestream.yml"
+#    test: |
+#      system "#{bin}/litestream", "version"
+#    commit_author:
+#      name: goreleaser
+#      email: bot@goreleaser.com
 
 checksum:
   name_template: 'checksums.txt'
