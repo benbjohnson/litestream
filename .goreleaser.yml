@@ -149,21 +149,20 @@ release:
     ### Binary installation
     Download the appropriate archive for your platform, extract, and move to your PATH.
 
-  # Signing configuration
-  signs:
-    - id: macos
-      cmd: gon
-      args:
-        - "{{ .ProjectPath }}/gon-sign.hcl"
-      artifacts: archive
-      ids:
-        - main
-      signature: "${artifact}.zip"
-      output: true
-      env:
-        - APPLE_DEVELOPER_ID_APPLICATION={{ .Env.APPLE_DEVELOPER_ID }}
-        - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
-        - AC_PASSWORD={{ .Env.AC_PASSWORD }}
+signs:
+  - id: macos
+    cmd: gon
+    args:
+      - "{{ .ProjectPath }}/gon-sign.hcl"
+    artifacts: archive
+    ids:
+      - main
+    signature: "${artifact}.zip"
+    output: true
+    env:
+      - APPLE_DEVELOPER_ID_APPLICATION={{ .Env.APPLE_DEVELOPER_ID }}
+      - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
+      - AC_PASSWORD={{ .Env.AC_PASSWORD }}
 
 sboms:
   - artifacts: archive
