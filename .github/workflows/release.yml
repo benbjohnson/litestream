@@ -19,6 +19,10 @@ permissions:
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
+    env:
+      APPLE_DEVELOPER_ID: ${{ secrets.APPLE_DEVELOPER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,7 +62,6 @@ jobs:
           version: latest
           args: release --clean
         env:
-          APPLE_DEVELOPER_ID: "${{ secrets.APPLE_DEVELOPER_ID }}"
           APPLE_TEAM_ID: "${{ secrets.APPLE_TEAM_ID }}"
           AC_PASSWORD: "${{ secrets.AC_PASSWORD }}"
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

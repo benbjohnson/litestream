@@ -160,7 +160,6 @@ signs:
     signature: "${artifact}.zip"
     output: true
     env:
-      - APPLE_DEVELOPER_ID_APPLICATION={{ .Env.APPLE_DEVELOPER_ID }}
       - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
       - AC_PASSWORD={{ .Env.AC_PASSWORD }}
 

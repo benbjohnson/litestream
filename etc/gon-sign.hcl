@@ -8,7 +8,7 @@ apple_id {
 }
 
 sign {
-  application_identity = "@env:APPLE_DEVELOPER_ID_APPLICATION"
+  application_identity = "Litestream"
   entitlements_file = ""
 }
 
