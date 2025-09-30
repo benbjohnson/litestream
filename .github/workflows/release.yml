@@ -62,53 +62,53 @@ jobs:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
 
-  macos-sign:
-    runs-on: macos-latest
-    needs: goreleaser
-    strategy:
-      matrix:
-        arch: [amd64, arm64]
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+  # macos-sign:
+  #   runs-on: macos-latest
+  #   needs: goreleaser
+  #   strategy:
+  #     matrix:
+  #       arch: [amd64, arm64]
+  #   steps:
+  #     - name: Checkout
+  #       uses: actions/checkout@v4
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
+  #     - name: Set up Go
+  #       uses: actions/setup-go@v5
+  #       with:
+  #         go-version-file: go.mod
 
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: litestream-darwin-${{ matrix.arch }}
-          path: dist/
+  #     - name: Download release artifacts
+  #       uses: actions/download-artifact@v4
+  #       with:
+  #         name: litestream-darwin-${{ matrix.arch }}
+  #         path: dist/
 
-      - name: Import Apple Developer Certificate
-        env:
-          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
-          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
-        run: |
-          echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
-          security create-keychain -p actions temp.keychain
-          security default-keychain -s temp.keychain
-          security unlock-keychain -p actions temp.keychain
-          security import certificate.p12 -k temp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions temp.keychain
+  #     - name: Import Apple Developer Certificate
+  #       env:
+  #         MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+  #         MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+  #       run: |
+  #         echo "$MACOS_CERTIFICATE" | base64 --decode > certificate.p12
+  #         security create-keychain -p actions temp.keychain
+  #         security default-keychain -s temp.keychain
+  #         security unlock-keychain -p actions temp.keychain
+  #         security import certificate.p12 -k temp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+  #         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions temp.keychain
 
-      - name: Sign and Notarize
-        env:
-          APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
-          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
-          APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
-          AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
-        run: |
-          gon etc/gon-${{ matrix.arch }}.hcl
+  #     - name: Sign and Notarize
+  #       env:
+  #         APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
+  #         APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+  #         APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
+  #         AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
+  #       run: |
+  #         gon etc/gon-${{ matrix.arch }}.hcl
 
-      - name: Upload signed binary
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release upload ${{ github.ref_name }} dist/litestream-*-darwin-${{ matrix.arch }}.zip
+  #     - name: Upload signed binary
+  #       env:
+  #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #       run: |
+  #         gh release upload ${{ github.ref_name }} dist/litestream-*-darwin-${{ matrix.arch }}.zip
 
   # windows-sign:
   #   runs-on: windows-latest
