@@ -370,11 +370,10 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 
 		// Build file info
 		info := &ltx.FileInfo{
-			Level:     itr.level,
-			MinTXID:   minTXID,
-			MaxTXID:   maxTXID,
-			Size:      *item.Properties.ContentLength,
-			CreatedAt: item.Properties.CreationTime.UTC(),
+			Level:   itr.level,
+			MinTXID: minTXID,
+			MaxTXID: maxTXID,
+			Size:    *item.Properties.ContentLength,
 		}
 
 		// Skip if below seek TXID
@@ -386,6 +385,8 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 		if info.Level != itr.level {
 			continue
 		}
+
+		info.CreatedAt = litestream.ReadLTXTimestamp(itr.ctx, itr.client, itr.level, minTXID, maxTXID, item.Properties.CreationTime.UTC())
 
 		itr.pageItems = append(itr.pageItems, info)
 	}

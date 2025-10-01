@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"time"
 
 	"github.com/superfly/ltx"
 )
@@ -67,6 +68,26 @@ func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, filter f
 		return nil, err
 	}
 	return a, nil
+}
+
+// ReadLTXTimestamp reads the timestamp from an LTX file's header.
+// Returns the timestamp from the header, or the fallback time if unable to read.
+// This is used to get authoritative timestamps from LTX files rather than relying
+// on file system or object storage metadata, which may not be preserved during
+// operations like compaction.
+func ReadLTXTimestamp(ctx context.Context, client ReplicaClient, level int, minTXID, maxTXID ltx.TXID, fallback time.Time) time.Time {
+	r, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
+	if err != nil {
+		return fallback
+	}
+	defer r.Close()
+
+	hdr, _, err := ltx.PeekHeader(r)
+	if err != nil {
+		return fallback
+	}
+
+	return time.UnixMilli(hdr.Timestamp).UTC()
 }
 
 // DefaultEstimatedPageIndexSize is size that is first fetched when fetching the page index.

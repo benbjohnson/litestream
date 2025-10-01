@@ -89,7 +89,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      fi.Size(),
-			CreatedAt: fi.ModTime().UTC(),
+			CreatedAt: litestream.ReadLTXTimestamp(ctx, c, level, minTXID, maxTXID, fi.ModTime().UTC()),
 		})
 	}
 

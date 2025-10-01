@@ -525,7 +525,8 @@ func (itr *fileIterator) Next() bool {
 
 			// Set file info
 			info.Size = aws.ToInt64(obj.Size)
-			info.CreatedAt = aws.ToTime(obj.LastModified)
+			info.CreatedAt = litestream.ReadLTXTimestamp(itr.ctx, itr.client, itr.level, minTXID, maxTXID, aws.ToTime(obj.LastModified))
+
 			itr.info = info
 			return true
 		}

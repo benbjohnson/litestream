@@ -102,7 +102,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 		prefix += seek.String()
 	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), level), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -176,16 +176,18 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 }
 
 type ltxFileIterator struct {
-	it    *storage.ObjectIterator
-	level int
-	info  *ltx.FileInfo
-	err   error
+	it     *storage.ObjectIterator
+	client *ReplicaClient
+	level  int
+	info   *ltx.FileInfo
+	err    error
 }
 
-func newLTXFileIterator(it *storage.ObjectIterator, level int) *ltxFileIterator {
+func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int) *ltxFileIterator {
 	return &ltxFileIterator{
-		it:    it,
-		level: level,
+		it:     it,
+		client: client,
+		level:  level,
 	}
 }
 
@@ -216,13 +218,15 @@ func (itr *ltxFileIterator) Next() bool {
 		}
 
 		// Store current snapshot and return.
+		ctx := context.Background() // TODO: should we pass context through the iterator?
 		itr.info = &ltx.FileInfo{
 			Level:     itr.level,
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      attrs.Size,
-			CreatedAt: attrs.Created.UTC(),
+			CreatedAt: litestream.ReadLTXTimestamp(ctx, itr.client, itr.level, minTXID, maxTXID, attrs.Created.UTC()),
 		}
+
 		return true
 	}
 }

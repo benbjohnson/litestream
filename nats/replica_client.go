@@ -271,10 +271,11 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 		}
 
 		fileInfos = append(fileInfos, &ltx.FileInfo{
-			Level:   fileLevel,
-			MinTXID: minTXID,
-			MaxTXID: maxTXID,
-			Size:    int64(objInfo.Size),
+			Level:     fileLevel,
+			MinTXID:   minTXID,
+			MaxTXID:   maxTXID,
+			Size:      int64(objInfo.Size),
+			CreatedAt: litestream.ReadLTXTimestamp(ctx, c, fileLevel, minTXID, maxTXID, objInfo.ModTime),
 		})
 	}
 
