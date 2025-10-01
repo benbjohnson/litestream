@@ -594,7 +594,14 @@ func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle boo
 	}
 
 	// Check common object storage providers
-	if a := digitaloceanRegex.FindStringSubmatch(host); len(a) > 1 {
+	// Check for AWS S3 URLs first
+	if a := awsS3Regex.FindStringSubmatch(host); len(a) > 1 {
+		bucket = a[1]
+		if len(a) > 2 && a[2] != "" {
+			region = a[2]
+		}
+		return bucket, region, "", false
+	} else if a := digitaloceanRegex.FindStringSubmatch(host); len(a) > 1 {
 		region = a[2]
 		return "", region, fmt.Sprintf("https://%s.digitaloceanspaces.com", region), false
 	} else if a := backblazeRegex.FindStringSubmatch(host); len(a) > 1 {
@@ -618,6 +625,7 @@ func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle boo
 }
 
 var (
+	awsS3Regex        = regexp.MustCompile(`^(.+)\.s3(?:\.([^.]+))?\.amazonaws\.com$`)
 	digitaloceanRegex = regexp.MustCompile(`^(?:(.+)\.)?([^.]+)\.digitaloceanspaces.com$`)
 	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
 	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
