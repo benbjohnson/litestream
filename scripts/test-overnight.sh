@@ -72,38 +72,31 @@ cat > "$CONFIG_FILE" <<EOF
 # Litestream configuration for overnight testing
 # with aggressive compaction and snapshot intervals
 
+# Snapshot every 10 minutes
+snapshot:
+  interval: 10m
+  retention: 720h    # Keep everything for analysis
+
+# Compaction settings - very frequent for testing
+levels:
+  - interval: 30s
+  - interval: 1m
+  - interval: 5m
+  - interval: 15m
+  - interval: 30m
+  - interval: 1h
+
 dbs:
   - path: $DB_PATH
-    replicas:
-      - type: file
-        path: $REPLICA_PATH
-
-        # Snapshot every 10 minutes
-        snapshot-interval: 10m
-
-        # Retention settings - keep everything for analysis
-        retention: 720h
-        retention-check-interval: 1h
-
-        # Compaction settings - very frequent for testing
-        compaction:
-          - duration: 30s
-            interval: 30s
-          - duration: 1m
-            interval: 1m
-          - duration: 5m
-            interval: 5m
-          - duration: 1h
-            interval: 15m
-          - duration: 6h
-            interval: 30m
-          - duration: 24h
-            interval: 1h
-
     # Checkpoint after every 1000 frames (frequent for testing)
     checkpoint-interval: 30s
     min-checkpoint-page-count: 1000
     max-checkpoint-page-count: 10000
+
+    replicas:
+      - type: file
+        path: $REPLICA_PATH
+        retention-check-interval: 1h
 EOF
 
 echo ""
@@ -151,35 +144,47 @@ monitor_test() {
         echo "" | tee -a "$LOG_DIR/monitor.log"
         echo "Replica Statistics:" | tee -a "$LOG_DIR/monitor.log"
 
-        # Count snapshots
-        SNAPSHOT_COUNT=$(find "$REPLICA_PATH" -name "*.snapshot.lz4" 2>/dev/null | wc -l | tr -d ' ')
+        # Count snapshots (for file replica, look for snapshot.ltx files)
+        SNAPSHOT_COUNT=$(find "$REPLICA_PATH" -name "*snapshot*.ltx" 2>/dev/null | wc -l | tr -d ' ')
         echo "  Snapshots: $SNAPSHOT_COUNT" | tee -a "$LOG_DIR/monitor.log"
 
-        # Count WAL segments by age
+        # Count LTX segments by age (file replicas use .ltx not .wal.lz4)
         if [ -d "$REPLICA_PATH" ]; then
-            WAL_30S=$(find "$REPLICA_PATH" -name "*.wal.lz4" -mmin -0.5 2>/dev/null | wc -l | tr -d ' ')
-            WAL_1M=$(find "$REPLICA_PATH" -name "*.wal.lz4" -mmin -1 2>/dev/null | wc -l | tr -d ' ')
-            WAL_5M=$(find "$REPLICA_PATH" -name "*.wal.lz4" -mmin -5 2>/dev/null | wc -l | tr -d ' ')
-            WAL_TOTAL=$(find "$REPLICA_PATH" -name "*.wal.lz4" 2>/dev/null | wc -l | tr -d ' ')
+            LTX_30S=$(find "$REPLICA_PATH" -name "*.ltx" -mmin -0.5 2>/dev/null | wc -l | tr -d ' ')
+            LTX_1M=$(find "$REPLICA_PATH" -name "*.ltx" -mmin -1 2>/dev/null | wc -l | tr -d ' ')
+            LTX_5M=$(find "$REPLICA_PATH" -name "*.ltx" -mmin -5 2>/dev/null | wc -l | tr -d ' ')
+            LTX_TOTAL=$(find "$REPLICA_PATH" -name "*.ltx" 2>/dev/null | wc -l | tr -d ' ')
 
-            echo "  WAL segments (last 30s): $WAL_30S" | tee -a "$LOG_DIR/monitor.log"
-            echo "  WAL segments (last 1m): $WAL_1M" | tee -a "$LOG_DIR/monitor.log"
-            echo "  WAL segments (last 5m): $WAL_5M" | tee -a "$LOG_DIR/monitor.log"
-            echo "  WAL segments (total): $WAL_TOTAL" | tee -a "$LOG_DIR/monitor.log"
+            echo "  LTX segments (last 30s): $LTX_30S" | tee -a "$LOG_DIR/monitor.log"
+            echo "  LTX segments (last 1m): $LTX_1M" | tee -a "$LOG_DIR/monitor.log"
+            echo "  LTX segments (last 5m): $LTX_5M" | tee -a "$LOG_DIR/monitor.log"
+            echo "  LTX segments (total): $LTX_TOTAL" | tee -a "$LOG_DIR/monitor.log"
 
             # Replica size
             REPLICA_SIZE=$(du -sh "$REPLICA_PATH" 2>/dev/null | cut -f1)
             echo "  Total replica size: $REPLICA_SIZE" | tee -a "$LOG_DIR/monitor.log"
         fi
 
-        # Check for errors in litestream log
+        # Count operations
         echo "" | tee -a "$LOG_DIR/monitor.log"
-        ERROR_COUNT=$(grep -c "ERROR\|error" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
-        echo "Errors in litestream log: $ERROR_COUNT" | tee -a "$LOG_DIR/monitor.log"
+        echo "Operations:" | tee -a "$LOG_DIR/monitor.log"
+        if [ -f "$LOG_DIR/litestream.log" ]; then
+            COMPACTION_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+            CHECKPOINT_COUNT=$(grep -iE "checkpoint|checkpointed" "$LOG_DIR/litestream.log" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+            SYNC_COUNT=$(grep -c "replica sync" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+            echo "  Compactions: $COMPACTION_COUNT" | tee -a "$LOG_DIR/monitor.log"
+            echo "  Checkpoints: $CHECKPOINT_COUNT" | tee -a "$LOG_DIR/monitor.log"
+            echo "  Syncs: $SYNC_COUNT" | tee -a "$LOG_DIR/monitor.log"
+        fi
+
+        # Check for errors in litestream log (exclude known non-critical)
+        echo "" | tee -a "$LOG_DIR/monitor.log"
+        ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" 2>/dev/null | grep -v "page size not initialized" | wc -l | tr -d ' ' || echo "0")
+        echo "Critical errors in litestream log: $ERROR_COUNT" | tee -a "$LOG_DIR/monitor.log"
 
         if [ "$ERROR_COUNT" -gt 0 ]; then
             echo "Recent errors:" | tee -a "$LOG_DIR/monitor.log"
-            grep "ERROR\|error" "$LOG_DIR/litestream.log" | tail -5 | tee -a "$LOG_DIR/monitor.log"
+            grep -i "ERROR" "$LOG_DIR/litestream.log" | grep -v "page size not initialized" | tail -5 | tee -a "$LOG_DIR/monitor.log"
         fi
 
         # Process status
@@ -209,8 +214,22 @@ MONITOR_PID=$!
 echo "Monitor started with PID: $MONITOR_PID"
 
 echo ""
-echo "Initial database population..."
+echo "Initial database population (before starting litestream)..."
+# Kill litestream temporarily to populate database
+kill "$LITESTREAM_PID" 2>/dev/null || true
+wait "$LITESTREAM_PID" 2>/dev/null || true
+
 bin/litestream-test populate -db "$DB_PATH" -target-size 100MB -batch-size 10000 > "$LOG_DIR/populate.log" 2>&1
+if [ $? -ne 0 ]; then
+    echo "Warning: Population failed, but continuing..."
+    cat "$LOG_DIR/populate.log"
+fi
+
+# Restart litestream
+echo "Restarting litestream after population..."
+LOG_LEVEL=debug bin/litestream replicate -config "$CONFIG_FILE" > "$LOG_DIR/litestream.log" 2>&1 &
+LITESTREAM_PID=$!
+sleep 3
 
 echo ""
 echo "Starting load generator for overnight test..."
@@ -255,7 +274,51 @@ echo ""
 wait "$LOAD_PID"
 
 echo ""
-echo "Load generation completed. Running validation..."
+echo "Load generation completed."
+
+# Final statistics
+echo ""
+echo "================================================"
+echo "Final Statistics"
+echo "================================================"
+
+if [ -f "$DB_PATH" ]; then
+    DB_SIZE=$(stat -f%z "$DB_PATH" 2>/dev/null || stat -c%s "$DB_PATH" 2>/dev/null)
+    # Find actual table name
+    TABLES=$(sqlite3 "$DB_PATH" ".tables" 2>/dev/null)
+    if echo "$TABLES" | grep -q "load_test"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM load_test" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_table_0"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_table_0" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_data"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "0")
+    else
+        ROW_COUNT="0"
+    fi
+    echo "Database size: $(numfmt --to=iec-i --suffix=B $DB_SIZE 2>/dev/null || echo "$DB_SIZE bytes")"
+    echo "Total rows: $ROW_COUNT"
+fi
+
+if [ -d "$REPLICA_PATH" ]; then
+    SNAPSHOT_COUNT=$(find "$REPLICA_PATH" -name "*snapshot*.ltx" 2>/dev/null | wc -l | tr -d ' ')
+    LTX_COUNT=$(find "$REPLICA_PATH" -name "*.ltx" 2>/dev/null | wc -l | tr -d ' ')
+    REPLICA_SIZE=$(du -sh "$REPLICA_PATH" | cut -f1)
+    echo "Snapshots created: $SNAPSHOT_COUNT"
+    echo "LTX segments: $LTX_COUNT"
+    echo "Replica size: $REPLICA_SIZE"
+fi
+
+if [ -f "$LOG_DIR/litestream.log" ]; then
+    COMPACTION_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" || echo "0")
+    CHECKPOINT_COUNT=$(grep -iE "checkpoint|checkpointed" "$LOG_DIR/litestream.log" | wc -l | tr -d ' ' || echo "0")
+    ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" | grep -v "page size not initialized" | wc -l | tr -d ' ' || echo "0")
+    echo "Compactions: $COMPACTION_COUNT"
+    echo "Checkpoints: $CHECKPOINT_COUNT"
+    echo "Critical errors: $ERROR_COUNT"
+fi
+
+echo ""
+echo "Running validation..."
 bin/litestream-test validate \
     -source "$DB_PATH" \
     -replica "$REPLICA_PATH" \

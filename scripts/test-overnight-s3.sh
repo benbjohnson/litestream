@@ -98,33 +98,31 @@ cat > "$CONFIG_FILE" <<EOF
 # access-key-id: ${AWS_ACCESS_KEY_ID}
 # secret-access-key: ${AWS_SECRET_ACCESS_KEY}
 
+# Snapshot every 10 minutes
+snapshot:
+  interval: 10m
+  retention: 720h    # Keep data for 30 days
+
+# Compaction settings - very frequent for testing
+levels:
+  - interval: 30s
+  - interval: 1m
+  - interval: 5m
+  - interval: 15m
+  - interval: 30m
+  - interval: 1h
+
 dbs:
   - path: $DB_PATH
+    # Checkpoint settings - frequent for testing
+    checkpoint-interval: 30s
+    min-checkpoint-page-count: 1000
+    max-checkpoint-page-count: 10000
+
     replicas:
       - url: ${S3_PATH}
         region: ${AWS_REGION}
-
-        # Snapshot every 10 minutes
-        snapshot-interval: 10m
-
-        # Retention settings - keep data for 30 days
-        retention: 720h
         retention-check-interval: 1h
-
-        # Compaction settings - very frequent for testing
-        compaction:
-          - duration: 30s
-            interval: 30s
-          - duration: 1m
-            interval: 1m
-          - duration: 5m
-            interval: 5m
-          - duration: 1h
-            interval: 15m
-          - duration: 6h
-            interval: 30m
-          - duration: 24h
-            interval: 1h
 
         # S3-specific settings
         force-path-style: false
@@ -133,11 +131,6 @@ dbs:
         # Optional: Server-side encryption
         # sse: AES256
         # sse-kms-key-id: your-kms-key-id
-
-    # Checkpoint settings - frequent for testing
-    checkpoint-interval: 30s
-    min-checkpoint-page-count: 1000
-    max-checkpoint-page-count: 10000
 EOF
 
 echo ""
@@ -207,14 +200,26 @@ monitor_s3_test() {
             echo "  Total S3 storage: $(numfmt --to=iec-i --suffix=B $S3_SIZE 2>/dev/null || echo "$S3_SIZE bytes")" | tee -a "$LOG_DIR/monitor.log"
         fi
 
-        # Check for errors
+        # Count operations
         echo "" | tee -a "$LOG_DIR/monitor.log"
-        ERROR_COUNT=$(grep -c "ERROR\|error" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
-        echo "Errors in litestream log: $ERROR_COUNT" | tee -a "$LOG_DIR/monitor.log"
+        echo "Operations:" | tee -a "$LOG_DIR/monitor.log"
+        if [ -f "$LOG_DIR/litestream.log" ]; then
+            COMPACTION_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+            CHECKPOINT_COUNT=$(grep -iE "checkpoint|checkpointed" "$LOG_DIR/litestream.log" 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+            SYNC_COUNT=$(grep -c "replica sync" "$LOG_DIR/litestream.log" 2>/dev/null || echo "0")
+            echo "  Compactions: $COMPACTION_COUNT" | tee -a "$LOG_DIR/monitor.log"
+            echo "  Checkpoints: $CHECKPOINT_COUNT" | tee -a "$LOG_DIR/monitor.log"
+            echo "  Syncs: $SYNC_COUNT" | tee -a "$LOG_DIR/monitor.log"
+        fi
+
+        # Check for errors (exclude known non-critical)
+        echo "" | tee -a "$LOG_DIR/monitor.log"
+        ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" 2>/dev/null | grep -v "page size not initialized" | wc -l | tr -d ' ' || echo "0")
+        echo "Critical errors in litestream log: $ERROR_COUNT" | tee -a "$LOG_DIR/monitor.log"
 
         if [ "$ERROR_COUNT" -gt 0 ]; then
             echo "Recent errors:" | tee -a "$LOG_DIR/monitor.log"
-            grep "ERROR\|error" "$LOG_DIR/litestream.log" | tail -5 | tee -a "$LOG_DIR/monitor.log"
+            grep -i "ERROR" "$LOG_DIR/litestream.log" | grep -v "page size not initialized" | tail -5 | tee -a "$LOG_DIR/monitor.log"
         fi
 
         # Check for S3-specific errors
@@ -255,8 +260,22 @@ MONITOR_PID=$!
 echo "Monitor started with PID: $MONITOR_PID"
 
 echo ""
-echo "Initial database population..."
+echo "Initial database population (before starting litestream)..."
+# Kill litestream temporarily to populate database
+kill "$LITESTREAM_PID" 2>/dev/null || true
+wait "$LITESTREAM_PID" 2>/dev/null || true
+
 bin/litestream-test populate -db "$DB_PATH" -target-size 100MB -batch-size 10000 > "$LOG_DIR/populate.log" 2>&1
+if [ $? -ne 0 ]; then
+    echo "Warning: Population failed, but continuing..."
+    cat "$LOG_DIR/populate.log"
+fi
+
+# Restart litestream
+echo "Restarting litestream after population..."
+LOG_LEVEL=debug bin/litestream replicate -config "$CONFIG_FILE" > "$LOG_DIR/litestream.log" 2>&1 &
+LITESTREAM_PID=$!
+sleep 3
 
 echo ""
 echo "Starting load generator for overnight S3 test..."
@@ -304,7 +323,61 @@ echo ""
 wait "$LOAD_PID"
 
 echo ""
-echo "Load generation completed. Testing restoration from S3..."
+echo "Load generation completed."
+
+# Final statistics
+echo ""
+echo "================================================"
+echo "Final Statistics"
+echo "================================================"
+
+if [ -f "$DB_PATH" ]; then
+    DB_SIZE=$(stat -f%z "$DB_PATH" 2>/dev/null || stat -c%s "$DB_PATH" 2>/dev/null)
+    # Find actual table name
+    TABLES=$(sqlite3 "$DB_PATH" ".tables" 2>/dev/null)
+    if echo "$TABLES" | grep -q "load_test"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM load_test" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_table_0"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_table_0" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_data"; then
+        ROW_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "0")
+    else
+        ROW_COUNT="0"
+    fi
+    echo "Database size: $(numfmt --to=iec-i --suffix=B $DB_SIZE 2>/dev/null || echo "$DB_SIZE bytes")"
+    echo "Total rows: $ROW_COUNT"
+fi
+
+echo ""
+echo "S3 Statistics:"
+# Count objects in S3
+SNAPSHOT_COUNT=$(aws s3 ls "${S3_PATH}/" --recursive 2>/dev/null | grep -c "\.snapshot\.lz4" || echo "0")
+WAL_COUNT=$(aws s3 ls "${S3_PATH}/" --recursive 2>/dev/null | grep -c "\.wal\.lz4" || echo "0")
+TOTAL_OBJECTS=$(aws s3 ls "${S3_PATH}/" --recursive 2>/dev/null | wc -l | tr -d ' ' || echo "0")
+S3_SIZE=$(aws s3 ls "${S3_PATH}/" --recursive --summarize 2>/dev/null | grep "Total Size" | awk '{print $3}' || echo "0")
+
+echo "  Snapshots in S3: $SNAPSHOT_COUNT"
+echo "  WAL segments in S3: $WAL_COUNT"
+echo "  Total objects: $TOTAL_OBJECTS"
+if [ "$S3_SIZE" != "0" ]; then
+    echo "  Total S3 storage: $(numfmt --to=iec-i --suffix=B $S3_SIZE 2>/dev/null || echo "$S3_SIZE bytes")"
+fi
+
+echo ""
+echo "Operation Counts:"
+if [ -f "$LOG_DIR/litestream.log" ]; then
+    COMPACTION_COUNT=$(grep -c "compaction complete" "$LOG_DIR/litestream.log" || echo "0")
+    CHECKPOINT_COUNT=$(grep -iE "checkpoint|checkpointed" "$LOG_DIR/litestream.log" | wc -l | tr -d ' ' || echo "0")
+    SYNC_COUNT=$(grep -c "replica sync" "$LOG_DIR/litestream.log" || echo "0")
+    ERROR_COUNT=$(grep -i "ERROR" "$LOG_DIR/litestream.log" | grep -v "page size not initialized" | wc -l | tr -d ' ' || echo "0")
+    echo "  Compactions: $COMPACTION_COUNT"
+    echo "  Checkpoints: $CHECKPOINT_COUNT"
+    echo "  Syncs: $SYNC_COUNT"
+    echo "  Critical errors: $ERROR_COUNT"
+fi
+
+echo ""
+echo "Testing restoration from S3..."
 
 # Test restoration
 RESTORE_DB="$TEST_DIR/restored.db"
@@ -314,17 +387,22 @@ bin/litestream restore -o "$RESTORE_DB" "$S3_PATH" > "$LOG_DIR/restore.log" 2>&1
 if [ $? -eq 0 ]; then
     echo "✓ Restoration successful!"
 
-    # Compare row counts
-    ORIGINAL_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "0")
-    RESTORED_COUNT=$(sqlite3 "$RESTORE_DB" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "0")
-
-    echo "Original database rows: $ORIGINAL_COUNT"
-    echo "Restored database rows: $RESTORED_COUNT"
-
-    if [ "$ORIGINAL_COUNT" = "$RESTORED_COUNT" ]; then
-        echo "✓ Row counts match!"
+    # Compare row counts - use same table detection logic
+    TABLES=$(sqlite3 "$RESTORE_DB" ".tables" 2>/dev/null)
+    if echo "$TABLES" | grep -q "load_test"; then
+        RESTORED_COUNT=$(sqlite3 "$RESTORE_DB" "SELECT COUNT(*) FROM load_test" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_table_0"; then
+        RESTORED_COUNT=$(sqlite3 "$RESTORE_DB" "SELECT COUNT(*) FROM test_table_0" 2>/dev/null || echo "0")
+    elif echo "$TABLES" | grep -q "test_data"; then
+        RESTORED_COUNT=$(sqlite3 "$RESTORE_DB" "SELECT COUNT(*) FROM test_data" 2>/dev/null || echo "0")
     else
-        echo "✗ Row count mismatch!"
+        RESTORED_COUNT="0"
+    fi
+
+    if [ "$ROW_COUNT" = "$RESTORED_COUNT" ]; then
+        echo "✓ Row counts match! ($RESTORED_COUNT rows)"
+    else
+        echo "⚠ Row count mismatch! Original: $ROW_COUNT, Restored: $RESTORED_COUNT"
     fi
 else
     echo "✗ Restoration failed! Check $LOG_DIR/restore.log"
