@@ -525,7 +525,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Get list of snapshots before retention
-	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0)
+	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +548,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Verify snapshots after retention
-	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0)
+	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, time.Time{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -680,7 +680,7 @@ func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
 	}
 
 	// Record the earliest L0 file timestamp before compaction
-	itr, err := client.LTXFiles(ctx, 0, 0)
+	itr, err := client.LTXFiles(ctx, 0, 0, time.Time{})
 	if err != nil {
 		t.Fatalf("list L0 files: %v", err)
 	}
@@ -729,7 +729,7 @@ func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
 	}
 
 	// Verify L1 file has the earliest timestamp from L0 files
-	itr, err = client.LTXFiles(ctx, 1, 0)
+	itr, err = client.LTXFiles(ctx, 1, 0, time.Time{})
 	if err != nil {
 		t.Fatalf("list L1 files: %v", err)
 	}

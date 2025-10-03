@@ -145,7 +145,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -386,7 +386,7 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 			continue
 		}
 
-		info.CreatedAt = litestream.ReadLTXTimestamp(itr.ctx, itr.client, itr.level, minTXID, maxTXID, item.Properties.CreationTime.UTC())
+		info.CreatedAt = item.Properties.CreationTime.UTC()
 
 		itr.pageItems = append(itr.pageItems, info)
 	}

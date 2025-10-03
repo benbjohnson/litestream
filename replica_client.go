@@ -15,6 +15,18 @@ import (
 
 var ErrStopIter = errors.New("stop iterator")
 
+// Metadata keys for storing LTX file timestamps across different storage backends.
+const (
+	// MetadataKeyTimestamp is used by S3 and GCS for object metadata.
+	MetadataKeyTimestamp = "litestream-timestamp"
+
+	// MetadataKeyTimestampAzure is used by Azure Blob Storage (no hyphens, C# identifier rules).
+	MetadataKeyTimestampAzure = "litestreamtimestamp"
+
+	// HeaderKeyTimestamp is used by NATS for object headers.
+	HeaderKeyTimestamp = "Litestream-Timestamp"
+)
+
 // ReplicaClient represents client to connect to a Replica.
 type ReplicaClient interface {
 	// Type returns the type of client.
@@ -22,7 +34,9 @@ type ReplicaClient interface {
 
 	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
 	// If seek is specified, the iterator start from the given TXID or the next available if not found.
-	LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+	// If timestamp is non-zero, the iterator fetches accurate timestamps from metadata for timestamp-based restore.
+	// When timestamp is zero, the iterator uses fast timestamps (LastModified/Created/ModTime) for normal operations.
+	LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error)
 
 	// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
 	// If seek is specified, the reader will start at the given offset.
@@ -41,8 +55,11 @@ type ReplicaClient interface {
 }
 
 // FindLTXFiles returns a list of files that match filter.
-func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
-	itr, err := client.LTXFiles(ctx, level, 0)
+// The timestamp parameter is passed through to LTXFiles to control whether accurate timestamps
+// are fetched from metadata. When timestamp is non-zero (timestamp-based restore), accurate
+// timestamps are required. When zero (normal operations), fast timestamps are sufficient.
+func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, timestamp time.Time, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
+	itr, err := client.LTXFiles(ctx, level, 0, timestamp)
 	if err != nil {
 		return nil, err
 	}
@@ -68,26 +85,6 @@ func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, filter f
 		return nil, err
 	}
 	return a, nil
-}
-
-// ReadLTXTimestamp reads the timestamp from an LTX file's header.
-// Returns the timestamp from the header, or the fallback time if unable to read.
-// This is used to get authoritative timestamps from LTX files rather than relying
-// on file system or object storage metadata, which may not be preserved during
-// operations like compaction.
-func ReadLTXTimestamp(ctx context.Context, client ReplicaClient, level int, minTXID, maxTXID ltx.TXID, fallback time.Time) time.Time {
-	r, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
-	if err != nil {
-		return fallback
-	}
-	defer r.Close()
-
-	hdr, _, err := ltx.PeekHeader(r)
-	if err != nil {
-		return fallback
-	}
-
-	return time.UnixMilli(hdr.Timestamp).UTC()
 }
 
 // DefaultEstimatedPageIndexSize is size that is first fetched when fetching the page index.

@@ -230,7 +230,7 @@ func (c *ReplicaClient) parseLTXPath(objPath string) (level int, minTXID, maxTXI
 }
 
 // LTXFiles returns an iterator of all LTX files on the replica for a given level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -275,7 +275,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      int64(objInfo.Size),
-			CreatedAt: litestream.ReadLTXTimestamp(ctx, c, fileLevel, minTXID, maxTXID, objInfo.ModTime),
+			CreatedAt: objInfo.ModTime,
 		})
 	}
 

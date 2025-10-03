@@ -91,7 +91,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -218,13 +218,12 @@ func (itr *ltxFileIterator) Next() bool {
 		}
 
 		// Store current snapshot and return.
-		ctx := context.Background() // TODO: should we pass context through the iterator?
 		itr.info = &ltx.FileInfo{
 			Level:     itr.level,
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      attrs.Size,
-			CreatedAt: litestream.ReadLTXTimestamp(ctx, itr.client, itr.level, minTXID, maxTXID, attrs.Created.UTC()),
+			CreatedAt: attrs.Created.UTC(),
 		}
 
 		return true

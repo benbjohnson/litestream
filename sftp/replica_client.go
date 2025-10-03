@@ -167,7 +167,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (_ ltx.FileIterator, err error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (_ ltx.FileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -198,7 +198,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      fi.Size(),
-			CreatedAt: litestream.ReadLTXTimestamp(ctx, c, level, minTXID, maxTXID, fi.ModTime().UTC()),
+			CreatedAt: fi.ModTime().UTC(),
 		})
 	}
 
