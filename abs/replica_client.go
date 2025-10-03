@@ -1,6 +1,7 @@
 package abs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -145,11 +146,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ time.Time) (ltx.FileIterator, error) {
+// When timestamp is non-zero (timestamp-based restore), accurate timestamps are read from metadata.
+// Otherwise, fast timestamps from blob creation time are used.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newLTXFileIterator(ctx, c, level, seek), nil
+	return newLTXFileIterator(ctx, c, level, seek, timestamp), nil
 }
 
 // WriteLTXFile writes an LTX file to remote storage.
@@ -159,16 +162,32 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
 
-	rc := internal.NewReadCounter(rd)
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
 
-	// Upload blob with proper content type and access tier
+	// Extract timestamp from LTX header
+	var timestamp time.Time
+	if hdr, _, err := ltx.PeekHeader(teeReader); err == nil {
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+	} else {
+		timestamp = time.Now().UTC() // Fallback if header read fails
+	}
+
+	// Combine buffered data with rest of reader
+	rc := internal.NewReadCounter(io.MultiReader(&buf, rd))
+
+	// Upload blob with proper content type, access tier, and metadata
+	// Azure metadata keys cannot contain hyphens, so use litestreamtimestamp
 	_, err = c.client.UploadStream(ctx, c.Bucket, key, rc, &azblob.UploadStreamOptions{
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: to.Ptr("application/octet-stream"),
 		},
 		AccessTier: to.Ptr(blob.AccessTierHot), // Use Hot tier as default
+		Metadata: map[string]*string{
+			litestream.MetadataKeyTimestampAzure: to.Ptr(timestamp.Format(time.RFC3339Nano)),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("abs: cannot upload ltx file %q: %w", key, err)
@@ -182,7 +201,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      rc.N(),
-		CreatedAt: startTime.UTC(),
+		CreatedAt: timestamp,
 	}, nil
 }
 
@@ -274,11 +293,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 type ltxFileIterator struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	client *ReplicaClient
-	level  int
-	seek   ltx.TXID
+	ctx       context.Context
+	cancel    context.CancelFunc
+	client    *ReplicaClient
+	level     int
+	seek      ltx.TXID
+	timestamp time.Time // Non-zero for timestamp-based restore
 
 	pager     *runtime.Pager[azblob.ListBlobsFlatResponse]
 	pageItems []*ltx.FileInfo
@@ -289,15 +309,16 @@ type ltxFileIterator struct {
 	info   *ltx.FileInfo
 }
 
-func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
+func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, timestamp time.Time) *ltxFileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
 	itr := &ltxFileIterator{
-		ctx:    ctx,
-		cancel: cancel,
-		client: client,
-		level:  level,
-		seek:   seek,
+		ctx:       ctx,
+		cancel:    cancel,
+		client:    client,
+		level:     level,
+		seek:      seek,
+		timestamp: timestamp,
 	}
 
 	// Create paginator for listing blobs with level prefix
@@ -386,7 +407,20 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 			continue
 		}
 
-		info.CreatedAt = item.Properties.CreationTime.UTC()
+		// Use fast timestamp from blob creation by default
+		createdAt := item.Properties.CreationTime.UTC()
+
+		// Only read accurate timestamp from metadata when requested (timestamp-based restore)
+		// Azure includes metadata in LIST operations, so no extra API call needed
+		if !itr.timestamp.IsZero() && item.Metadata != nil {
+			if ts, ok := item.Metadata[litestream.MetadataKeyTimestampAzure]; ok && ts != nil {
+				if parsed, err := time.Parse(time.RFC3339Nano, *ts); err == nil {
+					createdAt = parsed
+				}
+			}
+		}
+
+		info.CreatedAt = createdAt
 
 		itr.pageItems = append(itr.pageItems, info)
 	}

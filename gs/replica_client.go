@@ -1,6 +1,7 @@
 package gs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -91,7 +92,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ time.Time) (ltx.FileIterator, error) {
+// When timestamp is non-zero (timestamp-based restore), accurate timestamps are read from metadata.
+// Otherwise, fast timestamps from object creation time are used.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -102,7 +105,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 		prefix += seek.String()
 	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level, timestamp), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -112,12 +115,31 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
+
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
+
+	// Extract timestamp from LTX header
+	var timestamp time.Time
+	if hdr, _, err := ltx.PeekHeader(teeReader); err == nil {
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+	} else {
+		timestamp = time.Now().UTC() // Fallback if header read fails
+	}
+
+	// Combine buffered data with rest of reader
+	fullReader := io.MultiReader(&buf, rd)
 
 	w := c.bkt.Object(key).NewWriter(ctx)
 	defer w.Close()
 
-	n, err := io.Copy(w, rd)
+	// Store timestamp in GCS metadata for accurate timestamp retrieval
+	w.Metadata = map[string]string{
+		litestream.MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
+	}
+
+	n, err := io.Copy(w, fullReader)
 	if err != nil {
 		return info, err
 	} else if err := w.Close(); err != nil {
@@ -132,7 +154,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      n,
-		CreatedAt: startTime.UTC(),
+		CreatedAt: timestamp,
 	}, nil
 }
 
@@ -176,18 +198,20 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 }
 
 type ltxFileIterator struct {
-	it     *storage.ObjectIterator
-	client *ReplicaClient
-	level  int
-	info   *ltx.FileInfo
-	err    error
+	it        *storage.ObjectIterator
+	client    *ReplicaClient
+	level     int
+	timestamp time.Time // Non-zero for timestamp-based restore
+	info      *ltx.FileInfo
+	err       error
 }
 
-func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int) *ltxFileIterator {
+func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int, timestamp time.Time) *ltxFileIterator {
 	return &ltxFileIterator{
-		it:     it,
-		client: client,
-		level:  level,
+		it:        it,
+		client:    client,
+		level:     level,
+		timestamp: timestamp,
 	}
 }
 
@@ -217,13 +241,26 @@ func (itr *ltxFileIterator) Next() bool {
 			continue
 		}
 
+		// Use fast timestamp from object creation by default
+		createdAt := attrs.Created.UTC()
+
+		// Only read accurate timestamp from metadata when requested (timestamp-based restore)
+		// GCS includes metadata in LIST operations, so no extra API call needed
+		if !itr.timestamp.IsZero() && attrs.Metadata != nil {
+			if ts, ok := attrs.Metadata[litestream.MetadataKeyTimestamp]; ok {
+				if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+					createdAt = parsed
+				}
+			}
+		}
+
 		// Store current snapshot and return.
 		itr.info = &ltx.FileInfo{
 			Level:     itr.level,
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      attrs.Size,
-			CreatedAt: attrs.Created.UTC(),
+			CreatedAt: createdAt,
 		}
 
 		return true
