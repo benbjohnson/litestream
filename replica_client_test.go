@@ -36,7 +36,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		itr, err := c.LTXFiles(context.Background(), 0, 0)
+		itr, err := c.LTXFiles(context.Background(), 0, 0, time.Time{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 		t.Helper()
 		t.Parallel()
 
-		itr, err := c.LTXFiles(context.Background(), 0, 0)
+		itr, err := c.LTXFiles(context.Background(), 0, 0, time.Time{})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -195,6 +195,83 @@ func stripLTXFileInfo(info *ltx.FileInfo) *ltx.FileInfo {
 	other := *info
 	other.CreatedAt = time.Time{}
 	return &other
+}
+
+// TestReplicaClient_TimestampPreservation verifies that LTX file timestamps are preserved
+// during write and read operations. This is critical for point-in-time restoration (#771).
+func TestReplicaClient_TimestampPreservation(t *testing.T) {
+	RunWithReplicaClient(t, "PreservesTimestamp", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
+		t.Parallel()
+
+		ctx := context.Background()
+
+		// Create an LTX file with a specific timestamp
+		// Use a timestamp from the past to ensure it's different from write time
+		expectedTimestamp := time.Now().Add(-1 * time.Hour).Truncate(time.Millisecond)
+
+		// Create a minimal LTX file with header containing the timestamp
+		hdr := ltx.Header{
+			Version:   1,
+			PageSize:  4096,
+			Commit:    1,
+			MinTXID:   1,
+			MaxTXID:   1,
+			Timestamp: expectedTimestamp.UnixMilli(),
+		}
+
+		// Marshal LTX header
+		headerBytes, err := hdr.MarshalBinary()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Combine header with minimal body to create valid LTX file
+		buf := bytes.NewReader(headerBytes)
+
+		// Write to storage backend
+		info, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(1), buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// For File backend, timestamp should be preserved immediately
+		// For cloud backends (S3, GCS, Azure, NATS), timestamp is stored in metadata
+		// Verify the returned FileInfo has correct timestamp
+		if info.CreatedAt.IsZero() {
+			t.Fatal("WriteLTXFile returned zero timestamp")
+		}
+
+		// Read back via LTXFiles and verify timestamp is preserved
+		itr, err := c.LTXFiles(ctx, 0, 0, time.Time{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		var found *ltx.FileInfo
+		for itr.Next() {
+			item := itr.Item()
+			if item.MinTXID == 1 && item.MaxTXID == 1 {
+				found = item
+				break
+			}
+		}
+		if err := itr.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if found == nil {
+			t.Fatal("LTX file not found in iteration")
+		}
+
+		// Verify timestamp was preserved (allow 1 second drift for precision)
+		timeDiff := found.CreatedAt.Sub(expectedTimestamp)
+		if timeDiff.Abs() > time.Second {
+			t.Errorf("Timestamp not preserved: expected %v, got %v (diff: %v)",
+				expectedTimestamp, found.CreatedAt, timeDiff)
+		}
+	})
 }
 
 // TestReplicaClient_S3_UploaderConfig tests S3 uploader configuration for large files
