@@ -1,10 +1,13 @@
 package file
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/superfly/ltx"
 
@@ -59,8 +62,9 @@ func (c *ReplicaClient) LTXFilePath(level int, minTXID, maxTXID ltx.TXID) string
 	return filepath.FromSlash(litestream.LTXFilePath(c.path, level, minTXID, maxTXID))
 }
 
-// LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+// LTXFiles returns an iterator over all LTX files on the replica for the given level.
+// The useMetadata parameter is ignored for file backend as ModTime is always available from readdir.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	f, err := os.Open(c.LTXLevelDir(level))
 	if os.IsNotExist(err) {
 		return ltx.NewFileInfoSliceIterator(nil), nil
@@ -75,6 +79,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 	}
 
 	// Iterate over every file and convert to metadata.
+	// ModTime contains the accurate timestamp set by Chtimes in WriteLTXFile.
 	infos := make([]*ltx.FileInfo, 0, len(fis))
 	for _, fi := range fis {
 		minTXID, maxTXID, err := ltx.ParseFilename(fi.Name())
@@ -117,12 +122,27 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	return f, nil
 }
 
-// WriteLTXFile writes an LTX file to disk.
+// WriteLTXFile writes an LTX file to the replica.
+// Extracts timestamp from LTX header and sets it as the file's ModTime to preserve original creation time.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	var fileInfo, dirInfo os.FileInfo
 	if db := c.db(); db != nil {
 		fileInfo, dirInfo = db.FileInfo(), db.DirInfo()
 	}
+
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
+
+	// Extract timestamp from LTX header
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+
+	// Combine buffered data with rest of reader
+	fullReader := io.MultiReader(&buf, rd)
 
 	// Ensure parent directory exists.
 	filename := c.LTXFilePath(level, minTXID, maxTXID)
@@ -137,7 +157,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(f, rd); err != nil {
+	if _, err := io.Copy(f, fullReader); err != nil {
 		return nil, err
 	}
 	if err := f.Sync(); err != nil {
@@ -154,7 +174,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      fi.Size(),
-		CreatedAt: fi.ModTime().UTC(),
+		CreatedAt: timestamp,
 	}
 
 	if err := f.Close(); err != nil {
@@ -163,6 +183,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	// Move LTX file to final path when it has been written & synced to disk.
 	if err := os.Rename(filename+".tmp", filename); err != nil {
+		return nil, err
+	}
+
+	// Set file ModTime to preserve original timestamp
+	if err := os.Chtimes(filename, timestamp, timestamp); err != nil {
 		return nil, err
 	}
 

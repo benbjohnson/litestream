@@ -2,8 +2,10 @@ package litestream_test
 
 import (
 	"context"
+	"fmt"
 	"hash/crc64"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
@@ -522,7 +525,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Get list of snapshots before retention
-	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0)
+	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -545,7 +548,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Verify snapshots after retention
-	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0)
+	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -640,4 +643,117 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 	wg.Wait()
 
 	t.Log("Test completed without race condition")
+}
+
+// TestCompaction_PreservesLastTimestamp verifies that after compaction,
+// the resulting file's timestamp reflects the last source file timestamp
+// as recorded in the LTX headers. This ensures point-in-time restoration
+// continues to work after compaction (issue #771).
+func TestCompaction_PreservesLastTimestamp(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Set up replica with file backend
+	replicaPath := filepath.Join(t.TempDir(), "replica")
+	client := file.NewReplicaClient(replicaPath)
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+
+	// Create some transactions
+	for i := 0; i < 10; i++ {
+		if _, err := sqldb.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+			t.Fatalf("create table: %v", err)
+		}
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (val) VALUES (?)`, fmt.Sprintf("value-%d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+
+		// Sync to create L0 files
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync db: %v", err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatalf("sync replica: %v", err)
+		}
+	}
+
+	// Record the last L0 file timestamp before compaction
+	itr, err := client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		t.Fatalf("list L0 files: %v", err)
+	}
+	defer itr.Close()
+
+	l0Files, err := ltx.SliceFileIterator(itr)
+	if err != nil {
+		t.Fatalf("convert iterator: %v", err)
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatalf("close iterator: %v", err)
+	}
+
+	var lastTime time.Time
+	for _, info := range l0Files {
+		if lastTime.IsZero() || info.CreatedAt.After(lastTime) {
+			lastTime = info.CreatedAt
+		}
+	}
+
+	if len(l0Files) == 0 {
+		t.Fatal("expected L0 files before compaction")
+	}
+	t.Logf("Found %d L0 files, last timestamp: %v", len(l0Files), lastTime)
+
+	// Perform compaction from L0 to L1
+	levels := litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Second},
+	}
+	store := litestream.NewStore([]*litestream.DB{db}, levels)
+	store.CompactionMonitorEnabled = false
+
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(ctx); err != nil {
+			t.Fatalf("close store: %v", err)
+		}
+	}()
+
+	_, err = store.CompactDB(ctx, db, levels[1])
+	if err != nil {
+		t.Fatalf("compact: %v", err)
+	}
+
+	// Verify L1 file has the last timestamp from L0 files
+	itr, err = client.LTXFiles(ctx, 1, 0, false)
+	if err != nil {
+		t.Fatalf("list L1 files: %v", err)
+	}
+	defer itr.Close()
+
+	l1Files, err := ltx.SliceFileIterator(itr)
+	if err != nil {
+		t.Fatalf("convert L1 iterator: %v", err)
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatalf("close L1 iterator: %v", err)
+	}
+
+	if len(l1Files) == 0 {
+		t.Fatal("expected L1 file after compaction")
+	}
+
+	l1Info := l1Files[0]
+
+	// The L1 file's CreatedAt should be the last timestamp from the L0 files
+	// Allow for some drift due to millisecond precision in LTX headers
+	timeDiff := l1Info.CreatedAt.Sub(lastTime)
+	if timeDiff.Abs() > time.Second {
+		t.Errorf("L1 CreatedAt = %v, last L0 = %v (diff: %v)", l1Info.CreatedAt, lastTime, timeDiff)
+		t.Error("L1 file timestamp should preserve last source file timestamp")
+	}
 }

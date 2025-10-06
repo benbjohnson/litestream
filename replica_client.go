@@ -21,7 +21,9 @@ type ReplicaClient interface {
 
 	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
 	// If seek is specified, the iterator start from the given TXID or the next available if not found.
-	LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+	// If useMetadata is true, the iterator fetches accurate timestamps from metadata for timestamp-based restore.
+	// When false, the iterator uses fast timestamps (LastModified/Created/ModTime) for normal operations.
+	LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
 
 	// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
 	// If seek is specified, the reader will start at the given offset.
@@ -40,8 +42,11 @@ type ReplicaClient interface {
 }
 
 // FindLTXFiles returns a list of files that match filter.
-func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
-	itr, err := client.LTXFiles(ctx, level, 0)
+// The useMetadata parameter is passed through to LTXFiles to control whether accurate timestamps
+// are fetched from metadata. When true (timestamp-based restore), accurate timestamps are required.
+// When false (normal operations), fast timestamps are sufficient.
+func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, useMetadata bool, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
+	itr, err := client.LTXFiles(ctx, level, 0, useMetadata)
 	if err != nil {
 		return nil, err
 	}

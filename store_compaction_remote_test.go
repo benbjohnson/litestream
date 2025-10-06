@@ -130,7 +130,7 @@ func (c *delayedReplicaClient) key(level int, min, max ltx.TXID) string {
 	return fmt.Sprintf("%d:%s:%s", level, min.String(), max.String())
 }
 
-func (c *delayedReplicaClient) LTXFiles(_ context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *delayedReplicaClient) LTXFiles(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
