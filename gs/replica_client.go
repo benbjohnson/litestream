@@ -22,6 +22,9 @@ import (
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "gs"
 
+// MetadataKeyTimestamp is the metadata key for storing LTX file timestamps in GCS.
+const MetadataKeyTimestamp = "litestream-timestamp"
+
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Google Cloud Storage.
@@ -92,9 +95,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-// When timestamp is non-zero (timestamp-based restore), accurate timestamps are read from metadata.
-// Otherwise, fast timestamps from object creation time are used.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
+// GCS always uses accurate timestamps from metadata since they're included in LIST operations at zero cost.
+// The useMetadata parameter is ignored.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -105,7 +108,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 		prefix += seek.String()
 	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level, timestamp), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -121,12 +124,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	teeReader := io.TeeReader(rd, &buf)
 
 	// Extract timestamp from LTX header
-	var timestamp time.Time
-	if hdr, _, err := ltx.PeekHeader(teeReader); err == nil {
-		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
-	} else {
-		timestamp = time.Now().UTC() // Fallback if header read fails
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
 	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
 	// Combine buffered data with rest of reader
 	fullReader := io.MultiReader(&buf, rd)
@@ -136,7 +138,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	// Store timestamp in GCS metadata for accurate timestamp retrieval
 	w.Metadata = map[string]string{
-		litestream.MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
+		MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
 	}
 
 	n, err := io.Copy(w, fullReader)
@@ -198,20 +200,18 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 }
 
 type ltxFileIterator struct {
-	it        *storage.ObjectIterator
-	client    *ReplicaClient
-	level     int
-	timestamp time.Time // Non-zero for timestamp-based restore
-	info      *ltx.FileInfo
-	err       error
+	it     *storage.ObjectIterator
+	client *ReplicaClient
+	level  int
+	info   *ltx.FileInfo
+	err    error
 }
 
-func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int, timestamp time.Time) *ltxFileIterator {
+func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int) *ltxFileIterator {
 	return &ltxFileIterator{
-		it:        it,
-		client:    client,
-		level:     level,
-		timestamp: timestamp,
+		it:     it,
+		client: client,
+		level:  level,
 	}
 }
 
@@ -241,13 +241,11 @@ func (itr *ltxFileIterator) Next() bool {
 			continue
 		}
 
-		// Use fast timestamp from object creation by default
-		createdAt := attrs.Created.UTC()
-
-		// Only read accurate timestamp from metadata when requested (timestamp-based restore)
+		// Always use accurate timestamp from metadata since it's zero-cost
 		// GCS includes metadata in LIST operations, so no extra API call needed
-		if !itr.timestamp.IsZero() && attrs.Metadata != nil {
-			if ts, ok := attrs.Metadata[litestream.MetadataKeyTimestamp]; ok {
+		createdAt := attrs.Created.UTC()
+		if attrs.Metadata != nil {
+			if ts, ok := attrs.Metadata[MetadataKeyTimestamp]; ok {
 				if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
 					createdAt = parsed
 				}

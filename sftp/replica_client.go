@@ -169,8 +169,8 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 
 // LTXFiles returns an iterator over all available LTX files for a level.
 // SFTP uses file ModTime for timestamps, which is set via Chtimes() to preserve original timestamp.
-// The timestamp parameter is ignored since ModTime always contains the accurate timestamp.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ time.Time) (_ ltx.FileIterator, err error) {
+// The useMetadata parameter is ignored since ModTime always contains the accurate timestamp.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -224,12 +224,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	teeReader := io.TeeReader(rd, &buf)
 
 	// Extract timestamp from LTX header
-	var timestamp time.Time
-	if hdr, _, err := ltx.PeekHeader(teeReader); err == nil {
-		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
-	} else {
-		timestamp = time.Now().UTC() // Fallback if header read fails
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
 	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
 	// Combine buffered data with rest of reader
 	fullReader := io.MultiReader(&buf, rd)

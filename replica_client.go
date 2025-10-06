@@ -8,24 +8,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/superfly/ltx"
 )
 
 var ErrStopIter = errors.New("stop iterator")
-
-// Metadata keys for storing LTX file timestamps across different storage backends.
-const (
-	// MetadataKeyTimestamp is used by S3 and GCS for object metadata.
-	MetadataKeyTimestamp = "litestream-timestamp"
-
-	// MetadataKeyTimestampAzure is used by Azure Blob Storage (no hyphens, C# identifier rules).
-	MetadataKeyTimestampAzure = "litestreamtimestamp"
-
-	// HeaderKeyTimestamp is used by NATS for object headers.
-	HeaderKeyTimestamp = "Litestream-Timestamp"
-)
 
 // ReplicaClient represents client to connect to a Replica.
 type ReplicaClient interface {
@@ -34,9 +21,9 @@ type ReplicaClient interface {
 
 	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
 	// If seek is specified, the iterator start from the given TXID or the next available if not found.
-	// If timestamp is non-zero, the iterator fetches accurate timestamps from metadata for timestamp-based restore.
-	// When timestamp is zero, the iterator uses fast timestamps (LastModified/Created/ModTime) for normal operations.
-	LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error)
+	// If useMetadata is true, the iterator fetches accurate timestamps from metadata for timestamp-based restore.
+	// When false, the iterator uses fast timestamps (LastModified/Created/ModTime) for normal operations.
+	LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
 
 	// OpenLTXFile returns a reader that contains an LTX file at a given TXID.
 	// If seek is specified, the reader will start at the given offset.
@@ -55,11 +42,11 @@ type ReplicaClient interface {
 }
 
 // FindLTXFiles returns a list of files that match filter.
-// The timestamp parameter is passed through to LTXFiles to control whether accurate timestamps
-// are fetched from metadata. When timestamp is non-zero (timestamp-based restore), accurate
-// timestamps are required. When zero (normal operations), fast timestamps are sufficient.
-func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, timestamp time.Time, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
-	itr, err := client.LTXFiles(ctx, level, 0, timestamp)
+// The useMetadata parameter is passed through to LTXFiles to control whether accurate timestamps
+// are fetched from metadata. When true (timestamp-based restore), accurate timestamps are required.
+// When false (normal operations), fast timestamps are sufficient.
+func FindLTXFiles(ctx context.Context, client ReplicaClient, level int, useMetadata bool, filter func(*ltx.FileInfo) (bool, error)) ([]*ltx.FileInfo, error) {
+	itr, err := client.LTXFiles(ctx, level, 0, useMetadata)
 	if err != nil {
 		return nil, err
 	}

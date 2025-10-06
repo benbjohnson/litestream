@@ -72,7 +72,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 
 	fmt.Fprintln(w, "min_txid\tmax_txid\tsize\tcreated")
 	// Normal operation - use fast timestamps
-	itr, err := r.Client.LTXFiles(ctx, 0, 0, time.Time{})
+	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return err
 	}

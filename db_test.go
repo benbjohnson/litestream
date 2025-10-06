@@ -525,7 +525,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Get list of snapshots before retention
-	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, time.Time{})
+	itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +548,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 
 	// Verify snapshots after retention
-	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, time.Time{})
+	itr, err = db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -645,11 +645,11 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 	t.Log("Test completed without race condition")
 }
 
-// TestCompaction_PreservesEarliestTimestamp verifies that after compaction,
-// the resulting file's timestamp reflects the earliest source file timestamp
+// TestCompaction_PreservesLastTimestamp verifies that after compaction,
+// the resulting file's timestamp reflects the last source file timestamp
 // as recorded in the LTX headers. This ensures point-in-time restoration
 // continues to work after compaction (issue #771).
-func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
+func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 	ctx := context.Background()
 
 	db, sqldb := testingutil.MustOpenDBs(t)
@@ -679,8 +679,8 @@ func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
 		}
 	}
 
-	// Record the earliest L0 file timestamp before compaction
-	itr, err := client.LTXFiles(ctx, 0, 0, time.Time{})
+	// Record the last L0 file timestamp before compaction
+	itr, err := client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		t.Fatalf("list L0 files: %v", err)
 	}
@@ -694,17 +694,17 @@ func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
 		t.Fatalf("close iterator: %v", err)
 	}
 
-	var earliestTime time.Time
+	var lastTime time.Time
 	for _, info := range l0Files {
-		if earliestTime.IsZero() || info.CreatedAt.Before(earliestTime) {
-			earliestTime = info.CreatedAt
+		if lastTime.IsZero() || info.CreatedAt.After(lastTime) {
+			lastTime = info.CreatedAt
 		}
 	}
 
 	if len(l0Files) == 0 {
 		t.Fatal("expected L0 files before compaction")
 	}
-	t.Logf("Found %d L0 files, earliest timestamp: %v", len(l0Files), earliestTime)
+	t.Logf("Found %d L0 files, last timestamp: %v", len(l0Files), lastTime)
 
 	// Perform compaction from L0 to L1
 	levels := litestream.CompactionLevels{
@@ -728,8 +728,8 @@ func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
 		t.Fatalf("compact: %v", err)
 	}
 
-	// Verify L1 file has the earliest timestamp from L0 files
-	itr, err = client.LTXFiles(ctx, 1, 0, time.Time{})
+	// Verify L1 file has the last timestamp from L0 files
+	itr, err = client.LTXFiles(ctx, 1, 0, false)
 	if err != nil {
 		t.Fatalf("list L1 files: %v", err)
 	}
@@ -749,11 +749,11 @@ func TestCompaction_PreservesEarliestTimestamp(t *testing.T) {
 
 	l1Info := l1Files[0]
 
-	// The L1 file's CreatedAt should be the earliest timestamp from the L0 files
+	// The L1 file's CreatedAt should be the last timestamp from the L0 files
 	// Allow for some drift due to millisecond precision in LTX headers
-	timeDiff := l1Info.CreatedAt.Sub(earliestTime)
+	timeDiff := l1Info.CreatedAt.Sub(lastTime)
 	if timeDiff.Abs() > time.Second {
-		t.Errorf("L1 CreatedAt = %v, earliest L0 = %v (diff: %v)", l1Info.CreatedAt, earliestTime, timeDiff)
-		t.Error("L1 file timestamp should preserve earliest source file timestamp")
+		t.Errorf("L1 CreatedAt = %v, last L0 = %v (diff: %v)", l1Info.CreatedAt, lastTime, timeDiff)
+		t.Error("L1 file timestamp should preserve last source file timestamp")
 	}
 }

@@ -1308,7 +1308,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 
 	// Collect files after last compaction.
 	// Normal operation - use fast timestamps
-	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID, time.Time{})
+	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID, false)
 	if err != nil {
 		return nil, fmt.Errorf("source ltx files after %s: %w", seekTXID, err)
 	}
@@ -1416,7 +1416,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	db.Logger.Debug("enforcing snapshot retention", "timestamp", timestamp)
 
 	// Normal operation - use fast timestamps
-	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0, time.Time{})
+	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
 	if err != nil {
 		return 0, fmt.Errorf("fetch ltx files: %w", err)
 	}
@@ -1463,7 +1463,7 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 	db.Logger.Debug("enforcing retention", "level", level, "txid", txID)
 
 	// Normal operation - use fast timestamps
-	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, time.Time{})
+	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch ltx files: %w", err)
 	}

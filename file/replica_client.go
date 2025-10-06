@@ -3,6 +3,7 @@ package file
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,8 +63,8 @@ func (c *ReplicaClient) LTXFilePath(level int, minTXID, maxTXID ltx.TXID) string
 }
 
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
-// The timestamp parameter is ignored for file backend as ModTime is always available from readdir.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
+// The useMetadata parameter is ignored for file backend as ModTime is always available from readdir.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	f, err := os.Open(c.LTXLevelDir(level))
 	if os.IsNotExist(err) {
 		return ltx.NewFileInfoSliceIterator(nil), nil
@@ -134,12 +135,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	teeReader := io.TeeReader(rd, &buf)
 
 	// Extract timestamp from LTX header
-	var timestamp time.Time
-	if hdr, _, err := ltx.PeekHeader(teeReader); err == nil {
-		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
-	} else {
-		timestamp = time.Now().UTC() // Fallback if header read fails
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
 	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
 	// Combine buffered data with rest of reader
 	fullReader := io.MultiReader(&buf, rd)

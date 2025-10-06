@@ -36,7 +36,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		itr, err := c.LTXFiles(context.Background(), 0, 0, time.Time{})
+		itr, err := c.LTXFiles(context.Background(), 0, 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -72,7 +72,7 @@ func TestReplicaClient_LTX(t *testing.T) {
 		t.Helper()
 		t.Parallel()
 
-		itr, err := c.LTXFiles(context.Background(), 0, 0, time.Time{})
+		itr, err := c.LTXFiles(context.Background(), 0, 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -243,7 +243,7 @@ func TestReplicaClient_TimestampPreservation(t *testing.T) {
 		}
 
 		// Read back via LTXFiles and verify timestamp is preserved
-		itr, err := c.LTXFiles(ctx, 0, 0, time.Time{})
+		itr, err := c.LTXFiles(ctx, 0, 0, false)
 		if err != nil {
 			t.Fatal(err)
 		}

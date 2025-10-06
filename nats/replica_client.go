@@ -24,6 +24,9 @@ import (
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "nats"
 
+// HeaderKeyTimestamp is the header key for storing LTX file timestamps in NATS object headers.
+const HeaderKeyTimestamp = "Litestream-Timestamp"
+
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to NATS JetStream Object Store.
@@ -231,9 +234,9 @@ func (c *ReplicaClient) parseLTXPath(objPath string) (level int, minTXID, maxTXI
 }
 
 // LTXFiles returns an iterator of all LTX files on the replica for a given level.
-// When timestamp is non-zero (timestamp-based restore), accurate timestamps are read from headers.
-// Otherwise, fast timestamps from object ModTime are used.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, timestamp time.Time) (ltx.FileIterator, error) {
+// NATS always uses accurate timestamps from headers since they're included in LIST operations at zero cost.
+// The useMetadata parameter is ignored.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -273,13 +276,11 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 			continue
 		}
 
-		// Use fast timestamp from object ModTime by default
-		createdAt := objInfo.ModTime
-
-		// Only read accurate timestamp from headers when requested (timestamp-based restore)
+		// Always use accurate timestamp from headers since it's zero-cost
 		// NATS includes headers in LIST operations, so no extra API call needed
-		if !timestamp.IsZero() && objInfo.Headers != nil {
-			if values, ok := objInfo.Headers[litestream.HeaderKeyTimestamp]; ok && len(values) > 0 {
+		createdAt := objInfo.ModTime
+		if objInfo.Headers != nil {
+			if values, ok := objInfo.Headers[HeaderKeyTimestamp]; ok && len(values) > 0 {
 				if parsed, err := time.Parse(time.RFC3339Nano, values[0]); err == nil {
 					createdAt = parsed
 				}
@@ -352,12 +353,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	teeReader := io.TeeReader(r, &buf)
 
 	// Extract timestamp from LTX header
-	var timestamp time.Time
-	if hdr, _, err := ltx.PeekHeader(teeReader); err == nil {
-		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
-	} else {
-		timestamp = time.Now().UTC() // Fallback if header read fails
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
 	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
 	// Combine buffered data with rest of reader
 	rc := internal.NewReadCounter(io.MultiReader(&buf, r))
@@ -366,7 +366,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	objectInfo, err := c.objectStore.Put(ctx, jetstream.ObjectMeta{
 		Name: objectPath,
 		Headers: map[string][]string{
-			litestream.HeaderKeyTimestamp: {timestamp.Format(time.RFC3339Nano)},
+			HeaderKeyTimestamp: {timestamp.Format(time.RFC3339Nano)},
 		},
 	}, rc)
 	if err != nil {
