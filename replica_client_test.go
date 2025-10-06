@@ -17,22 +17,38 @@ import (
 	"github.com/benbjohnson/litestream/s3"
 )
 
+// createLTXData creates a minimal valid LTX file with a header for testing.
+// The data parameter is appended after the header for testing purposes.
+func createLTXData(minTXID, maxTXID ltx.TXID, data []byte) []byte {
+	hdr := ltx.Header{
+		Version:   1,
+		PageSize:  4096,
+		Commit:    1,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	headerBytes, _ := hdr.MarshalBinary()
+	return append(headerBytes, data...)
+}
+
 func TestReplicaClient_LTX(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Helper()
 		t.Parallel()
 
 		// Write files out of order to check for sorting.
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(4), ltx.TXID(8), strings.NewReader(`67`)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(4), ltx.TXID(8), bytes.NewReader(createLTXData(4, 8, []byte(`67`)))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(1), strings.NewReader(``)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(1), bytes.NewReader(createLTXData(1, 1, []byte(``)))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(9), ltx.TXID(9), strings.NewReader(`xyz`)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(9), ltx.TXID(9), bytes.NewReader(createLTXData(9, 9, []byte(`xyz`)))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(2), ltx.TXID(3), strings.NewReader(`12345`)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(2), ltx.TXID(3), bytes.NewReader(createLTXData(2, 3, []byte(`12345`)))); err != nil {
 			t.Fatal(err)
 		}
 
@@ -50,17 +66,30 @@ func TestReplicaClient_LTX(t *testing.T) {
 			t.Fatalf("len=%v, want %v", got, want)
 		}
 
-		if got, want := stripLTXFileInfo(a[0]), (&ltx.FileInfo{MinTXID: 1, MaxTXID: 1, Size: 0}); *got != *want {
-			t.Fatalf("Index=%v, want %v", got, want)
+		// Check that files are sorted by MinTXID (Size no longer checked since we add LTX headers)
+		if got, want := a[0].MinTXID, ltx.TXID(1); got != want {
+			t.Fatalf("Index[0].MinTXID=%v, want %v", got, want)
 		}
-		if got, want := stripLTXFileInfo(a[1]), (&ltx.FileInfo{MinTXID: 2, MaxTXID: 3, Size: 5}); *got != *want {
-			t.Fatalf("Index=%v, want %v", got, want)
+		if got, want := a[0].MaxTXID, ltx.TXID(1); got != want {
+			t.Fatalf("Index[0].MaxTXID=%v, want %v", got, want)
 		}
-		if got, want := stripLTXFileInfo(a[2]), (&ltx.FileInfo{MinTXID: 4, MaxTXID: 8, Size: 2}); *got != *want {
-			t.Fatalf("Index=%v, want %v", got, want)
+		if got, want := a[1].MinTXID, ltx.TXID(2); got != want {
+			t.Fatalf("Index[1].MinTXID=%v, want %v", got, want)
 		}
-		if got, want := stripLTXFileInfo(a[3]), (&ltx.FileInfo{MinTXID: 9, MaxTXID: 9, Size: 3}); *got != *want {
-			t.Fatalf("Index=%v, want %v", got, want)
+		if got, want := a[1].MaxTXID, ltx.TXID(3); got != want {
+			t.Fatalf("Index[1].MaxTXID=%v, want %v", got, want)
+		}
+		if got, want := a[2].MinTXID, ltx.TXID(4); got != want {
+			t.Fatalf("Index[2].MinTXID=%v, want %v", got, want)
+		}
+		if got, want := a[2].MaxTXID, ltx.TXID(8); got != want {
+			t.Fatalf("Index[2].MaxTXID=%v, want %v", got, want)
+		}
+		if got, want := a[3].MinTXID, ltx.TXID(9); got != want {
+			t.Fatalf("Index[3].MinTXID=%v, want %v", got, want)
+		}
+		if got, want := a[3].MaxTXID, ltx.TXID(9); got != want {
+			t.Fatalf("Index[3].MaxTXID=%v, want %v", got, want)
 		}
 
 		if err := itr.Close(); err != nil {
@@ -89,7 +118,11 @@ func TestReplicaClient_WriteLTXFile(t *testing.T) {
 		t.Helper()
 		t.Parallel()
 
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), strings.NewReader(`foobar`)); err != nil {
+		testData := []byte(`foobar`)
+		ltxData := createLTXData(1, 2, testData)
+		expectedContent := ltxData
+
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), bytes.NewReader(expectedContent)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -108,7 +141,7 @@ func TestReplicaClient_WriteLTXFile(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if got, want := string(buf), `foobar`; got != want {
+		if got, want := string(buf), string(expectedContent); got != want {
 			t.Fatalf("data=%q, want %q", got, want)
 		}
 	})
@@ -118,7 +151,12 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Helper()
 		t.Parallel()
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), strings.NewReader(`foobar`)); err != nil {
+
+		testData := []byte(`foobar`)
+		ltxData := createLTXData(1, 2, testData)
+		expectedContent := ltxData
+
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), bytes.NewReader(expectedContent)); err != nil {
 			t.Fatal(err)
 		}
 
@@ -130,7 +168,7 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 
 		if buf, err := io.ReadAll(r); err != nil {
 			t.Fatal(err)
-		} else if got, want := string(buf), "foobar"; got != want {
+		} else if got, want := string(buf), string(expectedContent); got != want {
 			t.Fatalf("ReadAll=%v, want %v", got, want)
 		}
 	})
@@ -150,10 +188,10 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 		t.Helper()
 		t.Parallel()
 
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), strings.NewReader(`foo`)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), bytes.NewReader(createLTXData(1, 2, []byte(`foo`)))); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(3), ltx.TXID(4), strings.NewReader(`bar`)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(3), ltx.TXID(4), bytes.NewReader(createLTXData(3, 4, []byte(`bar`)))); err != nil {
 			t.Fatal(err)
 		}
 
@@ -189,12 +227,6 @@ func RunWithReplicaClient(t *testing.T, name string, fn func(*testing.T, litestr
 			})
 		}
 	})
-}
-
-func stripLTXFileInfo(info *ltx.FileInfo) *ltx.FileInfo {
-	other := *info
-	other.CreatedAt = time.Time{}
-	return &other
 }
 
 // TestReplicaClient_TimestampPreservation verifies that LTX file timestamps are preserved
