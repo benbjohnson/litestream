@@ -148,6 +148,29 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 
 	r.Logger().Debug("replica sync", "txid", dpos.TXID.String())
 
+	// If database TXID is less than replica TXID, this means the database
+	// has been restored and is behind the replica. We need to create a snapshot at
+	// the current database state and reset the replica position to continue from there.
+	// This fixes issue #781 where restored databases skip replication until they exceed
+	// the previous high-water mark.
+	if dpos.TXID < r.Pos().TXID && dpos.TXID > 0 {
+		r.Logger().Debug("database behind replica, creating snapshot to resynchronize",
+			"db_txid", dpos.TXID,
+			"replica_txid", r.Pos().TXID)
+
+		// Create a snapshot at the current database state
+		if _, err := r.db.Snapshot(ctx); err != nil {
+			return fmt.Errorf("snapshot after restore: %w", err)
+		}
+
+		// Reset replica position to match database position
+		r.SetPos(dpos)
+		r.Logger().Debug("replica position reset to database position", "txid", dpos.TXID)
+
+		// No need to replicate any L0 files since we just created a snapshot
+		return nil
+	}
+
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {

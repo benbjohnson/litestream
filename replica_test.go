@@ -91,6 +91,106 @@ func TestReplica_Sync(t *testing.T) {
 	// TODO(ltx): Restore snapshot and verify
 }
 
+// TestReplica_RestoreAndReplicateAfterDataLoss tests the scenario described in issue #781
+// where a restore does not preserve LTX ID information, causing replication to skip new writes
+// until the TXID exceeds the previous high-water mark.
+func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
+	ctx := context.Background()
+
+	// Create a temporary directory for replica storage
+	replicaDir := t.TempDir()
+	replicaClient := file.NewReplicaClient(replicaDir)
+
+	// Create database with some data
+	dbDir := t.TempDir()
+	dbPath := dbDir + "/db.sqlite"
+
+	db := testingutil.NewDB(t, dbPath)
+	db.MonitorInterval = 0
+	db.Replica = litestream.NewReplicaWithClient(db, replicaClient)
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+
+	// Create table and insert data to establish initial TXID
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(col1 INTEGER);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync to get initial replication
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get current database position
+	dbPos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Close SQL connection and database
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the scenario from issue #781:
+	// Database has been restored and is at a lower TXID than the replica
+	// This happens when .litestream directory is deleted but remote replica exists
+
+	// Reopen database
+	db2 := testingutil.NewDB(t, dbPath)
+	db2.MonitorInterval = 0
+	db2.Replica = litestream.NewReplicaWithClient(db2, replicaClient)
+	db2.Replica.MonitorEnabled = false
+
+	if err := db2.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close(ctx)
+
+	// Manually set replica position ahead to simulate the "database behind replica" scenario
+	// This is the core issue in #781
+	aheadPos := ltx.Pos{TXID: dbPos.TXID + 10}
+	db2.Replica.SetPos(aheadPos)
+
+	// Verify that replica is ahead
+	if db2.Replica.Pos().TXID <= dbPos.TXID {
+		t.Fatal("test setup failed: replica should be ahead of database")
+	}
+
+	// Sync should detect database is behind replica and create a snapshot
+	if err := db2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Before the fix, this would skip replication because db TXID < replica TXID
+	// After the fix, this should create a snapshot and reset replica position
+	if err := db2.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify replica position was reset to database position (this is the fix for #781)
+	newReplicaPos := db2.Replica.Pos()
+	if newReplicaPos.TXID != dbPos.TXID {
+		t.Fatalf("expected replica position to reset to %d, got %d", dbPos.TXID, newReplicaPos.TXID)
+	}
+
+	t.Log("Test passed: Replica position reset when database behind replica")
+}
+
 func TestReplica_CalcRestorePlan(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
