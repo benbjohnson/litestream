@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -94,6 +95,12 @@ func TestReplica_Sync(t *testing.T) {
 // TestReplica_RestoreAndReplicateAfterDataLoss tests the scenario described in issue #781
 // where a restore does not preserve LTX ID information, causing replication to skip new writes
 // until the TXID exceeds the previous high-water mark.
+//
+// This test follows the reproduction steps from issue #781:
+// 1. Create DB and replicate data
+// 2. Restore from backup (simulating hard recovery)
+// 3. Insert new data and replicate
+// 4. Restore again and verify new data exists
 func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
 	ctx := context.Background()
 
@@ -101,56 +108,67 @@ func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
 	replicaDir := t.TempDir()
 	replicaClient := file.NewReplicaClient(replicaDir)
 
-	// Create database with some data
+	// Create database with initial data
 	dbDir := t.TempDir()
 	dbPath := dbDir + "/db.sqlite"
 
-	db := testingutil.NewDB(t, dbPath)
-	db.MonitorInterval = 0
-	db.Replica = litestream.NewReplicaWithClient(db, replicaClient)
-	db.Replica.MonitorEnabled = false
-
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-
+	// Step 1: Create initial data and replicate
 	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
-
-	// Create table and insert data to establish initial TXID
 	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(col1 INTEGER);`); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1);`); err != nil {
 		t.Fatal(err)
 	}
-
-	// Sync to get initial replication
-	if err := db.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-	if err := db.Replica.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	// Get current database position
-	dbPos, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Close SQL connection and database
 	if err := sqldb.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Close(ctx); err != nil {
+
+	// Start litestream replication
+	db1 := testingutil.NewDB(t, dbPath)
+	db1.MonitorInterval = 0
+	db1.Replica = litestream.NewReplicaWithClient(db1, replicaClient)
+	db1.Replica.MonitorEnabled = false
+
+	if err := db1.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 1 complete: Initial data replicated")
+
+	// Step 2: Simulate hard recovery - remove database and .litestream directory, then restore
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-wal"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-shm"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	metaPath := db1.MetaPath()
+	if err := os.RemoveAll(metaPath); err != nil {
 		t.Fatal(err)
 	}
 
-	// Simulate the scenario from issue #781:
-	// Database has been restored and is at a lower TXID than the replica
-	// This happens when .litestream directory is deleted but remote replica exists
+	// Restore from backup
+	restoreOpt := litestream.RestoreOptions{
+		OutputPath: dbPath,
+	}
+	if err := db1.Replica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 2 complete: Database restored from backup")
 
-	// Reopen database
+	// Step 3: Start replication and insert new data
 	db2 := testingutil.NewDB(t, dbPath)
 	db2.MonitorInterval = 0
 	db2.Replica = litestream.NewReplicaWithClient(db2, replicaClient)
@@ -159,36 +177,72 @@ func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
 	if err := db2.Open(); err != nil {
 		t.Fatal(err)
 	}
-	defer db2.Close(ctx)
 
-	// Manually set replica position ahead to simulate the "database behind replica" scenario
-	// This is the core issue in #781
-	aheadPos := ltx.Pos{TXID: dbPos.TXID + 10}
-	db2.Replica.SetPos(aheadPos)
-
-	// Verify that replica is ahead
-	if db2.Replica.Pos().TXID <= dbPos.TXID {
-		t.Fatal("test setup failed: replica should be ahead of database")
+	sqldb2 := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb2.ExecContext(ctx, `INSERT INTO test VALUES (2);`); err != nil {
+		t.Fatal(err)
 	}
+	if err := sqldb2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 3: Inserted new data (value=2) after restore")
 
-	// Sync should detect database is behind replica and create a snapshot
+	// Sync new data
 	if err := db2.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-
-	// Before the fix, this would skip replication because db TXID < replica TXID
-	// After the fix, this should create a snapshot and reset replica position
 	if err := db2.Replica.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
+	if err := db2.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 3 complete: New data synced")
 
-	// Verify replica position was reset to database position (this is the fix for #781)
-	newReplicaPos := db2.Replica.Pos()
-	if newReplicaPos.TXID != dbPos.TXID {
-		t.Fatalf("expected replica position to reset to %d, got %d", dbPos.TXID, newReplicaPos.TXID)
+	// Step 4: Simulate second hard recovery and restore again
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-wal"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-shm"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(db2.MetaPath()); err != nil {
+		t.Fatal(err)
 	}
 
-	t.Log("Test passed: Replica position reset when database behind replica")
+	// Restore again
+	if err := db2.Replica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 4 complete: Second restore from backup")
+
+	// Step 5: Verify the new data (value=2) exists in restored database
+	sqldb3 := testingutil.MustOpenSQLDB(t, dbPath)
+	defer sqldb3.Close()
+
+	var count int
+	if err := sqldb3.QueryRowContext(ctx, `SELECT COUNT(*) FROM test;`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have 2 rows (1 and 2)
+	if count != 2 {
+		t.Fatalf("expected 2 rows in restored database, got %d", count)
+	}
+
+	// Verify the new row (value=2) exists
+	var exists bool
+	if err := sqldb3.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM test WHERE col1 = 2);`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("new data (value=2) was not replicated - this is the bug in issue #781")
+	}
+
+	t.Log("Test passed: New data after restore was successfully replicated")
 }
 
 func TestReplica_CalcRestorePlan(t *testing.T) {

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
@@ -47,6 +48,10 @@ type Replica struct {
 	// Encryption identities and recipients
 	AgeIdentities []age.Identity
 	AgeRecipients []age.Recipient
+
+	// skipCalcPos is set when we've detected a restore scenario and want to
+	// force re-upload of local files even if remote position is ahead.
+	skipCalcPos bool
 }
 
 func NewReplica(db *DB) *Replica {
@@ -81,6 +86,14 @@ func (r *Replica) DB() *DB { return r.db }
 
 // Starts replicating in a background goroutine.
 func (r *Replica) Start(ctx context.Context) error {
+	// Check if database is behind replica and fix local L0 files if needed.
+	// This handles the case where a database has been restored to an earlier state.
+	// Do this check regardless of MonitorEnabled to handle synchronous replication tests.
+	if err := r.checkReplicaPosition(ctx); err != nil {
+		r.Logger().Error("failed to check replica position on startup", "error", err)
+		// Continue despite error to allow normal replication to proceed
+	}
+
 	// Ignore if replica is being used sychronously.
 	if !r.MonitorEnabled {
 		return nil
@@ -125,17 +138,26 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		if err != nil {
 			r.mu.Lock()
 			r.pos = ltx.Pos{}
+			r.skipCalcPos = false
 			r.mu.Unlock()
 		}
 	}()
 
-	// Calculate current replica position, if unknown.
-	if r.Pos().IsZero() {
+	// Calculate current replica position, if unknown and not skipped.
+	// We skip calcPos after a restore scenario to force re-upload of local files.
+	if r.Pos().IsZero() && !r.skipCalcPos {
 		pos, err := r.calcPos(ctx)
 		if err != nil {
 			return fmt.Errorf("calc pos: %w", err)
 		}
 		r.SetPos(pos)
+	}
+
+	// After using skipCalcPos once, reset it for future syncs
+	if r.skipCalcPos {
+		r.mu.Lock()
+		r.skipCalcPos = false
+		r.mu.Unlock()
 	}
 
 	// Find current position of database.
@@ -148,35 +170,114 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 
 	r.Logger().Debug("replica sync", "txid", dpos.TXID.String())
 
-	// If database TXID is less than replica TXID, this means the database
-	// has been restored and is behind the replica. We need to create a snapshot at
-	// the current database state and reset the replica position to continue from there.
-	// This fixes issue #781 where restored databases skip replication until they exceed
-	// the previous high-water mark.
-	if dpos.TXID < r.Pos().TXID && dpos.TXID > 0 {
-		r.Logger().Debug("database behind replica, creating snapshot to resynchronize",
-			"db_txid", dpos.TXID,
-			"replica_txid", r.Pos().TXID)
-
-		// Create a snapshot at the current database state
-		if _, err := r.db.Snapshot(ctx); err != nil {
-			return fmt.Errorf("snapshot after restore: %w", err)
-		}
-
-		// Reset replica position to match database position
-		r.SetPos(dpos)
-		r.Logger().Debug("replica position reset to database position", "txid", dpos.TXID)
-
-		// No need to replicate any L0 files since we just created a snapshot
-		return nil
-	}
-
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
+	}
+
+	return nil
+}
+
+// checkReplicaPosition checks if local L0 files are missing on startup.
+// If local L0 files don't exist but remote replica does, this indicates a restore
+// scenario where we need to clear any stale local files and reset the replica position.
+// This fixes issue #781 where restored databases skip replication.
+func (r *Replica) checkReplicaPosition(ctx context.Context) error {
+	// Check if local L0 directory exists and has files
+	hasLocalL0 := r.hasLocalL0Files()
+
+	// Get current replica position from remote.
+	rpos, err := r.calcPos(ctx)
+	if err != nil {
+		return fmt.Errorf("cannot determine replica position: %w", err)
+	} else if rpos.IsZero() {
+		return nil // No replica data yet, nothing to check
+	}
+
+	// If we have local L0 files, assume normal operation
+	if hasLocalL0 {
+		return nil
+	}
+
+	// No local L0 files but remote replica exists - this is a restore scenario
+	r.Logger().Info("detected restore scenario: no local L0 files but remote replica exists",
+		"replica_txid", rpos.TXID)
+
+	// Clear any stale local L0 files (shouldn't be any, but be safe)
+	if err := r.clearLocalL0Files(ctx); err != nil {
+		return fmt.Errorf("clear local L0 files: %w", err)
+	}
+
+	// Reset replica position to zero and set flag to skip calcPos on next sync.
+	// This forces re-upload of all local L0 files even though remote may already have them.
+	r.mu.Lock()
+	r.pos = ltx.Pos{}
+	r.skipCalcPos = true
+	r.mu.Unlock()
+	r.Logger().Info("replica position reset to allow fresh replication start")
+
+	return nil
+}
+
+// hasLocalL0Files checks if local L0 directory exists and contains any LTX files.
+func (r *Replica) hasLocalL0Files() bool {
+	dir := r.db.LTXLevelDir(0)
+
+	// If directory doesn't exist, no L0 files
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return false
+	}
+
+	// Check if any files are valid LTX files
+	for _, ent := range ents {
+		if ent.IsDir() {
+			continue
+		}
+		if _, _, err := ltx.ParseFilename(ent.Name()); err == nil {
+			return true // Found at least one valid LTX file
+		}
+	}
+
+	return false
+}
+
+// clearLocalL0Files removes all local L0 LTX files.
+func (r *Replica) clearLocalL0Files(ctx context.Context) error {
+	dir := r.db.LTXLevelDir(0)
+
+	// If directory doesn't exist, nothing to clear
+	if _, err := os.Stat(dir); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+
+	// Read all files in L0 directory
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	// Remove each LTX file
+	for _, ent := range ents {
+		if ent.IsDir() {
+			continue
+		}
+
+		// Parse filename to verify it's an LTX file
+		if _, _, err := ltx.ParseFilename(ent.Name()); err != nil {
+			continue // skip non-LTX files
+		}
+
+		path := filepath.Join(dir, ent.Name())
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("remove %s: %w", path, err)
+		}
+		r.Logger().Debug("removed local L0 file", "path", path)
 	}
 
 	return nil
