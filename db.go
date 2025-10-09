@@ -1381,7 +1381,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 
 	// If this is L1, clean up L0 files that are below the minTXID.
 	if dstLevel == 1 {
-		if err := db.EnforceRetentionByTXID(ctx, 0, maxTXID); err != nil {
+		if err := db.EnforceRetentionByTXID(ctx, 0, minTXID); err != nil {
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				db.Logger.Error("enforce L0 retention", "error", err)
