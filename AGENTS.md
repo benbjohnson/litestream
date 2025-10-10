@@ -841,3 +841,101 @@ For complex architectural questions, consult:
 - [ ] Use proper locking (Lock vs RLock)
 - [ ] Preserve timestamps where applicable
 - [ ] Test with race detector enabled
+
+## Agent-Specific Instructions
+
+This document serves as the universal source of truth for all AI coding assistants. Different agents may access it through various paths:
+- **Claude**: Reads `AGENTS.md` directly (also loads `CLAUDE.md` if present)
+- **GitHub Copilot**: Via `.github/copilot-instructions.md` symlink
+- **Cursor**: Via `.cursorrules` symlink
+- **Gemini**: Reads `AGENTS.md` and respects `.aiexclude` patterns
+- **Other agents**: Check for `AGENTS.md` or `llms.txt` in repository root
+
+### GitHub Copilot / OpenAI Codex
+
+**Context Window**: 64k tokens (upgrading to 1M with GPT-4.1)
+
+**Best Practices**:
+- Use `/explain` command for SQLite internals
+- Reference patterns in Common Pitfalls section
+- Switch to GPT-5-Codex model for complex refactoring
+- Focus on architectural boundaries and anti-patterns
+- Leverage workspace indexing for multi-file operations
+
+**Model Selection**:
+- Use GPT-4o for quick completions
+- Switch to GPT-5 or Claude Opus 4.1 for complex tasks
+
+### Cursor
+
+**Context Window**: Configurable based on model selection
+
+**Best Practices**:
+- Enable "codebase indexing" for full repository context
+- Use Claude 3.5 Sonnet for architectural questions
+- Use GPT-4o for quick inline completions
+- Split complex rules into `.cursor/rules/*.mdc` files if needed
+- Leverage workspace search before asking questions
+
+**Model Recommendations**:
+- **Architecture changes**: Claude 3.5 Sonnet
+- **Quick fixes**: GPT-4o or cursor-small
+- **Test generation**: Any model with codebase context
+
+### Claude / Claude Code
+
+**Context Window**: 200k tokens standard (1M in beta)
+
+**Best Practices**:
+- Full documentation can be loaded (5k lines fits easily)
+- Reference `docs/` subdirectory for deep technical details
+- Use structured note-taking for complex multi-step tasks
+- Leverage MCP tools when available
+- Check `CLAUDE.md` for project-specific configuration
+
+**Strengths**:
+- Deep architectural reasoning
+- Complex system analysis
+- Large context window utilization
+
+### Google Gemini / Gemini Code Assist
+
+**Context Window**: Varies by tier
+
+**Best Practices**:
+- Check `.aiexclude` for files to ignore
+- Enable local codebase awareness
+- Excellent for test generation and documentation
+- Use for code review and security scanning
+- Leverage code customization features
+
+**Configuration**:
+- Respects `.aiexclude` patterns (like `.gitignore`)
+- Can use custom AI rules files
+
+### General Multi-Agent Guidelines
+
+1. **Always start with this document** (AGENTS.md) for project understanding
+2. **Check `llms.txt`** for quick navigation to other documentation
+3. **Respect architectural boundaries** (DB layer vs Replica layer)
+4. **Follow the patterns** in Common Pitfalls section
+5. **Test with race detector** for any concurrent code changes
+6. **Preserve backward compatibility** with v0.5.0 constraints
+
+### Documentation Hierarchy
+
+```
+Tier 1 (Always read):
+- AGENTS.md (this file)
+- llms.txt (if you need navigation)
+
+Tier 2 (Read when relevant):
+- docs/SQLITE_INTERNALS.md (for WAL/page work)
+- docs/LTX_FORMAT.md (for replication work)
+- docs/ARCHITECTURE.md (for major changes)
+
+Tier 3 (Reference only):
+- docs/TESTING_GUIDE.md (for test scenarios)
+- docs/REPLICA_CLIENT_GUIDE.md (for new backends)
+- docs/V050_CHANGES.md (for migration context)
+```
