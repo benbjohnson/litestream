@@ -453,8 +453,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	// This must happen before replica.Start() to detect restore scenarios.
 	if db.Replica != nil {
 		if err := db.checkDatabaseBehindReplica(ctx); err != nil {
-			db.Logger.Error("failed to check database position vs replica", "error", err)
-			// Continue despite error to allow normal replication
+			return fmt.Errorf("check database behind replica: %w", err)
 		}
 	}
 
@@ -699,25 +698,35 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("open remote L0 file: %w", err)
 	}
-	defer func() {
-		if closer, ok := reader.(io.Closer); ok {
-			_ = closer.Close()
-		}
-	}()
+	defer func() { _ = reader.Close() }()
 
-	// Write to local L0 directory
+	// Write to temp file and atomically rename
 	localPath := db.LTXPath(0, minTXID, maxTXID)
-	localFile, err := os.Create(localPath)
-	if err != nil {
-		return fmt.Errorf("create local L0 file: %w", err)
-	}
-	defer func() { _ = localFile.Close() }()
+	tmpPath := localPath + ".tmp"
 
-	if _, err := io.Copy(localFile, reader); err != nil {
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp L0 file: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
+
+	if _, err := io.Copy(tmpFile, reader); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("copy L0 file: %w", err)
 	}
-	if err := localFile.Sync(); err != nil {
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
 		return fmt.Errorf("sync L0 file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close L0 file: %w", err)
+	}
+
+	// Atomically rename temp file to final path
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("rename L0 file: %w", err)
 	}
 
 	db.Logger.Info("fetched latest L0 file from replica",
