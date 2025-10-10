@@ -232,11 +232,11 @@ Many storage backends (S3, R2, etc.) are eventually consistent. This means:
 - A file might be listed but only partially available
 - Reads might return stale or incomplete data
 
-**Solution**: Always prefer local files during compaction (see PR #760).
+**Solution**: Always prefer local files during compaction.
 
 ## Architectural Boundaries and Patterns
 
-**CRITICAL**: Based on PR #783 feedback, understanding proper architectural boundaries is essential for successful contributions.
+**CRITICAL**: Understanding proper architectural boundaries is essential for successful contributions.
 
 ### Layer Responsibilities
 
@@ -427,7 +427,7 @@ func (db *DB) customSnapshot() error {
 
 ## Common Pitfalls
 
-### ❌ DON'T: Mix architectural concerns (PR #783)
+### ❌ DON'T: Mix architectural concerns
 
 ```go
 // WRONG - Database state logic in Replica layer
@@ -515,7 +515,7 @@ info := &ltx.FileInfo{
 }
 ```
 
-### ❌ DON'T: Write files without atomic operations (PR #783)
+### ❌ DON'T: Write files without atomic operations
 
 ```go
 // WRONG - Can leave partial files on failure
@@ -565,7 +565,7 @@ func (db *DB) processFiles() error {
 }
 ```
 
-### ❌ DON'T: Recreate existing functionality (PR #783)
+### ❌ DON'T: Recreate existing functionality
 
 ```go
 // WRONG - Don't reimplement what already exists
@@ -795,7 +795,7 @@ For complex architectural questions, consult:
 4. `docs/ARCHITECTURE.md` - Deep technical details of Litestream components
 5. `docs/REPLICA_CLIENT_GUIDE.md` - Storage backend implementation guide
 6. `docs/TESTING_GUIDE.md` - Comprehensive testing strategies
-7. Recent PRs, especially #760 (compaction fix), #748 (testing harness), and #783 (architectural boundaries)
+7. Review recent PRs for current patterns and best practices
 
 ## Future Roadmap
 
