@@ -93,8 +93,12 @@ func TestReplica_Sync(t *testing.T) {
 }
 
 // TestReplica_RestoreAndReplicateAfterDataLoss tests the scenario described in issue #781
-// where a restore does not preserve LTX ID information, causing replication to skip new writes
-// until the TXID exceeds the previous high-water mark.
+// where a database is restored to an earlier state (with lower TXID) but the replica has
+// a higher TXID, causing new writes to not be replicated.
+//
+// The fix detects this condition in DB.init() by comparing database position vs replica
+// position. When database is behind, it fetches the latest L0 file from the replica and
+// triggers a snapshot on the next sync.
 //
 // This test follows the reproduction steps from issue #781:
 // 1. Create DB and replicate data
