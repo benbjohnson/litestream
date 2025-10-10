@@ -8,6 +8,7 @@ This document provides comprehensive guidance for AI agents working with the Lit
 - [Fundamental Concepts](#fundamental-concepts)
 - [Core Architecture](#core-architecture)
 - [Critical Concepts](#critical-concepts)
+- [Architectural Boundaries and Patterns](#architectural-boundaries-and-patterns)
 - [Common Pitfalls](#common-pitfalls)
 - [Component Guide](#component-guide)
 - [Performance Considerations](#performance-considerations)
@@ -233,7 +234,231 @@ Many storage backends (S3, R2, etc.) are eventually consistent. This means:
 
 **Solution**: Always prefer local files during compaction (see PR #760).
 
+## Architectural Boundaries and Patterns
+
+**CRITICAL**: Based on PR #783 feedback, understanding proper architectural boundaries is essential for successful contributions.
+
+### Layer Responsibilities
+
+```mermaid
+graph TB
+    subgraph "DB Layer (db.go)"
+        DBInit[DB.init()]
+        DBPos[DB.pos tracking]
+        DBRestore[Database state validation]
+        DBSnapshot[Snapshot triggering via verify()]
+    end
+
+    subgraph "Replica Layer (replica.go)"
+        ReplicaStart[Replica.Start()]
+        ReplicaSync[Sync operations]
+        ReplicaPos[Replica.pos tracking]
+        ReplicaClient[Storage interaction]
+    end
+
+    subgraph "Storage Layer"
+        S3[S3/GCS/Azure]
+        LTXFiles[LTX Files]
+    end
+
+    DBInit -->|Initialize| ReplicaStart
+    DBInit -->|Check positions| DBPos
+    DBInit -->|Validate state| DBRestore
+    ReplicaStart -->|Focus on replication only| ReplicaSync
+    ReplicaSync -->|Upload/Download| ReplicaClient
+    ReplicaClient -->|Read/Write| S3
+    S3 -->|Store| LTXFiles
+```
+
+### ✅ DO: Handle database state in DB.init()
+
+```go
+// CORRECT - Database restoration logic belongs in DB layer
+func (db *DB) init() error {
+    // Check if database is behind replica
+    if db.pos < replica.pos {
+        // Clear local L0 files
+        if err := db.clearL0Files(); err != nil {
+            return fmt.Errorf("clear L0 files: %w", err)
+        }
+
+        // Fetch latest L0 LTX file from replica
+        ltxFile, err := replica.Client.OpenLTXFile(ctx, 0, replica.pos.MinTXID, replica.pos.MaxTXID, 0, 0)
+        if err != nil {
+            return fmt.Errorf("fetch latest L0 LTX: %w", err)
+        }
+        defer ltxFile.Close()
+
+        // Write to local L0 directory
+        if err := db.writeL0File(ltxFile); err != nil {
+            return fmt.Errorf("write L0 file: %w", err)
+        }
+    }
+
+    // Now start replica with clean state
+    return replica.Start()
+}
+```
+
+### ❌ DON'T: Put database state logic in Replica layer
+
+```go
+// WRONG - Replica should only handle replication concerns
+func (r *Replica) Start() error {
+    // DON'T check database state here
+    if needsRestore() {  // ❌ Wrong layer!
+        restoreDatabase()  // ❌ Wrong layer!
+    }
+    // Replica should focus only on replication mechanics
+}
+```
+
+### Atomic File Operations Pattern
+
+**CRITICAL**: Always use atomic writes to prevent partial/corrupted files.
+
+### ✅ DO: Write to temp file, then rename
+
+```go
+// CORRECT - Atomic file write pattern
+func writeFileAtomic(path string, data []byte) error {
+    // Create temp file in same directory (for atomic rename)
+    dir := filepath.Dir(path)
+    tmpFile, err := os.CreateTemp(dir, ".tmp-*")
+    if err != nil {
+        return fmt.Errorf("create temp file: %w", err)
+    }
+    tmpPath := tmpFile.Name()
+
+    // Clean up temp file on error
+    defer func() {
+        if tmpFile != nil {
+            tmpFile.Close()
+            os.Remove(tmpPath)
+        }
+    }()
+
+    // Write data to temp file
+    if _, err := tmpFile.Write(data); err != nil {
+        return fmt.Errorf("write temp file: %w", err)
+    }
+
+    // Sync to ensure data is on disk
+    if err := tmpFile.Sync(); err != nil {
+        return fmt.Errorf("sync temp file: %w", err)
+    }
+
+    // Close before rename
+    if err := tmpFile.Close(); err != nil {
+        return fmt.Errorf("close temp file: %w", err)
+    }
+    tmpFile = nil // Prevent defer cleanup
+
+    // Atomic rename (on same filesystem)
+    if err := os.Rename(tmpPath, path); err != nil {
+        os.Remove(tmpPath)
+        return fmt.Errorf("rename to final path: %w", err)
+    }
+
+    return nil
+}
+```
+
+### ❌ DON'T: Write directly to final location
+
+```go
+// WRONG - Can leave partial files on failure
+func writeFileDirect(path string, data []byte) error {
+    return os.WriteFile(path, data, 0644)  // ❌ Not atomic!
+}
+```
+
+### Error Handling Patterns
+
+### ✅ DO: Return errors immediately
+
+```go
+// CORRECT - Return error for caller to handle
+func (db *DB) validatePosition() error {
+    if db.pos < replica.pos {
+        return fmt.Errorf("database position (%v) behind replica (%v)", db.pos, replica.pos)
+    }
+    return nil
+}
+```
+
+### ❌ DON'T: Continue on critical errors
+
+```go
+// WRONG - Silently continuing can cause data corruption
+func (db *DB) validatePosition() {
+    if db.pos < replica.pos {
+        log.Printf("warning: position mismatch")  // ❌ Don't just log!
+        // Continuing here is dangerous
+    }
+}
+```
+
+### Leveraging Existing Mechanisms
+
+### ✅ DO: Use verify() for snapshot triggering
+
+```go
+// CORRECT - Leverage existing snapshot mechanism
+func (db *DB) ensureSnapshot() error {
+    // Use existing verify() which already handles snapshot logic
+    if err := db.verify(); err != nil {
+        return fmt.Errorf("verify for snapshot: %w", err)
+    }
+    // verify() will trigger snapshot if needed
+    return nil
+}
+```
+
+### ❌ DON'T: Reimplement existing functionality
+
+```go
+// WRONG - Don't recreate what already exists
+func (db *DB) customSnapshot() error {
+    // ❌ Don't write custom snapshot logic
+    // when verify() already does this correctly
+}
+```
+
 ## Common Pitfalls
+
+### ❌ DON'T: Mix architectural concerns (PR #783)
+
+```go
+// WRONG - Database state logic in Replica layer
+func (r *Replica) Start() error {
+    if db.needsRestore() {  // ❌ Wrong layer for DB state!
+        r.restoreDatabase()  // ❌ Replica shouldn't manage DB state!
+    }
+    return r.sync()
+}
+```
+
+### ✅ DO: Keep concerns in proper layers
+
+```go
+// CORRECT - Each layer handles its own concerns
+func (db *DB) init() error {
+    // DB layer handles database state
+    if db.needsRestore() {
+        if err := db.restore(); err != nil {
+            return err
+        }
+    }
+    // Then start replica for replication only
+    return db.replica.Start()
+}
+
+func (r *Replica) Start() error {
+    // Replica focuses only on replication
+    return r.startSync()
+}
+```
 
 ### ❌ DON'T: Read from remote during compaction
 
@@ -287,6 +512,75 @@ info := &ltx.FileInfo{
 // CORRECT - Preserve temporal information
 info := &ltx.FileInfo{
     CreatedAt: oldestSourceFile.CreatedAt, // Keep original
+}
+```
+
+### ❌ DON'T: Write files without atomic operations (PR #783)
+
+```go
+// WRONG - Can leave partial files on failure
+func saveLTXFile(path string, data []byte) error {
+    return os.WriteFile(path, data, 0644)  // ❌ Not atomic!
+}
+```
+
+### ✅ DO: Use atomic write pattern
+
+```go
+// CORRECT - Write to temp, then rename
+func saveLTXFileAtomic(path string, data []byte) error {
+    tmpPath := path + ".tmp"
+    if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+        return err
+    }
+    return os.Rename(tmpPath, path)  // Atomic on same filesystem
+}
+```
+
+### ❌ DON'T: Ignore errors and continue
+
+```go
+// WRONG - Continuing after error can corrupt state
+func (db *DB) processFiles() {
+    for _, file := range files {
+        if err := processFile(file); err != nil {
+            log.Printf("error: %v", err)  // ❌ Just logging!
+            // Continuing to next file is dangerous
+        }
+    }
+}
+```
+
+### ✅ DO: Return errors for proper handling
+
+```go
+// CORRECT - Let caller decide how to handle errors
+func (db *DB) processFiles() error {
+    for _, file := range files {
+        if err := processFile(file); err != nil {
+            return fmt.Errorf("process file %s: %w", file, err)
+        }
+    }
+    return nil
+}
+```
+
+### ❌ DON'T: Recreate existing functionality (PR #783)
+
+```go
+// WRONG - Don't reimplement what already exists
+func customSnapshotTrigger() {
+    // Complex custom logic to trigger snapshots
+    // when db.verify() already does this!
+}
+```
+
+### ✅ DO: Leverage existing mechanisms
+
+```go
+// CORRECT - Use what's already there
+func triggerSnapshot() error {
+    return db.verify()  // Already handles snapshot logic correctly
 }
 ```
 
@@ -501,7 +795,7 @@ For complex architectural questions, consult:
 4. `docs/ARCHITECTURE.md` - Deep technical details of Litestream components
 5. `docs/REPLICA_CLIENT_GUIDE.md` - Storage backend implementation guide
 6. `docs/TESTING_GUIDE.md` - Comprehensive testing strategies
-7. Recent PRs, especially #760 (compaction fix) and #748 (testing harness)
+7. Recent PRs, especially #760 (compaction fix), #748 (testing harness), and #783 (architectural boundaries)
 
 ## Future Roadmap
 
@@ -536,8 +830,12 @@ For complex architectural questions, consult:
 - [ ] Read `docs/LTX_FORMAT.md` for replication format details
 - [ ] Understand v0.5.0 changes and limitations
 - [ ] Understand the component you're modifying
+- [ ] Understand architectural boundaries (DB vs Replica responsibilities)
 - [ ] Check for eventual consistency implications
 - [ ] Consider >1GB database edge cases (lock page at 0x40000000)
+- [ ] Use atomic file operations (temp file + rename)
+- [ ] Return errors properly (don't just log and continue)
+- [ ] Leverage existing mechanisms (e.g., verify() for snapshots)
 - [ ] Plan appropriate tests
 - [ ] Review recent similar PRs for patterns
 - [ ] Use proper locking (Lock vs RLock)
