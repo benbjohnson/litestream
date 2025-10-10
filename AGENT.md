@@ -1,0 +1,545 @@
+# AGENT.md - Litestream AI Agent Documentation
+
+This document provides comprehensive guidance for AI agents working with the Litestream codebase. Read this document carefully before making any modifications.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Fundamental Concepts](#fundamental-concepts)
+- [Core Architecture](#core-architecture)
+- [Critical Concepts](#critical-concepts)
+- [Common Pitfalls](#common-pitfalls)
+- [Component Guide](#component-guide)
+- [Performance Considerations](#performance-considerations)
+- [Testing Requirements](#testing-requirements)
+
+## Overview
+
+Litestream is a **disaster recovery tool for SQLite** that runs as a background process and safely replicates changes incrementally to various storage backends. It monitors SQLite's Write-Ahead Log (WAL), converts changes to an immutable LTX format, and replicates these to configured destinations.
+
+**Version 0.5.0 Major Changes:**
+- **New LTX Format**: Replaced WAL segment replication with page-level LTX format
+- **Multi-level Compaction**: Hierarchical compaction strategy for efficient storage
+- **Single Replica Constraint**: Each database now limited to one replica destination
+- **No CGO Required**: Switched to `modernc.org/sqlite` (pure Go implementation)
+- **NATS JetStream Support**: Added as new replica type
+- **Breaking Change**: Cannot restore from v0.3.x backups
+
+**Key Design Principles:**
+- **Non-invasive**: Uses only SQLite API, never directly manipulates database files
+- **Incremental**: Replicates only changes, not full databases
+- **Single-destination** (v0.5.0+): One replica destination per database
+- **Eventually Consistent**: Handles storage backends with eventual consistency
+- **Safe**: Maintains long-running read transactions for consistency
+
+## Fundamental Concepts
+
+**CRITICAL**: Understanding SQLite internals and the LTX format is essential for working with Litestream.
+
+### Required Reading
+
+1. **[SQLite Internals](docs/SQLITE_INTERNALS.md)** - Understand WAL, pages, transactions, and the 1GB lock page
+2. **[LTX Format](docs/LTX_FORMAT.md)** - Learn the custom replication format Litestream uses
+
+### Key SQLite Concepts
+
+- **WAL (Write-Ahead Log)**: Temporary file containing uncommitted changes
+- **Pages**: Fixed-size blocks (typically 4KB) that make up the database
+- **Lock Page at 1GB**: Special page at 0x40000000 that MUST be skipped
+- **Checkpoints**: Process of merging WAL back into main database
+- **Transaction Isolation**: Long-running read transaction for consistency
+
+### Key LTX Concepts
+
+- **Immutable Files**: Once written, LTX files are never modified
+- **TXID Ranges**: Each file covers a range of transaction IDs
+- **Page Index**: Binary search tree for efficient page lookup
+- **Compaction Levels**: Time-based merging to reduce storage (30s → 5min → 1hr)
+- **Checksums**: CRC-64 integrity verification at multiple levels
+- **CLI Command**: Use `litestream ltx` (not `wal`) for LTX operations
+
+### The Replication Flow
+
+```mermaid
+graph LR
+    App[Application] -->|SQL| SQLite
+    SQLite -->|Writes| WAL[WAL File]
+    WAL -->|Monitor| Litestream
+    Litestream -->|Convert| LTX[LTX Format]
+    LTX -->|Upload| Storage[Cloud Storage]
+    Storage -->|Restore| Database[New Database]
+```
+
+## Core Architecture
+
+```mermaid
+graph TB
+    subgraph "SQLite Layer"
+        SQLite[SQLite Database]
+        WAL[WAL File]
+        SQLite -->|Writes| WAL
+    end
+
+    subgraph "Litestream Core"
+        DB[DB Component<br/>db.go]
+        Replica[Replica Manager<br/>replica.go]
+        Store[Store<br/>store.go]
+
+        DB -->|Manages| Replica
+        Store -->|Coordinates| DB
+    end
+
+    subgraph "Storage Layer"
+        RC[ReplicaClient Interface<br/>replica_client.go]
+        S3[S3 Client]
+        GCS[GCS Client]
+        File[File Client]
+        SFTP[SFTP Client]
+
+        Replica -->|Uses| RC
+        RC -->|Implements| S3
+        RC -->|Implements| GCS
+        RC -->|Implements| File
+        RC -->|Implements| SFTP
+    end
+
+    WAL -->|Monitor Changes| DB
+    DB -->|Checkpoint| SQLite
+```
+
+### Data Flow Sequence
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant SQLite
+    participant WAL
+    participant DB
+    participant Replica
+    participant Storage
+
+    App->>SQLite: Write Transaction
+    SQLite->>WAL: Append Changes
+
+    loop Monitor (1s interval)
+        DB->>WAL: Check Size/Changes
+        WAL-->>DB: Current State
+
+        alt WAL Has Changes
+            DB->>WAL: Read Pages
+            DB->>DB: Convert to LTX Format
+            DB->>Replica: Queue LTX File
+
+            loop Sync (configurable interval)
+                Replica->>Storage: WriteLTXFile()
+                Storage-->>Replica: FileInfo
+                Replica->>Replica: Update Position
+            end
+        end
+    end
+
+    alt Checkpoint Needed
+        DB->>SQLite: PRAGMA wal_checkpoint
+        SQLite->>WAL: Merge to Main DB
+    end
+```
+
+## Critical Concepts
+
+### 1. SQLite Lock Page at 1GB Boundary ⚠️
+
+**CRITICAL**: SQLite reserves a special lock page at exactly 1GB (0x40000000 bytes).
+
+```go
+// db.go:951-953 - Must skip lock page during replication
+lockPgno := ltx.LockPgno(pageSize)  // Page number varies by page size
+if pgno == lockPgno {
+    continue // Skip this page - it's reserved by SQLite
+}
+```
+
+**Lock Page Numbers by Page Size:**
+- 4KB pages: 262145 (most common)
+- 8KB pages: 131073
+- 16KB pages: 65537
+- 32KB pages: 32769
+
+**Testing Requirement**: Any changes affecting page iteration MUST be tested with >1GB databases.
+
+### 2. LTX File Format
+
+LTX (Log Transaction) files are **immutable**, append-only files containing:
+- Header with transaction IDs (MinTXID, MaxTXID)
+- Page data with checksums
+- Page index for efficient seeking
+- Trailer with metadata
+
+**Important**: LTX files are NOT SQLite WAL files - they're a custom format for efficient replication.
+
+### 3. Compaction Process
+
+Compaction merges multiple LTX files to reduce storage overhead:
+
+```mermaid
+flowchart LR
+    subgraph "Level 0 (Raw)"
+        L0A[0000000001-0000000100.ltx]
+        L0B[0000000101-0000000200.ltx]
+        L0C[0000000201-0000000300.ltx]
+    end
+
+    subgraph "Level 1 (30 seconds)"
+        L1[0000000001-0000000300.ltx]
+    end
+
+    subgraph "Level 2 (5 minutes)"
+        L2[0000000001-0000001000.ltx]
+    end
+
+    subgraph "Level 3 (1 hour)"
+        L3[0000000001-0000002000.ltx]
+    end
+
+    subgraph "Snapshot (24h)"
+        Snap[snapshot.ltx]
+    end
+
+    L0A -->|Merge| L1
+    L0B -->|Merge| L1
+    L0C -->|Merge| L1
+    L1 -->|30s window| L2
+    L2 -->|5min window| L3
+    L3 -->|Hourly| Snap
+```
+
+**Critical Compaction Rule**: When compacting with eventually consistent storage:
+```go
+// db.go:1280-1294 - ALWAYS read from local disk when available
+f, err := os.Open(db.LTXPath(info.Level, info.MinTXID, info.MaxTXID))
+if err == nil {
+    // Use local file - it's complete and consistent
+    return f, nil
+}
+// Only fall back to remote if local doesn't exist
+return replica.Client.OpenLTXFile(...)
+```
+
+### 4. Eventual Consistency Handling
+
+Many storage backends (S3, R2, etc.) are eventually consistent. This means:
+- A file you just wrote might not be immediately readable
+- A file might be listed but only partially available
+- Reads might return stale or incomplete data
+
+**Solution**: Always prefer local files during compaction (see PR #760).
+
+## Common Pitfalls
+
+### ❌ DON'T: Read from remote during compaction
+
+```go
+// WRONG - Can get partial/corrupt data
+f, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
+```
+
+### ✅ DO: Read from local when available
+
+```go
+// CORRECT - Check local first
+if f, err := os.Open(localPath); err == nil {
+    defer f.Close()
+    // Use local file
+} else {
+    // Fall back to remote only if necessary
+}
+```
+
+### ❌ DON'T: Use RLock for write operations
+
+```go
+// WRONG - Race condition in replica.go:217
+r.mu.RLock()  // Should be Lock() for writes
+defer r.mu.RUnlock()
+r.pos = pos   // Writing with RLock!
+```
+
+### ✅ DO: Use proper lock types
+
+```go
+// CORRECT
+r.mu.Lock()
+defer r.mu.Unlock()
+r.pos = pos
+```
+
+### ❌ DON'T: Ignore CreatedAt preservation
+
+```go
+// WRONG - Loses timestamp granularity
+info := &ltx.FileInfo{
+    CreatedAt: time.Now(), // Don't use current time
+}
+```
+
+### ✅ DO: Preserve earliest timestamp
+
+```go
+// CORRECT - Preserve temporal information
+info := &ltx.FileInfo{
+    CreatedAt: oldestSourceFile.CreatedAt, // Keep original
+}
+```
+
+## Component Guide
+
+### DB Component (db.go)
+
+**Responsibilities:**
+- Manages SQLite database connection (via `modernc.org/sqlite` - no CGO)
+- Monitors WAL for changes
+- Performs checkpoints
+- Maintains long-running read transaction
+- Converts WAL pages to LTX format
+
+**Key Fields:**
+```go
+type DB struct {
+    path     string      // Database file path
+    db       *sql.DB     // SQLite connection
+    rtx      *sql.Tx     // Long-running read transaction
+    pageSize int         // Database page size (critical for lock page)
+    notify   chan struct{} // Notifies on WAL changes
+}
+```
+
+**Initialization Sequence:**
+1. Open database connection
+2. Read page size from database
+3. Initialize long-running read transaction
+4. Start monitor goroutine
+5. Initialize replicas
+
+### Replica Component (replica.go)
+
+**Responsibilities:**
+- Manages replication to a single destination (v0.5.0: one replica per DB only)
+- Tracks replication position (ltx.Pos)
+- Handles sync intervals
+- Manages encryption (if configured)
+
+**Key Operations:**
+- `Sync()`: Synchronizes pending changes
+- `SetPos()`: Updates replication position (must use Lock, not RLock!)
+- `Snapshot()`: Creates full database snapshot
+
+### ReplicaClient Interface (replica_client.go)
+
+**Required Methods:**
+```go
+type ReplicaClient interface {
+    Type() string  // Client type identifier
+
+    // File operations
+    LTXFiles(ctx, level, seek) (FileIterator, error)
+    OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size) (io.ReadCloser, error)
+    WriteLTXFile(ctx, level, minTXID, maxTXID, r) (*FileInfo, error)
+    DeleteLTXFiles(ctx, files) error
+}
+```
+
+**Implementation Requirements:**
+- Handle partial reads gracefully
+- Implement proper error types (os.ErrNotExist)
+- Support seek/offset for efficient page fetching
+- Preserve file timestamps (CreatedAt)
+
+### Store Component (store.go)
+
+**Responsibilities:**
+- Coordinates multiple databases
+- Manages compaction schedules
+- Controls resource usage
+- Handles retention policies
+
+**Compaction Levels (v0.5.0):**
+```go
+var defaultLevels = CompactionLevels{
+    {Level: 0, Interval: 0},               // Raw LTX files (no compaction)
+    {Level: 1, Interval: 30*Second},        // 30-second windows
+    {Level: 2, Interval: 5*Minute},         // 5-minute windows
+    {Level: 3, Interval: 1*Hour},           // Hourly windows
+    // Snapshots created daily (24h retention)
+}
+```
+
+## Performance Considerations
+
+### O(n) Operations to Watch
+
+1. **Page Iteration**: Linear scan through all pages
+   - Cache page index when possible
+   - Use binary search on sorted page lists
+
+2. **File Listing**: Directory scans can be expensive
+   - Cache file listings when unchanged
+   - Use seek parameter to skip old files
+
+3. **Compaction**: Reads all input files
+   - Limit concurrent compactions
+   - Use appropriate level intervals
+
+### Caching Strategy
+
+```go
+// Page index caching example
+const DefaultEstimatedPageIndexSize = 32 * 1024 // 32KB
+
+// Fetch end of file first for page index
+offset := info.Size - DefaultEstimatedPageIndexSize
+if offset < 0 {
+    offset = 0
+}
+// Read page index once, cache for duration of operation
+```
+
+### Batch Operations
+
+- Group small writes into larger LTX files
+- Batch delete operations for old files
+- Use prepared statements for repeated queries
+
+## Testing Requirements
+
+### For Any DB Changes
+
+```bash
+# Test with various page sizes
+./bin/litestream-test populate -db test.db -page-size 4096 -target-size 2GB
+./bin/litestream-test populate -db test.db -page-size 8192 -target-size 2GB
+
+# Test lock page handling
+./bin/litestream-test validate -source-db test.db -replica-url file:///tmp/replica
+```
+
+### For Replica Client Changes
+
+```bash
+# Test eventual consistency
+go test -v ./replica_client_test.go -integration [s3|gcs|abs|sftp]
+
+# Test partial reads
+go test -v -run TestReplicaClient_PartialRead ./...
+```
+
+### For Compaction Changes
+
+```bash
+# Test with store compaction
+go test -v -run TestStore_CompactDB ./...
+
+# Test with eventual consistency mock
+go test -v -run TestStore_CompactDB_RemotePartialRead ./...
+```
+
+### Race Condition Testing
+
+```bash
+# Always run with race detector
+go test -race -v ./...
+
+# Specific race-prone areas
+go test -race -v -run TestReplica_SetPos ./...
+go test -race -v -run TestDB_Monitor ./...
+```
+
+## Quick Reference
+
+### File Paths
+
+- **Database**: `/path/to/database.db`
+- **Metadata**: `/path/to/database.db-litestream/`
+- **LTX Files**: `/path/to/database.db-litestream/ltx/LEVEL/MIN-MAX.ltx`
+- **Snapshots**: `/path/to/database.db-litestream/snapshots/TIMESTAMP.ltx`
+
+### Key Configuration
+
+```yaml
+dbs:
+  - path: /path/to/db.sqlite
+    replicas:
+      - type: s3
+        bucket: my-bucket
+        path: db-backup
+        sync-interval: 10s  # How often to sync
+
+# Compaction configuration (v0.5.0 defaults)
+levels:
+  - level: 1
+    interval: 30s    # 30-second windows
+  - level: 2
+    interval: 5m     # 5-minute windows
+  - level: 3
+    interval: 1h     # 1-hour windows
+```
+
+### Important Constants
+
+```go
+DefaultMonitorInterval    = 1 * time.Second   // WAL check frequency
+DefaultCheckpointInterval = 1 * time.Minute   // Checkpoint frequency
+DefaultMinCheckpointPageN = 1000              // Min pages before passive checkpoint
+DefaultMaxCheckpointPageN = 10000             // Max pages before forced checkpoint
+DefaultTruncatePageN      = 500000            // Pages before truncation
+```
+
+## Getting Help
+
+For complex architectural questions, consult:
+1. **`docs/V050_CHANGES.md`** - v0.5.0 breaking changes and migration guide
+2. **`docs/SQLITE_INTERNALS.md`** - SQLite fundamentals, WAL format, lock page details
+3. **`docs/LTX_FORMAT.md`** - LTX file format specification and operations
+4. `docs/ARCHITECTURE.md` - Deep technical details of Litestream components
+5. `docs/REPLICA_CLIENT_GUIDE.md` - Storage backend implementation guide
+6. `docs/TESTING_GUIDE.md` - Comprehensive testing strategies
+7. Recent PRs, especially #760 (compaction fix) and #748 (testing harness)
+
+## Future Roadmap
+
+**Planned Features:**
+- **Litestream VFS**: Virtual File System for read replicas
+  - Instantly spin up database copies
+  - Background hydration from S3
+  - Enables scaling read operations without full database downloads
+- **Enhanced read replica support**: Direct reads from remote storage
+
+## Important v0.5.0 Migration Notes
+
+1. **Breaking Changes:**
+   - Cannot restore from v0.3.x WAL segment files
+   - Single replica destination per database (removed multi-replica support)
+   - Command renamed: `litestream wal` → `litestream ltx`
+   - Removed "generations" concept for backup tracking
+
+2. **Build Changes:**
+   - CGO no longer required (uses `modernc.org/sqlite`)
+   - Pure Go implementation enables easier cross-compilation
+
+3. **New Features:**
+   - NATS JetStream replica type added
+   - Page-level compaction for better efficiency
+   - Point-in-time restoration with minimal files
+
+## Final Checklist Before Making Changes
+
+- [ ] Read this entire document
+- [ ] Read `docs/SQLITE_INTERNALS.md` for SQLite fundamentals
+- [ ] Read `docs/LTX_FORMAT.md` for replication format details
+- [ ] Understand v0.5.0 changes and limitations
+- [ ] Understand the component you're modifying
+- [ ] Check for eventual consistency implications
+- [ ] Consider >1GB database edge cases (lock page at 0x40000000)
+- [ ] Plan appropriate tests
+- [ ] Review recent similar PRs for patterns
+- [ ] Use proper locking (Lock vs RLock)
+- [ ] Preserve timestamps where applicable
+- [ ] Test with race detector enabled
