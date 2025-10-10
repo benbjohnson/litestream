@@ -449,6 +449,14 @@ func (db *DB) init(ctx context.Context) (err error) {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
+	// Check if database is behind replica (issue #781).
+	// This must happen before replica.Start() to detect restore scenarios.
+	if db.Replica != nil {
+		if err := db.checkDatabaseBehindReplica(ctx); err != nil {
+			return fmt.Errorf("check database behind replica: %w", err)
+		}
+	}
+
 	// If we have an existing replication files, ensure the headers match.
 	// if err := db.verifyHeadersMatch(); err != nil {
 	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
@@ -643,6 +651,89 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	// Otherwise create transaction that updates the internal litestream table.
 	_, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
 	return err
+}
+
+// checkDatabaseBehindReplica detects when a database has been restored to an
+// earlier state and the replica has a higher TXID. This handles issue #781.
+//
+// If detected, it clears local L0 files and fetches the latest L0 LTX file
+// from the replica to establish a baseline. The next DB.sync() will detect
+// the mismatch and trigger a snapshot at the current database state.
+func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
+	// Get database position from local L0 files
+	dbPos, err := db.Pos()
+	if err != nil {
+		return fmt.Errorf("get database position: %w", err)
+	}
+
+	// Get replica position from remote
+	replicaInfo, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("get replica position: %w", err)
+	} else if replicaInfo.MaxTXID == 0 {
+		return nil // No remote replica data yet
+	}
+
+	// Check if database is behind replica
+	if dbPos.TXID >= replicaInfo.MaxTXID {
+		return nil // Database is ahead or equal
+	}
+
+	db.Logger.Info("detected database behind replica",
+		"db_txid", dbPos.TXID,
+		"replica_txid", replicaInfo.MaxTXID)
+
+	// Clear local L0 files
+	l0Dir := db.LTXLevelDir(0)
+	if err := os.RemoveAll(l0Dir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove L0 directory: %w", err)
+	}
+	if err := internal.MkdirAll(l0Dir, db.dirInfo); err != nil {
+		return fmt.Errorf("recreate L0 directory: %w", err)
+	}
+
+	// Fetch latest L0 LTX file from replica
+	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
+	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open remote L0 file: %w", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	// Write to temp file and atomically rename
+	localPath := db.LTXPath(0, minTXID, maxTXID)
+	tmpPath := localPath + ".tmp"
+
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp L0 file: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
+
+	if _, err := io.Copy(tmpFile, reader); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("copy L0 file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync L0 file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close L0 file: %w", err)
+	}
+
+	// Atomically rename temp file to final path
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("rename L0 file: %w", err)
+	}
+
+	db.Logger.Info("fetched latest L0 file from replica",
+		"min_txid", minTXID,
+		"max_txid", maxTXID)
+
+	return nil
 }
 
 // verify ensures the current LTX state matches where it left off from
