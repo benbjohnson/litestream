@@ -415,8 +415,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
-	} else if len(infos) == 0 {
-		return fmt.Errorf("no matching backup files available")
 	}
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
