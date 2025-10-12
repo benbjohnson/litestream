@@ -64,48 +64,46 @@ The LTX header contains metadata about the file:
 ```go
 // From github.com/superfly/ltx
 type Header struct {
-    // Magic bytes: "LTX\x00" (0x4C545800)
-    Magic    [4]byte
-
-    // Format version (current: 0)
-    Version  uint32
-
-    // Flags for special behaviors
-    Flags    uint32
-
-    // Database page size (typically 4096)
-    PageSize uint32
-
-    // Database page count at snapshot
-    PageCount uint32
-
-    // Transaction ID range
-    MinTXID  TXID  // uint64
-    MaxTXID  TXID  // uint64
-
-    // Checksum of header
-    Checksum uint64
+    Version          int      // Derived from the magic string ("LTX1")
+    Flags            uint32   // Reserved flag bits
+    PageSize         uint32   // Database page size
+    Commit           uint32   // Page count after applying file
+    MinTXID          TXID
+    MaxTXID          TXID
+    Timestamp        int64    // Milliseconds since Unix epoch
+    PreApplyChecksum Checksum // Database checksum before apply
+    WALOffset        int64    // Offset within source WAL (0 for snapshots)
+    WALSize          int64    // WAL byte length (0 for snapshots)
+    WALSalt1         uint32
+    WALSalt2         uint32
+    NodeID           uint64
 }
 
-// Header flags
-const (
-    HeaderFlagNoChecksum = 1 << 0  // Disable checksums
-)
+const HeaderFlagNoChecksum = uint32(1 << 1)
 ```
+
+> Note: the version is implied by the magic string. Present files use
+> `Magic == "LTX1"`, which corresponds to `ltx.Version == 2`.
 
 ### Binary Layout (Header)
 
 ```
 Offset  Size  Field
-0       4     Magic ("LTX\x00")
-4       4     Version
-8       4     Flags
-12      4     PageSize
-16      4     PageCount
-20      8     MinTXID
-28      8     MaxTXID
-36      8     Checksum
-Total: 44 bytes
+0       4     Magic ("LTX1")
+4       4     Flags
+8       4     PageSize
+12      4     Commit
+16      8     MinTXID
+24      8     MaxTXID
+32      8     Timestamp
+40      8     PreApplyChecksum
+48      8     WALOffset
+56      8     WALSize
+64      4     WALSalt1
+68      4     WALSalt2
+72      8     NodeID
+80     20     Reserved (zeros)
+Total: 100 bytes
 ```
 
 ## Page Frames
@@ -119,8 +117,7 @@ type PageFrame struct {
 }
 
 type PageHeader struct {
-    PageNo   uint32  // Page number in database (1-based)
-    Checksum uint64  // CRC-64 checksum of page data
+    Pgno uint32  // Database page number (1-based)
 }
 ```
 
@@ -128,9 +125,8 @@ type PageHeader struct {
 
 ```
 Offset  Size     Field
-0       4        Page Number
-4       8        Checksum
-12      PageSize Page Data
+0       4        Page Number (Pgno)
+4       PageSize Page Data
 ```
 
 ### Page Frame Constraints
@@ -146,24 +142,19 @@ The page index enables efficient random access to pages:
 
 ```go
 type PageIndexElem struct {
-    PageNo uint32  // Database page number
-    Offset int64   // Byte offset in LTX file
+    Level   int
+    MinTXID TXID
+    MaxTXID TXID
+    Offset  int64 // Byte offset of encoded payload
+    Size    int64 // Bytes occupied by encoded payload
 }
-
-// Index is sorted by PageNo for binary search
-type PageIndex []PageIndexElem
 ```
 
 ### Binary Layout (Page Index)
 
 ```
-Each entry (16 bytes):
-Offset  Size  Field
-0       4     Page Number
-4       4     Reserved (padding)
-8       8     File Offset
-
-Total index size = EntryCount * 16
+Rather than parsing raw bytes, call `ltx.DecodePageIndex` which returns a
+map of page number to `ltx.PageIndexElem` for you.
 ```
 
 ### Index Usage
@@ -189,14 +180,8 @@ The trailer contains metadata and pointers:
 
 ```go
 type Trailer struct {
-    // Offset to start of page index
-    PageIndexOffset int64
-
-    // Size of page index in bytes
-    PageIndexSize int64
-
-    // Total checksum of all pages
-    Checksum uint64
+    PostApplyChecksum Checksum // Database checksum after apply
+    FileChecksum      Checksum // CRC-64 checksum of entire file
 }
 ```
 
@@ -204,10 +189,9 @@ type Trailer struct {
 
 ```
 Offset  Size  Field
-0       8     Page Index Offset
-8       8     Page Index Size
-16      8     Checksum
-Total: 24 bytes
+0       8     PostApplyChecksum
+8       8     FileChecksum
+Total: 16 bytes
 ```
 
 ### Reading Trailer
@@ -646,42 +630,42 @@ func readWithRetry(client ReplicaClient, info *FileInfo) ([]byte, error) {
 
 ## Debugging LTX Files
 
-### Inspect LTX File
+### Inspect LTX Files
+
+The Litestream CLI currently exposes a single helper for listing LTX files:
 
 ```bash
-# Using litestream CLI
-litestream ltx info file.ltx
-
-# Output:
-# Version: 0
-# Page Size: 4096
-# Page Count: 1234
-# Min TXID: 1
-# Max TXID: 100
-# File Size: 5.2MB
+litestream ltx /path/to/db.sqlite
+litestream ltx s3://bucket/db
 ```
 
-### Dump Pages
+For low-level inspection (page payloads, checksums, etc.), use the Go API:
 
-```bash
-# List all pages in file
-litestream ltx pages file.ltx
+```go
+f, err := os.Open("0000000000000001-0000000000000064.ltx")
+if err != nil {
+    log.Fatal(err)
+}
+defer f.Close()
 
-# Dump specific page
-litestream ltx page file.ltx 42
-```
-
-### Verify Integrity
-
-```bash
-# Check all checksums
-litestream ltx verify file.ltx
-
-# Output:
-# Header checksum: OK
-# Page checksums: OK (1234/1234)
-# Trailer checksum: OK
-# File integrity: VALID
+dec := ltx.NewDecoder(f)
+if err := dec.DecodeHeader(); err != nil {
+    log.Fatal(err)
+}
+for {
+    var hdr ltx.PageHeader
+    data := make([]byte, dec.Header().PageSize)
+    if err := dec.DecodePage(&hdr, data); err == io.EOF {
+        break
+    } else if err != nil {
+        log.Fatal(err)
+    }
+    // Inspect hdr.Pgno or data here.
+}
+if err := dec.Close(); err != nil {
+    log.Fatal(err)
+}
+fmt.Println("post-apply checksum:", dec.Trailer().PostApplyChecksum)
 ```
 
 ## Summary

@@ -9,56 +9,80 @@ INSERT INTO table VALUES (...);
 -- SQLite appends to WAL file
 ```
 
-2. **DB.monitor() detects changes** (db.go:1499):
+2. **DB.monitor() syncs the shadow WAL** (db.go:1499):
 ```go
-ticker := time.NewTicker(db.MonitorInterval) // Every 1s
-changed, err := db.checkWAL()
-if changed {
-    db.notifyReplicas() // Signal replicas
+ticker := time.NewTicker(db.MonitorInterval) // default 1s
+for {
+    select {
+    case <-db.ctx.Done():
+        return
+    case <-ticker.C:
+    }
+
+    if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+        db.Logger.Error("sync error", "error", err)
+    }
 }
 ```
 
 3. **Replica.monitor() responds** (replica.go):
 ```go
-select {
-case <-db.notify:
-    // WAL changed, time to sync
-case <-ticker.C:
-    // Regular sync interval
+ticker := time.NewTicker(r.SyncInterval)
+defer ticker.Stop()
+
+notify := r.db.Notify()
+for {
+    select {
+    case <-ctx.Done():
+        return
+    case <-ticker.C:
+        // Enforce minimum sync interval
+    case <-notify:
+        // WAL changed, time to sync
+    }
+
+    notify = r.db.Notify()
+
+    if err := r.Sync(ctx); err != nil && !errors.Is(err, context.Canceled) {
+        r.Logger().Error("monitor error", "error", err)
+    }
 }
 ```
 
-4. **Replica.Sync() processes changes**:
+4. **Replica.Sync() uploads new L0 files** (replica.go):
 ```go
-// Read WAL pages since last position
-reader := db.WALReader(r.pos.PageNo)
+// Determine local database position
+dpos, err := r.db.Pos()
+if err != nil {
+    return err
+}
+if dpos.IsZero() {
+    return fmt.Errorf("no position, waiting for data")
+}
 
-// Convert to LTX format
-ltxData := convertWALToLTX(reader)
-
-// Write to storage backend
-info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, ltxData)
-
-// Update position
-r.SetPos(newPos)
+// Upload each unreplicated L0 file
+for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+    if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+        return err
+    }
+    r.SetPos(ltx.Pos{TXID: txID})
+}
 ```
 
 5. **ReplicaClient uploads to storage**:
 ```go
-// Backend-specific upload
-func (c *S3Client) WriteLTXFile(...) (*ltx.FileInfo, error) {
-    // Upload to S3
-    // Return file metadata
+func (c *S3Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+    // Stream LTX data to storage and return metadata (size, CreatedAt, checksums)
 }
 ```
 
-6. **Checkpoint when threshold reached**:
+6. **Checkpoint when thresholds are hit**:
 ```go
 if walPageCount > db.MinCheckpointPageN {
-    db.Checkpoint("PASSIVE") // Try checkpoint
+    db.Checkpoint(ctx, litestream.CheckpointModePassive)
 }
 if walPageCount > db.MaxCheckpointPageN {
-    db.Checkpoint("RESTART") // Force checkpoint
+    db.Checkpoint(ctx, litestream.CheckpointModeRestart)
 }
 ```
 
@@ -75,7 +99,7 @@ slog.SetLogLevel(slog.LevelDebug)
 
 // Key log points:
 slog.Debug("wal changed", "size", walSize)
-slog.Debug("syncing replica", "pos", r.pos)
+slog.Debug("syncing replica", "pos", r.Pos())
 slog.Debug("ltx uploaded", "txid", maxTXID)
 slog.Debug("checkpoint complete", "mode", mode)
 ```

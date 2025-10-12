@@ -18,18 +18,18 @@ This document provides comprehensive guidance for AI agents working with the Lit
 
 Litestream is a **disaster recovery tool for SQLite** that runs as a background process and safely replicates changes incrementally to various storage backends. It monitors SQLite's Write-Ahead Log (WAL), converts changes to an immutable LTX format, and replicates these to configured destinations.
 
-**Version 0.5.0 Major Changes:**
-- **New LTX Format**: Replaced WAL segment replication with page-level LTX format
-- **Multi-level Compaction**: Hierarchical compaction strategy for efficient storage
-- **Single Replica Constraint**: Each database now limited to one replica destination
-- **No CGO Required**: Switched to `modernc.org/sqlite` (pure Go implementation)
-- **NATS JetStream Support**: Added as new replica type
-- **Breaking Change**: Cannot restore from v0.3.x backups
+**Current Architecture Highlights:**
+- **LTX Format**: Page-level replication format replaces direct WAL mirroring
+- **Multi-level Compaction**: Hierarchical compaction keeps storage efficient (30s → 5m → 1h → snapshots)
+- **Single Replica Constraint**: Each database is replicated to exactly one remote destination
+- **Pure Go Build**: Uses `modernc.org/sqlite`, so no CGO dependency for the main binary
+- **Optional NATS JetStream Support**: Additional replica backend alongside S3/GCS/ABS/File/SFTP
+- **Snapshot Compatibility**: Only LTX-based backups are supported—keep legacy v0.3.x binaries to restore old WAL snapshots
 
 **Key Design Principles:**
 - **Non-invasive**: Uses only SQLite API, never directly manipulates database files
 - **Incremental**: Replicates only changes, not full databases
-- **Single-destination** (v0.5.0+): One replica destination per database
+- **Single-destination**: Exactly one replica destination per database
 - **Eventually Consistent**: Handles storage backends with eventual consistency
 - **Safe**: Maintains long-running read transactions for consistency
 
@@ -274,29 +274,43 @@ graph TB
 
 ```go
 // CORRECT - Database restoration logic belongs in DB layer
-func (db *DB) init() error {
-    // Check if database is behind replica
-    if db.pos < replica.pos {
-        // Clear local L0 files
+func (db *DB) init(ctx context.Context, replica *litestream.Replica) error {
+    dpos, err := db.Pos()
+    if err != nil {
+        return err
+    }
+    rpos := replica.Pos()
+
+    if dpos.TXID < rpos.TXID {
         if err := db.clearL0Files(); err != nil {
             return fmt.Errorf("clear L0 files: %w", err)
         }
 
-        // Fetch latest L0 LTX file from replica
-        ltxFile, err := replica.Client.OpenLTXFile(ctx, 0, replica.pos.MinTXID, replica.pos.MaxTXID, 0, 0)
+        itr, err := replica.Client.LTXFiles(ctx, 0, rpos.TXID)
         if err != nil {
-            return fmt.Errorf("fetch latest L0 LTX: %w", err)
+            return fmt.Errorf("enumerate ltx files: %w", err)
         }
-        defer ltxFile.Close()
+        defer itr.Close()
 
-        // Write to local L0 directory
-        if err := db.writeL0File(ltxFile); err != nil {
-            return fmt.Errorf("write L0 file: %w", err)
+        if itr.Next() {
+            info := itr.Item()
+            rd, err := replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+            if err != nil {
+                return fmt.Errorf("fetch latest L0 LTX: %w", err)
+            }
+            defer rd.Close()
+
+            if err := db.writeL0File(rd); err != nil {
+                return fmt.Errorf("write L0 file: %w", err)
+            }
+        }
+
+        if err := itr.Close(); err != nil {
+            return err
         }
     }
 
-    // Now start replica with clean state
-    return replica.Start()
+    return replica.Start(ctx)
 }
 ```
 
@@ -380,8 +394,13 @@ func writeFileDirect(path string, data []byte) error {
 ```go
 // CORRECT - Return error for caller to handle
 func (db *DB) validatePosition() error {
-    if db.pos < replica.pos {
-        return fmt.Errorf("database position (%v) behind replica (%v)", db.pos, replica.pos)
+    dpos, err := db.Pos()
+    if err != nil {
+        return err
+    }
+    rpos := replica.Pos()
+    if dpos.TXID < rpos.TXID {
+        return fmt.Errorf("database position (%v) behind replica (%v)", dpos, rpos)
     }
     return nil
 }
@@ -392,7 +411,7 @@ func (db *DB) validatePosition() error {
 ```go
 // WRONG - Silently continuing can cause data corruption
 func (db *DB) validatePosition() {
-    if db.pos < replica.pos {
+    if dpos, _ := db.Pos(); dpos.TXID < replica.Pos().TXID {
         log.Printf("warning: position mismatch")  // ❌ Don't just log!
         // Continuing here is dangerous
     }
@@ -510,9 +529,11 @@ info := &ltx.FileInfo{
 
 ```go
 // CORRECT - Preserve temporal information
-info := &ltx.FileInfo{
-    CreatedAt: oldestSourceFile.CreatedAt, // Keep original
+info, err := replica.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+if err != nil {
+    return fmt.Errorf("write ltx: %w", err)
 }
+info.CreatedAt = oldestSourceFile.CreatedAt
 ```
 
 ### ❌ DON'T: Write files without atomic operations
@@ -616,7 +637,7 @@ type DB struct {
 ### Replica Component (replica.go)
 
 **Responsibilities:**
-- Manages replication to a single destination (v0.5.0: one replica per DB only)
+- Manages replication to a single destination (one replica per DB)
 - Tracks replication position (ltx.Pos)
 - Handles sync intervals
 - Manages encryption (if configured)
@@ -634,10 +655,11 @@ type ReplicaClient interface {
     Type() string  // Client type identifier
 
     // File operations
-    LTXFiles(ctx, level, seek) (FileIterator, error)
-    OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size) (io.ReadCloser, error)
-    WriteLTXFile(ctx, level, minTXID, maxTXID, r) (*FileInfo, error)
-    DeleteLTXFiles(ctx, files) error
+    LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+    OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
+    WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
+    DeleteLTXFiles(ctx context.Context, files []*ltx.FileInfo) error
+    DeleteAll(ctx context.Context) error
 }
 ```
 
@@ -655,13 +677,13 @@ type ReplicaClient interface {
 - Controls resource usage
 - Handles retention policies
 
-**Compaction Levels (v0.5.0):**
+**Default Compaction Levels:**
 ```go
 var defaultLevels = CompactionLevels{
-    {Level: 0, Interval: 0},               // Raw LTX files (no compaction)
-    {Level: 1, Interval: 30*Second},        // 30-second windows
-    {Level: 2, Interval: 5*Minute},         // 5-minute windows
-    {Level: 3, Interval: 1*Hour},           // Hourly windows
+    {Level: 0, Interval: 0},        // Raw LTX files (no compaction)
+    {Level: 1, Interval: 30*Second},
+    {Level: 2, Interval: 5*Minute},
+    {Level: 3, Interval: 1*Hour},
     // Snapshots created daily (24h retention)
 }
 ```
@@ -722,6 +744,7 @@ if offset < 0 {
 go test -v ./replica_client_test.go -integration [s3|gcs|abs|sftp]
 
 # Test partial reads
+# (Example) add targeted partial-read tests in your backend package
 go test -v -run TestReplicaClient_PartialRead ./...
 ```
 
@@ -742,8 +765,9 @@ go test -v -run TestStore_CompactDB_RemotePartialRead ./...
 go test -race -v ./...
 
 # Specific race-prone areas
-go test -race -v -run TestReplica_SetPos ./...
-go test -race -v -run TestDB_Monitor ./...
+go test -race -v -run TestReplica_Sync ./...
+go test -race -v -run TestDB_Sync ./...
+go test -race -v -run TestStore_CompactDB ./...
 ```
 
 ## Quick Reference
@@ -766,7 +790,7 @@ dbs:
         path: db-backup
         sync-interval: 10s  # How often to sync
 
-# Compaction configuration (v0.5.0 defaults)
+# Compaction configuration (default)
 levels:
   - level: 1
     interval: 30s    # 30-second windows
@@ -789,13 +813,12 @@ DefaultTruncatePageN      = 500000            // Pages before truncation
 ## Getting Help
 
 For complex architectural questions, consult:
-1. **`docs/V050_CHANGES.md`** - v0.5.0 breaking changes and migration guide
-2. **`docs/SQLITE_INTERNALS.md`** - SQLite fundamentals, WAL format, lock page details
-3. **`docs/LTX_FORMAT.md`** - LTX file format specification and operations
-4. `docs/ARCHITECTURE.md` - Deep technical details of Litestream components
-5. `docs/REPLICA_CLIENT_GUIDE.md` - Storage backend implementation guide
-6. `docs/TESTING_GUIDE.md` - Comprehensive testing strategies
-7. Review recent PRs for current patterns and best practices
+1. **`docs/SQLITE_INTERNALS.md`** - SQLite fundamentals, WAL format, lock page details
+2. **`docs/LTX_FORMAT.md`** - LTX file format specification and operations
+3. `docs/ARCHITECTURE.md` - Deep technical details of Litestream components
+4. `docs/REPLICA_CLIENT_GUIDE.md` - Storage backend implementation guide
+5. `docs/TESTING_GUIDE.md` - Comprehensive testing strategies
+6. Review recent PRs for current patterns and best practices
 
 ## Future Roadmap
 
@@ -806,29 +829,20 @@ For complex architectural questions, consult:
   - Enables scaling read operations without full database downloads
 - **Enhanced read replica support**: Direct reads from remote storage
 
-## Important v0.5.0 Migration Notes
+## Important Constraints
 
-1. **Breaking Changes:**
-   - Cannot restore from v0.3.x WAL segment files
-   - Single replica destination per database (removed multi-replica support)
-   - Command renamed: `litestream wal` → `litestream ltx`
-   - Removed "generations" concept for backup tracking
-
-2. **Build Changes:**
-   - CGO no longer required (uses `modernc.org/sqlite`)
-   - Pure Go implementation enables easier cross-compilation
-
-3. **New Features:**
-   - NATS JetStream replica type added
-   - Page-level compaction for better efficiency
-   - Point-in-time restoration with minimal files
+1. **Single Replica Authority**: Each database is replicated to exactly one remote target—configure redundancy at the storage layer if needed.
+2. **Legacy Backups**: Pre-LTX (v0.3.x) WAL snapshots cannot be restored with current binaries; keep an old binary around to hydrate those backups before re-replicating.
+3. **CLI Changes**: Use `litestream ltx` for LTX inspection; `litestream wal` is deprecated.
+4. **Pure Go Build**: The default build is CGO-free via `modernc.org/sqlite`; enable CGO only for optional VFS tooling.
+5. **Page-Level Compaction**: Expect compaction to merge files across 30s/5m/1h windows plus daily snapshots.
 
 ## Final Checklist Before Making Changes
 
 - [ ] Read this entire document
 - [ ] Read `docs/SQLITE_INTERNALS.md` for SQLite fundamentals
 - [ ] Read `docs/LTX_FORMAT.md` for replication format details
-- [ ] Understand v0.5.0 changes and limitations
+- [ ] Understand current constraints (single replica authority, LTX-only restores)
 - [ ] Understand the component you're modifying
 - [ ] Understand architectural boundaries (DB vs Replica responsibilities)
 - [ ] Check for eventual consistency implications
@@ -920,7 +934,7 @@ This document serves as the universal source of truth for all AI coding assistan
 3. **Respect architectural boundaries** (DB layer vs Replica layer)
 4. **Follow the patterns** in Common Pitfalls section
 5. **Test with race detector** for any concurrent code changes
-6. **Preserve backward compatibility** with v0.5.0 constraints
+6. **Preserve backward compatibility** with current constraints
 
 ### Documentation Hierarchy
 
@@ -937,5 +951,4 @@ Tier 2 (Read when relevant):
 Tier 3 (Reference only):
 - docs/TESTING_GUIDE.md (for test scenarios)
 - docs/REPLICA_CLIENT_GUIDE.md (for new backends)
-- docs/V050_CHANGES.md (for migration context)
 ```

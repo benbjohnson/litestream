@@ -43,8 +43,8 @@ sqlite3 restored.db "PRAGMA integrity_check;"
 go test -race -v ./...
 
 # Specific areas prone to races
-go test -race -v -run TestReplica_SetPos ./...
-go test -race -v -run TestDB_Monitor ./...
+go test -race -v -run TestReplica_Sync ./...
+go test -race -v -run TestDB_Sync ./...
 go test -race -v -run TestStore_CompactDB ./...
 ```
 
@@ -105,11 +105,11 @@ done
 
 ### Compaction Scenarios
 ```bash
-# Generate files for compaction
-./bin/litestream-test generate-ltx \
-    --count 100 \
-    --size 10MB \
-    --level 0
+# Exercise store-level compaction logic
+go test -v -run TestStore_CompactDB ./...
+
+# Include remote partial-read coverage
+go test -v -run TestStore_CompactDB_RemotePartialRead ./...
 ```
 
 ## Performance Testing
@@ -138,7 +138,7 @@ go tool pprof mem.prof
 ### Simulate Failures
 ```go
 type FailingReplicaClient struct {
-    ReplicaClient
+    litestream.ReplicaClient
     failAfter int
     count     int
 }

@@ -44,7 +44,7 @@ SQLite reserves a special lock page at exactly 1GB (0x40000000 bytes). This page
 
 ```go
 func createLargeTestDB(t *testing.T, path string, targetSize int64) {
-    db, err := sql.Open("sqlite3", path+"?_journal=WAL")
+    db, err := sql.Open("sqlite", path+"?_journal=WAL")
     require.NoError(t, err)
     defer db.Close()
 
@@ -131,18 +131,18 @@ func TestDB_LockPageHandling(t *testing.T) {
             createLargeTestDB(t, dbPath, 1100*1024*1024) // 1.1GB
 
             // Open with Litestream
-            db := NewDB(dbPath, "")
+            db := litestream.NewDB(dbPath)
             err := db.Open()
             require.NoError(t, err)
             defer db.Close(context.Background())
 
             // Start replication
-            replica := NewReplica(db, newMockClient())
+            replica := litestream.NewReplicaWithClient(db, newMockClient())
             err = replica.Start(context.Background())
             require.NoError(t, err)
 
             // Perform writes that span the lock page
-            conn, err := sql.Open("sqlite3", dbPath)
+            conn, err := sql.Open("sqlite", dbPath)
             require.NoError(t, err)
 
             tx, err := conn.Begin()
@@ -173,7 +173,7 @@ func TestDB_LockPageHandling(t *testing.T) {
     }
 }
 
-func verifyLockPageSkipped(t *testing.T, replica *Replica, lockPgno uint32) {
+func verifyLockPageSkipped(t *testing.T, replica *litestream.Replica, lockPgno uint32) {
     // Get LTX files
     files, err := replica.Client.LTXFiles(context.Background(), 0, 0)
     require.NoError(t, err)
@@ -183,7 +183,7 @@ func verifyLockPageSkipped(t *testing.T, replica *Replica, lockPgno uint32) {
         info := files.Item()
 
         // Read page index
-        pageIndex, err := FetchPageIndex(context.Background(),
+        pageIndex, err := litestream.FetchPageIndex(context.Background(),
             replica.Client, info)
         require.NoError(t, err)
 
@@ -204,12 +204,12 @@ func TestDB_RestoreLargeDatabase(t *testing.T) {
     createLargeTestDB(t, srcPath, 1500*1024*1024) // 1.5GB
 
     // Setup replication
-    db := NewDB(srcPath, "")
+    db := litestream.NewDB(srcPath)
     err := db.Open()
     require.NoError(t, err)
 
     client := file.NewReplicaClient(filepath.Join(t.TempDir(), "replica"))
-    replica := NewReplicaWithClient(db, client)
+    replica := litestream.NewReplicaWithClient(db, client)
 
     err = replica.Start(context.Background())
     require.NoError(t, err)
@@ -222,7 +222,7 @@ func TestDB_RestoreLargeDatabase(t *testing.T) {
 
     // Restore to new location
     dstPath := filepath.Join(t.TempDir(), "restored.db")
-    err = Restore(context.Background(), client, dstPath, nil)
+    err = litestream.Restore(context.Background(), client, dstPath, nil)
     require.NoError(t, err)
 
     // Verify restoration
@@ -241,7 +241,7 @@ func verifyDatabasesMatch(t *testing.T, path1, path2 string) {
     assert.Equal(t, pageCount1, pageCount2, "Page counts should match")
 
     // Run integrity check
-    db, err := sql.Open("sqlite3", path2)
+    db, err := sql.Open("sqlite", path2)
     require.NoError(t, err)
     defer db.Close()
 
@@ -261,9 +261,9 @@ func verifyDatabasesMatch(t *testing.T, path1, path2 string) {
 go test -race -v ./...
 
 # Run specific race-prone tests
-go test -race -v -run TestReplica_SetPos ./...
-go test -race -v -run TestDB_ConcurrentSync ./...
-go test -race -v -run TestStore_Integration ./...
+go test -race -v -run TestReplica_Sync ./...
+go test -race -v -run TestDB_Sync ./...
+go test -race -v -run TestStore_CompactDB ./...
 ```
 
 ### Common Race Conditions
@@ -272,9 +272,7 @@ go test -race -v -run TestStore_Integration ./...
 
 ```go
 func TestReplica_ConcurrentPositionUpdate(t *testing.T) {
-    replica := NewReplica(nil)
-    ctx := context.Background()
-
+    replica := litestream.NewReplica(nil)
     var wg sync.WaitGroup
     errors := make(chan error, 100)
 
@@ -284,10 +282,7 @@ func TestReplica_ConcurrentPositionUpdate(t *testing.T) {
         go func(n int) {
             defer wg.Done()
 
-            pos := ltx.Pos{
-                TXID:   ltx.TXID(n),
-                PageNo: uint32(n * 100),
-            }
+            pos := ltx.NewPos(ltx.TXID(n), ltx.Checksum(uint64(n)))
 
             // This should use proper locking
             replica.SetPos(pos)
@@ -339,7 +334,7 @@ func TestDB_ConcurrentWALAccess(t *testing.T) {
     go func() {
         defer wg.Done()
 
-        conn, err := sql.Open("sqlite3", db.Path())
+        conn, err := sql.Open("sqlite", db.Path())
         if err != nil {
             return
         }
@@ -356,11 +351,13 @@ func TestDB_ConcurrentWALAccess(t *testing.T) {
     go func() {
         defer wg.Done()
 
+        notifyCh := db.Notify()
+
         for {
             select {
             case <-ctx.Done():
                 return
-            case <-db.notify:
+            case <-notifyCh:
                 // Process WAL changes
                 _ = db.Sync(context.Background())
             }
@@ -380,7 +377,7 @@ func TestDB_ConcurrentWALAccess(t *testing.T) {
             case <-ctx.Done():
                 return
             case <-ticker.C:
-                _ = db.Checkpoint("PASSIVE")
+                _ = db.Checkpoint(context.Background(), litestream.CheckpointModePassive)
             }
         }
     }()
@@ -506,7 +503,7 @@ func BenchmarkDB_Sync(b *testing.B) {
     defer db.Close(context.Background())
 
     // Prepare test data
-    conn, _ := sql.Open("sqlite3", db.Path())
+    conn, _ := sql.Open("sqlite", db.Path())
     defer conn.Close()
 
     for i := 0; i < 1000; i++ {
@@ -611,7 +608,7 @@ func runLoadTest(t *testing.T, db *DB, config LoadConfig) LoadResults {
         go func(workerID int) {
             defer wg.Done()
 
-            conn, err := sql.Open("sqlite3", db.Path())
+            conn, err := sql.Open("sqlite", db.Path())
             if err != nil {
                 return
             }
@@ -782,7 +779,7 @@ func NewTestDB(t testing.TB) *litestream.DB {
     path := filepath.Join(t.TempDir(), "test.db")
 
     // Create SQLite database
-    conn, err := sql.Open("sqlite3", path+"?_journal=WAL")
+    conn, err := sql.Open("sqlite", path+"?_journal=WAL")
     require.NoError(t, err)
 
     _, err = conn.Exec(`
@@ -795,7 +792,7 @@ func NewTestDB(t testing.TB) *litestream.DB {
     conn.Close()
 
     // Open with Litestream
-    db := litestream.NewDB(path, "")
+    db := litestream.NewDB(path)
     db.MonitorInterval = 10 * time.Millisecond  // Speed up for tests
     db.MinCheckpointPageN = 100  // Lower threshold for tests
 
@@ -812,7 +809,7 @@ func NewTestDB(t testing.TB) *litestream.DB {
 func WriteTestData(t testing.TB, db *litestream.DB, count int) {
     t.Helper()
 
-    conn, err := sql.Open("sqlite3", db.Path())
+    conn, err := sql.Open("sqlite", db.Path())
     require.NoError(t, err)
     defer conn.Close()
 
@@ -873,14 +870,14 @@ func ExtractFixture(name string, path string) error {
 ```go
 // Problem: Multiple connections without proper WAL mode
 func TestBroken(t *testing.T) {
-    db1, _ := sql.Open("sqlite3", "test.db")  // Wrong!
-    db2, _ := sql.Open("sqlite3", "test.db")  // Will fail
+    db1, _ := sql.Open("sqlite", "test.db")    // Wrong! WAL disabled
+    db2, _ := sql.Open("sqlite", "test.db")    // Will fail
 }
 
 // Solution: Use WAL mode
 func TestFixed(t *testing.T) {
-    db1, _ := sql.Open("sqlite3", "test.db?_journal=WAL")
-    db2, _ := sql.Open("sqlite3", "test.db?_journal=WAL")
+    db1, _ := sql.Open("sqlite", "test.db?_journal=WAL")
+    db2, _ := sql.Open("sqlite", "test.db?_journal=WAL")
 }
 ```
 

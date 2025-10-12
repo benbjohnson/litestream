@@ -136,7 +136,7 @@ Main entry point (`cmd/litestream/main.go`) provides subcommands:
 
 1. **Non-invasive monitoring**: Uses SQLite API exclusively, no direct file manipulation
 2. **Incremental replication**: Segments WAL into small chunks for efficient transfer
-3. **Multi-destination support**: Single database can replicate to multiple destinations
+3. **Single remote authority**: Each database replicates to exactly one destination
 4. **Age encryption**: Optional end-to-end encryption using age identities/recipients
 5. **Prometheus metrics**: Built-in observability for monitoring replication health
 6. **Timestamp preservation**: Compaction preserves earliest CreatedAt timestamp from source files to maintain temporal granularity for point-in-time restoration
