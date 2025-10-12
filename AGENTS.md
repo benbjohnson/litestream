@@ -243,16 +243,16 @@ Many storage backends (S3, R2, etc.) are eventually consistent. This means:
 ```mermaid
 graph TB
     subgraph "DB Layer (db.go)"
-        DBInit[DB.init()]
-        DBPos[DB.pos tracking]
+        DBInit[DB.init&#40;&#41;]
+        DBPos[DB position tracking]
         DBRestore[Database state validation]
-        DBSnapshot[Snapshot triggering via verify()]
+        DBSnapshot[Snapshot triggering via verify&#40;&#41;]
     end
 
     subgraph "Replica Layer (replica.go)"
-        ReplicaStart[Replica.Start()]
+        ReplicaStart[Replica.Start&#40;&#41;]
         ReplicaSync[Sync operations]
-        ReplicaPos[Replica.pos tracking]
+        ReplicaPos[Replica position tracking]
         ReplicaClient[Storage interaction]
     end
 
