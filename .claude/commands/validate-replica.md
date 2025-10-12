@@ -34,11 +34,11 @@ if len(data) != 25 {
 
 4. **Verify timestamp preservation**:
 ```go
-// WriteLTXFile must preserve CreatedAt if provided
-createdAt := time.Now().Add(-24 * time.Hour)
-info, _ := client.WriteLTXFile(ctx, 0, 1, 100, reader, &createdAt)
-if !info.CreatedAt.Equal(createdAt) {
-    t.Error("CreatedAt not preserved")
+// CreatedAt should reflect remote object metadata (or upload time)
+start := time.Now()
+info, _ := client.WriteLTXFile(ctx, 0, 1, 100, reader)
+if info.CreatedAt.IsZero() || info.CreatedAt.Before(start.Add(-time.Second)) {
+    t.Error("unexpected CreatedAt timestamp")
 }
 ```
 

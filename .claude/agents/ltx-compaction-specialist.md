@@ -18,13 +18,13 @@ You are an expert in the LTX (Log Transaction) format and multi-level compaction
 ### LTX File Format
 ```
 ┌─────────────────────┐
-│      Header         │ 44 bytes
+│      Header         │ 84 bytes
 ├─────────────────────┤
 │    Page Frames      │ Variable
 ├─────────────────────┤
-│    Page Index       │ Binary search tree
+│    Page Index       │ Binary search structure
 ├─────────────────────┤
-│      Trailer        │ 24 bytes
+│      Trailer        │ 16 bytes
 └─────────────────────┘
 ```
 
@@ -37,7 +37,7 @@ Where:
 Example: 0000000000000001-0000000000000064.ltx
 ```
 
-## Compaction Levels (v0.5.0)
+## Default Compaction Levels
 
 ### Level Structure
 ```
@@ -64,9 +64,11 @@ Snapshots: Daily full database
 2. **Preserve Timestamps**:
    ```go
    // Keep earliest CreatedAt
-   info := &ltx.FileInfo{
-       CreatedAt: oldestSourceFile.CreatedAt,
+   info, err := replica.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, reader)
+   if err != nil {
+       return nil, fmt.Errorf("write ltx file: %w", err)
    }
+   info.CreatedAt = oldestSourceFile.CreatedAt
    ```
 
 3. **Skip Lock Page**:
@@ -117,13 +119,13 @@ func compactLTXFiles(files []*LTXFile) (*LTXFile, error) {
 
 ### Checksums
 - CRC-64 ECMA for integrity
-- Per-page checksums
-- Cumulative file checksum
+- `PreApplyChecksum`/`PostApplyChecksum` on the header/trailer bracketing file state
+- `FileChecksum` covering the entire file contents
 
 ### Page Index
-- Binary search tree for O(log n) lookups
-- 16-byte entries (page number + offset)
-- Located via trailer
+- Exposed via `ltx.DecodePageIndex`
+- Tracks page number plus offset/size of the encoded payload
+- Located by seeking from the end of the file using trailer metadata
 
 ## Common Issues
 
@@ -142,9 +144,9 @@ go test -v -run TestStore_CompactDB ./...
 # Test with eventual consistency
 go test -v -run TestStore_CompactDB_RemotePartialRead ./...
 
-# Manual test
-litestream ltx info file.ltx
-litestream ltx verify file.ltx
+# Manual inspection
+litestream ltx /path/to/db.sqlite
+# For deeper inspection use the Go API (ltx.NewDecoder)
 ```
 
 ## References

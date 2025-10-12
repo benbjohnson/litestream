@@ -8,7 +8,6 @@ Disaster recovery tool for SQLite that runs as a background process and safely r
 - [docs/SQLITE_INTERNALS.md](docs/SQLITE_INTERNALS.md): Critical SQLite knowledge including WAL format and 1GB lock page
 - [docs/LTX_FORMAT.md](docs/LTX_FORMAT.md): LTX (Log Transaction) format specification for replication
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Deep technical details of Litestream components
-- [docs/V050_CHANGES.md](docs/V050_CHANGES.md): Version 0.5.0 breaking changes and migration guide
 
 ## Implementation Guides
 
@@ -29,7 +28,7 @@ Disaster recovery tool for SQLite that runs as a background process and safely r
 - [abs/replica_client.go](abs/replica_client.go): Azure Blob Storage implementation
 - [sftp/replica_client.go](sftp/replica_client.go): SFTP implementation
 - [file/replica_client.go](file/replica_client.go): Local file system implementation
-- [nats/replica_client.go](nats/replica_client.go): NATS JetStream implementation (v0.5.0+)
+- [nats/replica_client.go](nats/replica_client.go): NATS JetStream implementation
 
 ## Critical Concepts
 
@@ -39,7 +38,7 @@ The lock page at exactly 1GB (0x40000000) must always be skipped during replicat
 ### LTX Format
 Immutable, append-only files containing database changes. Files are named by transaction ID ranges (e.g., 0000000001-0000000064.ltx).
 
-### Compaction Levels (v0.5.0)
+### Compaction Levels
 - Level 0: Raw LTX files (no compaction)
 - Level 1: 30-second windows
 - Level 2: 5-minute windows
@@ -74,7 +73,7 @@ Use Lock() for writes, RLock() for reads. Never use RLock() when modifying state
 
 ## Configuration
 
-Primary configuration via YAML file (etc/litestream.yml) or environment variables. Single replica per database in v0.5.0+ (breaking change from v0.3.x).
+Primary configuration via YAML file (etc/litestream.yml) or environment variables. Each database replicates to exactly one remote destination.
 
 ## Build Requirements
 

@@ -334,77 +334,20 @@ Compaction merges multiple LTX files to reduce storage overhead:
 
 ### Compaction Algorithm (store.go:189)
 
-```go
-func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
-    // 1. Check if compaction is needed
-    if !s.shouldCompact(db, lvl) {
-        return nil, ErrCompactionTooEarly
-    }
+High-level compaction flow:
 
-    // 2. Get source files from previous level
-    srcLevel := lvl.Level - 1
-    srcFiles, err := db.LTXFiles(ctx, srcLevel)
-    if err != nil {
-        return nil, err
-    }
-
-    // 3. Create page map for deduplication
-    pageMap := make(map[uint32]PageData)
-
-    // 4. Read all source files (preferring local)
-    for _, info := range srcFiles {
-        // CRITICAL: Try local first for consistency
-        f, err := os.Open(db.LTXPath(info))
-        if err != nil {
-            // Fall back to remote only if local doesn't exist
-            f, err = replica.Client.OpenLTXFile(ctx, info)
-            if err != nil {
-                return nil, err
-            }
-        }
-        defer f.Close()
-
-        // Read pages and add to map (newer overwrites older)
-        pages, err := ltx.ReadPages(f)
-        for _, page := range pages {
-            pageMap[page.PageNo] = page
-        }
-    }
-
-    // 5. Write compacted file
-    var buf bytes.Buffer
-    writer := ltx.NewWriter(&buf)
-
-    // Write pages in order
-    pageNos := make([]uint32, 0, len(pageMap))
-    for pgno := range pageMap {
-        pageNos = append(pageNos, pgno)
-    }
-    sort.Slice(pageNos, func(i, j int) bool {
-        return pageNos[i] < pageNos[j]
-    })
-
-    for _, pgno := range pageNos {
-        // CRITICAL: Skip lock page at 1GB
-        if pgno == ltx.LockPgno(db.pageSize) {
-            continue
-        }
-        writer.WritePage(pageMap[pgno])
-    }
-
-    // 6. Upload compacted file
-    info, err := replica.Client.WriteLTXFile(ctx, lvl.Level, minTXID, maxTXID, &buf)
-    if err != nil {
-        return nil, err
-    }
-
-    // CRITICAL: Preserve earliest timestamp
-    info.CreatedAt = s.earliestTimestamp(srcFiles)
-
-    // 7. Delete source files
-    return info, replica.Client.DeleteLTXFiles(ctx, srcFiles)
-}
-```
+1. Determine whether the level is due for compaction (`Store.shouldCompact`).
+2. Enumerate level-`L-1` files using `ReplicaClient.LTXFiles`, preferring local
+   copies via `os.Open(db.LTXPath(...))` and falling back to
+   `ReplicaClient.OpenLTXFile` only when necessary.
+3. Stream the source readers through `ltx.NewCompactor`, which performs
+   page-level deduplication and enforces lock-page skipping automatically.
+4. Pipe the compactor output into `ReplicaClient.WriteLTXFile` to create the
+   merged LTX file for level `L`.
+5. Adjust the returned `ltx.FileInfo.CreatedAt` to the earliest timestamp from
+   the source files so point-in-time recovery remains accurate.
+6. Update the cached max file info for the level and delete old L0 files when
+   promoting to level 1.
 
 ### Compaction Levels
 

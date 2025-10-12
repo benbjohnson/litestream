@@ -20,10 +20,11 @@ Every storage backend MUST implement:
 ```go
 type ReplicaClient interface {
     Type() string
-    LTXFiles(ctx, level, seek) (FileIterator, error)
-    OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size) (io.ReadCloser, error)
-    WriteLTXFile(ctx, level, minTXID, maxTXID, r, createdAt) (*FileInfo, error)
-    DeleteLTXFiles(ctx, files) error
+    LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+    OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
+    WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
+    DeleteLTXFiles(ctx context.Context, files []*ltx.FileInfo) error
+    DeleteAll(ctx context.Context) error
 }
 ```
 
@@ -52,7 +53,7 @@ type ReplicaClient interface {
 - [ ] Implement ReplicaClient interface
 - [ ] Handle partial reads (offset/size)
 - [ ] Support seek parameter for pagination
-- [ ] Preserve CreatedAt timestamps
+- [ ] Preserve CreatedAt timestamps when metadata is available
 - [ ] Handle eventual consistency
 - [ ] Implement proper error types
 - [ ] Add integration tests

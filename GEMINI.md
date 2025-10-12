@@ -53,7 +53,7 @@ When generating tests:
 
 ### Refactoring
 1. Respect layer boundaries (DB vs Replica)
-2. Maintain backward compatibility with v0.5.0
+2. Maintain current constraints (single replica authority, LTX-only restores)
 3. Use atomic file operations
 4. Return errors properly (don't just log)
 
@@ -72,7 +72,7 @@ go test -v ./replica_client_test.go -integration s3
 
 ## Configuration Reference
 
-See `etc/litestream.yml` for configuration examples. Note v0.5.0 constraint: single replica per database only.
+See `etc/litestream.yml` for configuration examples. Remember: each database replicates to exactly one remote destination.
 
 ## Additional Resources
 

@@ -31,7 +31,7 @@ if pgno == lockPgno {
 
 **Check**:
 ```bash
-go test -race -v -run TestReplica_SetPos ./...
+go test -race -v -run TestReplica_Sync ./...
 ```
 
 **Fix**:
@@ -67,18 +67,24 @@ return replica.Client.OpenLTXFile(...)
 
 ## Issue 4: CreatedAt Timestamp Loss
 
-**Symptom**: Cannot do point-in-time recovery
+**Symptom**: Point-in-time recovery lacks accurate timestamps
 
 **Check**:
-```bash
-# Find WriteLTXFile calls without CreatedAt
-grep -r "WriteLTXFile" --include="*.go" | grep "nil"
+```go
+info, err := client.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+if err != nil {
+    t.Fatal(err)
+}
+if info.CreatedAt.IsZero() {
+    t.Fatal("CreatedAt not set")
+}
 ```
 
 **Fix**:
 ```go
-// Preserve earliest timestamp
-info, err := client.WriteLTXFile(ctx, level, minTXID, maxTXID, r, &oldestFile.CreatedAt)
+// Ensure storage metadata is copied into the returned FileInfo
+modTime := resp.LastModified
+info.CreatedAt = modTime
 ```
 
 ## Issue 5: Non-Atomic File Writes
@@ -158,8 +164,8 @@ defer func() {
 # Check database integrity
 sqlite3 database.db "PRAGMA integrity_check;"
 
-# Verify LTX files
-litestream ltx verify *.ltx
+# List replicated LTX files
+litestream ltx /path/to/db.sqlite
 
 # Check replication status
 litestream databases

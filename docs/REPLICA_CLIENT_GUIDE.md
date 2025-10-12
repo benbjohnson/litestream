@@ -29,7 +29,7 @@ type ReplicaClient interface {
     OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
 
     // Writes an LTX file to storage
-    // MUST preserve createdAt timestamp if provided
+    // SHOULD set CreatedAt based on backend metadata or upload time
     WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
 
     // Deletes one or more LTX files
@@ -88,18 +88,28 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
     }
 
     // Verify the file is readable before returning
-    return c.verifyUpload(ctx, path, checksum)
+    return c.verifyUpload(ctx, path, int64(len(data)), checksum)
 }
 
-func (c *ReplicaClient) verifyUpload(ctx context.Context, path string, expectedChecksum uint64) (*ltx.FileInfo, error) {
+func (c *ReplicaClient) verifyUpload(ctx context.Context, path string, expectedSize int64, expectedChecksum uint64) (*ltx.FileInfo, error) {
     // Implement retry loop with backoff
     backoff := 100 * time.Millisecond
     for i := 0; i < 10; i++ {
         info, err := c.statFile(ctx, path)
         if err == nil {
-            // Verify checksum if possible
-            if info.Checksum == expectedChecksum {
-                return info, nil
+            if info.Size == expectedSize {
+                rc, err := c.openFile(ctx, path, 0, 0)
+                if err != nil {
+                    return nil, fmt.Errorf("open uploaded file: %w", err)
+                }
+                data, err := io.ReadAll(rc)
+                rc.Close()
+                if err != nil {
+                    return nil, fmt.Errorf("read uploaded file: %w", err)
+                }
+                if crc64.Checksum(data, crc64.MakeTable(crc64.ECMA)) == expectedChecksum {
+                    return info, nil
+                }
             }
         }
 
@@ -471,24 +481,20 @@ func (c *Client) WriteLTXFile(...) (*ltx.FileInfo, error) {
 
 ```go
 // CORRECT - Preserves original timestamp
-func (c *Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader, createdAt *time.Time) (*ltx.FileInfo, error) {
+func (c *Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
     // Upload file...
-
-    info := &ltx.FileInfo{
-        Level:   level,
-        MinTXID: minTXID,
-        MaxTXID: maxTXID,
-        Size:    uploadedSize,
+    uploadedSize, modTime, err := c.storage.Upload(path, r)
+    if err != nil {
+        return nil, err
     }
 
-    // Preserve timestamp if provided
-    if createdAt != nil {
-        info.CreatedAt = *createdAt
-    } else {
-        info.CreatedAt = time.Now()
-    }
-
-    return info, nil
+    return &ltx.FileInfo{
+        Level:     level,
+        MinTXID:   minTXID,
+        MaxTXID:   maxTXID,
+        Size:      uploadedSize,
+        CreatedAt: modTime,
+    }, nil
 }
 ```
 
