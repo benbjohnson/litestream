@@ -217,6 +217,77 @@ func TestNewGSReplicaFromConfig(t *testing.T) {
 	}
 }
 
+// TestNewReplicaFromConfig_AgeEncryption verifies that age encryption configuration is rejected.
+// Age encryption is currently non-functional and would silently write plaintext data.
+// See: https://github.com/benbjohnson/litestream/issues/790
+func TestNewReplicaFromConfig_AgeEncryption(t *testing.T) {
+	t.Run("RejectIdentities", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+		config.Age.Identities = []string{"AGE-SECRET-KEY-1EXAMPLE"}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err == nil {
+			t.Fatal("expected error when age identities are configured")
+		}
+		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
+			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
+	})
+
+	t.Run("RejectRecipients", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+		config.Age.Recipients = []string{"age1example"}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err == nil {
+			t.Fatal("expected error when age recipients are configured")
+		}
+		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
+			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
+	})
+
+	t.Run("RejectBoth", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+		config.Age.Identities = []string{"AGE-SECRET-KEY-1EXAMPLE"}
+		config.Age.Recipients = []string{"age1example"}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err == nil {
+			t.Fatal("expected error when both age identities and recipients are configured")
+		}
+		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
+			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
+	})
+
+	t.Run("AllowEmpty", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err != nil {
+			t.Fatalf("unexpected error when age configuration is not present: %v", err)
+		}
+	})
+}
+
 // TestConfig_Validate_SnapshotIntervals tests validation of snapshot intervals
 func TestConfig_Validate_SnapshotIntervals(t *testing.T) {
 	t.Run("ValidInterval", func(t *testing.T) {

@@ -567,6 +567,15 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", c.Path)
 	}
 
+	// Reject age encryption configuration as it's currently non-functional.
+	// Age encryption support was removed during the LTX storage layer refactor
+	// and has not been reimplemented. Accepting this config would silently
+	// write plaintext data to remote storage instead of encrypted data.
+	// See: https://github.com/benbjohnson/litestream/issues/790
+	if len(c.Age.Identities) > 0 || len(c.Age.Recipients) > 0 {
+		return nil, fmt.Errorf("age encryption is not currently supported, if you need encryption please revert back to Litestream v0.3.x")
+	}
+
 	// Build replica.
 	r := litestream.NewReplica(db)
 	if v := c.SyncInterval; v != nil {
