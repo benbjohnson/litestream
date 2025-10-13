@@ -1,6 +1,7 @@
 package abs
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -29,6 +30,10 @@ import (
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "abs"
+
+// MetadataKeyTimestamp is the metadata key for storing LTX file timestamps in Azure Blob Storage.
+// Azure metadata keys cannot contain hyphens, so we use litestreamtimestamp (C# identifier rules).
+const MetadataKeyTimestamp = "litestreamtimestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
@@ -145,7 +150,9 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+// Azure always uses accurate timestamps from metadata since they're included in LIST operations at zero cost.
+// The useMetadata parameter is ignored.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -159,16 +166,31 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
 
-	rc := internal.NewReadCounter(rd)
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
 
-	// Upload blob with proper content type and access tier
+	// Extract timestamp from LTX header
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+
+	// Combine buffered data with rest of reader
+	rc := internal.NewReadCounter(io.MultiReader(&buf, rd))
+
+	// Upload blob with proper content type, access tier, and metadata
+	// Azure metadata keys cannot contain hyphens, so use litestreamtimestamp
 	_, err = c.client.UploadStream(ctx, c.Bucket, key, rc, &azblob.UploadStreamOptions{
 		HTTPHeaders: &blob.HTTPHeaders{
 			BlobContentType: to.Ptr("application/octet-stream"),
 		},
 		AccessTier: to.Ptr(blob.AccessTierHot), // Use Hot tier as default
+		Metadata: map[string]*string{
+			MetadataKeyTimestamp: to.Ptr(timestamp.Format(time.RFC3339Nano)),
+		},
 	})
 	if err != nil {
 		return nil, fmt.Errorf("abs: cannot upload ltx file %q: %w", key, err)
@@ -182,7 +204,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      rc.N(),
-		CreatedAt: startTime.UTC(),
+		CreatedAt: timestamp,
 	}, nil
 }
 
@@ -370,11 +392,10 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 
 		// Build file info
 		info := &ltx.FileInfo{
-			Level:     itr.level,
-			MinTXID:   minTXID,
-			MaxTXID:   maxTXID,
-			Size:      *item.Properties.ContentLength,
-			CreatedAt: item.Properties.CreationTime.UTC(),
+			Level:   itr.level,
+			MinTXID: minTXID,
+			MaxTXID: maxTXID,
+			Size:    *item.Properties.ContentLength,
 		}
 
 		// Skip if below seek TXID
@@ -385,6 +406,17 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 		// Skip if wrong level
 		if info.Level != itr.level {
 			continue
+		}
+
+		// Always use accurate timestamp from metadata since it's zero-cost
+		// Azure includes metadata in LIST operations, so no extra API call needed
+		info.CreatedAt = item.Properties.CreationTime.UTC()
+		if item.Metadata != nil {
+			if ts, ok := item.Metadata[MetadataKeyTimestamp]; ok && ts != nil {
+				if parsed, err := time.Parse(time.RFC3339Nano, *ts); err == nil {
+					info.CreatedAt = parsed
+				}
+			}
 		}
 
 		itr.pageItems = append(itr.pageItems, info)
