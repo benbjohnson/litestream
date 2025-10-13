@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -89,6 +90,163 @@ func TestReplica_Sync(t *testing.T) {
 	}
 
 	// TODO(ltx): Restore snapshot and verify
+}
+
+// TestReplica_RestoreAndReplicateAfterDataLoss tests the scenario described in issue #781
+// where a database is restored to an earlier state (with lower TXID) but the replica has
+// a higher TXID, causing new writes to not be replicated.
+//
+// The fix detects this condition in DB.init() by comparing database position vs replica
+// position. When database is behind, it fetches the latest L0 file from the replica and
+// triggers a snapshot on the next sync.
+//
+// This test follows the reproduction steps from issue #781:
+// 1. Create DB and replicate data
+// 2. Restore from backup (simulating hard recovery)
+// 3. Insert new data and replicate
+// 4. Restore again and verify new data exists
+func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
+	ctx := context.Background()
+
+	// Create a temporary directory for replica storage
+	replicaDir := t.TempDir()
+	replicaClient := file.NewReplicaClient(replicaDir)
+
+	// Create database with initial data
+	dbDir := t.TempDir()
+	dbPath := dbDir + "/db.sqlite"
+
+	// Step 1: Create initial data and replicate
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(col1 INTEGER);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start litestream replication
+	db1 := testingutil.NewDB(t, dbPath)
+	db1.MonitorInterval = 0
+	db1.Replica = litestream.NewReplicaWithClient(db1, replicaClient)
+	db1.Replica.MonitorEnabled = false
+
+	if err := db1.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 1 complete: Initial data replicated")
+
+	// Step 2: Simulate hard recovery - remove database and .litestream directory, then restore
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-wal"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-shm"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	metaPath := db1.MetaPath()
+	if err := os.RemoveAll(metaPath); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore from backup
+	restoreOpt := litestream.RestoreOptions{
+		OutputPath: dbPath,
+	}
+	if err := db1.Replica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 2 complete: Database restored from backup")
+
+	// Step 3: Start replication and insert new data
+	db2 := testingutil.NewDB(t, dbPath)
+	db2.MonitorInterval = 0
+	db2.Replica = litestream.NewReplicaWithClient(db2, replicaClient)
+	db2.Replica.MonitorEnabled = false
+
+	if err := db2.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb2 := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb2.ExecContext(ctx, `INSERT INTO test VALUES (2);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 3: Inserted new data (value=2) after restore")
+
+	// Sync new data
+	if err := db2.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db2.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 3 complete: New data synced")
+
+	// Step 4: Simulate second hard recovery and restore again
+	if err := os.Remove(dbPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-wal"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.Remove(dbPath + "-shm"); os.IsExist(err) {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(db2.MetaPath()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore again
+	if err := db2.Replica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatal(err)
+	}
+	t.Log("Step 4 complete: Second restore from backup")
+
+	// Step 5: Verify the new data (value=2) exists in restored database
+	sqldb3 := testingutil.MustOpenSQLDB(t, dbPath)
+	defer sqldb3.Close()
+
+	var count int
+	if err := sqldb3.QueryRowContext(ctx, `SELECT COUNT(*) FROM test;`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+
+	// Should have 2 rows (1 and 2)
+	if count != 2 {
+		t.Fatalf("expected 2 rows in restored database, got %d", count)
+	}
+
+	// Verify the new row (value=2) exists
+	var exists bool
+	if err := sqldb3.QueryRowContext(ctx, `SELECT EXISTS(SELECT 1 FROM test WHERE col1 = 2);`).Scan(&exists); err != nil {
+		t.Fatal(err)
+	}
+	if !exists {
+		t.Fatal("new data (value=2) was not replicated - this is the bug in issue #781")
+	}
+
+	t.Log("Test passed: New data after restore was successfully replicated")
 }
 
 func TestReplica_CalcRestorePlan(t *testing.T) {
