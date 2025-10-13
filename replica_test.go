@@ -217,14 +217,16 @@ func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Restore again
+	// Restore to a path with non-existent parent directory to verify it gets created
+	restoredPath := dbDir + "/restored/db.sqlite"
+	restoreOpt.OutputPath = restoredPath
 	if err := db2.Replica.Restore(ctx, restoreOpt); err != nil {
 		t.Fatal(err)
 	}
-	t.Log("Step 4 complete: Second restore from backup")
+	t.Log("Step 4 complete: Second restore from backup to path with non-existent parent")
 
 	// Step 5: Verify the new data (value=2) exists in restored database
-	sqldb3 := testingutil.MustOpenSQLDB(t, dbPath)
+	sqldb3 := testingutil.MustOpenSQLDB(t, restoredPath)
 	defer sqldb3.Close()
 
 	var count int

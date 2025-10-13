@@ -7,11 +7,14 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sync"
 	"time"
 
 	"filippo.io/age"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default replica settings.
@@ -444,6 +447,15 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	if len(rdrs) == 0 {
 		return fmt.Errorf("no matching backup files available")
+	}
+
+	// Create parent directory if it doesn't exist.
+	var dirInfo os.FileInfo
+	if db := r.DB(); db != nil {
+		dirInfo = db.dirInfo
+	}
+	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
 	}
 
 	// Output to temp file & atomically rename.
