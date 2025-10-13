@@ -152,6 +152,12 @@ func TestReplicaClient_ConfigureEndpoint(t *testing.T) {
 			expectHTTPS:    true,
 		},
 		{
+			name:           "EndpointWithoutScheme",
+			endpoint:       "s3.us-west-002.backblazeb2.com",
+			forcePathStyle: false,
+			expectHTTPS:    true,
+		},
+		{
 			name:           "EmptyEndpoint",
 			endpoint:       "",
 			forcePathStyle: false,
