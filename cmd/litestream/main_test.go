@@ -234,8 +234,8 @@ func TestNewReplicaFromConfig_AgeEncryption(t *testing.T) {
 		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
 			t.Errorf("expected age encryption error, got: %v", err)
 		}
-		if !strings.Contains(err.Error(), "issue #790") {
-			t.Errorf("expected error to reference issue #790, got: %v", err)
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
 		}
 	})
 
@@ -252,6 +252,9 @@ func TestNewReplicaFromConfig_AgeEncryption(t *testing.T) {
 		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
 			t.Errorf("expected age encryption error, got: %v", err)
 		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
 	})
 
 	t.Run("RejectBoth", func(t *testing.T) {
@@ -267,6 +270,9 @@ func TestNewReplicaFromConfig_AgeEncryption(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
 			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
 		}
 	})
 

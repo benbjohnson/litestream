@@ -573,7 +573,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	// write plaintext data to remote storage instead of encrypted data.
 	// See: https://github.com/benbjohnson/litestream/issues/790
 	if len(c.Age.Identities) > 0 || len(c.Age.Recipients) > 0 {
-		return nil, fmt.Errorf("age encryption is not currently supported; configuration would be silently ignored resulting in plaintext data being written to remote storage (see issue #790)")
+		return nil, fmt.Errorf("age encryption is not currently supported, if you need encryption please revert back to Litestream v0.3.x")
 	}
 
 	// Build replica.
