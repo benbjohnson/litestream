@@ -210,9 +210,16 @@ func (c *ReplicaClient) configureEndpoint(opts *[]func(*s3.Options)) {
 	if c.Endpoint != "" {
 		*opts = append(*opts, func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
-			o.BaseEndpoint = aws.String(c.Endpoint)
+
+			endpoint := c.Endpoint
+			// Add scheme if not present
+			if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+				endpoint = "https://" + endpoint
+			}
+
+			o.BaseEndpoint = aws.String(endpoint)
 			// For MinIO and other S3-compatible services
-			if strings.HasPrefix(c.Endpoint, "http://") {
+			if strings.HasPrefix(endpoint, "http://") {
 				o.EndpointOptions.DisableHTTPS = true
 			}
 		})
