@@ -41,6 +41,7 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 type ReplicaClient struct {
 	mu     sync.Mutex
 	client *azblob.Client
+	logger *slog.Logger
 
 	// Azure credentials
 	AccountName string
@@ -54,7 +55,9 @@ type ReplicaClient struct {
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
-	return &ReplicaClient{}
+	return &ReplicaClient{
+		logger: slog.Default().WithGroup(ReplicaClientType),
+	}
 }
 
 // Type returns "abs" as the client type.
@@ -243,6 +246,9 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 	for _, info := range a {
 		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
+
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
+
 		_, err := c.client.DeleteBlob(ctx, c.Bucket, key, nil)
 		if isNotExists(err) {
 			continue

@@ -1543,9 +1543,9 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	}
 
 	for _, info := range deleted {
-		db.Logger.Debug("deleting ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-
 		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
 		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
 		}
@@ -1590,9 +1590,9 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 	}
 
 	for _, info := range deleted {
-		db.Logger.Debug("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-
 		localPath := db.LTXPath(level, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
 		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
 		}
