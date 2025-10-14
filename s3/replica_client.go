@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -51,6 +52,7 @@ type ReplicaClient struct {
 	mu       sync.Mutex
 	s3       *s3.Client // s3 service
 	uploader *manager.Uploader
+	logger   *slog.Logger
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -71,7 +73,9 @@ type ReplicaClient struct {
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
-	return &ReplicaClient{}
+	return &ReplicaClient{
+		logger: slog.Default().WithGroup(ReplicaClientType),
+	}
 }
 
 // Type returns "s3" as the client type.
@@ -390,6 +394,8 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		filename := ltx.FormatFilename(info.MinTXID, info.MaxTXID)
 		key := c.Path + "/" + fmt.Sprintf("%04x/%s", info.Level, filename)
 		objIDs = append(objIDs, types.ObjectIdentifier{Key: aws.String(key)})
+
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 	}
 
 	// Delete in batches

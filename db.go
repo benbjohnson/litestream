@@ -1537,12 +1537,18 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion.
-	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-	}
+	// Remove all files marked for deletion from both remote and local storage.
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
+		}
 	}
 
 	return minSnapshotTXID, nil
@@ -1578,12 +1584,18 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion.
-	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-	}
+	// Remove all files marked for deletion from both remote and local storage.
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(level, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
+		}
 	}
 
 	return nil

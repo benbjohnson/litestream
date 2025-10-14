@@ -757,3 +757,88 @@ func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 		t.Error("L1 file timestamp should preserve last source file timestamp")
 	}
 }
+
+func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	replicaPath := filepath.Join(t.TempDir(), "replica")
+	client := file.NewReplicaClient(replicaPath)
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	type localFile struct {
+		path    string
+		minTXID ltx.TXID
+		maxTXID ltx.TXID
+	}
+	var firstBatchL0Files []localFile
+
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (val) VALUES (?)`, fmt.Sprintf("batch1-value-%d", i)); err != nil {
+			t.Fatalf("insert batch1 %d: %v", i, err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync db batch1 %d: %v", i, err)
+		}
+
+		minTXID, maxTXID, err := db.MaxLTX()
+		if err != nil {
+			t.Fatalf("get max ltx: %v", err)
+		}
+		localPath := db.LTXPath(0, minTXID, maxTXID)
+		firstBatchL0Files = append(firstBatchL0Files, localFile{
+			path:    localPath,
+			minTXID: minTXID,
+			maxTXID: maxTXID,
+		})
+
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatalf("sync replica batch1 %d: %v", i, err)
+		}
+	}
+
+	for _, lf := range firstBatchL0Files {
+		if _, err := os.Stat(lf.path); os.IsNotExist(err) {
+			t.Fatalf("local L0 file should exist before first compaction: %s", lf.path)
+		}
+	}
+
+	if _, err := db.Compact(ctx, 1); err != nil {
+		t.Fatalf("compact batch1 to L1: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (val) VALUES (?)`, fmt.Sprintf("batch2-value-%d", i)); err != nil {
+			t.Fatalf("insert batch2 %d: %v", i, err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync db batch2 %d: %v", i, err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatalf("sync replica batch2 %d: %v", i, err)
+		}
+	}
+
+	secondCompactInfo, err := db.Compact(ctx, 1)
+	if err != nil {
+		t.Fatalf("compact batch2 to L1: %v", err)
+	}
+
+	for _, lf := range firstBatchL0Files {
+		if lf.maxTXID < secondCompactInfo.MinTXID {
+			if _, err := os.Stat(lf.path); err == nil {
+				t.Errorf("local L0 file should be removed after second compaction: %s (maxTXID=%s < minTXID=%s)",
+					lf.path, lf.maxTXID, secondCompactInfo.MinTXID)
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("unexpected error checking local file: %v", err)
+			}
+		}
+	}
+}

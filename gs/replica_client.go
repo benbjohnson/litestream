@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path"
 	"sync"
@@ -32,6 +33,7 @@ type ReplicaClient struct {
 	mu     sync.Mutex
 	client *storage.Client       // gs client
 	bkt    *storage.BucketHandle // gs bucket handle
+	logger *slog.Logger
 
 	// GS bucket information
 	Bucket string
@@ -40,7 +42,9 @@ type ReplicaClient struct {
 
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
-	return &ReplicaClient{}
+	return &ReplicaClient{
+		logger: slog.Default().WithGroup(ReplicaClientType),
+	}
 }
 
 // Type returns "gs" as the client type.
@@ -190,6 +194,9 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 	for _, info := range a {
 		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
+
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
+
 		if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
 			return fmt.Errorf("gs: cannot delete ltx file %q: %w", key, err)
 		}

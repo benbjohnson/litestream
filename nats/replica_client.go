@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"sort"
 	"strconv"
@@ -31,7 +32,8 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to NATS JetStream Object Store.
 type ReplicaClient struct {
-	mu sync.Mutex
+	mu     sync.Mutex
+	logger *slog.Logger
 
 	// NATS connection and JetStream context
 	nc          *nats.Conn
@@ -72,6 +74,7 @@ type ReplicaClient struct {
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
+		logger:           slog.Default().WithGroup(ReplicaClientType),
 		MaxReconnects:    -1, // Unlimited
 		ReconnectWait:    2 * time.Second,
 		Timeout:          10 * time.Second,
@@ -394,6 +397,8 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 	for _, fileInfo := range a {
 		objectPath := c.ltxPath(fileInfo.Level, fileInfo.MinTXID, fileInfo.MaxTXID)
+
+		c.logger.Debug("deleting ltx file", "level", fileInfo.Level, "minTXID", fileInfo.MinTXID, "maxTXID", fileInfo.MaxTXID, "path", objectPath)
 
 		if err := c.objectStore.Delete(ctx, objectPath); err != nil {
 			if !isNotFoundError(err) {
