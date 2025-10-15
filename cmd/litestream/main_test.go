@@ -696,3 +696,270 @@ func TestConfig_DefaultValues(t *testing.T) {
 		t.Errorf("expected default snapshot retention of 24h, got %v", *config.Snapshot.Retention)
 	}
 }
+
+// TestParseByteSize tests the parseByteSize function with various inputs.
+func TestParseByteSize(t *testing.T) {
+	tests := []struct {
+		input   string
+		want    int64
+		wantErr bool
+	}{
+		// Valid sizes
+		{"1MB", 1024 * 1024, false},
+		{"5MB", 5 * 1024 * 1024, false},
+		{"1024KB", 1024 * 1024, false},
+		{"1GB", 1024 * 1024 * 1024, false},
+		{"1.5MB", int64(1.5 * 1024 * 1024), false},
+		{"100B", 100, false},
+		{"100", 100, false}, // No unit defaults to bytes
+
+		// Case insensitive
+		{"1mb", 1024 * 1024, false},
+		{"5Mb", 5 * 1024 * 1024, false},
+
+		// Short form
+		{"1M", 1024 * 1024, false},
+		{"1K", 1024, false},
+		{"1G", 1024 * 1024 * 1024, false},
+
+		// With spaces
+		{"1 MB", 1024 * 1024, false},
+		{"5 MB", 5 * 1024 * 1024, false},
+
+		// Invalid inputs
+		{"", 0, true},
+		{"MB", 0, true},
+		{"invalid", 0, true},
+		{"1XB", 0, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, err := main.ParseByteSize(tt.input)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("parseByteSize(%q) error = %v, wantErr %v", tt.input, err, tt.wantErr)
+				return
+			}
+			if !tt.wantErr && got != tt.want {
+				t.Errorf("parseByteSize(%q) = %v, want %v", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestS3ReplicaConfig_PartSizeAndConcurrency tests that part-size and concurrency
+// configuration values are properly parsed from YAML and applied to the S3 client.
+// This test addresses issue #747 where Backblaze B2's 1MB chunk size limit was
+// being exceeded due to part-size not being honored.
+func TestS3ReplicaConfig_PartSizeAndConcurrency(t *testing.T) {
+	t.Run("WithPartSize", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        part-size: 1MB
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 || len(config.DBs[0].Replicas) != 1 {
+			t.Fatal("expected one database with one replica")
+		}
+
+		replicaConfig := config.DBs[0].Replicas[0]
+		if replicaConfig.PartSize == nil {
+			t.Fatal("expected part-size to be set")
+		}
+		if got, want := int64(*replicaConfig.PartSize), int64(1024*1024); got != want {
+			t.Errorf("PartSize = %d, want %d", got, want)
+		}
+
+		// Test that the value is properly applied to the client
+		r, err := main.NewReplicaFromConfig(replicaConfig, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+
+		if got, want := client.PartSize, int64(1024*1024); got != want {
+			t.Errorf("client.PartSize = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("WithConcurrency", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        concurrency: 10
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 || len(config.DBs[0].Replicas) != 1 {
+			t.Fatal("expected one database with one replica")
+		}
+
+		replicaConfig := config.DBs[0].Replicas[0]
+		if replicaConfig.Concurrency == nil {
+			t.Fatal("expected concurrency to be set")
+		}
+		if got, want := *replicaConfig.Concurrency, 10; got != want {
+			t.Errorf("Concurrency = %d, want %d", got, want)
+		}
+
+		// Test that the value is properly applied to the client
+		r, err := main.NewReplicaFromConfig(replicaConfig, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+
+		if got, want := client.Concurrency, 10; got != want {
+			t.Errorf("client.Concurrency = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("WithBoth", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+        part-size: 1MB
+        concurrency: 10
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 || len(config.DBs[0].Replicas) != 1 {
+			t.Fatal("expected one database with one replica")
+		}
+
+		replicaConfig := config.DBs[0].Replicas[0]
+
+		// Verify both values are parsed
+		if replicaConfig.PartSize == nil {
+			t.Fatal("expected part-size to be set")
+		}
+		if got, want := int64(*replicaConfig.PartSize), int64(1024*1024); got != want {
+			t.Errorf("PartSize = %d, want %d", got, want)
+		}
+
+		if replicaConfig.Concurrency == nil {
+			t.Fatal("expected concurrency to be set")
+		}
+		if got, want := *replicaConfig.Concurrency, 10; got != want {
+			t.Errorf("Concurrency = %d, want %d", got, want)
+		}
+
+		// Test that both values are properly applied to the client
+		r, err := main.NewReplicaFromConfig(replicaConfig, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+
+		if got, want := client.PartSize, int64(1024*1024); got != want {
+			t.Errorf("client.PartSize = %d, want %d", got, want)
+		}
+		if got, want := client.Concurrency, 10; got != want {
+			t.Errorf("client.Concurrency = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("NotSpecified", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /path/to/db
+    replicas:
+      - type: s3
+        bucket: mybucket
+        path: mypath
+        region: us-east-1
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 || len(config.DBs[0].Replicas) != 1 {
+			t.Fatal("expected one database with one replica")
+		}
+
+		replicaConfig := config.DBs[0].Replicas[0]
+
+		// When not specified, should be nil
+		if replicaConfig.PartSize != nil {
+			t.Errorf("expected PartSize to be nil when not specified, got %v", *replicaConfig.PartSize)
+		}
+		if replicaConfig.Concurrency != nil {
+			t.Errorf("expected Concurrency to be nil when not specified, got %v", *replicaConfig.Concurrency)
+		}
+
+		// Test that the client is created successfully without these values
+		r, err := main.NewReplicaFromConfig(replicaConfig, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("expected S3 replica client")
+		}
+
+		// When not specified, client should have default (0) values
+		// The AWS SDK will use its own defaults
+		if got, want := client.PartSize, int64(0); got != want {
+			t.Errorf("client.PartSize = %d, want %d (AWS SDK default will be used)", got, want)
+		}
+		if got, want := client.Concurrency, 0; got != want {
+			t.Errorf("client.Concurrency = %d, want %d (AWS SDK default will be used)", got, want)
+		}
+	})
+}

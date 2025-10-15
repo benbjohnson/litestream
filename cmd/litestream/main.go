@@ -509,6 +509,69 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	return db, nil
 }
 
+// ByteSize is a custom type for parsing byte sizes from YAML.
+// It supports formats like "1MB", "5MB", "1024KB", etc.
+type ByteSize int64
+
+// UnmarshalYAML implements yaml.Unmarshaler for ByteSize.
+func (b *ByteSize) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+
+	size, err := ParseByteSize(s)
+	if err != nil {
+		return err
+	}
+	*b = ByteSize(size)
+	return nil
+}
+
+// ParseByteSize parses a byte size string like "1MB", "5MB", "1024KB", etc.
+func ParseByteSize(s string) (int64, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0, fmt.Errorf("empty size string")
+	}
+
+	// Find where the numeric part ends
+	i := 0
+	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
+		i++
+	}
+
+	if i == 0 {
+		return 0, fmt.Errorf("invalid size format: %s", s)
+	}
+
+	numStr := s[:i]
+	unit := strings.TrimSpace(s[i:])
+
+	var num float64
+	if _, err := fmt.Sscanf(numStr, "%f", &num); err != nil {
+		return 0, fmt.Errorf("invalid number in size: %s", s)
+	}
+
+	var multiplier int64
+	switch strings.ToUpper(unit) {
+	case "B", "":
+		multiplier = 1
+	case "KB", "K":
+		multiplier = 1024
+	case "MB", "M":
+		multiplier = 1024 * 1024
+	case "GB", "G":
+		multiplier = 1024 * 1024 * 1024
+	case "TB", "T":
+		multiplier = 1024 * 1024 * 1024 * 1024
+	default:
+		return 0, fmt.Errorf("unknown size unit: %s", unit)
+	}
+
+	return int64(num * float64(multiplier)), nil
+}
+
 // ReplicaConfig represents the configuration for a single replica in a database.
 type ReplicaConfig struct {
 	Type               string         `yaml:"type"` // "file", "s3"
@@ -519,13 +582,15 @@ type ReplicaConfig struct {
 	ValidationInterval *time.Duration `yaml:"validation-interval"`
 
 	// S3 settings
-	AccessKeyID     string `yaml:"access-key-id"`
-	SecretAccessKey string `yaml:"secret-access-key"`
-	Region          string `yaml:"region"`
-	Bucket          string `yaml:"bucket"`
-	Endpoint        string `yaml:"endpoint"`
-	ForcePathStyle  *bool  `yaml:"force-path-style"`
-	SkipVerify      bool   `yaml:"skip-verify"`
+	AccessKeyID     string    `yaml:"access-key-id"`
+	SecretAccessKey string    `yaml:"secret-access-key"`
+	Region          string    `yaml:"region"`
+	Bucket          string    `yaml:"bucket"`
+	Endpoint        string    `yaml:"endpoint"`
+	ForcePathStyle  *bool     `yaml:"force-path-style"`
+	SkipVerify      bool      `yaml:"skip-verify"`
+	PartSize        *ByteSize `yaml:"part-size"`
+	Concurrency     *int      `yaml:"concurrency"`
 
 	// ABS settings
 	AccountName string `yaml:"account-name"`
@@ -722,6 +787,15 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+
+	// Apply upload configuration if specified.
+	if c.PartSize != nil {
+		client.PartSize = int64(*c.PartSize)
+	}
+	if c.Concurrency != nil {
+		client.Concurrency = *c.Concurrency
+	}
+
 	return client, nil
 }
 
