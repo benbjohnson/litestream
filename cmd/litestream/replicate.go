@@ -87,8 +87,10 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 			}
 			syncInterval := litestream.DefaultSyncInterval
 			dbConfig.Replicas = append(dbConfig.Replicas, &ReplicaConfig{
-				URL:          u,
-				SyncInterval: &syncInterval,
+				URL: u,
+				ReplicaSettings: ReplicaSettings{
+					SyncInterval: &syncInterval,
+				},
 			})
 		}
 		c.Config.DBs = []*DBConfig{dbConfig}
