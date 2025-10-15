@@ -3,8 +3,14 @@
 /dist
 .vscode
 
-# Claude-related files
-.claude/
+# Claude-related files (force include despite global gitignore)
+!.claude/
+!.claude/**
+# But ignore logs, hooks, and local settings
+.claude/logs/
+.claude/hooks/
+.claude/settings.local.json
+# Keep CLAUDE.md ignored as it's auto-loaded by Claude Code
 CLAUDE.md
 
 # Binary

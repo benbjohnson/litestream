@@ -1,0 +1,53 @@
+# .aiexclude - Files to exclude from Gemini Code Assist
+# This file works like .gitignore for AI context
+
+# Sensitive files
+*.key
+*.pem
+*.secret
+.env
+.env.*
+
+# Build artifacts
+bin/
+dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test databases
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+
+# Large test files
+testdata/large/
+*.ltx
+
+# Vendor directories
+vendor/
+
+# Generated files
+*.pb.go
+*_generated.go
+
+# Documentation that's redundant with AGENTS.md
+docs/RELEASE.md
+
+# CI/CD configs that aren't relevant for code understanding
+.github/workflows/release.yml
+.goreleaser.yml
+
+# Temporary and backup files
+*.tmp
+*.bak
+*.swp
+*~
+
+# OS-specific files
+.DS_Store
+Thumbs.db
