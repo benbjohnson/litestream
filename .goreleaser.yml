@@ -77,24 +77,23 @@ nfpms:
       {{- else }}{{ .Arch }}{{ end }}
       {{- if .Arm }}v{{ .Arm }}{{ end }}
 
-brews:
-  - name: litestream
-    homepage: https://litestream.io
-    description: Streaming replication for SQLite databases
-    license: Apache-2.0
-    repository:
-      owner: benbjohnson
-      name: homebrew-litestream
-      branch: main
-    directory: Formula
-    install: |
-      bin.install "litestream"
-      etc.install "etc/litestream.yml" => "litestream.yml"
-    test: |
-      system "#{bin}/litestream", "version"
-    commit_author:
-      name: goreleaser
-      email: bot@goreleaser.com
+#brews:
+#  - name: litestream
+#    homepage: https://litestream.io
+#    description: Streaming replication for SQLite databases
+#    license: Apache-2.0
+#    repository:
+#      owner: benbjohnson
+#      name: homebrew-litestream
+#      branch: main
+#      install: |
+#      bin.install "litestream"
+#      etc.install "etc/litestream.yml" => "litestream.yml"
+#    test: |
+#      system "#{bin}/litestream", "version"
+#    commit_author:
+#      name: goreleaser
+#      email: bot@goreleaser.com
 
 checksum:
   name_template: 'checksums.txt'
@@ -150,21 +149,21 @@ release:
     ### Binary installation
     Download the appropriate archive for your platform, extract, and move to your PATH.
 
-# Signing configuration - uncomment after setting up certificates (see issue #733)
-# signs:
-#   - id: macos
-#     cmd: gon
-#     args:
-#       - "{{ .ProjectPath }}/gon-sign.hcl"
-#     artifacts: archive
-#     ids:
-#       - main
-#     signature: "${artifact}.zip"
-#     output: true
-#     env:
-#       - APPLE_DEVELOPER_ID_APPLICATION={{ .Env.APPLE_DEVELOPER_ID }}
-#       - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
-#       - AC_PASSWORD={{ .Env.AC_PASSWORD }}
+  # Signing configuration
+  # signs:
+  #   - id: macos
+  #     cmd: gon
+  #     args:
+  #       - "{{ .ProjectPath }}/gon-sign.hcl"
+  #     artifacts: archive
+  #     ids:
+  #       - main
+  #     signature: "${artifact}.zip"
+  #     output: true
+  #     env:
+  #       - APPLE_DEVELOPER_ID_APPLICATION={{ .Env.APPLE_DEVELOPER_ID }}
+  #       - APPLE_DEVELOPER_TEAM_ID={{ .Env.APPLE_TEAM_ID }}
+  #       - AC_PASSWORD={{ .Env.AC_PASSWORD }}
 
 sboms:
   - artifacts: archive

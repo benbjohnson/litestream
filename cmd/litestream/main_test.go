@@ -239,6 +239,77 @@ func TestNewSFTPReplicaFromConfig(t *testing.T) {
 	}
 }
 
+// TestNewReplicaFromConfig_AgeEncryption verifies that age encryption configuration is rejected.
+// Age encryption is currently non-functional and would silently write plaintext data.
+// See: https://github.com/benbjohnson/litestream/issues/790
+func TestNewReplicaFromConfig_AgeEncryption(t *testing.T) {
+	t.Run("RejectIdentities", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+		config.Age.Identities = []string{"AGE-SECRET-KEY-1EXAMPLE"}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err == nil {
+			t.Fatal("expected error when age identities are configured")
+		}
+		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
+			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
+	})
+
+	t.Run("RejectRecipients", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+		config.Age.Recipients = []string{"age1example"}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err == nil {
+			t.Fatal("expected error when age recipients are configured")
+		}
+		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
+			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
+	})
+
+	t.Run("RejectBoth", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+		config.Age.Identities = []string{"AGE-SECRET-KEY-1EXAMPLE"}
+		config.Age.Recipients = []string{"age1example"}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err == nil {
+			t.Fatal("expected error when both age identities and recipients are configured")
+		}
+		if !strings.Contains(err.Error(), "age encryption is not currently supported") {
+			t.Errorf("expected age encryption error, got: %v", err)
+		}
+		if !strings.Contains(err.Error(), "revert back to Litestream v0.3.x") {
+			t.Errorf("expected error to reference v0.3.x, got: %v", err)
+		}
+	})
+
+	t.Run("AllowEmpty", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://foo/bar",
+		}
+
+		_, err := main.NewReplicaFromConfig(config, nil)
+		if err != nil {
+			t.Fatalf("unexpected error when age configuration is not present: %v", err)
+		}
+	})
+}
+
 // TestConfig_Validate_SnapshotIntervals tests validation of snapshot intervals
 func TestConfig_Validate_SnapshotIntervals(t *testing.T) {
 	t.Run("ValidInterval", func(t *testing.T) {
@@ -582,15 +653,18 @@ dbs:
 		}
 
 		// When levels are not specified, defaults should be applied
-		if len(config.Levels) != 2 {
-			t.Fatalf("expected 2 default compaction levels, got %d", len(config.Levels))
+		if len(config.Levels) != 3 {
+			t.Fatalf("expected 3 default compaction levels, got %d", len(config.Levels))
 		}
 
-		// Check default intervals: 5m and 1h
-		if config.Levels[0].Interval != 5*time.Minute {
+		// Check default intervals: 30s, 5m and 1h
+		if config.Levels[0].Interval != 30*time.Second {
 			t.Errorf("expected default level[0] interval of 5m, got %v", config.Levels[0].Interval)
 		}
-		if config.Levels[1].Interval != 1*time.Hour {
+		if config.Levels[1].Interval != 5*time.Minute {
+			t.Errorf("expected default level[0] interval of 5m, got %v", config.Levels[0].Interval)
+		}
+		if config.Levels[2].Interval != 1*time.Hour {
 			t.Errorf("expected default level[1] interval of 1h, got %v", config.Levels[1].Interval)
 		}
 	})

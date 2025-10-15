@@ -39,6 +39,11 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
+      - name: Install Syft for SBOM generation
+        uses: anchore/sbom-action/download-syft@v0
+        with:
+          syft-version: latest
+
       - name: Import GPG key
         if: ${{ env.GPG_PRIVATE_KEY != '' }}
         id: import_gpg
@@ -57,9 +62,6 @@ jobs:
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
           HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
 
-  # Signing jobs - uncomment after setting up certificates (see issue #733)
-  # Instructions: https://github.com/benbjohnson/litestream/issues/733
-  #
   # macos-sign:
   #   runs-on: macos-latest
   #   needs: goreleaser
@@ -69,18 +71,18 @@ jobs:
   #   steps:
   #     - name: Checkout
   #       uses: actions/checkout@v4
-  #
+
   #     - name: Set up Go
   #       uses: actions/setup-go@v5
   #       with:
   #         go-version-file: go.mod
-  #
+
   #     - name: Download release artifacts
   #       uses: actions/download-artifact@v4
   #       with:
   #         name: litestream-darwin-${{ matrix.arch }}
   #         path: dist/
-  #
+
   #     - name: Import Apple Developer Certificate
   #       env:
   #         MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE_P12 }}
@@ -92,7 +94,7 @@ jobs:
   #         security unlock-keychain -p actions temp.keychain
   #         security import certificate.p12 -k temp.keychain -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
   #         security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions temp.keychain
-  #
+
   #     - name: Sign and Notarize
   #       env:
   #         APPLE_API_KEY: ${{ secrets.APPLE_API_KEY_P8 }}
@@ -101,13 +103,13 @@ jobs:
   #         AC_PASSWORD: ${{ secrets.AC_PASSWORD }}
   #       run: |
   #         gon etc/gon-${{ matrix.arch }}.hcl
-  #
+
   #     - name: Upload signed binary
   #       env:
   #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   #       run: |
   #         gh release upload ${{ github.ref_name }} dist/litestream-*-darwin-${{ matrix.arch }}.zip
-  #
+
   # windows-sign:
   #   runs-on: windows-latest
   #   needs: goreleaser

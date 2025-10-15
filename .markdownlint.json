@@ -1,0 +1,12 @@
+{
+  "default": true,
+  "MD013": false,
+  "MD024": false,
+  "MD026": false,
+  "MD031": false,
+  "MD032": false,
+  "MD033": {
+    "allowed_elements": ["br", "kbd", "sub", "sup"]
+  },
+  "MD041": false
+}

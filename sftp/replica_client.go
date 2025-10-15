@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -35,6 +36,7 @@ type ReplicaClient struct {
 	mu         sync.Mutex
 	sshClient  *ssh.Client
 	sftpClient *sftp.Client
+	logger     *slog.Logger
 
 	// SFTP connection info
 	Host        string
@@ -53,6 +55,7 @@ type ReplicaClient struct {
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
+		logger:           slog.Default().WithGroup(ReplicaClientType),
 		DialTimeout:      DefaultDialTimeout,
 		ConcurrentWrites: true, // Default to true for better performance
 	}
@@ -180,7 +183,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all available LTX files for a level.
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (_ ltx.FileIterator, err error) {
+// SFTP uses file ModTime for timestamps, which is set via Chtimes() to preserve original timestamp.
+// The useMetadata parameter is ignored since ModTime always contains the accurate timestamp.
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.Init(ctx)
@@ -211,7 +216,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) 
 			MinTXID:   minTXID,
 			MaxTXID:   maxTXID,
 			Size:      fi.Size(),
-			CreatedAt: fi.ModTime().UTC(),
+			CreatedAt: fi.ModTime().UTC(), // ModTime contains accurate timestamp from Chtimes()
 		})
 	}
 
@@ -228,7 +233,20 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	startTime := time.Now()
+
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	teeReader := io.TeeReader(rd, &buf)
+
+	// Extract timestamp from LTX header
+	hdr, _, err := ltx.PeekHeader(teeReader)
+	if err != nil {
+		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+
+	// Combine buffered data with rest of reader
+	fullReader := io.MultiReader(&buf, rd)
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
 		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
@@ -240,11 +258,16 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	defer f.Close()
 
-	n, err := io.Copy(f, rd)
+	n, err := io.Copy(f, fullReader)
 	if err != nil {
 		return nil, err
 	} else if err := f.Close(); err != nil {
 		return nil, err
+	}
+
+	// Set file ModTime to preserve original timestamp
+	if err := sftpClient.Chtimes(filename, timestamp, timestamp); err != nil {
+		return nil, fmt.Errorf("sftp: cannot set file timestamps: %w", err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
@@ -255,7 +278,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
 		Size:      n,
-		CreatedAt: startTime.UTC(),
+		CreatedAt: timestamp,
 	}, nil
 }
 
@@ -300,6 +323,9 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
+
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
+
 		if err := sftpClient.Remove(filename); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("sftp: cannot delete ltx file %q: %w", filename, err)
 		}

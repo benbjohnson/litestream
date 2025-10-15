@@ -449,6 +449,14 @@ func (db *DB) init(ctx context.Context) (err error) {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
+	// Check if database is behind replica (issue #781).
+	// This must happen before replica.Start() to detect restore scenarios.
+	if db.Replica != nil {
+		if err := db.checkDatabaseBehindReplica(ctx); err != nil {
+			return fmt.Errorf("check database behind replica: %w", err)
+		}
+	}
+
 	// If we have an existing replication files, ensure the headers match.
 	// if err := db.verifyHeadersMatch(); err != nil {
 	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
@@ -645,9 +653,93 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	return err
 }
 
+// checkDatabaseBehindReplica detects when a database has been restored to an
+// earlier state and the replica has a higher TXID. This handles issue #781.
+//
+// If detected, it clears local L0 files and fetches the latest L0 LTX file
+// from the replica to establish a baseline. The next DB.sync() will detect
+// the mismatch and trigger a snapshot at the current database state.
+func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
+	// Get database position from local L0 files
+	dbPos, err := db.Pos()
+	if err != nil {
+		return fmt.Errorf("get database position: %w", err)
+	}
+
+	// Get replica position from remote
+	replicaInfo, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		return fmt.Errorf("get replica position: %w", err)
+	} else if replicaInfo.MaxTXID == 0 {
+		return nil // No remote replica data yet
+	}
+
+	// Check if database is behind replica
+	if dbPos.TXID >= replicaInfo.MaxTXID {
+		return nil // Database is ahead or equal
+	}
+
+	db.Logger.Info("detected database behind replica",
+		"db_txid", dbPos.TXID,
+		"replica_txid", replicaInfo.MaxTXID)
+
+	// Clear local L0 files
+	l0Dir := db.LTXLevelDir(0)
+	if err := os.RemoveAll(l0Dir); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove L0 directory: %w", err)
+	}
+	if err := internal.MkdirAll(l0Dir, db.dirInfo); err != nil {
+		return fmt.Errorf("recreate L0 directory: %w", err)
+	}
+
+	// Fetch latest L0 LTX file from replica
+	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
+	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open remote L0 file: %w", err)
+	}
+	defer func() { _ = reader.Close() }()
+
+	// Write to temp file and atomically rename
+	localPath := db.LTXPath(0, minTXID, maxTXID)
+	tmpPath := localPath + ".tmp"
+
+	tmpFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create temp L0 file: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpPath) }() // Clean up temp file on error
+
+	if _, err := io.Copy(tmpFile, reader); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("copy L0 file: %w", err)
+	}
+
+	if err := tmpFile.Sync(); err != nil {
+		_ = tmpFile.Close()
+		return fmt.Errorf("sync L0 file: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("close L0 file: %w", err)
+	}
+
+	// Atomically rename temp file to final path
+	if err := os.Rename(tmpPath, localPath); err != nil {
+		return fmt.Errorf("rename L0 file: %w", err)
+	}
+
+	db.Logger.Info("fetched latest L0 file from replica",
+		"min_txid", minTXID,
+		"max_txid", maxTXID)
+
+	return nil
+}
+
 // verify ensures the current LTX state matches where it left off from
 // the real WAL. Check info.ok if verification was successful.
 func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
 	pos, err := db.Pos()
@@ -689,46 +781,53 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	}
 	salt1 := binary.BigEndian.Uint32(hdr0[16:])
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
+	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
 
-	if salt1 != dec.Header().WALSalt1 || salt2 != dec.Header().WALSalt2 {
+	// If offset is at the beginning of the first page, we can't check for previous page.
+	prevWALOffset := info.offset - frameSize
+	slog.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
+
+	if prevWALOffset == WALHeaderSize {
+		if saltMatch { // No writes occurred since last sync, salt still matches
+			info.snapshotting = false
+			return info, nil
+		}
+		// Salt has changed but we don't know if writes occurred since last sync
+		info.reason = "wal header salt reset, snapshotting"
+		return info, nil
+	} else if prevWALOffset < WALHeaderSize {
+		return info, fmt.Errorf("prev WAL offset is less than the header size: %d", prevWALOffset)
+	}
+
+	// If we can't verify the last page is in the last LTX file, then we need to snapshot.
+	lastPageMatch, err := db.lastPageMatch(ctx, dec, prevWALOffset, frameSize)
+	if err != nil {
+		return info, fmt.Errorf("last page match: %w", err)
+	} else if !lastPageMatch {
+		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
+		return info, nil
+	}
+
+	slog.Debug("verify.2", "lastPageMatch", lastPageMatch)
+
+	// Salt has changed which could indicate a FULL checkpoint.
+	// If we have a last page match, then we can assume that the WAL has not been overwritten.
+	if !saltMatch {
 		db.Logger.Log(ctx, internal.LevelTrace, "wal restarted",
 			"salt1", salt1,
 			"salt2", salt2)
 
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
-		info.snapshotting = false
-		return info, nil
-	}
 
-	// If offset is at the beginning of the first page, we can't check for previous page.
-	frameSize := int64(db.pageSize + WALFrameHeaderSize)
-	prevWALOffset := info.offset - frameSize
-	if prevWALOffset <= 0 {
-		info.snapshotting = false
-		return info, nil
-	}
+		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {dec.Header().WALSalt1, dec.Header().WALSalt2}}); err != nil {
+			return info, fmt.Errorf("detect full checkpoint: %w", err)
+		} else if detected {
+			info.reason = "full or restart checkpoint detected, snapshotting"
+		} else {
+			info.snapshotting = false
+		}
 
-	// Verify last page exists in latest LTX file.
-	buf, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
-	if err != nil {
-		return info, fmt.Errorf("cannot read last synced wal page: %w", err)
-	}
-	pgno := binary.BigEndian.Uint32(buf[0:])
-	fsalt1 := binary.BigEndian.Uint32(buf[8:])
-	fsalt2 := binary.BigEndian.Uint32(buf[12:])
-
-	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
-		info.reason = "frame salt mismatch, wal overwritten by another process"
-		return info, nil
-	}
-
-	// Verify that the last page in the WAL exists in the last LTX file.
-	if ok, err := db.ltxDecoderContains(dec, pgno, buf[WALFrameHeaderSize:]); err != nil {
-		return info, fmt.Errorf("ltx contains: %w", err)
-	} else if !ok {
-		db.Logger.Log(ctx, internal.LevelTrace, "cannot find last page in last ltx file", "pgno", pgno, "offset", prevWALOffset)
-		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
 
@@ -737,24 +836,75 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	return info, nil
 }
 
-func (db *DB) ltxDecoderContains(dec *ltx.Decoder, pgno uint32, data []byte) (bool, error) {
+// lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
+func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
+	if prevWALOffset <= WALHeaderSize {
+		return false, nil
+	}
+
+	frame, err := readWALFileAt(db.WALPath(), prevWALOffset, frameSize)
+	if err != nil {
+		return false, fmt.Errorf("cannot read last synced wal page: %w", err)
+	}
+	pgno := binary.BigEndian.Uint32(frame[0:])
+	fsalt1 := binary.BigEndian.Uint32(frame[8:])
+	fsalt2 := binary.BigEndian.Uint32(frame[12:])
+	data := frame[WALFrameHeaderSize:]
+
+	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
+		return false, nil
+	}
+
+	// Verify that the last page in the WAL exists in the last LTX file.
 	buf := make([]byte, dec.Header().PageSize)
 	for {
 		var hdr ltx.PageHeader
 		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
-			return false, nil
+			return false, nil // page not found in LTX file
 		} else if err != nil {
 			return false, fmt.Errorf("decode ltx page: %w", err)
 		}
 
 		if pgno != hdr.Pgno {
-			continue
+			continue // page number doesn't match
 		}
 		if !bytes.Equal(data, buf) {
-			continue
+			continue // page data doesn't match
 		}
-		return true, nil
+		return true, nil // Page matches
 	}
+}
+
+// detectFullCheckpoint attempts to detect checks if a FULL or RESTART checkpoint
+// has occurred and we may have missed some frames.
+func (db *DB) detectFullCheckpoint(ctx context.Context, knownSalts [][2]uint32) (bool, error) {
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		return false, fmt.Errorf("open wal file: %w", err)
+	}
+	defer walFile.Close()
+
+	var lastKnownSalt [2]uint32
+	if len(knownSalts) > 0 {
+		lastKnownSalt = knownSalts[len(knownSalts)-1]
+	}
+
+	rd, err := NewWALReader(walFile, db.Logger)
+	if err != nil {
+		return false, fmt.Errorf("new wal reader: %w", err)
+	}
+	m, err := rd.FrameSaltsUntil(ctx, lastKnownSalt)
+	if err != nil {
+		return false, fmt.Errorf("frame salts until: %w", err)
+	}
+
+	// Remove known salts from the map.
+	for _, salt := range knownSalts {
+		delete(m, salt)
+	}
+
+	// If we have more than one unknown salt, then we have a FULL or RESTART checkpoint.
+	return len(m) >= 1, nil
 }
 
 type syncInfo struct {
@@ -1248,7 +1398,8 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	seekTXID := prevMaxInfo.MaxTXID + 1
 
 	// Collect files after last compaction.
-	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID)
+	// Normal operation - use fast timestamps
+	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID, false)
 	if err != nil {
 		return nil, fmt.Errorf("source ltx files after %s: %w", seekTXID, err)
 	}
@@ -1275,6 +1426,17 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 		}
 		if maxTXID == 0 || info.MaxTXID > maxTXID {
 			maxTXID = info.MaxTXID
+		}
+
+		// Prefer the on-disk LTX file when available so compaction is not subject
+		// to eventual consistency quirks of remote storage providers. Fallback to
+		// downloading the file from the replica client if the local copy has been
+		// removed.
+		if f, err := os.Open(db.LTXPath(srcLevel, info.MinTXID, info.MaxTXID)); err == nil {
+			rdrs = append(rdrs, f)
+			continue
+		} else if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("open local ltx file: %w", err)
 		}
 
 		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
@@ -1311,7 +1473,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 
 	// If this is L1, clean up L0 files that are below the minTXID.
 	if dstLevel == 1 {
-		if err := db.EnforceRetentionByTXID(ctx, 0, maxTXID); err != nil {
+		if err := db.EnforceRetentionByTXID(ctx, 0, minTXID); err != nil {
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				db.Logger.Error("enforce L0 retention", "error", err)
@@ -1344,7 +1506,8 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time) (minSnapshotTXID ltx.TXID, err error) {
 	db.Logger.Debug("enforcing snapshot retention", "timestamp", timestamp)
 
-	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0)
+	// Normal operation - use fast timestamps
+	itr, err := db.Replica.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
 	if err != nil {
 		return 0, fmt.Errorf("fetch ltx files: %w", err)
 	}
@@ -1374,12 +1537,18 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion.
-	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-	}
+	// Remove all files marked for deletion from both remote and local storage.
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
+		}
 	}
 
 	return minSnapshotTXID, nil
@@ -1390,7 +1559,8 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) (err error) {
 	db.Logger.Debug("enforcing retention", "level", level, "txid", txID)
 
-	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0)
+	// Normal operation - use fast timestamps
+	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch ltx files: %w", err)
 	}
@@ -1414,12 +1584,18 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion.
-	for _, info := range deleted {
-		db.Logger.Info("deleting ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID)
-	}
+	// Remove all files marked for deletion from both remote and local storage.
 	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(level, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting local ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
+		}
 	}
 
 	return nil
