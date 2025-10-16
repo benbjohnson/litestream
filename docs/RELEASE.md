@@ -317,14 +317,7 @@ goreleaser release --skip=publish --clean
 
 ## Migration from Manual Process
 
-The old manual release process using Makefile targets and individual workflows has been replaced by GoReleaser. The following have been removed:
-
-- `make dist-linux` - replaced by `goreleaser build --snapshot --single-target`
-- `make dist-linux-arm` - replaced by `goreleaser build --snapshot --single-target`
-- `make dist-linux-arm64` - replaced by `goreleaser build --snapshot --single-target`
-- `make dist-macos` - replaced by `git tag vX.Y.Z && git push origin vX.Y.Z`
-- `.github/workflows/release.linux.yml`
-- Manual gon invocation for macOS
+The old manual release process using Makefile targets and individual workflows has been replaced by GoReleaser.
 
 ## Support and Issues
 
