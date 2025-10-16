@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/url"
 	"os"
 	"os/user"
@@ -17,6 +18,7 @@ import (
 	"time"
 
 	"filippo.io/age"
+	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
 	"gopkg.in/yaml.v2"
 	_ "modernc.org/sqlite"
@@ -510,7 +512,8 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 }
 
 // ByteSize is a custom type for parsing byte sizes from YAML.
-// It supports formats like "1MB", "5MB", "1024KB", etc.
+// It supports both SI units (KB, MB, GB using base 1000) and IEC units
+// (KiB, MiB, GiB using base 1024) as well as short forms (K, M, G).
 type ByteSize int64
 
 // UnmarshalYAML implements yaml.Unmarshaler for ByteSize.
@@ -528,48 +531,27 @@ func (b *ByteSize) UnmarshalYAML(unmarshal func(interface{}) error) error {
 	return nil
 }
 
-// ParseByteSize parses a byte size string like "1MB", "5MB", "1024KB", etc.
+// ParseByteSize parses a byte size string using github.com/dustin/go-humanize.
+// Supports both SI units (KB=1000, MB=1000², etc.) and IEC units (KiB=1024, MiB=1024², etc.).
+// Examples: "1MB", "5MiB", "1.5GB", "100B", "1024KB"
 func ParseByteSize(s string) (int64, error) {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return 0, fmt.Errorf("empty size string")
 	}
 
-	// Find where the numeric part ends
-	i := 0
-	for i < len(s) && (s[i] >= '0' && s[i] <= '9' || s[i] == '.') {
-		i++
+	// Use go-humanize to parse the byte size string
+	bytes, err := humanize.ParseBytes(s)
+	if err != nil {
+		return 0, fmt.Errorf("invalid size format: %w", err)
 	}
 
-	if i == 0 {
-		return 0, fmt.Errorf("invalid size format: %s", s)
+	// Check that the value fits in int64
+	if bytes > math.MaxInt64 {
+		return 0, fmt.Errorf("size %d exceeds maximum allowed value (%d)", bytes, int64(math.MaxInt64))
 	}
 
-	numStr := s[:i]
-	unit := strings.TrimSpace(s[i:])
-
-	var num float64
-	if _, err := fmt.Sscanf(numStr, "%f", &num); err != nil {
-		return 0, fmt.Errorf("invalid number in size: %s", s)
-	}
-
-	var multiplier int64
-	switch strings.ToUpper(unit) {
-	case "B", "":
-		multiplier = 1
-	case "KB", "K":
-		multiplier = 1024
-	case "MB", "M":
-		multiplier = 1024 * 1024
-	case "GB", "G":
-		multiplier = 1024 * 1024 * 1024
-	case "TB", "T":
-		multiplier = 1024 * 1024 * 1024 * 1024
-	default:
-		return 0, fmt.Errorf("unknown size unit: %s", unit)
-	}
-
-	return int64(num * float64(multiplier)), nil
+	return int64(bytes), nil
 }
 
 // ReplicaConfig represents the configuration for a single replica in a database.
