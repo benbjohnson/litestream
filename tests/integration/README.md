@@ -85,7 +85,6 @@ Core functionality tests that run in seconds to minutes:
 - `TestFreshStart` - Starting replication before database exists
 - `TestDatabaseIntegrity` - Complex schema and data integrity
 - `TestDatabaseDeletion` - Source database deletion during replication
-- `TestReplicaFailover` - Multiple replica configuration and failover
 
 ### Concurrent Tests
 
@@ -231,7 +230,7 @@ These Go tests replace the following bash scripts:
 - `cmd/litestream-test/scripts/test-fresh-start.sh` → `scenario_test.go::TestFreshStart`
 - `cmd/litestream-test/scripts/test-database-integrity.sh` → `scenario_test.go::TestDatabaseIntegrity`
 - `cmd/litestream-test/scripts/test-database-deletion.sh` → `scenario_test.go::TestDatabaseDeletion`
-- `cmd/litestream-test/scripts/test-replica-failover.sh` → `scenario_test.go::TestReplicaFailover`
+- `cmd/litestream-test/scripts/test-replica-failover.sh` → NOT MIGRATED (feature removed from Litestream)
 - `cmd/litestream-test/scripts/test-rapid-checkpoints.sh` → `concurrent_test.go::TestRapidCheckpoints`
 - `cmd/litestream-test/scripts/test-wal-growth.sh` → `concurrent_test.go::TestWALGrowth`
 - `cmd/litestream-test/scripts/test-concurrent-operations.sh` → `concurrent_test.go::TestConcurrentOperations`

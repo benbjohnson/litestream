@@ -75,7 +75,7 @@ jobs:
       - name: Run all scenario tests
         run: |
           go test -v -tags=integration -timeout=1h ./tests/integration/... \
-            -run="Test(FreshStart|DatabaseIntegrity|DatabaseDeletion|ReplicaFailover|RapidCheckpoints|WALGrowth|ConcurrentOperations|BusyTimeout)"
+            -run="Test(FreshStart|DatabaseIntegrity|DatabaseDeletion|RapidCheckpoints|WALGrowth|ConcurrentOperations|BusyTimeout)"
         env:
           CGO_ENABLED: 1
 

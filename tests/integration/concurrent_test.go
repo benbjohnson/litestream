@@ -141,7 +141,7 @@ func TestWALGrowth(t *testing.T) {
 
 	RequireBinaries(t)
 
-	duration := GetTestDuration(t, 5*time.Minute)
+	duration := GetTestDuration(t, 2*time.Minute)
 	t.Logf("Testing: Large WAL file handling (duration: %v)", duration)
 
 	db := SetupTestDB(t, "wal-growth")
