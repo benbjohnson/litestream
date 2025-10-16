@@ -3,14 +3,14 @@
 # secret-access-key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
 
 # dbs:
-#  - path: /path/to/primary/db            # Database to replicate from
-#    replicas:
-#      - path: /path/to/replica           # File-based replication
-#      - url:  s3://my.bucket.com/db      # S3-based replication
-#      - type: nats                       # NATS JetStream replication
-#        url: nats://nats.example.com:4222
-#        bucket: litestream-backups
-#        # Optional TLS configuration:
-#        # client-cert: /path/to/client.pem
-#        # client-key: /path/to/client.key
-#        # root-cas: [/path/to/ca.pem]
+#  - path: /path/to/primary/db          # Database to replicate from
+#    replica:
+#      path: /path/to/replica           # File-based replication
+#      url:  s3://my.bucket.com/db      # S3-based replication
+#      type: nats                       # NATS JetStream replication
+#      url: nats://nats.example.com:4222
+#      bucket: litestream-backups
+#      # Optional TLS configuration:
+#      # client-cert: /path/to/client.pem
+#      # client-key: /path/to/client.key
+#      # root-cas: [/path/to/ca.pem]
