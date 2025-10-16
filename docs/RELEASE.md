@@ -317,12 +317,7 @@ goreleaser release --skip=publish --clean
 
 ## Migration from Manual Process
 
-The old manual release process using Makefile targets and individual workflows has been replaced by GoReleaser. The following are deprecated:
-
-- `make dist-linux`
-- `make dist-macos`
-- `.github/workflows/release.linux.yml`
-- Manual gon invocation for macOS
+The old manual release process using Makefile targets and individual workflows has been replaced by GoReleaser.
 
 ## Support and Issues
 
