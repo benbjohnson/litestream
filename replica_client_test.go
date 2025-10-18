@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"log/slog"
 	"os"
 	"slices"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal/testingutil"
@@ -416,4 +418,80 @@ func TestReplicaClient_S3_BucketValidation(t *testing.T) {
 	if !strings.Contains(err.Error(), "bucket name is required") {
 		t.Errorf("expected bucket validation error, got: %v", err)
 	}
+}
+
+func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
+	testHostKeyPEM := `-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAJytPhncDnpV5QF3ai8f6r0u1hzK96x+81tvtA7ZiuawAAAJAIcGGVCHBh
+lQAAAAtzc2gtZWQyNTUxOQAAACAJytPhncDnpV5QF3ai8f6r0u1hzK96x+81tvtA7Ziuaw
+AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
+7WHMr3rH7zW2+0DtmK5rAAAADGZlbGl4QGJvcmVhcwE=
+-----END OPENSSH PRIVATE KEY-----`
+	privateKey, err := ssh.ParsePrivateKey([]byte(testHostKeyPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("ValidHostKey", func(t *testing.T) {
+		addr := testingutil.MockSFTPServer(t, privateKey)
+		expectedHostKey := string(ssh.MarshalAuthorizedKey(privateKey.PublicKey()))
+
+		c := testingutil.NewSFTPReplicaClient(t)
+		c.User = "foo"
+		c.Host = addr
+		c.HostKey = expectedHostKey
+
+		_, err = c.Init(context.Background())
+		if err != nil {
+			t.Fatalf("SFTP connection failed: %v", err)
+		}
+	})
+	t.Run("InvalidHostKey", func(t *testing.T) {
+		addr := testingutil.MockSFTPServer(t, privateKey)
+		invalidHostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEqM2NkGvKKhR1oiKO0E72L3tOsYk+aX7H8Xn4bbZKsa"
+
+		c := testingutil.NewSFTPReplicaClient(t)
+		c.User = "foo"
+		c.Host = addr
+		c.HostKey = invalidHostKey
+
+		_, err = c.Init(context.Background())
+		if err == nil {
+			t.Fatalf("SFTP connection established despite invalid host key")
+		}
+		if !strings.Contains(err.Error(), "ssh: host key mismatch") {
+			t.Errorf("expected host key validation error, got: %v", err)
+		}
+	})
+	t.Run("IgnoreHostKey", func(t *testing.T) {
+		var captured []string
+		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
+			Level: slog.LevelWarn,
+			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
+				if a.Key == slog.MessageKey {
+					captured = append(captured, a.Value.String())
+				}
+				return a
+			},
+		})))
+
+		addr := testingutil.MockSFTPServer(t, privateKey)
+
+		c := testingutil.NewSFTPReplicaClient(t)
+		c.User = "foo"
+		c.Host = addr
+
+		_, err = c.Init(context.Background())
+		if err != nil {
+			t.Fatalf("SFTP connection failed: %v", err)
+		}
+
+		if !slices.ContainsFunc(captured, func(msg string) bool {
+			return strings.Contains(msg, "sftp host key not verified")
+		}) {
+			t.Errorf("Expected warning not found")
+		}
+
+	})
 }

@@ -5,13 +5,18 @@ import (
 	"database/sql"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"math/rand/v2"
+	"net"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	sftpserver "github.com/pkg/sftp"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -294,4 +299,62 @@ func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
 			tb.Fatalf("cannot cleanup sftp: %s", err)
 		}
 	}
+}
+
+func MockSFTPServer(t *testing.T, hostKey ssh.Signer) string {
+	config := &ssh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(hostKey)
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0") // random available port
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				_, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return
+				}
+				go ssh.DiscardRequests(reqs)
+
+				for ch := range chans {
+					if ch.ChannelType() != "session" {
+						ch.Reject(ssh.UnknownChannelType, "unsupported")
+						continue
+					}
+					channel, requests, err := ch.Accept()
+					if err != nil {
+						return
+					}
+
+					go func(in <-chan *ssh.Request) {
+						for req := range in {
+							if req.Type == "subsystem" && string(req.Payload[4:]) == "sftp" {
+								req.Reply(true, nil)
+
+								server, err := sftpserver.NewServer(channel)
+								if err != nil {
+									return
+								}
+								if err := server.Serve(); err != nil && err != io.EOF {
+									t.Logf("SFTP server error: %v", err)
+								}
+								return
+							}
+							req.Reply(false, nil)
+						}
+					}(requests)
+				}
+			}()
+		}
+	}()
+
+	return listener.Addr().String()
 }
