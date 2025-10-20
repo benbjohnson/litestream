@@ -20,7 +20,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
-	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
 )
@@ -334,8 +333,13 @@ func (db *DB) setPersistWAL(ctx context.Context) error {
 	}
 	defer conn.Close()
 
-	return conn.Raw(func(driverConn interface{}) error {
-		fc, ok := driverConn.(sqlite.FileControl)
+	return conn.Raw(func(driverConn any) error {
+		// Using an anonymous interface here avoids unnecessarily importing our
+		// chosen driver. This is important for library users (e.g. the VFS)
+		// that don't need to depend on the driver.
+		fc, ok := driverConn.(interface {
+			FileControlPersistWAL(string, int) (int, error)
+		})
 		if !ok {
 			return fmt.Errorf("driver does not implement FileControl")
 		}

@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/superfly/ltx"
-	_ "modernc.org/sqlite"
 )
 
 // Naming constants.
