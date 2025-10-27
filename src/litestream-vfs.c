@@ -15,7 +15,7 @@ int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_r
   SQLITE_EXTENSION_INIT2(pApi);
 
   // call into Go
-  LitestreamVFSRegister();
+  sqlite3_extension_init();
 
   if( rc==SQLITE_OK ) rc = SQLITE_OK_LOAD_PERMANENTLY;
   return rc;

@@ -25,8 +25,8 @@ import (
 
 func main() {}
 
-//export LitestreamVFSRegister
-func LitestreamVFSRegister() {
+//export sqlite3_extension_init
+func sqlite3_extension_init() {
 	println("dbg/LitestreamVFSRegister")
 	client, err := newReplicaClientFromEnv()
 	if err != nil {

@@ -145,8 +145,8 @@ func openWithVFS(tb testing.TB, path string) *sql.DB {
 	if err := conn.Raw(func(x interface{}) error {
 		conn := x.(*sqlite3.SQLiteConn)
 		println("dbg/LOADEXT")
-		err := conn.LoadExtension("../../dist/litestream-vfs.so", "LitestreamVFSRegister")
-		println("dbg/LOADEXT.DONE", err)
+		err := conn.LoadExtension("../../dist/litestream-vfs.so", "sqlite3_extension_init")
+		println("dbg/LOADEXT.DONE")
 		return err
 	}); err != nil {
 		tb.Fatalf("failed to load extension: %v", err)
