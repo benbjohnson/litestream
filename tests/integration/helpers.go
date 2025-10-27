@@ -78,9 +78,15 @@ func (db *TestDB) Populate(targetSize string) error {
 		"-db", db.Path,
 		"-target-size", targetSize,
 	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("populate failed: %w\nOutput: %s", err, string(output))
+
+	// Stream output to see progress
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	db.t.Logf("Populating database to %s...", targetSize)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("populate failed: %w", err)
 	}
 	return nil
 }
@@ -92,9 +98,15 @@ func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize i
 		"-page-size", fmt.Sprintf("%d", pageSize),
 		"-row-size", fmt.Sprintf("%d", rowSize),
 	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("populate failed: %w\nOutput: %s", err, string(output))
+
+	// Stream output to see progress
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	db.t.Logf("Populating database to %s (page size: %d, row size: %d)...", targetSize, pageSize, rowSize)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("populate failed: %w", err)
 	}
 	return nil
 }
@@ -106,9 +118,15 @@ func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time
 		"-duration", duration.String(),
 		"-pattern", pattern,
 	)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("load generation failed: %w\nOutput: %s", err, string(output))
+
+	// Stream output to see progress in real-time
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	db.t.Logf("Starting load generation: %d writes/sec for %v (%s pattern)", writeRate, duration, pattern)
+
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("load generation failed: %w", err)
 	}
 	return nil
 }
@@ -367,4 +385,23 @@ func InsertTestData(t *testing.T, dbPath string, count int) error {
 	}
 
 	return tx.Commit()
+}
+
+// PrintTestSummary prints a summary of the test results
+func (db *TestDB) PrintTestSummary(t *testing.T, testName string, startTime time.Time) {
+	t.Helper()
+
+	duration := time.Since(startTime)
+	dbSize, _ := db.GetDatabaseSize()
+	fileCount, _ := db.GetReplicaFileCount()
+	errors, _ := db.CheckForErrors()
+
+	t.Log("\n" + strings.Repeat("=", 80))
+	t.Logf("TEST SUMMARY: %s", testName)
+	t.Log(strings.Repeat("=", 80))
+	t.Logf("Duration:           %v", duration.Round(time.Second))
+	t.Logf("Database Size:      %.2f MB", float64(dbSize)/(1024*1024))
+	t.Logf("Replica Files:      %d LTX files", fileCount)
+	t.Logf("Litestream Errors:  %d", len(errors))
+	t.Log(strings.Repeat("=", 80))
 }

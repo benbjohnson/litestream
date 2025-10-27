@@ -18,12 +18,14 @@ func TestQuickValidation(t *testing.T) {
 
 	RequireBinaries(t)
 
+	startTime := time.Now()
 	duration := GetTestDuration(t, 30*time.Minute)
 	t.Logf("Testing: Quick validation test (duration: %v)", duration)
 	t.Log("Default: 30 minutes, configurable via test duration")
 
 	db := SetupTestDB(t, "quick-validation")
 	defer db.Cleanup()
+	defer db.PrintTestSummary(t, "Quick Validation Test", startTime)
 
 	t.Log("[1] Creating and populating database...")
 	if err := db.Create(); err != nil {

@@ -18,12 +18,14 @@ func TestOvernightFile(t *testing.T) {
 
 	RequireBinaries(t)
 
+	startTime := time.Now()
 	duration := GetTestDuration(t, 8*time.Hour)
 	t.Logf("Testing: Overnight file-based replication (duration: %v)", duration)
 	t.Log("Default: 8 hours, configurable via test duration")
 
 	db := SetupTestDB(t, "overnight-file")
 	defer db.Cleanup()
+	defer db.PrintTestSummary(t, "Overnight File Replication", startTime)
 
 	t.Log("[1] Creating and populating database...")
 	if err := db.Create(); err != nil {
@@ -134,11 +136,13 @@ func TestOvernightComprehensive(t *testing.T) {
 
 	RequireBinaries(t)
 
+	startTime := time.Now()
 	duration := GetTestDuration(t, 8*time.Hour)
 	t.Logf("Testing: Comprehensive overnight test (duration: %v)", duration)
 
 	db := SetupTestDB(t, "overnight-comprehensive")
 	defer db.Cleanup()
+	defer db.PrintTestSummary(t, "Overnight Comprehensive Test", startTime)
 
 	t.Log("[1] Creating large database...")
 	if err := db.Create(); err != nil {
