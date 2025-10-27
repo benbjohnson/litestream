@@ -173,7 +173,15 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	key := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
-	r, err := c.bkt.Object(key).NewRangeReader(ctx, offset, size)
+	// In the GCS client, a length of -1 reads to EOF while 0 returns no data.
+	// Callers pass size=0 to indicate "entire object" so translate that here.
+	// See: https://pkg.go.dev/cloud.google.com/go/storage#ObjectHandle.NewRangeReader
+	length := size
+	if length <= 0 {
+		length = -1
+	}
+
+	r, err := c.bkt.Object(key).NewRangeReader(ctx, offset, length)
 	if isNotExists(err) {
 		return nil, os.ErrNotExist
 	} else if err != nil {
