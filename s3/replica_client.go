@@ -49,6 +49,8 @@ const MaxKeys = 1000
 // DefaultRegion is the region used if one is not specified.
 const DefaultRegion = "us-east-1"
 
+// contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
+// through the middleware stack from Serialize to Finalize phase.
 type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
@@ -452,6 +454,9 @@ func litestreamAPIOption() func(*middleware.Stack) error {
 			)
 		}
 
+		// Try to insert before AWS's checksum middleware for optimal ordering.
+		// If that middleware doesn't exist (e.g., different SDK version), add at the end.
+		// Our middleware checks if Content-MD5 is already set, so order is not critical.
 		if err := stack.Finalize.Insert(md5Middleware(), "AWSChecksum:ComputeInputPayloadChecksum", middleware.Before); err != nil {
 			if err := stack.Finalize.Add(md5Middleware(), middleware.After); err != nil {
 				return err
@@ -542,6 +547,9 @@ func encodeObjectIdentifierList(v []types.ObjectIdentifier, value smithyxml.Valu
 	return nil
 }
 
+// encodeObjectIdentifier mirrors the AWS SDK's XML serializer for DeleteObjects.
+// This ensures our precomputed Content-MD5 matches the actual request body.
+// Includes all ObjectIdentifier fields as of AWS SDK v2 (2024).
 func encodeObjectIdentifier(v *types.ObjectIdentifier, value smithyxml.Value) error {
 	defer value.Close()
 	if v.ETag != nil {

@@ -14,6 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/superfly/ltx"
 )
@@ -283,6 +284,71 @@ func TestReplicaClientDeleteLTXFiles_ContentMD5(t *testing.T) {
 	files := []*ltx.FileInfo{
 		{Level: 0, MinTXID: 1, MaxTXID: 1},
 		{Level: 0, MinTXID: 2, MaxTXID: 2},
+	}
+
+	if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
+		t.Fatalf("DeleteLTXFiles: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("unexpected call count: %d", callCount)
+	}
+}
+
+func TestReplicaClientDeleteLTXFiles_PreexistingContentMD5(t *testing.T) {
+	const preexistingMD5 = "preexisting-checksum-value"
+	var callCount int
+
+	httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+		callCount++
+
+		got := r.Header.Get("Content-MD5")
+		if got != preexistingMD5 {
+			t.Fatalf("middleware should not override existing Content-MD5: got %q, want %q", got, preexistingMD5)
+		}
+
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/xml"}},
+			Body: io.NopCloser(strings.NewReader(
+				`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
+			)),
+		}
+		return resp, nil
+	})
+
+	cfg := aws.Config{
+		Region:      "us-east-1",
+		Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
+		HTTPClient:  httpClient,
+	}
+
+	c := NewReplicaClient()
+	c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Finalize.Add(
+				middleware.FinalizeMiddlewareFunc(
+					"InjectPreexistingContentMD5",
+					func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+						out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
+					) {
+						if req, ok := in.Request.(*smithyhttp.Request); ok {
+							req.Header.Set("Content-MD5", preexistingMD5)
+						}
+						return next.HandleFinalize(ctx, in)
+					},
+				),
+				middleware.Before,
+			)
+		})
+	})
+	c.Bucket = "test-bucket"
+	c.Path = "test-path"
+
+	files := []*ltx.FileInfo{
+		{Level: 0, MinTXID: 1, MaxTXID: 1},
 	}
 
 	if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
