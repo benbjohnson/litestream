@@ -2,12 +2,20 @@ package s3
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/superfly/ltx"
 )
 
 // mockAPIError implements smithy.APIError for testing
@@ -211,6 +219,78 @@ func TestReplicaClient_HTTPClientConfiguration(t *testing.T) {
 			t.Error("expected SkipVerify to be false")
 		}
 	})
+}
+
+func TestReplicaClientDeleteLTXFiles_ContentMD5(t *testing.T) {
+	var callCount int
+
+	httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+		callCount++
+
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		if !strings.Contains(r.URL.RawQuery, "delete") {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+
+		if ua := r.Header.Get("User-Agent"); !strings.Contains(ua, "litestream") {
+			t.Fatalf("expected User-Agent to contain litestream, got %q", ua)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		r.Body.Close()
+
+		got := r.Header.Get("Content-MD5")
+		if got == "" {
+			t.Fatal("expected Content-MD5 header")
+		}
+
+		sum := md5.Sum(body)
+		want := base64.StdEncoding.EncodeToString(sum[:])
+		if got != want {
+			t.Fatalf("unexpected Content-MD5 header: got %q, want %q", got, want)
+		}
+
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/xml"}},
+			Body: io.NopCloser(strings.NewReader(
+				`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
+			)),
+		}
+		return resp, nil
+	})
+
+	cfg := aws.Config{
+		Region:      "us-east-1",
+		Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
+		HTTPClient:  httpClient,
+	}
+
+	c := NewReplicaClient()
+	c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+	})
+	c.Bucket = "test-bucket"
+	c.Path = "test-path"
+
+	files := []*ltx.FileInfo{
+		{Level: 0, MinTXID: 1, MaxTXID: 1},
+		{Level: 0, MinTXID: 2, MaxTXID: 2},
+	}
+
+	if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
+		t.Fatalf("DeleteLTXFiles: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("unexpected call count: %d", callCount)
+	}
 }
 
 // TestReplicaClient_CredentialConfiguration tests credential setup
