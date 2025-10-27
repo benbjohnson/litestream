@@ -4,7 +4,6 @@
 package main_test
 
 import (
-	"context"
 	"database/sql"
 	"log/slog"
 	"os"
@@ -131,27 +130,16 @@ func openWithVFS(tb testing.TB, path string) *sql.DB {
 	tb.Setenv("LITESTREAM_REPLICA_TYPE", "file")
 	tb.Setenv("LITESTREAM_REPLICA_PATH", path)
 
-	db, err := sql.Open("sqlite3", ":memory:")
+	sql.Register("sqlite3_ext",
+		&sqlite3.SQLiteDriver{
+			Extensions: []string{
+				`/Users/benbjohnson/src/benbjohnson/litestream/dist/litestream-vfs.so`,
+			},
+		})
+
+	db, err := sql.Open("sqlite3_ext", ":memory:")
 	if err != nil {
 		tb.Fatalf("failed to open database: %v", err)
-	}
-
-	conn, err := db.Conn(context.Background())
-	if err != nil {
-		tb.Fatalf("failed to get connection: %v", err)
-	}
-	defer conn.Close()
-
-	if err := conn.Raw(func(x interface{}) error {
-		conn := x.(*sqlite3.SQLiteConn)
-		println("dbg/LOADEXT")
-		err := conn.LoadExtension("../../dist/litestream-vfs.so", "sqlite3_extension_init")
-		println("dbg/LOADEXT.DONE")
-		return err
-	}); err != nil {
-		tb.Fatalf("failed to load extension: %v", err)
-	} else {
-		println("dbg/LOADEXT.DONE.NOERR")
 	}
 
 	return db
