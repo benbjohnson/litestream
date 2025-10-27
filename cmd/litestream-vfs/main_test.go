@@ -5,12 +5,14 @@ package main_test
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
 
@@ -19,13 +21,25 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
+func init() {
+	sql.Register("sqlite3-vfs",
+		&sqlite3.SQLiteDriver{
+			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
+				fmt.Println("dbg/LOAD")
+				if err := conn.LoadExtension("../../dist/litestream-vfs.so", "LitestreamVFSRegister"); err != nil {
+					return fmt.Errorf("load extension: %w", err)
+				}
+				return nil
+			},
+		})
+	if _, err := sql.Open("sqlite3-vfs", ":memory:"); err != nil {
+		panic(err)
+	}
+}
+
 func TestVFS_Integration(t *testing.T) {
 	t.Run("Simple", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
-		vfs := newVFS(t, client)
-		if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
-			t.Fatalf("failed to register litestream vfs: %v", err)
-		}
 
 		db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 		db.MonitorInterval = 100 * time.Millisecond
@@ -45,7 +59,7 @@ func TestVFS_Integration(t *testing.T) {
 		}
 		time.Sleep(2 * db.MonitorInterval)
 
-		sqldb1, err := sql.Open("sqlite3", "file:/tmp/test.db?vfs=litestream")
+		sqldb1, err := sql.Open("sqlite3-vfs", "file:/tmp/test.db?vfs=litestream-vfs")
 		if err != nil {
 			t.Fatalf("failed to open database: %v", err)
 		}
