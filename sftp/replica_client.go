@@ -234,19 +234,29 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
-	// Use TeeReader to peek at LTX header while preserving data for upload
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(rd, &buf)
+	var timestamp time.Time
+	var fullReader io.Reader
 
-	// Extract timestamp from LTX header
-	hdr, _, err := ltx.PeekHeader(teeReader)
-	if err != nil {
-		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	// Try to get timestamp from context first (compaction path).
+	// This avoids race condition where PeekHeader is called on io.Pipe
+	// before the compactor goroutine writes the header.
+	if ts, ok := litestream.LTXTimestampFromContext(ctx); ok {
+		timestamp = ts
+		fullReader = rd
+	} else {
+		// Fallback: Extract timestamp from LTX header (normal upload path)
+		var buf bytes.Buffer
+		teeReader := io.TeeReader(rd, &buf)
+
+		hdr, _, err := ltx.PeekHeader(teeReader)
+		if err != nil {
+			return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+		}
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+
+		// Combine buffered data with rest of reader
+		fullReader = io.MultiReader(&buf, rd)
 	}
-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
-
-	// Combine buffered data with rest of reader
-	fullReader := io.MultiReader(&buf, rd)
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
 		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)

@@ -3,9 +3,11 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -494,4 +496,105 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		}
 
 	})
+}
+
+// TestStore_CompactDB_WithCloudBackends exercises compaction with real storage backends
+// using io.Pipe() to catch race conditions that only manifest in production.
+//
+// This test reproduces issue #800: During compaction, WriteLTXFile calls ltx.PeekHeader()
+// on an io.Pipe() reader before the compactor goroutine has written the header, causing
+// intermittent "EOF" errors with ~80% failure rate on cloud storage backends.
+//
+// The test should FAIL before the fix is applied, demonstrating the race condition.
+// After the fix, it should pass 100% of the time.
+func TestStore_CompactDB_WithCloudBackends(t *testing.T) {
+	if !testingutil.Integration() {
+		t.Skip("use -integration flag")
+	}
+
+	for _, typ := range testingutil.ReplicaClientTypes() {
+		t.Run(typ, func(t *testing.T) {
+			ctx := context.Background()
+
+			// Create DB with real backend (file, gs, s3, abs, nats, sftp)
+			client := testingutil.NewReplicaClient(t, typ)
+			defer testingutil.MustDeleteAll(t, client)
+
+			dbPath := filepath.Join(t.TempDir(), "db")
+			db := litestream.NewDB(dbPath)
+			db.MonitorInterval = 0
+			db.Replica = litestream.NewReplicaWithClient(db, client)
+			db.Replica.MonitorEnabled = false
+
+			levels := litestream.CompactionLevels{
+				{Level: 0},
+				{Level: 1, Interval: 100 * time.Millisecond}, // Short interval for faster testing
+			}
+			store := litestream.NewStore([]*litestream.DB{db}, levels)
+			store.CompactionMonitorEnabled = false
+
+			if err := store.Open(ctx); err != nil {
+				t.Fatal(err)
+			}
+			defer store.Close(ctx)
+
+			sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+			defer testingutil.MustCloseSQLDB(t, sqldb)
+
+			// Create data to compact
+			if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+
+			// Generate multiple L0 files by inserting data and syncing
+			// This creates the source files that will be compacted
+			for i := 0; i < 5; i++ {
+				if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (data) VALUES (?)`, fmt.Sprintf("row-%d", i)); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Sync(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Replica.Sync(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// THE KEY TEST: Run compaction multiple times to catch the race condition
+			// The bug has ~80% failure rate, so 10 iterations gives high confidence
+			// that we'll catch it if it exists.
+			//
+			// BEFORE FIX: Should fail ~8 out of 10 times with EOF error
+			// AFTER FIX: Should pass 10/10 times
+			for i := 0; i < 10; i++ {
+				t.Logf("Compaction iteration %d/10", i+1)
+
+				// Generate more L0 files before each compaction (except first iteration)
+				if i > 0 {
+					// Wait for compaction interval to pass
+					time.Sleep(150 * time.Millisecond)
+
+					for j := 0; j < 3; j++ {
+						if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (data) VALUES (?)`, fmt.Sprintf("iteration-%d-row-%d", i, j)); err != nil {
+							t.Fatal(err)
+						}
+					}
+					if err := db.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if err := db.Replica.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				_, err := store.CompactDB(ctx, db, levels[1])
+				if err != nil {
+					t.Fatalf("compaction iteration %d failed: %v\n\nThis is the expected failure demonstrating issue #800.\nThe error occurs because WriteLTXFile calls PeekHeader on the pipe reader\nbefore the compactor goroutine has written the header.", i+1, err)
+				}
+				t.Logf("✓ Compaction iteration %d succeeded", i+1)
+			}
+
+			t.Log("✓ All 10 compaction iterations succeeded")
+		})
+	}
 }

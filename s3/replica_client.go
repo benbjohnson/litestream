@@ -326,19 +326,29 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
-	// Use TeeReader to peek at LTX header while preserving data for upload
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(r, &buf)
+	var timestamp time.Time
+	var rc *internal.ReadCounter
 
-	// Extract timestamp from LTX header
-	hdr, _, err := ltx.PeekHeader(teeReader)
-	if err != nil {
-		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	// Try to get timestamp from context first (compaction path).
+	// This avoids race condition where PeekHeader is called on io.Pipe
+	// before the compactor goroutine writes the header.
+	if ts, ok := litestream.LTXTimestampFromContext(ctx); ok {
+		timestamp = ts
+		rc = internal.NewReadCounter(r)
+	} else {
+		// Fallback: Extract timestamp from LTX header (normal upload path)
+		var buf bytes.Buffer
+		teeReader := io.TeeReader(r, &buf)
+
+		hdr, _, err := ltx.PeekHeader(teeReader)
+		if err != nil {
+			return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+		}
+		timestamp = time.UnixMilli(hdr.Timestamp).UTC()
+
+		// Combine buffered data with rest of reader
+		rc = internal.NewReadCounter(io.MultiReader(&buf, r))
 	}
-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
-
-	// Combine buffered data with rest of reader
-	rc := internal.NewReadCounter(io.MultiReader(&buf, r))
 
 	filename := ltx.FormatFilename(minTXID, maxTXID)
 	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)

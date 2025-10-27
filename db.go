@@ -1417,6 +1417,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 
 	// Build a list of input files to compact from.
 	var minTXID, maxTXID ltx.TXID
+	var latestTimestamp time.Time
 	for itr.Next() {
 		info := itr.Item()
 
@@ -1426,6 +1427,11 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 		}
 		if maxTXID == 0 || info.MaxTXID > maxTXID {
 			maxTXID = info.MaxTXID
+		}
+
+		// Track latest timestamp from source files for the compacted file.
+		if latestTimestamp.IsZero() || info.CreatedAt.After(latestTimestamp) {
+			latestTimestamp = info.CreatedAt
 		}
 
 		// Prefer the on-disk LTX file when available so compaction is not subject
@@ -1448,6 +1454,10 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction
 	}
+
+	// Store timestamp in context before creating pipe to avoid race condition
+	// where WriteLTXFile calls PeekHeader before the compactor writes it.
+	ctx = WithLTXTimestamp(ctx, latestTimestamp)
 
 	// Stream compaction to destination in level.
 	pr, pw := io.Pipe()
