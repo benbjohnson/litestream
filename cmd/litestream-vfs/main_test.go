@@ -4,8 +4,8 @@
 package main_test
 
 import (
+	"context"
 	"database/sql"
-	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -20,22 +20,6 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
-
-func init() {
-	sql.Register("sqlite3-vfs",
-		&sqlite3.SQLiteDriver{
-			ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-				fmt.Println("dbg/LOAD")
-				if err := conn.LoadExtension("../../dist/litestream-vfs.so", "LitestreamVFSRegister"); err != nil {
-					return fmt.Errorf("load extension: %w", err)
-				}
-				return nil
-			},
-		})
-	if _, err := sql.Open("sqlite3-vfs", ":memory:"); err != nil {
-		panic(err)
-	}
-}
 
 func TestVFS_Integration(t *testing.T) {
 	t.Run("Simple", func(t *testing.T) {
@@ -59,10 +43,7 @@ func TestVFS_Integration(t *testing.T) {
 		}
 		time.Sleep(2 * db.MonitorInterval)
 
-		sqldb1, err := sql.Open("sqlite3-vfs", "file:/tmp/test.db?vfs=litestream-vfs")
-		if err != nil {
-			t.Fatalf("failed to open database: %v", err)
-		}
+		sqldb1 := openWithVFS(t, client.Path())
 		defer sqldb1.Close()
 
 		// Execute query
@@ -143,4 +124,35 @@ func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
 	vfs := litestream.NewVFS(client, logger)
 	vfs.PollInterval = 100 * time.Millisecond
 	return vfs
+}
+
+func openWithVFS(tb testing.TB, path string) *sql.DB {
+	tb.Helper()
+	tb.Setenv("LITESTREAM_REPLICA_TYPE", "file")
+	tb.Setenv("LITESTREAM_REPLICA_PATH", path)
+
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		tb.Fatalf("failed to open database: %v", err)
+	}
+
+	conn, err := db.Conn(context.Background())
+	if err != nil {
+		tb.Fatalf("failed to get connection: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.Raw(func(x interface{}) error {
+		conn := x.(*sqlite3.SQLiteConn)
+		println("dbg/LOADEXT")
+		err := conn.LoadExtension("../../dist/litestream-vfs.so", "LitestreamVFSRegister")
+		println("dbg/LOADEXT.DONE", err)
+		return err
+	}); err != nil {
+		tb.Fatalf("failed to load extension: %v", err)
+	} else {
+		println("dbg/LOADEXT.DONE.NOERR")
+	}
+
+	return db
 }
