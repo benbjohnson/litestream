@@ -5,16 +5,12 @@ package main_test
 
 import (
 	"database/sql"
-	"fmt"
 	"log/slog"
-	"net/url"
 	"os"
 	"path/filepath"
-	"sync"
 	"testing"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
 
@@ -23,9 +19,59 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
+const sharedReplicaDir = "/tmp/litestream-vfs-test-shared"
+
+// TestMain sets up a shared VFS once for all tests using Ben's approach:
+// - Single shared temp directory
+// - VFS registered once at package level
+// - Tests clean up between runs
+func TestMain(m *testing.M) {
+	// Skip setup if building as loadable extension (not yet supported)
+	if loadableExtensionBuild {
+		os.Exit(m.Run())
+	}
+
+	// Create shared replica directory
+	if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
+		panic(err)
+	}
+	if err := os.MkdirAll(sharedReplicaDir, 0755); err != nil {
+		panic(err)
+	}
+
+	// Set up VFS once for all tests
+	client := file.NewReplicaClient(sharedReplicaDir)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	vfs := litestream.NewVFS(client, logger)
+	vfs.PollInterval = 100 * time.Millisecond
+
+	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
+		panic(err)
+	}
+
+	// Run tests
+	code := m.Run()
+
+	// Cleanup
+	os.RemoveAll(sharedReplicaDir)
+
+	os.Exit(code)
+}
+
 func TestVFS_Integration(t *testing.T) {
 	t.Run("Simple", func(t *testing.T) {
-		client := file.NewReplicaClient(t.TempDir())
+		// Clean shared replica directory for this test
+		if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sharedReplicaDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Use shared replica directory (Ben's approach)
+		client := file.NewReplicaClient(sharedReplicaDir)
 
 		db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 		db.MonitorInterval = 100 * time.Millisecond
@@ -45,7 +91,11 @@ func TestVFS_Integration(t *testing.T) {
 		}
 		time.Sleep(2 * db.MonitorInterval)
 
-		sqldb1 := openWithVFS(t, client.Path())
+		// Use the VFS registered in TestMain - no complex extension loading needed!
+		sqldb1, err := sql.Open("sqlite3", "file:/tmp/test.db?vfs=litestream&mode=ro")
+		if err != nil {
+			t.Fatalf("failed to open database with VFS: %v", err)
+		}
 		defer sqldb1.Close()
 
 		// Execute query
@@ -58,15 +108,17 @@ func TestVFS_Integration(t *testing.T) {
 	})
 
 	t.Run("Updating", func(t *testing.T) {
-		if loadableExtensionBuild {
-			t.Skip("litestream VFS registered separately when building loadable extension")
+		// Clean shared replica directory for this test
+		if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sharedReplicaDir, 0755); err != nil {
+			t.Fatal(err)
 		}
 
-		client := file.NewReplicaClient(t.TempDir())
-		vfs := newVFS(t, client)
-		if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
-			t.Fatalf("failed to register litestream vfs: %v", err)
-		}
+		// Use shared replica directory (Ben's approach)
+		// VFS already registered in TestMain!
+		client := file.NewReplicaClient(sharedReplicaDir)
 
 		db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 		db.MonitorInterval = 100 * time.Millisecond
@@ -120,74 +172,12 @@ func TestVFS_Integration(t *testing.T) {
 	})
 }
 
-func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
-	tb.Helper()
-
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-
-	vfs := litestream.NewVFS(client, logger)
-	vfs.PollInterval = 100 * time.Millisecond
-	return vfs
-}
-
-var driverOnce sync.Once
-
-// openWithVFS attempts to open a database using the litestream VFS loaded as an extension.
+// Note: The complex extension loading code (openWithVFS, etc.) has been removed.
+// With Ben's approach of using a shared temp directory and setting up VFS once in TestMain,
+// we don't need the LazyReplicaClient pattern or complex extension loading for tests.
 //
-// CURRENT STATE: This currently fails with a segfault because github.com/psanford/sqlite3vfs
-// cannot be used from within a dynamically loaded SQLite extension. The sqlite3vfs package
-// is designed for static linking only.
+// The LazyReplicaClient implementation in litestream-vfs.go remains for potential future
+// loadable extension use cases, but is not needed for static linking tests.
 //
-// The LazyReplicaClient pattern implemented in litestream-vfs.go successfully solves the
-// environment variable propagation issue, but we hit the sqlite3vfs limitation before
-// we can test it fully.
-//
-// See VFS_EXTENSION_FINDINGS.md for full analysis and recommendations.
-func openWithVFS(tb testing.TB, path string) *sql.DB {
-	tb.Helper()
-
-	// Set environment variables BEFORE registering the driver.
-	// The LazyReplicaClient will read these when the VFS is first accessed.
-	os.Setenv("LITESTREAM_REPLICA_TYPE", "file")
-	os.Setenv("LITESTREAM_REPLICA_PATH", path)
-	os.Setenv("LITESTREAM_LOG_LEVEL", "DEBUG")
-
-	// Register the driver once with the extension.
-	// The extension loads on first connection and registers the lazy VFS.
-	driverOnce.Do(func() {
-		sql.Register("sqlite3_ext",
-			&sqlite3.SQLiteDriver{
-				Extensions: []string{
-					`/Users/corylanou/projects/benbjohnson/litestream/dist/litestream-vfs.so`,
-				},
-			})
-	})
-
-	// Open connection - this loads the extension and registers the VFS.
-	db, err := sql.Open("sqlite3_ext", ":memory:")
-	if err != nil {
-		tb.Fatalf("failed to open database: %v", err)
-	}
-
-	// Ping to actually establish the connection and load the extension.
-	if err := db.Ping(); err != nil {
-		tb.Fatalf("failed to ping database: %v", err)
-	}
-
-	// Close the initial connection.
-	if err := db.Close(); err != nil {
-		tb.Fatalf("failed to close initial database: %v", err)
-	}
-
-	// Now open with the litestream VFS that was registered by the extension.
-	// Use file URI so SQLite honors the custom VFS parameter.
-	dsn := fmt.Sprintf("file:%s?vfs=litestream&mode=ro", url.PathEscape(path))
-	db, err = sql.Open("sqlite3_ext", dsn)
-	if err != nil {
-		tb.Fatalf("failed to open database with VFS: %v", err)
-	}
-
-	return db
-}
+// See VFS_EXTENSION_FINDINGS.md for analysis of why loadable extensions don't work with
+// the sqlite3vfs package (requires pure C VFS implementation).

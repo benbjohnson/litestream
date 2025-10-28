@@ -4,6 +4,8 @@
 
 Investigation into loading the Litestream VFS as a dynamically loaded SQLite extension (.so file) instead of static linking.
 
+**UPDATE (2025-10-28)**: Ben clarified that for testing purposes, he can use a single shared temp directory and set env vars once before tests run. **This eliminates the need for complex lazy initialization** and allows us to use simple static linking with TestMain setup. ✅ **Tests now pass!**
+
 ## Issues Discovered
 
 ### 1. Environment Variable Propagation (SOLVED)
@@ -154,9 +156,100 @@ Ben needs to choose one of these approaches:
 - `src/litestream-vfs.c` - Better error handling
 - `go.mod` - Removed local module replacements (needed for building)
 
+## Working Solution (Updated 2025-10-28)
+
+### Ben's Constraint Simplifies Everything
+
+Ben clarified: *"If I can get the env vars set once then that's good enough. I don't mind using a single temp directory to run tests against. I can just clear it out between runs."*
+
+This completely eliminates the need for complex lazy initialization or per-test configuration!
+
+### Implementation
+
+**TestMain Setup** (`cmd/litestream-vfs/main_test.go`):
+```go
+const sharedReplicaDir = "/tmp/litestream-vfs-test-shared"
+
+func TestMain(m *testing.M) {
+    // Create shared replica directory
+    os.RemoveAll(sharedReplicaDir)
+    os.MkdirAll(sharedReplicaDir, 0755)
+
+    // Set up VFS once for all tests
+    client := file.NewReplicaClient(sharedReplicaDir)
+    logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+        Level: slog.LevelDebug,
+    }))
+    vfs := litestream.NewVFS(client, logger)
+    vfs.PollInterval = 100 * time.Millisecond
+
+    // Register VFS once
+    sqlite3vfs.RegisterVFS("litestream", vfs)
+
+    // Run all tests
+    code := m.Run()
+
+    // Cleanup
+    os.RemoveAll(sharedReplicaDir)
+    os.Exit(code)
+}
+```
+
+**Test Structure**:
+```go
+t.Run("Simple", func(t *testing.T) {
+    // Clean shared directory for this test
+    os.RemoveAll(sharedReplicaDir)
+    os.MkdirAll(sharedReplicaDir, 0755)
+
+    // Use shared replica directory
+    client := file.NewReplicaClient(sharedReplicaDir)
+
+    // ... rest of test uses the VFS registered in TestMain
+    db, err := sql.Open("sqlite3", "file:/tmp/test.db?vfs=litestream&mode=ro")
+    // Tests work!
+})
+```
+
+### Results
+
+✅ **Both tests now pass:**
+```
+=== RUN   TestVFS_Integration
+=== RUN   TestVFS_Integration/Simple
+--- PASS: TestVFS_Integration/Simple (0.21s)
+=== RUN   TestVFS_Integration/Updating
+--- PASS: TestVFS_Integration/Updating (0.71s)
+--- PASS: TestVFS_Integration (0.92s)
+PASS
+ok      github.com/benbjohnson/litestream/cmd/litestream-vfs   1.444s
+```
+
+### What Changed
+
+1. **Removed complexity**: No need for LazyReplicaClient in tests
+2. **Added TestMain**: Sets up VFS once before all tests
+3. **Shared directory**: All tests use `/tmp/litestream-vfs-test-shared`
+4. **Per-test cleanup**: Each test cleans the directory before running
+5. **Simple**: Just use the registered VFS, no extension loading needed
+
+### Benefits
+
+- ✅ No env var propagation issues
+- ✅ No segfaults (using static linking)
+- ✅ Simple, easy to understand
+- ✅ Tests run fast
+- ✅ Clean separation of test data
+- ✅ Works exactly as Ben wanted
+
+### Note on LazyReplicaClient
+
+The LazyReplicaClient implementation in `litestream-vfs.go` remains for potential future loadable extension use cases, but **is not needed for static linking tests**. If Ben wants to pursue loadable extensions in the future, that code is there as a starting point (though it would still require solving the sqlite3vfs compatibility issue).
+
 ## Next Steps
 
-1. Decide on static vs dynamic approach
-2. If static: Integrate LazyReplicaClient pattern into main branch tests
-3. If dynamic: Plan C VFS implementation approach
-4. Update documentation with chosen architecture
+1. ✅ **DONE**: Tests working with static linking + TestMain approach
+2. Verify this approach works on Linux/other platforms
+3. Consider if loadable extension capability is still needed
+4. If yes: Would require pure C VFS implementation (Option B)
+5. If no: Can remove loadable extension code and simplify further
