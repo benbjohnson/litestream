@@ -2,12 +2,23 @@ package s3
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/base64"
 	"errors"
+	"io"
+	"log/slog"
+	"net/http"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/superfly/ltx"
 )
 
 // mockAPIError implements smithy.APIError for testing
@@ -213,6 +224,143 @@ func TestReplicaClient_HTTPClientConfiguration(t *testing.T) {
 	})
 }
 
+func TestReplicaClientDeleteLTXFiles_ContentMD5(t *testing.T) {
+	var callCount int
+
+	httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+		callCount++
+
+		if r.Method != http.MethodPost {
+			t.Fatalf("unexpected method: %s", r.Method)
+		}
+		if !strings.Contains(r.URL.RawQuery, "delete") {
+			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+		}
+
+		if ua := r.Header.Get("User-Agent"); !strings.Contains(ua, "litestream") {
+			t.Fatalf("expected User-Agent to contain litestream, got %q", ua)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		r.Body.Close()
+
+		got := r.Header.Get("Content-MD5")
+		if got == "" {
+			t.Fatal("expected Content-MD5 header")
+		}
+
+		sum := md5.Sum(body)
+		want := base64.StdEncoding.EncodeToString(sum[:])
+		if got != want {
+			t.Fatalf("unexpected Content-MD5 header: got %q, want %q", got, want)
+		}
+
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/xml"}},
+			Body: io.NopCloser(strings.NewReader(
+				`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
+			)),
+		}
+		return resp, nil
+	})
+
+	cfg := aws.Config{
+		Region:      "us-east-1",
+		Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
+		HTTPClient:  httpClient,
+	}
+
+	c := NewReplicaClient()
+	c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+	})
+	c.Bucket = "test-bucket"
+	c.Path = "test-path"
+
+	files := []*ltx.FileInfo{
+		{Level: 0, MinTXID: 1, MaxTXID: 1},
+		{Level: 0, MinTXID: 2, MaxTXID: 2},
+	}
+
+	if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
+		t.Fatalf("DeleteLTXFiles: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("unexpected call count: %d", callCount)
+	}
+}
+
+func TestReplicaClientDeleteLTXFiles_PreexistingContentMD5(t *testing.T) {
+	const preexistingMD5 = "preexisting-checksum-value"
+	var callCount int
+
+	httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+		t.Helper()
+		callCount++
+
+		got := r.Header.Get("Content-MD5")
+		if got != preexistingMD5 {
+			t.Fatalf("middleware should not override existing Content-MD5: got %q, want %q", got, preexistingMD5)
+		}
+
+		resp := &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/xml"}},
+			Body: io.NopCloser(strings.NewReader(
+				`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
+			)),
+		}
+		return resp, nil
+	})
+
+	cfg := aws.Config{
+		Region:      "us-east-1",
+		Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
+		HTTPClient:  httpClient,
+	}
+
+	c := NewReplicaClient()
+	c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+		o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
+			return stack.Finalize.Add(
+				middleware.FinalizeMiddlewareFunc(
+					"InjectPreexistingContentMD5",
+					func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+						out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
+					) {
+						if req, ok := in.Request.(*smithyhttp.Request); ok {
+							req.Header.Set("Content-MD5", preexistingMD5)
+						}
+						return next.HandleFinalize(ctx, in)
+					},
+				),
+				middleware.Before,
+			)
+		})
+	})
+	c.Bucket = "test-bucket"
+	c.Path = "test-path"
+
+	files := []*ltx.FileInfo{
+		{Level: 0, MinTXID: 1, MaxTXID: 1},
+	}
+
+	if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
+		t.Fatalf("DeleteLTXFiles: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("unexpected call count: %d", callCount)
+	}
+}
+
 // TestReplicaClient_CredentialConfiguration tests credential setup
 func TestReplicaClient_CredentialConfiguration(t *testing.T) {
 	t.Run("WithStaticCredentials", func(t *testing.T) {
@@ -264,4 +412,235 @@ func TestReplicaClient_DefaultRegionUsage(t *testing.T) {
 			t.Error("expected forcePathStyle to be true for MinIO")
 		}
 	})
+}
+
+func TestMarshalDeleteObjects_EdgeCases(t *testing.T) {
+	t.Run("EmptyObjects", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		if !strings.Contains(string(xml), "<Delete") {
+			t.Error("expected XML to contain Delete element")
+		}
+	})
+
+	t.Run("KeyWithSpecialCharacters", func(t *testing.T) {
+		key := "test/path with spaces & <special> chars.txt"
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String(key)},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, "test/path with spaces &amp; &lt;special&gt; chars.txt") {
+			t.Errorf("expected XML to properly escape special characters, got: %s", xmlStr)
+		}
+	})
+
+	t.Run("KeyWithUnicode", func(t *testing.T) {
+		key := "test/文件.txt"
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String(key)},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, key) {
+			t.Errorf("expected XML to contain unicode key, got: %s", xmlStr)
+		}
+	})
+
+	t.Run("LargeBatch", func(t *testing.T) {
+		const count = 1000
+		objects := make([]types.ObjectIdentifier, count)
+		for i := 0; i < count; i++ {
+			objects[i] = types.ObjectIdentifier{
+				Key: aws.String(string(rune('a' + (i % 26)))),
+			}
+		}
+		deleteInput := &types.Delete{
+			Objects: objects,
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed for %d objects: %v", count, err)
+		}
+		if len(xml) == 0 {
+			t.Error("expected non-empty XML output")
+		}
+	})
+
+	t.Run("NilOptionalFields", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key: aws.String("test-key"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, "<Key>test-key</Key>") {
+			t.Errorf("expected Key element in XML, got: %s", xmlStr)
+		}
+		if strings.Contains(xmlStr, "<ETag>") {
+			t.Error("expected no ETag element when nil")
+		}
+		if strings.Contains(xmlStr, "<VersionId>") {
+			t.Error("expected no VersionId element when nil")
+		}
+	})
+
+	t.Run("QuietFlag", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String("test")},
+			},
+			Quiet: aws.Bool(true),
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, "<Quiet>true</Quiet>") {
+			t.Errorf("expected Quiet element to be true, got: %s", xmlStr)
+		}
+	})
+}
+
+func TestEncodeObjectIdentifier_AllFields(t *testing.T) {
+	t.Run("AllFieldsPopulated", func(t *testing.T) {
+		timestamp, err := time.Parse(time.RFC3339, "2023-01-01T00:00:00Z")
+		if err != nil {
+			t.Fatalf("failed to parse timestamp: %v", err)
+		}
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key:              aws.String("my-object-key"),
+					ETag:             aws.String("abc123etag"),
+					VersionId:        aws.String("version-456"),
+					LastModifiedTime: aws.Time(timestamp),
+					Size:             aws.Int64(12345),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+
+		if !strings.Contains(xmlStr, "<Key>my-object-key</Key>") {
+			t.Error("expected Key element")
+		}
+		if !strings.Contains(xmlStr, "<ETag>abc123etag</ETag>") {
+			t.Error("expected ETag element")
+		}
+		if !strings.Contains(xmlStr, "<VersionId>version-456</VersionId>") {
+			t.Error("expected VersionId element")
+		}
+		if !strings.Contains(xmlStr, "<LastModifiedTime>") {
+			t.Error("expected LastModifiedTime element")
+		}
+		if !strings.Contains(xmlStr, "<Size>12345</Size>") {
+			t.Error("expected Size element with value 12345")
+		}
+	})
+
+	t.Run("OnlyRequiredKey", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key: aws.String("only-key"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+
+		if !strings.Contains(xmlStr, "<Key>only-key</Key>") {
+			t.Error("expected Key element")
+		}
+		if strings.Contains(xmlStr, "<ETag>") {
+			t.Error("expected no ETag element when nil")
+		}
+		if strings.Contains(xmlStr, "<VersionId>") {
+			t.Error("expected no VersionId element when nil")
+		}
+	})
+
+	t.Run("FieldOrder", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key:       aws.String("test"),
+					ETag:      aws.String("etag1"),
+					VersionId: aws.String("v1"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+
+		keyIdx := strings.Index(xmlStr, "<Key>")
+		etagIdx := strings.Index(xmlStr, "<ETag>")
+		versionIdx := strings.Index(xmlStr, "<VersionId>")
+
+		if keyIdx == -1 || etagIdx == -1 || versionIdx == -1 {
+			t.Fatal("missing expected elements")
+		}
+		if etagIdx > keyIdx || keyIdx > versionIdx {
+			t.Errorf("expected field order: ETag, Key, VersionId, got ETag@%d, Key@%d, VersionId@%d", etagIdx, keyIdx, versionIdx)
+		}
+	})
+}
+
+func TestComputeDeleteObjectsContentMD5_Deterministic(t *testing.T) {
+	deleteInput := &types.Delete{
+		Objects: []types.ObjectIdentifier{
+			{Key: aws.String("key1")},
+			{Key: aws.String("key2")},
+		},
+	}
+
+	md51, err := computeDeleteObjectsContentMD5(deleteInput)
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+
+	md52, err := computeDeleteObjectsContentMD5(deleteInput)
+	if err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+
+	if md51 != md52 {
+		t.Errorf("MD5 computation not deterministic: %q != %q", md51, md52)
+	}
+
+	if md51 == "" {
+		t.Error("expected non-empty MD5")
+	}
 }

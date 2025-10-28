@@ -3,7 +3,9 @@ package s3
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -25,7 +27,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
+	smithyxml "github.com/aws/smithy-go/encoding/xml"
 	"github.com/aws/smithy-go/middleware"
+	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/superfly/ltx"
 
@@ -44,6 +48,10 @@ const MaxKeys = 1000
 
 // DefaultRegion is the region used if one is not specified.
 const DefaultRegion = "us-east-1"
+
+// contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
+// through the middleware stack from Serialize to Finalize phase.
+type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
@@ -170,23 +178,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	s3Opts := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
-			// Add User-Agent for telemetry (similar to Azure's ApplicationID)
-			o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
-				return stack.Build.Add(
-					middleware.BuildMiddlewareFunc(
-						"LitestreamUserAgent",
-						func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
-							out middleware.BuildOutput, metadata middleware.Metadata, err error,
-						) {
-							if req, ok := in.Request.(*smithyhttp.Request); ok {
-								req.Header.Add("User-Agent", "litestream")
-							}
-							return next.HandleBuild(ctx, in)
-						},
-					),
-					middleware.After,
-				)
-			})
+			// Add User-Agent and Content-MD5 middleware.
+			o.APIOptions = append(o.APIOptions, litestreamAPIOption())
 		},
 	}
 
@@ -376,6 +369,230 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	return info, nil
+}
+
+func litestreamAPIOption() func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		if err := stack.Serialize.Add(
+			middleware.SerializeMiddlewareFunc(
+				"LitestreamComputeDeleteContentMD5",
+				func(ctx context.Context, in middleware.SerializeInput, next middleware.SerializeHandler) (
+					out middleware.SerializeOutput, metadata middleware.Metadata, err error,
+				) {
+					if middleware.GetOperationName(ctx) != "DeleteObjects" {
+						return next.HandleSerialize(ctx, in)
+					}
+
+					input, ok := in.Parameters.(*s3.DeleteObjectsInput)
+					if !ok || input == nil || input.Delete == nil || len(input.Delete.Objects) == 0 {
+						return next.HandleSerialize(ctx, in)
+					}
+
+					checksum, err := computeDeleteObjectsContentMD5(input.Delete)
+					if err != nil {
+						return out, metadata, err
+					}
+					if checksum != "" {
+						ctx = middleware.WithStackValue(ctx, contentMD5StackKey{}, checksum)
+					}
+
+					return next.HandleSerialize(ctx, in)
+				},
+			),
+			middleware.Before,
+		); err != nil {
+			return err
+		}
+
+		if err := stack.Build.Add(
+			middleware.BuildMiddlewareFunc(
+				"LitestreamUserAgent",
+				func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+					out middleware.BuildOutput, metadata middleware.Metadata, err error,
+				) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok {
+						current := req.Header.Get("User-Agent")
+						if current == "" {
+							req.Header.Set("User-Agent", "litestream")
+						} else if !strings.Contains(current, "litestream") {
+							req.Header.Set("User-Agent", "litestream "+current)
+						}
+					}
+					return next.HandleBuild(ctx, in)
+				},
+			),
+			middleware.After,
+		); err != nil {
+			return err
+		}
+
+		md5Middleware := func() middleware.FinalizeMiddleware {
+			return middleware.FinalizeMiddlewareFunc(
+				"LitestreamDeleteContentMD5",
+				func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+					out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
+				) {
+					if middleware.GetOperationName(ctx) != "DeleteObjects" {
+						return next.HandleFinalize(ctx, in)
+					}
+
+					checksum, _ := middleware.GetStackValue(ctx, contentMD5StackKey{}).(string)
+					if checksum == "" {
+						return next.HandleFinalize(ctx, in)
+					}
+
+					req, ok := in.Request.(*smithyhttp.Request)
+					if !ok {
+						return next.HandleFinalize(ctx, in)
+					}
+					if req.Header.Get("Content-MD5") == "" {
+						req.Header.Set("Content-MD5", checksum)
+					}
+
+					return next.HandleFinalize(ctx, in)
+				},
+			)
+		}
+
+		// Try to insert before AWS's checksum middleware for optimal ordering.
+		// If that middleware doesn't exist (e.g., different SDK version), add at the end.
+		// Our middleware checks if Content-MD5 is already set, so order is not critical.
+		if err := stack.Finalize.Insert(md5Middleware(), "AWSChecksum:ComputeInputPayloadChecksum", middleware.Before); err != nil {
+			if err := stack.Finalize.Add(md5Middleware(), middleware.After); err != nil {
+				return err
+			}
+		}
+
+		return nil
+	}
+}
+
+func computeDeleteObjectsContentMD5(deleteInput *types.Delete) (string, error) {
+	if deleteInput == nil {
+		return "", nil
+	}
+
+	payload, err := marshalDeleteObjects(deleteInput)
+	if err != nil {
+		return "", err
+	}
+	if len(payload) == 0 {
+		return "", nil
+	}
+
+	sum := md5.Sum(payload)
+	return base64.StdEncoding.EncodeToString(sum[:]), nil
+}
+
+func marshalDeleteObjects(deleteInput *types.Delete) ([]byte, error) {
+	if deleteInput == nil {
+		return nil, nil
+	}
+
+	var buf bytes.Buffer
+	encoder := smithyxml.NewEncoder(&buf)
+	root := smithyxml.StartElement{
+		Name: smithyxml.Name{
+			Local: "Delete",
+		},
+		Attr: []smithyxml.Attr{
+			smithyxml.NewNamespaceAttribute("", "http://s3.amazonaws.com/doc/2006-03-01/"),
+		},
+	}
+
+	if err := encodeDeleteDocument(deleteInput, encoder.RootElement(root)); err != nil {
+		return nil, err
+	}
+
+	return encoder.Bytes(), nil
+}
+
+func encodeDeleteDocument(v *types.Delete, value smithyxml.Value) error {
+	defer value.Close()
+	if v.Objects != nil {
+		root := smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "Object",
+			},
+		}
+		el := value.FlattenedElement(root)
+		if err := encodeObjectIdentifierList(v.Objects, el); err != nil {
+			return err
+		}
+	}
+	if v.Quiet != nil {
+		root := smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "Quiet",
+			},
+		}
+		el := value.MemberElement(root)
+		el.Boolean(*v.Quiet)
+	}
+	return nil
+}
+
+func encodeObjectIdentifierList(v []types.ObjectIdentifier, value smithyxml.Value) error {
+	if !value.IsFlattened() {
+		defer value.Close()
+	}
+
+	array := value.Array()
+	for i := range v {
+		member := array.Member()
+		if err := encodeObjectIdentifier(&v[i], member); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// encodeObjectIdentifier mirrors the AWS SDK's XML serializer for DeleteObjects.
+// This ensures our precomputed Content-MD5 matches the actual request body.
+// Includes all ObjectIdentifier fields as of AWS SDK v2 (2024).
+func encodeObjectIdentifier(v *types.ObjectIdentifier, value smithyxml.Value) error {
+	defer value.Close()
+	if v.ETag != nil {
+		el := value.MemberElement(smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "ETag",
+			},
+		})
+		el.String(*v.ETag)
+	}
+	if v.Key != nil {
+		el := value.MemberElement(smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "Key",
+			},
+		})
+		el.String(*v.Key)
+	}
+	if v.LastModifiedTime != nil {
+		el := value.MemberElement(smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "LastModifiedTime",
+			},
+		})
+		el.String(smithytime.FormatHTTPDate(*v.LastModifiedTime))
+	}
+	if v.Size != nil {
+		el := value.MemberElement(smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "Size",
+			},
+		})
+		el.Long(*v.Size)
+	}
+	if v.VersionId != nil {
+		el := value.MemberElement(smithyxml.StartElement{
+			Name: smithyxml.Name{
+				Local: "VersionId",
+			},
+		})
+		el.String(*v.VersionId)
+	}
+	return nil
 }
 
 // DeleteLTXFiles deletes one or more LTX files.
