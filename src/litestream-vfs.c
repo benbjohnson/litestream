@@ -6,8 +6,6 @@
 /* sqlite3vfs already called SQLITE_EXTENSION_INIT1 */
 extern const sqlite3_api_routines *sqlite3_api;
 
-extern void Sqlite3HTTPRegister();
-
 // This routine is called when the extension is loaded.
 // Register the new VFS.
 int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
@@ -15,7 +13,7 @@ int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_r
   SQLITE_EXTENSION_INIT2(pApi);
 
   // call into Go
-  rc = sqlite3_extension_init();
+  rc = litestream_sqlite3_extension_init();
 
   if( rc != SQLITE_OK ) {
     *pzErrMsg = sqlite3_mprintf("Failed to initialize litestream VFS");
@@ -23,4 +21,8 @@ int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_r
   }
 
   return SQLITE_OK_LOAD_PERMANENTLY;
+}
+
+int sqlite3_extension_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
+  return sqlite3_litestreamvfs_init(db, pzErrMsg, pApi);
 }

@@ -5,7 +5,9 @@ package main_test
 
 import (
 	"database/sql"
+	"fmt"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sync"
@@ -56,6 +58,10 @@ func TestVFS_Integration(t *testing.T) {
 	})
 
 	t.Run("Updating", func(t *testing.T) {
+		if loadableExtensionBuild {
+			t.Skip("litestream VFS registered separately when building loadable extension")
+		}
+
 		client := file.NewReplicaClient(t.TempDir())
 		vfs := newVFS(t, client)
 		if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
@@ -149,7 +155,7 @@ func openWithVFS(tb testing.TB, path string) *sql.DB {
 	os.Setenv("LITESTREAM_LOG_LEVEL", "DEBUG")
 
 	// Register the driver once with the extension.
-	// The extension will load on first connection and attempt to register a lazy VFS.
+	// The extension loads on first connection and registers the lazy VFS.
 	driverOnce.Do(func() {
 		sql.Register("sqlite3_ext",
 			&sqlite3.SQLiteDriver{
@@ -159,8 +165,7 @@ func openWithVFS(tb testing.TB, path string) *sql.DB {
 			})
 	})
 
-	// Open connection - this will load the extension and attempt VFS registration.
-	// Currently segfaults during sqlite3vfs.RegisterVFS() call.
+	// Open connection - this loads the extension and registers the VFS.
 	db, err := sql.Open("sqlite3_ext", ":memory:")
 	if err != nil {
 		tb.Fatalf("failed to open database: %v", err)
@@ -177,7 +182,9 @@ func openWithVFS(tb testing.TB, path string) *sql.DB {
 	}
 
 	// Now open with the litestream VFS that was registered by the extension.
-	db, err = sql.Open("sqlite3_ext", ":memory:?vfs=litestream")
+	// Use file URI so SQLite honors the custom VFS parameter.
+	dsn := fmt.Sprintf("file:%s?vfs=litestream&mode=ro", url.PathEscape(path))
+	db, err = sql.Open("sqlite3_ext", dsn)
 	if err != nil {
 		tb.Fatalf("failed to open database with VFS: %v", err)
 	}
