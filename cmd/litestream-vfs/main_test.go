@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/mattn/go-sqlite3"
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
 
@@ -20,9 +19,54 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
+const sharedReplicaDir = "/tmp/litestream-vfs-test-shared"
+
+// TestMain sets up a shared VFS once for all tests using Ben's approach:
+// - Single shared temp directory
+// - VFS registered once at package level
+// - Tests clean up the directory between runs
+func TestMain(m *testing.M) {
+	// Create shared replica directory
+	if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
+		panic(err)
+	}
+	if err := os.MkdirAll(sharedReplicaDir, 0755); err != nil {
+		panic(err)
+	}
+
+	// Set up VFS once for all tests
+	client := file.NewReplicaClient(sharedReplicaDir)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	}))
+	vfs := litestream.NewVFS(client, logger)
+	vfs.PollInterval = 100 * time.Millisecond
+
+	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
+		panic(err)
+	}
+
+	// Run tests
+	code := m.Run()
+
+	// Cleanup
+	os.RemoveAll(sharedReplicaDir)
+
+	os.Exit(code)
+}
+
 func TestVFS_Integration(t *testing.T) {
 	t.Run("Simple", func(t *testing.T) {
-		client := file.NewReplicaClient(t.TempDir())
+		// Clean shared replica directory for this test
+		if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(sharedReplicaDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Use shared replica directory (Ben's approach)
+		client := file.NewReplicaClient(sharedReplicaDir)
 
 		db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 		db.MonitorInterval = 100 * time.Millisecond
@@ -42,7 +86,11 @@ func TestVFS_Integration(t *testing.T) {
 		}
 		time.Sleep(2 * db.MonitorInterval)
 
-		sqldb1 := openWithVFS(t, client.Path())
+		// Use the VFS registered in TestMain - no complex extension loading needed!
+		sqldb1, err := sql.Open("sqlite3", "file:/tmp/test.db?vfs=litestream&mode=ro")
+		if err != nil {
+			t.Fatalf("failed to open database with VFS: %v", err)
+		}
 		defer sqldb1.Close()
 
 		// Execute query
@@ -55,11 +103,17 @@ func TestVFS_Integration(t *testing.T) {
 	})
 
 	t.Run("Updating", func(t *testing.T) {
-		client := file.NewReplicaClient(t.TempDir())
-		vfs := newVFS(t, client)
-		if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
-			t.Fatalf("failed to register litestream vfs: %v", err)
+		// Clean shared replica directory for this test
+		if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
 		}
+		if err := os.MkdirAll(sharedReplicaDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Use shared replica directory (Ben's approach)
+		// VFS already registered in TestMain!
+		client := file.NewReplicaClient(sharedReplicaDir)
 
 		db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
 		db.MonitorInterval = 100 * time.Millisecond
@@ -113,34 +167,7 @@ func TestVFS_Integration(t *testing.T) {
 	})
 }
 
-func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
-	tb.Helper()
-
-	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
-		Level: slog.LevelDebug,
-	}))
-
-	vfs := litestream.NewVFS(client, logger)
-	vfs.PollInterval = 100 * time.Millisecond
-	return vfs
-}
-
-func openWithVFS(tb testing.TB, path string) *sql.DB {
-	tb.Helper()
-	tb.Setenv("LITESTREAM_REPLICA_TYPE", "file")
-	tb.Setenv("LITESTREAM_REPLICA_PATH", path)
-
-	sql.Register("sqlite3_ext",
-		&sqlite3.SQLiteDriver{
-			Extensions: []string{
-				`/Users/benbjohnson/src/benbjohnson/litestream/dist/litestream-vfs.so`,
-			},
-		})
-
-	db, err := sql.Open("sqlite3_ext", ":memory:")
-	if err != nil {
-		tb.Fatalf("failed to open database: %v", err)
-	}
-
-	return db
-}
+// Note: With Ben's approach of using a shared temp directory and setting up VFS once
+// in TestMain, we can use simple static linking. No complex extension loading needed.
+//
+// See VFS_EXTENSION_FINDINGS.md for full analysis and test results.
