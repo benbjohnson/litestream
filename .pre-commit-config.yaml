@@ -7,8 +7,6 @@ repos:
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-added-large-files
-        args: ["--maxkb=1024"]
-        exclude: ^(src/sqlite3-binding\.h|third_party/sqlite3vfs/sqlite3-binding\.h)$
 
   - repo: https://github.com/tekwizely/pre-commit-golang
     rev: v1.0.0-beta.5
@@ -19,6 +17,4 @@ repos:
           - "github.com/benbjohnson/litestream"
           - "-w"
       - id: go-vet-repo-mod
-        exclude: ^third_party/
       - id: go-staticcheck-repo-mod
-        exclude: ^third_party/

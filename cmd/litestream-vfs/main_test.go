@@ -24,13 +24,8 @@ const sharedReplicaDir = "/tmp/litestream-vfs-test-shared"
 // TestMain sets up a shared VFS once for all tests using Ben's approach:
 // - Single shared temp directory
 // - VFS registered once at package level
-// - Tests clean up between runs
+// - Tests clean up the directory between runs
 func TestMain(m *testing.M) {
-	// Skip setup if building as loadable extension (not yet supported)
-	if loadableExtensionBuild {
-		os.Exit(m.Run())
-	}
-
 	// Create shared replica directory
 	if err := os.RemoveAll(sharedReplicaDir); err != nil && !os.IsNotExist(err) {
 		panic(err)
@@ -172,12 +167,7 @@ func TestVFS_Integration(t *testing.T) {
 	})
 }
 
-// Note: The complex extension loading code (openWithVFS, etc.) has been removed.
-// With Ben's approach of using a shared temp directory and setting up VFS once in TestMain,
-// we don't need the LazyReplicaClient pattern or complex extension loading for tests.
+// Note: With Ben's approach of using a shared temp directory and setting up VFS once
+// in TestMain, we can use simple static linking. No complex extension loading needed.
 //
-// The LazyReplicaClient implementation in litestream-vfs.go remains for potential future
-// loadable extension use cases, but is not needed for static linking tests.
-//
-// See VFS_EXTENSION_FINDINGS.md for analysis of why loadable extensions don't work with
-// the sqlite3vfs package (requires pure C VFS implementation).
+// See VFS_EXTENSION_FINDINGS.md for full analysis and test results.
