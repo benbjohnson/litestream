@@ -13,6 +13,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
@@ -410,4 +411,226 @@ func TestReplicaClient_DefaultRegionUsage(t *testing.T) {
 			t.Error("expected forcePathStyle to be true for MinIO")
 		}
 	})
+}
+
+func TestMarshalDeleteObjects_EdgeCases(t *testing.T) {
+	t.Run("EmptyObjects", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		if !strings.Contains(string(xml), "<Delete") {
+			t.Error("expected XML to contain Delete element")
+		}
+	})
+
+	t.Run("KeyWithSpecialCharacters", func(t *testing.T) {
+		key := "test/path with spaces & <special> chars.txt"
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String(key)},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, "test/path with spaces &amp; &lt;special&gt; chars.txt") {
+			t.Errorf("expected XML to properly escape special characters, got: %s", xmlStr)
+		}
+	})
+
+	t.Run("KeyWithUnicode", func(t *testing.T) {
+		key := "test/文件.txt"
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String(key)},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, key) {
+			t.Errorf("expected XML to contain unicode key, got: %s", xmlStr)
+		}
+	})
+
+	t.Run("LargeBatch", func(t *testing.T) {
+		const count = 1000
+		objects := make([]types.ObjectIdentifier, count)
+		for i := 0; i < count; i++ {
+			objects[i] = types.ObjectIdentifier{
+				Key: aws.String(string(rune('a' + (i % 26)))),
+			}
+		}
+		deleteInput := &types.Delete{
+			Objects: objects,
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed for %d objects: %v", count, err)
+		}
+		if len(xml) == 0 {
+			t.Error("expected non-empty XML output")
+		}
+	})
+
+	t.Run("NilOptionalFields", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key: aws.String("test-key"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, "<Key>test-key</Key>") {
+			t.Errorf("expected Key element in XML, got: %s", xmlStr)
+		}
+		if strings.Contains(xmlStr, "<ETag>") {
+			t.Error("expected no ETag element when nil")
+		}
+		if strings.Contains(xmlStr, "<VersionId>") {
+			t.Error("expected no VersionId element when nil")
+		}
+	})
+
+	t.Run("QuietFlag", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{Key: aws.String("test")},
+			},
+			Quiet: aws.Bool(true),
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+		if !strings.Contains(xmlStr, "<Quiet>true</Quiet>") {
+			t.Errorf("expected Quiet element to be true, got: %s", xmlStr)
+		}
+	})
+}
+
+func TestEncodeObjectIdentifier_AllFields(t *testing.T) {
+	t.Run("AllFieldsPopulated", func(t *testing.T) {
+		timestamp := "2023-01-01T00:00:00Z"
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key:       aws.String("my-object-key"),
+					ETag:      aws.String("abc123etag"),
+					VersionId: aws.String("version-456"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+
+		if !strings.Contains(xmlStr, "<Key>my-object-key</Key>") {
+			t.Error("expected Key element")
+		}
+		if !strings.Contains(xmlStr, "<ETag>abc123etag</ETag>") {
+			t.Error("expected ETag element")
+		}
+		if !strings.Contains(xmlStr, "<VersionId>version-456</VersionId>") {
+			t.Error("expected VersionId element")
+		}
+
+		_ = timestamp
+	})
+
+	t.Run("OnlyRequiredKey", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key: aws.String("only-key"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+
+		if !strings.Contains(xmlStr, "<Key>only-key</Key>") {
+			t.Error("expected Key element")
+		}
+		if strings.Contains(xmlStr, "<ETag>") {
+			t.Error("expected no ETag element when nil")
+		}
+		if strings.Contains(xmlStr, "<VersionId>") {
+			t.Error("expected no VersionId element when nil")
+		}
+	})
+
+	t.Run("FieldOrder", func(t *testing.T) {
+		deleteInput := &types.Delete{
+			Objects: []types.ObjectIdentifier{
+				{
+					Key:       aws.String("test"),
+					ETag:      aws.String("etag1"),
+					VersionId: aws.String("v1"),
+				},
+			},
+		}
+		xml, err := marshalDeleteObjects(deleteInput)
+		if err != nil {
+			t.Fatalf("marshalDeleteObjects failed: %v", err)
+		}
+		xmlStr := string(xml)
+
+		keyIdx := strings.Index(xmlStr, "<Key>")
+		etagIdx := strings.Index(xmlStr, "<ETag>")
+		versionIdx := strings.Index(xmlStr, "<VersionId>")
+
+		if keyIdx == -1 || etagIdx == -1 || versionIdx == -1 {
+			t.Fatal("missing expected elements")
+		}
+		if etagIdx > keyIdx || keyIdx > versionIdx {
+			t.Errorf("expected field order: ETag, Key, VersionId, got ETag@%d, Key@%d, VersionId@%d", etagIdx, keyIdx, versionIdx)
+		}
+	})
+}
+
+func TestComputeDeleteObjectsContentMD5_Deterministic(t *testing.T) {
+	deleteInput := &types.Delete{
+		Objects: []types.ObjectIdentifier{
+			{Key: aws.String("key1")},
+			{Key: aws.String("key2")},
+		},
+	}
+
+	md51, err := computeDeleteObjectsContentMD5(deleteInput)
+	if err != nil {
+		t.Fatalf("first call failed: %v", err)
+	}
+
+	md52, err := computeDeleteObjectsContentMD5(deleteInput)
+	if err != nil {
+		t.Fatalf("second call failed: %v", err)
+	}
+
+	if md51 != md52 {
+		t.Errorf("MD5 computation not deterministic: %q != %q", md51, md52)
+	}
+
+	if md51 == "" {
+		t.Error("expected non-empty MD5")
+	}
 }
