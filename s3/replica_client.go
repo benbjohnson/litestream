@@ -489,8 +489,8 @@ func marshalDeleteObjects(deleteInput *types.Delete) ([]byte, error) {
 		return nil, nil
 	}
 
-	buf := bytes.NewBuffer(nil)
-	encoder := smithyxml.NewEncoder(buf)
+	var buf bytes.Buffer
+	encoder := smithyxml.NewEncoder(&buf)
 	root := smithyxml.StartElement{
 		Name: smithyxml.Name{
 			Local: "Delete",

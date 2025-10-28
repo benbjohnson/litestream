@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -525,13 +526,18 @@ func TestMarshalDeleteObjects_EdgeCases(t *testing.T) {
 
 func TestEncodeObjectIdentifier_AllFields(t *testing.T) {
 	t.Run("AllFieldsPopulated", func(t *testing.T) {
-		timestamp := "2023-01-01T00:00:00Z"
+		timestamp, err := time.Parse(time.RFC3339, "2023-01-01T00:00:00Z")
+		if err != nil {
+			t.Fatalf("failed to parse timestamp: %v", err)
+		}
 		deleteInput := &types.Delete{
 			Objects: []types.ObjectIdentifier{
 				{
-					Key:       aws.String("my-object-key"),
-					ETag:      aws.String("abc123etag"),
-					VersionId: aws.String("version-456"),
+					Key:              aws.String("my-object-key"),
+					ETag:             aws.String("abc123etag"),
+					VersionId:        aws.String("version-456"),
+					LastModifiedTime: aws.Time(timestamp),
+					Size:             aws.Int64(12345),
 				},
 			},
 		}
@@ -550,8 +556,12 @@ func TestEncodeObjectIdentifier_AllFields(t *testing.T) {
 		if !strings.Contains(xmlStr, "<VersionId>version-456</VersionId>") {
 			t.Error("expected VersionId element")
 		}
-
-		_ = timestamp
+		if !strings.Contains(xmlStr, "<LastModifiedTime>") {
+			t.Error("expected LastModifiedTime element")
+		}
+		if !strings.Contains(xmlStr, "<Size>12345</Size>") {
+			t.Error("expected Size element with value 12345")
+		}
 	})
 
 	t.Run("OnlyRequiredKey", func(t *testing.T) {
