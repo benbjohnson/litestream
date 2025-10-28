@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -125,21 +126,60 @@ func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
 	return vfs
 }
 
+var driverOnce sync.Once
+
+// openWithVFS attempts to open a database using the litestream VFS loaded as an extension.
+//
+// CURRENT STATE: This currently fails with a segfault because github.com/psanford/sqlite3vfs
+// cannot be used from within a dynamically loaded SQLite extension. The sqlite3vfs package
+// is designed for static linking only.
+//
+// The LazyReplicaClient pattern implemented in litestream-vfs.go successfully solves the
+// environment variable propagation issue, but we hit the sqlite3vfs limitation before
+// we can test it fully.
+//
+// See VFS_EXTENSION_FINDINGS.md for full analysis and recommendations.
 func openWithVFS(tb testing.TB, path string) *sql.DB {
 	tb.Helper()
-	tb.Setenv("LITESTREAM_REPLICA_TYPE", "file")
-	tb.Setenv("LITESTREAM_REPLICA_PATH", path)
 
-	sql.Register("sqlite3_ext",
-		&sqlite3.SQLiteDriver{
-			Extensions: []string{
-				`/Users/benbjohnson/src/benbjohnson/litestream/dist/litestream-vfs.so`,
-			},
-		})
+	// Set environment variables BEFORE registering the driver.
+	// The LazyReplicaClient will read these when the VFS is first accessed.
+	os.Setenv("LITESTREAM_REPLICA_TYPE", "file")
+	os.Setenv("LITESTREAM_REPLICA_PATH", path)
+	os.Setenv("LITESTREAM_LOG_LEVEL", "DEBUG")
 
+	// Register the driver once with the extension.
+	// The extension will load on first connection and attempt to register a lazy VFS.
+	driverOnce.Do(func() {
+		sql.Register("sqlite3_ext",
+			&sqlite3.SQLiteDriver{
+				Extensions: []string{
+					`/Users/corylanou/projects/benbjohnson/litestream/dist/litestream-vfs.so`,
+				},
+			})
+	})
+
+	// Open connection - this will load the extension and attempt VFS registration.
+	// Currently segfaults during sqlite3vfs.RegisterVFS() call.
 	db, err := sql.Open("sqlite3_ext", ":memory:")
 	if err != nil {
 		tb.Fatalf("failed to open database: %v", err)
+	}
+
+	// Ping to actually establish the connection and load the extension.
+	if err := db.Ping(); err != nil {
+		tb.Fatalf("failed to ping database: %v", err)
+	}
+
+	// Close the initial connection.
+	if err := db.Close(); err != nil {
+		tb.Fatalf("failed to close initial database: %v", err)
+	}
+
+	// Now open with the litestream VFS that was registered by the extension.
+	db, err = sql.Open("sqlite3_ext", ":memory:?vfs=litestream")
+	if err != nil {
+		tb.Fatalf("failed to open database with VFS: %v", err)
 	}
 
 	return db

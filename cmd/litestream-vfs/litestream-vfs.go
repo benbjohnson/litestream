@@ -10,13 +10,16 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"log/slog"
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/psanford/sqlite3vfs"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -26,12 +29,14 @@ import (
 func main() {}
 
 //export sqlite3_extension_init
-func sqlite3_extension_init() {
-	println("dbg/LitestreamVFSRegister")
-	client, err := newReplicaClientFromEnv()
-	if err != nil {
-		log.Fatalf("failed to create replica client: %s", err)
-	}
+func sqlite3_extension_init() int {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("panic in sqlite3_extension_init: %v", r)
+		}
+	}()
+
+	println("sqlite3_extension_init called")
 
 	var level slog.Level
 	switch strings.ToUpper(os.Getenv("LITESTREAM_LOG_LEVEL")) {
@@ -42,11 +47,93 @@ func sqlite3_extension_init() {
 	}
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
-	vfs := litestream.NewVFS(client, logger)
+	// Create a lazy replica client that reads env vars on first use
+	lazyClient := &LazyReplicaClient{logger: logger}
+	vfs := litestream.NewVFS(lazyClient, logger)
 
+	println("Registering litestream VFS")
 	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
-		log.Fatalf("failed to register litestream vfs: %s", err)
+		log.Printf("failed to register litestream vfs: %s", err)
+		return 1 // SQLITE_ERROR
 	}
+	println("VFS registered successfully")
+	return 0 // SQLITE_OK
+}
+
+// LazyReplicaClient wraps a ReplicaClient and defers initialization until first use.
+// This allows environment variables to be set after the extension loads but before
+// the VFS is actually used.
+type LazyReplicaClient struct {
+	mu     sync.Mutex
+	client litestream.ReplicaClient
+	logger *slog.Logger
+	err    error
+}
+
+func (c *LazyReplicaClient) init() (litestream.ReplicaClient, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Return cached client or error
+	if c.client != nil || c.err != nil {
+		return c.client, c.err
+	}
+
+	// Initialize from environment variables
+	c.logger.Debug("initializing replica client from environment variables",
+		"type", os.Getenv("LITESTREAM_REPLICA_TYPE"),
+		"path", os.Getenv("LITESTREAM_REPLICA_PATH"))
+
+	c.client, c.err = newReplicaClientFromEnv()
+	return c.client, c.err
+}
+
+func (c *LazyReplicaClient) Type() string {
+	client, err := c.init()
+	if err != nil {
+		return ""
+	}
+	return client.Type()
+}
+
+func (c *LazyReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	client, err := c.init()
+	if err != nil {
+		return nil, err
+	}
+	return client.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+func (c *LazyReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	client, err := c.init()
+	if err != nil {
+		return nil, err
+	}
+	return client.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *LazyReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	client, err := c.init()
+	if err != nil {
+		return nil, err
+	}
+	return client.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func (c *LazyReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
+	client, err := c.init()
+	if err != nil {
+		return err
+	}
+	return client.DeleteLTXFiles(ctx, a)
+}
+
+func (c *LazyReplicaClient) DeleteAll(ctx context.Context) error {
+	client, err := c.init()
+	if err != nil {
+		return err
+	}
+	return client.DeleteAll(ctx)
 }
 
 func newReplicaClientFromEnv() (_ litestream.ReplicaClient, err error) {
