@@ -1,6 +1,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/base64"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -81,6 +83,82 @@ func TestIsNotExists(t *testing.T) {
 	if !isNotExists(wrappedErr) {
 		t.Error("isNotExists should return true for wrapped NoSuchKey error")
 	}
+}
+
+func TestReplicaClientUnsignedPayload(t *testing.T) {
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		if r.Method == http.MethodPut {
+			select {
+			case headers <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	data := mustLTX(t)
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-headers:
+		if got, want := hdr.Get("x-amz-content-sha256"), "UNSIGNED-PAYLOAD"; got != want {
+			t.Fatalf("x-amz-content-sha256 header = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for signed PUT request")
+	}
+}
+
+func mustLTX(t *testing.T) []byte {
+	t.Helper()
+
+	buf := new(bytes.Buffer)
+	enc, err := ltx.NewEncoder(buf)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
+
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:          ltx.Version,
+		PageSize:         4096,
+		Commit:           0,
+		MinTXID:          2,
+		MaxTXID:          2,
+		Timestamp:        time.Now().UnixMilli(),
+		PreApplyChecksum: ltx.ChecksumFlag | 1,
+	}); err != nil {
+		t.Fatalf("EncodeHeader: %v", err)
+	}
+
+	enc.SetPostApplyChecksum(ltx.ChecksumFlag)
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	return buf.Bytes()
 }
 
 // TestReplicaClient_Init_BucketValidation tests that Init validates bucket name
