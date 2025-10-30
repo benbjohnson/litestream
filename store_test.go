@@ -141,11 +141,10 @@ func TestStore_Integration(t *testing.T) {
 	// WaitGroup to ensure insert goroutine completes before cleanup
 	var wg sync.WaitGroup
 
-	// Wait for insert goroutine to finish before cleanup
-	defer wg.Wait()
-
-	// Check for any insert errors that occurred before shutdown
+	// Wait for insert goroutine to finish before cleanup & surface any errors.
 	defer func() {
+		wg.Wait()
+
 		select {
 		case err := <-insertErr:
 			t.Fatalf("insert error during test: %v", err)
