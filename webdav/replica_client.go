@@ -136,6 +136,59 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
+// WriteLTXFile writes an LTX file to the WebDAV server.
+//
+// WebDAV Upload Strategy - Temp File Approach:
+//
+// Unlike other replica backends (S3, SFTP, NATS, ABS) which stream directly using
+// internal.NewReadCounter, WebDAV requires a different approach due to library and
+// protocol constraints:
+//
+// 1. gowebdav Library Limitations:
+//
+//   - WriteStream() buffers entire payload in memory for non-seekable readers
+//
+//   - WriteStreamWithLength() requires both content-length AND seekable reader
+//
+//   - No native support for HTTP chunked transfer encoding
+//
+//     2. Server Compatibility Issues:
+//     Research shows HTTP chunked transfer encoding with WebDAV is unreliable:
+//
+//   - Nginx + FastCGI: Discards request body → 0-byte files (silent data loss)
+//
+//   - Lighttpd: Returns HTTP 411 (Length Required), rejects chunked requests
+//
+//   - Apache + FastCGI: Request body never arrives at application
+//
+//   - Only Apache + mod_php handles chunked encoding reliably (~30-40% of deployments)
+//
+// 3. LTX Header Requirement:
+//   - Must peek at LTX header to extract timestamp before upload
+//   - Peeking consumes data, making the reader non-seekable
+//   - Cannot calculate content-length without fully reading stream
+//
+// Solution: Stage to temporary file
+//
+// To ensure universal compatibility and prevent silent data loss:
+//  1. Extract timestamp from LTX header (required for file metadata)
+//  2. Stream full contents to temporary file on disk
+//  3. Seek back to start of temp file (now seekable + known size)
+//  4. Upload using WriteStreamWithLength() with Content-Length header
+//  5. Clean up temp file
+//
+// Trade-offs:
+//   - Universal compatibility with all WebDAV server configurations
+//   - No risk of silent data loss or failed uploads
+//   - Predictable, reliable behavior
+//   - Additional disk I/O overhead
+//   - Requires local disk space proportional to LTX file size
+//   - Diverges from streaming pattern used by other backends
+//
+// References:
+//   - https://github.com/studio-b12/gowebdav/issues/35 (chunked encoding issues)
+//   - https://github.com/nextcloud/server/issues/7995 (0-byte file bug)
+//   - https://evertpot.com/260/ (WebDAV chunked encoding compatibility)
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	client, err := c.Init(ctx)
 	if err != nil {
@@ -153,6 +206,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
+	// Stage to temporary file to get seekable reader with known size.
+	// This ensures compatibility with all WebDAV servers and avoids the
+	// unreliable chunked transfer encoding that causes silent data loss
+	// on common configurations (Nginx+FastCGI, Lighttpd, Apache+FastCGI).
 	tmpFile, err := os.CreateTemp("", "litestream-webdav-*.ltx")
 	if err != nil {
 		return nil, fmt.Errorf("webdav: cannot create temp file: %w", err)
@@ -177,6 +234,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("webdav: cannot create parent directory %q: %w", path.Dir(filename), err)
 	}
 
+	// Upload with Content-Length header using seekable temp file.
+	// WriteStreamWithLength requires both a seekable reader and known size,
+	// which we now have from the temp file. This avoids chunked encoding
+	// and ensures reliable uploads across all WebDAV server configurations.
 	if err := client.WriteStreamWithLength(filename, tmpFile, size, 0644); err != nil {
 		return nil, fmt.Errorf("webdav: cannot write file %q: %w", filename, err)
 	}
