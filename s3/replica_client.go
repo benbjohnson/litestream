@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/feature/s3/manager"
@@ -423,6 +424,19 @@ func litestreamAPIOption() func(*middleware.Stack) error {
 			),
 			middleware.After,
 		); err != nil {
+			return err
+		}
+
+		// Many S3-compatible providers (e.g. Filebase) do not support SigV4
+		// payload hashing. Switching to unsigned payload matches the behavior
+		// of the AWS SDK v1 client used in Litestream v0.3.x and restores
+		// compatibility.
+		_ = v4.RemoveComputePayloadSHA256Middleware(stack)
+		if err := v4.AddUnsignedPayloadMiddleware(stack); err != nil {
+			return err
+		}
+		_ = v4.RemoveContentSHA256HeaderMiddleware(stack)
+		if err := v4.AddContentSHA256HeaderMiddleware(stack); err != nil {
 			return err
 		}
 
