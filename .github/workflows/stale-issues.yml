@@ -1,0 +1,48 @@
+name: Stale Issue Manager
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/stale@v9
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # Issues: Label after 90 days, close after 30 more days
+          days-before-stale: 90
+          days-before-close: 30
+          stale-issue-label: 'stale'
+
+          # Exempt these labels from stale marking
+          exempt-issue-labels: 'Soon,release-blocker'
+
+          # Message posted when issue becomes stale
+          stale-issue-message: >
+            This issue has been inactive for 90 days and will be automatically
+            closed in 30 days if there is no further activity. If this issue is
+            still relevant, please add a comment to keep it open. Thank you for
+            your contribution!
+
+          # Message posted when issue is closed
+          close-issue-message: >
+            This issue has been automatically closed due to inactivity. If you
+            believe this issue is still relevant, please reopen it or create a
+            new issue with updated information. Thank you!
+
+          # Disable pull request processing
+          days-before-pr-stale: -1
+          days-before-pr-close: -1
+
+          # Limit operations per run
+          operations-per-run: 100
+
+          # Remove stale label when there is activity
+          remove-stale-when-updated: true
