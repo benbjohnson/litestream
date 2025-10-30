@@ -1103,6 +1103,9 @@ func isURL(s string) bool {
 func (c *ReplicaConfig) ReplicaType() string {
 	scheme, _, _, _ := ParseReplicaURL(c.URL)
 	if scheme != "" {
+		if scheme == "webdavs" {
+			return "webdav"
+		}
 		return scheme
 	} else if c.Type != "" {
 		return c.Type
