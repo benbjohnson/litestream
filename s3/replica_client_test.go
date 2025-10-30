@@ -111,6 +111,8 @@ func TestReplicaClientUnsignedPayload(t *testing.T) {
 	client.Region = "us-east-1"
 	client.Endpoint = server.URL
 	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
 
 	ctx := context.Background()
 	if err := client.Init(ctx); err != nil {
