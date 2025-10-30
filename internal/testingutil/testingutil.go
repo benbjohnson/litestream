@@ -26,6 +26,7 @@ import (
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/webdav"
 )
 
 var (
@@ -71,6 +72,14 @@ var (
 	sftpPassword = flag.String("sftp-password", os.Getenv("LITESTREAM_SFTP_PASSWORD"), "")
 	sftpKeyPath  = flag.String("sftp-key-path", os.Getenv("LITESTREAM_SFTP_KEY_PATH"), "")
 	sftpPath     = flag.String("sftp-path", os.Getenv("LITESTREAM_SFTP_PATH"), "")
+)
+
+// WebDAV settings
+var (
+	webdavURL      = flag.String("webdav-url", os.Getenv("LITESTREAM_WEBDAV_URL"), "")
+	webdavUsername = flag.String("webdav-username", os.Getenv("LITESTREAM_WEBDAV_USERNAME"), "")
+	webdavPassword = flag.String("webdav-password", os.Getenv("LITESTREAM_WEBDAV_PASSWORD"), "")
+	webdavPath     = flag.String("webdav-path", os.Getenv("LITESTREAM_WEBDAV_PATH"), "")
 )
 
 // NATS settings
@@ -187,6 +196,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewABSReplicaClient(tb)
 	case sftp.ReplicaClientType:
 		return NewSFTPReplicaClient(tb)
+	case webdav.ReplicaClientType:
+		return NewWebDAVReplicaClient(tb)
 	case nats.ReplicaClientType:
 		return NewNATSReplicaClient(tb)
 	default:
@@ -269,6 +280,18 @@ func NewSFTPReplicaClient(tb testing.TB) *sftp.ReplicaClient {
 	c.Password = *sftpPassword
 	c.KeyPath = *sftpKeyPath
 	c.Path = path.Join(*sftpPath, fmt.Sprintf("%016x", rand.Uint64()))
+	return c
+}
+
+// NewWebDAVReplicaClient returns a new client for integration testing.
+func NewWebDAVReplicaClient(tb testing.TB) *webdav.ReplicaClient {
+	tb.Helper()
+
+	c := webdav.NewReplicaClient()
+	c.URL = *webdavURL
+	c.Username = *webdavUsername
+	c.Password = *webdavPassword
+	c.Path = path.Join(*webdavPath, fmt.Sprintf("%016x", rand.Uint64()))
 	return c
 }
 
