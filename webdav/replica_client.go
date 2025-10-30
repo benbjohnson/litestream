@@ -80,7 +80,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 
-	if err := client.RemoveAll(c.Path); err != nil && !os.IsNotExist(err) {
+	if err := client.RemoveAll(c.Path); err != nil && !os.IsNotExist(err) && !gowebdav.IsErrNotFound(err) {
 		return fmt.Errorf("webdav: cannot delete path %q: %w", c.Path, err)
 	}
 
@@ -98,7 +98,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	dir := litestream.LTXLevelDir(c.Path, level)
 	files, err := client.ReadDir(dir)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || gowebdav.IsErrNotFound(err) {
 			return ltx.NewFileInfoSliceIterator(nil), nil
 		}
 		return nil, fmt.Errorf("webdav: cannot read directory %q: %w", dir, err)
@@ -153,26 +153,42 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
+	tmpFile, err := os.CreateTemp("", "litestream-webdav-*.ltx")
+	if err != nil {
+		return nil, fmt.Errorf("webdav: cannot create temp file: %w", err)
+	}
+	defer func() {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+	}()
+
 	fullReader := io.MultiReader(&buf, rd)
+
+	size, err := io.Copy(tmpFile, fullReader)
+	if err != nil {
+		return nil, fmt.Errorf("webdav: cannot copy to temp file: %w", err)
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		return nil, fmt.Errorf("webdav: cannot seek temp file: %w", err)
+	}
 
 	if err := client.MkdirAll(path.Dir(filename), 0755); err != nil {
 		return nil, fmt.Errorf("webdav: cannot create parent directory %q: %w", path.Dir(filename), err)
 	}
 
-	rc := internal.NewReadCounter(fullReader)
-
-	if err := client.WriteStream(filename, rc, 0644); err != nil {
+	if err := client.WriteStreamWithLength(filename, tmpFile, size, 0644); err != nil {
 		return nil, fmt.Errorf("webdav: cannot write file %q: %w", filename, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(size))
 
 	return &ltx.FileInfo{
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
-		Size:      rc.N(),
+		Size:      size,
 		CreatedAt: timestamp,
 	}, nil
 }
@@ -187,28 +203,41 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
-	if offset > 0 || size > 0 {
-		length := size
-		if size <= 0 {
-			length = -1
-		}
-		rc, err := client.ReadStreamRange(filename, offset, length)
+	if size > 0 {
+		rc, err := client.ReadStreamRange(filename, offset, size)
 		if err != nil {
-			if os.IsNotExist(err) {
+			if os.IsNotExist(err) || gowebdav.IsErrNotFound(err) {
+				return nil, os.ErrNotExist
+			}
+			return nil, fmt.Errorf("webdav: cannot read file %q: %w", filename, err)
+		}
+		return internal.LimitReadCloser(rc, size), nil
+	}
+
+	if offset > 0 {
+		rc, err := client.ReadStream(filename)
+		if err != nil {
+			if os.IsNotExist(err) || gowebdav.IsErrNotFound(err) {
 				return nil, os.ErrNotExist
 			}
 			return nil, fmt.Errorf("webdav: cannot read file %q: %w", filename, err)
 		}
 
-		if size > 0 {
-			return internal.LimitReadCloser(rc, size), nil
+		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				_ = rc.Close()
+				return io.NopCloser(bytes.NewReader(nil)), nil
+			}
+			_ = rc.Close()
+			return nil, fmt.Errorf("webdav: cannot skip offset in file %q: %w", filename, err)
 		}
+
 		return rc, nil
 	}
 
 	rc, err := client.ReadStream(filename)
 	if err != nil {
-		if os.IsNotExist(err) {
+		if os.IsNotExist(err) || gowebdav.IsErrNotFound(err) {
 			return nil, os.ErrNotExist
 		}
 		return nil, fmt.Errorf("webdav: cannot read file %q: %w", filename, err)
@@ -227,7 +256,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
 
-		if err := client.Remove(filename); err != nil && !os.IsNotExist(err) {
+		if err := client.Remove(filename); err != nil && !os.IsNotExist(err) && !gowebdav.IsErrNotFound(err) {
 			return fmt.Errorf("webdav: cannot delete ltx file %q: %w", filename, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
