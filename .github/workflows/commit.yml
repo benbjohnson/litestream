@@ -346,3 +346,53 @@ jobs:
 
           # Check files were created
           ssh -i /test/id_ed25519 -o StrictHostKeyChecking=accept-new -p 2222 root@localhost "ls -la /test/data/sequential/" || true
+
+  webdav-integration-test:
+    name: Run WebDAV Integration Tests
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Start WebDAV Server
+        run: |
+          docker run -d \
+            --name webdav-test \
+            -p 8080:80 \
+            -e USERNAME=testuser \
+            -e PASSWORD=testpass \
+            -v /tmp/webdav:/var/webdav \
+            bytemark/webdav
+
+          # Wait for WebDAV to be ready
+          for i in {1..30}; do
+            if curl -s -u testuser:testpass http://localhost:8080/ >/dev/null 2>&1; then
+              echo "WebDAV server is ready"
+              break
+            fi
+            sleep 1
+          done
+
+          # Verify WebDAV is accessible
+          curl -u testuser:testpass http://localhost:8080/ || (docker logs webdav-test && exit 1)
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go env
+
+      - run: go install ./cmd/litestream
+
+      - run: go test -v ./replica_client_test.go -integration webdav
+        env:
+          LITESTREAM_WEBDAV_URL:      "http://localhost:8080"
+          LITESTREAM_WEBDAV_USERNAME: "testuser"
+          LITESTREAM_WEBDAV_PASSWORD: "testpass"
+          LITESTREAM_WEBDAV_PATH:     "/testdata"
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker stop webdav-test || true
+          docker rm webdav-test || true
