@@ -17,12 +17,15 @@ require (
 	github.com/aws/aws-sdk-go-v2/feature/s3/manager v1.18.2
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.85.1
 	github.com/aws/smithy-go v1.22.5
+	github.com/dustin/go-humanize v1.0.1
+	github.com/fsouza/fake-gcs-server v1.47.3
 	github.com/mark3labs/mcp-go v0.32.0
 	github.com/mattn/go-shellwords v1.0.12
 	github.com/mattn/go-sqlite3 v1.14.19
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
+	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.0
 	golang.org/x/crypto v0.41.0
 	golang.org/x/sys v0.35.0
@@ -33,8 +36,6 @@ require (
 
 require (
 	cloud.google.com/go/pubsub v1.33.0 // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
-	github.com/fsouza/fake-gcs-server v1.47.3 // indirect
 	github.com/google/renameio/v2 v2.0.0 // indirect
 	github.com/gorilla/handlers v1.5.1 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect

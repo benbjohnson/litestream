@@ -31,6 +31,7 @@ import (
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/webdav"
 )
 
 // Build information.
@@ -586,6 +587,11 @@ type ReplicaConfig struct {
 	ConcurrentWrites *bool  `yaml:"concurrent-writes"`
 	HostKey          string `yaml:"host-key"`
 
+	// WebDAV settings
+	WebDAVURL      string `yaml:"webdav-url"`
+	WebDAVUsername string `yaml:"webdav-username"`
+	WebDAVPassword string `yaml:"webdav-password"`
+
 	// NATS settings
 	JWT           string         `yaml:"jwt"`
 	Seed          string         `yaml:"seed"`
@@ -666,6 +672,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		}
 	case "sftp":
 		if r.Client, err = newSFTPReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
+	case "webdav":
+		if r.Client, err = newWebDAVReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	case "nats":
@@ -921,6 +931,60 @@ func newSFTPReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	return client, nil
 }
 
+// newWebDAVReplicaClientFromConfig returns a new instance of webdav.ReplicaClient built from config.
+func newWebDAVReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *webdav.ReplicaClient, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for webdav replica")
+	} else if c.URL != "" && c.WebDAVURL != "" {
+		return nil, fmt.Errorf("cannot specify url & webdav-url for webdav replica")
+	}
+
+	webdavURL, username, password, path := c.WebDAVURL, c.WebDAVUsername, c.WebDAVPassword, c.Path
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		u, err := url.Parse(c.URL)
+		if err != nil {
+			return nil, err
+		}
+
+		// Build WebDAV URL from scheme and host
+		scheme := "http"
+		if u.Scheme == "webdavs" {
+			scheme = "https"
+		}
+		if webdavURL == "" && u.Host != "" {
+			webdavURL = fmt.Sprintf("%s://%s", scheme, u.Host)
+		}
+
+		// Extract credentials from URL
+		if username == "" && u.User != nil {
+			username = u.User.Username()
+		}
+		if password == "" && u.User != nil {
+			password, _ = u.User.Password()
+		}
+		if path == "" {
+			path = u.Path
+		}
+	}
+
+	// Ensure required settings are set.
+	if webdavURL == "" {
+		return nil, fmt.Errorf("webdav-url required for webdav replica")
+	}
+
+	// Build replica.
+	client := webdav.NewReplicaClient()
+	client.URL = webdavURL
+	client.Username = username
+	client.Password = password
+	client.Path = path
+
+	return client, nil
+}
+
 // newNATSReplicaClientFromConfig returns a new instance of nats.ReplicaClient built from config.
 func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *nats.ReplicaClient, err error) {
 	// Parse URL if provided to extract bucket name and server URL
@@ -1039,6 +1103,9 @@ func isURL(s string) bool {
 func (c *ReplicaConfig) ReplicaType() string {
 	scheme, _, _, _ := ParseReplicaURL(c.URL)
 	if scheme != "" {
+		if scheme == "webdavs" {
+			return "webdav"
+		}
 		return scheme
 	} else if c.Type != "" {
 		return c.Type
