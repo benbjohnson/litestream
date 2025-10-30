@@ -160,6 +160,8 @@ func MustOpenSQLDB(tb testing.TB, path string) *sql.DB {
 		tb.Fatal(err)
 	} else if _, err := d.ExecContext(context.Background(), `PRAGMA journal_mode = wal;`); err != nil {
 		tb.Fatal(err)
+	} else if _, err := d.ExecContext(context.Background(), `PRAGMA busy_timeout = 5000;`); err != nil {
+		tb.Fatal(err)
 	}
 	return d
 }

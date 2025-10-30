@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,6 +138,12 @@ func TestStore_Integration(t *testing.T) {
 	// Channel for insert errors
 	insertErr := make(chan error, 1)
 
+	// WaitGroup to ensure insert goroutine completes before cleanup
+	var wg sync.WaitGroup
+
+	// Wait for insert goroutine to finish before cleanup
+	defer wg.Wait()
+
 	// Check for any insert errors that occurred before shutdown
 	defer func() {
 		select {
@@ -148,7 +155,9 @@ func TestStore_Integration(t *testing.T) {
 	}()
 
 	// Start goroutine to continuously insert records
+	wg.Add(1)
 	go func() {
+		defer wg.Done()
 		ticker := time.NewTicker(factor * 10 * time.Millisecond)
 		defer ticker.Stop()
 
