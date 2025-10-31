@@ -238,7 +238,7 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config) string {
 
 	// Database configuration
 	config.WriteString("dbs:\n")
-	config.WriteString(fmt.Sprintf("  - path: %s\n", dbPath))
+	config.WriteString(fmt.Sprintf("  - path: %s\n", filepath.ToSlash(dbPath)))
 	config.WriteString("    checkpoint-interval: 1m\n")
 	config.WriteString("    min-checkpoint-page-count: 100\n")
 	config.WriteString("    max-checkpoint-page-count: 5000\n")

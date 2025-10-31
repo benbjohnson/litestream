@@ -338,13 +338,6 @@ Tests respect the `-test.short` flag to run abbreviated versions:
 go test -v -tags="integration,soak" -timeout=1h -run=TestComprehensiveSoak ./tests/integration/ -test.short
 ```
 
-You can also set `TEST_DURATION` environment variable:
-
-```bash
-# Run for custom duration
-TEST_DURATION=30m go test -v -tags="integration,soak" -timeout=1h -run=TestComprehensiveSoak ./tests/integration/
-```
-
 ### Soak Test Build Tags
 
 Soak tests use multiple build tags to control execution:
