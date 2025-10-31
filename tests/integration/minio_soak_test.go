@@ -123,6 +123,14 @@ func TestMinIOSoak(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
+	// Setup signal handler for graceful interruption
+	testInfo := &TestInfo{
+		StartTime: startTime,
+		Duration:  duration,
+		DB:        db,
+	}
+	setupSignalHandler(t, cancel, testInfo)
+
 	// Run load generation in background
 	loadDone := make(chan error, 1)
 	go func() {
@@ -132,10 +140,22 @@ func TestMinIOSoak(t *testing.T) {
 	// Monitor every 60 seconds with MinIO-specific metrics
 	t.Log("Running MinIO S3 test...")
 	t.Log("Monitor will report every 60 seconds")
+	t.Log("Press Ctrl+C twice within 5 seconds to stop early")
 	t.Log("================================================")
 	t.Log("")
 
-	MonitorSoakTest(t, db, ctx, func() {
+	MonitorSoakTest(t, db, ctx, startTime, duration, func() {
+		// Update test info with current stats
+		testInfo.RowCount, _ = db.GetRowCount("load_test")
+		if testInfo.RowCount == 0 {
+			testInfo.RowCount, _ = db.GetRowCount("test_table_0")
+		}
+		if testInfo.RowCount == 0 {
+			testInfo.RowCount, _ = db.GetRowCount("test_data")
+		}
+		testInfo.FileCount = CountMinIOObjects(t, containerID, bucket)
+
+		// Display metrics
 		logMinIOMetrics(t, db, containerID, bucket)
 
 		// Check if Litestream is still running

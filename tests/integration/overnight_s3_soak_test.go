@@ -127,6 +127,14 @@ func TestOvernightS3Soak(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
+	// Setup signal handler for graceful interruption
+	testInfo := &TestInfo{
+		StartTime: startTime,
+		Duration:  duration,
+		DB:        db,
+	}
+	setupSignalHandler(t, cancel, testInfo)
+
 	// Run load generation in background
 	loadDone := make(chan error, 1)
 	go func() {
@@ -136,12 +144,24 @@ func TestOvernightS3Soak(t *testing.T) {
 	// Monitor every 60 seconds with S3-specific metrics
 	t.Log("Overnight S3 test is running!")
 	t.Log("Monitor will report every 60 seconds")
+	t.Log("Press Ctrl+C twice within 5 seconds to stop early")
 	t.Log("================================================")
 	t.Log("")
 	t.Logf("The test will run for %v. Monitor progress below.", duration)
 	t.Log("")
 
-	MonitorSoakTest(t, db, ctx, func() {
+	MonitorSoakTest(t, db, ctx, startTime, duration, func() {
+		// Update test info with current stats
+		testInfo.RowCount, _ = db.GetRowCount("load_test")
+		if testInfo.RowCount == 0 {
+			testInfo.RowCount, _ = db.GetRowCount("test_table_0")
+		}
+		if testInfo.RowCount == 0 {
+			testInfo.RowCount, _ = db.GetRowCount("test_data")
+		}
+		testInfo.FileCount = CountS3Objects(t, s3URL)
+
+		// Display metrics
 		logS3Metrics(t, db, s3URL)
 
 		// Check if Litestream is still running

@@ -9,9 +9,11 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -26,6 +28,24 @@ type S3Config struct {
 	SkipVerify     bool
 	SSE            string
 	SSEKMSKeyID    string
+}
+
+// TestInfo holds test state for signal handler and monitoring
+type TestInfo struct {
+	StartTime time.Time
+	Duration  time.Duration
+	RowCount  int
+	FileCount int
+	DB        *TestDB
+}
+
+// ErrorStats holds error categorization and counts
+type ErrorStats struct {
+	TotalCount    int
+	CriticalCount int
+	BenignCount   int
+	RecentErrors  []string
+	ErrorsByType  map[string]int
 }
 
 // RequireDocker checks if Docker is available
@@ -289,8 +309,289 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	return configPath
 }
 
+// setupSignalHandler sets up SIGINT/SIGTERM handler with confirmation
+func setupSignalHandler(t *testing.T, cancel context.CancelFunc, testInfo *TestInfo) {
+	t.Helper()
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+
+	go func() {
+		firstInterrupt := true
+
+		for sig := range sigChan {
+			if firstInterrupt {
+				firstInterrupt = false
+
+				t.Logf("")
+				t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+				t.Logf("⚠ Interrupt signal received (%v)", sig)
+				t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+				t.Logf("")
+
+				elapsed := time.Since(testInfo.StartTime)
+				remaining := testInfo.Duration - elapsed
+				pct := float64(elapsed) / float64(testInfo.Duration) * 100
+
+				t.Logf("Test Progress:")
+				t.Logf("  Elapsed: %v (%.0f%% complete)", elapsed.Round(time.Second), pct)
+				t.Logf("  Remaining: %v", remaining.Round(time.Second))
+				t.Logf("  Data collected: %d rows, %d replica files", testInfo.RowCount, testInfo.FileCount)
+				t.Logf("")
+				t.Logf("Press Ctrl+C again within 5 seconds to confirm shutdown.")
+				t.Logf("Otherwise, test will continue...")
+				t.Logf("")
+
+				// Wait 5 seconds for second interrupt
+				timeout := time.NewTimer(5 * time.Second)
+				select {
+				case <-sigChan:
+					// Second interrupt - confirmed shutdown
+					timeout.Stop()
+					t.Logf("Shutdown confirmed. Initiating graceful cleanup...")
+					cancel() // Cancel context to stop test
+					performGracefulShutdown(t, testInfo)
+					return
+
+				case <-timeout.C:
+					// Timeout - continue test
+					t.Logf("No confirmation received. Continuing test...")
+					t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+					t.Logf("")
+					firstInterrupt = true
+				}
+			} else {
+				// Second interrupt received
+				t.Logf("Shutdown confirmed. Initiating graceful cleanup...")
+				cancel()
+				performGracefulShutdown(t, testInfo)
+				return
+			}
+		}
+	}()
+}
+
+// performGracefulShutdown performs cleanup on early termination
+func performGracefulShutdown(t *testing.T, testInfo *TestInfo) {
+	t.Helper()
+
+	t.Log("")
+	t.Log("================================================")
+	t.Log("Graceful Shutdown - Early Termination")
+	t.Log("================================================")
+	t.Log("")
+
+	elapsed := time.Since(testInfo.StartTime)
+
+	// Stop Litestream gracefully
+	t.Log("Stopping Litestream...")
+	if err := testInfo.DB.StopLitestream(); err != nil {
+		t.Logf("Warning: Error stopping Litestream: %v", err)
+	} else {
+		t.Log("✓ Litestream stopped")
+	}
+
+	// Wait for pending operations
+	t.Log("Waiting for pending operations to complete...")
+	time.Sleep(2 * time.Second)
+
+	// Show partial results
+	t.Log("")
+	t.Log("Partial Test Results:")
+	t.Logf("  Test duration: %v (%.0f%% of planned %v)",
+		elapsed.Round(time.Second),
+		float64(elapsed)/float64(testInfo.Duration)*100,
+		testInfo.Duration.Round(time.Minute))
+
+	if dbSize, err := testInfo.DB.GetDatabaseSize(); err == nil {
+		t.Logf("  Database size: %.2f MB", float64(dbSize)/(1024*1024))
+	}
+
+	if rowCount, err := testInfo.DB.GetRowCount("load_test"); err == nil {
+		t.Logf("  Rows inserted: %d", rowCount)
+		if elapsed.Seconds() > 0 {
+			rate := float64(rowCount) / elapsed.Seconds()
+			t.Logf("  Average write rate: %.1f rows/second", rate)
+		}
+	}
+
+	if fileCount, err := testInfo.DB.GetReplicaFileCount(); err == nil {
+		t.Logf("  Replica LTX files: %d", fileCount)
+	}
+
+	// Run abbreviated analysis
+	t.Log("")
+	t.Log("Analyzing partial test data...")
+	analysis := AnalyzeSoakTest(t, testInfo.DB, elapsed)
+
+	t.Log("")
+	t.Log("What Was Validated (Partial):")
+	if analysis.SnapshotCount > 0 {
+		t.Logf("  ✓ Snapshots: %d generated", analysis.SnapshotCount)
+	}
+	if analysis.TotalCompactions > 0 {
+		t.Logf("  ✓ Compactions: %d completed", analysis.TotalCompactions)
+	}
+	if analysis.DatabaseRows > 0 {
+		t.Logf("  ✓ Data written: %d rows", analysis.DatabaseRows)
+	}
+
+	// Check for errors
+	errors, _ := testInfo.DB.CheckForErrors()
+	criticalErrors := 0
+	for _, errLine := range errors {
+		if !strings.Contains(errLine, "page size not initialized") {
+			criticalErrors++
+		}
+	}
+	t.Logf("  Critical errors: %d", criticalErrors)
+
+	// Show where data is preserved
+	t.Log("")
+	t.Log("Test artifacts preserved at:")
+	t.Logf("  %s", testInfo.DB.TempDir)
+
+	if logPath, err := testInfo.DB.GetLitestreamLog(); err == nil {
+		t.Logf("  Log: %s", logPath)
+	}
+
+	t.Log("")
+	t.Log("Test terminated early by user.")
+	t.Log("================================================")
+
+	// Mark test as failed (early termination)
+	t.Fail()
+}
+
+// getErrorStats categorizes and counts errors
+func getErrorStats(db *TestDB) ErrorStats {
+	errors, _ := db.CheckForErrors()
+	stats := ErrorStats{
+		TotalCount:   len(errors),
+		ErrorsByType: make(map[string]int),
+	}
+
+	for _, errLine := range errors {
+		// Categorize
+		if strings.Contains(errLine, "page size not initialized") {
+			stats.BenignCount++
+			stats.ErrorsByType["page size not initialized"]++
+		} else {
+			stats.CriticalCount++
+			// Track recent critical errors (last 5)
+			if len(stats.RecentErrors) < 5 {
+				stats.RecentErrors = append(stats.RecentErrors, errLine)
+			}
+
+			// Extract error type
+			if strings.Contains(errLine, "connection refused") {
+				stats.ErrorsByType["connection refused"]++
+			} else if strings.Contains(errLine, "timeout") {
+				stats.ErrorsByType["timeout"]++
+			} else if strings.Contains(errLine, "compaction failed") {
+				stats.ErrorsByType["compaction failed"]++
+			} else {
+				stats.ErrorsByType["other"]++
+			}
+		}
+	}
+
+	return stats
+}
+
+// printProgress displays progress bar with error status
+func printProgress(t *testing.T, elapsed, total time.Duration, errorStats ErrorStats) {
+	t.Helper()
+
+	pct := float64(elapsed) / float64(total) * 100
+	remaining := total - elapsed
+
+	// Progress bar
+	barWidth := 40
+	filled := int(float64(barWidth) * elapsed.Seconds() / total.Seconds())
+	if filled > barWidth {
+		filled = barWidth
+	}
+	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
+
+	// Status indicator
+	status := "✓"
+	if errorStats.CriticalCount > 0 {
+		status = "⚠"
+	}
+
+	t.Logf("%s Progress: [%s] %.0f%% | %v elapsed | %v remaining | Errors: %d/%d",
+		status, bar, pct,
+		elapsed.Round(time.Minute), remaining.Round(time.Minute),
+		errorStats.CriticalCount, errorStats.TotalCount)
+}
+
+// printErrorDetails displays detailed error information
+func printErrorDetails(t *testing.T, errorStats ErrorStats) {
+	t.Helper()
+
+	t.Log("")
+	t.Log("⚠ Error Status:")
+	t.Logf("  Total: %d (%d critical, %d benign)", errorStats.TotalCount, errorStats.CriticalCount, errorStats.BenignCount)
+
+	// Group critical errors by type
+	if errorStats.CriticalCount > 0 {
+		t.Log("  Critical errors:")
+		for errorType, count := range errorStats.ErrorsByType {
+			if errorType != "page size not initialized" && count > 0 {
+				t.Logf("    • %q (%d)", errorType, count)
+			}
+		}
+
+		// Show recent errors
+		if len(errorStats.RecentErrors) > 0 {
+			t.Log("")
+			t.Log("  Recent errors:")
+			for _, errLine := range errorStats.RecentErrors {
+				// Extract just the error message
+				if idx := strings.Index(errLine, "error="); idx != -1 {
+					msg := errLine[idx+7:]
+					if len(msg) > 80 {
+						msg = msg[:80] + "..."
+					}
+					t.Logf("    %s", msg)
+				}
+			}
+		}
+	}
+
+	// Show benign errors if present
+	if errorStats.BenignCount > 0 {
+		t.Log("")
+		t.Logf("  Benign: %q (%d)", "page size not initialized", errorStats.BenignCount)
+	}
+}
+
+// shouldAbortTest checks if test should auto-abort due to critical issues
+func shouldAbortTest(errorStats ErrorStats, fileCount int, elapsed time.Duration) (bool, string) {
+	// Abort if critical error threshold exceeded
+	if errorStats.CriticalCount > 10 {
+		return true, fmt.Sprintf("Critical error threshold exceeded (%d errors)", errorStats.CriticalCount)
+	}
+
+	// Abort if replication completely stopped (0 files after 10 minutes)
+	if elapsed > 10*time.Minute && fileCount == 0 {
+		return true, "Replication not working (0 files created after 10 minutes)"
+	}
+
+	// Abort if error rate is increasing rapidly (>1 error/minute)
+	if errorStats.CriticalCount > 0 && elapsed.Minutes() > 0 {
+		errorRate := float64(errorStats.CriticalCount) / elapsed.Minutes()
+		if errorRate > 1.0 {
+			return true, fmt.Sprintf("Error rate too high (%.1f errors/minute)", errorRate)
+		}
+	}
+
+	return false, ""
+}
+
 // MonitorSoakTest monitors a soak test, calling metricsFunc every 60 seconds
-func MonitorSoakTest(t *testing.T, db *TestDB, ctx context.Context, metricsFunc func()) {
+func MonitorSoakTest(t *testing.T, db *TestDB, ctx context.Context, startTime time.Time, duration time.Duration, metricsFunc func()) {
 	t.Helper()
 
 	ticker := time.NewTicker(60 * time.Second)
@@ -302,11 +603,32 @@ func MonitorSoakTest(t *testing.T, db *TestDB, ctx context.Context, metricsFunc 
 			t.Log("Monitoring stopped: test duration completed")
 			return
 		case <-ticker.C:
+			elapsed := time.Since(startTime)
+
+			// Get error stats
+			errorStats := getErrorStats(db)
+
+			// Check abort conditions
+			fileCount, _ := db.GetReplicaFileCount()
+			if shouldAbort, reason := shouldAbortTest(errorStats, fileCount, elapsed); shouldAbort {
+				t.Logf("")
+				t.Logf("⚠ AUTO-ABORTING TEST: %s", reason)
+				t.Fail()
+				return
+			}
+
+			// Display progress with error status
+			printProgress(t, elapsed, duration, errorStats)
 			t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 			t.Logf("[%s] Status Report", time.Now().Format("15:04:05"))
 			t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
 			metricsFunc()
+
+			// Show error details if any critical errors
+			if errorStats.CriticalCount > 0 {
+				printErrorDetails(t, errorStats)
+			}
 
 			t.Log("")
 		}
