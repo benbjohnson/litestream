@@ -1,14 +1,12 @@
-# Integration Test Scripts
+# Utility Scripts
 
-Long-running integration test scripts for comprehensive Litestream validation. These scripts are designed for extended testing scenarios, including overnight tests and production-like workloads.
+Utility scripts for Litestream testing and distribution.
 
 ## Overview
 
-This directory contains integration test scripts that run for extended periods (30 minutes to 8+ hours) to validate Litestream's behavior under sustained load and realistic production scenarios.
+This directory contains utility scripts for post-test analysis and packaging. All long-running soak tests have been migrated to Go integration tests in `tests/integration/`.
 
-**Key Difference from `cmd/litestream-test/scripts/`:**
-- **This directory:** Long-running integration tests (minutes to hours)
-- **`cmd/litestream-test/scripts/`:** Focused scenario tests (seconds to minutes)
+> **Note:** For all soak tests (2-8 hours), see the Go-based test suite in [tests/integration/](../tests/integration/README.md). The bash soak tests have been migrated to Go for better maintainability and cross-platform support
 
 ## Prerequisites
 
@@ -17,92 +15,7 @@ go build -o bin/litestream ./cmd/litestream
 go build -o bin/litestream-test ./cmd/litestream-test
 ```
 
-## Test Scripts
-
-> **Note:** Some tests have been migrated to Go integration tests in `tests/integration/`. See [tests/integration/README.md](../tests/integration/README.md) for the Go-based test suite.
-
-### test-overnight-s3.sh
-
-Comprehensive 8-hour test with S3 replication.
-
-```bash
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-export S3_BUCKET=your-test-bucket
-export AWS_REGION=us-east-1
-
-./scripts/test-overnight-s3.sh
-```
-
-**Configuration:**
-- Duration: 8 hours
-- Database: 100MB initial population
-- Write rate: 100 writes/second (higher than file test)
-- Pattern: Wave (simulates varying load)
-- Payload size: 4KB (larger than file test)
-- Workers: 8 (more than file test)
-- Replica: S3 bucket with unique timestamped path
-
-**S3-Specific Settings:**
-- Force path style: false
-- Skip verify: false
-- Optional SSE encryption support
-- Region configurable via environment
-
-**Features:**
-- Higher load than file-based test (S3 can handle more)
-- S3 connectivity validation before start
-- S3-specific error monitoring (403, 404, 500, 503)
-- Upload operation tracking
-- S3 object count monitoring
-- Restoration from S3 after completion
-- Automatic row count comparison
-
-**Real-time Monitoring:**
-```bash
-tail -f /tmp/litestream-overnight-s3-*/logs/monitor.log
-tail -f /tmp/litestream-overnight-s3-*/logs/litestream.log
-
-aws s3 ls s3://your-bucket/litestream-overnight-<timestamp>/ --recursive
-```
-
-**What it Tests:**
-- S3 replication stability
-- Network resilience over 8 hours
-- S3 API call efficiency
-- Multipart upload handling
-- S3-specific error recovery
-- Cross-region replication (if configured)
-- S3 cost implications (API calls, storage)
-- Restoration from cloud storage
-
-**S3 Monitoring Includes:**
-- Snapshot count in S3
-- WAL segment count in S3
-- Total S3 object count
-- S3 storage size
-- Upload operation count
-- S3-specific errors
-
-**Expected Behavior:**
-- Successful S3 connectivity throughout
-- Regular S3 uploads without failures
-- S3 object counts grow over time
-- Compaction reduces old S3 objects
-- Successful S3 restore at end
-- Row count match between source and restored
-
-**Prerequisites:**
-- Valid AWS credentials
-- S3 bucket with write permissions
-- Network connectivity to S3
-- AWS CLI installed (for monitoring)
-
-**Cost Considerations:**
-- ~8 hours of continuous uploads
-- Estimated API calls: Thousands of PUTs/GETs
-- Storage: 100MB+ depending on replication
-- Consider using a test/dev account
+## Available Scripts
 
 ### analyze-test-results.sh
 
@@ -155,20 +68,9 @@ Homebrew tap setup script for packaging and distribution.
 
 **Purpose:** Automates Homebrew tap setup for Litestream distribution. Not a test script per se, but part of the release process.
 
-## Usage Patterns
+## Usage
 
-### Running Overnight S3 Tests
-
-```bash
-export AWS_ACCESS_KEY_ID=your_key
-export AWS_SECRET_ACCESS_KEY=your_secret
-export S3_BUCKET=your-test-bucket
-export AWS_REGION=us-east-1
-
-./scripts/test-overnight-s3.sh
-```
-
-### Analyzing Results
+### Analyzing Test Results
 
 ```bash
 ls /tmp/litestream-overnight-* -dt | head -1
@@ -182,10 +84,9 @@ ls /tmp/litestream-overnight-* -dt | head -1
 |----------|----------|-----------|------------------|
 | 5 minutes | CI/CD smoke test | Go integration tests | Basic functionality |
 | 30 minutes | Short integration | Go integration tests | Pattern detection |
-| 8 hours | Overnight stability | S3 overnight test | Full validation |
-| 12+ hours | Stress testing | S3 overnight test | Edge case discovery |
+| 2-8 hours | Soak testing | Go soak tests (local only) | Full validation |
 
-> **Note:** For shorter validation tests, use the Go integration test suite in `tests/integration/`.
+> **Note:** All soak tests are now Go-based in `tests/integration/`. See [tests/integration/README.md](../tests/integration/README.md) for details on running comprehensive, MinIO, and overnight S3 soak tests.
 
 ## Monitoring and Debugging
 
@@ -266,12 +167,7 @@ sqlite3 /tmp/litestream-*/restored.db "SELECT COUNT(*) FROM test_data"
 
 ### Stopping Tests Early
 
-Tests can be interrupted with Ctrl+C. They will cleanup gracefully:
-```bash
-./scripts/test-overnight.sh
-^C
-Cleaning up...
-```
+Go tests can be interrupted with Ctrl+C. They will cleanup gracefully via defer statements.
 
 ## Test Artifacts
 
@@ -293,49 +189,24 @@ All tests create timestamped directories with comprehensive artifacts:
 └── restored.db            # Restored database for validation
 ```
 
-## Integration with Other Tests
+## Integration with Go Tests
 
-These scripts complement the scenario tests in `cmd/litestream-test/scripts/`:
+These utility scripts complement the Go integration test suite:
 
-**Relationship:**
-- `cmd/litestream-test/scripts/` → Focused scenarios (seconds to ~30 minutes)
-- `scripts/` → Integration tests (30 minutes to 8+ hours)
+**Test Locations:**
+- `tests/integration/` → All integration and soak tests (Go-based)
+- `cmd/litestream-test/scripts/` → Scenario and debugging tests (bash, being phased out)
+- `scripts/` → Utilities only (this directory)
 
-**Workflow:**
-1. Run focused scenario tests during development (Go tests in `tests/integration/`)
-2. Run Go integration tests before major changes
-3. Run overnight S3 tests (8h) before releases
-4. Analyze results with analysis script
-
-## Success Criteria
-
-### Overnight S3 Tests (8h)
-
-✅ Pass Criteria:
-- No process crashes
-- Error count < 10 (excluding transient)
-- Steady database growth
-- Regular snapshots (40+)
-- Active compaction visible
-- Successful final restoration
-- Row count match
-- Memory usage stable
+**Testing Workflow:**
+1. Run quick integration tests during development
+2. Run full integration test suite before major changes
+3. Run soak tests (2-8h) locally before releases: `TestComprehensiveSoak`, `TestMinIOSoak`, `TestOvernightS3Soak`
+4. Analyze results with `analyze-test-results.sh`
 
 ## Related Documentation
 
+- [Go Integration Tests](../tests/integration/README.md) - Complete Go-based test suite including soak tests
 - [litestream-test CLI Tool](../cmd/litestream-test/README.md) - Testing harness documentation
 - [Scenario Test Scripts](../cmd/litestream-test/scripts/README.md) - Focused test scenarios
 - [S3 Retention Testing](../cmd/litestream-test/S3-RETENTION-TESTING.md) - S3-specific testing
-
-## Contributing
-
-When adding new integration scripts:
-
-1. Follow naming conventions (`test-*.sh`)
-2. Include clear duration estimates in comments
-3. Create comprehensive monitoring
-4. Generate timestamped test directories
-5. Implement graceful cleanup with `trap`
-6. Provide clear success/failure output
-7. Update this README with script documentation
-8. Consider both file and S3 variants if applicable

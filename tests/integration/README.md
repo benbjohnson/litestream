@@ -225,14 +225,18 @@ This is part of an ongoing effort to migrate bash test scripts to Go integration
 
 ### Test Directory Organization
 
-Two distinct script directories serve different purposes:
+Three distinct test locations serve different purposes:
 
-**`scripts/` (top-level)** - Long-running **soak tests** (2-8 hours) for pre-release validation:
-- File-based replication: `test-quick-validation.sh`, `test-overnight.sh`, `test-comprehensive.sh`
-- S3 replication: `test-minio-s3.sh`, `test-overnight-s3.sh`
-- Utilities: `analyze-test-results.sh`, `setup-homebrew-tap.sh`
+**`tests/integration/` (this directory)** - Go-based integration and soak tests:
+- Quick integration tests: `scenario_test.go`, `concurrent_test.go`, `boundary_test.go`
+- Soak tests (2-8 hours): `comprehensive_soak_test.go`, `minio_soak_test.go`, `overnight_s3_soak_test.go`
+- All tests use proper Go testing infrastructure with build tags
 
-**`cmd/litestream-test/scripts/`** - Scenario and debugging tests (seconds to ~30 minutes):
+**`scripts/` (top-level)** - Utility scripts only (soak tests migrated to Go):
+- `analyze-test-results.sh` - Post-test analysis utility
+- `setup-homebrew-tap.sh` - Packaging script (not a test)
+
+**`cmd/litestream-test/scripts/`** - Scenario and debugging bash scripts (being phased out):
 - Bug reproduction scripts for specific issues (#752, #754)
 - Format & upgrade tests for version compatibility
 - S3 retention tests with Python mock
