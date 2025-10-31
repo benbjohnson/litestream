@@ -337,12 +337,20 @@ func LogSoakMetrics(t *testing.T, db *TestDB, testName string) {
 		t.Logf("  Replica LTX files: %d", fileCount)
 	}
 
-	// Error check
+	// Error check - filter out known benign errors
 	if errors, err := db.CheckForErrors(); err == nil && len(errors) > 0 {
-		t.Logf("  ⚠ Errors detected: %d", len(errors))
-		if len(errors) <= 2 {
-			for _, errLine := range errors {
-				t.Logf("    %s", errLine)
+		criticalErrors := []string{}
+		for _, errLine := range errors {
+			if !strings.Contains(errLine, "page size not initialized") {
+				criticalErrors = append(criticalErrors, errLine)
+			}
+		}
+		if len(criticalErrors) > 0 {
+			t.Logf("  ⚠ Critical errors detected: %d", len(criticalErrors))
+			if len(criticalErrors) <= 2 {
+				for _, errLine := range criticalErrors {
+					t.Logf("    %s", errLine)
+				}
 			}
 		}
 	}
