@@ -124,8 +124,8 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [quick-tests, scenario-tests, long-running-tests]
-    if: always()
+    needs: [quick-tests]
+    if: always() && (github.event_name == 'pull_request' || inputs.test_type == 'quick' || inputs.test_type == 'all')
     steps:
       - name: Generate summary
         run: |
@@ -140,22 +140,9 @@ jobs:
             echo "⏭️ **Quick Tests:** Skipped" >> $GITHUB_STEP_SUMMARY
           fi
 
-          if [ "${{ needs.scenario-tests.result }}" == "success" ]; then
-            echo "✅ **Scenario Tests:** Passed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.scenario-tests.result }}" == "failure" ]; then
-            echo "❌ **Scenario Tests:** Failed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.scenario-tests.result }}" == "skipped" ]; then
-            echo "⏭️ **Scenario Tests:** Skipped" >> $GITHUB_STEP_SUMMARY
-          fi
-
-          if [ "${{ needs.long-running-tests.result }}" == "success" ]; then
-            echo "✅ **Long-Running Tests:** Passed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.long-running-tests.result }}" == "failure" ]; then
-            echo "❌ **Long-Running Tests:** Failed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.long-running-tests.result }}" == "skipped" ]; then
-            echo "⏭️ **Long-Running Tests:** Skipped" >> $GITHUB_STEP_SUMMARY
-          fi
-
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+          # Note: Scenario and long-running tests run independently on workflow_dispatch.
+          # Check individual job results for those test suites.

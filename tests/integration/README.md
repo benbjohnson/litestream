@@ -221,28 +221,163 @@ t.Logf("DB size: %.2f MB", float64(size)/(1024*1024))
 
 ## Migration from Bash
 
-These Go tests replace the following bash scripts:
+This is part of an ongoing effort to migrate bash test scripts to Go integration tests. This migration improves maintainability, enables CI integration, and provides platform independence.
 
-### Migrated Scripts
+### Test Directory Organization
 
-- `scripts/test-quick-validation.sh` → `quick_test.go::TestQuickValidation`
-- `scripts/test-overnight.sh` → `overnight_test.go::TestOvernightFile`
-- `cmd/litestream-test/scripts/test-fresh-start.sh` → `scenario_test.go::TestFreshStart`
-- `cmd/litestream-test/scripts/test-database-integrity.sh` → `scenario_test.go::TestDatabaseIntegrity`
-- `cmd/litestream-test/scripts/test-database-deletion.sh` → `scenario_test.go::TestDatabaseDeletion`
-- `cmd/litestream-test/scripts/test-replica-failover.sh` → NOT MIGRATED (feature removed from Litestream)
-- `cmd/litestream-test/scripts/test-rapid-checkpoints.sh` → `concurrent_test.go::TestRapidCheckpoints`
-- `cmd/litestream-test/scripts/test-wal-growth.sh` → `concurrent_test.go::TestWALGrowth`
-- `cmd/litestream-test/scripts/test-concurrent-operations.sh` → `concurrent_test.go::TestConcurrentOperations`
-- `cmd/litestream-test/scripts/test-busy-timeout.sh` → `concurrent_test.go::TestBusyTimeout`
-- `cmd/litestream-test/scripts/test-1gb-boundary.sh` → `boundary_test.go::Test1GBBoundary`
+Two distinct script directories serve different purposes:
 
-### Pending Migration
+**`scripts/` (top-level)** - Long-running **soak tests** (2-8 hours) for pre-release validation:
+- File-based replication: `test-quick-validation.sh`, `test-overnight.sh`, `test-comprehensive.sh`
+- S3 replication: `test-minio-s3.sh`, `test-overnight-s3.sh`
+- Utilities: `analyze-test-results.sh`, `setup-homebrew-tap.sh`
 
-Future PRs will add:
-- S3/retention tests (requires S3 mock setup)
-- Format isolation and upgrade tests
-- Bug reproduction tests
+**`cmd/litestream-test/scripts/`** - Scenario and debugging tests (seconds to ~30 minutes):
+- Bug reproduction scripts for specific issues (#752, #754)
+- Format & upgrade tests for version compatibility
+- S3 retention tests with Python mock
+- Quick validation and setup utilities
+
+### Migration Status
+
+**Migrated from `scripts/` (5 scripts):**
+- `test-quick-validation.sh` → `quick_test.go::TestQuickValidation` (CI: ✅)
+- `test-overnight.sh` → `overnight_test.go::TestOvernightFile` (CI: ❌ too long)
+- `test-comprehensive.sh` → `comprehensive_soak_test.go::TestComprehensiveSoak` (CI: ❌ soak test)
+- `test-minio-s3.sh` → `minio_soak_test.go::TestMinIOSoak` (CI: ❌ soak test, requires Docker)
+- `test-overnight-s3.sh` → `overnight_s3_soak_test.go::TestOvernightS3Soak` (CI: ❌ soak test, 8 hours)
+
+**Migrated from `cmd/litestream-test/scripts/` (9 scripts):**
+- `test-fresh-start.sh` → `scenario_test.go::TestFreshStart`
+- `test-database-integrity.sh` → `scenario_test.go::TestDatabaseIntegrity`
+- `test-database-deletion.sh` → `scenario_test.go::TestDatabaseDeletion`
+- `test-replica-failover.sh` → NOT MIGRATED (feature removed from Litestream)
+- `test-rapid-checkpoints.sh` → `concurrent_test.go::TestRapidCheckpoints`
+- `test-wal-growth.sh` → `concurrent_test.go::TestWALGrowth`
+- `test-concurrent-operations.sh` → `concurrent_test.go::TestConcurrentOperations`
+- `test-busy-timeout.sh` → `concurrent_test.go::TestBusyTimeout`
+- `test-1gb-boundary.sh` → `boundary_test.go::Test1GBBoundary`
+
+**Remaining Bash Scripts:**
+
+_scripts/_ (2 scripts remaining):
+- `analyze-test-results.sh` - Post-test analysis utility (may stay as bash)
+- `setup-homebrew-tap.sh` - Packaging script (not a test)
+
+_cmd/litestream-test/scripts/_ (16 scripts remaining):
+- Bug reproduction scripts: `reproduce-critical-bug.sh`, `test-754-*.sh`, `test-v0.5-*.sh`
+- Format & upgrade tests: `test-format-isolation.sh`, `test-upgrade-*.sh`, `test-massive-upgrade.sh`
+- S3 retention tests: `test-s3-retention-*.sh` (4 scripts, use Python S3 mock)
+- Utility: `verify-test-setup.sh`
+
+### Why Some Tests Aren't in CI
+
+Per industry best practices, CI tests should complete in < 1 hour (ideally < 10 minutes):
+- ✅ **Quick tests** (< 5 min) - Run on every PR
+- ❌ **Soak tests** (2-8 hours) - Run locally before releases only
+- ❌ **Long-running tests** (> 30 min) - Too slow for CI feedback loop
+
+Soak tests are migrated to Go for maintainability but run **locally only**. See "Soak Tests" section below.
+
+## Soak Tests (Long-Running Stability Tests)
+
+Soak tests run for 2-8 hours to validate long-term stability under sustained load. These tests are **NOT run in CI** per industry best practices (effective CI requires tests to complete in < 1 hour).
+
+### Purpose
+
+Soak tests validate:
+- Long-term replication stability
+- Memory leak detection over time
+- Compaction effectiveness across multiple cycles
+- Checkpoint behavior under sustained load
+- Recovery from transient issues
+- Storage growth patterns
+
+### When to Run Soak Tests
+
+- ✅ Before major releases
+- ✅ After significant replication changes
+- ✅ To reproduce stability issues
+- ✅ For performance benchmarking
+- ❌ NOT on every commit (too slow for CI)
+
+### Running Soak Tests Locally
+
+**File-based comprehensive test (2 hours):**
+```bash
+go test -v -tags="integration,soak" -timeout=3h -run=TestComprehensiveSoak ./tests/integration/
+```
+
+**MinIO S3 test (2 hours, requires Docker):**
+```bash
+# Ensure Docker is running
+go test -v -tags="integration,soak,docker" -timeout=3h -run=TestMinIOSoak ./tests/integration/
+```
+
+**Overnight S3 test (8 hours, requires AWS):**
+```bash
+export AWS_ACCESS_KEY_ID=your_key
+export AWS_SECRET_ACCESS_KEY=your_secret
+export S3_BUCKET=your-test-bucket
+export AWS_REGION=us-east-1
+
+go test -v -tags="integration,soak,aws" -timeout=10h -run=TestOvernightS3Soak ./tests/integration/
+```
+
+**Run all soak tests:**
+```bash
+go test -v -tags="integration,soak,docker,aws" -timeout=15h ./tests/integration/
+```
+
+### Adjust Duration for Testing
+
+Tests respect the `-test.short` flag to run abbreviated versions:
+
+```bash
+# Run comprehensive test for 30 minutes instead of 2 hours
+go test -v -tags="integration,soak" -timeout=1h -run=TestComprehensiveSoak ./tests/integration/ -test.short
+```
+
+You can also set `TEST_DURATION` environment variable:
+
+```bash
+# Run for custom duration
+TEST_DURATION=30m go test -v -tags="integration,soak" -timeout=1h -run=TestComprehensiveSoak ./tests/integration/
+```
+
+### Soak Test Build Tags
+
+Soak tests use multiple build tags to control execution:
+
+- `integration` - Required for all integration tests
+- `soak` - Marks long-running stability tests (2-8 hours)
+- `docker` - Requires Docker (MinIO test)
+- `aws` - Requires AWS credentials (S3 tests)
+
+### Monitoring Soak Tests
+
+All soak tests log progress every 60 seconds:
+
+```bash
+# Watch test progress in real-time
+go test -v -tags="integration,soak" -run=TestComprehensiveSoak ./tests/integration/ 2>&1 | tee soak-test.log
+```
+
+Metrics reported during execution:
+- Database size and WAL size
+- Row count
+- Replica statistics (snapshots, LTX segments)
+- Operation counts (checkpoints, compactions, syncs)
+- Error counts
+- Write rate
+
+### Soak Test Summary
+
+| Test | Duration | Requirements | What It Tests |
+|------|----------|--------------|---------------|
+| TestComprehensiveSoak | 2h | None | File-based replication with aggressive compaction |
+| TestMinIOSoak | 2h | Docker | S3-compatible storage via MinIO container |
+| TestOvernightS3Soak | 8h | AWS credentials | Real S3 replication, overnight stability |
 
 ## Benefits Over Bash
 

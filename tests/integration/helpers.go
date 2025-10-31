@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -24,6 +25,16 @@ type TestDB struct {
 	LitestreamCmd *exec.Cmd
 	LitestreamPID int
 	t             *testing.T
+}
+
+// getBinaryPath returns the cross-platform path to a binary.
+// On Windows, it adds the .exe extension.
+func getBinaryPath(name string) string {
+	binPath := filepath.Join("..", "..", "bin", name)
+	if runtime.GOOS == "windows" {
+		binPath += ".exe"
+	}
+	return binPath
 }
 
 func SetupTestDB(t *testing.T, name string) *TestDB {
@@ -74,7 +85,7 @@ func (db *TestDB) CreateWithPageSize(pageSize int) error {
 }
 
 func (db *TestDB) Populate(targetSize string) error {
-	cmd := exec.Command("../../bin/litestream-test", "populate",
+	cmd := exec.Command(getBinaryPath("litestream-test"), "populate",
 		"-db", db.Path,
 		"-target-size", targetSize,
 	)
@@ -92,7 +103,7 @@ func (db *TestDB) Populate(targetSize string) error {
 }
 
 func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize int) error {
-	cmd := exec.Command("../../bin/litestream-test", "populate",
+	cmd := exec.Command(getBinaryPath("litestream-test"), "populate",
 		"-db", db.Path,
 		"-target-size", targetSize,
 		"-page-size", fmt.Sprintf("%d", pageSize),
@@ -112,7 +123,7 @@ func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize i
 }
 
 func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time.Duration, pattern string) error {
-	cmd := exec.CommandContext(ctx, "../../bin/litestream-test", "load",
+	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), "load",
 		"-db", db.Path,
 		"-write-rate", fmt.Sprintf("%d", writeRate),
 		"-duration", duration.String(),
@@ -138,9 +149,10 @@ func (db *TestDB) StartLitestream() error {
 		return fmt.Errorf("create log file: %w", err)
 	}
 
-	cmd := exec.Command("../../bin/litestream", "replicate",
+	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	cmd := exec.Command(getBinaryPath("litestream"), "replicate",
 		db.Path,
-		fmt.Sprintf("file://%s", db.ReplicaPath),
+		replicaURL,
 	)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -171,7 +183,7 @@ func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
 	}
 
 	db.ConfigPath = configPath
-	cmd := exec.Command("../../bin/litestream", "replicate",
+	cmd := exec.Command(getBinaryPath("litestream"), "replicate",
 		"-config", configPath,
 	)
 	cmd.Stdout = logFile
@@ -206,9 +218,10 @@ func (db *TestDB) StopLitestream() error {
 }
 
 func (db *TestDB) Restore(outputPath string) error {
-	cmd := exec.Command("../../bin/litestream", "restore",
+	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	cmd := exec.Command(getBinaryPath("litestream"), "restore",
 		"-o", outputPath,
-		fmt.Sprintf("file://%s", db.ReplicaPath),
+		replicaURL,
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -218,9 +231,10 @@ func (db *TestDB) Restore(outputPath string) error {
 }
 
 func (db *TestDB) Validate(restoredPath string) error {
-	cmd := exec.Command("../../bin/litestream-test", "validate",
+	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	cmd := exec.Command(getBinaryPath("litestream-test"), "validate",
 		"-source-db", db.Path,
-		"-replica-url", fmt.Sprintf("file://%s", db.ReplicaPath),
+		"-replica-url", replicaURL,
 		"-restored-db", restoredPath,
 		"-check-type", "full",
 	)
@@ -232,9 +246,10 @@ func (db *TestDB) Validate(restoredPath string) error {
 }
 
 func (db *TestDB) QuickValidate(restoredPath string) error {
-	cmd := exec.Command("../../bin/litestream-test", "validate",
+	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	cmd := exec.Command(getBinaryPath("litestream-test"), "validate",
 		"-source-db", db.Path,
-		"-replica-url", fmt.Sprintf("file://%s", db.ReplicaPath),
+		"-replica-url", replicaURL,
 		"-restored-db", restoredPath,
 		"-check-type", "quick",
 	)
@@ -329,11 +344,13 @@ func GetTestDuration(t *testing.T, defaultDuration time.Duration) time.Duration 
 func RequireBinaries(t *testing.T) {
 	t.Helper()
 
-	if _, err := os.Stat("../../bin/litestream"); err != nil {
+	litestreamBin := getBinaryPath("litestream")
+	if _, err := os.Stat(litestreamBin); err != nil {
 		t.Skip("litestream binary not found, run: go build -o bin/litestream ./cmd/litestream")
 	}
 
-	if _, err := os.Stat("../../bin/litestream-test"); err != nil {
+	litestreamTestBin := getBinaryPath("litestream-test")
+	if _, err := os.Stat(litestreamTestBin); err != nil {
 		t.Skip("litestream-test binary not found, run: go build -o bin/litestream-test ./cmd/litestream-test")
 	}
 }
