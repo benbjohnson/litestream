@@ -247,8 +247,11 @@ func TestOvernightS3Soak(t *testing.T) {
 	}
 	t.Log("✓ Validation passed!")
 
+	// Analyze test results
+	analysis := AnalyzeSoakTest(t, db, duration)
+	PrintSoakTestAnalysis(t, analysis)
+
 	// Test Summary
-	t.Log("")
 	t.Log("================================================")
 	t.Log("Test Summary")
 	t.Log("================================================")
@@ -267,13 +270,10 @@ func TestOvernightS3Soak(t *testing.T) {
 	}
 
 	if testPassed {
-		t.Log("✓ OVERNIGHT S3 SOAK TEST PASSED!")
+		t.Log("✓ TEST PASSED!")
 		t.Log("")
-		t.Log("Successfully validated:")
-		t.Logf("  - Real S3 replication (%d objects)", finalObjects)
-		t.Logf("  - Long-term stability (%v runtime)", duration)
-		t.Log("  - Database restoration from S3")
-		t.Log("  - Data integrity verification")
+		t.Logf("Successfully replicated to AWS S3 (%d objects)", finalObjects)
+		t.Log("The configuration is ready for production use.")
 	} else {
 		t.Log("⚠ TEST COMPLETED WITH ISSUES:")
 		for _, issue := range issues {

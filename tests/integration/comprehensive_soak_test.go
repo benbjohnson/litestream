@@ -198,13 +198,15 @@ func TestComprehensiveSoak(t *testing.T) {
 	}
 	t.Log("✓ Integrity check passed!")
 
+	// Analyze test results
+	analysis := AnalyzeSoakTest(t, db, duration)
+	PrintSoakTestAnalysis(t, analysis)
+
 	// Test Summary
-	t.Log("")
 	t.Log("================================================")
 	t.Log("Test Summary")
 	t.Log("================================================")
 
-	// Determine if test passed
 	testPassed := true
 	issues := []string{}
 
@@ -213,19 +215,13 @@ func TestComprehensiveSoak(t *testing.T) {
 		issues = append(issues, fmt.Sprintf("Critical errors detected: %d", criticalErrors))
 	}
 
-	fileCount, _ := db.GetReplicaFileCount()
-	if fileCount == 0 {
+	if analysis.FinalFileCount == 0 {
 		testPassed = false
-		issues = append(issues, "No LTX segments created (replication not working)")
+		issues = append(issues, "No files created (replication not working)")
 	}
 
 	if testPassed {
-		t.Log("✓ COMPREHENSIVE SOAK TEST PASSED!")
-		t.Log("")
-		t.Log("Successfully validated:")
-		t.Logf("  - Continuous replication (%d segments)", fileCount)
-		t.Log("  - Database restoration")
-		t.Log("  - Data integrity verification")
+		t.Log("✓ TEST PASSED!")
 		t.Log("")
 		t.Log("The configuration is ready for production use.")
 	} else {
