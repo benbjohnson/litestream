@@ -35,6 +35,17 @@ func TestMinIOSoak(t *testing.T) {
 
 	// Determine test duration
 	duration := GetTestDuration(t, 2*time.Hour)
+	shortMode := testing.Short()
+	if shortMode {
+		duration = 2 * time.Minute
+	}
+
+	targetSize := "50MB"
+	writeRate := 500
+	if shortMode {
+		targetSize = "5MB"
+		writeRate = 100
+	}
 
 	t.Logf("================================================")
 	t.Logf("Litestream MinIO S3 Soak Test")
@@ -66,9 +77,9 @@ func TestMinIOSoak(t *testing.T) {
 		t.Fatalf("Failed to create database: %v", err)
 	}
 
-	// Populate with 50MB of initial data
-	t.Log("Populating database (50MB initial data)...")
-	if err := db.Populate("50MB"); err != nil {
+	// Populate with initial data
+	t.Logf("Populating database (%s initial data)...", targetSize)
+	if err := db.Populate(targetSize); err != nil {
 		t.Fatalf("Failed to populate database: %v", err)
 	}
 	t.Log("✓ Database populated")
@@ -77,6 +88,7 @@ func TestMinIOSoak(t *testing.T) {
 	// Create S3 configuration for MinIO
 	s3Path := fmt.Sprintf("litestream-test-%d", time.Now().Unix())
 	s3URL := fmt.Sprintf("s3://%s/%s", bucket, s3Path)
+	db.ReplicaURL = s3URL
 	t.Log("Creating Litestream configuration for MinIO S3...")
 	s3Config := &S3Config{
 		Endpoint:       endpoint,
@@ -86,7 +98,8 @@ func TestMinIOSoak(t *testing.T) {
 		ForcePathStyle: true,
 		SkipVerify:     true,
 	}
-	configPath := CreateSoakConfig(db.Path, s3URL, s3Config)
+	configPath := CreateSoakConfig(db.Path, s3URL, s3Config, shortMode)
+	db.ConfigPath = configPath
 	t.Logf("✓ Configuration created: %s", configPath)
 	t.Logf("  S3 URL: %s", s3URL)
 	t.Log("")
@@ -101,7 +114,7 @@ func TestMinIOSoak(t *testing.T) {
 
 	// Start load generator
 	t.Log("Starting load generator (heavy sustained load)...")
-	t.Logf("  Write rate: 500 writes/second")
+	t.Logf("  Write rate: %d writes/second", writeRate)
 	t.Logf("  Pattern: wave (simulates varying load)")
 	t.Logf("  Payload size: 4KB")
 	t.Logf("  Workers: 8")
@@ -113,7 +126,7 @@ func TestMinIOSoak(t *testing.T) {
 	// Run load generation in background
 	loadDone := make(chan error, 1)
 	go func() {
-		loadDone <- db.GenerateLoad(ctx, 500, duration, "wave")
+		loadDone <- db.GenerateLoad(ctx, writeRate, duration, "wave")
 	}()
 
 	// Monitor every 60 seconds with MinIO-specific metrics
@@ -135,6 +148,10 @@ func TestMinIOSoak(t *testing.T) {
 	// Wait for load generation to complete
 	if err := <-loadDone; err != nil {
 		t.Logf("Load generation completed: %v", err)
+	}
+
+	if err := db.WaitForSnapshots(30 * time.Second); err != nil {
+		t.Fatalf("Failed waiting for snapshot: %v", err)
 	}
 
 	t.Log("")
@@ -212,13 +229,14 @@ func TestMinIOSoak(t *testing.T) {
 		}
 	}
 
-	// Validate
+	// Validate integrity
 	t.Log("")
-	t.Log("Validating restored database...")
-	if err := db.Validate(restoredPath); err != nil {
-		t.Fatalf("Validation failed: %v", err)
+	t.Log("Validating restored database integrity...")
+	restoredDB := &TestDB{Path: restoredPath, t: t}
+	if err := restoredDB.IntegrityCheck(); err != nil {
+		t.Fatalf("Integrity check failed: %v", err)
 	}
-	t.Log("✓ Validation passed!")
+	t.Log("✓ Integrity check passed!")
 
 	// Test Summary
 	t.Log("")

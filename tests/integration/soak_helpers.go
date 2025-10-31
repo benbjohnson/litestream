@@ -208,11 +208,23 @@ func GetS3StorageSize(t *testing.T, s3URL string) int64 {
 }
 
 // CreateSoakConfig creates a litestream configuration file for soak tests
-func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config) string {
+func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode bool) string {
 	tempDir := filepath.Dir(dbPath)
 	configPath := filepath.Join(tempDir, "litestream.yml")
 
 	var config strings.Builder
+
+	snapshotInterval := "10m"
+	snapshotRetention := "1h"
+	retentionCheckInterval := "5m"
+	levelIntervals := []string{"30s", "1m", "5m", "15m", "30m"}
+
+	if shortMode {
+		snapshotInterval = "30s"
+		snapshotRetention = "10m"
+		retentionCheckInterval = "2m"
+		levelIntervals = []string{"15s", "30s", "1m"}
+	}
 
 	// Add S3 credentials if provided
 	if s3Config != nil && s3Config.AccessKey != "" {
@@ -223,17 +235,15 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config) string {
 
 	// Aggressive snapshot settings for testing
 	config.WriteString("snapshot:\n")
-	config.WriteString("  interval: 10m\n")
-	config.WriteString("  retention: 1h\n")
+	config.WriteString(fmt.Sprintf("  interval: %s\n", snapshotInterval))
+	config.WriteString(fmt.Sprintf("  retention: %s\n", snapshotRetention))
 	config.WriteString("\n")
 
 	// Aggressive compaction levels
 	config.WriteString("levels:\n")
-	config.WriteString("  - interval: 30s\n")
-	config.WriteString("  - interval: 1m\n")
-	config.WriteString("  - interval: 5m\n")
-	config.WriteString("  - interval: 15m\n")
-	config.WriteString("  - interval: 30m\n")
+	for _, interval := range levelIntervals {
+		config.WriteString(fmt.Sprintf("  - interval: %s\n", interval))
+	}
 	config.WriteString("\n")
 
 	// Database configuration
@@ -266,7 +276,7 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config) string {
 		if s3Config.SSEKMSKeyID != "" {
 			config.WriteString(fmt.Sprintf("        sse-kms-key-id: %s\n", s3Config.SSEKMSKeyID))
 		}
-		config.WriteString("        retention-check-interval: 5m\n")
+		config.WriteString(fmt.Sprintf("        retention-check-interval: %s\n", retentionCheckInterval))
 	}
 
 	if err := os.WriteFile(configPath, []byte(config.String()), 0644); err != nil {

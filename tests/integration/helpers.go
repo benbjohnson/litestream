@@ -15,11 +15,15 @@ import (
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
+
+	"github.com/benbjohnson/litestream"
 )
 
 type TestDB struct {
 	Path          string
 	ReplicaPath   string
+	ReplicaURL    string
+	ReplicaEnv    []string
 	ConfigPath    string
 	TempDir       string
 	LitestreamCmd *exec.Cmd
@@ -40,13 +44,26 @@ func getBinaryPath(name string) string {
 func SetupTestDB(t *testing.T, name string) *TestDB {
 	t.Helper()
 
-	tempDir := t.TempDir()
+	var tempDir string
+	if os.Getenv("SOAK_KEEP_TEMP") != "" {
+		dir, err := os.MkdirTemp("", fmt.Sprintf("litestream-%s-", name))
+		if err != nil {
+			t.Fatalf("create temp dir: %v", err)
+		}
+		tempDir = dir
+		t.Cleanup(func() {
+			t.Logf("SOAK_KEEP_TEMP set, preserving test artifacts at: %s", tempDir)
+		})
+	} else {
+		tempDir = t.TempDir()
+	}
 	dbPath := filepath.Join(tempDir, fmt.Sprintf("%s.db", name))
 	replicaPath := filepath.Join(tempDir, "replica")
 
 	return &TestDB{
 		Path:        dbPath,
 		ReplicaPath: replicaPath,
+		ReplicaURL:  fmt.Sprintf("file://%s", filepath.ToSlash(replicaPath)),
 		TempDir:     tempDir,
 		t:           t,
 	}
@@ -218,11 +235,24 @@ func (db *TestDB) StopLitestream() error {
 }
 
 func (db *TestDB) Restore(outputPath string) error {
-	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
-	cmd := exec.Command(getBinaryPath("litestream"), "restore",
-		"-o", outputPath,
-		replicaURL,
-	)
+	replicaURL := db.ReplicaURL
+	if replicaURL == "" {
+		replicaURL = fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	}
+	var cmd *exec.Cmd
+	if db.ConfigPath != "" && (strings.HasPrefix(replicaURL, "s3://") || strings.HasPrefix(replicaURL, "abs://") || strings.HasPrefix(replicaURL, "nats://")) {
+		cmd = exec.Command(getBinaryPath("litestream"), "restore",
+			"-config", db.ConfigPath,
+			"-o", outputPath,
+			db.Path,
+		)
+	} else {
+		cmd = exec.Command(getBinaryPath("litestream"), "restore",
+			"-o", outputPath,
+			replicaURL,
+		)
+	}
+	cmd.Env = append(os.Environ(), db.ReplicaEnv...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("restore failed: %w\nOutput: %s", err, string(output))
@@ -231,13 +261,17 @@ func (db *TestDB) Restore(outputPath string) error {
 }
 
 func (db *TestDB) Validate(restoredPath string) error {
-	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	replicaURL := db.ReplicaURL
+	if replicaURL == "" {
+		replicaURL = fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	}
 	cmd := exec.Command(getBinaryPath("litestream-test"), "validate",
 		"-source-db", db.Path,
 		"-replica-url", replicaURL,
 		"-restored-db", restoredPath,
 		"-check-type", "full",
 	)
+	cmd.Env = append(os.Environ(), db.ReplicaEnv...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("validation failed: %w\nOutput: %s", err, string(output))
@@ -246,13 +280,17 @@ func (db *TestDB) Validate(restoredPath string) error {
 }
 
 func (db *TestDB) QuickValidate(restoredPath string) error {
-	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	replicaURL := db.ReplicaURL
+	if replicaURL == "" {
+		replicaURL = fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
+	}
 	cmd := exec.Command(getBinaryPath("litestream-test"), "validate",
 		"-source-db", db.Path,
 		"-replica-url", replicaURL,
 		"-restored-db", restoredPath,
 		"-check-type", "quick",
 	)
+	cmd.Env = append(os.Environ(), db.ReplicaEnv...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("validation failed: %w\nOutput: %s", err, string(output))
@@ -331,6 +369,40 @@ func (db *TestDB) Cleanup() {
 	db.StopLitestream()
 }
 
+// WaitForSnapshots waits for snapshots & WAL segments to appear on file replicas.
+func (db *TestDB) WaitForSnapshots(timeout time.Duration) error {
+	if !strings.HasPrefix(db.ReplicaURL, "file://") {
+		return nil
+	}
+
+	snapshotDir := filepath.Join(db.ReplicaPath, "ltx", fmt.Sprintf("%d", litestream.SnapshotLevel))
+	walDir := filepath.Join(db.ReplicaPath, "ltx", "0")
+
+	deadline := time.Now().Add(timeout)
+	for {
+		snapshotCount := countLTXFiles(snapshotDir)
+		walCount := countLTXFiles(walDir)
+
+		if snapshotCount > 0 && walCount > 0 {
+			return nil
+		}
+
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout waiting for replica data: snapshots=%d wal=%d", snapshotCount, walCount)
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func countLTXFiles(dir string) int {
+	matches, err := filepath.Glob(filepath.Join(dir, "*.ltx"))
+	if err != nil {
+		return 0
+	}
+	return len(matches)
+}
+
 func GetTestDuration(t *testing.T, defaultDuration time.Duration) time.Duration {
 	t.Helper()
 
@@ -402,6 +474,24 @@ func InsertTestData(t *testing.T, dbPath string, count int) error {
 	}
 
 	return tx.Commit()
+}
+
+// IntegrityCheck runs PRAGMA integrity_check on the database.
+func (db *TestDB) IntegrityCheck() error {
+	sqlDB, err := sql.Open("sqlite3", db.Path)
+	if err != nil {
+		return err
+	}
+	defer sqlDB.Close()
+
+	var result string
+	if err := sqlDB.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
+		return err
+	}
+	if result != "ok" {
+		return fmt.Errorf("integrity check failed: %s", result)
+	}
+	return nil
 }
 
 // PrintTestSummary prints a summary of the test results

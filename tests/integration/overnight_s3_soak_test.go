@@ -7,7 +7,6 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
@@ -40,10 +39,12 @@ func TestOvernightS3Soak(t *testing.T) {
 	// Determine test duration
 	var duration time.Duration
 	if testing.Short() {
-		duration = 1 * time.Hour
+		duration = 10 * time.Minute
 	} else {
 		duration = 8 * time.Hour
 	}
+
+	shortMode := testing.Short()
 
 	t.Logf("================================================")
 	t.Logf("Litestream Overnight S3 Soak Test")
@@ -73,11 +74,13 @@ func TestOvernightS3Soak(t *testing.T) {
 	// Create S3 configuration
 	s3Path := fmt.Sprintf("litestream-overnight-%d", time.Now().Unix())
 	s3URL := fmt.Sprintf("s3://%s/%s", bucket, s3Path)
+	db.ReplicaURL = s3URL
 	t.Log("Creating Litestream configuration for S3...")
 	s3Config := &S3Config{
 		Region: region,
 	}
-	configPath := CreateSoakConfig(db.Path, s3URL, s3Config)
+	configPath := CreateSoakConfig(db.Path, s3URL, s3Config, shortMode)
+	db.ConfigPath = configPath
 	t.Logf("✓ Configuration created: %s", configPath)
 	t.Logf("  S3 URL: %s", s3URL)
 	t.Log("")
@@ -324,14 +327,4 @@ func getRowCountFromPath(dbPath, table string) (int, error) {
 	}
 
 	return count, nil
-}
-
-// containsAny checks if s contains any of the substrings
-func containsAny(s string, substrs []string) bool {
-	for _, substr := range substrs {
-		if strings.Contains(s, substr) {
-			return true
-		}
-	}
-	return false
 }

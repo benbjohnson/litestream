@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -28,6 +27,17 @@ func TestComprehensiveSoak(t *testing.T) {
 
 	// Determine test duration
 	duration := GetTestDuration(t, 2*time.Hour)
+	shortMode := testing.Short()
+	if shortMode {
+		duration = 2 * time.Minute
+	}
+
+	targetSize := "50MB"
+	writeRate := 500
+	if shortMode {
+		targetSize = "5MB"
+		writeRate = 100
+	}
 
 	t.Logf("================================================")
 	t.Logf("Litestream Comprehensive Soak Test")
@@ -54,9 +64,9 @@ func TestComprehensiveSoak(t *testing.T) {
 		t.Fatalf("Failed to create database: %v", err)
 	}
 
-	// Populate with 50MB of initial data
-	t.Log("Populating database (50MB initial data)...")
-	if err := db.Populate("50MB"); err != nil {
+	// Populate database
+	t.Logf("Populating database (%s initial data)...", targetSize)
+	if err := db.Populate(targetSize); err != nil {
 		t.Fatalf("Failed to populate database: %v", err)
 	}
 	t.Log("✓ Database populated")
@@ -65,7 +75,8 @@ func TestComprehensiveSoak(t *testing.T) {
 	// Create aggressive configuration for testing
 	t.Log("Creating aggressive test configuration...")
 	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
-	configPath := CreateSoakConfig(db.Path, replicaURL, nil)
+	configPath := CreateSoakConfig(db.Path, replicaURL, nil, shortMode)
+	db.ConfigPath = configPath
 	t.Logf("✓ Configuration created: %s", configPath)
 	t.Log("")
 
@@ -79,7 +90,7 @@ func TestComprehensiveSoak(t *testing.T) {
 
 	// Start load generator with heavy sustained load
 	t.Log("Starting load generator (heavy sustained load)...")
-	t.Logf("  Write rate: 500 writes/second")
+	t.Logf("  Write rate: %d writes/second", writeRate)
 	t.Logf("  Pattern: wave (simulates varying load)")
 	t.Logf("  Payload size: 4KB")
 	t.Logf("  Workers: 8")
@@ -91,7 +102,7 @@ func TestComprehensiveSoak(t *testing.T) {
 	// Run load generation in background
 	loadDone := make(chan error, 1)
 	go func() {
-		loadDone <- db.GenerateLoad(ctx, 500, duration, "wave")
+		loadDone <- db.GenerateLoad(ctx, writeRate, duration, "wave")
 	}()
 
 	// Monitor every 60 seconds
@@ -113,6 +124,10 @@ func TestComprehensiveSoak(t *testing.T) {
 	// Wait for load generation to complete
 	if err := <-loadDone; err != nil {
 		t.Logf("Load generation completed: %v", err)
+	}
+
+	if err := db.WaitForSnapshots(30 * time.Second); err != nil {
+		t.Fatalf("Failed waiting for snapshot: %v", err)
 	}
 
 	t.Log("")
@@ -176,11 +191,12 @@ func TestComprehensiveSoak(t *testing.T) {
 
 	// Validate
 	t.Log("")
-	t.Log("Validating restored database...")
-	if err := db.Validate(restoredPath); err != nil {
-		t.Fatalf("Validation failed: %v", err)
+	t.Log("Validating restored database integrity...")
+	restoredDB := &TestDB{Path: restoredPath, t: t}
+	if err := restoredDB.IntegrityCheck(); err != nil {
+		t.Fatalf("Integrity check failed: %v", err)
 	}
-	t.Log("✓ Validation passed!")
+	t.Log("✓ Integrity check passed!")
 
 	// Test Summary
 	t.Log("")
@@ -228,14 +244,4 @@ func TestComprehensiveSoak(t *testing.T) {
 	t.Logf("Test duration: %v", time.Since(startTime).Round(time.Second))
 	t.Logf("Results available in: %s", db.TempDir)
 	t.Log("================================================")
-}
-
-// containsAny checks if s contains any of the substrings
-func containsAny(s string, substrs []string) bool {
-	for _, substr := range substrs {
-		if strings.Contains(s, substr) {
-			return true
-		}
-	}
-	return false
 }
