@@ -3,9 +3,11 @@
 package integration
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -39,6 +41,41 @@ func getBinaryPath(name string) string {
 		binPath += ".exe"
 	}
 	return binPath
+}
+
+func streamCommandOutput() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("SOAK_DEBUG")))
+	switch v {
+	case "", "0", "false", "off", "no":
+		return false
+	default:
+		return true
+	}
+}
+
+func configureCmdIO(cmd *exec.Cmd) (bool, *bytes.Buffer, *bytes.Buffer) {
+	stream := streamCommandOutput()
+	stdoutBuf := &bytes.Buffer{}
+	stderrBuf := &bytes.Buffer{}
+	if stream {
+		cmd.Stdout = io.MultiWriter(os.Stdout, stdoutBuf)
+		cmd.Stderr = io.MultiWriter(os.Stderr, stderrBuf)
+	} else {
+		cmd.Stdout = stdoutBuf
+		cmd.Stderr = stderrBuf
+	}
+	return stream, stdoutBuf, stderrBuf
+}
+
+func combinedOutput(stdoutBuf, stderrBuf *bytes.Buffer) string {
+	var sb strings.Builder
+	if stdoutBuf != nil && stdoutBuf.Len() > 0 {
+		sb.Write(stdoutBuf.Bytes())
+	}
+	if stderrBuf != nil && stderrBuf.Len() > 0 {
+		sb.Write(stderrBuf.Bytes())
+	}
+	return strings.TrimSpace(sb.String())
 }
 
 func SetupTestDB(t *testing.T, name string) *TestDB {
@@ -107,13 +144,14 @@ func (db *TestDB) Populate(targetSize string) error {
 		"-target-size", targetSize,
 	)
 
-	// Stream output to see progress
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 
 	db.t.Logf("Populating database to %s...", targetSize)
 
 	if err := cmd.Run(); err != nil {
+		if output := combinedOutput(stdoutBuf, stderrBuf); output != "" {
+			return fmt.Errorf("populate failed: %w\nOutput: %s", err, output)
+		}
 		return fmt.Errorf("populate failed: %w", err)
 	}
 	return nil
@@ -127,13 +165,14 @@ func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize i
 		"-row-size", fmt.Sprintf("%d", rowSize),
 	)
 
-	// Stream output to see progress
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 
 	db.t.Logf("Populating database to %s (page size: %d, row size: %d)...", targetSize, pageSize, rowSize)
 
 	if err := cmd.Run(); err != nil {
+		if output := combinedOutput(stdoutBuf, stderrBuf); output != "" {
+			return fmt.Errorf("populate failed: %w\nOutput: %s", err, output)
+		}
 		return fmt.Errorf("populate failed: %w", err)
 	}
 	return nil
@@ -147,13 +186,14 @@ func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time
 		"-pattern", pattern,
 	)
 
-	// Stream output to see progress in real-time
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 
 	db.t.Logf("Starting load generation: %d writes/sec for %v (%s pattern)", writeRate, duration, pattern)
 
 	if err := cmd.Run(); err != nil {
+		if output := combinedOutput(stdoutBuf, stderrBuf); output != "" {
+			return fmt.Errorf("load generation failed: %w\nOutput: %s", err, output)
+		}
 		return fmt.Errorf("load generation failed: %w", err)
 	}
 	return nil

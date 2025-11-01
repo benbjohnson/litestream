@@ -51,6 +51,71 @@ go test -v -tags="integration,long" -timeout=10h ./tests/integration/... \
   -run="TestOvernight|Test1GBBoundary"
 ```
 
+## Soak Tests
+
+Long-running soak tests live alongside the other integration tests and share the same helpers. They are excluded from CI by default and are intended for release validation or targeted debugging.
+
+### Overview
+
+| Test | Tags | Defaults | Purpose | Extra Requirements |
+| --- | --- | --- | --- | --- |
+| `TestComprehensiveSoak` | `integration,soak` | 2h duration, 50 MB DB, 500 writes/s | File-backed end-to-end stress | Litestream binaries in `./bin` |
+| `TestMinIOSoak` | `integration,soak,docker` | 2h duration, 5 MB DB (short=2 m), 100 writes/s | S3-compatible replication via MinIO | Docker daemon, `docker` CLI |
+| `TestOvernightS3Soak` | `integration,soak,aws` | 8h duration, 50 MB DB | Real S3 replication & restore | AWS credentials, `aws` CLI |
+
+All soak tests support `go test -test.short` to scale the default duration down to roughly two minutes for smoke verification.
+
+### Environment Variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `SOAK_AUTO_PURGE` | `yes` for non-interactive shells; prompts otherwise | Controls whether MinIO buckets are cleared before each run. Set to `no` to retain objects between runs. |
+| `SOAK_KEEP_TEMP` | unset | When set (any value), preserves the temporary directory and artifacts (database, config, logs) instead of removing them after the test completes. |
+| `SOAK_DEBUG` | `0` | Streams command stdout/stderr (database population, load generation, docker helpers) directly to the console. Without this the output is captured and only shown on failure. |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `S3_BUCKET`, `AWS_REGION` | required for `aws` tag | Provide credentials and target bucket for the overnight S3 soak. Region defaults to `us-east-1` if unset. |
+
+### Example Commands
+
+File-based soak (full length):
+
+```bash
+go test -v -tags="integration,soak" \
+  -run=TestComprehensiveSoak -timeout=3h ./tests/integration
+```
+
+File-based soak (short mode with preserved artifacts and debug logging):
+
+```bash
+SOAK_KEEP_TEMP=1 SOAK_DEBUG=1 go test -v -tags="integration,soak" \
+  -run=TestComprehensiveSoak -test.short -timeout=1h ./tests/integration
+```
+
+MinIO soak (short mode, auto-purges bucket, preserves results):
+
+```bash
+SOAK_AUTO_PURGE=yes SOAK_KEEP_TEMP=1 go test -v -tags="integration,soak,docker" \
+  -run=TestMinIOSoak -test.short -timeout=20m ./tests/integration
+```
+
+Overnight S3 soak (full duration):
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export S3_BUCKET=your-bucket
+export AWS_REGION=us-east-1
+
+go test -v -tags="integration,soak,aws" \
+  -run=TestOvernightS3Soak -timeout=10h ./tests/integration
+```
+
+### Tips
+
+- Run with `-v` to view the 60-second progress updates and final status summary. Without `-v`, progress output is suppressed by Go’s test runner.
+- When prompted about purging a MinIO bucket, answering “yes” clears the bucket via `minio/mc` before the run; “no” allows you to inspect lingering objects from previous executions.
+- `SOAK_KEEP_TEMP=1` is especially useful when investigating failures—the helper prints the preserved path so you can inspect databases, configs, and logs.
+- The monitoring infrastructure automatically prints additional status blocks when error counts change, making `SOAK_DEBUG=1` optional for most workflows.
+
 ### Specific Tests
 
 Run individual test functions:

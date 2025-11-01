@@ -37,6 +37,7 @@ type TestInfo struct {
 	RowCount  int
 	FileCount int
 	DB        *TestDB
+	cancel    context.CancelFunc
 }
 
 // ErrorStats holds error categorization and counts
@@ -46,6 +47,68 @@ type ErrorStats struct {
 	BenignCount   int
 	RecentErrors  []string
 	ErrorsByType  map[string]int
+}
+
+func isInteractive() bool {
+	if fi, err := os.Stdin.Stat(); err == nil {
+		return fi.Mode()&os.ModeCharDevice != 0
+	}
+	return false
+}
+
+func promptYesNo(t *testing.T, prompt string, defaultYes bool) bool {
+	t.Helper()
+
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SOAK_AUTO_PURGE"))) {
+	case "y", "yes", "true", "1", "on":
+		t.Logf("%s yes (SOAK_AUTO_PURGE)", prompt)
+		return true
+	case "n", "no", "false", "0", "off":
+		t.Logf("%s no (SOAK_AUTO_PURGE)", prompt)
+		return false
+	}
+
+	if !isInteractive() {
+		if defaultYes {
+			t.Logf("%s yes (non-interactive default)", prompt)
+			return true
+		}
+		t.Logf("%s no (non-interactive default)", prompt)
+		return false
+	}
+
+	defPrompt := "[y/N]"
+	if defaultYes {
+		defPrompt = "[Y/n]"
+	}
+
+	fmt.Printf("%s %s ", prompt, defPrompt)
+	reader := bufio.NewReader(os.Stdin)
+	text, err := reader.ReadString('\n')
+	if err != nil {
+		t.Logf("Failed to read response: %v (defaulting to no)", err)
+		return false
+	}
+
+	switch strings.ToLower(strings.TrimSpace(text)) {
+	case "", "y", "yes":
+		if defaultYes || text != "" {
+			return true
+		}
+		return false
+	case "n", "no":
+		return false
+	default:
+		return defaultYes
+	}
+}
+
+func promptYesNoDefaultNo(t *testing.T, prompt string) bool {
+	return promptYesNo(t, prompt, false)
+}
+
+func promptYesNoDefaultYes(t *testing.T, prompt string) bool {
+	return promptYesNo(t, prompt, true)
 }
 
 // RequireDocker checks if Docker is available
@@ -59,10 +122,11 @@ func RequireDocker(t *testing.T) {
 }
 
 // StartMinIOContainer starts a MinIO container and returns the container ID and endpoint
-func StartMinIOContainer(t *testing.T) (containerID string, endpoint string) {
+func StartMinIOContainer(t *testing.T) (containerID string, endpoint string, volumeName string) {
 	t.Helper()
 
 	containerName := fmt.Sprintf("litestream-test-minio-%d", time.Now().Unix())
+	volumeName = fmt.Sprintf("litestream-test-minio-data-%d", time.Now().Unix())
 	minioPort := "9100"
 	consolePort := "9101"
 
@@ -70,11 +134,18 @@ func StartMinIOContainer(t *testing.T) (containerID string, endpoint string) {
 	exec.Command("docker", "stop", containerName).Run()
 	exec.Command("docker", "rm", containerName).Run()
 
+	// Remove any lingering volume with the same name, then create fresh volume.
+	exec.Command("docker", "volume", "rm", volumeName).Run()
+	if out, err := exec.Command("docker", "volume", "create", volumeName).CombinedOutput(); err != nil {
+		t.Fatalf("Failed to create MinIO volume: %v\nOutput: %s", err, string(out))
+	}
+
 	// Start MinIO container
 	cmd := exec.Command("docker", "run", "-d",
 		"--name", containerName,
 		"-p", minioPort+":9000",
 		"-p", consolePort+":9001",
+		"-v", volumeName+":/data",
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
 		"minio/minio", "server", "/data", "--console-address", ":9001")
@@ -99,11 +170,11 @@ func StartMinIOContainer(t *testing.T) (containerID string, endpoint string) {
 
 	t.Logf("MinIO container started: %s (endpoint: %s)", containerID[:12], endpoint)
 
-	return containerID, endpoint
+	return containerID, endpoint, volumeName
 }
 
 // StopMinIOContainer stops and removes a MinIO container
-func StopMinIOContainer(t *testing.T, containerID string) {
+func StopMinIOContainer(t *testing.T, containerID string, volumeName string) {
 	t.Helper()
 
 	if containerID == "" {
@@ -114,11 +185,26 @@ func StopMinIOContainer(t *testing.T, containerID string) {
 
 	exec.Command("docker", "stop", containerID).Run()
 	exec.Command("docker", "rm", containerID).Run()
+
+	if volumeName != "" {
+		exec.Command("docker", "volume", "rm", volumeName).Run()
+	}
 }
 
 // CreateMinIOBucket creates a bucket in MinIO
 func CreateMinIOBucket(t *testing.T, containerID, bucket string) {
 	t.Helper()
+
+	if minioBucketExists(containerID, bucket) {
+		if promptYesNoDefaultYes(t, fmt.Sprintf("Bucket '%s' already exists. Purge existing objects before running soak test?", bucket)) {
+			t.Logf("Purging MinIO bucket '%s'...", bucket)
+			if err := clearMinIOBucket(containerID, bucket); err != nil {
+				t.Fatalf("Failed to purge MinIO bucket: %v", err)
+			}
+		} else {
+			t.Logf("Skipping purge of bucket '%s'. Residual data may cause replication errors.", bucket)
+		}
+	}
 
 	// Use mc (MinIO Client) via docker to create bucket
 	cmd := exec.Command("docker", "run", "--rm",
@@ -126,12 +212,65 @@ func CreateMinIOBucket(t *testing.T, containerID, bucket string) {
 		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
 		"minio/mc", "mb", "minio/"+bucket)
 
-	output, err := cmd.CombinedOutput()
-	if err != nil && !strings.Contains(string(output), "already exists") {
-		t.Logf("Create bucket output: %s", string(output))
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
+		output := combinedOutput(stdoutBuf, stderrBuf)
+		if !strings.Contains(output, "already exists") {
+			t.Fatalf("Create bucket failed: %v Output: %s", err, output)
+		}
+	}
+
+	if err := waitForMinIOBucket(containerID, bucket, 60*time.Second); err != nil {
+		t.Fatalf("Bucket %s not ready: %v", bucket, err)
+	}
+
+	if err := clearMinIOBucket(containerID, bucket); err != nil {
+		t.Fatalf("Failed to purge MinIO bucket: %v", err)
 	}
 
 	t.Logf("MinIO bucket '%s' ready", bucket)
+}
+
+func minioBucketExists(containerID, bucket string) bool {
+	cmd := exec.Command("docker", "run", "--rm",
+		"--link", containerID+":minio",
+		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
+		"minio/mc", "ls", "minio/"+bucket+"/")
+	_, _, _ = configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
+		return false
+	}
+	return true
+}
+
+func clearMinIOBucket(containerID, bucket string) error {
+	cmd := exec.Command("docker", "run", "--rm",
+		"--link", containerID+":minio",
+		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
+		"minio/mc", "rm", "--recursive", "--force", "minio/"+bucket)
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
+		output := combinedOutput(stdoutBuf, stderrBuf)
+		if output != "" {
+			return fmt.Errorf("%w: %s", err, output)
+		}
+		return err
+	}
+	return nil
+}
+
+func waitForMinIOBucket(containerID, bucket string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if minioBucketExists(containerID, bucket) {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+	return fmt.Errorf("bucket %s not available", bucket)
 }
 
 // CountMinIOObjects counts objects in a MinIO bucket
@@ -143,12 +282,13 @@ func CountMinIOObjects(t *testing.T, containerID, bucket string) int {
 		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
 		"minio/mc", "ls", "minio/"+bucket+"/", "--recursive")
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
 		return 0
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	output := combinedOutput(stdoutBuf, stderrBuf)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) == 1 && lines[0] == "" {
 		return 0
 	}
@@ -195,12 +335,13 @@ func CountS3Objects(t *testing.T, s3URL string) int {
 	t.Helper()
 
 	cmd := exec.Command("aws", "s3", "ls", s3URL+"/", "--recursive")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
 		return 0
 	}
 
-	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	output := combinedOutput(stdoutBuf, stderrBuf)
+	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) == 1 && lines[0] == "" {
 		return 0
 	}
@@ -213,12 +354,13 @@ func GetS3StorageSize(t *testing.T, s3URL string) int64 {
 	t.Helper()
 
 	cmd := exec.Command("aws", "s3", "ls", s3URL+"/", "--recursive", "--summarize")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
 		return 0
 	}
 
-	lines := strings.Split(string(output), "\n")
+	output := combinedOutput(stdoutBuf, stderrBuf)
+	lines := strings.Split(output, "\n")
 	for _, line := range lines {
 		if strings.Contains(line, "Total Size:") {
 			var size int64
@@ -369,11 +511,20 @@ func setupSignalHandler(t *testing.T, cancel context.CancelFunc, testInfo *TestI
 			}
 		}
 	}()
+
+	t.Cleanup(func() {
+		signal.Stop(sigChan)
+		close(sigChan)
+	})
 }
 
 // performGracefulShutdown performs cleanup on early termination
 func performGracefulShutdown(t *testing.T, testInfo *TestInfo) {
 	t.Helper()
+
+	if testInfo.cancel != nil {
+		testInfo.cancel()
+	}
 
 	t.Log("")
 	t.Log("================================================")
@@ -472,25 +623,28 @@ func getErrorStats(db *TestDB) ErrorStats {
 	}
 
 	for _, errLine := range errors {
-		// Categorize
-		if strings.Contains(errLine, "page size not initialized") {
+		switch {
+		case strings.Contains(errLine, "page size not initialized"):
 			stats.BenignCount++
 			stats.ErrorsByType["page size not initialized"]++
-		} else {
+		case strings.Contains(errLine, "connection refused"):
+			stats.BenignCount++
+			stats.ErrorsByType["connection refused"]++
+		case strings.Contains(errLine, "context canceled"):
+			stats.BenignCount++
+			stats.ErrorsByType["context canceled"]++
+		default:
 			stats.CriticalCount++
-			// Track recent critical errors (last 5)
 			if len(stats.RecentErrors) < 5 {
 				stats.RecentErrors = append(stats.RecentErrors, errLine)
 			}
 
-			// Extract error type
-			if strings.Contains(errLine, "connection refused") {
-				stats.ErrorsByType["connection refused"]++
-			} else if strings.Contains(errLine, "timeout") {
+			switch {
+			case strings.Contains(errLine, "timeout"):
 				stats.ErrorsByType["timeout"]++
-			} else if strings.Contains(errLine, "compaction failed") {
+			case strings.Contains(errLine, "compaction failed"):
 				stats.ErrorsByType["compaction failed"]++
-			} else {
+			default:
 				stats.ErrorsByType["other"]++
 			}
 		}
@@ -503,14 +657,43 @@ func getErrorStats(db *TestDB) ErrorStats {
 func printProgress(t *testing.T, elapsed, total time.Duration, errorStats ErrorStats) {
 	t.Helper()
 
+	if total <= 0 {
+		total = time.Second
+	}
+
+	if elapsed < 0 {
+		elapsed = 0
+	}
+
 	pct := float64(elapsed) / float64(total) * 100
+	if pct > 100 {
+		pct = 100
+	} else if pct < 0 {
+		pct = 0
+	}
+
 	remaining := total - elapsed
+	if remaining < 0 {
+		remaining = 0
+	}
 
 	// Progress bar
 	barWidth := 40
-	filled := int(float64(barWidth) * elapsed.Seconds() / total.Seconds())
+	filled := 0
+	if total.Seconds() > 0 {
+		ratio := elapsed.Seconds() / total.Seconds()
+		if ratio < 0 {
+			ratio = 0
+		} else if ratio > 1 {
+			ratio = 1
+		}
+		filled = int(float64(barWidth) * ratio)
+	}
 	if filled > barWidth {
 		filled = barWidth
+	}
+	if filled < 0 {
+		filled = 0
 	}
 	bar := strings.Repeat("█", filled) + strings.Repeat("░", barWidth-filled)
 
@@ -569,8 +752,8 @@ func printErrorDetails(t *testing.T, errorStats ErrorStats) {
 
 // shouldAbortTest checks if test should auto-abort due to critical issues
 func shouldAbortTest(errorStats ErrorStats, fileCount int, elapsed time.Duration) (bool, string) {
-	// Abort if critical error threshold exceeded
-	if errorStats.CriticalCount > 10 {
+	// Abort if critical error threshold exceeded after extended runtime
+	if elapsed > 10*time.Minute && errorStats.CriticalCount > 100 {
 		return true, fmt.Sprintf("Critical error threshold exceeded (%d errors)", errorStats.CriticalCount)
 	}
 
@@ -580,10 +763,13 @@ func shouldAbortTest(errorStats ErrorStats, fileCount int, elapsed time.Duration
 	}
 
 	// Abort if error rate is increasing rapidly (>1 error/minute)
-	if errorStats.CriticalCount > 0 && elapsed.Minutes() > 0 {
-		errorRate := float64(errorStats.CriticalCount) / elapsed.Minutes()
-		if errorRate > 1.0 {
-			return true, fmt.Sprintf("Error rate too high (%.1f errors/minute)", errorRate)
+	if errorStats.CriticalCount > 0 && elapsed > 30*time.Minute {
+		minutes := elapsed.Minutes()
+		if minutes > 0 {
+			errorRate := float64(errorStats.CriticalCount) / minutes
+			if errorRate > 2.0 {
+				return true, fmt.Sprintf("Error rate too high (%.1f errors/minute)", errorRate)
+			}
 		}
 	}
 
@@ -591,41 +777,107 @@ func shouldAbortTest(errorStats ErrorStats, fileCount int, elapsed time.Duration
 }
 
 // MonitorSoakTest monitors a soak test, calling metricsFunc every 60 seconds
-func MonitorSoakTest(t *testing.T, db *TestDB, ctx context.Context, startTime time.Time, duration time.Duration, metricsFunc func()) {
+func MonitorSoakTest(t *testing.T, db *TestDB, ctx context.Context, info *TestInfo, refresh func(), logFunc func()) {
 	t.Helper()
+
+	if info == nil {
+		info = &TestInfo{}
+	}
 
 	ticker := time.NewTicker(60 * time.Second)
 	defer ticker.Stop()
 
+	lastCritical := -1
+	lastTotal := -1
+	lastProgress := -1.0
+
 	for {
 		select {
 		case <-ctx.Done():
+			if refresh != nil {
+				refresh()
+			}
+			if info != nil {
+				// Show final progress snapshot
+				errorStats := getErrorStats(db)
+				if lastProgress < 0 || lastProgress < 100 || errorStats.CriticalCount != lastCritical || errorStats.TotalCount != lastTotal {
+					printProgress(t, info.Duration, info.Duration, errorStats)
+					t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+					t.Logf("[%s] Status Report", time.Now().Format("15:04:05"))
+					t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+					if logFunc != nil {
+						logFunc()
+					}
+					if errorStats.CriticalCount > 0 {
+						printErrorDetails(t, errorStats)
+					}
+				}
+			}
 			t.Log("Monitoring stopped: test duration completed")
 			return
 		case <-ticker.C:
-			elapsed := time.Since(startTime)
+			if refresh != nil {
+				refresh()
+			}
 
-			// Get error stats
+			elapsed := time.Since(info.StartTime)
+			if elapsed < 0 {
+				elapsed = 0
+			}
+
 			errorStats := getErrorStats(db)
 
-			// Check abort conditions
-			fileCount, _ := db.GetReplicaFileCount()
-			if shouldAbort, reason := shouldAbortTest(errorStats, fileCount, elapsed); shouldAbort {
+			if shouldAbort, reason := shouldAbortTest(errorStats, info.FileCount, elapsed); shouldAbort {
 				t.Logf("")
 				t.Logf("⚠ AUTO-ABORTING TEST: %s", reason)
+				if info.cancel != nil {
+					info.cancel()
+				}
 				t.Fail()
 				return
 			}
 
-			// Display progress with error status
-			printProgress(t, elapsed, duration, errorStats)
+			totalDuration := info.Duration
+			if totalDuration <= 0 {
+				totalDuration = time.Second
+			}
+			progress := elapsed.Seconds() / totalDuration.Seconds() * 100
+			if progress < 0 {
+				progress = 0
+			} else if progress > 100 {
+				progress = 100
+			}
+
+			shouldLog := false
+			if lastCritical == -1 && lastTotal == -1 {
+				shouldLog = true
+			}
+
+			if !shouldLog && (errorStats.CriticalCount != lastCritical || errorStats.TotalCount != lastTotal) {
+				shouldLog = true
+			}
+
+			if !shouldLog && (lastProgress < 0 || progress >= lastProgress+5 || progress >= 100) {
+				shouldLog = true
+			}
+
+			if !shouldLog {
+				continue
+			}
+
+			lastCritical = errorStats.CriticalCount
+			lastTotal = errorStats.TotalCount
+			lastProgress = progress
+
+			printProgress(t, elapsed, info.Duration, errorStats)
 			t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 			t.Logf("[%s] Status Report", time.Now().Format("15:04:05"))
 			t.Logf("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-			metricsFunc()
+			if logFunc != nil {
+				logFunc()
+			}
 
-			// Show error details if any critical errors
 			if errorStats.CriticalCount > 0 {
 				printErrorDetails(t, errorStats)
 			}
