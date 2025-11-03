@@ -1078,3 +1078,613 @@ dbs:
 		}
 	})
 }
+func TestFindSQLiteDatabases(t *testing.T) {
+	// Create a temporary directory using t.TempDir() - automatically cleaned up
+	tmpDir := t.TempDir()
+
+	// Create test files
+	testFiles := []struct {
+		path       string
+		isSQLite   bool
+		shouldFind bool
+	}{
+		{"test1.db", true, true},
+		{"test2.sqlite", true, true},
+		{"test3.db", false, false}, // Not a SQLite file
+		{"test.txt", false, false},
+		{"subdir/test4.db", true, true},
+		{"subdir/test5.sqlite", true, true},
+		{"subdir/deep/test6.db", true, true},
+	}
+
+	// Create test files
+	for _, tf := range testFiles {
+		fullPath := filepath.Join(tmpDir, tf.path)
+		dir := filepath.Dir(fullPath)
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		file, err := os.Create(fullPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if tf.isSQLite {
+			// Write SQLite header
+			if _, err := file.Write([]byte("SQLite format 3\x00")); err != nil {
+				t.Fatal(err)
+			}
+		} else {
+			// Write non-SQLite content
+			if _, err := file.Write([]byte("not a sqlite file")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	t.Run("non-recursive *.db pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*.db", false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should only find test1.db in root directory
+		if len(dbs) != 1 {
+			t.Errorf("expected 1 database, got %d", len(dbs))
+		}
+	})
+
+	t.Run("recursive *.db pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*.db", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should find test1.db, test4.db, and test6.db
+		if len(dbs) != 3 {
+			t.Errorf("expected 3 databases, got %d", len(dbs))
+		}
+	})
+
+	t.Run("recursive *.sqlite pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*.sqlite", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should find test2.sqlite and test5.sqlite
+		if len(dbs) != 2 {
+			t.Errorf("expected 2 databases, got %d", len(dbs))
+		}
+	})
+
+	t.Run("recursive * pattern", func(t *testing.T) {
+		dbs, err := main.FindSQLiteDatabases(tmpDir, "*", true)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should find all 5 SQLite databases
+		if len(dbs) != 5 {
+			t.Errorf("expected 5 databases, got %d", len(dbs))
+		}
+	})
+}
+
+func TestIsSQLiteDatabase(t *testing.T) {
+	// Create temporary test files using t.TempDir() - automatically cleaned up
+	tmpDir := t.TempDir()
+
+	t.Run("valid SQLite file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "valid.db")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte("SQLite format 3\x00")); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if !main.IsSQLiteDatabase(path) {
+			t.Error("expected file to be identified as SQLite database")
+		}
+	})
+
+	t.Run("invalid SQLite file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "invalid.db")
+		file, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := file.Write([]byte("not a sqlite file")); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		if main.IsSQLiteDatabase(path) {
+			t.Error("expected file to NOT be identified as SQLite database")
+		}
+	})
+
+	t.Run("non-existent file", func(t *testing.T) {
+		path := filepath.Join(tmpDir, "doesnotexist.db")
+		if main.IsSQLiteDatabase(path) {
+			t.Error("expected non-existent file to NOT be identified as SQLite database")
+		}
+	})
+}
+
+func TestDBConfigValidation(t *testing.T) {
+	t.Run("both path and dir specified", func(t *testing.T) {
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Path: "/path/to/db.sqlite",
+					Dir:  "/path/to/dir",
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Error("expected validation error when both path and dir are specified")
+		}
+	})
+
+	t.Run("neither path nor dir specified", func(t *testing.T) {
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Error("expected validation error when neither path nor dir are specified")
+		}
+	})
+
+	t.Run("dir without pattern", func(t *testing.T) {
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Dir: "/path/to/dir",
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Error("expected validation error when dir is specified without pattern")
+		}
+	})
+
+	t.Run("valid path configuration", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{
+				Path: "/path/to/db.sqlite",
+			},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for valid path config: %v", err)
+		}
+	})
+
+	t.Run("valid directory configuration", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{
+				Dir:       "/path/to/dir",
+				Pattern:   "*.db",
+				Recursive: true,
+			},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for valid directory config: %v", err)
+		}
+	})
+}
+
+// TestNewDBsFromDirectoryConfig_UniquePaths verifies that each database discovered
+// in a directory gets a unique replica path to prevent data corruption.
+func TestNewDBsFromDirectoryConfig_UniquePaths(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create multiple databases
+	createSQLiteDB(t, filepath.Join(tmpDir, "db1.db"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "db2.db"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "db3.db"))
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{
+			Type:   "file",
+			Path:   "/backup/base",
+			Bucket: "",
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 3 {
+		t.Fatalf("expected 3 databases, got %d", len(dbs))
+	}
+
+	// Verify each has unique replica path
+	paths := make(map[string]bool)
+	for _, db := range dbs {
+		if db.Replica == nil {
+			t.Fatalf("database %s has no replica", db.Path())
+		}
+		replicaPath := db.Replica.Client.(*file.ReplicaClient).Path()
+		if paths[replicaPath] {
+			t.Errorf("duplicate replica path: %s", replicaPath)
+		}
+		paths[replicaPath] = true
+
+		// Verify path includes database name
+		dbName := filepath.Base(db.Path())
+		if !strings.Contains(replicaPath, dbName) {
+			t.Errorf("replica path %s does not contain database name %s", replicaPath, dbName)
+		}
+	}
+
+	// Verify all paths are different
+	if len(paths) != 3 {
+		t.Errorf("expected 3 unique paths, got %d", len(paths))
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_SubdirectoryPaths verifies that the relative
+// directory structure is preserved in replica paths when using recursive scanning.
+func TestNewDBsFromDirectoryConfig_SubdirectoryPaths(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create databases in subdirectories
+	createSQLiteDB(t, filepath.Join(tmpDir, "db1.db"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-a", "db2.db"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "nested", "db3.db"))
+
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: "/backup",
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 3 {
+		t.Fatalf("expected 3 databases, got %d", len(dbs))
+	}
+
+	// Build expected path mappings
+	expectedPaths := map[string]string{
+		filepath.Join(tmpDir, "db1.db"):                     "/backup/db1.db",
+		filepath.Join(tmpDir, "team-a", "db2.db"):           "/backup/team-a/db2.db",
+		filepath.Join(tmpDir, "team-b", "nested", "db3.db"): "/backup/team-b/nested/db3.db",
+	}
+
+	for _, db := range dbs {
+		expectedPath, ok := expectedPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+
+		replicaPath := db.Replica.Client.(*file.ReplicaClient).Path()
+		if replicaPath != expectedPath {
+			t.Errorf("database %s: expected replica path %s, got %s", db.Path(), expectedPath, replicaPath)
+		}
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_DuplicateFilenames verifies that databases with
+// the same filename in different subdirectories get unique replica paths.
+func TestNewDBsFromDirectoryConfig_DuplicateFilenames(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create databases with same name in different directories
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-a", "db.sqlite"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "db.sqlite"))
+
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.sqlite",
+		Recursive: true,
+		Replica: &main.ReplicaConfig{
+			Type:   "s3",
+			Path:   "backups",
+			Bucket: "test-bucket",
+			Region: "us-east-1",
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	// Verify paths are unique despite duplicate filenames
+	paths := make(map[string]bool)
+	for _, db := range dbs {
+		replicaPath := db.Replica.Client.(*s3.ReplicaClient).Path
+		if paths[replicaPath] {
+			t.Errorf("duplicate replica path found: %s", replicaPath)
+		}
+		paths[replicaPath] = true
+	}
+
+	if len(paths) != 2 {
+		t.Errorf("expected 2 unique paths, got %d", len(paths))
+	}
+
+	// Verify paths contain subdirectory to disambiguate
+	for _, db := range dbs {
+		replicaPath := db.Replica.Client.(*s3.ReplicaClient).Path
+		if !strings.Contains(replicaPath, "team-a") && !strings.Contains(replicaPath, "team-b") {
+			t.Errorf("replica path %s does not contain team subdirectory", replicaPath)
+		}
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_S3URL verifies that replica URLs receive a
+// per-database suffix so multiple databases do not overwrite one another.
+func TestNewDBsFromDirectoryConfig_S3URL(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-a", "db.sqlite"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "nested", "db.sqlite"))
+
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.sqlite",
+		Recursive: true,
+		Replica: &main.ReplicaConfig{
+			URL: "s3://test-bucket/backups",
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedPaths := map[string]string{
+		filepath.Join(tmpDir, "team-a", "db.sqlite"):           "backups/team-a/db.sqlite",
+		filepath.Join(tmpDir, "team-b", "nested", "db.sqlite"): "backups/team-b/nested/db.sqlite",
+	}
+
+	for _, db := range dbs {
+		expectedPath, ok := expectedPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+
+		client := db.Replica.Client.(*s3.ReplicaClient)
+		if client.Path != expectedPath {
+			t.Errorf("database %s: expected replica path %s, got %s", db.Path(), expectedPath, client.Path)
+		}
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_ReplicasArrayURL verifies URL handling when
+// using the deprecated replicas array form.
+func TestNewDBsFromDirectoryConfig_ReplicasArrayURL(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "db1.sqlite"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "subs", "db2.sqlite"))
+
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.sqlite",
+		Recursive: true,
+		Replicas: []*main.ReplicaConfig{
+			{
+				URL: "s3://legacy-bucket/base",
+			},
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedPaths := map[string]string{
+		filepath.Join(tmpDir, "db1.sqlite"):         "base/db1.sqlite",
+		filepath.Join(tmpDir, "subs", "db2.sqlite"): "base/subs/db2.sqlite",
+	}
+
+	for _, db := range dbs {
+		expectedPath, ok := expectedPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+
+		client := db.Replica.Client.(*s3.ReplicaClient)
+		if client.Path != expectedPath {
+			t.Errorf("database %s: expected replica path %s, got %s", db.Path(), expectedPath, client.Path)
+		}
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_SpecialCharacters verifies that special characters
+// in database filenames are handled correctly in replica paths.
+func TestNewDBsFromDirectoryConfig_SpecialCharacters(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// Create databases with special characters
+	specialNames := []string{
+		"my database.db",
+		"user@example.com.db",
+		"tenant#1.db",
+	}
+
+	for _, name := range specialNames {
+		createSQLiteDB(t, filepath.Join(tmpDir, name))
+	}
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: "/backup",
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != len(specialNames) {
+		t.Fatalf("expected %d databases, got %d", len(specialNames), len(dbs))
+	}
+
+	// Verify each special name is in a replica path
+	for _, db := range dbs {
+		replicaPath := db.Replica.Client.(*file.ReplicaClient).Path()
+		dbName := filepath.Base(db.Path())
+
+		if !strings.Contains(replicaPath, dbName) {
+			t.Errorf("replica path %s does not contain database name %s", replicaPath, dbName)
+		}
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_EmptyBasePath verifies that an empty base path
+// results in the database relative path being used as the entire replica path.
+func TestNewDBsFromDirectoryConfig_EmptyBasePath(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "test.db"))
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: "", // Empty base path
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 1 {
+		t.Fatalf("expected 1 database, got %d", len(dbs))
+	}
+
+	replicaPath := dbs[0].Replica.Client.(*file.ReplicaClient).Path()
+	// When base path is empty, the relative path (just filename) is used
+	// But it's still expanded to absolute path by the file backend
+	if !strings.HasSuffix(replicaPath, "test.db") {
+		t.Errorf("expected replica path to end with 'test.db', got %s", replicaPath)
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_ReplicasArray verifies that the deprecated
+// 'replicas' array field is handled correctly with unique paths.
+func TestNewDBsFromDirectoryConfig_ReplicasArray(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "db1.db"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "db2.db"))
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Replicas: []*main.ReplicaConfig{
+			{
+				Type: "file",
+				Path: "/backup",
+			},
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	// Verify each has unique replica path
+	paths := make(map[string]bool)
+	for _, db := range dbs {
+		if db.Replica == nil {
+			t.Fatalf("database %s has no replica", db.Path())
+		}
+		replicaPath := db.Replica.Client.(*file.ReplicaClient).Path()
+		if paths[replicaPath] {
+			t.Errorf("duplicate replica path: %s", replicaPath)
+		}
+		paths[replicaPath] = true
+	}
+}
+
+// createSQLiteDB creates a minimal SQLite database file for testing
+func createSQLiteDB(t *testing.T, path string) {
+	t.Helper()
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatalf("failed to create directory %s: %v", dir, err)
+	}
+
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatalf("failed to create file %s: %v", path, err)
+	}
+	defer file.Close()
+
+	// Write SQLite header
+	if _, err := file.Write([]byte("SQLite format 3\x00")); err != nil {
+		t.Fatalf("failed to write SQLite header: %v", err)
+	}
+}
