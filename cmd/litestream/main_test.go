@@ -1441,6 +1441,98 @@ func TestNewDBsFromDirectoryConfig_DuplicateFilenames(t *testing.T) {
 	}
 }
 
+// TestNewDBsFromDirectoryConfig_S3URL verifies that replica URLs receive a
+// per-database suffix so multiple databases do not overwrite one another.
+func TestNewDBsFromDirectoryConfig_S3URL(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-a", "db.sqlite"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "nested", "db.sqlite"))
+
+	config := &main.DBConfig{
+		Directory: tmpDir,
+		Pattern:   "*.sqlite",
+		Recursive: true,
+		Replica: &main.ReplicaConfig{
+			URL: "s3://test-bucket/backups",
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedPaths := map[string]string{
+		filepath.Join(tmpDir, "team-a", "db.sqlite"):           "backups/team-a/db.sqlite",
+		filepath.Join(tmpDir, "team-b", "nested", "db.sqlite"): "backups/team-b/nested/db.sqlite",
+	}
+
+	for _, db := range dbs {
+		expectedPath, ok := expectedPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+
+		client := db.Replica.Client.(*s3.ReplicaClient)
+		if client.Path != expectedPath {
+			t.Errorf("database %s: expected replica path %s, got %s", db.Path(), expectedPath, client.Path)
+		}
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_ReplicasArrayURL verifies URL handling when
+// using the deprecated replicas array form.
+func TestNewDBsFromDirectoryConfig_ReplicasArrayURL(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "db1.sqlite"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "subs", "db2.sqlite"))
+
+	config := &main.DBConfig{
+		Directory: tmpDir,
+		Pattern:   "*.sqlite",
+		Recursive: true,
+		Replicas: []*main.ReplicaConfig{
+			{
+				URL: "s3://legacy-bucket/base",
+			},
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedPaths := map[string]string{
+		filepath.Join(tmpDir, "db1.sqlite"):         "base/db1.sqlite",
+		filepath.Join(tmpDir, "subs", "db2.sqlite"): "base/subs/db2.sqlite",
+	}
+
+	for _, db := range dbs {
+		expectedPath, ok := expectedPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+
+		client := db.Replica.Client.(*s3.ReplicaClient)
+		if client.Path != expectedPath {
+			t.Errorf("database %s: expected replica path %s, got %s", db.Path(), expectedPath, client.Path)
+		}
+	}
+}
+
 // TestNewDBsFromDirectoryConfig_SpecialCharacters verifies that special characters
 // in database filenames are handled correctly in replica paths.
 func TestNewDBsFromDirectoryConfig_SpecialCharacters(t *testing.T) {

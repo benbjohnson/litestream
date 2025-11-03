@@ -570,32 +570,25 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 		dbConfigCopy.Path = dbPath
 		dbConfigCopy.Directory = "" // Clear directory field for individual DB
 
-		// Deep copy replica config and make path unique per database
-		// This prevents all databases from writing to the same replica path
+		// Deep copy replica config and make path unique per database.
+		// This prevents all databases from writing to the same replica path.
 		if dbc.Replica != nil {
-			replicaCopy := *dbc.Replica
-			// Append relative path to base replica path, normalized for cloud storage
-			// Use path.Join (not filepath.Join) to ensure forward slashes for URLs
-			if replicaCopy.Path != "" {
-				replicaCopy.Path = path.Join(replicaCopy.Path, filepath.ToSlash(relPath))
-			} else {
-				replicaCopy.Path = filepath.ToSlash(relPath)
+			replicaCopy, err := cloneReplicaConfigWithRelativePath(dbc.Replica, relPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to configure replica for %s: %w", dbPath, err)
 			}
-			dbConfigCopy.Replica = &replicaCopy
+			dbConfigCopy.Replica = replicaCopy
 		}
 
-		// Also handle deprecated 'replicas' array field
+		// Also handle deprecated 'replicas' array field.
 		if len(dbc.Replicas) > 0 {
 			dbConfigCopy.Replicas = make([]*ReplicaConfig, len(dbc.Replicas))
 			for i, replica := range dbc.Replicas {
-				replicaCopy := *replica
-				// Append relative path to base replica path, normalized for cloud storage
-				if replicaCopy.Path != "" {
-					replicaCopy.Path = path.Join(replicaCopy.Path, filepath.ToSlash(relPath))
-				} else {
-					replicaCopy.Path = filepath.ToSlash(relPath)
+				replicaCopy, err := cloneReplicaConfigWithRelativePath(replica, relPath)
+				if err != nil {
+					return nil, fmt.Errorf("failed to configure replica %d for %s: %w", i, dbPath, err)
 				}
-				dbConfigCopy.Replicas[i] = &replicaCopy
+				dbConfigCopy.Replicas[i] = replicaCopy
 			}
 		}
 
@@ -607,6 +600,71 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 	}
 
 	return dbs, nil
+}
+
+// cloneReplicaConfigWithRelativePath returns a copy of the replica configuration with the
+// database-relative path appended to either the replica path or URL, depending on how the
+// replica was configured.
+func cloneReplicaConfigWithRelativePath(base *ReplicaConfig, relPath string) (*ReplicaConfig, error) {
+	if base == nil {
+		return nil, nil
+	}
+
+	replicaCopy := *base
+	relPath = filepath.ToSlash(relPath)
+	if relPath == "" || relPath == "." {
+		return &replicaCopy, nil
+	}
+
+	if replicaCopy.URL != "" {
+		u, err := url.Parse(replicaCopy.URL)
+		if err != nil {
+			return nil, fmt.Errorf("parse replica url: %w", err)
+		}
+		appendRelativePathToURL(u, relPath)
+		replicaCopy.URL = u.String()
+		return &replicaCopy, nil
+	}
+
+	switch base.ReplicaType() {
+	case "file":
+		relOSPath := filepath.FromSlash(relPath)
+		if replicaCopy.Path != "" {
+			replicaCopy.Path = filepath.Join(replicaCopy.Path, relOSPath)
+		} else {
+			replicaCopy.Path = relOSPath
+		}
+	default:
+		// Normalize to forward slashes for cloud/object storage backends.
+		basePath := filepath.ToSlash(replicaCopy.Path)
+		if basePath != "" {
+			replicaCopy.Path = path.Join(basePath, relPath)
+		} else {
+			replicaCopy.Path = relPath
+		}
+	}
+
+	return &replicaCopy, nil
+}
+
+// appendRelativePathToURL appends relPath to the URL's path component, ensuring
+// the result remains rooted and uses forward slashes.
+func appendRelativePathToURL(u *url.URL, relPath string) {
+	cleanRel := strings.TrimPrefix(relPath, "/")
+	if cleanRel == "" || cleanRel == "." {
+		return
+	}
+
+	basePath := u.Path
+	var joined string
+	if basePath == "" {
+		joined = cleanRel
+	} else {
+		joined = path.Join(basePath, cleanRel)
+	}
+
+	joined = "/" + strings.TrimPrefix(joined, "/")
+	u.Path = joined
 }
 
 // FindSQLiteDatabases recursively finds all SQLite database files in a directory.
