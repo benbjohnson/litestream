@@ -1,12 +1,29 @@
 ---
 # Example configuration for replicating directories of SQLite databases
 # Demonstrates directory replication feature (issue #42)
+#
+# IMPORTANT: Replica Path Behavior
+# ---------------------------------
+# When using directory replication, each database gets a UNIQUE replica path
+# to prevent data corruption. The relative path from the directory root is
+# automatically appended to the configured replica path.
+#
+# Example:
+#   directory: /var/lib/databases
+#   replica path: backups/prod
+#
+# Results in:
+#   /var/lib/databases/tenant1.db     → backups/prod/tenant1.db/ltx/...
+#   /var/lib/databases/subdir/db2.db  → backups/prod/subdir/db2.db/ltx/...
+#
+# This ensures each database has isolated replica storage.
 
 # Serve metrics over HTTP on port 9090.
 addr: ":9090"
 
 dbs:
   # Example 1: Replicate all .db files in a directory (non-recursive)
+  # Replica paths: myapp/databases/<filename>/ltx/...
   - directory: /var/lib/myapp/databases
     pattern: "*.db"
     recursive: false
@@ -18,6 +35,9 @@ dbs:
 
   # Example 2: Replicate SQLite files recursively in multi-tenant dir
   # Perfect for multi-tenancy with separate databases per tenant
+  # Replica paths preserve directory structure:
+  #   /var/lib/tenants/team-a/prod.sqlite → tenants/team-a/prod.sqlite/ltx/...
+  #   /var/lib/tenants/team-b/prod.sqlite → tenants/team-b/prod.sqlite/ltx/...
   - directory: /var/lib/tenants
     pattern: "*.sqlite"
     recursive: true
