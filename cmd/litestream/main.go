@@ -423,6 +423,9 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 
 	// Normalize paths.
 	for _, dbConfig := range config.DBs {
+		if dbConfig.Path == "" {
+			continue
+		}
 		if dbConfig.Path, err = expand(dbConfig.Path); err != nil {
 			return config, err
 		}
