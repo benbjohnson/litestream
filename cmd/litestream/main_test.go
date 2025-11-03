@@ -1224,23 +1224,23 @@ func TestIsSQLiteDatabase(t *testing.T) {
 }
 
 func TestDBConfigValidation(t *testing.T) {
-	t.Run("both path and directory specified", func(t *testing.T) {
+	t.Run("both path and dir specified", func(t *testing.T) {
 		config := main.Config{
 			DBs: []*main.DBConfig{
 				{
-					Path:      "/path/to/db.sqlite",
-					Directory: "/path/to/dir",
+					Path: "/path/to/db.sqlite",
+					Dir:  "/path/to/dir",
 				},
 			},
 		}
 
 		err := config.Validate()
 		if err == nil {
-			t.Error("expected validation error when both path and directory are specified")
+			t.Error("expected validation error when both path and dir are specified")
 		}
 	})
 
-	t.Run("neither path nor directory specified", func(t *testing.T) {
+	t.Run("neither path nor dir specified", func(t *testing.T) {
 		config := main.Config{
 			DBs: []*main.DBConfig{
 				{},
@@ -1249,7 +1249,22 @@ func TestDBConfigValidation(t *testing.T) {
 
 		err := config.Validate()
 		if err == nil {
-			t.Error("expected validation error when neither path nor directory are specified")
+			t.Error("expected validation error when neither path nor dir are specified")
+		}
+	})
+
+	t.Run("dir without pattern", func(t *testing.T) {
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Dir: "/path/to/dir",
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Error("expected validation error when dir is specified without pattern")
 		}
 	})
 
@@ -1271,7 +1286,7 @@ func TestDBConfigValidation(t *testing.T) {
 		config := main.DefaultConfig()
 		config.DBs = []*main.DBConfig{
 			{
-				Directory: "/path/to/dir",
+				Dir:       "/path/to/dir",
 				Pattern:   "*.db",
 				Recursive: true,
 			},
@@ -1295,8 +1310,8 @@ func TestNewDBsFromDirectoryConfig_UniquePaths(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "db3.db"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
-		Pattern:   "*.db",
+		Dir:     tmpDir,
+		Pattern: "*.db",
 		Replica: &main.ReplicaConfig{
 			Type:   "file",
 			Path:   "/backup/base",
@@ -1349,7 +1364,7 @@ func TestNewDBsFromDirectoryConfig_SubdirectoryPaths(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "nested", "db3.db"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
+		Dir:       tmpDir,
 		Pattern:   "*.db",
 		Recursive: true,
 		Replica: &main.ReplicaConfig{
@@ -1398,7 +1413,7 @@ func TestNewDBsFromDirectoryConfig_DuplicateFilenames(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "db.sqlite"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
+		Dir:       tmpDir,
 		Pattern:   "*.sqlite",
 		Recursive: true,
 		Replica: &main.ReplicaConfig{
@@ -1450,7 +1465,7 @@ func TestNewDBsFromDirectoryConfig_S3URL(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "team-b", "nested", "db.sqlite"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
+		Dir:       tmpDir,
 		Pattern:   "*.sqlite",
 		Recursive: true,
 		Replica: &main.ReplicaConfig{
@@ -1495,7 +1510,7 @@ func TestNewDBsFromDirectoryConfig_ReplicasArrayURL(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "subs", "db2.sqlite"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
+		Dir:       tmpDir,
 		Pattern:   "*.sqlite",
 		Recursive: true,
 		Replicas: []*main.ReplicaConfig{
@@ -1550,8 +1565,8 @@ func TestNewDBsFromDirectoryConfig_SpecialCharacters(t *testing.T) {
 	}
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
-		Pattern:   "*.db",
+		Dir:     tmpDir,
+		Pattern: "*.db",
 		Replica: &main.ReplicaConfig{
 			Type: "file",
 			Path: "/backup",
@@ -1586,8 +1601,8 @@ func TestNewDBsFromDirectoryConfig_EmptyBasePath(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "test.db"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
-		Pattern:   "*.db",
+		Dir:     tmpDir,
+		Pattern: "*.db",
 		Replica: &main.ReplicaConfig{
 			Type: "file",
 			Path: "", // Empty base path
@@ -1620,8 +1635,8 @@ func TestNewDBsFromDirectoryConfig_ReplicasArray(t *testing.T) {
 	createSQLiteDB(t, filepath.Join(tmpDir, "db2.db"))
 
 	config := &main.DBConfig{
-		Directory: tmpDir,
-		Pattern:   "*.db",
+		Dir:     tmpDir,
+		Pattern: "*.db",
 		Replicas: []*main.ReplicaConfig{
 			{
 				Type: "file",

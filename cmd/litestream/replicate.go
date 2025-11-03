@@ -126,13 +126,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	var dbs []*litestream.DB
 	for _, dbConfig := range c.Config.DBs {
 		// Handle directory configuration
-		if dbConfig.Directory != "" {
+		if dbConfig.Dir != "" {
 			dirDbs, err := NewDBsFromDirectoryConfig(dbConfig)
 			if err != nil {
 				return err
 			}
 			dbs = append(dbs, dirDbs...)
-			slog.Info("found databases in directory", "directory", dbConfig.Directory, "count", len(dirDbs))
+			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs))
 		} else {
 			// Handle single database configuration
 			db, err := NewDBFromConfig(dbConfig)

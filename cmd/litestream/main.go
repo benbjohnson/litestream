@@ -295,18 +295,23 @@ func (c *Config) Validate() error {
 
 	// Validate database configs
 	for idx, db := range c.DBs {
-		// Validate that either path or directory is specified, but not both
-		if db.Path != "" && db.Directory != "" {
-			return fmt.Errorf("database config #%d: cannot specify both 'path' and 'directory'", idx+1)
+		// Validate that either path or dir is specified, but not both
+		if db.Path != "" && db.Dir != "" {
+			return fmt.Errorf("database config #%d: cannot specify both 'path' and 'dir'", idx+1)
 		}
-		if db.Path == "" && db.Directory == "" {
-			return fmt.Errorf("database config #%d: must specify either 'path' or 'directory'", idx+1)
+		if db.Path == "" && db.Dir == "" {
+			return fmt.Errorf("database config #%d: must specify either 'path' or 'dir'", idx+1)
 		}
 
-		// Use path or directory for identifying the config in error messages
+		// When using dir, pattern must be specified
+		if db.Dir != "" && db.Pattern == "" {
+			return fmt.Errorf("database config #%d: 'pattern' is required when using 'dir'", idx+1)
+		}
+
+		// Use path or dir for identifying the config in error messages
 		dbIdentifier := db.Path
 		if dbIdentifier == "" {
-			dbIdentifier = db.Directory
+			dbIdentifier = db.Dir
 		}
 
 		// Validate sync intervals for replicas
@@ -460,7 +465,7 @@ type CompactionLevelConfig struct {
 // DBConfig represents the configuration for a single database or directory of databases.
 type DBConfig struct {
 	Path               string         `yaml:"path"`
-	Directory          string         `yaml:"directory"` // Directory to scan for databases
+	Dir                string         `yaml:"dir"`       // Directory to scan for databases
 	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
 	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
 	MetaPath           *string        `yaml:"meta-path"`
@@ -534,29 +539,27 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 
 // NewDBsFromDirectoryConfig scans a directory and creates DB instances for all SQLite databases found.
 func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
-	if dbc.Directory == "" {
+	if dbc.Dir == "" {
 		return nil, fmt.Errorf("directory path is required for directory replication")
 	}
 
-	dirPath, err := expand(dbc.Directory)
+	if dbc.Pattern == "" {
+		return nil, fmt.Errorf("pattern is required for directory replication")
+	}
+
+	dirPath, err := expand(dbc.Dir)
 	if err != nil {
 		return nil, err
 	}
 
-	// Default pattern if not specified
-	pattern := dbc.Pattern
-	if pattern == "" {
-		pattern = "*.db"
-	}
-
 	// Find all SQLite databases in the directory
-	dbPaths, err := FindSQLiteDatabases(dirPath, pattern, dbc.Recursive)
+	dbPaths, err := FindSQLiteDatabases(dirPath, dbc.Pattern, dbc.Recursive)
 	if err != nil {
 		return nil, fmt.Errorf("failed to scan directory %s: %w", dirPath, err)
 	}
 
 	if len(dbPaths) == 0 {
-		return nil, fmt.Errorf("no SQLite databases found in directory %s with pattern %s", dirPath, pattern)
+		return nil, fmt.Errorf("no SQLite databases found in directory %s with pattern %s", dirPath, dbc.Pattern)
 	}
 
 	// Create DB instances for each found database
@@ -571,7 +574,9 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 		// Create a copy of the config for each database
 		dbConfigCopy := *dbc
 		dbConfigCopy.Path = dbPath
-		dbConfigCopy.Directory = "" // Clear directory field for individual DB
+		dbConfigCopy.Dir = ""          // Clear dir field for individual DB
+		dbConfigCopy.Pattern = ""      // Clear pattern field
+		dbConfigCopy.Recursive = false // Clear recursive flag
 
 		// Deep copy replica config and make path unique per database.
 		// This prevents all databases from writing to the same replica path.
