@@ -1,0 +1,148 @@
+name: Integration Tests
+
+on:
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'tests/integration/**'
+      - '.github/workflows/integration-tests.yml'
+  workflow_dispatch:
+    inputs:
+      test_type:
+        description: 'Test type to run'
+        required: false
+        default: 'quick'
+        type: choice
+        options:
+          - 'quick'
+          - 'all'
+          - 'long'
+
+permissions:
+  contents: read
+
+jobs:
+  quick-tests:
+    name: Quick Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' || inputs.test_type == 'quick' || inputs.test_type == 'all'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run quick integration tests
+        run: |
+          go test -v -tags=integration -timeout=30m ./tests/integration/... \
+            -run="TestFreshStart|TestDatabaseIntegrity|TestRapidCheckpoints"
+        env:
+          CGO_ENABLED: 1
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quick-test-logs
+          path: |
+            /tmp/litestream-*/*.log
+            /tmp/*-test.log
+
+  scenario-tests:
+    name: Scenario Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && (inputs.test_type == 'all' || inputs.test_type == 'long')
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run all scenario tests
+        run: |
+          go test -v -tags=integration -timeout=1h ./tests/integration/... \
+            -run="Test(FreshStart|DatabaseIntegrity|DatabaseDeletion|RapidCheckpoints|WALGrowth|ConcurrentOperations|BusyTimeout)"
+        env:
+          CGO_ENABLED: 1
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-test-logs
+          path: |
+            /tmp/litestream-*/*.log
+            /tmp/*-test.log
+
+  long-running-tests:
+    name: Long-Running Integration Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && inputs.test_type == 'long'
+    timeout-minutes: 600
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run long tests
+        run: |
+          go test -v -tags="integration,long" -timeout=10h ./tests/integration/... \
+            -run="TestOvernight|Test1GBBoundary"
+        env:
+          CGO_ENABLED: 1
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-test-logs
+          path: |
+            /tmp/litestream-*/*.log
+            /tmp/*-test.log
+
+  summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [quick-tests]
+    if: always() && (github.event_name == 'pull_request' || inputs.test_type == 'quick' || inputs.test_type == 'all')
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.quick-tests.result }}" == "success" ]; then
+            echo "✅ **Quick Tests:** Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.quick-tests.result }}" == "failure" ]; then
+            echo "❌ **Quick Tests:** Failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.quick-tests.result }}" == "skipped" ]; then
+            echo "⏭️ **Quick Tests:** Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+
+          # Note: Scenario and long-running tests run independently on workflow_dispatch.
+          # Check individual job results for those test suites.
