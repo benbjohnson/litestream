@@ -3,6 +3,7 @@
 This guide provides comprehensive instructions for implementing new storage backends for Litestream replication.
 
 ## Table of Contents
+
 - [Interface Contract](#interface-contract)
 - [Implementation Checklist](#implementation-checklist)
 - [Eventual Consistency Handling](#eventual-consistency-handling)
@@ -22,7 +23,8 @@ type ReplicaClient interface {
 
     // Returns iterator of LTX files at given level
     // seek: Start from this TXID (0 = beginning)
-    LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+    // useMetadata: When true, fetch accurate timestamps from backend metadata (required for PIT restore)
+    LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
 
     // Opens an LTX file for reading
     // Returns os.ErrNotExist if file doesn't exist
@@ -43,6 +45,7 @@ type ReplicaClient interface {
 ## Implementation Checklist
 
 ### Required Features
+
 - [ ] Implement all interface methods
 - [ ] Support partial reads (offset/size in OpenLTXFile)
 - [ ] Return proper error types (especially os.ErrNotExist)
@@ -52,6 +55,7 @@ type ReplicaClient interface {
 - [ ] Implement proper cleanup in DeleteAll
 
 ### Optional Features
+
 - [ ] Connection pooling
 - [ ] Retry logic with exponential backoff
 - [ ] Request batching
@@ -127,9 +131,9 @@ func (c *ReplicaClient) verifyUpload(ctx context.Context, path string, expectedS
 #### 2. List-After-Write Consistency
 
 ```go
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
     // List files from storage
-    files, err := c.listFiles(ctx, level)
+    files, err := c.listFiles(ctx, level, useMetadata)
     if err != nil {
         return nil, err
     }
@@ -384,7 +388,7 @@ func TestReplicaClient_Integration(t *testing.T) {
         assert.NoError(t, err)
 
         // Verify cleanup
-        iter, err := client.LTXFiles(ctx, 0, 0)
+        iter, err := client.LTXFiles(ctx, 0, 0, false)
         require.NoError(t, err)
         defer iter.Close()
 
@@ -558,7 +562,7 @@ func (c *Client) WriteLTXFile(ctx context.Context, ...) (*ltx.FileInfo, error) {
 
 ```go
 // WRONG - Loads all files at once
-func (c *Client) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *Client) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
     allFiles, err := c.loadAllFiles(level)  // Could be millions!
     if err != nil {
         return nil, err
@@ -570,12 +574,13 @@ func (c *Client) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.Fi
 
 ```go
 // CORRECT - Lazy loading with pagination
-func (c *Client) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+func (c *Client) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
     return &lazyIterator{
-        client:   c,
-        level:    level,
-        seek:     seek,
-        pageSize: 1000,
+        client:      c,
+        level:       level,
+        seek:        seek,
+        useMetadata: useMetadata,
+        pageSize:    1000,
     }, nil
 }
 
@@ -709,15 +714,17 @@ type ReplicaClient struct {
     cache *FileInfoCache
 }
 
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
-    // Check cache first
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+    // Check cache first (only cache when useMetadata=false for fast queries)
     cacheKey := fmt.Sprintf("%d-%d", level, seek)
-    if cached, ok := c.cache.Get(cacheKey); ok {
-        return ltx.NewFileInfoSliceIterator(cached), nil
+    if !useMetadata {
+        if cached, ok := c.cache.Get(cacheKey); ok {
+            return ltx.NewFileInfoSliceIterator(cached), nil
+        }
     }
 
     // Load from storage
-    files, err := c.loadFiles(ctx, level, seek)
+    files, err := c.loadFiles(ctx, level, seek, useMetadata)
     if err != nil {
         return nil, err
     }

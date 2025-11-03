@@ -26,8 +26,9 @@ Create a new storage backend implementation for Litestream with all required com
        return "{{backend_name}}"
    }
 
-   func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error) {
+   func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
        // List files at level
+       // When useMetadata=true, fetch accurate timestamps from backend metadata
    }
 
    func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
@@ -77,6 +78,7 @@ Create a new storage backend implementation for Litestream with all required com
    ```
 
 ## Key Requirements
+
 - Handle eventual consistency
 - Implement atomic writes (temp file + rename)
 - Support partial reads (offset/size)
@@ -84,6 +86,7 @@ Create a new storage backend implementation for Litestream with all required com
 - Return proper error types (os.ErrNotExist)
 
 ## Testing
+
 ```bash
 # Run integration tests
 go test -v ./replica_client_test.go -integration {{backend_name}}

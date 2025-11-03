@@ -7,12 +7,14 @@ This file is automatically loaded by Claude Code and provides Claude-specific op
 **Primary Documentation**: See AGENTS.md for comprehensive architectural guidance, patterns, and anti-patterns.
 
 ### Context Window Advantages
+
 With Claude's 200k token context window, you can load the entire documentation suite:
 - Full AGENTS.md for patterns and anti-patterns
 - All docs/ subdirectory files for deep technical understanding
 - Multiple source files simultaneously for cross-referencing
 
 ### Key Focus Areas for Claude
+
 1. **Architectural Reasoning**: Leverage deep understanding of DB vs Replica layer boundaries
 2. **Complex Analysis**: Use full context for multi-file refactoring
 3. **SQLite Internals**: Reference docs/SQLITE_INTERNALS.md for WAL format details
@@ -21,6 +23,7 @@ With Claude's 200k token context window, you can load the entire documentation s
 ### Claude-Specific Resources
 
 #### Specialized Agents (.claude/agents/)
+
 - **sqlite-expert.md**: SQLite WAL and page management expertise
 - **replica-client-developer.md**: Storage backend implementation
 - **ltx-compaction-specialist.md**: LTX format and compaction
@@ -28,6 +31,7 @@ With Claude's 200k token context window, you can load the entire documentation s
 - **performance-optimizer.md**: Performance and resource optimization
 
 #### Commands (.claude/commands/)
+
 - `/analyze-ltx`: Analyze LTX file structure and contents
 - `/debug-wal`: Debug WAL replication issues
 - `/test-compaction`: Test compaction scenarios
@@ -108,7 +112,7 @@ pre-commit run --all-files
 
 **Replica (`replica.go`)**: Connects a database to replication destinations via ReplicaClient interface. Manages periodic synchronization and maintains replication position.
 
-**ReplicaClient Interface** (`replica_client.go`): Abstraction for different storage backends (S3, GCS, Azure Blob Storage, SFTP, file system, NATS). Each implementation handles snapshot/WAL segment upload and restoration. The `WriteLTXFile` method accepts an optional `createdAt` timestamp parameter to preserve original file timestamps during compaction operations.
+**ReplicaClient Interface** (`replica_client.go`): Abstraction for different storage backends (S3, GCS, Azure Blob Storage, SFTP, file system, NATS). Each implementation handles snapshot/WAL segment upload and restoration. The `LTXFiles` method includes a `useMetadata` parameter: when true, it fetches accurate timestamps from backend metadata (required for point-in-time restores); when false, it uses fast timestamps for normal operations. During compaction, the system preserves the earliest CreatedAt timestamp from source files to maintain temporal granularity for restoration.
 
 **WAL Processing**: The system monitors SQLite WAL files for changes, segments them into LTX format files, and replicates these segments to configured destinations. Uses SQLite checksums for integrity verification.
 

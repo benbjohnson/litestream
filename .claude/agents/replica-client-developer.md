@@ -16,17 +16,22 @@ You specialize in implementing and maintaining storage backend clients for Lites
 ## Core Knowledge
 
 ### ReplicaClient Interface
+
 Every storage backend MUST implement:
 ```go
 type ReplicaClient interface {
     Type() string
-    LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+    LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
     OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
     WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
     DeleteLTXFiles(ctx context.Context, files []*ltx.FileInfo) error
     DeleteAll(ctx context.Context) error
 }
 ```
+
+**LTXFiles useMetadata parameter**:
+- When `useMetadata=true`: Fetch accurate timestamps from backend metadata (slower, required for point-in-time restore)
+- When `useMetadata=false`: Use fast timestamps from file listing (faster, suitable for replication monitoring)
 
 ### Critical Patterns
 
@@ -50,6 +55,7 @@ type ReplicaClient interface {
 ## Implementation Checklist
 
 ### New Backend Requirements
+
 - [ ] Implement ReplicaClient interface
 - [ ] Handle partial reads (offset/size)
 - [ ] Support seek parameter for pagination
@@ -60,6 +66,7 @@ type ReplicaClient interface {
 - [ ] Document configuration
 
 ### Testing Requirements
+
 ```bash
 # Integration test
 go test -v ./replica_client_test.go -integration [backend]
@@ -74,6 +81,7 @@ go test -race -v ./[backend]/...
 ## Existing Backends Reference
 
 ### Study These Implementations
+
 - `s3/replica_client.go` - AWS S3 (most complete)
 - `gs/replica_client.go` - Google Cloud Storage
 - `abs/replica_client.go` - Azure Blob Storage
@@ -82,6 +90,7 @@ go test -race -v ./[backend]/...
 - `nats/replica_client.go` - NATS JetStream (newest)
 
 ## Common Pitfalls
+
 1. Not handling eventual consistency
 2. Missing atomic write operations
 3. Incorrect error types
@@ -90,6 +99,7 @@ go test -race -v ./[backend]/...
 6. No retry logic for transient failures
 
 ## Configuration Pattern
+
 ```yaml
 replicas:
   - type: [backend]
@@ -98,6 +108,7 @@ replicas:
 ```
 
 ## References
+
 - docs/REPLICA_CLIENT_GUIDE.md - Complete implementation guide
 - replica_client.go - Interface definition
 - replica_client_test.go - Test suite

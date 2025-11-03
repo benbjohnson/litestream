@@ -3,6 +3,7 @@
 Comprehensive guide for testing Litestream components and handling edge cases.
 
 ## Table of Contents
+
 - [Testing Philosophy](#testing-philosophy)
 - [1GB Database Testing](#1gb-database-testing)
 - [Race Condition Testing](#race-condition-testing)
@@ -175,7 +176,7 @@ func TestDB_LockPageHandling(t *testing.T) {
 
 func verifyLockPageSkipped(t *testing.T, replica *litestream.Replica, lockPgno uint32) {
     // Get LTX files
-    files, err := replica.Client.LTXFiles(context.Background(), 0, 0)
+    files, err := replica.Client.LTXFiles(context.Background(), 0, 0, false)
     require.NoError(t, err)
 
     // Check each file

@@ -270,49 +270,28 @@ graph TB
     S3 -->|Store| LTXFiles
 ```
 
-### ✅ DO: Handle database state in DB.init()
+### ✅ DO: Handle database state in DB layer
 
-```go
-// CORRECT - Database restoration logic belongs in DB layer
-func (db *DB) init(ctx context.Context, replica *litestream.Replica) error {
-    dpos, err := db.Pos()
-    if err != nil {
-        return err
-    }
-    rpos := replica.Pos()
+**Principle**: Database restoration logic belongs in the DB layer, not the Replica layer.
 
-    if dpos.TXID < rpos.TXID {
-        if err := db.clearL0Files(); err != nil {
-            return fmt.Errorf("clear L0 files: %w", err)
-        }
+**Pattern**: When the database is behind the replica (local TXID < remote TXID):
 
-        itr, err := replica.Client.LTXFiles(ctx, 0, rpos.TXID)
-        if err != nil {
-            return fmt.Errorf("enumerate ltx files: %w", err)
-        }
-        defer itr.Close()
+1. **Clear local L0 cache**: Remove the entire L0 directory and recreate it
+   - Use `os.RemoveAll()` on the L0 directory path
+   - Recreate with proper permissions using `internal.MkdirAll()`
 
-        if itr.Next() {
-            info := itr.Item()
-            rd, err := replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-            if err != nil {
-                return fmt.Errorf("fetch latest L0 LTX: %w", err)
-            }
-            defer rd.Close()
+2. **Fetch latest L0 file from replica**: Download the most recent L0 LTX file
+   - Call `replica.Client.OpenLTXFile()` with the remote min/max TXID
+   - Stream the file contents (don't load into memory)
 
-            if err := db.writeL0File(rd); err != nil {
-                return fmt.Errorf("write L0 file: %w", err)
-            }
-        }
+3. **Write using atomic file operations**: Prevent partial/corrupted files
+   - Write to temporary file with `.tmp` suffix
+   - Call `Sync()` to ensure data is on disk
+   - Atomically rename temp file to final path
 
-        if err := itr.Close(); err != nil {
-            return err
-        }
-    }
+**Why this matters**: If the database state is not synchronized before replication starts, the system will attempt to apply WAL segments that are ahead of the database's current position, leading to restore failures.
 
-    return replica.Start(ctx)
-}
-```
+**Reference Implementation**: See `DB.checkDatabaseBehindReplica()` in db.go:670-737
 
 ### ❌ DON'T: Put database state logic in Replica layer
 
@@ -655,7 +634,7 @@ type ReplicaClient interface {
     Type() string  // Client type identifier
 
     // File operations
-    LTXFiles(ctx context.Context, level int, seek ltx.TXID) (ltx.FileIterator, error)
+    LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
     OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
     WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
     DeleteLTXFiles(ctx context.Context, files []*ltx.FileInfo) error
@@ -663,11 +642,19 @@ type ReplicaClient interface {
 }
 ```
 
+**LTXFiles useMetadata Parameter:**
+- **`useMetadata=true`**: Fetch accurate timestamps from backend metadata (required for point-in-time restores)
+  - Slower but provides correct CreatedAt timestamps
+  - Use when restoring to specific timestamp
+- **`useMetadata=false`**: Use fast timestamps (LastModified/ModTime) for normal operations
+  - Faster enumeration, suitable for synchronization
+  - Use during replication monitoring
+
 **Implementation Requirements:**
 - Handle partial reads gracefully
 - Implement proper error types (os.ErrNotExist)
 - Support seek/offset for efficient page fetching
-- Preserve file timestamps (CreatedAt)
+- Preserve file timestamps when `useMetadata=true`
 
 ### Store Component (store.go)
 
@@ -938,7 +925,7 @@ This document serves as the universal source of truth for all AI coding assistan
 
 ### Documentation Hierarchy
 
-```
+```text
 Tier 1 (Always read):
 - AGENTS.md (this file)
 - llms.txt (if you need navigation)
