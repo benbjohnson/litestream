@@ -106,6 +106,9 @@ type DB struct {
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
 
+	// Minimum time to retain L0 files after they have been compacted into L1.
+	L0Retention time.Duration
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -129,6 +132,7 @@ func NewDB(path string) *DB {
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
 		BusyTimeout:        DefaultBusyTimeout,
+		L0Retention:        DefaultL0Retention,
 		Logger:             slog.With("db", filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
@@ -1471,12 +1475,12 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	db.maxLTXFileInfos.m[dstLevel] = info
 	db.maxLTXFileInfos.Unlock()
 
-	// If this is L1, clean up L0 files that are below the minTXID.
+	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
-		if err := db.EnforceRetentionByTXID(ctx, 0, minTXID); err != nil {
+		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				db.Logger.Error("enforce L0 retention", "error", err)
+				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
 		}
 	}
@@ -1552,6 +1556,76 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	}
 
 	return minSnapshotTXID, nil
+}
+
+// EnforceL0RetentionByTime retains L0 files until they have been compacted into
+// L1 and have existed for at least L0Retention.
+func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
+	if db.L0Retention <= 0 {
+		return nil
+	}
+
+	db.Logger.Debug("enforcing l0 retention", "retention", db.L0Retention)
+
+	// Determine the highest TXID that has been compacted into L1.
+	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	if err != nil {
+		return fmt.Errorf("fetch l1 files: %w", err)
+	}
+	var maxL1TXID ltx.TXID
+	for itr.Next() {
+		info := itr.Item()
+		if info.MaxTXID > maxL1TXID {
+			maxL1TXID = info.MaxTXID
+		}
+	}
+	if err := itr.Close(); err != nil {
+		return fmt.Errorf("close l1 iterator: %w", err)
+	}
+	if maxL1TXID == 0 {
+		return nil
+	}
+
+	threshold := time.Now().Add(-db.L0Retention)
+	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		return fmt.Errorf("fetch l0 files: %w", err)
+	}
+	defer itr.Close()
+
+	var deleted []*ltx.FileInfo
+	var lastInfo *ltx.FileInfo
+	for itr.Next() {
+		info := itr.Item()
+		lastInfo = info
+
+		if info.MaxTXID <= maxL1TXID && !info.CreatedAt.IsZero() && !info.CreatedAt.After(threshold) {
+			deleted = append(deleted, info)
+		}
+	}
+
+	// Ensure we do not delete the newest L0 file.
+	if len(deleted) > 0 && lastInfo != nil && deleted[len(deleted)-1] == lastInfo {
+		deleted = deleted[:len(deleted)-1]
+	}
+
+	if len(deleted) == 0 {
+		return nil
+	}
+
+	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+		return fmt.Errorf("remove expired l0 files: %w", err)
+	}
+
+	for _, info := range deleted {
+		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
+		db.Logger.Debug("deleting expired local l0 file", "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
+			db.Logger.Error("failed to remove local l0 file", "path", localPath, "error", err)
+		}
+	}
+
+	return nil
 }
 
 // EnforceRetentionByTXID enforces retention so that any LTX files below

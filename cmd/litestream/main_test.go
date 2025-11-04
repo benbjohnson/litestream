@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
@@ -511,6 +512,67 @@ func TestParseReplicaURL_AccessPoint(t *testing.T) {
 	t.Run("Invalid", func(t *testing.T) {
 		if _, _, _, err := main.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/"); err == nil {
 			t.Fatal("expected error")
+		}
+	})
+}
+
+func TestConfig_Validate_L0Retention(t *testing.T) {
+	t.Run("ZeroRetention", func(t *testing.T) {
+		yaml := `
+l0-retention: 0s
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for zero l0 retention")
+		}
+		if !errors.Is(err, main.ErrInvalidL0Retention) {
+			t.Errorf("expected ErrInvalidL0Retention, got %v", err)
+		}
+	})
+
+	t.Run("ZeroCheckInterval", func(t *testing.T) {
+		yaml := `
+l0-retention-check-interval: 0s
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for zero l0 retention check interval")
+		}
+		if !errors.Is(err, main.ErrInvalidL0RetentionCheckInterval) {
+			t.Errorf("expected ErrInvalidL0RetentionCheckInterval, got %v", err)
+		}
+	})
+
+	t.Run("DefaultsApplied", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if config.L0Retention == nil {
+			t.Fatal("expected default l0 retention to be set")
+		}
+		if *config.L0Retention != litestream.DefaultL0Retention {
+			t.Errorf("expected default l0 retention %v, got %v", litestream.DefaultL0Retention, *config.L0Retention)
+		}
+		if config.L0RetentionCheckInterval == nil {
+			t.Fatal("expected default l0 retention check interval to be set")
+		}
+		if *config.L0RetentionCheckInterval != litestream.DefaultL0RetentionCheckInterval {
+			t.Errorf("expected default l0 retention check interval %v, got %v", litestream.DefaultL0RetentionCheckInterval, *config.L0RetentionCheckInterval)
 		}
 	})
 }

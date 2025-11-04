@@ -32,6 +32,14 @@ const (
 
 	DefaultRetention              = 24 * time.Hour
 	DefaultRetentionCheckInterval = 1 * time.Hour
+
+	// DefaultL0Retention is the default time that L0 files are kept around
+	// after they have been compacted into L1 files.
+	DefaultL0Retention = 5 * time.Minute
+	// DefaultL0RetentionCheckInterval controls how frequently L0 retention is
+	// enforced. This interval should be more frequent than the L1 compaction
+	// interval so that VFS read replicas have time to observe new files.
+	DefaultL0RetentionCheckInterval = 15 * time.Second
 )
 
 // Store represents the top-level container for databases.
@@ -52,6 +60,11 @@ type Store struct {
 	// The duration of time that snapshots are kept before being deleted.
 	SnapshotRetention time.Duration
 
+	// The duration that L0 files are kept after being compacted into L1.
+	L0Retention time.Duration
+	// How often to check for expired L0 files.
+	L0RetentionCheckInterval time.Duration
+
 	// If true, compaction is run in the background according to compaction levels.
 	CompactionMonitorEnabled bool
 }
@@ -63,7 +76,13 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 
 		SnapshotInterval:         DefaultSnapshotInterval,
 		SnapshotRetention:        DefaultSnapshotRetention,
+		L0Retention:              DefaultL0Retention,
+		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
 		CompactionMonitorEnabled: true,
+	}
+
+	for _, db := range dbs {
+		db.L0Retention = s.L0Retention
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -104,6 +123,14 @@ func (s *Store) Open(ctx context.Context) error {
 		}()
 	}
 
+	if s.L0Retention > 0 && s.L0RetentionCheckInterval > 0 {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.monitorL0Retention(s.ctx)
+		}()
+	}
+
 	return nil
 }
 
@@ -125,6 +152,17 @@ func (s *Store) DBs() []*DB {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.dbs)
+}
+
+// SetL0Retention updates the retention window for L0 files and propagates it to
+// all managed databases.
+func (s *Store) SetL0Retention(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.L0Retention = d
+	for _, db := range s.dbs {
+		db.L0Retention = d
+	}
 }
 
 // SnapshotLevel returns a pseudo compaction level based on snapshot settings.
@@ -179,6 +217,31 @@ LOOP:
 						}
 					}
 				}
+			}
+		}
+	}
+}
+
+func (s *Store) monitorL0Retention(ctx context.Context) {
+	slog.Info("starting L0 retention monitor", "interval", s.L0RetentionCheckInterval, "retention", s.L0Retention)
+
+	ticker := time.NewTicker(s.L0RetentionCheckInterval)
+	defer ticker.Stop()
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-ticker.C:
+		}
+
+		for _, db := range s.DBs() {
+			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					continue
+				}
+				slog.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
 			}
 		}
 	}

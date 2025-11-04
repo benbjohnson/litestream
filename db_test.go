@@ -831,6 +831,10 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 		t.Fatalf("compact batch2 to L1: %v", err)
 	}
 
+	if err := db.EnforceRetentionByTXID(ctx, 0, secondCompactInfo.MinTXID); err != nil {
+		t.Fatalf("enforce retention: %v", err)
+	}
+
 	for _, lf := range firstBatchL0Files {
 		if lf.maxTXID < secondCompactInfo.MinTXID {
 			if _, err := os.Stat(lf.path); err == nil {
@@ -841,4 +845,105 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestDB_EnforceL0RetentionByTime(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	replicaPath := filepath.Join(t.TempDir(), "replica")
+	client := file.NewReplicaClient(replicaPath)
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+
+	// Use a long retention initially so compaction does not immediately clean up files.
+	db.L0Retention = 30 * time.Minute
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (val) VALUES (?)`, fmt.Sprintf("value-%d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync db %d: %v", i, err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatalf("sync replica %d: %v", i, err)
+		}
+	}
+
+	if _, err := db.Compact(ctx, 1); err != nil {
+		t.Fatalf("compact L0 -> L1: %v", err)
+	}
+
+	itr, err := client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		t.Fatalf("list L0 files: %v", err)
+	}
+	l0Files, err := ltx.SliceFileIterator(itr)
+	if err != nil {
+		t.Fatalf("slice iterator: %v", err)
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatalf("close iterator: %v", err)
+	}
+	if len(l0Files) < 2 {
+		t.Fatalf("expected at least two L0 files, got %d", len(l0Files))
+	}
+
+	checkExists := func(expectMissing bool) {
+		for idx, info := range l0Files {
+			remotePath := client.LTXFilePath(0, info.MinTXID, info.MaxTXID)
+			localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
+			_, remoteErr := os.Stat(remotePath)
+			_, localErr := os.Stat(localPath)
+			if expectMissing && idx < len(l0Files)-1 {
+				if !os.IsNotExist(remoteErr) {
+					t.Fatalf("expected remote file removed: %s", remotePath)
+				}
+				if !os.IsNotExist(localErr) {
+					t.Fatalf("expected local file removed: %s", localPath)
+				}
+			}
+			if !expectMissing || idx == len(l0Files)-1 {
+				if remoteErr != nil {
+					t.Fatalf("expected remote file to exist: %s (%v)", remotePath, remoteErr)
+				}
+				if localErr != nil {
+					t.Fatalf("expected local file to exist: %s (%v)", localPath, localErr)
+				}
+			}
+		}
+	}
+
+	// Files should still exist immediately after compaction since they are new.
+	if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+		t.Fatalf("enforce recent retention: %v", err)
+	}
+	checkExists(false)
+
+	// Age the files so they exceed the retention threshold.
+	oldTime := time.Now().Add(-1 * time.Hour)
+	for _, info := range l0Files {
+		remotePath := client.LTXFilePath(0, info.MinTXID, info.MaxTXID)
+		if err := os.Chtimes(remotePath, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes remote: %v", err)
+		}
+		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
+		if err := os.Chtimes(localPath, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes local: %v", err)
+		}
+	}
+
+	// Shorten retention so aged files qualify for deletion.
+	db.L0Retention = time.Second
+	if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+		t.Fatalf("enforce aged retention: %v", err)
+	}
+	checkExists(true)
 }

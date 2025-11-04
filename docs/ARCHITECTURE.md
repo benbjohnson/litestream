@@ -190,8 +190,10 @@ type Store struct {
     levels CompactionLevels
 
     // Configuration
-    SnapshotInterval  time.Duration
-    SnapshotRetention time.Duration
+    SnapshotInterval           time.Duration
+    SnapshotRetention          time.Duration
+    L0Retention                time.Duration
+    L0RetentionCheckInterval   time.Duration
     CompactionMonitorEnabled bool
 
     // Lifecycle
