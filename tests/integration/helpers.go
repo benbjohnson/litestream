@@ -467,6 +467,34 @@ func RequireBinaries(t *testing.T) {
 	}
 }
 
+// WriteS3AccessPointConfig writes a minimal configuration file for S3 access point tests.
+func WriteS3AccessPointConfig(t *testing.T, dbPath, replicaURL, endpoint string, forcePathStyle bool, accessKey, secretKey string) string {
+	t.Helper()
+
+	dir := filepath.Dir(dbPath)
+	configPath := filepath.Join(dir, "litestream-access-point.yml")
+
+	config := fmt.Sprintf(`access-key-id: %s
+secret-access-key: %s
+
+dbs:
+  - path: %s
+    replicas:
+      - url: %s
+        endpoint: %s
+        region: us-east-1
+        force-path-style: %t
+        skip-verify: true
+        sync-interval: 1s
+`, accessKey, secretKey, filepath.ToSlash(dbPath), replicaURL, endpoint, forcePathStyle)
+
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatalf("failed to write config: %v", err)
+	}
+
+	return configPath
+}
+
 func CreateTestTable(t *testing.T, dbPath string) error {
 	t.Helper()
 

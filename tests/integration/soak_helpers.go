@@ -111,16 +111,6 @@ func promptYesNoDefaultYes(t *testing.T, prompt string) bool {
 	return promptYesNo(t, prompt, true)
 }
 
-// RequireDocker checks if Docker is available
-func RequireDocker(t *testing.T) {
-	t.Helper()
-
-	cmd := exec.Command("docker", "version")
-	if err := cmd.Run(); err != nil {
-		t.Skip("Docker is not available, skipping test")
-	}
-}
-
 // StartMinIOContainer starts a MinIO container and returns the container ID and endpoint
 func StartMinIOContainer(t *testing.T) (containerID string, endpoint string, volumeName string) {
 	t.Helper()

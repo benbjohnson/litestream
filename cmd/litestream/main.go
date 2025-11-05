@@ -964,7 +964,20 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if err != nil {
 			return nil, err
 		}
-		ubucket, uregion, uendpoint, uforcePathStyle := s3.ParseHost(host)
+
+		var (
+			ubucket         string
+			uregion         string
+			uendpoint       string
+			uforcePathStyle bool
+		)
+
+		if strings.HasPrefix(host, "arn:") {
+			ubucket = host
+			uregion = regionFromS3ARN(host)
+		} else {
+			ubucket, uregion, uendpoint, uforcePathStyle = s3.ParseHost(host)
+		}
 
 		// Only apply URL parts to field that have not been overridden.
 		if configPath == "" {
@@ -1295,6 +1308,10 @@ func applyLitestreamEnv() {
 
 // ParseReplicaURL parses a replica URL.
 func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
+	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
+		return parseS3AccessPointURL(s)
+	}
+
 	u, err := url.Parse(s)
 	if err != nil {
 		return "", "", "", err
@@ -1311,6 +1328,66 @@ func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
 	default:
 		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), nil
 	}
+}
+
+func parseS3AccessPointURL(s string) (scheme, host, urlpath string, err error) {
+	const prefix = "s3://"
+	if !strings.HasPrefix(strings.ToLower(s), prefix) {
+		return "", "", "", fmt.Errorf("invalid s3 access point url: %s", s)
+	}
+
+	arnWithPath := s[len(prefix):]
+	bucket, key, err := splitS3AccessPointARN(arnWithPath)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	return "s3", bucket, cleanReplicaURLPath(key), nil
+}
+
+func splitS3AccessPointARN(s string) (bucket, key string, err error) {
+	lower := strings.ToLower(s)
+	const marker = ":accesspoint/"
+	idx := strings.Index(lower, marker)
+	if idx == -1 {
+		return "", "", fmt.Errorf("invalid s3 access point arn: %s", s)
+	}
+
+	nameStart := idx + len(marker)
+	if nameStart >= len(s) {
+		return "", "", fmt.Errorf("invalid s3 access point arn: %s", s)
+	}
+
+	remainder := s[nameStart:]
+	slashIdx := strings.IndexByte(remainder, '/')
+	if slashIdx == -1 {
+		return s, "", nil
+	}
+
+	bucketEnd := nameStart + slashIdx
+	bucket = s[:bucketEnd]
+	key = remainder[slashIdx+1:]
+	return bucket, key, nil
+}
+
+func cleanReplicaURLPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	cleaned := path.Clean("/" + p)
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	if cleaned == "." {
+		return ""
+	}
+	return cleaned
+}
+
+func regionFromS3ARN(arn string) string {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) >= 4 {
+		return parts[3]
+	}
+	return ""
 }
 
 // isURL returns true if s can be parsed and has a scheme.

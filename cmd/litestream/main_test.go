@@ -203,6 +203,60 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 			t.Fatalf("ForcePathStyle=%v, want %v", got, want)
 		}
 	})
+
+	t.Run("AccessPointARN", func(t *testing.T) {
+		url := "s3://arn:aws:s3:us-east-2:123456789012:accesspoint/stream-replica"
+		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: url}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("unexpected replica type")
+		}
+		if got, want := client.Bucket, "arn:aws:s3:us-east-2:123456789012:accesspoint/stream-replica"; got != want {
+			t.Fatalf("Bucket=%s, want %s", got, want)
+		}
+		if got, want := client.Path, ""; got != want {
+			t.Fatalf("Path=%s, want %s", got, want)
+		}
+		if got, want := client.Region, "us-east-2"; got != want {
+			t.Fatalf("Region=%s, want %s", got, want)
+		}
+		if got, want := client.Endpoint, ""; got != want {
+			t.Fatalf("Endpoint=%s, want %s", got, want)
+		}
+		if got, want := client.ForcePathStyle, false; got != want {
+			t.Fatalf("ForcePathStyle=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("AccessPointARNWithPrefix", func(t *testing.T) {
+		url := "s3://arn:aws:s3:us-west-1:123456789012:accesspoint/stream-replica/backups/primary"
+		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: url}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		client, ok := r.Client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatal("unexpected replica type")
+		}
+		if got, want := client.Bucket, "arn:aws:s3:us-west-1:123456789012:accesspoint/stream-replica"; got != want {
+			t.Fatalf("Bucket=%s, want %s", got, want)
+		}
+		if got, want := client.Path, "backups/primary"; got != want {
+			t.Fatalf("Path=%s, want %s", got, want)
+		}
+		if got, want := client.Region, "us-west-1"; got != want {
+			t.Fatalf("Region=%s, want %s", got, want)
+		}
+		if got, want := client.Endpoint, ""; got != want {
+			t.Fatalf("Endpoint=%s, want %s", got, want)
+		}
+		if got, want := client.ForcePathStyle, false; got != want {
+			t.Fatalf("ForcePathStyle=%v, want %v", got, want)
+		}
+	})
 }
 
 func TestNewGSReplicaFromConfig(t *testing.T) {
@@ -433,6 +487,30 @@ snapshot:
 		}
 		if *config.Snapshot.Retention != 24*time.Hour {
 			t.Errorf("expected default snapshot retention of 24h, got %v", *config.Snapshot.Retention)
+		}
+	})
+}
+
+func TestParseReplicaURL_AccessPoint(t *testing.T) {
+	t.Run("WithPrefix", func(t *testing.T) {
+		scheme, host, urlPath, err := main.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/db-access/backups/prod")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scheme != "s3" {
+			t.Fatalf("scheme=%s, want s3", scheme)
+		}
+		if host != "arn:aws:s3:us-east-1:123456789012:accesspoint/db-access" {
+			t.Fatalf("host=%s, want arn:aws:s3:us-east-1:123456789012:accesspoint/db-access", host)
+		}
+		if urlPath != "backups/prod" {
+			t.Fatalf("path=%s, want backups/prod", urlPath)
+		}
+	})
+
+	t.Run("Invalid", func(t *testing.T) {
+		if _, _, _, err := main.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/"); err == nil {
+			t.Fatal("expected error")
 		}
 	})
 }
