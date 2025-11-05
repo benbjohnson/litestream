@@ -1593,19 +1593,38 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	}
 	defer itr.Close()
 
-	var deleted []*ltx.FileInfo
-	var lastInfo *ltx.FileInfo
+	var (
+		deleted      []*ltx.FileInfo
+		lastInfo     *ltx.FileInfo
+		processedAll = true
+	)
 	for itr.Next() {
 		info := itr.Item()
 		lastInfo = info
 
-		if info.MaxTXID <= maxL1TXID && !info.CreatedAt.IsZero() && !info.CreatedAt.After(threshold) {
+		createdAt := info.CreatedAt
+		if createdAt.IsZero() {
+			if fi, err := os.Stat(db.LTXPath(0, info.MinTXID, info.MaxTXID)); err == nil {
+				createdAt = fi.ModTime().UTC()
+			} else {
+				createdAt = threshold
+			}
+		}
+
+		if createdAt.After(threshold) {
+			// L0 entries are ordered; once we reach a newer file we stop so we don't
+			// create gaps between retained files. VFS expects contiguous coverage.
+			processedAll = false
+			break
+		}
+
+		if info.MaxTXID <= maxL1TXID {
 			deleted = append(deleted, info)
 		}
 	}
 
-	// Ensure we do not delete the newest L0 file.
-	if len(deleted) > 0 && lastInfo != nil && deleted[len(deleted)-1] == lastInfo {
+	// Ensure we do not delete the newest L0 file only if we processed the entire level.
+	if processedAll && len(deleted) > 0 && lastInfo != nil && deleted[len(deleted)-1] == lastInfo {
 		deleted = deleted[:len(deleted)-1]
 	}
 
