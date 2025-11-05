@@ -771,11 +771,11 @@ go test -race -v -run TestStore_CompactDB ./...
 ```yaml
 dbs:
   - path: /path/to/db.sqlite
-    replicas:
-      - type: s3
-        bucket: my-bucket
-        path: db-backup
-        sync-interval: 10s  # How often to sync
+    replica:
+      type: s3
+      bucket: my-bucket
+      path: db-backup
+      sync-interval: 10s  # How often to sync
 
 # Compaction configuration (default)
 levels:

@@ -101,10 +101,10 @@ go test -race -v ./[backend]/...
 ## Configuration Pattern
 
 ```yaml
-replicas:
-  - type: [backend]
-    option1: value1
-    option2: value2
+replica:
+  type: [backend]
+  option1: value1
+  option2: value2
 ```
 
 ## References
