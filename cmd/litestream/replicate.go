@@ -153,6 +153,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.Snapshot.Retention != nil {
 		c.Store.SnapshotRetention = *c.Config.Snapshot.Retention
 	}
+	if c.Config.L0Retention != nil {
+		c.Store.SetL0Retention(*c.Config.L0Retention)
+	}
+	if c.Config.L0RetentionCheckInterval != nil {
+		c.Store.L0RetentionCheckInterval = *c.Config.L0RetentionCheckInterval
+	}
 	if err := c.Store.Open(ctx); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
 	}

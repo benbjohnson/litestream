@@ -44,11 +44,13 @@ var errStop = errors.New("stop")
 
 // Sentinel errors for configuration validation
 var (
-	ErrInvalidSnapshotInterval   = errors.New("snapshot interval must be greater than 0")
-	ErrInvalidSnapshotRetention  = errors.New("snapshot retention must be greater than 0")
-	ErrInvalidCompactionInterval = errors.New("compaction interval must be greater than 0")
-	ErrInvalidSyncInterval       = errors.New("sync interval must be greater than 0")
-	ErrConfigFileNotFound        = errors.New("config file not found")
+	ErrInvalidSnapshotInterval         = errors.New("snapshot interval must be greater than 0")
+	ErrInvalidSnapshotRetention        = errors.New("snapshot retention must be greater than 0")
+	ErrInvalidCompactionInterval       = errors.New("compaction interval must be greater than 0")
+	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
+	ErrInvalidL0Retention              = errors.New("l0 retention must be greater than 0")
+	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
+	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
 // ConfigValidationError wraps a validation error with additional context
@@ -198,6 +200,10 @@ type Config struct {
 	// Snapshot configuration
 	Snapshot SnapshotConfig `yaml:"snapshot"`
 
+	// L0 retention settings
+	L0Retention              *time.Duration `yaml:"l0-retention"`
+	L0RetentionCheckInterval *time.Duration `yaml:"l0-retention-check-interval"`
+
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
 
@@ -251,6 +257,8 @@ func (c *Config) propagateGlobalSettings() {
 func DefaultConfig() Config {
 	defaultSnapshotInterval := 24 * time.Hour
 	defaultSnapshotRetention := 24 * time.Hour
+	defaultL0Retention := litestream.DefaultL0Retention
+	defaultL0RetentionCheckInterval := litestream.DefaultL0RetentionCheckInterval
 	return Config{
 		Levels: []*CompactionLevelConfig{
 			{Interval: 30 * time.Second},
@@ -261,6 +269,8 @@ func DefaultConfig() Config {
 			Interval:  &defaultSnapshotInterval,
 			Retention: &defaultSnapshotRetention,
 		},
+		L0Retention:              &defaultL0Retention,
+		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
 	}
 }
 
@@ -279,6 +289,20 @@ func (c *Config) Validate() error {
 			Err:   ErrInvalidSnapshotRetention,
 			Field: "snapshot.retention",
 			Value: *c.Snapshot.Retention,
+		}
+	}
+	if c.L0Retention != nil && *c.L0Retention <= 0 {
+		return &ConfigValidationError{
+			Err:   ErrInvalidL0Retention,
+			Field: "l0-retention",
+			Value: *c.L0Retention,
+		}
+	}
+	if c.L0RetentionCheckInterval != nil && *c.L0RetentionCheckInterval <= 0 {
+		return &ConfigValidationError{
+			Err:   ErrInvalidL0RetentionCheckInterval,
+			Field: "l0-retention-check-interval",
+			Value: *c.L0RetentionCheckInterval,
 		}
 	}
 
@@ -413,6 +437,8 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	// Save defaults before unmarshaling
 	defaultSnapshotInterval := config.Snapshot.Interval
 	defaultSnapshotRetention := config.Snapshot.Retention
+	defaultL0Retention := config.L0Retention
+	defaultL0RetentionCheckInterval := config.L0RetentionCheckInterval
 
 	if err := yaml.Unmarshal(buf, &config); err != nil {
 		return config, err
@@ -424,6 +450,12 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 	if config.Snapshot.Retention == nil {
 		config.Snapshot.Retention = defaultSnapshotRetention
+	}
+	if config.L0Retention == nil {
+		config.L0Retention = defaultL0Retention
+	}
+	if config.L0RetentionCheckInterval == nil {
+		config.L0RetentionCheckInterval = defaultL0RetentionCheckInterval
 	}
 
 	// Normalize paths.

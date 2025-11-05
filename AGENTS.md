@@ -769,6 +769,8 @@ go test -race -v -run TestStore_CompactDB ./...
 ### Key Configuration
 
 ```yaml
+l0-retention: 5m                 # Minimum time to keep compacted L0 files
+l0-retention-check-interval: 15s # Frequency for enforcing L0 retention
 dbs:
   - path: /path/to/db.sqlite
     replicas:
