@@ -5,6 +5,7 @@ package litestream
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -42,13 +43,22 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	slog.Info("opening file", "name", name, "flags", flags)
 
-	// TODO: Clone client w/ new path based on name.
+	switch {
+	case flags&sqlite3vfs.OpenMainDB != 0:
+		return vfs.openMainDB(name, flags)
+	default:
+		return nil, flags, sqlite3vfs.CantOpenError
+	}
+}
 
+func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	if err := f.Open(); err != nil {
 		return nil, 0, err
 	}
+
+	flags |= sqlite3vfs.OpenReadOnly
 	return f, flags, nil
 }
 
@@ -190,12 +200,13 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("fetch page: %w", err)
 	}
 
-	n = copy(p, data)
+	n = copy(p, data[off%4096:])
 	f.logger.Info("data read", "n", n, "data", len(data))
 
 	// Update the first page to pretend like we are in journal mode.
 	if off == 0 {
 		p[18], p[19] = 0x01, 0x01
+		_, _ = rand.Read(p[24:28])
 	}
 
 	return n, nil

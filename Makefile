@@ -6,9 +6,12 @@ docker:
 .PHONY: vfs
 vfs:
 	mkdir -p dist
-	go build -tags SQLITE3VFS_LOADABLE_EXT -o dist/litestream-vfs.a -buildmode=c-archive cmd/litestream-vfs/litestream-vfs.go
+	go build -tags vfs,SQLITE3VFS_LOADABLE_EXT -o dist/litestream-vfs.a -buildmode=c-archive ./cmd/litestream-vfs
 	mv dist/litestream-vfs.h src/litestream-vfs.h
 	gcc -framework CoreFoundation -framework Security -lresolv -g -fPIC -shared -o dist/litestream-vfs.so src/litestream-vfs.c dist/litestream-vfs.a
+
+vfs-test:
+	go test -v -tags=vfs ./cmd/litestream-vfs
 
 .PHONY: clean
 clean:
