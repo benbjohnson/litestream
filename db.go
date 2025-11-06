@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -671,7 +672,16 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, origWALSize, newWALSize in
 
 	// Priority 2: Regular checkpoint at min threshold (PASSIVE mode, non-blocking)
 	if newWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.MinCheckpointPageN)) {
-		return db.checkpoint(ctx, CheckpointModePassive)
+		if err := db.checkpoint(ctx, CheckpointModePassive); err != nil {
+			// PASSIVE checkpoints can fail with SQLITE_BUSY when database is locked.
+			// This is expected behavior and not an error - just log and continue.
+			if isSQLiteBusyError(err) {
+				db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+				return nil
+			}
+			return err
+		}
+		return nil
 	}
 
 	// Priority 3: Time-based checkpoint (PASSIVE mode, non-blocking)
@@ -684,11 +694,31 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, origWALSize, newWALSize in
 
 		// Only checkpoint if enough time has passed and WAL has data
 		if time.Since(fi.ModTime()) > db.CheckpointInterval && newWALSize > calcWALSize(uint32(db.pageSize), 1) {
-			return db.checkpoint(ctx, CheckpointModePassive)
+			if err := db.checkpoint(ctx, CheckpointModePassive); err != nil {
+				// PASSIVE checkpoints can fail with SQLITE_BUSY when database is locked.
+				// This is expected behavior and not an error - just log and continue.
+				if isSQLiteBusyError(err) {
+					db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+					return nil
+				}
+				return err
+			}
+			return nil
 		}
 	}
 
 	return nil
+}
+
+// isSQLiteBusyError returns true if the error is an SQLITE_BUSY error.
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for "database is locked" or "SQLITE_BUSY" in error message
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "SQLITE_BUSY")
 }
 
 // walFileSize returns the size of the WAL file in bytes.
