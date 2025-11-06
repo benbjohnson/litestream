@@ -505,7 +505,6 @@ type DBConfig struct {
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
-	MaxCheckpointPageN *int           `yaml:"max-checkpoint-page-count"`
 
 	Replica  *ReplicaConfig   `yaml:"replica"`
 	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
@@ -536,9 +535,6 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.MinCheckpointPageN != nil {
 		db.MinCheckpointPageN = *dbc.MinCheckpointPageN
-	}
-	if dbc.MaxCheckpointPageN != nil {
-		db.MaxCheckpointPageN = *dbc.MaxCheckpointPageN
 	}
 
 	// Instantiate and attach replica.
