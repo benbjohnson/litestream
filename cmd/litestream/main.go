@@ -1374,6 +1374,12 @@ func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
 
 // ParseReplicaURLWithQuery parses a replica URL and returns query parameters.
 func ParseReplicaURLWithQuery(s string) (scheme, host, urlpath string, query url.Values, err error) {
+	// Handle S3 Access Point ARNs which can't be parsed by standard url.Parse
+	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
+		scheme, host, urlpath, err := parseS3AccessPointURL(s)
+		return scheme, host, urlpath, nil, err
+	}
+
 	u, err := url.Parse(s)
 	if err != nil {
 		return "", "", "", nil, err

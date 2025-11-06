@@ -724,3 +724,85 @@ func TestComputeDeleteObjectsContentMD5_Deterministic(t *testing.T) {
 		t.Error("expected non-empty MD5")
 	}
 }
+
+// TestParseHost tests URL parsing for various S3-compatible storage providers.
+// This test addresses issue #825 where Digital Ocean Space URLs were not correctly
+// extracting the bucket name.
+func TestParseHost(t *testing.T) {
+	tests := []struct {
+		name               string
+		host               string
+		wantBucket         string
+		wantRegion         string
+		wantEndpoint       string
+		wantForcePathStyle bool
+	}{
+		{
+			name:               "Digital Ocean Space URL",
+			host:               "my-space.sgp1.digitaloceanspaces.com",
+			wantBucket:         "my-space",
+			wantRegion:         "sgp1",
+			wantEndpoint:       "https://sgp1.digitaloceanspaces.com",
+			wantForcePathStyle: false,
+		},
+		{
+			name:               "Digital Ocean Space different region",
+			host:               "test-bucket.nyc3.digitaloceanspaces.com",
+			wantBucket:         "test-bucket",
+			wantRegion:         "nyc3",
+			wantEndpoint:       "https://nyc3.digitaloceanspaces.com",
+			wantForcePathStyle: false,
+		},
+		{
+			name:               "AWS S3 URL with region",
+			host:               "mybucket.s3.us-east-1.amazonaws.com",
+			wantBucket:         "mybucket",
+			wantRegion:         "us-east-1",
+			wantEndpoint:       "",
+			wantForcePathStyle: false,
+		},
+		{
+			name:               "AWS S3 URL without region",
+			host:               "mybucket.s3.amazonaws.com",
+			wantBucket:         "mybucket",
+			wantRegion:         "",
+			wantEndpoint:       "",
+			wantForcePathStyle: false,
+		},
+		{
+			name:               "Backblaze B2",
+			host:               "mybucket.s3.us-west-004.backblazeb2.com",
+			wantBucket:         "mybucket",
+			wantRegion:         "us-west-004",
+			wantEndpoint:       "https://s3.us-west-004.backblazeb2.com",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "MinIO with port",
+			host:               "mybucket.localhost:9000",
+			wantBucket:         "mybucket",
+			wantRegion:         "us-east-1",
+			wantEndpoint:       "http://localhost:9000",
+			wantForcePathStyle: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bucket, region, endpoint, forcePathStyle := ParseHost(tt.host)
+
+			if bucket != tt.wantBucket {
+				t.Errorf("bucket = %q, want %q", bucket, tt.wantBucket)
+			}
+			if region != tt.wantRegion {
+				t.Errorf("region = %q, want %q", region, tt.wantRegion)
+			}
+			if endpoint != tt.wantEndpoint {
+				t.Errorf("endpoint = %q, want %q", endpoint, tt.wantEndpoint)
+			}
+			if forcePathStyle != tt.wantForcePathStyle {
+				t.Errorf("forcePathStyle = %v, want %v", forcePathStyle, tt.wantForcePathStyle)
+			}
+		})
+	}
+}
