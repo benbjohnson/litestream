@@ -328,6 +328,9 @@ func (c *Config) Validate() error {
 		if db.Dir != "" && db.Pattern == "" {
 			return fmt.Errorf("database config #%d: 'pattern' is required when using 'dir'", idx+1)
 		}
+		if db.Watch && db.Dir == "" {
+			return fmt.Errorf("database config #%d: 'watch' can only be enabled with a directory", idx+1)
+		}
 
 		// Use path or dir for identifying the config in error messages
 		dbIdentifier := db.Path
@@ -497,6 +500,7 @@ type DBConfig struct {
 	Dir                string         `yaml:"dir"`       // Directory to scan for databases
 	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
 	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
+	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
@@ -614,6 +618,7 @@ func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream
 	dbConfigCopy.Dir = ""          // Clear dir field for individual DB
 	dbConfigCopy.Pattern = ""      // Clear pattern field
 	dbConfigCopy.Recursive = false // Clear recursive flag
+	dbConfigCopy.Watch = false     // Individual DBs do not watch directories
 
 	// Deep copy replica config and make path unique per database.
 	// This prevents all databases from writing to the same replica path.

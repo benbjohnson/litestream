@@ -130,8 +130,8 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	var (
-		dbs              []*litestream.DB
-		dirConfigEntries []struct {
+		dbs        []*litestream.DB
+		watchables []struct {
 			config *DBConfig
 			dbs    []*litestream.DB
 		}
@@ -144,11 +144,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 				return err
 			}
 			dbs = append(dbs, dirDbs...)
-			dirConfigEntries = append(dirConfigEntries, struct {
-				config *DBConfig
-				dbs    []*litestream.DB
-			}{config: dbConfig, dbs: dirDbs})
-			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs))
+			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs), "watch", dbConfig.Watch)
+			if dbConfig.Watch {
+				watchables = append(watchables, struct {
+					config *DBConfig
+					dbs    []*litestream.DB
+				}{config: dbConfig, dbs: dirDbs})
+			}
 		} else {
 			// Handle single database configuration
 			db, err := NewDBFromConfig(dbConfig)
@@ -179,7 +181,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
-	for _, entry := range dirConfigEntries {
+	for _, entry := range watchables {
 		monitor, err := NewDirectoryMonitor(ctx, c.Store, entry.config, entry.dbs)
 		if err != nil {
 			for _, m := range c.directoryMonitors {
