@@ -298,15 +298,17 @@ func TestDB_Sync(t *testing.T) {
 			}
 		}
 
-		// Sync to shadow WAL.
+		// Sync to shadow WAL. This should trigger a PASSIVE checkpoint because
+		// we've exceeded MinCheckpointPageN threshold.
 		if err := db.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
 
-		// Ensure position is now on the second index.
+		// Ensure position is now on the third index (TXID 1 = initial,
+		// TXID 2 = after inserts, TXID 3 = after PASSIVE checkpoint).
 		if pos, err := db.Pos(); err != nil {
 			t.Fatal(err)
-		} else if got, want := pos.TXID, ltx.TXID(2); got != want {
+		} else if got, want := pos.TXID, ltx.TXID(3); got != want {
 			t.Fatalf("Index=%v, want %v", got, want)
 		}
 	})
