@@ -91,8 +91,10 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos   ltx.Pos
-	index map[uint32]ltx.PageIndexElem
+	pos      ltx.Pos
+	index    map[uint32]ltx.PageIndexElem
+	pending  map[uint32]ltx.PageIndexElem
+	lockType sqlite3vfs.LockType // Current lock state
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -108,6 +110,7 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 		client:       client,
 		name:         name,
 		index:        make(map[uint32]ltx.PageIndexElem),
+		pending:      make(map[uint32]ltx.PageIndexElem),
 		logger:       logger,
 		PollInterval: DefaultPollInterval,
 	}
@@ -120,6 +123,13 @@ func (f *VFSFile) Pos() ltx.Pos {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.pos
+}
+
+// LockType returns the current lock type of the file.
+func (f *VFSFile) LockType() sqlite3vfs.LockType {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lockType
 }
 
 func (f *VFSFile) Open() error {
@@ -188,7 +198,11 @@ func (f *VFSFile) Close() error {
 func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	f.logger.Info("reading at", "off", off, "len", len(p))
 	pgno := uint32(off/4096) + 1
+
+	f.mu.Lock()
 	elem, ok := f.index[pgno]
+	f.mu.Unlock()
+
 	if !ok {
 		f.logger.Error("page not found", "page", pgno)
 		return 0, fmt.Errorf("page not found: %d", pgno)
@@ -229,23 +243,44 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 
 func (f *VFSFile) FileSize() (size int64, err error) {
 	const pageSize = 4096
+
+	f.mu.Lock()
 	for pgno := range f.index {
 		if int64(pgno)*pageSize > int64(size) {
 			size = int64(pgno * pageSize)
 		}
 	}
+	f.mu.Unlock()
+
 	f.logger.Info("file size", "size", size)
 	return size, nil
 }
 
 func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	f.logger.Info("locking file", "lock", elock)
-	return nil // TODO: Implement locking for internal state only
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.lockType = elock
+	return nil
 }
 
 func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	f.logger.Info("unlocking file", "lock", elock)
-	return nil // TODO: Implement unlocking for internal state only
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.lockType = elock
+
+	// Copy pending index to main index.
+	for k, v := range f.pending {
+		f.index[k] = v
+	}
+	f.pending = make(map[uint32]ltx.PageIndexElem)
+
+	return nil
 }
 
 func (f *VFSFile) CheckReservedLock() (bool, error) {
@@ -286,6 +321,7 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 // the page index & the current position.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	pos := f.Pos()
+	index := make(map[uint32]ltx.PageIndexElem)
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
 	// Start reading from the next LTX file after the current position.
@@ -318,10 +354,22 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		f.mu.Lock()
 		for k, v := range idx {
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
-			f.index[k] = v
+			index[k] = v
 		}
 		f.pos.TXID = info.MaxTXID
 		f.mu.Unlock()
+	}
+
+	// Send updates to a pending list if there are active readers.
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	target := f.index
+	if f.lockType >= sqlite3vfs.LockShared {
+		target = f.pending
+	}
+	for k, v := range index {
+		target[k] = v
 	}
 
 	return nil
