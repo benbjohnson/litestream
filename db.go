@@ -586,6 +586,10 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return err
 	}
 
+	if err := db.maybeForceTruncateCheckpoint(ctx); err != nil {
+		return fmt.Errorf("truncate checkpoint: %w", err)
+	}
+
 	/*
 		// TODO(ltx): Move checkpointing into its own goroutine?
 
@@ -643,6 +647,56 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) error {
 		return fmt.Errorf("sync: %w", err)
 	}
 	return nil
+}
+
+// maybeForceTruncateCheckpoint runs a TRUNCATE checkpoint when the WAL grows
+// beyond the configured threshold. This prevents unbounded WAL growth when
+// long-lived read transactions starve SQLite's internal checkpointing.
+func (db *DB) maybeForceTruncateCheckpoint(ctx context.Context) error {
+	if db.TruncatePageN <= 0 || db.pageSize == 0 {
+		return nil
+	}
+
+	walPages, err := db.currentWALPageCount()
+	if err != nil {
+		return fmt.Errorf("stat wal: %w", err)
+	}
+	if walPages < int64(db.TruncatePageN) {
+		return nil
+	}
+
+	db.Logger.Info("forcing truncate checkpoint",
+		"wal_pages", walPages,
+		"threshold", db.TruncatePageN,
+	)
+
+	if err := db.checkpoint(ctx, CheckpointModeTruncate); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (db *DB) currentWALPageCount() (int64, error) {
+	fi, err := os.Stat(db.WALPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	return walSizeToPageCount(fi.Size(), db.pageSize), nil
+}
+
+func walSizeToPageCount(size int64, pageSize int) int64 {
+	if pageSize <= 0 {
+		return 0
+	}
+	if size <= WALHeaderSize {
+		return 0
+	}
+
+	frameSize := int64(pageSize + WALFrameHeaderSize)
+	return (size - WALHeaderSize) / frameSize
 }
 
 // ensureWALExists checks that the real WAL exists and has a header.

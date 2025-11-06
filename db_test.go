@@ -6,6 +6,7 @@ import (
 	"hash/crc64"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -310,6 +311,41 @@ func TestDB_Sync(t *testing.T) {
 		}
 	})
 
+	// Ensure DB forces a truncate checkpoint once WAL exceeds the threshold.
+	t.Run("TruncatePageN", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+		db.TruncatePageN = 1
+
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT);`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		payloadSize := db.PageSize()
+		if payloadSize == 0 {
+			payloadSize = 4096
+		}
+		payload := strings.Repeat("x", payloadSize)
+
+		// Grow the WAL until we have more than one full page worth of changes.
+		for walPageCountForTest(t, db) <= 1 {
+			if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES (?);`, payload); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		if got := walPageCountForTest(t, db); got > 1 {
+			t.Fatalf("expected truncate checkpoint to shrink wal, pages=%d", got)
+		}
+	})
+
 	// Ensure DB checkpoints after interval.
 	t.Run("CheckpointInterval", func(t *testing.T) {
 		t.Skip("TODO(ltx)")
@@ -446,6 +482,26 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 	})
+}
+
+func walPageCountForTest(tb testing.TB, db *litestream.DB) int64 {
+	tb.Helper()
+
+	fi, err := os.Stat(db.WALPath())
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0
+		}
+		tb.Fatalf("stat wal: %v", err)
+	}
+
+	pageSize := db.PageSize()
+	if pageSize <= 0 || fi.Size() <= litestream.WALHeaderSize {
+		return 0
+	}
+
+	frameSize := int64(litestream.WALFrameHeaderSize + pageSize)
+	return (fi.Size() - litestream.WALHeaderSize) / frameSize
 }
 
 func TestDB_Snapshot(t *testing.T) {
