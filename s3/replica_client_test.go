@@ -492,6 +492,69 @@ func TestReplicaClient_DefaultRegionUsage(t *testing.T) {
 			t.Error("expected forcePathStyle to be true for MinIO")
 		}
 	})
+
+	t.Run("ParseHost_DigitalOceanSpace", func(t *testing.T) {
+		tests := []struct {
+			name              string
+			host              string
+			expectedBucket    string
+			expectedRegion    string
+			expectedEndpoint  string
+			expectedPathStyle bool
+		}{
+			{
+				name:              "BucketAndRegion",
+				host:              "mybucket.sgp1.digitaloceanspaces.com",
+				expectedBucket:    "mybucket",
+				expectedRegion:    "sgp1",
+				expectedEndpoint:  "https://sgp1.digitaloceanspaces.com",
+				expectedPathStyle: false,
+			},
+			{
+				name:              "RegionOnly",
+				host:              "sgp1.digitaloceanspaces.com",
+				expectedBucket:    "",
+				expectedRegion:    "sgp1",
+				expectedEndpoint:  "https://sgp1.digitaloceanspaces.com",
+				expectedPathStyle: false,
+			},
+			{
+				name:              "HyphenatedBucket",
+				host:              "my-backup.nyc3.digitaloceanspaces.com",
+				expectedBucket:    "my-backup",
+				expectedRegion:    "nyc3",
+				expectedEndpoint:  "https://nyc3.digitaloceanspaces.com",
+				expectedPathStyle: false,
+			},
+			{
+				name:              "DifferentRegion",
+				host:              "mybucket.sfo3.digitaloceanspaces.com",
+				expectedBucket:    "mybucket",
+				expectedRegion:    "sfo3",
+				expectedEndpoint:  "https://sfo3.digitaloceanspaces.com",
+				expectedPathStyle: false,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				bucket, region, endpoint, forcePathStyle := ParseHost(tt.host)
+
+				if bucket != tt.expectedBucket {
+					t.Errorf("bucket = %q, want %q", bucket, tt.expectedBucket)
+				}
+				if region != tt.expectedRegion {
+					t.Errorf("region = %q, want %q", region, tt.expectedRegion)
+				}
+				if endpoint != tt.expectedEndpoint {
+					t.Errorf("endpoint = %q, want %q", endpoint, tt.expectedEndpoint)
+				}
+				if forcePathStyle != tt.expectedPathStyle {
+					t.Errorf("forcePathStyle = %v, want %v", forcePathStyle, tt.expectedPathStyle)
+				}
+			})
+		}
+	})
 }
 
 func TestMarshalDeleteObjects_EdgeCases(t *testing.T) {
