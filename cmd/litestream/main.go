@@ -587,49 +587,10 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 		return nil, fmt.Errorf("failed to scan directory %s: %w", dirPath, err)
 	}
 
-	if len(dbPaths) == 0 {
-		return nil, fmt.Errorf("no SQLite databases found in directory %s with pattern %s", dirPath, dbc.Pattern)
-	}
-
 	// Create DB instances for each found database
 	var dbs []*litestream.DB
 	for _, dbPath := range dbPaths {
-		// Calculate relative path from directory root
-		relPath, err := filepath.Rel(dirPath, dbPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to calculate relative path for %s: %w", dbPath, err)
-		}
-
-		// Create a copy of the config for each database
-		dbConfigCopy := *dbc
-		dbConfigCopy.Path = dbPath
-		dbConfigCopy.Dir = ""          // Clear dir field for individual DB
-		dbConfigCopy.Pattern = ""      // Clear pattern field
-		dbConfigCopy.Recursive = false // Clear recursive flag
-
-		// Deep copy replica config and make path unique per database.
-		// This prevents all databases from writing to the same replica path.
-		if dbc.Replica != nil {
-			replicaCopy, err := cloneReplicaConfigWithRelativePath(dbc.Replica, relPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to configure replica for %s: %w", dbPath, err)
-			}
-			dbConfigCopy.Replica = replicaCopy
-		}
-
-		// Also handle deprecated 'replicas' array field.
-		if len(dbc.Replicas) > 0 {
-			dbConfigCopy.Replicas = make([]*ReplicaConfig, len(dbc.Replicas))
-			for i, replica := range dbc.Replicas {
-				replicaCopy, err := cloneReplicaConfigWithRelativePath(replica, relPath)
-				if err != nil {
-					return nil, fmt.Errorf("failed to configure replica %d for %s: %w", i, dbPath, err)
-				}
-				dbConfigCopy.Replicas[i] = replicaCopy
-			}
-		}
-
-		db, err := NewDBFromConfig(&dbConfigCopy)
+		db, err := newDBFromDirectoryEntry(dbc, dirPath, dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create DB for %s: %w", dbPath, err)
 		}
@@ -637,6 +598,46 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 	}
 
 	return dbs, nil
+}
+
+// newDBFromDirectoryEntry creates a DB instance for a database discovered via directory replication.
+func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream.DB, error) {
+	// Calculate relative path from directory root
+	relPath, err := filepath.Rel(dirPath, dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate relative path for %s: %w", dbPath, err)
+	}
+
+	// Create a copy of the config for the discovered database
+	dbConfigCopy := *dbc
+	dbConfigCopy.Path = dbPath
+	dbConfigCopy.Dir = ""          // Clear dir field for individual DB
+	dbConfigCopy.Pattern = ""      // Clear pattern field
+	dbConfigCopy.Recursive = false // Clear recursive flag
+
+	// Deep copy replica config and make path unique per database.
+	// This prevents all databases from writing to the same replica path.
+	if dbc.Replica != nil {
+		replicaCopy, err := cloneReplicaConfigWithRelativePath(dbc.Replica, relPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure replica for %s: %w", dbPath, err)
+		}
+		dbConfigCopy.Replica = replicaCopy
+	}
+
+	// Also handle deprecated 'replicas' array field.
+	if len(dbc.Replicas) > 0 {
+		dbConfigCopy.Replicas = make([]*ReplicaConfig, len(dbc.Replicas))
+		for i, replica := range dbc.Replicas {
+			replicaCopy, err := cloneReplicaConfigWithRelativePath(replica, relPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to configure replica %d for %s: %w", i, dbPath, err)
+			}
+			dbConfigCopy.Replicas[i] = replicaCopy
+		}
+	}
+
+	return NewDBFromConfig(&dbConfigCopy)
 }
 
 // cloneReplicaConfigWithRelativePath returns a copy of the replica configuration with the

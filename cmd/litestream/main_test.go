@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -2109,6 +2110,80 @@ func TestNewDBsFromDirectoryConfig_ReplicasArray(t *testing.T) {
 	}
 }
 
+func TestNewDBsFromDirectoryConfig_EmptyDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	replicaDir := filepath.Join(tmpDir, "replica")
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(dbs) != 0 {
+		t.Fatalf("expected 0 databases, got %d", len(dbs))
+	}
+}
+
+func TestDirectoryMonitor_DetectsDatabaseLifecycle(t *testing.T) {
+	ctx := context.Background()
+
+	rootDir := t.TempDir()
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	initialPath := filepath.Join(rootDir, "initial.db")
+	createSQLiteDB(t, initialPath)
+
+	config := &main.DBConfig{
+		Dir:     rootDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(dbs, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Fatalf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, dbs)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	newPath := filepath.Join(rootDir, "new.db")
+	createSQLiteDB(t, newPath)
+
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), newPath) }) {
+		t.Fatalf("expected new database %s to be detected", newPath)
+	}
+
+	if err := os.Remove(newPath); err != nil {
+		t.Fatalf("failed to remove database: %v", err)
+	}
+
+	if !waitForCondition(5*time.Second, func() bool { return !hasDBPath(store.DBs(), newPath) }) {
+		t.Fatalf("expected database %s to be removed", newPath)
+	}
+}
+
 // createSQLiteDB creates a minimal SQLite database file for testing
 func createSQLiteDB(t *testing.T, path string) {
 	t.Helper()
@@ -2670,4 +2745,26 @@ dbs:
 			t.Errorf("DBs[0].Path = %q, want %q", got, dbPath)
 		}
 	})
+}
+
+func hasDBPath(dbs []*litestream.DB, path string) bool {
+	for _, db := range dbs {
+		if db.Path() == path {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForCondition(timeout time.Duration, fn func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if fn() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return fn()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
