@@ -894,8 +894,9 @@ func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle boo
 
 	// Check common object storage providers
 	if a := digitaloceanRegex.FindStringSubmatch(host); len(a) > 1 {
+		bucket = a[1]
 		region = a[2]
-		return "", region, fmt.Sprintf("https://%s.digitaloceanspaces.com", region), false
+		return bucket, region, fmt.Sprintf("https://%s.digitaloceanspaces.com", region), false
 	} else if a := backblazeRegex.FindStringSubmatch(host); len(a) > 1 {
 		region = a[2]
 		bucket = a[1]
