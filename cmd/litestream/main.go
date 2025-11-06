@@ -910,7 +910,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	case "s3":
-		if r.Client, err = newS3ReplicaClientFromConfig(c, r); err != nil {
+		if r.Client, err = NewS3ReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
 	case "gs":
@@ -971,8 +971,9 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	return client, nil
 }
 
-// newS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
-func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s3.ReplicaClient, err error) {
+// NewS3ReplicaClientFromConfig returns a new instance of s3.ReplicaClient built from config.
+// Exported for testing.
+func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s3.ReplicaClient, err error) {
 	// Ensure URL & constituent parts are not both specified.
 	if c.URL != "" && c.Path != "" {
 		return nil, fmt.Errorf("cannot specify url & path for s3 replica")
@@ -992,7 +993,7 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Apply settings from URL, if specified.
 	if c.URL != "" {
-		_, host, upath, err := ParseReplicaURL(c.URL)
+		_, host, upath, query, err := ParseReplicaURLWithQuery(c.URL)
 		if err != nil {
 			return nil, err
 		}
@@ -1009,6 +1010,29 @@ func newS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			uregion = regionFromS3ARN(host)
 		} else {
 			ubucket, uregion, uendpoint, uforcePathStyle = s3.ParseHost(host)
+		}
+
+		// Override with query parameters if provided
+		if qEndpoint := query.Get("endpoint"); qEndpoint != "" {
+			// Ensure endpoint has a scheme
+			if !strings.HasPrefix(qEndpoint, "http://") && !strings.HasPrefix(qEndpoint, "https://") {
+				// Default to http for non-TLS endpoints (common for local/dev)
+				qEndpoint = "http://" + qEndpoint
+			}
+			uendpoint = qEndpoint
+			// Default to path style for custom endpoints unless explicitly set to false
+			if query.Get("forcePathStyle") != "false" {
+				uforcePathStyle = true
+			}
+		}
+		if qRegion := query.Get("region"); qRegion != "" {
+			uregion = qRegion
+		}
+		if qForcePathStyle := query.Get("forcePathStyle"); qForcePathStyle != "" {
+			uforcePathStyle = qForcePathStyle == "true"
+		}
+		if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
+			skipVerify = qSkipVerify == "true"
 		}
 
 		// Only apply URL parts to field that have not been overridden.
@@ -1344,21 +1368,35 @@ func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
 		return parseS3AccessPointURL(s)
 	}
 
+	scheme, host, urlpath, _, err = ParseReplicaURLWithQuery(s)
+	return scheme, host, urlpath, err
+}
+
+// ParseReplicaURLWithQuery parses a replica URL and returns query parameters.
+func ParseReplicaURLWithQuery(s string) (scheme, host, urlpath string, query url.Values, err error) {
+	// Handle S3 Access Point ARNs which can't be parsed by standard url.Parse
+	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
+		scheme, host, urlpath, err := parseS3AccessPointURL(s)
+		return scheme, host, urlpath, nil, err
+	}
+
 	u, err := url.Parse(s)
 	if err != nil {
-		return "", "", "", err
+		return "", "", "", nil, err
 	}
 
 	switch u.Scheme {
 	case "file":
 		scheme, u.Scheme = u.Scheme, ""
-		return scheme, "", path.Clean(u.String()), nil
+		// Remove query params from path for file URLs
+		u.RawQuery = ""
+		return scheme, "", path.Clean(u.String()), nil, nil
 
 	case "":
-		return u.Scheme, u.Host, u.Path, fmt.Errorf("replica url scheme required: %s", s)
+		return u.Scheme, u.Host, u.Path, nil, fmt.Errorf("replica url scheme required: %s", s)
 
 	default:
-		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), nil
+		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), u.Query(), nil
 	}
 }
 
