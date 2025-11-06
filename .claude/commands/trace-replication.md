@@ -81,8 +81,8 @@ func (c *S3Client) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID
 if walPageCount > db.MinCheckpointPageN {
     db.Checkpoint(ctx, litestream.CheckpointModePassive)
 }
-if walPageCount > db.MaxCheckpointPageN {
-    db.Checkpoint(ctx, litestream.CheckpointModeRestart)
+if walPageCount > db.TruncatePageN {
+    db.Checkpoint(ctx, litestream.CheckpointModeTruncate)
 }
 ```
 

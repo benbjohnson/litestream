@@ -733,8 +733,9 @@ func (db *DB) walFileSize() (int64, error) {
 }
 
 // calcWALSize returns the size of the WAL for a given page size & count.
+// Casts to int64 before multiplication to prevent uint32 overflow with large page sizes.
 func calcWALSize(pageSize uint32, pageN uint32) int64 {
-	return int64(WALHeaderSize + ((WALFrameHeaderSize + pageSize) * pageN))
+	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
 }
 
 // ensureWALExists checks that the real WAL exists and has a header.
