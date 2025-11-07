@@ -773,11 +773,11 @@ l0-retention: 5m                 # Minimum time to keep compacted L0 files
 l0-retention-check-interval: 15s # Frequency for enforcing L0 retention
 dbs:
   - path: /path/to/db.sqlite
-    replicas:
-      - type: s3
-        bucket: my-bucket
-        path: db-backup
-        sync-interval: 10s  # How often to sync
+    replica:
+      type: s3
+      bucket: my-bucket
+      path: db-backup
+      sync-interval: 10s  # How often to sync
 
 # Compaction configuration (default)
 levels:

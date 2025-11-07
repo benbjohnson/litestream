@@ -71,10 +71,10 @@ Create a new storage backend implementation for Litestream with all required com
 5. **Add Documentation**
    Update README.md with configuration example:
    ```yaml
-   replicas:
-     - type: {{backend_name}}
-       option1: value1
-       option2: value2
+   replica:
+     type: {{backend_name}}
+     option1: value1
+     option2: value2
    ```
 
 ## Key Requirements

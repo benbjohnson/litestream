@@ -372,13 +372,13 @@ jobs:
           cat > /tmp/sftp-concurrent.yml <<EOF
           dbs:
             - path: /tmp/test-concurrent.db
-              replicas:
-                - type: sftp
-                  host: localhost:2222
-                  key-path: /test/id_ed25519
-                  user: root
-                  path: /test/data/concurrent
-                  concurrent-writes: true
+              replica:
+                type: sftp
+                host: localhost:2222
+                key-path: /test/id_ed25519
+                user: root
+                path: /test/data/concurrent
+                concurrent-writes: true
           EOF
 
           # Create test database
@@ -398,12 +398,12 @@ jobs:
           cat > /tmp/sftp-sequential.yml <<EOF
           dbs:
             - path: /tmp/test-sequential.db
-              replicas:
-                - type: sftp
-                  host: localhost:2222
-                  key-path: /test/id_ed25519
-                  user: root
-                  path: /test/data/sequential
+              replica:
+                type: sftp
+                host: localhost:2222
+                key-path: /test/id_ed25519
+                user: root
+                path: /test/data/sequential
                   concurrent-writes: false
           EOF
 

@@ -408,8 +408,8 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	config.WriteString("    min-checkpoint-page-count: 100\n")
 	config.WriteString("    max-checkpoint-page-count: 5000\n")
 	config.WriteString("\n")
-	config.WriteString("    replicas:\n")
-	config.WriteString(fmt.Sprintf("      - url: %s\n", replicaURL))
+	config.WriteString("    replica:\n")
+	config.WriteString(fmt.Sprintf("      url: %s\n", replicaURL))
 
 	// Add S3-specific settings if provided
 	if s3Config != nil {
