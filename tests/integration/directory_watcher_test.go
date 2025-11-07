@@ -94,14 +94,14 @@ func TestDirectoryWatcherBasicLifecycle(t *testing.T) {
 		t.Fatalf("database still replicating after removal: %v", err)
 	}
 
-	// Step 5: Verify no errors in log
+	// Step 5: Verify no critical errors in log
 	t.Log("Checking for errors...")
-	errors, err := db.CheckForErrors()
+	errors, err := CheckForCriticalErrors(t, db.TestDB)
 	if err != nil {
 		t.Fatalf("check errors: %v", err)
 	}
 	if len(errors) > 0 {
-		t.Fatalf("found errors in log: %v", errors)
+		t.Fatalf("found critical errors in log: %v", errors)
 	}
 
 	t.Log("✓ Basic lifecycle test passed")

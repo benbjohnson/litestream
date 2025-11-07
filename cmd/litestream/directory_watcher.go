@@ -84,6 +84,9 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 		return nil, err
 	}
 
+	// Scan for existing databases after watches are set up
+	dm.scanDirectory(dm.dirPath)
+
 	dm.wg.Add(1)
 	go dm.run()
 
@@ -181,10 +184,12 @@ func (dm *DirectoryMonitor) handleEvent(event fsnotify.Event) {
 	info, statErr := os.Stat(path)
 	isDir := statErr == nil && info.IsDir()
 
-	if dm.recursive && isDir && event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
+	if isDir && event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
 		if err := dm.addDirectoryWatch(path); err != nil {
 			dm.logger.Error("add directory watch", "path", path, "error", err)
 		}
+		// Always scan newly created directory to catch files created during watch registration race window
+		dm.scanDirectory(path)
 	}
 
 	if isDir {
@@ -302,4 +307,63 @@ func (dm *DirectoryMonitor) matchesPattern(path string) bool {
 		return false
 	}
 	return matched
+}
+
+// scanDirectory walks an existing directory tree and ensures all subdirectories
+// are watched while any pre-existing databases are registered. This is used when
+// new directories appear before a watch can be established so we do not miss
+// files created within them.
+func (dm *DirectoryMonitor) scanDirectory(dir string) {
+	// In non-recursive mode, only scan the immediate directory (no subdirs)
+	// In recursive mode, scan the full tree
+
+	if !dm.recursive {
+		// Non-recursive: scan only immediate directory
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				dm.logger.Debug("read directory", "path", dir, "error", err)
+			}
+			return
+		}
+
+		for _, entry := range entries {
+			path := filepath.Join(dir, entry.Name())
+			if entry.IsDir() {
+				// Watch subdirectories but don't recurse into them
+				if err := dm.addDirectoryWatch(path); err != nil {
+					dm.logger.Error("add directory watch", "path", path, "error", err)
+				}
+				continue
+			}
+			dm.handlePotentialDatabase(path)
+		}
+		return
+	}
+
+	// Recursive mode: scan full tree
+	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			dm.logger.Debug("scan directory entry", "path", path, "error", err)
+			return nil
+		}
+
+		if d.IsDir() {
+			if path != dir {
+				if err := dm.addDirectoryWatch(path); err != nil {
+					dm.logger.Error("add directory watch", "path", path, "error", err)
+				}
+			}
+			return nil
+		}
+
+		dm.handlePotentialDatabase(path)
+		return nil
+	})
+	if err != nil && !os.IsNotExist(err) {
+		dm.logger.Debug("scan directory", "path", dir, "error", err)
+	}
 }
