@@ -32,7 +32,7 @@ const (
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultBusyTimeout        = 1 * time.Second
 	DefaultMinCheckpointPageN = 1000
-	DefaultTruncatePageN      = 500000
+	DefaultTruncatePageN      = 121359 // ~500MB with 4KB page size
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -47,7 +47,7 @@ const (
 //  2. CheckpointInterval (PASSIVE): Time-based non-blocking checkpoint.
 //     Ensures regular checkpointing even with low write volume.
 //
-//  3. TruncatePageN (TRUNCATE): Blocking checkpoint at ~500k pages (~2GB).
+//  3. TruncatePageN (TRUNCATE): Blocking checkpoint at ~121k pages (~500MB).
 //     Emergency brake for runaway WAL growth. Can block writes while waiting
 //     for long-lived read transactions. Configurable/disableable.
 //
@@ -104,7 +104,7 @@ type DB struct {
 	// truncating the WAL.
 	//
 	// Uses TRUNCATE checkpoint mode (blocking). Prevents unbounded WAL growth
-	// from long-lived read transactions. Default: 500000 pages (~2GB with 4KB
+	// from long-lived read transactions. Default: 121359 pages (~500MB with 4KB
 	// page size). Set to 0 to disable forced truncation (use with caution as
 	// WAL can grow unbounded if read transactions prevent checkpointing).
 	TruncatePageN int

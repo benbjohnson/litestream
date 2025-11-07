@@ -31,7 +31,7 @@ func (db *DB) checkWAL() (bool, error) {
 ```go
 // Check checkpoint thresholds
 MinCheckpointPageN int // Default: 1000 pages
-TruncatePageN int     // Default: 500000 pages
+TruncatePageN int     // Default: 121359 pages
 
 // Verify WAL page count
 walPageCount := db.WALPageCount()
