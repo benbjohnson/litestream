@@ -18,7 +18,8 @@ import (
 func TestDirectoryWatcherBasicLifecycle(t *testing.T) {
 	RequireBinaries(t)
 
-	db := SetupDirectoryWatchTest(t, "dir-watch-lifecycle", "*.db", false)
+	// Use recursive:true because this test creates databases in subdirectories (tenant1/app.db, etc.)
+	db := SetupDirectoryWatchTest(t, "dir-watch-lifecycle", "*.db", true)
 
 	// Create config with directory watching
 	configPath, err := db.CreateDirectoryWatchConfig()

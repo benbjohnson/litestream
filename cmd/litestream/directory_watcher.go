@@ -184,19 +184,37 @@ func (dm *DirectoryMonitor) handleEvent(event fsnotify.Event) {
 	info, statErr := os.Stat(path)
 	isDir := statErr == nil && info.IsDir()
 
+	// Check if this path was previously a watched directory (needed for removal detection)
+	dm.mu.Lock()
+	_, wasWatchedDir := dm.watchedDirs[path]
+	dm.mu.Unlock()
+
+	// Handle directory creation/rename
+	// Note: In non-recursive mode, only the root directory is watched.
+	// Subdirectories are completely ignored, and their databases are not replicated.
+	// In recursive mode, all subdirectories are watched and scanned.
 	if isDir && event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
-		if err := dm.addDirectoryWatch(path); err != nil {
-			dm.logger.Error("add directory watch", "path", path, "error", err)
+		// Only add watches for: (1) root directory, or (2) subdirectories when recursive=true
+		if dm.recursive {
+			if err := dm.addDirectoryWatch(path); err != nil {
+				dm.logger.Error("add directory watch", "path", path, "error", err)
+			}
+			// Scan to catch files created during watch registration race window
+			dm.scanDirectory(path)
 		}
-		// Always scan newly created directory to catch files created during watch registration race window
-		dm.scanDirectory(path)
 	}
 
+	// Handle directory removal/rename
+	// Check both current state (isDir) AND previous state (wasWatchedDir)
+	// because os.Stat fails for deleted directories, leaving watches orphaned
+	if (isDir || wasWatchedDir) && event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
+		dm.removeDirectoryWatch(path)
+		dm.removeDatabasesUnder(path)
+		return
+	}
+
+	// If it's still a directory, don't process as a file
 	if isDir {
-		if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
-			dm.removeDirectoryWatch(path)
-			dm.removeDatabasesUnder(path)
-		}
 		return
 	}
 
@@ -309,16 +327,16 @@ func (dm *DirectoryMonitor) matchesPattern(path string) bool {
 	return matched
 }
 
-// scanDirectory walks an existing directory tree and ensures all subdirectories
-// are watched while any pre-existing databases are registered. This is used when
-// new directories appear before a watch can be established so we do not miss
-// files created within them.
+// scanDirectory walks a directory to discover pre-existing databases.
+// In non-recursive mode, only scans files directly in the directory (subdirectories are ignored).
+// In recursive mode, walks the entire tree and adds watches for all subdirectories.
+// This is called on startup and when new directories are created to catch files created
+// during the fsnotify watch registration race window.
 func (dm *DirectoryMonitor) scanDirectory(dir string) {
-	// In non-recursive mode, only scan the immediate directory (no subdirs)
-	// In recursive mode, scan the full tree
-
 	if !dm.recursive {
-		// Non-recursive: scan only immediate directory
+		// Non-recursive mode: Only scan files in the immediate directory.
+		// Subdirectories and their contents are completely ignored.
+		// TODO: Document recursive behavior on litestream.io
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if !os.IsNotExist(err) {
@@ -328,14 +346,11 @@ func (dm *DirectoryMonitor) scanDirectory(dir string) {
 		}
 
 		for _, entry := range entries {
-			path := filepath.Join(dir, entry.Name())
+			// Skip subdirectories - they're not watched in non-recursive mode
 			if entry.IsDir() {
-				// Watch subdirectories but don't recurse into them
-				if err := dm.addDirectoryWatch(path); err != nil {
-					dm.logger.Error("add directory watch", "path", path, "error", err)
-				}
 				continue
 			}
+			path := filepath.Join(dir, entry.Name())
 			dm.handlePotentialDatabase(path)
 		}
 		return
