@@ -591,6 +591,10 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 		return nil, fmt.Errorf("failed to scan directory %s: %w", dirPath, err)
 	}
 
+	if len(dbPaths) == 0 && !dbc.Watch {
+		return nil, fmt.Errorf("no SQLite databases found in directory %s with pattern %s", dirPath, dbc.Pattern)
+	}
+
 	// Create DB instances for each found database
 	var dbs []*litestream.DB
 	for _, dbPath := range dbPaths {

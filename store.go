@@ -139,7 +139,11 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	for _, db := range s.dbs {
+	s.mu.Lock()
+	dbs := slices.Clone(s.dbs)
+	s.mu.Unlock()
+
+	for _, db := range dbs {
 		if e := db.Close(ctx); e != nil && err == nil {
 			err = e
 		}

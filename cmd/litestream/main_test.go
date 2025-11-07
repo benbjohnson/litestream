@@ -2110,13 +2110,29 @@ func TestNewDBsFromDirectoryConfig_ReplicasArray(t *testing.T) {
 	}
 }
 
-func TestNewDBsFromDirectoryConfig_EmptyDirectory(t *testing.T) {
+func TestNewDBsFromDirectoryConfig_EmptyDirectoryRequiresDatabases(t *testing.T) {
 	tmpDir := t.TempDir()
 	replicaDir := filepath.Join(tmpDir, "replica")
 
 	config := &main.DBConfig{
 		Dir:     tmpDir,
 		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	if _, err := main.NewDBsFromDirectoryConfig(config); err == nil {
+		t.Fatalf("expected error for empty directory when watch disabled")
+	}
+}
+
+func TestNewDBsFromDirectoryConfig_EmptyDirectoryWithWatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	replicaDir := filepath.Join(tmpDir, "replica")
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Watch:   true,
 		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
 	}
 
@@ -2181,6 +2197,49 @@ func TestDirectoryMonitor_DetectsDatabaseLifecycle(t *testing.T) {
 
 	if !waitForCondition(5*time.Second, func() bool { return !hasDBPath(store.DBs(), newPath) }) {
 		t.Fatalf("expected database %s to be removed", newPath)
+	}
+}
+
+func TestDirectoryMonitor_RecursiveDetectsNestedDatabases(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	config := &main.DBConfig{
+		Dir:       rootDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		Watch:     true,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(nil, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Fatalf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, nil)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	deepDir := filepath.Join(rootDir, "tenant", "nested", "deeper")
+	if err := os.MkdirAll(deepDir, 0755); err != nil {
+		t.Fatalf("failed to create nested directories: %v", err)
+	}
+	deepDB := filepath.Join(deepDir, "deep.db")
+	createSQLiteDB(t, deepDB)
+
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), deepDB) }) {
+		t.Fatalf("expected nested database %s to be detected", deepDB)
 	}
 }
 
