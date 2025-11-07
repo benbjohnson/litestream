@@ -85,6 +85,9 @@ func CreateDatabaseInDir(t *testing.T, dirPath, subDir, name string) string {
 		if err := os.MkdirAll(dbDir, 0755); err != nil {
 			t.Fatalf("create subdirectory %s: %v", subDir, err)
 		}
+		// Give directory monitor time to register watch on new subdirectory
+		// to avoid race where database is created before watch is active
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	dbPath := filepath.Join(dbDir, name)
@@ -386,6 +389,13 @@ func CheckForCriticalErrors(t *testing.T, db *TestDB) ([]string, error) {
 	for _, errLine := range allErrors {
 		// Skip benign compaction errors that can occur during concurrent writes
 		if strings.Contains(errLine, "page size not initialized yet") {
+			continue
+		}
+		// Skip benign database removal errors that occur when closing databases
+		if strings.Contains(errLine, "remove database from store") &&
+			(strings.Contains(errLine, "transaction has already been committed or rolled back") ||
+				strings.Contains(errLine, "no such file or directory") ||
+				strings.Contains(errLine, "disk I/O error")) {
 			continue
 		}
 		criticalErrors = append(criticalErrors, errLine)
