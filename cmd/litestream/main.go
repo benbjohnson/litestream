@@ -524,7 +524,12 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 
 	// Override default database settings if specified in configuration.
 	if dbc.MetaPath != nil {
-		db.SetMetaPath(*dbc.MetaPath)
+		expandedMetaPath, err := expand(*dbc.MetaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand meta path: %w", err)
+		}
+		dbc.MetaPath = &expandedMetaPath
+		db.SetMetaPath(expandedMetaPath)
 	}
 	if dbc.MonitorInterval != nil {
 		db.MonitorInterval = *dbc.MonitorInterval
@@ -624,6 +629,18 @@ func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream
 	dbConfigCopy.Recursive = false // Clear recursive flag
 	dbConfigCopy.Watch = false     // Individual DBs do not watch directories
 
+	// Ensure every database discovered beneath a directory receives a unique
+	// metadata path. Without this, all databases share the same meta-path and
+	// clobber each other's replication state.
+	if dbc.MetaPath != nil {
+		baseMetaPath, err := expand(*dbc.MetaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand meta path for %s: %w", dbPath, err)
+		}
+		metaPathCopy := deriveMetaPathForDirectoryEntry(baseMetaPath, relPath)
+		dbConfigCopy.MetaPath = &metaPathCopy
+	}
+
 	// Deep copy replica config and make path unique per database.
 	// This prevents all databases from writing to the same replica path.
 	if dbc.Replica != nil {
@@ -692,6 +709,24 @@ func cloneReplicaConfigWithRelativePath(base *ReplicaConfig, relPath string) (*R
 	}
 
 	return &replicaCopy, nil
+}
+
+// deriveMetaPathForDirectoryEntry returns a unique metadata directory for a
+// database discovered through directory replication by appending the database's
+// relative path and the standard Litestream suffix to the configured base path.
+func deriveMetaPathForDirectoryEntry(basePath, relPath string) string {
+	relPath = filepath.Clean(relPath)
+	if relPath == "." || relPath == "" {
+		return basePath
+	}
+
+	relDir, relFile := filepath.Split(relPath)
+	if relFile == "" || relFile == "." {
+		return filepath.Join(basePath, relPath)
+	}
+
+	metaDirName := "." + relFile + litestream.MetaDirSuffix
+	return filepath.Join(basePath, relDir, metaDirName)
 }
 
 // appendRelativePathToURL appends relPath to the URL's path component, ensuring

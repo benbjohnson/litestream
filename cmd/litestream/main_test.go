@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -135,6 +136,46 @@ dbs:
 			t.Fatalf("Replica.URL=%v, want %v", got, want)
 		}
 	})
+}
+
+func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("user.Current failed: %v", err)
+	}
+	if u.HomeDir == "" {
+		t.Skip("no home directory available for expansion test")
+	}
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "db.sqlite")
+	replicaPath := filepath.Join(tmpDir, "replica")
+	if err := os.MkdirAll(replicaPath, 0o755); err != nil {
+		t.Fatalf("failed to create replica directory: %v", err)
+	}
+
+	metaPath := filepath.Join("~", "litestream-meta")
+	config := &main.DBConfig{
+		Path:     dbPath,
+		MetaPath: &metaPath,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: replicaPath,
+		},
+	}
+
+	db, err := main.NewDBFromConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBFromConfig failed: %v", err)
+	}
+
+	expectedMetaPath := filepath.Join(u.HomeDir, "litestream-meta")
+	if got := db.MetaPath(); got != expectedMetaPath {
+		t.Fatalf("MetaPath not expanded: got %s, want %s", got, expectedMetaPath)
+	}
+	if config.MetaPath == nil || *config.MetaPath != expectedMetaPath {
+		t.Fatalf("config MetaPath not updated: got %v, want %s", config.MetaPath, expectedMetaPath)
+	}
 }
 
 func TestNewFileReplicaFromConfig(t *testing.T) {
@@ -1790,6 +1831,74 @@ func TestNewDBsFromDirectoryConfig_UniquePaths(t *testing.T) {
 	// Verify all paths are different
 	if len(paths) != 3 {
 		t.Errorf("expected 3 unique paths, got %d", len(paths))
+	}
+}
+
+// TestNewDBsFromDirectoryConfig_MetaPathPerDatabase ensures that each database
+// discovered via a directory config receives a unique metadata directory when a
+// base meta-path is provided.
+func TestNewDBsFromDirectoryConfig_MetaPathPerDatabase(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	rootDB := filepath.Join(tmpDir, "primary.db")
+	createSQLiteDB(t, rootDB)
+
+	nestedDir := filepath.Join(tmpDir, "team", "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatalf("failed to create nested directory: %v", err)
+	}
+	nestedDB := filepath.Join(nestedDir, "analytics.db")
+	createSQLiteDB(t, nestedDB)
+
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("user.Current failed: %v", err)
+	}
+	if u.HomeDir == "" {
+		t.Skip("no home directory available for expansion test")
+	}
+
+	metaRoot := filepath.Join("~", "meta-root")
+	expandedMetaRoot := filepath.Join(u.HomeDir, "meta-root")
+	replicaDir := filepath.Join(t.TempDir(), "replica")
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		MetaPath:  &metaRoot,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: replicaDir,
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedMetaPaths := map[string]string{
+		rootDB:   filepath.Join(expandedMetaRoot, ".primary.db"+litestream.MetaDirSuffix),
+		nestedDB: filepath.Join(expandedMetaRoot, "team", "nested", ".analytics.db"+litestream.MetaDirSuffix),
+	}
+
+	metaSeen := make(map[string]struct{})
+	for _, db := range dbs {
+		metaPath := db.MetaPath()
+		want, ok := expectedMetaPaths[db.Path()]
+		if !ok {
+			t.Fatalf("unexpected database path returned: %s", db.Path())
+		}
+		if metaPath != want {
+			t.Fatalf("database %s meta path mismatch: got %s, want %s", db.Path(), metaPath, want)
+		}
+		if _, dup := metaSeen[metaPath]; dup {
+			t.Fatalf("duplicate meta path detected: %s", metaPath)
+		}
+		metaSeen[metaPath] = struct{}{}
 	}
 }
 
