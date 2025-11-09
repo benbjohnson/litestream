@@ -376,8 +376,8 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := db.path
-	dsn += fmt.Sprintf("?_busy_timeout=%d", db.BusyTimeout.Milliseconds())
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)",
+		db.path, db.BusyTimeout.Milliseconds())
 
 	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
