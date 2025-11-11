@@ -219,8 +219,14 @@ jobs:
 
       - name: Create NATS Object Store Bucket
         run: |
-          # Install NATS CLI - get latest version
-          NATS_VERSION=$(curl -s https://api.github.com/repos/nats-io/natscli/releases/latest | grep '"tag_name":' | sed -E 's/.*"v([^"]+)".*/\1/')
+          # Install NATS CLI - get latest version using jq for JSON parsing
+          NATS_VERSION=$(curl -fsSL https://api.github.com/repos/nats-io/natscli/releases/latest \
+            | jq -r '.tag_name' \
+            | sed 's/^v//')
+          if [ -z "$NATS_VERSION" ] || [ "$NATS_VERSION" = "null" ]; then
+            echo "Failed to determine latest NATS CLI version"
+            exit 1
+          fi
           wget "https://github.com/nats-io/natscli/releases/download/v${NATS_VERSION}/nats-${NATS_VERSION}-linux-amd64.zip" -O nats.zip
           unzip nats.zip
           sudo mv "nats-${NATS_VERSION}-linux-amd64/nats" /usr/local/bin/
