@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -35,6 +37,11 @@ type VFS struct {
 
 	// CacheSize is the maximum size of the page cache in bytes.
 	CacheSize int
+
+	tempDirOnce sync.Once
+	tempDir     string
+	tempDirErr  error
+	tempFiles   sync.Map // canonical name -> absolute path
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -52,6 +59,8 @@ func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, s
 	switch {
 	case flags&sqlite3vfs.OpenMainDB != 0:
 		return vfs.openMainDB(name, flags)
+	case vfs.requiresTempFile(flags):
+		return vfs.openTempFile(name, flags)
 	default:
 		return nil, flags, sqlite3vfs.CantOpenError
 	}
@@ -71,6 +80,11 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
 	slog.Info("deleting file", "name", name, "dirSync", dirSync)
+	if err := vfs.deleteTempFile(name); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errTempFileNotFound) {
+		return err
+	}
 	return fmt.Errorf("cannot delete vfs file")
 }
 
@@ -79,6 +93,9 @@ func (vfs *VFS) Access(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
 
 	if strings.HasSuffix(name, "-wal") {
 		return vfs.accessWAL(name, flag)
+	}
+	if vfs.isTempFileName(name) {
+		return vfs.accessTempFile(name, flag)
 	}
 	return false, nil
 }
@@ -91,6 +108,141 @@ func (vfs *VFS) FullPathname(name string) string {
 	slog.Info("full pathname", "name", name)
 	return name
 }
+
+func (vfs *VFS) requiresTempFile(flags sqlite3vfs.OpenFlag) bool {
+	const tempMask = sqlite3vfs.OpenTempDB |
+		sqlite3vfs.OpenTempJournal |
+		sqlite3vfs.OpenSubJournal |
+		sqlite3vfs.OpenSuperJournal |
+		sqlite3vfs.OpenTransientDB
+	if flags&tempMask != 0 {
+		return true
+	}
+	return flags&sqlite3vfs.OpenDeleteOnClose != 0
+}
+
+func (vfs *VFS) ensureTempDir() (string, error) {
+	vfs.tempDirOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "litestream-vfs-*")
+		if err != nil {
+			vfs.tempDirErr = fmt.Errorf("create temp dir: %w", err)
+			return
+		}
+		vfs.tempDir = dir
+	})
+	return vfs.tempDir, vfs.tempDirErr
+}
+
+func (vfs *VFS) canonicalTempName(name string) string {
+	name = filepath.Base(name)
+	if name == "." || name == string(filepath.Separator) {
+		return ""
+	}
+	return name
+}
+
+func (vfs *VFS) openTempFile(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	dir, err := vfs.ensureTempDir()
+	if err != nil {
+		return nil, flags, err
+	}
+	deleteOnClose := flags&sqlite3vfs.OpenDeleteOnClose != 0 || name == ""
+	var f *os.File
+	var onClose func()
+	if name == "" {
+		f, err = os.CreateTemp(dir, "temp-*")
+		if err != nil {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+	} else {
+		fname := vfs.canonicalTempName(name)
+		if fname == "" {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+		path := filepath.Join(dir, fname)
+		flag := openFlagToOSFlag(flags)
+		if flag == 0 {
+			flag = os.O_RDWR
+		}
+		f, err = os.OpenFile(path, flag|os.O_CREATE, 0o600)
+		if err != nil {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+		onClose = vfs.trackTempFile(name, path)
+	}
+
+	return newLocalTempFile(f, deleteOnClose, onClose), flags, nil
+}
+
+func (vfs *VFS) deleteTempFile(name string) error {
+	path, ok := vfs.loadTempFilePath(name)
+	if !ok {
+		return errTempFileNotFound
+	}
+	if err := os.Remove(path); err != nil {
+		return err
+	}
+	vfs.tempFiles.Delete(vfs.canonicalTempName(name))
+	return nil
+}
+
+func (vfs *VFS) isTempFileName(name string) bool {
+	_, ok := vfs.loadTempFilePath(name)
+	return ok
+}
+
+func (vfs *VFS) accessTempFile(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
+	path, ok := vfs.loadTempFilePath(name)
+	if !ok {
+		return false, nil
+	}
+	_, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (vfs *VFS) trackTempFile(name, path string) func() {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return func() {}
+	}
+	vfs.tempFiles.Store(canonical, path)
+	return func() { vfs.tempFiles.Delete(canonical) }
+}
+
+func (vfs *VFS) loadTempFilePath(name string) (string, bool) {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return "", false
+	}
+	if path, ok := vfs.tempFiles.Load(canonical); ok {
+		return path.(string), true
+	}
+	return "", false
+}
+
+func openFlagToOSFlag(flag sqlite3vfs.OpenFlag) int {
+	var v int
+	if flag&sqlite3vfs.OpenReadWrite != 0 {
+		v |= os.O_RDWR
+	} else if flag&sqlite3vfs.OpenReadOnly != 0 {
+		v |= os.O_RDONLY
+	}
+	if flag&sqlite3vfs.OpenCreate != 0 {
+		v |= os.O_CREATE
+	}
+	if flag&sqlite3vfs.OpenExclusive != 0 {
+		v |= os.O_EXCL
+	}
+	return v
+}
+
+var errTempFileNotFound = fmt.Errorf("temp file not tracked")
 
 // VFSFile implements the SQLite VFS file interface.
 type VFSFile struct {
@@ -222,6 +374,8 @@ func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 
 func (f *VFSFile) Close() error {
 	f.logger.Info("closing file")
+	f.cancel()
+	f.wg.Wait()
 	return nil
 }
 

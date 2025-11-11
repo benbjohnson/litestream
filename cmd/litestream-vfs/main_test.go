@@ -6,11 +6,15 @@ package main_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -405,6 +409,176 @@ func TestVFS_PollsL1Files(t *testing.T) {
 	t.Log("L1 file polling verified successfully")
 }
 
+func TestVFS_HighLoadConcurrentReads(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	vfs := newVFS(t, client)
+	vfs.PollInterval = 50 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec(`CREATE TABLE t (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		value TEXT,
+		updated_at INTEGER
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	seedLargeTable(t, primary, 2000)
+	forceReplicaSync(t, db)
+
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+	if _, err := replica.Exec("PRAGMA temp_store = MEMORY"); err != nil {
+		t.Fatalf("set temp_store: %v", err)
+	}
+
+	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	var writerOps atomic.Int64
+	writerErr := make(chan error, 1)
+	go func() {
+		defer close(writerErr)
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		for {
+			select {
+			case <-ctx.Done():
+				writerErr <- nil
+				return
+			default:
+			}
+
+			switch rnd.Intn(3) {
+			case 0:
+				if _, err := primary.Exec("INSERT INTO t (value, updated_at) VALUES (?, strftime('%s','now'))", fmt.Sprintf("value-%d", rnd.Int())); err != nil {
+					writerErr <- err
+					return
+				}
+			case 1:
+				if _, err := primary.Exec("UPDATE t SET value = value || '-u' WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
+					writerErr <- err
+					return
+				}
+			default:
+				if _, err := primary.Exec("DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
+					writerErr <- err
+					return
+				}
+			}
+
+			writerOps.Add(1)
+			time.Sleep(time.Duration(rnd.Intn(5)+1) * time.Millisecond)
+		}
+	}()
+
+	readerErrCh := make(chan error, 1)
+	var readerWg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		readerWg.Add(1)
+		go func(id int) {
+			defer readerWg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				var count int
+				var totalBytes int
+				if err := replica.QueryRow("SELECT COUNT(*), IFNULL(SUM(LENGTH(value)), 0) FROM t").Scan(&count, &totalBytes); err != nil {
+					readerErrCh <- fmt.Errorf("reader %d query: %w", id, err)
+					return
+				}
+				if count < 0 || totalBytes < 0 {
+					readerErrCh <- fmt.Errorf("reader %d observed invalid stats", id)
+					return
+				}
+			}
+		}(i)
+	}
+
+	<-ctx.Done()
+	readerWg.Wait()
+
+	if err := <-writerErr; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("writer error: %v", err)
+	}
+	select {
+	case err := <-readerErrCh:
+		if err != nil {
+			t.Fatalf("reader error: %v", err)
+		}
+	default:
+	}
+
+	if ops := writerOps.Load(); ops < 500 {
+		t.Fatalf("expected high write volume, got %d ops", ops)
+	}
+
+	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
+
+	var primaryCount, replicaCount int
+	if err := primary.QueryRow("SELECT COUNT(*) FROM t").Scan(&primaryCount); err != nil {
+		t.Fatalf("primary count: %v", err)
+	}
+	if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&replicaCount); err != nil {
+		t.Fatalf("replica count: %v", err)
+	}
+	if primaryCount != replicaCount {
+		t.Fatalf("replica lagging: primary=%d replica=%d", primaryCount, replicaCount)
+	}
+}
+
+func TestVFS_SortingLargeResultSet(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	vfs := newVFS(t, client)
+	vfs.PollInterval = 50 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec(`CREATE TABLE t (
+		id INTEGER PRIMARY KEY,
+		payload TEXT NOT NULL,
+		grp INTEGER NOT NULL
+	)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	seedSortedDataset(t, primary, 25000)
+	forceReplicaSync(t, db)
+
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+	if _, err := replica.Exec("PRAGMA temp_store = FILE"); err != nil {
+		t.Fatalf("set temp_store: %v", err)
+	}
+	if _, err := replica.Exec("PRAGMA cache_size = -2048"); err != nil {
+		t.Fatalf("set cache_size: %v", err)
+	}
+
+	waitForReplicaRowCount(t, primary, replica, time.Minute)
+
+	expected := fetchOrderedPayloads(t, primary, 500, "payload DESC, id DESC")
+	got := fetchOrderedPayloads(t, replica, 500, "payload DESC, id DESC")
+
+	if len(expected) != len(got) {
+		t.Fatalf("unexpected result size: expected=%d got=%d", len(expected), len(got))
+	}
+	for i := range expected {
+		if expected[i] != got[i] {
+			t.Fatalf("mismatched payload at %d: expected=%q got=%q", i, expected[i], got[i])
+		}
+	}
+}
+
 func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
 	tb.Helper()
 
@@ -415,4 +589,161 @@ func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
 	vfs := litestream.NewVFS(client, logger)
 	vfs.PollInterval = 100 * time.Millisecond
 	return vfs
+}
+
+func registerTestVFS(tb testing.TB, vfs *litestream.VFS) string {
+	tb.Helper()
+	name := fmt.Sprintf("litestream-%s-%d", strings.ToLower(tb.Name()), time.Now().UnixNano())
+	if err := sqlite3vfs.RegisterVFS(name, vfs); err != nil {
+		tb.Fatalf("failed to register litestream vfs %s: %v", name, err)
+	}
+	return name
+}
+
+func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monitorInterval, syncInterval time.Duration) (*litestream.DB, *sql.DB) {
+	tb.Helper()
+	db := testingutil.NewDB(tb, filepath.Join(tb.TempDir(), "primary.db"))
+	db.MonitorInterval = monitorInterval
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = client
+	db.Replica.SyncInterval = syncInterval
+	if err := db.Open(); err != nil {
+		tb.Fatalf("open db: %v", err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
+	tb.Cleanup(func() { _ = db.Close(context.Background()) })
+	return db, sqldb
+}
+
+func forceReplicaSync(tb testing.TB, db *litestream.DB) {
+	tb.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.Sync(ctx); err != nil {
+		tb.Fatalf("force sync: %v", err)
+	}
+	if db.Replica != nil {
+		if err := db.Replica.Sync(ctx); err != nil {
+			tb.Fatalf("replica sync: %v", err)
+		}
+	}
+}
+
+func openVFSReplicaDB(tb testing.TB, vfsName string) *sql.DB {
+	tb.Helper()
+	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(tb.TempDir(), vfsName+".db")), vfsName)
+	sqldb, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		tb.Fatalf("open replica db: %v", err)
+	}
+	sqldb.SetMaxOpenConns(32)
+	sqldb.SetMaxIdleConns(32)
+	sqldb.SetConnMaxIdleTime(30 * time.Second)
+	if _, err := sqldb.Exec("PRAGMA busy_timeout = 2000"); err != nil {
+		tb.Fatalf("set busy timeout: %v", err)
+	}
+	return sqldb
+}
+
+func waitForReplicaRowCount(tb testing.TB, primary, replica *sql.DB, timeout time.Duration) {
+	tb.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		var primaryCount int
+		if err := primary.QueryRow("SELECT COUNT(*) FROM t").Scan(&primaryCount); err != nil {
+			tb.Fatalf("primary count: %v", err)
+		}
+
+		var replicaCount int
+		if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&replicaCount); err == nil {
+			if primaryCount == replicaCount {
+				return
+			}
+		} else {
+			// Table may not exist yet on replica; retry.
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+	tb.Fatalf("timeout waiting for replica row count to match")
+}
+
+func fetchOrderedPayloads(tb testing.TB, db *sql.DB, limit int, orderBy string) []string {
+	tb.Helper()
+	query := fmt.Sprintf("SELECT payload FROM t ORDER BY %s LIMIT %d", orderBy, limit)
+	rows, err := db.Query(query)
+	if err != nil {
+		tb.Fatalf("query payloads: %v", err)
+	}
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var payload string
+		if err := rows.Scan(&payload); err != nil {
+			tb.Fatalf("scan payload: %v", err)
+		}
+		out = append(out, payload)
+	}
+	if err := rows.Err(); err != nil {
+		tb.Fatalf("rows err: %v", err)
+	}
+	return out
+}
+
+func seedLargeTable(tb testing.TB, db *sql.DB, n int) {
+	tb.Helper()
+	trx, err := db.Begin()
+	if err != nil {
+		tb.Fatalf("begin seed: %v", err)
+	}
+	stmt, err := trx.Prepare("INSERT INTO t (value, updated_at) VALUES (?, strftime('%s','now'))")
+	if err != nil {
+		_ = trx.Rollback()
+		tb.Fatalf("prepare seed: %v", err)
+	}
+	defer stmt.Close()
+	rnd := rand.New(rand.NewSource(42))
+	for i := 0; i < n; i++ {
+		if _, err := stmt.Exec(fmt.Sprintf("seed-%d-%d", i, rnd.Int())); err != nil {
+			_ = trx.Rollback()
+			tb.Fatalf("seed exec: %v", err)
+		}
+	}
+	if err := trx.Commit(); err != nil {
+		tb.Fatalf("commit seed: %v", err)
+	}
+}
+
+func seedSortedDataset(tb testing.TB, db *sql.DB, n int) {
+	tb.Helper()
+	trx, err := db.Begin()
+	if err != nil {
+		tb.Fatalf("begin sorted seed: %v", err)
+	}
+	stmt, err := trx.Prepare("INSERT INTO t (id, payload, grp) VALUES (?, ?, ?)")
+	if err != nil {
+		_ = trx.Rollback()
+		tb.Fatalf("prepare sorted seed: %v", err)
+	}
+	defer stmt.Close()
+	rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+	for i := 0; i < n; i++ {
+		if _, err := stmt.Exec(i+1, randomPayload(rnd, 256), rnd.Intn(1024)); err != nil {
+			_ = trx.Rollback()
+			tb.Fatalf("sorted seed exec: %v", err)
+		}
+	}
+	if err := trx.Commit(); err != nil {
+		tb.Fatalf("commit sorted seed: %v", err)
+	}
+}
+
+func randomPayload(r *rand.Rand, n int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = letters[r.Intn(len(letters))]
+	}
+	return string(b)
 }
