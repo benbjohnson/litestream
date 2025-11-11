@@ -168,6 +168,7 @@ func (s *Store) AddDB(db *DB) error {
 		return fmt.Errorf("db required")
 	}
 
+	// First check: see if database already exists
 	s.mu.Lock()
 	for _, existing := range s.dbs {
 		if existing.Path() == db.Path() {
@@ -180,15 +181,21 @@ func (s *Store) AddDB(db *DB) error {
 	// Apply store-wide retention settings before opening the database.
 	db.L0Retention = s.L0Retention
 
+	// Open the database without holding the lock to avoid blocking other operations.
+	// The double-check pattern below handles the race condition.
 	if err := db.Open(); err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
 
+	// Second check: verify database wasn't added by another goroutine while we were opening.
+	// If it was, close our instance and return without error.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	for _, existing := range s.dbs {
 		if existing.Path() == db.Path() {
+			// Another goroutine added this database while we were opening.
+			// Close our instance to avoid resource leaks.
 			if err := db.Close(context.Background()); err != nil {
 				slog.Error("close duplicate db", "path", db.Path(), "error", err)
 			}

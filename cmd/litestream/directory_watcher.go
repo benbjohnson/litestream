@@ -280,17 +280,20 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 func (dm *DirectoryMonitor) removeDatabase(path string) {
 	dm.mu.Lock()
 	db := dm.dbs[path]
-	delete(dm.dbs, path)
 	dm.mu.Unlock()
 
 	if db == nil {
 		return
 	}
 
-	if err := dm.store.RemoveDB(context.Background(), db.Path()); err != nil {
+	if err := dm.store.RemoveDB(dm.ctx, db.Path()); err != nil {
 		dm.logger.Error("remove database from store", "path", path, "error", err)
 		return
 	}
+
+	dm.mu.Lock()
+	delete(dm.dbs, path)
+	dm.mu.Unlock()
 
 	dm.logger.Info("removed database from replication", "path", path)
 }
@@ -300,21 +303,29 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 
 	dm.mu.Lock()
 	var toClose []*litestream.DB
+	var toClosePaths []string
 	for path, db := range dm.dbs {
 		if path == dir || strings.HasPrefix(path, prefix) {
 			toClose = append(toClose, db)
-			delete(dm.dbs, path)
+			toClosePaths = append(toClosePaths, path)
 		}
 	}
 	dm.mu.Unlock()
 
-	for _, db := range toClose {
+	// Remove from store first, only delete from local map on success
+	for i, db := range toClose {
 		if db == nil {
 			continue
 		}
-		if err := dm.store.RemoveDB(context.Background(), db.Path()); err != nil {
+		if err := dm.store.RemoveDB(dm.ctx, db.Path()); err != nil {
 			dm.logger.Error("remove database from store", "path", db.Path(), "error", err)
+			continue
 		}
+
+		// Only remove from local map after successful store removal
+		dm.mu.Lock()
+		delete(dm.dbs, toClosePaths[i])
+		dm.mu.Unlock()
 	}
 }
 

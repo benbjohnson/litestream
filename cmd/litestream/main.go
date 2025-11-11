@@ -602,11 +602,22 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 
 	// Create DB instances for each found database
 	var dbs []*litestream.DB
+	metaPaths := make(map[string]string)
+
 	for _, dbPath := range dbPaths {
 		db, err := newDBFromDirectoryEntry(dbc, dirPath, dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create DB for %s: %w", dbPath, err)
 		}
+
+		// Validate unique meta-path to prevent replication state corruption
+		if mp := db.MetaPath(); mp != "" {
+			if existingDB, exists := metaPaths[mp]; exists {
+				return nil, fmt.Errorf("meta-path collision: databases %s and %s would share meta-path %s, causing replication state corruption", existingDB, dbPath, mp)
+			}
+			metaPaths[mp] = dbPath
+		}
+
 		dbs = append(dbs, db)
 	}
 
