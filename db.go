@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,11 +32,28 @@ const (
 	DefaultCheckpointInterval = 1 * time.Minute
 	DefaultBusyTimeout        = 1 * time.Second
 	DefaultMinCheckpointPageN = 1000
-	DefaultMaxCheckpointPageN = 10000
-	DefaultTruncatePageN      = 500000
+	DefaultTruncatePageN      = 121359 // ~500MB with 4KB page size
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
+//
+// Checkpoint Strategy:
+// Litestream uses a progressive 3-tier checkpoint approach to balance WAL size
+// management with write availability:
+//
+//  1. MinCheckpointPageN (PASSIVE): Non-blocking checkpoint at ~1k pages (~4MB).
+//     Attempts checkpoint but allows concurrent readers/writers.
+//
+//  2. CheckpointInterval (PASSIVE): Time-based non-blocking checkpoint.
+//     Ensures regular checkpointing even with low write volume.
+//
+//  3. TruncatePageN (TRUNCATE): Blocking checkpoint at ~121k pages (~500MB).
+//     Emergency brake for runaway WAL growth. Can block writes while waiting
+//     for long-lived read transactions. Configurable/disableable.
+//
+// The RESTART checkpoint mode was permanently removed due to production issues
+// with indefinite write blocking (issue #724). All checkpoints now use either
+// PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
 	mu       sync.RWMutex
 	path     string        // part to database
@@ -75,29 +93,28 @@ type DB struct {
 	// Minimum threshold of WAL size, in pages, before a passive checkpoint.
 	// A passive checkpoint will attempt a checkpoint but fail if there are
 	// active transactions occurring at the same time.
-	MinCheckpointPageN int
-
-	// Maximum threshold of WAL size, in pages, before a forced checkpoint.
-	// A forced checkpoint will block new transactions and wait for existing
-	// transactions to finish before issuing a checkpoint and resetting the WAL.
 	//
-	// If zero, no checkpoints are forced. This can cause the WAL to grow
-	// unbounded if there are always read transactions occurring.
-	MaxCheckpointPageN int
+	// Uses PASSIVE checkpoint mode (non-blocking). Keeps WAL size manageable
+	// for faster restores. Default: 1000 pages (~4MB with 4KB page size).
+	MinCheckpointPageN int
 
 	// Threshold of WAL size, in pages, before a forced truncation checkpoint.
 	// A forced truncation checkpoint will block new transactions and wait for
 	// existing transactions to finish before issuing a checkpoint and
 	// truncating the WAL.
 	//
-	// If zero, no truncates are forced. This can cause the WAL to grow
-	// unbounded if there's a sudden spike of changes between other
-	// checkpoints.
+	// Uses TRUNCATE checkpoint mode (blocking). Prevents unbounded WAL growth
+	// from long-lived read transactions. Default: 121359 pages (~500MB with 4KB
+	// page size). Set to 0 to disable forced truncation (use with caution as
+	// WAL can grow unbounded if read transactions prevent checkpointing).
 	TruncatePageN int
 
 	// Time between automatic checkpoints in the WAL. This is done to allow
 	// more fine-grained WAL files so that restores can be performed with
 	// better precision.
+	//
+	// Uses PASSIVE checkpoint mode (non-blocking). Default: 1 minute.
+	// Set to 0 to disable time-based checkpoints.
 	CheckpointInterval time.Duration
 
 	// Frequency at which to perform db sync.
@@ -127,7 +144,6 @@ func NewDB(path string) *DB {
 		notify:   make(chan struct{}),
 
 		MinCheckpointPageN: DefaultMinCheckpointPageN,
-		MaxCheckpointPageN: DefaultMaxCheckpointPageN,
 		TruncatePageN:      DefaultTruncatePageN,
 		CheckpointInterval: DefaultCheckpointInterval,
 		MonitorInterval:    DefaultMonitorInterval,
@@ -582,36 +598,14 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("ensure wal exists: %w", err)
 	}
 
-	if err := db.verifyAndSync(ctx, false); err != nil {
+	origWALSize, newWALSize, err := db.verifyAndSync(ctx, false)
+	if err != nil {
 		return err
 	}
 
-	/*
-		// TODO(ltx): Move checkpointing into its own goroutine?
-
-		// If WAL size is greater than max threshold, force checkpoint.
-		// If WAL size is greater than min threshold, attempt checkpoint.
-		var checkpoint bool
-		checkpointMode := CheckpointModePassive
-		if db.TruncatePageN > 0 && origWALSize >= calcWALSize(db.pageSize, db.TruncatePageN) {
-			checkpoint, checkpointMode = true, CheckpointModeTruncate
-		} else if db.MaxCheckpointPageN > 0 && newWALSize >= calcWALSize(db.pageSize, db.MaxCheckpointPageN) {
-			checkpoint, checkpointMode = true, CheckpointModeRestart
-		} else if newWALSize >= calcWALSize(db.pageSize, db.MinCheckpointPageN) {
-			checkpoint = true
-		} else if db.CheckpointInterval > 0 && !info.dbModTime.IsZero() && time.Since(info.dbModTime) > db.CheckpointInterval && newWALSize > calcWALSize(db.pageSize, 1) {
-			checkpoint = true
-		}
-
-		// Issue the checkpoint.
-		if checkpoint {
-			changed = true
-
-			if err := db.checkpoint(ctx, checkpointMode); err != nil {
-				return fmt.Errorf("checkpoint: mode=%v err=%w", checkpointMode, err)
-			}
-		}
-	*/
+	if err := db.checkpointIfNeeded(ctx, origWALSize, newWALSize); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
 
 	// Compute current index and total shadow WAL size.
 	pos, err := db.Pos()
@@ -630,19 +624,118 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	return nil
 }
 
-func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) error {
+func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSize, newWALSize int64, err error) {
+	// Capture WAL size before sync for checkpoint threshold checks.
+	origWALSize, err = db.walFileSize()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat wal before sync: %w", err)
+	}
+
 	// Verify our last sync matches the current state of the WAL.
 	// This ensures that the last sync position of the real WAL hasn't
 	// been overwritten by another process.
 	info, err := db.verify(ctx)
 	if err != nil {
-		return fmt.Errorf("cannot verify wal state: %w", err)
+		return 0, 0, fmt.Errorf("cannot verify wal state: %w", err)
 	}
 
 	if err := db.sync(ctx, checkpointing, info); err != nil {
-		return fmt.Errorf("sync: %w", err)
+		return 0, 0, fmt.Errorf("sync: %w", err)
 	}
+
+	// Capture WAL size after sync for checkpoint threshold checks.
+	newWALSize, err = db.walFileSize()
+	if err != nil {
+		return 0, 0, fmt.Errorf("stat wal after sync: %w", err)
+	}
+
+	return origWALSize, newWALSize, nil
+}
+
+// checkpointIfNeeded performs a checkpoint based on configured thresholds.
+// Checks thresholds in priority order: TruncatePageN → MinCheckpointPageN → CheckpointInterval.
+//
+// TruncatePageN uses TRUNCATE mode (blocking), others use PASSIVE mode (non-blocking).
+func (db *DB) checkpointIfNeeded(ctx context.Context, origWALSize, newWALSize int64) error {
+	if db.pageSize == 0 {
+		return nil
+	}
+
+	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
+	// This prevents unbounded WAL growth from long-lived read transactions.
+	if db.TruncatePageN > 0 && origWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)) {
+		db.Logger.Info("forcing truncate checkpoint",
+			"wal_size", origWALSize,
+			"threshold", calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)))
+		return db.checkpoint(ctx, CheckpointModeTruncate)
+	}
+
+	// Priority 2: Regular checkpoint at min threshold (PASSIVE mode, non-blocking)
+	if newWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.MinCheckpointPageN)) {
+		if err := db.checkpoint(ctx, CheckpointModePassive); err != nil {
+			// PASSIVE checkpoints can fail with SQLITE_BUSY when database is locked.
+			// This is expected behavior and not an error - just log and continue.
+			if isSQLiteBusyError(err) {
+				db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+
+	// Priority 3: Time-based checkpoint (PASSIVE mode, non-blocking)
+	if db.CheckpointInterval > 0 {
+		// Get database file modification time
+		fi, err := db.f.Stat()
+		if err != nil {
+			return fmt.Errorf("stat database: %w", err)
+		}
+
+		// Only checkpoint if enough time has passed and WAL has data
+		if time.Since(fi.ModTime()) > db.CheckpointInterval && newWALSize > calcWALSize(uint32(db.pageSize), 1) {
+			if err := db.checkpoint(ctx, CheckpointModePassive); err != nil {
+				// PASSIVE checkpoints can fail with SQLITE_BUSY when database is locked.
+				// This is expected behavior and not an error - just log and continue.
+				if isSQLiteBusyError(err) {
+					db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+	}
+
 	return nil
+}
+
+// isSQLiteBusyError returns true if the error is an SQLITE_BUSY error.
+func isSQLiteBusyError(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Check for "database is locked" or "SQLITE_BUSY" in error message
+	errStr := err.Error()
+	return strings.Contains(errStr, "database is locked") ||
+		strings.Contains(errStr, "SQLITE_BUSY")
+}
+
+// walFileSize returns the size of the WAL file in bytes.
+func (db *DB) walFileSize() (int64, error) {
+	fi, err := os.Stat(db.WALPath())
+	if os.IsNotExist(err) {
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	}
+	return fi.Size(), nil
+}
+
+// calcWALSize returns the size of the WAL for a given page size & count.
+// Casts to int64 before multiplication to prevent uint32 overflow with large page sizes.
+func calcWALSize(pageSize uint32, pageN uint32) int64 {
+	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
 }
 
 // ensureWALExists checks that the real WAL exists and has a header.
@@ -1196,7 +1289,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Copy end of WAL before checkpoint to copy as much as possible.
-	if err := db.verifyAndSync(ctx, true); err != nil {
+	if _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
 	}
 
@@ -1231,7 +1324,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Copy anything that may have occurred after the checkpoint.
-	if err := db.verifyAndSync(ctx, true); err != nil {
+	if _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
 

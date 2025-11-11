@@ -793,10 +793,9 @@ levels:
 
 ```go
 DefaultMonitorInterval    = 1 * time.Second   // WAL check frequency
-DefaultCheckpointInterval = 1 * time.Minute   // Checkpoint frequency
+DefaultCheckpointInterval = 1 * time.Minute   // Time-based passive checkpoint frequency
 DefaultMinCheckpointPageN = 1000              // Min pages before passive checkpoint
-DefaultMaxCheckpointPageN = 10000             // Max pages before forced checkpoint
-DefaultTruncatePageN      = 500000            // Pages before truncation
+DefaultTruncatePageN      = 121359            // ~500MB truncate threshold (REMOVED: DefaultMaxCheckpointPageN - RESTART mode permanently removed due to #724)
 ```
 
 ## Getting Help

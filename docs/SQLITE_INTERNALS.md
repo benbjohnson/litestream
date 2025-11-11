@@ -358,14 +358,16 @@ func (db *DB) autoCheckpoint() error {
     pageCount := walSize / db.pageSize
 
     if pageCount > db.TruncatePageN {
-        // Force truncation for very large WAL
+        // Force truncation for very large WAL (emergency brake)
         return db.Checkpoint("TRUNCATE")
-    } else if pageCount > db.MaxCheckpointPageN {
-        // Force checkpoint for large WAL
-        return db.Checkpoint("RESTART")
     } else if pageCount > db.MinCheckpointPageN {
-        // Try passive checkpoint
+        // Try passive checkpoint (non-blocking)
         return db.Checkpoint("PASSIVE")
+    } else if db.CheckpointInterval elapsed {
+        // Time-based passive checkpoint
+        return db.Checkpoint("PASSIVE")
+    }
+    // Note: RESTART mode permanently removed due to issue #724 (write-blocking)
     }
 
     return nil

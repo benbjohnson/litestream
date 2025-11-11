@@ -226,9 +226,9 @@ PRAGMA busy_timeout = 5000;        -- 5 second timeout
 ```yaml
 # Optimal intervals
 min-checkpoint-page-n: 1000
-max-checkpoint-page-n: 10000
-truncate-page-n: 500000
+truncate-page-n: 121359
 monitor-interval: 1s
+checkpoint-interval: 1m
 ```
 
 ## Benchmarks to Run

@@ -107,11 +107,11 @@ type DB struct {
     wg     sync.WaitGroup
 
     // Configuration
-    MinCheckpointPageN int    // Min pages for passive checkpoint
-    MaxCheckpointPageN int    // Max pages for forced checkpoint
-    TruncatePageN      int    // Pages before truncation
-    CheckpointInterval time.Duration
-    MonitorInterval    time.Duration
+    MinCheckpointPageN int              // Min pages for passive checkpoint
+    TruncatePageN      int              // Pages before emergency truncate checkpoint
+    CheckpointInterval time.Duration    // Time-based passive checkpoint interval
+    MonitorInterval    time.Duration    // WAL monitoring frequency
+    // Note: MaxCheckpointPageN removed (RESTART mode disabled due to #724)
 
     // Metrics
     dbSizeGauge        prometheus.Gauge
