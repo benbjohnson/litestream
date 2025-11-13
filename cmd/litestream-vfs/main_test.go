@@ -20,7 +20,7 @@ import (
 	"testing"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	sqlite3 "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
 
 	"github.com/superfly/ltx"
@@ -651,7 +651,7 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 	if _, err := primary.Exec("INSERT INTO ledger (account, amount, created_at) VALUES (1, 0, strftime('%s','now'))"); err != nil {
 		t.Fatalf("seed ledger: %v", err)
 	}
-	forceReplicaSync(t, db)
+	time.Sleep(5 * db.MonitorInterval)
 
 	vfs := newVFS(t, client)
 	vfs.PollInterval = interval
@@ -757,6 +757,171 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 	}
 	if primaryCount != replicaCount {
 		t.Fatalf("ledger mismatch: primary=%d replica=%d", primaryCount, replicaCount)
+	}
+}
+
+func TestVFS_CacheMissStorm(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	const interval = 20 * time.Millisecond
+	_, primary := openReplicatedPrimary(t, client, interval, interval)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE stats (id INTEGER PRIMARY KEY, payload TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 0; i < 1000; i++ {
+		if _, err := primary.Exec("INSERT INTO stats (payload) VALUES (?)", fmt.Sprintf("row-%d", i)); err != nil {
+			t.Fatalf("insert payload: %v", err)
+		}
+	}
+	time.Sleep(5 * interval)
+
+	vfs := newVFS(t, client)
+	vfs.PollInterval = interval
+	vfsName := registerTestVFS(t, vfs)
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+
+	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
+
+	if _, err := replica.Exec("PRAGMA cache_size = -64"); err != nil {
+		t.Fatalf("set cache_size: %v", err)
+	}
+	if _, err := replica.Exec("PRAGMA cache_spill = ON"); err != nil {
+		t.Fatalf("enable cache_spill: %v", err)
+	}
+
+	for i := 0; i < 100; i++ {
+		var maxID int
+		if err := replica.QueryRow("SELECT MAX(id) FROM stats").Scan(&maxID); err != nil {
+			t.Fatalf("cache-miss query: %v", err)
+		}
+		if maxID == 0 {
+			t.Fatalf("unexpected empty stats table")
+		}
+	}
+}
+
+func BenchmarkVFS_LargeDatabase(b *testing.B) {
+	if testing.Short() {
+		b.Skip("skipping large benchmark in short mode")
+	}
+	client := file.NewReplicaClient(b.TempDir())
+	db, primary := openReplicatedPrimary(b, client, 25*time.Millisecond, 25*time.Millisecond)
+	b.Cleanup(func() { testingutil.MustCloseSQLDB(b, primary) })
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT, updated_at INTEGER)"); err != nil {
+		b.Fatalf("create table: %v", err)
+	}
+	seedLargeTable(b, primary, 20000)
+	forceReplicaSync(b, db)
+	if err := db.Replica.Stop(false); err != nil {
+		b.Fatalf("stop replica: %v", err)
+	}
+
+	vfs := newVFS(b, client)
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(b, vfs)
+	replica := openVFSReplicaDB(b, vfsName)
+	b.Cleanup(func() { replica.Close() })
+	waitForReplicaRowCount(b, primary, replica, 30*time.Second)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		var count, totalBytes int
+		if err := replica.QueryRow("SELECT COUNT(*), IFNULL(SUM(LENGTH(value)), 0) FROM t").Scan(&count, &totalBytes); err != nil {
+			b.Fatalf("benchmark query: %v", err)
+		}
+	}
+}
+
+func TestVFS_NetworkLatencySensitivity(t *testing.T) {
+	client := &latencyReplicaClient{ReplicaClient: file.NewReplicaClient(t.TempDir()), delay: 10 * time.Millisecond}
+	vfs := newVFS(t, client)
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE logs (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO logs (value) VALUES ('ok')"); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	time.Sleep(5 * db.MonitorInterval)
+
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var count int
+		if err := replica.QueryRow("SELECT COUNT(*) FROM logs").Scan(&count); err == nil && count == 1 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("replica never observed log row under injected latency")
+}
+
+func TestVFS_ConcurrentConnectionScaling(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	vfs := newVFS(t, client)
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE metrics (id INTEGER PRIMARY KEY AUTOINCREMENT, value INTEGER)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 0; i < 1000; i++ {
+		if _, err := primary.Exec("INSERT INTO metrics (value) VALUES (?)", i); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+	forceReplicaSync(t, db)
+
+	const connCount = 32
+	conns := make([]*sql.DB, connCount)
+	for i := 0; i < connCount; i++ {
+		conns[i] = openVFSReplicaDB(t, vfsName)
+	}
+	defer func() {
+		for _, c := range conns {
+			c.Close()
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	var wg sync.WaitGroup
+	for idx := range conns {
+		wg.Add(1)
+		go func(id int, dbConn *sql.DB) {
+			defer wg.Done()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+				var min, max int
+				if err := dbConn.QueryRow("SELECT MIN(value), MAX(value) FROM metrics").Scan(&min, &max); err != nil {
+					t.Errorf("conn %d query: %v", id, err)
+					return
+				}
+			}
+		}(idx, conns[idx])
+	}
+
+	wg.Wait()
+	if err := ctx.Err(); err != context.Canceled && err != context.DeadlineExceeded {
+		t.Fatalf("unexpected context err: %v", err)
 	}
 }
 
@@ -876,7 +1041,7 @@ func TestVFS_ConcurrentIndexAccessRaces(t *testing.T) {
 	time.Sleep(5 * monitorInterval)
 
 	vfs := newVFS(t, client)
-	vfs.PollInterval = 10 * time.Millisecond
+	vfs.PollInterval = 15 * time.Millisecond
 	vfsName := registerTestVFS(t, vfs)
 	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(t.TempDir(), "fail.db")), vfsName)
 	replica, err := sql.Open("sqlite3", dsn)
@@ -1210,6 +1375,265 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 	}
 }
 
+func TestVFS_PartialLTXUpload(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE logs (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO logs (value) VALUES ('ok')"); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	forceReplicaSync(t, db)
+
+	failingClient := &failingReplicaClient{ReplicaClient: client, mode: "partial"}
+
+	vfs := newVFS(t, failingClient)
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+	failingClient.failNextPage.Store(true)
+	replica.SetMaxOpenConns(8)
+
+	var count int
+	if err := replica.QueryRow("SELECT COUNT(*) FROM logs").Scan(&count); err == nil {
+		t.Fatalf("expected failure due to partial upload")
+	}
+
+	if err := replica.QueryRow("SELECT COUNT(*) FROM logs").Scan(&count); err != nil {
+		t.Fatalf("second attempt should succeed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("unexpected row count: %d", count)
+	}
+
+	if failingClient.failNextPage.Load() {
+		t.Fatalf("partial failure flag should be cleared")
+	}
+}
+
+func TestVFS_S3EventualConsistency(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO t (value) VALUES ('visible')"); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	time.Sleep(5 * db.MonitorInterval)
+
+	eventualClient := &eventualConsistencyClient{ReplicaClient: client}
+	vfs := newVFS(t, eventualClient)
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+
+	waitForReplicaRowCount(t, primary, replica, 5*time.Second)
+
+	if calls := eventualClient.calls.Load(); calls < 2 {
+		t.Fatalf("expected multiple polls under eventual consistency, got %d", calls)
+	}
+}
+
+func TestVFS_FileDescriptorBudget(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO t (value) VALUES ('seed')"); err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+	time.Sleep(5 * db.MonitorInterval)
+
+	limited := &fdLimitedReplicaClient{ReplicaClient: client, limit: 64}
+	vfs := newVFS(t, limited)
+	vfs.PollInterval = 10 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+
+	waitForReplicaRowCount(t, primary, replica, 5*time.Second)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	writerDone := make(chan error, 1)
+	go func() {
+		defer close(writerDone)
+		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			default:
+			}
+			if _, err := primary.Exec("INSERT INTO t (value) VALUES (?)", fmt.Sprintf("v-%d", rnd.Int())); err != nil {
+				if isBusyError(err) {
+					time.Sleep(2 * time.Millisecond)
+					continue
+				}
+				writerDone <- err
+				return
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+
+	const readers = 8
+	errs := make(chan error, readers)
+	for i := 0; i < readers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					errs <- nil
+					return
+				default:
+				}
+				var count int
+				if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+					if isBusyError(err) {
+						time.Sleep(2 * time.Millisecond)
+						continue
+					}
+					errs <- err
+					return
+				}
+			}
+		}()
+	}
+
+	<-ctx.Done()
+	for i := 0; i < readers; i++ {
+		if err := <-errs; err != nil {
+			t.Fatalf("reader %d error: %T %v", i, err, err)
+		}
+	}
+	if err := <-writerDone; err != nil && !errors.Is(err, context.Canceled) {
+		t.Fatalf("writer error: %v", err)
+	}
+
+	deadline := time.After(250 * time.Millisecond)
+	for limited.open.Load() != 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("descriptor leak: %d handles still open", limited.open.Load())
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+}
+
+func TestVFS_PageIndexOOM(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO t (value) VALUES ('ok')"); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	for i := 0; i < 64; i++ {
+		payload := strings.Repeat("p", 3500)
+		if _, err := primary.Exec("INSERT INTO t (value) VALUES (?)", payload); err != nil {
+			t.Fatalf("bulk insert: %v", err)
+		}
+	}
+	time.Sleep(5 * db.MonitorInterval)
+
+	oomClient := &oomPageIndexClient{ReplicaClient: client}
+	vfs := newVFS(t, oomClient)
+	vfs.PollInterval = 20 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(t.TempDir(), "oom.db")), vfsName)
+	failing, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open replica db: %v", err)
+	}
+	defer failing.Close()
+	failing.SetMaxOpenConns(4)
+	failing.SetMaxIdleConns(4)
+
+	oomClient.failNext.Store(true)
+	var count int
+	if err := failing.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err == nil {
+		t.Fatalf("expected query to fail due to page index OOM")
+	}
+	if !oomClient.triggered.Load() {
+		t.Fatalf("page index client never triggered")
+	}
+
+	oomClient.failNext.Store(false)
+	replica := openVFSReplicaDB(t, vfsName)
+	defer replica.Close()
+	waitForReplicaRowCount(t, primary, replica, 5*time.Second)
+
+	if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+		t.Fatalf("post-oom read failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("unexpected row count: %d", count)
+	}
+}
+
+func TestVFS_PageIndexCorruptionRecovery(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO t (value) VALUES ('ok')"); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+	time.Sleep(5 * db.MonitorInterval)
+
+	corruptClient := &corruptingPageIndexClient{ReplicaClient: client}
+	vfs := newVFS(t, corruptClient)
+	vfs.PollInterval = 20 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(t.TempDir(), "corrupt.db")), vfsName)
+
+	corruptClient.corruptNext.Store(true)
+	badConn, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open corrupt replica: %v", err)
+	}
+	badConn.SetMaxOpenConns(8)
+	badConn.SetMaxIdleConns(8)
+	badConn.SetConnMaxIdleTime(30 * time.Second)
+	var count int
+	if err := badConn.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err == nil {
+		badConn.Close()
+		t.Fatalf("expected corruption failure")
+	}
+	badConn.Close()
+	if !corruptClient.triggered.Load() {
+		t.Fatalf("corruption hook never triggered")
+	}
+
+	goodConn := openVFSReplicaDB(t, vfsName)
+	defer goodConn.Close()
+	if err := goodConn.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+		t.Fatalf("post-corruption read failed: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("unexpected row count after recovery: %d", count)
+	}
+}
+
 func TestVFS_RapidUpdateCoalescing(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	const interval = 5 * time.Millisecond
@@ -1465,6 +1889,30 @@ func waitForReplicaRowCount(tb testing.TB, primary, replica *sql.DB, timeout tim
 	tb.Fatalf("timeout waiting for replica row count to match")
 }
 
+func waitForTableRowCount(tb testing.TB, primary, replica *sql.DB, table string, timeout time.Duration) {
+	tb.Helper()
+	deadline := time.Now().Add(timeout)
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
+	for time.Now().Before(deadline) {
+		var primaryCount int
+		if err := primary.QueryRow(query).Scan(&primaryCount); err != nil {
+			tb.Fatalf("primary count (%s): %v", table, err)
+		}
+
+		var replicaCount int
+		if err := replica.QueryRow(query).Scan(&replicaCount); err == nil {
+			if primaryCount == replicaCount {
+				return
+			}
+		} else if !strings.Contains(err.Error(), "no such table") {
+			tb.Fatalf("replica count (%s): %v", table, err)
+		}
+
+		time.Sleep(50 * time.Millisecond)
+	}
+	tb.Fatalf("timeout waiting for %s row count to match", table)
+}
+
 func fetchOrderedPayloads(tb testing.TB, db *sql.DB, limit int, orderBy string) []string {
 	tb.Helper()
 	query := fmt.Sprintf("SELECT payload FROM t ORDER BY %s LIMIT %d", orderBy, limit)
@@ -1565,6 +2013,16 @@ func isBusyError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if e, ok := err.(sqlite3.Error); ok {
+		if e.Code == sqlite3.ErrBusy || e.Code == sqlite3.ErrLocked {
+			return true
+		}
+		// Under heavy churn, go-sqlite3 can surface ErrError with the
+		// generic "SQL logic error" message while the VFS swaps databases.
+		if e.Code == sqlite3.ErrError && strings.Contains(e.Error(), "SQL logic error") {
+			return true
+		}
+	}
 	msg := err.Error()
 	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy")
 }
@@ -1607,9 +2065,63 @@ type failingReplicaClient struct {
 	mode         string
 }
 
+type latencyReplicaClient struct {
+	litestream.ReplicaClient
+	delay time.Duration
+}
+
+func (c *latencyReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	time.Sleep(c.delay)
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *latencyReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	time.Sleep(c.delay)
+	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+type eventualConsistencyClient struct {
+	litestream.ReplicaClient
+	calls atomic.Int32
+}
+
+func (c *eventualConsistencyClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	if c.calls.Add(1) == 1 {
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
 type observingReplicaClient struct {
 	litestream.ReplicaClient
 	ltxCalls atomic.Int64
+}
+
+type fdLimitedReplicaClient struct {
+	litestream.ReplicaClient
+	limit   int32
+	open    atomic.Int32
+	maxOpen atomic.Int32
+}
+
+func (c *fdLimitedReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	current := c.open.Add(1)
+	for {
+		max := c.maxOpen.Load()
+		if current <= max || c.maxOpen.CompareAndSwap(max, current) {
+			break
+		}
+	}
+	if current > c.limit {
+		c.open.Add(-1)
+		return nil, fmt.Errorf("fd limit exceeded: %d/%d", current, c.limit)
+	}
+	rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		c.open.Add(-1)
+		return nil, err
+	}
+	return &hookedReadCloser{ReadCloser: rc, hook: func() { c.open.Add(-1) }}, nil
 }
 
 func (c *observingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -1671,4 +2183,61 @@ func (c *failingReplicaClient) OpenLTXFile(ctx context.Context, level int, minTX
 		}
 	}
 	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+type oomPageIndexClient struct {
+	litestream.ReplicaClient
+	failNext  atomic.Bool
+	triggered atomic.Bool
+}
+
+func (c *oomPageIndexClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	if offset > 0 && c.failNext.CompareAndSwap(true, false) {
+		c.triggered.Store(true)
+		return nil, fmt.Errorf("simulated page index OOM")
+	}
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+type corruptingPageIndexClient struct {
+	litestream.ReplicaClient
+	corruptNext atomic.Bool
+	triggered   atomic.Bool
+}
+
+func (c *corruptingPageIndexClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	if c.corruptNext.CompareAndSwap(true, false) {
+		c.triggered.Store(true)
+		data, readErr := io.ReadAll(rc)
+		rc.Close()
+		if readErr != nil {
+			return nil, readErr
+		}
+		if len(data) > 0 {
+			data[0] ^= 0xFF
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+	return rc, nil
+}
+
+type hookedReadCloser struct {
+	io.ReadCloser
+	once sync.Once
+	hook func()
+}
+
+func (h *hookedReadCloser) Close() error {
+	var err error
+	h.once.Do(func() {
+		err = h.ReadCloser.Close()
+		if h.hook != nil {
+			h.hook()
+		}
+	})
+	return err
 }

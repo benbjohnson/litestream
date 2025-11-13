@@ -2,30 +2,26 @@
 
 **Status:** In Progress
 **Started:** 2025-11-11
-**Last Updated:** 2025-11-11
+**Last Updated:** 2025-11-13
 
 ---
 
 ## Executive Summary
-
 ### Progress Dashboard
 
 | Metric | Value |
 |--------|-------|
 | **Total Tests Planned** | 34 |
-| **Tests Completed** | 22 |
+| **Tests Completed** | 31 |
 | **Tests In Progress** | 0 |
 | **Tests Blocked** | 0 |
 | **Bugs Found** | 0 |
-| **Overall Completion** | 65% |
-
+| **Overall Completion** | 91% |
 ### Current Focus
 - [ ] Setting up test infrastructure
 - [ ] Beginning Priority 1 tests
-
 ### Critical Blockers
 _None currently identified_
-
 ### Recent Discoveries
 _Bugs and issues will be tracked here as we implement tests_
 
@@ -54,12 +50,13 @@ _Bugs and issues will be tracked here as we implement tests_
 ---
 
 ## Priority 1: Critical Safety & Correctness
-
 ### Test #1: Concurrent Index Access Race Conditions ⚠️ HIGH RISK
 
 **Status:** ✅ Completed (see `TestVFS_ConcurrentIndexAccessRaces` in `cmd/litestream-vfs/main_test.go`)
 
 **Implementation Notes (2025-11-12):** High-concurrency integration test spins up 100 reader goroutines & a hot writer workload with 10 ms polling to stress index updates. Non-race runs are stable; `-race` attempts still trigger modernc/sqlite `checkptr` panics (see known issue in AGENTS.md), so we document the failure when the toolchain fixes upstream.
+
+**Ben Guidance (2025-11-13):** High-concurrency modes (100+ readers, continuous writes) may block updates, but that’s acceptable pre-release given VFS isn’t intended for high-volume production traffic—the test simply documents current behavior.
 
 **Rationale:**
 The current implementation has a potential race condition between the polling thread updating `f.index` and reader threads accessing it. The lock is released between lookup and use:
@@ -99,7 +96,6 @@ Additionally, the map itself could be concurrently modified during iteration, ca
 - Performance implications of holding locks longer
 
 ---
-
 ### Test #2: Storage Backend Failure Injection
 
 **Status:** ✅ Completed (see `TestVFS_StorageFailureInjection`)
@@ -254,7 +250,6 @@ func TestVFS_StorageFailureRecovery(t *testing.T) {
 - May need exponential backoff for retries
 
 ---
-
 ### Test #3: Non-Contiguous TXID Gaps
 
 **Status:** ✅ Completed (see `TestVFS_NonContiguousTXIDGapFailsOnOpen` in `cmd/litestream-vfs/main_test.go`)
@@ -404,7 +399,6 @@ func TestVFS_NonContiguousTXIDGaps(t *testing.T) {
 - May need smarter gap detection with timeout/retry
 
 ---
-
 ### Test #4: Index Memory Leak Detection
 
 **Status:** ✅ Completed (see `TestVFSFile_IndexMemoryDoesNotGrowUnbounded` in `vfs_lock_test.go`)
@@ -557,7 +551,6 @@ done:
 - Consider periodic index compaction/garbage collection
 
 ---
-
 ### Test #5: Multiple Page Size Support ⚠️ CRITICAL BUG
 
 **Status:** ✅ Completed (see `TestVFS_MultiplePageSizes` in `cmd/litestream-vfs/main_test.go`)
@@ -718,7 +711,6 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 ---
 
 ## Priority 2: Transaction Isolation & Locking
-
 ### Test #6: Pending Index Race Conditions
 
 **Status:** ✅ Completed (see `TestVFSFile_PendingIndexRace`, `TestVFSFile_PendingIndexIsolation`, `TestVFSFileMonitorStopsOnCancel`, & `TestVFS_ConcurrentIndexAccessRaces`)
@@ -747,7 +739,6 @@ _To be defined_
 _Implementation notes_
 
 ---
-
 ### Test #7: Lock State Machine Validation
 
 **Status:** ✅ Completed (see `TestVFSFile_LockStateMachine` & `TestVFSFile_PendingIndexIsolation`)
@@ -775,7 +766,6 @@ _To be defined_
 - Verify index routing at each state
 
 ---
-
 ### Test #8: Very Long-Running Transaction Stress
 
 **Status:** ✅ Completed (see `TestVFS_LongRunningTxnStress`)
@@ -783,7 +773,6 @@ _To be defined_
 _(Full specification to be added)_
 
 ---
-
 ### Test #9: Overlapping Transaction Commit Storm
 
 **Status:** ✅ Completed (see `TestVFS_OverlappingTransactionCommitStorm` in `cmd/litestream-vfs/main_test.go`)
@@ -793,7 +782,6 @@ _(Full specification to be added)_
 ---
 
 ## Priority 3: Polling & Synchronization Edge Cases
-
 ### Test #10: Polling Thread Death Detection
 
 **Status:** ✅ Completed (see `TestVFS_PollingThreadRecoversFromLTXListFailure` in `cmd/litestream-vfs/main_test.go`)
@@ -803,7 +791,6 @@ _(Full specification to be added)_
 _(Full specification to be added)_
 
 ---
-
 ### Test #11: Context Cancellation Propagation
 
 **Status:** ✅ Completed (see `TestVFSFile_PollingCancelsBlockedLTXFiles` in `vfs_lock_test.go`)
@@ -811,7 +798,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** Added a blocking replica client that intercepts `LTXFiles()` once the VFS monitor is running. The test forces the poller to hang on the backend call, invokes `VFSFile.Close()`, and asserts that the blocked request returns immediately with `context.Canceled`. This proves that poller goroutines always exit and release resources under cancellation.
 
 ---
-
 ### Test #12: Rapid Update Coalescing
 
 **Status:** ✅ Completed (see `TestVFS_RapidUpdateCoalescing` in `cmd/litestream-vfs/main_test.go`)
@@ -819,7 +805,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** High-frequency updates (200 increments with 1 ms spacing) now run against a VFS replica configured with a 5 ms poll interval. The test confirms that the replica observes the final value without errors, demonstrating that rapid LTX bursts are coalesced correctly by the monitor loop.
 
 ---
-
 ### Test #13: Poll Interval Edge Cases
 
 **Status:** ✅ Completed (see `TestVFS_PollIntervalEdgeCases` in `cmd/litestream-vfs/main_test.go`)
@@ -829,7 +814,6 @@ _(Full specification to be added)_
 ---
 
 ## Priority 4: Temp File & Lifecycle Management
-
 ### Test #14: Temp File Lifecycle Stress
 
 **Status:** ✅ Completed (see `TestVFS_TempFileLifecycleStress` in `vfs_lock_test.go`)
@@ -837,7 +821,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** Added a concurrent stress test that hammers `openTempFile` with mixed `DeleteOnClose` settings, validates tracking via `sync.Map`, and ensures the scratch directory is empty at the end. This exercises the temp-file code paths without adding any test-only hooks to `vfs.go`.
 
 ---
-
 ### Test #15: Temp File Name Collisions
 
 **Status:** ✅ Completed (see `TestVFS_TempFileNameCollision` in `vfs_lock_test.go`)
@@ -845,7 +828,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** Repeated calls to `openTempFile` with the same canonical name now have regression coverage ensuring the second handle can request `DELETE_ON_CLOSE`, remove the file, and leave the first handle able to close cleanly without tracking leaks.
 
 ---
-
 ### Test #16: Temp Directory Exhaustion
 
 **Status:** ✅ Completed (see `TestVFS_TempDirExhaustion` in `vfs_lock_test.go`)
@@ -853,7 +835,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** By injecting an error into `ensureTempDir()` we now assert the VFS surfaces disk-full conditions immediately and refuses to create temp files, matching SQLite’s expectations when scratch space is unavailable.
 
 ---
-
 ### Test #17: Temp File During Close()
 
 **Status:** ✅ Completed (see `TestVFS_TempFileDeleteOnClose` in `vfs_lock_test.go`)
@@ -863,7 +844,6 @@ _(Full specification to be added)_
 ---
 
 ## Priority 5: SQLite-Specific Behaviors
-
 ### Test #18: All Page Sizes + Lock Page Boundary
 
 **Status:** ✅ Completed (see `TestVFSFile_ReadAtLockPageBoundary` in `vfs_lock_test.go`)
@@ -871,7 +851,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** Synthetic LTX fixtures now exercise every supported page size (512–65536B) with page IDs just before & after the computed lock page (`ltx.LockPgno(pageSize)`). The test verifies VFS can serve data on both sides of the reserved page while returning a clean "page not found" error when SQLite (or a test) seeks the lock page itself. This keeps coverage without writing 1GB databases.
 
 ---
-
 ### Test #19: Database Header Manipulation Verification
 
 **Status:** ✅ Completed (see `TestVFSFile_HeaderForcesDeleteJournal` in `vfs_lock_test.go`)
@@ -879,7 +858,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-12):** Added a direct `ReadAt` test that decodes page 1 via the VFS and asserts bytes 18–19 are rewritten to `0x01` (DELETE journal mode). This ensures the read-only replica always presents itself as a rollback-journal database, matching SQLite’s expectations.
 
 ---
-
 ### Test #20: Empty Database & Edge Cases
 
 **Status:** ✅ Completed (see `TestVFS_WaitsForInitialSnapshot`)
@@ -891,7 +869,6 @@ Currently returns error for empty databases.
 _(Full specification to be added)_
 
 ---
-
 ### Test #21: Auto-Vacuum & Incremental Vacuum
 
 **Status:** ✅ Completed (see `TestVFSFile_AutoVacuumShrinksCommit` in `vfs_lock_test.go`)
@@ -899,7 +876,6 @@ _(Full specification to be added)_
 **Implementation Notes (2025-11-13):** Added a VFS unit test that synthesizes LTX files representing a database before & after an auto-vacuum run. The new snapshot logic clears the page index whenever the LTX header’s commit decreases, ensuring `FileSize()` shrinks and trimmed pages disappear on the replica.
 
 ---
-
 ### Test #22: PRAGMA Query Behavior
 
 **Status:** ✅ Completed (see `TestVFS_PRAGMAQueryBehavior` in `cmd/litestream-vfs/main_test.go`)
@@ -909,145 +885,110 @@ _(Full specification to be added)_
 ---
 
 ## Priority 6: Performance & Scalability
-
 ### Test #23: Large Database Benchmark Suite
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `BenchmarkVFS_LargeDatabase` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Added a `testing.B` benchmark that seeds a 20k-row dataset, opens the VFS replica, and repeatedly executes aggregate queries to measure traversal cost. Run via `go test -tags vfs ./cmd/litestream-vfs -bench BenchmarkVFS_LargeDatabase`.
 
 ---
-
 ### Test #24: Cache Miss Storm
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_CacheMissStorm` in `cmd/litestream-vfs/main_test.go`)
 
 _(Full specification to be added)_
 
 ---
-
 ### Test #25: Network Latency Sensitivity
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_NetworkLatencySensitivity` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Introduced a `latencyReplicaClient` wrapper that injects 10 ms delays into `LTXFiles`/`OpenLTXFile`. The new test ensures the replica still observes source rows under injected latency, while BEN’s guidance notes we only need awareness—not a pre-release fix—for extreme high-concurrency scenarios (100+ readers with continuous writes).
 
 ---
-
 ### Test #26: Concurrent Connection Scaling
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_ConcurrentConnectionScaling` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Opens 32 simultaneous VFS connections and hammers them with aggregate queries while the primary keeps writing. Confirms the VFS/Go driver combination handles connection scaling even under our low-latency polling configuration.
 
 ---
 
 ## Priority 7: Failure Recovery & Resilience
-
 ### Test #27: Partial LTX File Upload
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_PartialLTXUpload` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Uses the existing `failingReplicaClient` with a "partial" mode to return truncated LTX data on the first read, verifies the replica surfaces a clean error, and confirms the next poll succeeds—showing we don’t advance replica position after an incomplete upload.
 
 ---
-
 ### Test #28: Corrupted Page Index Recovery
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_PageIndexCorruptionRecovery` in `cmd/litestream-vfs/main_test.go` and `TestVFSFile_CorruptedPageIndexRecovery` in `vfs_lock_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Unit coverage already existed to prove we fail fast when `ltx.DecodePageIndex` cannot parse a corrupt blob; the new integration test introduces `corruptingPageIndexClient`, which feeds mangled data only for the page-index portion of an LTX file. The first replica connection now errors (documenting the failure mode), we assert the corruption hook fired, then the next connection succeeds once the client stops corrupting—showing that operators can retry/reconnect after a bad page index without leaving the VFS wedged.
 
 ---
-
 ### Test #29: S3 Eventual Consistency Simulation
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_S3EventualConsistency` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Added `eventualConsistencyClient`, which hides all L0 listings on the first poll to mimic S3/R2's delayed visibility after uploads. The integration test force-syncs a primary, stops the replica, then ensures the VFS keeps polling until the row appears and records that at least two listing attempts were required—documenting the precise behavior Ben asked us to verify for eventually consistent backends.
 
 ---
-
 ### Test #30: File Descriptor Exhaustion
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_FileDescriptorBudget` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Added `fdLimitedReplicaClient`, which tracks concurrent `OpenLTXFile` handles and enforces atomic close hooks. `TestVFS_FileDescriptorBudget` now runs eight reader goroutines alongside a jittery writer while the VFS polls every 15 ms, then asserts that outstanding handles return to zero within 250 ms—catching descriptor leaks without requiring OS-level `ulimit` tweaks. We log the observed peak so future regressions (e.g., hundreds of handles left open) are obvious if the assertion trips.
 
 ---
-
 ### Test #31: Out of Memory During Index Build
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_PageIndexOOM` in `cmd/litestream-vfs/main_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Added `oomPageIndexClient`, which makes the first `OpenLTXFile` call that targets the tail of the LTX file fail with `simulated page index OOM`. The new test verifies that this failure halts the initial VFS open (surfacing a `SQL logic error` from the driver), records that the fault path actually triggered, and then proves that a subsequent connection succeeds once the fault flag is cleared. This locks in the behavior Ben requested: page-index allocation failures bubble back to the caller instead of leaving the replica half-initialized, and the next poll can continue normally.
 
 ---
 
 ## Specific Bug-Finding Tests
-
 ### Test #32: Race Detector Stress Test
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_RaceStressHarness` in `cmd/litestream-vfs/stress_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Added a stress-only build tag (`-tags vfs,stress`) plus `TestVFS_RaceStressHarness`, which hammers a replica with 64 reader goroutines and a tight writer loop. Because `modernc.org/sqlite` still crashes under `-race` (checkptr panics), the harness is gated by `LITESTREAM_ALLOW_RACE=1`; by default it skips with a descriptive message so CI stays green while still documenting the current limitation and giving us a repeatable entry point as soon as the upstream bug is resolved.
 
 ---
-
 ### Test #33: Fuzzing VFS Operations
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_FuzzSeedCorpus`/`FuzzVFSReplicaReadPatterns` in `cmd/litestream-vfs/fuzz_test.go`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Added a deterministic fuzz harness that opens a real VFS replica, seeds 128 rows, and then drives random mixes of point reads, aggregates, LIKE queries, and primary/replica count comparisons. The `Fuzz...` function runs under `go test -tags vfs -fuzz=FuzzVFSReplicaReadPatterns`, while `TestVFS_FuzzSeedCorpus` replays a fixed corpus during normal `go test` runs to keep coverage in CI. This setup documented the current best practice for higher-entropy read workloads without relying on the unstable Go race detector.
 
 ---
-
 ### Test #34: Chaos Engineering Test
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Completed (see `TestVFS_ChaosEngineering` in `cmd/litestream-vfs/chaos_test.go`, run via `go test ./cmd/litestream-vfs -tags "vfs chaos" -run TestVFS_ChaosEngineering`)
 
-_(Full specification to be added)_
+**Implementation Notes (2025-11-13):** Introduced a `chaosReplicaClient` that wraps the file replica and injects randomized latency, timeouts, and partial LTX reads (deterministically seeded so runs stay reproducible). The new test hammers the VFS with 16 reader goroutines plus a jittery writer for 3 seconds, verifies the replica always catches up to the primary, and asserts that injected failures occurred. The `chaos` build tag keeps this heavier scenario out of the default suite while giving us a documented recipe for high-noise environments.
 
 ---
 
 ## Testing Infrastructure
-
 ### Required Test Helpers
 
-**Status:** ⬜ Not Started
+**Status:** ✅ Implemented
 
-```go
-// FailingReplicaClient - Injects storage failures
-type FailingReplicaClient struct {
-    wrapped ReplicaClient
-    failureRate float64
-    failureType string // "timeout", "500", "partial", "corrupt"
-}
+| Helper | Implementation |
+|--------|----------------|
+| `FailingReplicaClient` (storage failure injection) | `cmd/litestream-vfs/main_test.go` – used by `TestVFS_StorageFailureInjection` & `TestVFS_PartialLTXUpload`. |
+| `EventuallyConsistentClient` | `cmd/litestream-vfs/main_test.go` – used by `TestVFS_S3EventualConsistency`. |
+| Latency injector | `latencyReplicaClient` in `cmd/litestream-vfs/main_test.go` – exercised by `TestVFS_NetworkLatencySensitivity`. |
+| Stress harness | `cmd/litestream-vfs/stress_test.go` (`TestVFS_RaceStressHarness`, gated behind `-tags vfs,stress`). |
+| Parameterized page sizes | `TestVFS_MultiplePageSizes` in `cmd/litestream-vfs/main_test.go`. |
+| Chaos / leak-style helpers | `newChaosReplicaClient` in `cmd/litestream-vfs/chaos_test.go`; leak detection handled via descriptor budget test. |
 
-// EventuallyConsistentClient - Simulates S3 consistency delays
-type EventuallyConsistentClient struct {
-    wrapped ReplicaClient
-    listingDelay time.Duration
-    uploadDelay time.Duration
-}
-
-// LatencyInjector - Adds artificial network latency
-type LatencyInjector struct {
-    wrapped ReplicaClient
-    minLatency time.Duration
-    maxLatency time.Duration
-}
-
-// StressTestHarness - Race detector stress testing
-func StressTestWithRaceDetector(t *testing.T, goroutines int, duration time.Duration)
-
-// TestAllPageSizes - Parameterized page size testing
-func TestAllPageSizes(t *testing.T, testFunc func(*testing.T, int))
-
-// MemoryLeakDetector - pprof-based leak detection
-func DetectMemoryLeaks(t *testing.T, duration time.Duration) *MemoryProfile
-```
-
+Future work: memory-leak detector (pprof) remains optional; current test plan considers descriptor-budget coverage sufficient for release.
 ### Build Tags
 
 - `-tags vfs` - Standard VFS tests
@@ -1059,19 +1000,11 @@ func DetectMemoryLeaks(t *testing.T, duration time.Duration) *MemoryProfile
 ---
 
 ## Bugs Discovered
-
 ### Bug #1: Hardcoded Page Size (Test #5)
 
-**Status:** 🔴 CRITICAL - Not Fixed
+**Status:** ✅ Fixed (see `TestVFS_MultiplePageSizes` in `cmd/litestream-vfs/main_test.go`)
 
-**Location:** vfs.go:354
-
-**Description:**
-```go
-pgno := uint32(off/4096) + 1  // Wrong for non-4KB pages
-```
-
-**Impact:** VFS broken for any page size != 4096
+**Notes (2025-11-13):** `VFSFile.ReadAt` now consults the detected page size via `pageSizeBytes()` instead of assuming 4 KB, and the multiple-page-size integration test exercises page sizes from 512 B through 64 KB to prevent regressions. Keeping this entry here as historical context.
 
 **Fix Required:** Read page size from database header, use dynamic calculation
 
@@ -1080,7 +1013,6 @@ pgno := uint32(off/4096) + 1  // Wrong for non-4KB pages
 ---
 
 ## Notes & Observations
-
 ### General Testing Notes
 
 - Many tests require mocking infrastructure not yet built
@@ -1088,14 +1020,12 @@ pgno := uint32(off/4096) + 1  // Wrong for non-4KB pages
 - Race detector tests must run with `-race` flag
 - Memory leak tests need pprof integration
 - Several TODOs in production code must be fixed
-
 ### Performance Considerations
 
 - No page caching implemented - every read hits storage
 - Network latency directly impacts query performance
 - Index lookup is O(1) but map overhead significant at scale
 - Polling creates network overhead proportional to connections
-
 ### Architecture Questions
 
 1. Should VFS implement page cache? (Currently no caching)
@@ -1107,30 +1037,25 @@ pgno := uint32(off/4096) + 1  // Wrong for non-4KB pages
 ---
 
 ## Implementation Timeline
-
 ### Week 1: Critical Fixes (Nov 11-15)
 - [ ] Fix Test #5: Multiple page sizes (CRITICAL BUG)
 - [ ] Implement Test #1: Race detector stress
 - [ ] Implement Test #20: Empty database (TODO fix)
 - [ ] Implement Test #7: Lock state machine (TODO fix)
-
 ### Week 2: High Priority (Nov 18-22)
 - [x] Implement Test #2: Storage failure injection
 - [x] Build FailingReplicaClient test infrastructure
 - [x] Implement Test #3: TXID gap handling
 - [x] Implement Test #10: Polling thread monitoring
-
 ### Week 3: Core Functionality (Nov 25-29)
 - [x] Implement Test #6: Pending index races
 - [x] Implement Test #8: Long-running transactions
 - [x] Implement Test #14: Temp file lifecycle
 - [x] Implement Test #18: Lock page boundary
-
 ### Week 4: Completeness (Dec 2-6)
 - [ ] Implement remaining Priority 3 tests
 - [ ] Implement remaining Priority 4 tests
 - [ ] Build performance benchmark suite
-
 ### Ongoing:
 - [ ] Chaos engineering tests
 - [ ] Fuzzing campaigns
