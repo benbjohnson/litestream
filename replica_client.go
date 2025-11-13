@@ -88,6 +88,19 @@ func FetchPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInf
 	return ltx.DecodePageIndex(bufio.NewReader(rc), info.Level, info.MinTXID, info.MaxTXID)
 }
 
+func FetchLTXHeader(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (ltx.Header, error) {
+	rc, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, ltx.HeaderSize)
+	if err != nil {
+		return ltx.Header{}, fmt.Errorf("open ltx file: %w", err)
+	}
+	defer rc.Close()
+	hdr, _, err := ltx.PeekHeader(rc)
+	if err != nil {
+		return ltx.Header{}, fmt.Errorf("peek header: %w", err)
+	}
+	return hdr, nil
+}
+
 // fetchPageIndexData fetches a chunk of the end of the file to get the page index.
 // If the fetch was smaller than the actual page index, another call is made to fetch the rest.
 func fetchPageIndexData(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (io.ReadCloser, error) {
