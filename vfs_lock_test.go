@@ -273,6 +273,16 @@ func TestVFSFile_AutoVacuumShrinksCommit(t *testing.T) {
 	}
 }
 
+func TestVFSFile_CorruptedPageIndexRecovery(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, &ltxFixture{info: &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 0}, data: []byte("bad-index")})
+
+	f := NewVFSFile(client, "corrupt.db", slog.Default())
+	if err := f.Open(); err == nil {
+		t.Fatalf("expected open to fail on corrupted index")
+	}
+}
+
 func TestVFSFile_HeaderForcesDeleteJournal(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'h'))
