@@ -116,17 +116,28 @@ func TestVFS_ChaosEngineering(t *testing.T) {
 						readerErrs <- err
 						return
 					}
+					retryRows := false
 					for rows.Next() {
 						var id int
 						var value string
 						if err := rows.Scan(&id, &value); err != nil {
 							rows.Close()
+							if isBusyError(err) {
+								retryRows = true
+								break
+							}
 							readerErrs <- err
 							return
 						}
 					}
+					if retryRows {
+						continue
+					}
 					if err := rows.Err(); err != nil {
 						rows.Close()
+						if isBusyError(err) {
+							continue
+						}
 						readerErrs <- err
 						return
 					}

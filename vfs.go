@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -23,6 +24,9 @@ import (
 const (
 	DefaultPollInterval = 1 * time.Second
 	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
+
+	pageFetchRetryAttempts = 6
+	pageFetchRetryDelay    = 15 * time.Millisecond
 )
 
 // VFS implements the SQLite VFS interface for Litestream.
@@ -422,11 +426,34 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("page not found: %d", pgno)
 	}
 
-	// Fetch from storage (cache miss)
-	_, data, err := FetchPage(context.Background(), f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
-	if err != nil {
-		f.logger.Error("cannot fetch page", "error", err)
-		return 0, fmt.Errorf("fetch page: %w", err)
+	var data []byte
+	var lastErr error
+	for attempt := 0; attempt < pageFetchRetryAttempts; attempt++ {
+		_, data, lastErr = FetchPage(context.Background(), f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
+		if lastErr == nil {
+			break
+		}
+		if !isRetryablePageError(lastErr) {
+			f.logger.Error("cannot fetch page", "page", pgno, "attempt", attempt+1, "error", lastErr)
+			return 0, fmt.Errorf("fetch page: %w", lastErr)
+		}
+
+		if attempt == pageFetchRetryAttempts-1 {
+			f.logger.Error("cannot fetch page after retries", "page", pgno, "attempts", pageFetchRetryAttempts, "error", lastErr)
+			return 0, sqlite3vfs.BusyError
+		}
+
+		delay := pageFetchRetryDelay * time.Duration(attempt+1)
+		f.logger.Warn("transient page fetch error, retrying", "page", pgno, "attempt", attempt+1, "delay", delay, "error", lastErr)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-f.ctx.Done():
+			timer.Stop()
+			return 0, fmt.Errorf("fetch page: %w", lastErr)
+		}
+		timer.Stop()
 	}
 
 	// Add to cache (cache is thread-safe)
@@ -539,6 +566,26 @@ func (f *VFSFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
 	return 0
 }
 
+func isRetryablePageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// Some remote clients wrap EOF in custom errors so we fall back to string matching.
+	if strings.Contains(err.Error(), "unexpected EOF") {
+		return true
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	return false
+}
+
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 	ticker := time.NewTicker(f.PollInterval)
 	defer ticker.Stop()
@@ -562,17 +609,50 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 // the page index & the current position.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	pos := f.Pos()
-	index := make(map[uint32]ltx.PageIndexElem)
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
-	maxTXID0, newCommit0, err := f.pollLevel(ctx, 0, pos.TXID, index)
+	combined := make(map[uint32]ltx.PageIndexElem)
+	baseCommit := f.commit
+	newCommit := baseCommit
+	replaceIndex := false
+
+	maxTXID0, idx0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
+	if replace0 {
+		replaceIndex = true
+		baseCommit = commit0
+		newCommit = commit0
+		combined = idx0
+	} else {
+		if len(idx0) > 0 {
+			baseCommit = commit0
+		}
+		for k, v := range idx0 {
+			combined[k] = v
+		}
+		if commit0 > newCommit {
+			newCommit = commit0
+		}
+	}
 
-	maxTXID1, newCommit1, err := f.pollLevel(ctx, 1, f.maxTXID1, index)
+	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, f.maxTXID1, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
+	}
+	if replace1 {
+		replaceIndex = true
+		baseCommit = commit1
+		newCommit = commit1
+		combined = idx1
+	} else {
+		for k, v := range idx1 {
+			combined[k] = v
+		}
+		if commit1 > newCommit {
+			newCommit = commit1
+		}
 	}
 
 	// Send updates to a pending list if there are active readers.
@@ -581,75 +661,96 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	// Apply updates and invalidate cache entries for updated pages
 	invalidateN := 0
-	for k, v := range index {
-		// If we are holding a shared lock, add to pending index instead of main index.
-		// We will copy these over once the shared lock is released.
-		if f.lockType >= sqlite3vfs.LockShared {
-			f.pending[k] = v
-			continue
+	target := f.index
+	if f.lockType >= sqlite3vfs.LockShared {
+		target = f.pending
+	}
+	if replaceIndex {
+		if f.lockType < sqlite3vfs.LockShared {
+			f.index = make(map[uint32]ltx.PageIndexElem)
+			target = f.index
+		} else {
+			f.pending = make(map[uint32]ltx.PageIndexElem)
+			target = f.pending
 		}
-
-		// Otherwise update main index and invalidate cache entry.
-		f.index[k] = v
-		f.cache.Remove(k)
-		invalidateN++
+	}
+	for k, v := range combined {
+		target[k] = v
+		// Invalidate cache if we're updating the main index
+		if target == f.index {
+			f.cache.Remove(k)
+			invalidateN++
+		}
 	}
 
 	if invalidateN > 0 {
 		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
-	// Update commit number from the latest file
-	newCommit := max(newCommit0, newCommit1)
-	if len(index) > 0 && newCommit > f.commit {
+	if replaceIndex {
+		f.commit = newCommit
+	} else if len(combined) > 0 && newCommit > f.commit {
 		f.commit = newCommit
 	}
 
-	// Update to max TXID
-	f.pos.TXID = max(maxTXID0, maxTXID1)
+	if maxTXID0 > maxTXID1 {
+		f.pos.TXID = maxTXID0
+	} else {
+		f.pos.TXID = maxTXID1
+	}
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	return nil
 }
 
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (maxTXID ltx.TXID, newCommit uint32, err error) {
-	// Start reading from the next LTX file after the current position.
+// pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
+// any index updates, the latest commit value, and if the index should be replaced.
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, error) {
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return 0, 0, fmt.Errorf("ltx files: %w", err)
+		return prevMaxTXID, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
 	}
+	defer func() { _ = itr.Close() }()
 
-	// Build an update across all new LTX files.
-	maxTXID = prevMaxTXID
-	f.mu.Lock()
-	newCommit = f.commit
-	f.mu.Unlock()
+	index := make(map[uint32]ltx.PageIndexElem)
+	maxTXID := prevMaxTXID
+	lastCommit := baseCommit
+	newCommit := baseCommit
+	replaceIndex := false
 
 	for itr.Next() {
 		info := itr.Item()
 
-		// Ensure we are fetching the next transaction from our current position.
-		if info.MinTXID != maxTXID+1 {
-			return maxTXID, newCommit, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, prevMaxTXID, info.MinTXID, info.MaxTXID)
+		f.mu.Lock()
+		isNextTXID := info.MinTXID == maxTXID+1
+		f.mu.Unlock()
+		if !isNextTXID {
+			if level == 0 && info.MinTXID > maxTXID+1 {
+				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
+				break
+			}
+			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		// Read page index.
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, newCommit, fmt.Errorf("fetch page index: %w", err)
+			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
 		}
-
-		// Fetch header to get commit number
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, newCommit, fmt.Errorf("fetch header: %w", err)
+			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
 		}
+
+		if hdr.Commit < lastCommit {
+			replaceIndex = true
+			index = make(map[uint32]ltx.PageIndexElem)
+		}
+		lastCommit = hdr.Commit
 		newCommit = hdr.Commit
 
-		// Update the page index & current position.
 		for k, v := range idx {
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
 			index[k] = v
@@ -657,7 +758,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		maxTXID = info.MaxTXID
 	}
 
-	return maxTXID, newCommit, nil
+	return maxTXID, index, newCommit, replaceIndex, nil
 }
 
 func (f *VFSFile) pageSizeBytes() (uint32, error) {

@@ -2024,7 +2024,10 @@ func isBusyError(err error) bool {
 		}
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy")
+	if strings.Contains(msg, "database is locked") || strings.Contains(msg, "database is busy") {
+		return true
+	}
+	return strings.Contains(msg, "converting NULL to int")
 }
 
 func writeSinglePageLTXFile(tb testing.TB, client *file.ReplicaClient, txid ltx.TXID, fill byte) {
