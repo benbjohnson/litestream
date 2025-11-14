@@ -13,12 +13,14 @@ import (
 	"sync"
 	"time"
 
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
 )
 
 const (
 	DefaultPollInterval = 1 * time.Second
+	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
 )
 
 // VFS implements the SQLite VFS interface for Litestream.
@@ -30,6 +32,9 @@ type VFS struct {
 	// PollInterval is the interval at which to poll the replica client for new
 	// LTX files. The index will be fetched for the new files automatically.
 	PollInterval time.Duration
+
+	// CacheSize is the maximum size of the page cache in bytes.
+	CacheSize int
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -37,6 +42,7 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 		client:       client,
 		logger:       logger.With("vfs", "true"),
 		PollInterval: DefaultPollInterval,
+		CacheSize:    DefaultCacheSize,
 	}
 }
 
@@ -54,6 +60,7 @@ func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, s
 func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
+	f.CacheSize = vfs.CacheSize
 	if err := f.Open(); err != nil {
 		return nil, 0, err
 	}
@@ -95,7 +102,8 @@ type VFSFile struct {
 	maxTXID1 ltx.TXID // Last TXID read from level 1
 	index    map[uint32]ltx.PageIndexElem
 	pending  map[uint32]ltx.PageIndexElem
-	lockType sqlite3vfs.LockType // Current lock state
+	cache    *lru.Cache[uint32, []byte] // LRU cache for page data
+	lockType sqlite3vfs.LockType        // Current lock state
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -104,6 +112,7 @@ type VFSFile struct {
 	logger *slog.Logger
 
 	PollInterval time.Duration
+	CacheSize    int
 }
 
 func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile {
@@ -114,6 +123,7 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 		pending:      make(map[uint32]ltx.PageIndexElem),
 		logger:       logger,
 		PollInterval: DefaultPollInterval,
+		CacheSize:    DefaultCacheSize,
 	}
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 	return f
@@ -142,6 +152,18 @@ func (f *VFSFile) LockType() sqlite3vfs.LockType {
 
 func (f *VFSFile) Open() error {
 	f.logger.Info("opening file")
+
+	// Initialize page cache. Convert byte size to number of 4KB pages.
+	const pageSize = 4096
+	cacheEntries := f.CacheSize / pageSize
+	if cacheEntries < 1 {
+		cacheEntries = 1
+	}
+	cache, err := lru.New[uint32, []byte](cacheEntries)
+	if err != nil {
+		return fmt.Errorf("create page cache: %w", err)
+	}
+	f.cache = cache
 
 	infos, err := CalcRestorePlan(context.Background(), f.client, 0, time.Time{}, f.logger)
 	if err != nil {
@@ -207,6 +229,21 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	f.logger.Info("reading at", "off", off, "len", len(p))
 	pgno := uint32(off/4096) + 1
 
+	// Check cache first (cache is thread-safe)
+	if data, ok := f.cache.Get(pgno); ok {
+		n = copy(p, data[off%4096:])
+		f.logger.Info("cache hit", "page", pgno, "n", n)
+
+		// Update the first page to pretend like we are in journal mode.
+		if off == 0 {
+			p[18], p[19] = 0x01, 0x01
+			_, _ = rand.Read(p[24:28])
+		}
+
+		return n, nil
+	}
+
+	// Get page index element
 	f.mu.Lock()
 	elem, ok := f.index[pgno]
 	f.mu.Unlock()
@@ -216,14 +253,18 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("page not found: %d", pgno)
 	}
 
+	// Fetch from storage (cache miss)
 	_, data, err := FetchPage(context.Background(), f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
 	if err != nil {
 		f.logger.Error("cannot fetch page", "error", err)
 		return 0, fmt.Errorf("fetch page: %w", err)
 	}
 
+	// Add to cache (cache is thread-safe)
+	f.cache.Add(pgno, data)
+
 	n = copy(p, data[off%4096:])
-	f.logger.Info("data read", "n", n, "data", len(data))
+	f.logger.Info("data read from storage", "page", pgno, "n", n, "data", len(data))
 
 	// Update the first page to pretend like we are in journal mode.
 	if off == 0 {
@@ -282,11 +323,16 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 
 	f.lockType = elock
 
-	// Copy pending index to main index.
-	for k, v := range f.pending {
-		f.index[k] = v
+	// Copy pending index to main index and invalidate affected pages in cache.
+	if len(f.pending) > 0 {
+		count := len(f.pending)
+		for k, v := range f.pending {
+			f.index[k] = v
+			f.cache.Remove(k)
+		}
+		f.pending = make(map[uint32]ltx.PageIndexElem)
+		f.logger.Debug("cache invalidated pages", "count", count)
 	}
-	f.pending = make(map[uint32]ltx.PageIndexElem)
 
 	return nil
 }
@@ -346,12 +392,24 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	target := f.index
-	if f.lockType >= sqlite3vfs.LockShared {
-		target = f.pending
-	}
+	// Apply updates and invalidate cache entries for updated pages
+	invalidateN := 0
 	for k, v := range index {
-		target[k] = v
+		// If we are holding a shared lock, add to pending index instead of main index.
+		// We will copy these over once the shared lock is released.
+		if f.lockType >= sqlite3vfs.LockShared {
+			f.pending[k] = v
+			continue
+		}
+
+		// Otherwise update main index and invalidate cache entry.
+		f.index[k] = v
+		f.cache.Remove(k)
+		invalidateN++
+	}
+
+	if invalidateN > 0 {
+		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
 	// Update to max TXID
