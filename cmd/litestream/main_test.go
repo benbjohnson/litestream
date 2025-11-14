@@ -276,8 +276,10 @@ func TestNewGSReplicaFromConfig(t *testing.T) {
 func TestNewSFTPReplicaFromConfig(t *testing.T) {
 	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnK0+GdwOelXlAXdqLx/qvS7WHMr3rH7zW2+0DtmK5r"
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{
-		URL:     "sftp://user@example.com:2222/foo",
-		HostKey: hostKey,
+		URL: "sftp://user@example.com:2222/foo",
+		ReplicaSettings: main.ReplicaSettings{
+			HostKey: hostKey,
+		},
 	}, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -1751,9 +1753,8 @@ func TestNewDBsFromDirectoryConfig_UniquePaths(t *testing.T) {
 		Dir:     tmpDir,
 		Pattern: "*.db",
 		Replica: &main.ReplicaConfig{
-			Type:   "file",
-			Path:   "/backup/base",
-			Bucket: "",
+			Type: "file",
+			Path: "/backup/base",
 		},
 	}
 
@@ -1855,10 +1856,12 @@ func TestNewDBsFromDirectoryConfig_DuplicateFilenames(t *testing.T) {
 		Pattern:   "*.sqlite",
 		Recursive: true,
 		Replica: &main.ReplicaConfig{
-			Type:   "s3",
-			Path:   "backups",
-			Bucket: "test-bucket",
-			Region: "us-east-1",
+			Type: "s3",
+			Path: "backups",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket: "test-bucket",
+				Region: "us-east-1",
+			},
 		},
 	}
 
@@ -2185,9 +2188,11 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 	t.Run("ConfigOverridesQuery", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL:      "s3://mybucket/path?endpoint=from-query&region=us-east-1",
-			Endpoint: "from-config",
-			Region:   "us-west-1",
+			URL: "s3://mybucket/path?endpoint=from-query&region=us-east-1",
+			ReplicaSettings: main.ReplicaSettings{
+				Endpoint: "from-config",
+				Region:   "us-west-1",
+			},
 		}
 
 		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
