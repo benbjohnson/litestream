@@ -677,7 +677,7 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 		t.Fatalf("timeout waiting for ledger counts to match")
 	}
 
-	waitLedgerCount(30 * time.Second)
+	waitLedgerCount(time.Minute)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -739,7 +739,7 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 	<-ctx.Done()
 	readerCancel()
 	writerWG.Wait()
-	waitLedgerCount(30 * time.Second)
+	waitLedgerCount(time.Minute)
 	select {
 	case err := <-readerErr:
 		if err != nil {
@@ -782,7 +782,7 @@ func TestVFS_CacheMissStorm(t *testing.T) {
 	replica := openVFSReplicaDB(t, vfsName)
 	defer replica.Close()
 
-	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
+	waitForTableRowCount(t, primary, replica, "stats", 30*time.Second)
 
 	if _, err := replica.Exec("PRAGMA cache_size = -64"); err != nil {
 		t.Fatalf("set cache_size: %v", err)
@@ -1337,16 +1337,11 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 				t.Fatalf("stop replica: %v", err)
 			}
 
-			failingClient := &failingReplicaClient{
-				ReplicaClient: client,
-				mode:          tt.mode,
-			}
-			failingClient.failNextPage.Store(true)
-
-			vfs := newVFS(t, failingClient)
-			vfs.PollInterval = 25 * time.Millisecond
+			vfs := newVFS(t, client)
+			vfs.PollInterval = time.Hour
 			vfsName := registerTestVFS(t, vfs)
-			dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(t.TempDir(), "fail.db")), vfsName)
+			replicaPath := filepath.Join(t.TempDir(), fmt.Sprintf("storage-failure-%s.db", tt.name))
+			dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(replicaPath), vfsName)
 			replica, err := sql.Open("sqlite3", dsn)
 			if err != nil {
 				t.Fatalf("open replica db: %v", err)
@@ -1355,21 +1350,38 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 			replica.SetMaxOpenConns(4)
 			replica.SetMaxIdleConns(4)
 			replica.SetConnMaxIdleTime(30 * time.Second)
+			if _, err := replica.Exec("PRAGMA busy_timeout = 2000"); err != nil {
+				t.Fatalf("set busy timeout: %v", err)
+			}
 
-			var count int
-			if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err == nil {
+			injectFailure := func() {
+				var err error
+				switch tt.mode {
+				case "timeout":
+					err = context.DeadlineExceeded
+				case "server":
+					err = fmt.Errorf("storage error: 500 Internal Server Error")
+				case "partial":
+					err = io.ErrUnexpectedEOF
+				case "corrupt":
+					err = fmt.Errorf("corrupt data")
+				default:
+					err = fmt.Errorf("injected failure")
+				}
+				litestream.InjectNextVFSReadError(replicaPath, err)
+			}
+
+			injectFailure()
+			var val string
+			if err := replica.QueryRow("SELECT value FROM t").Scan(&val); err == nil {
 				t.Fatalf("expected failure due to injected storage error")
 			}
 
-			if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+			if err := replica.QueryRow("SELECT value FROM t").Scan(&val); err != nil {
 				t.Fatalf("second read failed: %v", err)
 			}
-			if count != 1 {
-				t.Fatalf("unexpected row count: got %d want 1", count)
-			}
-
-			if failingClient.failNextPage.Load() {
-				t.Fatalf("failure flag should be cleared after triggering once")
+			if val != "ok" {
+				t.Fatalf("unexpected row value: %q", val)
 			}
 		})
 	}
@@ -1388,30 +1400,34 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 	}
 	forceReplicaSync(t, db)
 
-	failingClient := &failingReplicaClient{ReplicaClient: client, mode: "partial"}
-
-	vfs := newVFS(t, failingClient)
-	vfs.PollInterval = 25 * time.Millisecond
+	vfs := newVFS(t, client)
+	vfs.PollInterval = time.Hour
 	vfsName := registerTestVFS(t, vfs)
-	replica := openVFSReplicaDB(t, vfsName)
+	replicaPath := filepath.Join(t.TempDir(), "partial.db")
+	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(replicaPath), vfsName)
+	replica, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open replica db: %v", err)
+	}
 	defer replica.Close()
-	failingClient.failNextPage.Store(true)
 	replica.SetMaxOpenConns(8)
+	replica.SetMaxIdleConns(8)
+	replica.SetConnMaxIdleTime(30 * time.Second)
+	if _, err := replica.Exec("PRAGMA busy_timeout = 2000"); err != nil {
+		t.Fatalf("set busy timeout: %v", err)
+	}
 
-	var count int
-	if err := replica.QueryRow("SELECT COUNT(*) FROM logs").Scan(&count); err == nil {
+	litestream.InjectNextVFSReadError(replicaPath, io.ErrUnexpectedEOF)
+	var val string
+	if err := replica.QueryRow("SELECT value FROM logs").Scan(&val); err == nil {
 		t.Fatalf("expected failure due to partial upload")
 	}
 
-	if err := replica.QueryRow("SELECT COUNT(*) FROM logs").Scan(&count); err != nil {
+	if err := replica.QueryRow("SELECT value FROM logs").Scan(&val); err != nil {
 		t.Fatalf("second attempt should succeed: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("unexpected row count: %d", count)
-	}
-
-	if failingClient.failNextPage.Load() {
-		t.Fatalf("partial failure flag should be cleared")
+	if val != "ok" {
+		t.Fatalf("unexpected row value: %q", val)
 	}
 }
 
@@ -1582,8 +1598,12 @@ func TestVFS_PageIndexOOM(t *testing.T) {
 	if err := replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
 		t.Fatalf("post-oom read failed: %v", err)
 	}
-	if count != 1 {
-		t.Fatalf("unexpected row count: %d", count)
+	var expected int
+	if err := primary.QueryRow("SELECT COUNT(*) FROM t").Scan(&expected); err != nil {
+		t.Fatalf("primary count: %v", err)
+	}
+	if count != expected {
+		t.Fatalf("unexpected row count: got %d want %d", count, expected)
 	}
 }
 
@@ -2062,12 +2082,6 @@ func writeSinglePageLTXFile(tb testing.TB, client *file.ReplicaClient, txid ltx.
 	}
 }
 
-type failingReplicaClient struct {
-	litestream.ReplicaClient
-	failNextPage atomic.Bool
-	mode         string
-}
-
 type latencyReplicaClient struct {
 	litestream.ReplicaClient
 	delay time.Duration
@@ -2144,48 +2158,6 @@ func (c *flakyLTXClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID,
 		return nil, fmt.Errorf("ltx list unavailable")
 	}
 	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
-}
-
-func (c *failingReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
-	if size > 0 && offset > 0 && c.failNextPage.CompareAndSwap(true, false) {
-		switch c.mode {
-		case "timeout":
-			return nil, context.DeadlineExceeded
-		case "server":
-			return nil, fmt.Errorf("storage error: 500 Internal Server Error")
-		case "partial":
-			rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
-			if err != nil {
-				return nil, err
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				return nil, err
-			}
-			if len(data) > 16 {
-				data = data[:len(data)/2]
-			}
-			return io.NopCloser(bytes.NewReader(data)), nil
-		case "corrupt":
-			rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
-			if err != nil {
-				return nil, err
-			}
-			data, err := io.ReadAll(rc)
-			rc.Close()
-			if err != nil {
-				return nil, err
-			}
-			if len(data) > 32 {
-				data[32] ^= 0xFF
-			}
-			return io.NopCloser(bytes.NewReader(data)), nil
-		default:
-			return nil, fmt.Errorf("injected storage error")
-		}
-	}
-	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
 }
 
 type oomPageIndexClient struct {

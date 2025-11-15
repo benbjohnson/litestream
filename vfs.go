@@ -29,6 +29,56 @@ const (
 	pageFetchRetryDelay    = 15 * time.Millisecond
 )
 
+var (
+	pageReadFailuresMu sync.Mutex
+	pageReadFailures   = make(map[string]error)
+
+	pageReadErrorInjector = func(f *VFSFile, off int64, n int) error {
+		pageReadFailuresMu.Lock()
+		defer pageReadFailuresMu.Unlock()
+		if err, ok := pageReadFailures[f.name]; ok {
+			delete(pageReadFailures, f.name)
+			if err == nil {
+				err = errors.New("vfs page read error")
+			}
+			return err
+		}
+		return nil
+	}
+)
+
+// InjectNextVFSReadError causes the next page read for the specified database
+// path to fail with err. Primarily used for testing.
+func InjectNextVFSReadError(path string, err error) {
+	pageReadFailuresMu.Lock()
+	defer pageReadFailuresMu.Unlock()
+	pageReadFailures[path] = err
+}
+
+type vfsContextKey string
+
+const pageFetchContextKey vfsContextKey = "litestream/vfs/page-fetch"
+
+func contextWithPageFetch(f *VFSFile) context.Context {
+	return context.WithValue(context.Background(), pageFetchContextKey, f)
+}
+
+// IsVFSPageFetchContext reports whether ctx originated from a VFS page read.
+func IsVFSPageFetchContext(ctx context.Context) bool {
+	_, ok := PageFetchFileName(ctx)
+	return ok
+}
+
+// PageFetchFileName returns the database file name associated with a VFS page
+// read context. Returns empty string & false if ctx did not originate from a
+// VFS page read.
+func PageFetchFileName(ctx context.Context) (string, bool) {
+	if f, ok := ctx.Value(pageFetchContextKey).(*VFSFile); ok && f != nil {
+		return f.name, true
+	}
+	return "", false
+}
+
 // VFS implements the SQLite VFS interface for Litestream.
 // It is intended to be used for read replicas that read directly from S3.
 type VFS struct {
@@ -254,14 +304,15 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos      ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1 ltx.TXID // Last TXID read from level 1
-	index    map[uint32]ltx.PageIndexElem
-	pending  map[uint32]ltx.PageIndexElem
-	cache    *lru.Cache[uint32, []byte] // LRU cache for page data
-	lockType sqlite3vfs.LockType        // Current lock state
-	pageSize uint32
-	commit   uint32
+	pos            ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1       ltx.TXID // Last TXID read from level 1
+	index          map[uint32]ltx.PageIndexElem
+	pending        map[uint32]ltx.PageIndexElem
+	pendingReplace bool
+	cache          *lru.Cache[uint32, []byte] // LRU cache for page data
+	lockType       sqlite3vfs.LockType        // Current lock state
+	pageSize       uint32
+	commit         uint32
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -400,6 +451,11 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	if err != nil {
 		return 0, err
 	}
+
+	if err := pageReadErrorInjector(f, off, len(p)); err != nil {
+		return 0, err
+	}
+
 	pgno := uint32(off/int64(pageSize)) + 1
 
 	// Check cache first (cache is thread-safe)
@@ -428,8 +484,9 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 	var data []byte
 	var lastErr error
+	ctx := contextWithPageFetch(f)
 	for attempt := 0; attempt < pageFetchRetryAttempts; attempt++ {
-		_, data, lastErr = FetchPage(context.Background(), f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
+		_, data, lastErr = FetchPage(ctx, f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
 		if lastErr == nil {
 			break
 		}
@@ -536,15 +593,24 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	f.lockType = elock
 
 	// Copy pending index to main index and invalidate affected pages in cache.
-	if len(f.pending) > 0 {
+	if f.pendingReplace {
+		// Replace entire index
+		count := len(f.index)
+		f.index = f.pending
+		f.logger.Debug("cache invalidated all pages", "count", count)
+		// Invalidate entire cache since we replaced the index
+		f.cache.Purge()
+	} else if len(f.pending) > 0 {
+		// Merge pending into index
 		count := len(f.pending)
 		for k, v := range f.pending {
 			f.index[k] = v
 			f.cache.Remove(k)
 		}
-		f.pending = make(map[uint32]ltx.PageIndexElem)
 		f.logger.Debug("cache invalidated pages", "count", count)
 	}
+	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.pendingReplace = false
 
 	return nil
 }
@@ -664,14 +730,18 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	target := f.index
 	if f.lockType >= sqlite3vfs.LockShared {
 		target = f.pending
+	} else {
+		f.pendingReplace = false
 	}
 	if replaceIndex {
 		if f.lockType < sqlite3vfs.LockShared {
 			f.index = make(map[uint32]ltx.PageIndexElem)
 			target = f.index
+			f.pendingReplace = false
 		} else {
 			f.pending = make(map[uint32]ltx.PageIndexElem)
 			target = f.pending
+			f.pendingReplace = true
 		}
 	}
 	for k, v := range combined {
@@ -698,6 +768,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	} else {
 		f.pos.TXID = maxTXID1
 	}
+
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 

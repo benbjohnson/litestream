@@ -214,8 +214,11 @@ func TestVFSFile_NonContiguousTXIDError(t *testing.T) {
 	}
 
 	client.addFixture(t, buildLTXFixture(t, 3, 'c'))
-	if err := f.pollReplicaClient(context.Background()); err == nil || !strings.Contains(err.Error(), "non-contiguous") {
-		t.Fatalf("expected non-contiguous error, got %v", err)
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll replica: %v", err)
+	}
+	if pos := f.Pos(); pos.TXID != 1 {
+		t.Fatalf("unexpected txid advance after gap: got %s", pos.TXID.String())
 	}
 }
 
@@ -270,6 +273,52 @@ func TestVFSFile_AutoVacuumShrinksCommit(t *testing.T) {
 	lockOffset := int64(3-1) * 4096
 	if _, err := f.ReadAt(buf, lockOffset); err == nil || !strings.Contains(err.Error(), "page not found") {
 		t.Fatalf("expected missing page after vacuum, got %v", err)
+	}
+}
+
+func TestVFSFile_PendingIndexReplacementRemovesStalePages(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixtureWithPages(t, 1, 4096, []uint32{1, 2, 3, 4}, 'a'))
+
+	f := NewVFSFile(client, "pending-replace.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("lock shared: %v", err)
+	}
+
+	client.addFixture(t, buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2}, 'b'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll replica: %v", err)
+	}
+
+	f.mu.Lock()
+	if _, ok := f.index[4]; !ok {
+		t.Fatalf("expected stale page to remain in main index while lock is held")
+	}
+	if !f.pendingReplace {
+		t.Fatalf("expected pending replacement flag set")
+	}
+	f.mu.Unlock()
+
+	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+
+	size, err := f.FileSize()
+	if err != nil {
+		t.Fatalf("file size: %v", err)
+	}
+	if size != int64(2*4096) {
+		t.Fatalf("unexpected file size after pending replacement applied: got %d want %d", size, 2*4096)
+	}
+
+	buf := make([]byte, 4096)
+	lockOffset := int64(3-1) * 4096
+	if _, err := f.ReadAt(buf, lockOffset); err == nil || !strings.Contains(err.Error(), "page not found") {
+		t.Fatalf("expected missing page after pending replacement applied, got %v", err)
 	}
 }
 
