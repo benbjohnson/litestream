@@ -1178,6 +1178,8 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 			}
 
 			vfs := newVFS(t, client)
+			injector := newVFSReadErrorInjector()
+			vfs.SetReadInterceptor(injector)
 			vfs.PollInterval = time.Hour
 			vfsName := registerTestVFS(t, vfs)
 			replicaPath := filepath.Join(t.TempDir(), fmt.Sprintf("storage-failure-%s.db", tt.name))
@@ -1208,7 +1210,7 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 				default:
 					err = fmt.Errorf("injected failure")
 				}
-				litestream.InjectNextVFSReadError(replicaPath, err)
+				injector.Inject(replicaPath, err)
 			}
 
 			injectFailure()
@@ -1241,6 +1243,8 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 	forceReplicaSync(t, db)
 
 	vfs := newVFS(t, client)
+	injector := newVFSReadErrorInjector()
+	vfs.SetReadInterceptor(injector)
 	vfs.PollInterval = time.Hour
 	vfsName := registerTestVFS(t, vfs)
 	replicaPath := filepath.Join(t.TempDir(), "partial.db")
@@ -1257,7 +1261,7 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 		t.Fatalf("set busy timeout: %v", err)
 	}
 
-	litestream.InjectNextVFSReadError(replicaPath, io.ErrUnexpectedEOF)
+	injector.Inject(replicaPath, io.ErrUnexpectedEOF)
 	var val string
 	if err := replica.QueryRow("SELECT value FROM logs").Scan(&val); err == nil {
 		t.Fatalf("expected failure due to partial upload")
@@ -1670,6 +1674,34 @@ func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
 	vfs := litestream.NewVFS(client, logger)
 	vfs.PollInterval = 100 * time.Millisecond
 	return vfs
+}
+
+type vfsReadErrorInjector struct {
+	mu       sync.Mutex
+	failures map[string]error
+}
+
+func newVFSReadErrorInjector() *vfsReadErrorInjector {
+	return &vfsReadErrorInjector{failures: make(map[string]error)}
+}
+
+func (i *vfsReadErrorInjector) Inject(name string, err error) {
+	i.mu.Lock()
+	i.failures[name] = err
+	i.mu.Unlock()
+}
+
+func (i *vfsReadErrorInjector) BeforePageRead(name string, off int64, n int) error {
+	i.mu.Lock()
+	defer i.mu.Unlock()
+	if err, ok := i.failures[name]; ok {
+		delete(i.failures, name)
+		if err == nil {
+			return errors.New("vfs page read error")
+		}
+		return err
+	}
+	return nil
 }
 
 func registerTestVFS(tb testing.TB, vfs *litestream.VFS) string {
