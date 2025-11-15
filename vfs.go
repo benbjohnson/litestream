@@ -29,30 +29,21 @@ const (
 	pageFetchRetryDelay    = 15 * time.Millisecond
 )
 
-var (
-	pageReadFailuresMu sync.Mutex
-	pageReadFailures   = make(map[string]error)
+// VFSReadInterceptor observes page read attempts. Returning a non-nil error
+// causes the read to fail. Primarily intended for instrumentation and testing.
+type VFSReadInterceptor interface {
+	BeforePageRead(name string, off int64, n int) error
+}
 
-	pageReadErrorInjector = func(f *VFSFile, off int64, n int) error {
-		pageReadFailuresMu.Lock()
-		defer pageReadFailuresMu.Unlock()
-		if err, ok := pageReadFailures[f.name]; ok {
-			delete(pageReadFailures, f.name)
-			if err == nil {
-				err = errors.New("vfs page read error")
-			}
-			return err
-		}
+// VFSReadInterceptorFunc adapts a function to the VFSReadInterceptor interface.
+type VFSReadInterceptorFunc func(name string, off int64, n int) error
+
+// BeforePageRead invokes fn if it is non-nil.
+func (fn VFSReadInterceptorFunc) BeforePageRead(name string, off int64, n int) error {
+	if fn == nil {
 		return nil
 	}
-)
-
-// InjectNextVFSReadError causes the next page read for the specified database
-// path to fail with err. Primarily used for testing.
-func InjectNextVFSReadError(path string, err error) {
-	pageReadFailuresMu.Lock()
-	defer pageReadFailuresMu.Unlock()
-	pageReadFailures[path] = err
+	return fn(name, off, n)
 }
 
 type vfsContextKey string
@@ -96,6 +87,8 @@ type VFS struct {
 	tempDir     string
 	tempDirErr  error
 	tempFiles   sync.Map // canonical name -> absolute path
+
+	readInterceptor VFSReadInterceptor
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -105,6 +98,11 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 		PollInterval: DefaultPollInterval,
 		CacheSize:    DefaultCacheSize,
 	}
+}
+
+// SetReadInterceptor installs interceptor for page reads issued through this VFS.
+func (vfs *VFS) SetReadInterceptor(interceptor VFSReadInterceptor) {
+	vfs.readInterceptor = interceptor
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
@@ -124,6 +122,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
+	f.SetReadInterceptor(vfs.readInterceptor)
 	if err := f.Open(); err != nil {
 		return nil, 0, err
 	}
@@ -304,15 +303,16 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos            ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1       ltx.TXID // Last TXID read from level 1
-	index          map[uint32]ltx.PageIndexElem
-	pending        map[uint32]ltx.PageIndexElem
-	pendingReplace bool
-	cache          *lru.Cache[uint32, []byte] // LRU cache for page data
-	lockType       sqlite3vfs.LockType        // Current lock state
-	pageSize       uint32
-	commit         uint32
+	pos             ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1        ltx.TXID // Last TXID read from level 1
+	index           map[uint32]ltx.PageIndexElem
+	pending         map[uint32]ltx.PageIndexElem
+	pendingReplace  bool
+	cache           *lru.Cache[uint32, []byte] // LRU cache for page data
+	lockType        sqlite3vfs.LockType        // Current lock state
+	pageSize        uint32
+	commit          uint32
+	readInterceptor VFSReadInterceptor
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -336,6 +336,11 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 	}
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 	return f
+}
+
+// SetReadInterceptor installs a read interceptor for the file.
+func (f *VFSFile) SetReadInterceptor(interceptor VFSReadInterceptor) {
+	f.readInterceptor = interceptor
 }
 
 // Pos returns the current position of the file.
@@ -452,7 +457,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, err
 	}
 
-	if err := pageReadErrorInjector(f, off, len(p)); err != nil {
+	if err := f.beforePageRead(off, len(p)); err != nil {
 		return 0, err
 	}
 
@@ -840,6 +845,13 @@ func (f *VFSFile) pageSizeBytes() (uint32, error) {
 		return 0, fmt.Errorf("page size not initialized")
 	}
 	return pageSize, nil
+}
+
+func (f *VFSFile) beforePageRead(off int64, n int) error {
+	if f.readInterceptor == nil {
+		return nil
+	}
+	return f.readInterceptor.BeforePageRead(f.name, off, n)
 }
 
 func detectPageSizeFromInfos(ctx context.Context, client ReplicaClient, infos []*ltx.FileInfo) (uint32, error) {
