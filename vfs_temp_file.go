@@ -16,7 +16,7 @@ import (
 type localTempFile struct {
 	f             *os.File
 	deleteOnClose bool
-	lockCount     int64
+	lockType      atomic.Int32
 	onClose       func()
 }
 
@@ -65,20 +65,17 @@ func (tf *localTempFile) Lock(elock sqlite3vfs.LockType) error {
 	if elock == sqlite3vfs.LockNone {
 		return nil
 	}
-	atomic.AddInt64(&tf.lockCount, 1)
+	tf.lockType.Store(int32(elock))
 	return nil
 }
 
 func (tf *localTempFile) Unlock(elock sqlite3vfs.LockType) error {
-	if elock == sqlite3vfs.LockNone {
-		return nil
-	}
-	atomic.AddInt64(&tf.lockCount, -1)
+	tf.lockType.Store(int32(elock))
 	return nil
 }
 
 func (tf *localTempFile) CheckReservedLock() (bool, error) {
-	return atomic.LoadInt64(&tf.lockCount) > 0, nil
+	return sqlite3vfs.LockType(tf.lockType.Load()) >= sqlite3vfs.LockReserved, nil
 }
 
 func (tf *localTempFile) SectorSize() int64 {

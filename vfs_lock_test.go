@@ -626,6 +626,53 @@ func TestVFS_TempFileDeleteOnClose(t *testing.T) {
 	}
 }
 
+func TestLocalTempFileLocking(t *testing.T) {
+	f, err := os.CreateTemp(t.TempDir(), "local-temp-*")
+	if err != nil {
+		t.Fatalf("create temp: %v", err)
+	}
+	tf := newLocalTempFile(f, false, nil)
+	defer tf.Close()
+
+	assertReserved := func(want bool) {
+		t.Helper()
+		got, err := tf.CheckReservedLock()
+		if err != nil {
+			t.Fatalf("check reserved: %v", err)
+		}
+		if got != want {
+			t.Fatalf("reserved lock state mismatch: got %v want %v", got, want)
+		}
+	}
+
+	assertReserved(false)
+
+	if err := tf.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("lock shared: %v", err)
+	}
+	assertReserved(false)
+
+	if err := tf.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("lock reserved: %v", err)
+	}
+	assertReserved(true)
+
+	if err := tf.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("unlock shared: %v", err)
+	}
+	assertReserved(false)
+
+	if err := tf.Lock(sqlite3vfs.LockExclusive); err != nil {
+		t.Fatalf("lock exclusive: %v", err)
+	}
+	assertReserved(true)
+
+	if err := tf.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("unlock none: %v", err)
+	}
+	assertReserved(false)
+}
+
 func TestVFS_DeleteIgnoresMissingTempFiles(t *testing.T) {
 	vfs := NewVFS(nil, slog.Default())
 
