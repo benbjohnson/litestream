@@ -332,6 +332,56 @@ func TestVFSFile_CorruptedPageIndexRecovery(t *testing.T) {
 	}
 }
 
+func TestVFSFile_OpenSeedsLevel1Position(t *testing.T) {
+	client := newMockReplicaClient()
+	snapshot := buildLTXFixture(t, 1, 's')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	l1 := buildLTXFixture(t, 2, 'l')
+	l1.info.Level = 1
+	client.addFixture(t, l1)
+	l0 := buildLTXFixture(t, 3, 'z')
+	l0.info.Level = 0
+	client.addFixture(t, l0)
+
+	f := NewVFSFile(client, "seed-level1.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	if got, want := f.maxTXID1, l1.info.MaxTXID; got != want {
+		t.Fatalf("unexpected maxTXID1: got %s want %s", got, want)
+	}
+	if got, want := f.Pos().TXID, l0.info.MaxTXID; got != want {
+		t.Fatalf("unexpected pos after open: got %s want %s", got, want)
+	}
+}
+
+func TestVFSFile_OpenSeedsLevel1PositionFromPos(t *testing.T) {
+	client := newMockReplicaClient()
+	snapshot := buildLTXFixture(t, 1, 's')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	l0 := buildLTXFixture(t, 2, '0')
+	l0.info.Level = 0
+	client.addFixture(t, l0)
+
+	f := NewVFSFile(client, "seed-default.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	pos := f.Pos().TXID
+	if pos == 0 {
+		t.Fatalf("expected non-zero position")
+	}
+	if got := f.maxTXID1; got != pos {
+		t.Fatalf("expected maxTXID1 to equal pos when no L1 files, got %s want %s", got, pos)
+	}
+}
+
 func TestVFSFile_HeaderForcesDeleteJournal(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'h'))
@@ -568,6 +618,61 @@ func TestVFS_TempFileDeleteOnClose(t *testing.T) {
 	if _, ok := vfs.loadTempFilePath(name); ok {
 		t.Fatalf("temp file tracking entry should be cleared")
 	}
+	if err := vfs.Delete(name, false); err != nil {
+		t.Fatalf("delete should ignore missing temp files: %v", err)
+	}
+	if err := vfs.Delete(name, false); err != nil {
+		t.Fatalf("delete should ignore repeated temp deletes: %v", err)
+	}
+}
+
+func TestVFS_DeleteIgnoresMissingTempFiles(t *testing.T) {
+	vfs := NewVFS(nil, slog.Default())
+
+	t.Run("AlreadyRemovedEntry", func(t *testing.T) {
+		name := "already-removed.db"
+		flags := sqlite3vfs.OpenTempDB | sqlite3vfs.OpenReadWrite | sqlite3vfs.OpenCreate | sqlite3vfs.OpenDeleteOnClose
+
+		file, _, err := vfs.openTempFile(name, flags)
+		if err != nil {
+			t.Fatalf("open temp file: %v", err)
+		}
+		tf := file.(*localTempFile)
+		if err := tf.Close(); err != nil {
+			t.Fatalf("close temp file: %v", err)
+		}
+		if err := vfs.Delete(name, false); err != nil {
+			t.Fatalf("delete should ignore missing tracked entry: %v", err)
+		}
+	})
+
+	t.Run("MissingOnDisk", func(t *testing.T) {
+		name := "missing-on-disk.db"
+		flags := sqlite3vfs.OpenTempDB | sqlite3vfs.OpenReadWrite | sqlite3vfs.OpenCreate
+
+		file, _, err := vfs.openTempFile(name, flags)
+		if err != nil {
+			t.Fatalf("open temp file: %v", err)
+		}
+		tf := file.(*localTempFile)
+
+		path, ok := vfs.loadTempFilePath(name)
+		if !ok {
+			t.Fatalf("temp file not tracked")
+		}
+		if err := os.Remove(path); err != nil {
+			t.Fatalf("remove backing file: %v", err)
+		}
+		if err := vfs.Delete(name, false); err != nil {
+			t.Fatalf("delete should ignore missing file: %v", err)
+		}
+		if _, ok := vfs.loadTempFilePath(name); ok {
+			t.Fatalf("temp file tracking entry should be cleared")
+		}
+		if err := tf.Close(); err != nil {
+			t.Fatalf("close temp file: %v", err)
+		}
+	})
 }
 
 func TestVFS_TempDirExhaustion(t *testing.T) {
