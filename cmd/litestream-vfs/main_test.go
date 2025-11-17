@@ -1338,8 +1338,6 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 			}
 
 			vfs := newVFS(t, client)
-			injector := newVFSReadErrorInjector()
-			vfs.SetReadInterceptor(injector)
 			vfs.PollInterval = time.Hour
 			vfsName := registerTestVFS(t, vfs)
 			replicaPath := filepath.Join(t.TempDir(), fmt.Sprintf("storage-failure-%s.db", tt.name))
@@ -1370,7 +1368,7 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 				default:
 					err = fmt.Errorf("injected failure")
 				}
-				injector.Inject(replicaPath, err)
+				vfs.Inject(replicaPath, err)
 			}
 
 			injectFailure()
@@ -1403,8 +1401,6 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 	forceReplicaSync(t, db)
 
 	vfs := newVFS(t, client)
-	injector := newVFSReadErrorInjector()
-	vfs.SetReadInterceptor(injector)
 	vfs.PollInterval = time.Hour
 	vfsName := registerTestVFS(t, vfs)
 	replicaPath := filepath.Join(t.TempDir(), "partial.db")
@@ -1421,7 +1417,7 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 		t.Fatalf("set busy timeout: %v", err)
 	}
 
-	injector.Inject(replicaPath, io.ErrUnexpectedEOF)
+	vfs.Inject(replicaPath, io.ErrUnexpectedEOF)
 	var val string
 	if err := replica.QueryRow("SELECT value FROM logs").Scan(&val); err == nil {
 		t.Fatalf("expected failure due to partial upload")
@@ -1824,47 +1820,144 @@ func TestVFS_PollIntervalEdgeCases(t *testing.T) {
 	}
 }
 
-func newVFS(tb testing.TB, client litestream.ReplicaClient) *litestream.VFS {
+func newVFS(tb testing.TB, client litestream.ReplicaClient) *testVFS {
 	tb.Helper()
 
 	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelDebug,
 	}))
 
-	vfs := litestream.NewVFS(client, logger)
-	vfs.PollInterval = 100 * time.Millisecond
-	return vfs
-}
-
-type vfsReadErrorInjector struct {
-	mu       sync.Mutex
-	failures map[string]error
-}
-
-func newVFSReadErrorInjector() *vfsReadErrorInjector {
-	return &vfsReadErrorInjector{failures: make(map[string]error)}
-}
-
-func (i *vfsReadErrorInjector) Inject(name string, err error) {
-	i.mu.Lock()
-	i.failures[name] = err
-	i.mu.Unlock()
-}
-
-func (i *vfsReadErrorInjector) BeforePageRead(name string, off int64, n int) error {
-	i.mu.Lock()
-	defer i.mu.Unlock()
-	if err, ok := i.failures[name]; ok {
-		delete(i.failures, name)
-		if err == nil {
-			return errors.New("vfs page read error")
-		}
-		return err
+	base := litestream.NewVFS(client, logger)
+	base.PollInterval = 100 * time.Millisecond
+	return &testVFS{
+		VFS:      base,
+		failures: make(map[string][]error),
 	}
-	return nil
 }
 
-func registerTestVFS(tb testing.TB, vfs *litestream.VFS) string {
+type faultInjectingReplicaClient struct {
+	litestream.ReplicaClient
+
+	mu       sync.Mutex
+	failures map[string]*faultInjection
+}
+
+func newFaultInjectingReplicaClient(inner litestream.ReplicaClient) *faultInjectingReplicaClient {
+	return &faultInjectingReplicaClient{
+		ReplicaClient: inner,
+		failures:      make(map[string]*faultInjection),
+	}
+}
+
+func (c *faultInjectingReplicaClient) Inject(path string, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err == nil {
+		err = errors.New("vfs page read error")
+	}
+	c.failures[path] = &faultInjection{err: err, remaining: faultInjectionAttempts}
+}
+
+func (c *faultInjectingReplicaClient) nextFailure(path string) (error, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	injection := c.failures[path]
+	if injection == nil {
+		return nil, false
+	}
+	injection.remaining--
+	err := injection.err
+	if injection.remaining <= 0 {
+		delete(c.failures, path)
+	}
+	return err, true
+}
+
+func (c *faultInjectingReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	if path, ok := litestream.PageFetchFileName(ctx); ok {
+		if err, ok := c.nextFailure(path); ok {
+			if err == nil {
+				err = errors.New("vfs page read error")
+			}
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return &faultyReadCloser{err: err}, nil
+			}
+			return nil, err
+		}
+	}
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+type faultyReadCloser struct {
+	err error
+}
+
+func (r *faultyReadCloser) Read([]byte) (int, error) { return 0, r.err }
+func (r *faultyReadCloser) Close() error             { return nil }
+
+type faultInjection struct {
+	err       error
+	remaining int
+}
+
+// Keep this in sync with pageFetchRetryAttempts in vfs.go.
+const faultInjectionAttempts = 6
+
+type testVFS struct {
+	*litestream.VFS
+
+	mu       sync.Mutex
+	failures map[string][]error
+}
+
+func (v *testVFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	f, flags, err := v.VFS.Open(name, flags)
+	if err != nil {
+		return nil, flags, err
+	}
+	return &injectingFile{File: f, vfs: v, name: name}, flags, nil
+}
+
+func (v *testVFS) Inject(path string, err error) {
+	v.mu.Lock()
+	v.failures[path] = append(v.failures[path], err)
+	v.mu.Unlock()
+}
+
+func (v *testVFS) popFailure(path string) error {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	queue := v.failures[path]
+	if len(queue) == 0 {
+		return nil
+	}
+	err := queue[0]
+	if len(queue) == 1 {
+		delete(v.failures, path)
+	} else {
+		v.failures[path] = queue[1:]
+	}
+	if err == nil {
+		return errors.New("vfs page read error")
+	}
+	return err
+}
+
+type injectingFile struct {
+	sqlite3vfs.File
+
+	vfs  *testVFS
+	name string
+}
+
+func (f *injectingFile) ReadAt(p []byte, off int64) (int, error) {
+	if err := f.vfs.popFailure(f.name); err != nil {
+		return 0, err
+	}
+	return f.File.ReadAt(p, off)
+}
+
+func registerTestVFS(tb testing.TB, vfs sqlite3vfs.VFS) string {
 	tb.Helper()
 	name := fmt.Sprintf("litestream-%s-%d", strings.ToLower(tb.Name()), time.Now().UnixNano())
 	if err := sqlite3vfs.RegisterVFS(name, vfs); err != nil {
