@@ -88,6 +88,7 @@ func FetchPageIndex(ctx context.Context, client ReplicaClient, info *ltx.FileInf
 	return ltx.DecodePageIndex(bufio.NewReader(rc), info.Level, info.MinTXID, info.MaxTXID)
 }
 
+// FetchLTXHeader reads & returns the LTX header for the given file info.
 func FetchLTXHeader(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (ltx.Header, error) {
 	rc, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, ltx.HeaderSize)
 	if err != nil {
