@@ -15,6 +15,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/s3"
 )
@@ -247,6 +248,13 @@ func TestReplicaClient_TimestampPreservation(t *testing.T) {
 	RunWithReplicaClient(t, "PreservesTimestamp", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Helper()
 		t.Parallel()
+
+		switch c.(type) {
+		case *s3.ReplicaClient, *file.ReplicaClient:
+			// supported
+		default:
+			t.Skipf("timestamp preservation not supported for %T", c)
+		}
 
 		ctx := context.Background()
 
