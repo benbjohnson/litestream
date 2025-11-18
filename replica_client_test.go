@@ -22,13 +22,23 @@ import (
 // createLTXData creates a minimal valid LTX file with a header for testing.
 // The data parameter is appended after the header for testing purposes.
 func createLTXData(minTXID, maxTXID ltx.TXID, data []byte) []byte {
+	return createLTXDataWithTimestamp(minTXID, maxTXID, time.Now(), data)
+}
+
+func createLTXDataWithTimestamp(minTXID, maxTXID ltx.TXID, ts time.Time, data []byte) []byte {
 	hdr := ltx.Header{
-		Version:   1,
+		Version:   ltx.Version,
 		PageSize:  4096,
 		Commit:    1,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: ts.UnixMilli(),
+	}
+	if minTXID == 1 {
+		// Snapshot files do not include a checksum.
+		hdr.PreApplyChecksum = 0
+	} else {
+		hdr.PreApplyChecksum = ltx.ChecksumFlag
 	}
 
 	headerBytes, _ := hdr.MarshalBinary()
@@ -244,27 +254,8 @@ func TestReplicaClient_TimestampPreservation(t *testing.T) {
 		// Use a timestamp from the past to ensure it's different from write time
 		expectedTimestamp := time.Now().Add(-1 * time.Hour).Truncate(time.Millisecond)
 
-		// Create a minimal LTX file with header containing the timestamp
-		hdr := ltx.Header{
-			Version:   1,
-			PageSize:  4096,
-			Commit:    1,
-			MinTXID:   1,
-			MaxTXID:   1,
-			Timestamp: expectedTimestamp.UnixMilli(),
-		}
-
-		// Marshal LTX header
-		headerBytes, err := hdr.MarshalBinary()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		// Combine header with minimal body to create valid LTX file
-		buf := bytes.NewReader(headerBytes)
-
-		// Write to storage backend
-		info, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(1), buf)
+		ltxData := createLTXDataWithTimestamp(1, 1, expectedTimestamp, []byte("payload"))
+		info, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(1), bytes.NewReader(ltxData))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -342,13 +333,14 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 		} else {
 			t.Log("Using 10MB file size to test multipart upload")
 		}
-		data := make([]byte, size)
-		for i := range data {
-			data[i] = byte(i % 256)
+		payload := make([]byte, size)
+		for i := range payload {
+			payload[i] = byte(i % 256)
 		}
+		ltxData := createLTXData(1, 100, payload)
 
 		// Upload the file using bytes.Reader to avoid string conversion issues
-		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100), bytes.NewReader(data)); err != nil {
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(100), bytes.NewReader(ltxData)); err != nil {
 			t.Fatalf("failed to write large file: %v", err)
 		}
 
@@ -364,12 +356,12 @@ func TestReplicaClient_S3_UploaderConfig(t *testing.T) {
 			t.Fatalf("failed to read large file: %v", err)
 		}
 
-		if len(buf) != size {
-			t.Errorf("size mismatch: got %d, want %d", len(buf), size)
+		if len(buf) != len(ltxData) {
+			t.Errorf("size mismatch: got %d, want %d", len(buf), len(ltxData))
 		}
 
 		// Verify the data matches what we uploaded
-		if !bytes.Equal(buf, data) {
+		if !bytes.Equal(buf, ltxData) {
 			t.Errorf("data mismatch: uploaded and downloaded data do not match")
 		}
 	})
