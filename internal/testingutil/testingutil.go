@@ -242,6 +242,7 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Endpoint = *s3Endpoint
 	c.ForcePathStyle = *s3ForcePathStyle
 	c.SkipVerify = *s3SkipVerify
+	c.SignPayload = true
 	return c
 }
 
