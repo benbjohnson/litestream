@@ -68,12 +68,14 @@ type ReplicaClient struct {
 	SecretAccessKey string
 
 	// S3 bucket information
-	Region         string
-	Bucket         string
-	Path           string
-	Endpoint       string
-	ForcePathStyle bool
-	SkipVerify     bool
+	Region            string
+	Bucket            string
+	Path              string
+	Endpoint          string
+	ForcePathStyle    bool
+	SkipVerify        bool
+	SignPayload       bool
+	RequireContentMD5 bool
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -83,7 +85,8 @@ type ReplicaClient struct {
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
-		logger: slog.Default().WithGroup(ReplicaClientType),
+		logger:            slog.Default().WithGroup(ReplicaClientType),
+		RequireContentMD5: true,
 	}
 }
 
@@ -179,8 +182,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	s3Opts := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
-			// Add User-Agent and Content-MD5 middleware.
-			o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+			// Add User-Agent and optional middleware.
+			o.APIOptions = append(o.APIOptions, c.middlewareOption())
 		},
 	}
 
@@ -372,37 +375,39 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	return info, nil
 }
 
-func litestreamAPIOption() func(*middleware.Stack) error {
+func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 	return func(stack *middleware.Stack) error {
-		if err := stack.Serialize.Add(
-			middleware.SerializeMiddlewareFunc(
-				"LitestreamComputeDeleteContentMD5",
-				func(ctx context.Context, in middleware.SerializeInput, next middleware.SerializeHandler) (
-					out middleware.SerializeOutput, metadata middleware.Metadata, err error,
-				) {
-					if middleware.GetOperationName(ctx) != "DeleteObjects" {
+		if c.RequireContentMD5 {
+			if err := stack.Serialize.Add(
+				middleware.SerializeMiddlewareFunc(
+					"LitestreamComputeDeleteContentMD5",
+					func(ctx context.Context, in middleware.SerializeInput, next middleware.SerializeHandler) (
+						out middleware.SerializeOutput, metadata middleware.Metadata, err error,
+					) {
+						if middleware.GetOperationName(ctx) != "DeleteObjects" {
+							return next.HandleSerialize(ctx, in)
+						}
+
+						input, ok := in.Parameters.(*s3.DeleteObjectsInput)
+						if !ok || input == nil || input.Delete == nil || len(input.Delete.Objects) == 0 {
+							return next.HandleSerialize(ctx, in)
+						}
+
+						checksum, err := computeDeleteObjectsContentMD5(input.Delete)
+						if err != nil {
+							return out, metadata, err
+						}
+						if checksum != "" {
+							ctx = middleware.WithStackValue(ctx, contentMD5StackKey{}, checksum)
+						}
+
 						return next.HandleSerialize(ctx, in)
-					}
-
-					input, ok := in.Parameters.(*s3.DeleteObjectsInput)
-					if !ok || input == nil || input.Delete == nil || len(input.Delete.Objects) == 0 {
-						return next.HandleSerialize(ctx, in)
-					}
-
-					checksum, err := computeDeleteObjectsContentMD5(input.Delete)
-					if err != nil {
-						return out, metadata, err
-					}
-					if checksum != "" {
-						ctx = middleware.WithStackValue(ctx, contentMD5StackKey{}, checksum)
-					}
-
-					return next.HandleSerialize(ctx, in)
-				},
-			),
-			middleware.Before,
-		); err != nil {
-			return err
+					},
+				),
+				middleware.Before,
+			); err != nil {
+				return err
+			}
 		}
 
 		if err := stack.Build.Add(
@@ -431,13 +436,19 @@ func litestreamAPIOption() func(*middleware.Stack) error {
 		// payload hashing. Switching to unsigned payload matches the behavior
 		// of the AWS SDK v1 client used in Litestream v0.3.x and restores
 		// compatibility.
-		_ = v4.RemoveComputePayloadSHA256Middleware(stack)
-		if err := v4.AddUnsignedPayloadMiddleware(stack); err != nil {
-			return err
+		if !c.SignPayload {
+			_ = v4.RemoveComputePayloadSHA256Middleware(stack)
+			if err := v4.AddUnsignedPayloadMiddleware(stack); err != nil {
+				return err
+			}
+			_ = v4.RemoveContentSHA256HeaderMiddleware(stack)
+			if err := v4.AddContentSHA256HeaderMiddleware(stack); err != nil {
+				return err
+			}
 		}
-		_ = v4.RemoveContentSHA256HeaderMiddleware(stack)
-		if err := v4.AddContentSHA256HeaderMiddleware(stack); err != nil {
-			return err
+
+		if !c.RequireContentMD5 {
+			return nil
 		}
 
 		md5Middleware := func() middleware.FinalizeMiddleware {

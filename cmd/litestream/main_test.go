@@ -2250,6 +2250,46 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			t.Error("expected ForcePathStyle to be true for custom endpoint")
 		}
 	})
+
+	t.Run("QuerySigningOptions", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://bucket/db?sign-payload=true&require-content-md5=false",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !client.SignPayload {
+			t.Error("expected SignPayload to be true when query parameter is set")
+		}
+		if client.RequireContentMD5 {
+			t.Error("expected RequireContentMD5 to be false when disabled via query")
+		}
+	})
+
+	t.Run("ConfigOverridesQuerySigning", func(t *testing.T) {
+		signTrue := true
+		requireFalse := false
+		config := &main.ReplicaConfig{
+			URL: "s3://bucket/db?sign-payload=false&require-content-md5=true",
+			ReplicaSettings: main.ReplicaSettings{
+				SignPayload:       &signTrue,
+				RequireContentMD5: &requireFalse,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !client.SignPayload {
+			t.Error("expected config SignPayload to override query parameter")
+		}
+		if client.RequireContentMD5 {
+			t.Error("expected config RequireContentMD5=false to override query parameter")
+		}
+	})
 }
 func TestGlobalDefaults(t *testing.T) {
 	// Test comprehensive global defaults functionality

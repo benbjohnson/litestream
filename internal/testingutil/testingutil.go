@@ -29,6 +29,13 @@ import (
 	"github.com/benbjohnson/litestream/webdav"
 )
 
+const (
+	defaultTigrisEndpoint = "https://fly.storage.tigris.dev"
+	defaultTigrisRegion   = "auto"
+	defaultTigrisBucket   = "litestream-dev"
+	defaultTigrisPathRoot = "integration-tests"
+)
+
 var (
 	// Enables integration tests.
 	integration = flag.Bool("integration", false, "")
@@ -49,6 +56,12 @@ var (
 	s3Endpoint        = flag.String("s3-endpoint", os.Getenv("LITESTREAM_S3_ENDPOINT"), "")
 	s3ForcePathStyle  = flag.Bool("s3-force-path-style", os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE") == "true", "")
 	s3SkipVerify      = flag.Bool("s3-skip-verify", os.Getenv("LITESTREAM_S3_SKIP_VERIFY") == "true", "")
+)
+
+// Tigris settings (S3-compatible)
+var (
+	tigrisAccessKeyID     = flag.String("tigris-access-key-id", os.Getenv("LITESTREAM_TIGRIS_ACCESS_KEY_ID"), "")
+	tigrisSecretAccessKey = flag.String("tigris-secret-access-key", os.Getenv("LITESTREAM_TIGRIS_SECRET_ACCESS_KEY"), "")
 )
 
 // Google cloud storage settings
@@ -202,6 +215,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewWebDAVReplicaClient(tb)
 	case nats.ReplicaClientType:
 		return NewNATSReplicaClient(tb)
+	case "tigris":
+		return NewTigrisReplicaClient(tb)
 	default:
 		tb.Fatalf("invalid replica client type: %q", typ)
 		return nil
@@ -227,6 +242,27 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Endpoint = *s3Endpoint
 	c.ForcePathStyle = *s3ForcePathStyle
 	c.SkipVerify = *s3SkipVerify
+	return c
+}
+
+// NewTigrisReplicaClient returns an S3 client configured for Fly.io Tigris.
+func NewTigrisReplicaClient(tb testing.TB) *s3.ReplicaClient {
+	tb.Helper()
+
+	if *tigrisAccessKeyID == "" || *tigrisSecretAccessKey == "" {
+		tb.Fatalf("tigris credentials not configured (set LITESTREAM_TIGRIS_ACCESS_KEY_ID/SECRET_ACCESS_KEY)")
+	}
+
+	c := s3.NewReplicaClient()
+	c.AccessKeyID = *tigrisAccessKeyID
+	c.SecretAccessKey = *tigrisSecretAccessKey
+	c.Region = defaultTigrisRegion
+	c.Bucket = defaultTigrisBucket
+	c.Path = path.Join(defaultTigrisPathRoot, fmt.Sprintf("%016x", rand.Uint64()))
+	c.Endpoint = defaultTigrisEndpoint
+	c.ForcePathStyle = true
+	c.SignPayload = true
+	c.RequireContentMD5 = false
 	return c
 }
 

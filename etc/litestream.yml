@@ -7,6 +7,10 @@
 #    replica:
 #      path: /path/to/replica             # File-based replication
 #      url:  s3://my.bucket.com/db        # S3-based replication
+#      # Example Fly.io Tigris setup (requires signed payloads & no Content-MD5 deletes)
+#      # url: s3://my-tigris-bucket/db.sqlite?endpoint=fly.storage.tigris.dev&region=auto
+#      # sign-payload: true
+#      # require-content-md5: false
 #      type: nats                         # NATS JetStream replication
 #      url: nats://nats.example.com:4222
 #      bucket: litestream-backups
