@@ -15,7 +15,6 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/s3"
 )
@@ -249,13 +248,6 @@ func TestReplicaClient_TimestampPreservation(t *testing.T) {
 		t.Helper()
 		t.Parallel()
 
-		switch c.(type) {
-		case *s3.ReplicaClient, *file.ReplicaClient:
-			// supported
-		default:
-			t.Skipf("timestamp preservation not supported for %T", c)
-		}
-
 		ctx := context.Background()
 
 		// Create an LTX file with a specific timestamp
@@ -298,11 +290,12 @@ func TestReplicaClient_TimestampPreservation(t *testing.T) {
 			t.Fatal("LTX file not found in iteration")
 		}
 
+		// All backends preserve timestamps in metadata (see issue #771)
 		// Verify timestamp was preserved (allow 1 second drift for precision)
 		timeDiff := found.CreatedAt.Sub(expectedTimestamp)
 		if timeDiff.Abs() > time.Second {
-			t.Errorf("Timestamp not preserved: expected %v, got %v (diff: %v)",
-				expectedTimestamp, found.CreatedAt, timeDiff)
+			t.Errorf("Timestamp not preserved for backend %T: expected %v, got %v (diff: %v)",
+				c, expectedTimestamp, found.CreatedAt, timeDiff)
 		}
 	})
 }
