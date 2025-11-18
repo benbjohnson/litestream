@@ -277,7 +277,7 @@ func TestReplicaClient_TimestampPreservation(t *testing.T) {
 		}
 
 		// Read back via LTXFiles and verify timestamp is preserved
-		itr, err := c.LTXFiles(ctx, 0, 0, false)
+		itr, err := c.LTXFiles(ctx, 0, 0, true)
 		if err != nil {
 			t.Fatal(err)
 		}

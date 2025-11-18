@@ -103,7 +103,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration s3
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=s3
         env:
           LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
           LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
@@ -193,7 +193,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration gs
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=gs
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp.json
           LITESTREAM_GS_BUCKET: litestream-github-workflows
@@ -234,7 +234,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration abs
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=abs
         env:
           LITESTREAM_ABS_ACCOUNT_NAME: ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
           LITESTREAM_ABS_ACCOUNT_KEY: ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
