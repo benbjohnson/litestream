@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -588,6 +589,59 @@ func TestVFS_TempFileNameCollision(t *testing.T) {
 	}
 	if err := tf1.Close(); err != nil {
 		t.Fatalf("close first file: %v", err)
+	}
+}
+
+func TestVFS_TempFileSameBasenameDifferentDirs(t *testing.T) {
+	vfs := NewVFS(nil, slog.Default())
+	flags := sqlite3vfs.OpenTempDB | sqlite3vfs.OpenReadWrite | sqlite3vfs.OpenCreate
+
+	name1 := filepath.Join("foo", "shared.db")
+	name2 := filepath.Join("bar", "shared.db")
+
+	file1, _, err := vfs.openTempFile(name1, flags)
+	if err != nil {
+		t.Fatalf("open first temp file: %v", err)
+	}
+	tf1 := file1.(*localTempFile)
+	path1, ok := vfs.loadTempFilePath(name1)
+	if !ok {
+		t.Fatalf("first temp file not tracked")
+	}
+
+	file2, _, err := vfs.openTempFile(name2, flags|sqlite3vfs.OpenDeleteOnClose)
+	if err != nil {
+		t.Fatalf("open second temp file: %v", err)
+	}
+	tf2 := file2.(*localTempFile)
+	path2, ok := vfs.loadTempFilePath(name2)
+	if !ok {
+		t.Fatalf("second temp file not tracked")
+	}
+
+	if path1 == path2 {
+		t.Fatalf("expected unique paths for %s and %s", name1, name2)
+	}
+
+	if err := tf1.Close(); err != nil {
+		t.Fatalf("close first file: %v", err)
+	}
+
+	if _, ok := vfs.loadTempFilePath(name2); !ok {
+		t.Fatalf("closing first file should not unregister second")
+	}
+
+	if path1 != "" {
+		if err := os.Remove(path1); err != nil && !os.IsNotExist(err) {
+			t.Fatalf("cleanup first temp file: %v", err)
+		}
+	}
+
+	if err := tf2.Close(); err != nil {
+		t.Fatalf("close second file: %v", err)
+	}
+	if _, ok := vfs.loadTempFilePath(name2); ok {
+		t.Fatalf("delete-on-close should clear second temp file")
 	}
 }
 

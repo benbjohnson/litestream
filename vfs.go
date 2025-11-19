@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"io"
 	"log/slog"
 	"os"
@@ -145,11 +146,27 @@ func (vfs *VFS) ensureTempDir() (string, error) {
 }
 
 func (vfs *VFS) canonicalTempName(name string) string {
-	name = filepath.Base(name)
+	if name == "" {
+		return ""
+	}
+	name = filepath.Clean(name)
 	if name == "." || name == string(filepath.Separator) {
 		return ""
 	}
 	return name
+}
+
+func tempFilenameFromCanonical(canonical string) (string, error) {
+	base := filepath.Base(canonical)
+	if base == "." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("invalid temp file name: %q", canonical)
+	}
+
+	h := fnv.New64a()
+	if _, err := h.Write([]byte(canonical)); err != nil {
+		return "", fmt.Errorf("hash temp name: %w", err)
+	}
+	return fmt.Sprintf("%s-%016x", base, h.Sum64()), nil
 }
 
 func (vfs *VFS) openTempFile(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
@@ -166,8 +183,12 @@ func (vfs *VFS) openTempFile(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs
 			return nil, flags, sqlite3vfs.CantOpenError
 		}
 	} else {
-		fname := vfs.canonicalTempName(name)
-		if fname == "" {
+		canonical := vfs.canonicalTempName(name)
+		if canonical == "" {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+		fname, err := tempFilenameFromCanonical(canonical)
+		if err != nil {
 			return nil, flags, sqlite3vfs.CantOpenError
 		}
 		path := filepath.Join(dir, fname)
@@ -179,7 +200,7 @@ func (vfs *VFS) openTempFile(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs
 		if err != nil {
 			return nil, flags, sqlite3vfs.CantOpenError
 		}
-		onClose = vfs.trackTempFile(name, path)
+		onClose = vfs.trackTempFile(canonical, path)
 	}
 
 	return newLocalTempFile(f, deleteOnClose, onClose), flags, nil
@@ -223,7 +244,6 @@ func (vfs *VFS) unregisterTempFile(name string) {
 		return
 	}
 	vfs.tempFiles.Delete(canonical)
-	vfs.tempNames.Delete(canonical)
 }
 
 func (vfs *VFS) accessTempFile(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
@@ -241,8 +261,7 @@ func (vfs *VFS) accessTempFile(name string, flag sqlite3vfs.AccessFlag) (bool, e
 	return true, nil
 }
 
-func (vfs *VFS) trackTempFile(name, path string) func() {
-	canonical := vfs.canonicalTempName(name)
+func (vfs *VFS) trackTempFile(canonical, path string) func() {
 	if canonical == "" {
 		return func() {}
 	}
