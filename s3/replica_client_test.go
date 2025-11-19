@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"io"
 	"log/slog"
@@ -85,52 +87,69 @@ func TestIsNotExists(t *testing.T) {
 	}
 }
 
-func TestReplicaClientUnsignedPayload(t *testing.T) {
-	headers := make(chan http.Header, 1)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer r.Body.Close()
-		_, _ = io.Copy(io.Discard, r.Body)
-
-		if r.Method == http.MethodPut {
-			select {
-			case headers <- r.Header.Clone():
-			default:
-			}
-			w.Header().Set("ETag", `"test-etag"`)
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer server.Close()
-
-	client := NewReplicaClient()
-	client.Bucket = "test-bucket"
-	client.Path = "replica"
-	client.Region = "us-east-1"
-	client.Endpoint = server.URL
-	client.ForcePathStyle = true
-	client.AccessKeyID = "test-access-key"
-	client.SecretAccessKey = "test-secret-key"
-
-	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
+func TestReplicaClientPayloadSigning(t *testing.T) {
 	data := mustLTX(t)
-	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
-		t.Fatalf("WriteLTXFile() error: %v", err)
+	signedPayload := sha256.Sum256(data)
+	wantSigned := hex.EncodeToString(signedPayload[:])
+
+	tests := []struct {
+		name        string
+		signPayload bool
+		wantHeader  string
+	}{
+		{name: "UnsignedByDefault", signPayload: false, wantHeader: "UNSIGNED-PAYLOAD"},
+		{name: "SignedWhenEnabled", signPayload: true, wantHeader: wantSigned},
 	}
 
-	select {
-	case hdr := <-headers:
-		if got, want := hdr.Get("x-amz-content-sha256"), "UNSIGNED-PAYLOAD"; got != want {
-			t.Fatalf("x-amz-content-sha256 header = %q, want %q", got, want)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("timeout waiting for signed PUT request")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			headers := make(chan http.Header, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				_, _ = io.Copy(io.Discard, r.Body)
+
+				if r.Method == http.MethodPut {
+					select {
+					case headers <- r.Header.Clone():
+					default:
+					}
+					w.Header().Set("ETag", `"test-etag"`)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			client := NewReplicaClient()
+			client.Bucket = "test-bucket"
+			client.Path = "replica"
+			client.Region = "us-east-1"
+			client.Endpoint = server.URL
+			client.ForcePathStyle = true
+			client.AccessKeyID = "test-access-key"
+			client.SecretAccessKey = "test-secret-key"
+			client.SignPayload = tt.signPayload
+
+			ctx := context.Background()
+			if err := client.Init(ctx); err != nil {
+				t.Fatalf("Init() error: %v", err)
+			}
+
+			if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+				t.Fatalf("WriteLTXFile() error: %v", err)
+			}
+
+			select {
+			case hdr := <-headers:
+				if got, want := hdr.Get("x-amz-content-sha256"), tt.wantHeader; got != want {
+					t.Fatalf("x-amz-content-sha256 header = %q, want %q", got, want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for PUT request")
+			}
+		})
 	}
 }
 
@@ -305,75 +324,114 @@ func TestReplicaClient_HTTPClientConfiguration(t *testing.T) {
 }
 
 func TestReplicaClientDeleteLTXFiles_ContentMD5(t *testing.T) {
-	var callCount int
+	t.Run("Enabled", func(t *testing.T) {
+		var callCount int
 
-	httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
-		t.Helper()
-		callCount++
+		httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+			t.Helper()
+			callCount++
 
-		if r.Method != http.MethodPost {
-			t.Fatalf("unexpected method: %s", r.Method)
-		}
-		if !strings.Contains(r.URL.RawQuery, "delete") {
-			t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+			if r.Method != http.MethodPost {
+				t.Fatalf("unexpected method: %s", r.Method)
+			}
+			if !strings.Contains(r.URL.RawQuery, "delete") {
+				t.Fatalf("unexpected query: %s", r.URL.RawQuery)
+			}
+
+			if ua := r.Header.Get("User-Agent"); !strings.Contains(ua, "litestream") {
+				t.Fatalf("expected User-Agent to contain litestream, got %q", ua)
+			}
+
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatalf("read body: %v", err)
+			}
+			r.Body.Close()
+
+			got := r.Header.Get("Content-MD5")
+			if got == "" {
+				t.Fatal("expected Content-MD5 header")
+			}
+
+			sum := md5.Sum(body)
+			want := base64.StdEncoding.EncodeToString(sum[:])
+			if got != want {
+				t.Fatalf("unexpected Content-MD5 header: got %q, want %q", got, want)
+			}
+
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/xml"}},
+				Body: io.NopCloser(strings.NewReader(
+					`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
+				)),
+			}
+			return resp, nil
+		})
+
+		cfg := aws.Config{
+			Region:      "us-east-1",
+			Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
+			HTTPClient:  httpClient,
 		}
 
-		if ua := r.Header.Get("User-Agent"); !strings.Contains(ua, "litestream") {
-			t.Fatalf("expected User-Agent to contain litestream, got %q", ua)
+		c := NewReplicaClient()
+		c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, c.middlewareOption())
+		})
+		c.Bucket = "test-bucket"
+		c.Path = "test-path"
+
+		files := []*ltx.FileInfo{
+			{Level: 0, MinTXID: 1, MaxTXID: 1},
+			{Level: 0, MinTXID: 2, MaxTXID: 2},
 		}
 
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			t.Fatalf("read body: %v", err)
+		if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
+			t.Fatalf("DeleteLTXFiles: %v", err)
 		}
-		r.Body.Close()
-
-		got := r.Header.Get("Content-MD5")
-		if got == "" {
-			t.Fatal("expected Content-MD5 header")
+		if callCount != 1 {
+			t.Fatalf("unexpected call count: %d", callCount)
 		}
-
-		sum := md5.Sum(body)
-		want := base64.StdEncoding.EncodeToString(sum[:])
-		if got != want {
-			t.Fatalf("unexpected Content-MD5 header: got %q, want %q", got, want)
-		}
-
-		resp := &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/xml"}},
-			Body: io.NopCloser(strings.NewReader(
-				`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
-			)),
-		}
-		return resp, nil
 	})
 
-	cfg := aws.Config{
-		Region:      "us-east-1",
-		Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
-		HTTPClient:  httpClient,
-	}
+	t.Run("Disabled", func(t *testing.T) {
+		httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+			t.Helper()
+			if md5Header := r.Header.Get("Content-MD5"); md5Header != "" {
+				t.Fatalf("expected Content-MD5 header to be empty when disabled, got %q", md5Header)
+			}
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"application/xml"}},
+				Body: io.NopCloser(strings.NewReader(
+					`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></DeleteResult>`,
+				)),
+			}
+			return resp, nil
+		})
 
-	c := NewReplicaClient()
-	c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
-	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+		cfg := aws.Config{
+			Region:      "us-east-1",
+			Credentials: aws.NewCredentialsCache(aws.AnonymousCredentials{}),
+			HTTPClient:  httpClient,
+		}
+
+		c := NewReplicaClient()
+		c.RequireContentMD5 = false
+		c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+		c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
+			o.APIOptions = append(o.APIOptions, c.middlewareOption())
+		})
+		c.Bucket = "test-bucket"
+		c.Path = "test-path"
+
+		files := []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}
+		if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
+			t.Fatalf("DeleteLTXFiles: %v", err)
+		}
 	})
-	c.Bucket = "test-bucket"
-	c.Path = "test-path"
-
-	files := []*ltx.FileInfo{
-		{Level: 0, MinTXID: 1, MaxTXID: 1},
-		{Level: 0, MinTXID: 2, MaxTXID: 2},
-	}
-
-	if err := c.DeleteLTXFiles(context.Background(), files); err != nil {
-		t.Fatalf("DeleteLTXFiles: %v", err)
-	}
-	if callCount != 1 {
-		t.Fatalf("unexpected call count: %d", callCount)
-	}
 }
 
 func TestReplicaClientDeleteLTXFiles_PreexistingContentMD5(t *testing.T) {
@@ -408,7 +466,7 @@ func TestReplicaClientDeleteLTXFiles_PreexistingContentMD5(t *testing.T) {
 	c := NewReplicaClient()
 	c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	c.s3 = s3.NewFromConfig(cfg, func(o *s3.Options) {
-		o.APIOptions = append(o.APIOptions, litestreamAPIOption())
+		o.APIOptions = append(o.APIOptions, c.middlewareOption())
 		o.APIOptions = append(o.APIOptions, func(stack *middleware.Stack) error {
 			return stack.Finalize.Add(
 				middleware.FinalizeMiddlewareFunc(

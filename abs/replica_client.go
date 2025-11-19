@@ -275,7 +275,8 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	}
 
 	pager := c.client.NewListBlobsFlatPager(c.Bucket, &azblob.ListBlobsFlatOptions{
-		Prefix: &prefix,
+		Prefix:  &prefix,
+		Include: azblob.ListBlobsInclude{Metadata: true},
 	})
 
 	for pager.More() {
@@ -336,7 +337,8 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 	}
 
 	itr.pager = client.client.NewListBlobsFlatPager(client.Bucket, &azblob.ListBlobsFlatOptions{
-		Prefix: &prefix,
+		Prefix:  &prefix,
+		Include: azblob.ListBlobsInclude{Metadata: true},
 	})
 
 	return itr

@@ -811,15 +811,17 @@ type ReplicaSettings struct {
 	ValidationInterval *time.Duration `yaml:"validation-interval"`
 
 	// S3 settings
-	AccessKeyID     string    `yaml:"access-key-id"`
-	SecretAccessKey string    `yaml:"secret-access-key"`
-	Region          string    `yaml:"region"`
-	Bucket          string    `yaml:"bucket"`
-	Endpoint        string    `yaml:"endpoint"`
-	ForcePathStyle  *bool     `yaml:"force-path-style"`
-	SkipVerify      bool      `yaml:"skip-verify"`
-	PartSize        *ByteSize `yaml:"part-size"`
-	Concurrency     *int      `yaml:"concurrency"`
+	AccessKeyID       string    `yaml:"access-key-id"`
+	SecretAccessKey   string    `yaml:"secret-access-key"`
+	Region            string    `yaml:"region"`
+	Bucket            string    `yaml:"bucket"`
+	Endpoint          string    `yaml:"endpoint"`
+	ForcePathStyle    *bool     `yaml:"force-path-style"`
+	SignPayload       *bool     `yaml:"sign-payload"`
+	RequireContentMD5 *bool     `yaml:"require-content-md5"`
+	SkipVerify        bool      `yaml:"skip-verify"`
+	PartSize          *ByteSize `yaml:"part-size"`
+	Concurrency       *int      `yaml:"concurrency"`
 
 	// ABS settings
 	AccountName string `yaml:"account-name"`
@@ -893,6 +895,12 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.ForcePathStyle == nil {
 		rs.ForcePathStyle = src.ForcePathStyle
+	}
+	if rs.SignPayload == nil {
+		rs.SignPayload = src.SignPayload
+	}
+	if rs.RequireContentMD5 == nil {
+		rs.RequireContentMD5 = src.RequireContentMD5
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
@@ -1101,6 +1109,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
+	signPayload := false
+	if v := c.SignPayload; v != nil {
+		signPayload = *v
+	}
+	requireContentMD5 := true
+	if v := c.RequireContentMD5; v != nil {
+		requireContentMD5 = *v
+	}
 
 	// Use path style if an endpoint is explicitly set. This works because the
 	// only service to not use path style is AWS which does not use an endpoint.
@@ -1117,10 +1133,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 
 		var (
-			ubucket         string
-			uregion         string
-			uendpoint       string
-			uforcePathStyle bool
+			ubucket               string
+			uregion               string
+			uendpoint             string
+			uforcePathStyle       bool
+			usignPayload          bool
+			usignPayloadSet       bool
+			urequireContentMD5    bool
+			urequireContentMD5Set bool
 		)
 
 		if strings.HasPrefix(host, "arn:") {
@@ -1152,6 +1172,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
 			skipVerify = qSkipVerify == "true"
 		}
+		if v, ok := boolQueryValue(query, "signPayload", "sign-payload"); ok {
+			usignPayload = v
+			usignPayloadSet = true
+		}
+		if v, ok := boolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
+			urequireContentMD5 = v
+			urequireContentMD5Set = true
+		}
 
 		// Only apply URL parts to field that have not been overridden.
 		if configPath == "" {
@@ -1168,6 +1196,12 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 		if !forcePathStyle {
 			forcePathStyle = uforcePathStyle
+		}
+		if c.SignPayload == nil && usignPayloadSet {
+			signPayload = usignPayload
+		}
+		if c.RequireContentMD5 == nil && urequireContentMD5Set {
+			requireContentMD5 = urequireContentMD5
 		}
 	}
 
@@ -1186,6 +1220,8 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	client.SignPayload = signPayload
+	client.RequireContentMD5 = requireContentMD5
 
 	// Apply upload configuration if specified.
 	if c.PartSize != nil {
@@ -1568,6 +1604,25 @@ func cleanReplicaURLPath(p string) string {
 		return ""
 	}
 	return cleaned
+}
+
+func boolQueryValue(query url.Values, keys ...string) (bool, bool) {
+	if query == nil {
+		return false, false
+	}
+	for _, key := range keys {
+		if raw := query.Get(key); raw != "" {
+			switch strings.ToLower(raw) {
+			case "true", "1", "t", "yes":
+				return true, true
+			case "false", "0", "f", "no":
+				return false, true
+			default:
+				return false, true
+			}
+		}
+	}
+	return false, false
 }
 
 func regionFromS3ARN(arn string) string {
