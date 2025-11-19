@@ -2231,6 +2231,34 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if !client.ForcePathStyle {
 			t.Error("expected ForcePathStyle to be true for custom endpoint")
 		}
+		if !client.SignPayload {
+			t.Error("expected SignPayload to be true for Tigris")
+		}
+		if client.RequireContentMD5 {
+			t.Error("expected RequireContentMD5 to be false for Tigris")
+		}
+	})
+
+	t.Run("TigrisConfigEndpoint", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:   "mybucket",
+				Endpoint: "https://fly.storage.tigris.dev",
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !client.SignPayload {
+			t.Error("expected SignPayload to be true for config-based Tigris endpoint")
+		}
+		if client.RequireContentMD5 {
+			t.Error("expected RequireContentMD5 to be false for config-based Tigris endpoint")
+		}
 	})
 
 	t.Run("HTTPSEndpoint", func(t *testing.T) {
@@ -2288,6 +2316,29 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected config RequireContentMD5=false to override query parameter")
+		}
+	})
+
+	t.Run("TigrisManualOverride", func(t *testing.T) {
+		signFalse := false
+		requireTrue := true
+		config := &main.ReplicaConfig{
+			URL: "s3://bucket/db?endpoint=fly.storage.tigris.dev&region=auto",
+			ReplicaSettings: main.ReplicaSettings{
+				SignPayload:       &signFalse,
+				RequireContentMD5: &requireTrue,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.SignPayload {
+			t.Error("expected manual SignPayload override to take precedence")
+		}
+		if !client.RequireContentMD5 {
+			t.Error("expected manual RequireContentMD5 override to take precedence")
 		}
 	})
 }

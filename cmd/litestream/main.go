@@ -1109,13 +1109,13 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
-	signPayload := false
+	signSetting := newBoolSetting(false)
 	if v := c.SignPayload; v != nil {
-		signPayload = *v
+		signSetting.Set(*v)
 	}
-	requireContentMD5 := true
+	requireSetting := newBoolSetting(true)
 	if v := c.RequireContentMD5; v != nil {
-		requireContentMD5 = *v
+		requireSetting.Set(*v)
 	}
 
 	// Use path style if an endpoint is explicitly set. This works because the
@@ -1126,6 +1126,17 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 
 	// Apply settings from URL, if specified.
+	var (
+		endpointWasSet        bool
+		usignPayload          bool
+		usignPayloadSet       bool
+		urequireContentMD5    bool
+		urequireContentMD5Set bool
+	)
+	if endpoint != "" {
+		endpointWasSet = true
+	}
+
 	if c.URL != "" {
 		_, host, upath, query, err := ParseReplicaURLWithQuery(c.URL)
 		if err != nil {
@@ -1133,14 +1144,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 
 		var (
-			ubucket               string
-			uregion               string
-			uendpoint             string
-			uforcePathStyle       bool
-			usignPayload          bool
-			usignPayloadSet       bool
-			urequireContentMD5    bool
-			urequireContentMD5Set bool
+			ubucket         string
+			uregion         string
+			uendpoint       string
+			uforcePathStyle bool
 		)
 
 		if strings.HasPrefix(host, "arn:") {
@@ -1162,6 +1169,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			if query.Get("forcePathStyle") != "false" {
 				uforcePathStyle = true
 			}
+			endpointWasSet = true
 		}
 		if qRegion := query.Get("region"); qRegion != "" {
 			uregion = qRegion
@@ -1197,17 +1205,22 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if !forcePathStyle {
 			forcePathStyle = uforcePathStyle
 		}
-		if c.SignPayload == nil && usignPayloadSet {
-			signPayload = usignPayload
+		if !signSetting.set && usignPayloadSet {
+			signSetting.Set(usignPayload)
 		}
-		if c.RequireContentMD5 == nil && urequireContentMD5Set {
-			requireContentMD5 = urequireContentMD5
+		if !requireSetting.set && urequireContentMD5Set {
+			requireSetting.Set(urequireContentMD5)
 		}
 	}
 
 	// Ensure required settings are set.
 	if bucket == "" {
 		return nil, fmt.Errorf("bucket required for s3 replica")
+	}
+
+	isTigris := isTigrisEndpoint(endpoint)
+	if !isTigris && !endpointWasSet && isTigrisEndpoint(c.Endpoint) {
+		isTigris = true
 	}
 
 	// Build replica.
@@ -1220,8 +1233,13 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
-	client.SignPayload = signPayload
-	client.RequireContentMD5 = requireContentMD5
+	if isTigris {
+		signSetting.ApplyDefault(true)
+		requireSetting.ApplyDefault(false)
+	}
+
+	client.SignPayload = signSetting.value
+	client.RequireContentMD5 = requireSetting.value
 
 	// Apply upload configuration if specified.
 	if c.PartSize != nil {
@@ -1623,6 +1641,39 @@ func boolQueryValue(query url.Values, keys ...string) (bool, bool) {
 		}
 	}
 	return false, false
+}
+
+func isTigrisEndpoint(endpoint string) bool {
+	endpoint = strings.TrimSpace(strings.ToLower(endpoint))
+	if endpoint == "" {
+		return false
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+			endpoint = u.Host
+		}
+	}
+	return endpoint == "fly.storage.tigris.dev"
+}
+
+type boolSetting struct {
+	value bool
+	set   bool
+}
+
+func newBoolSetting(defaultValue bool) boolSetting {
+	return boolSetting{value: defaultValue}
+}
+
+func (s *boolSetting) Set(value bool) {
+	s.value = value
+	s.set = true
+}
+
+func (s *boolSetting) ApplyDefault(value bool) {
+	if !s.set {
+		s.value = value
+	}
 }
 
 func regionFromS3ARN(arn string) string {
