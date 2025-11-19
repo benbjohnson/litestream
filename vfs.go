@@ -30,23 +30,6 @@ const (
 	pageFetchRetryDelay    = 15 * time.Millisecond
 )
 
-// VFSReadInterceptor observes page read attempts. Returning a non-nil error
-// causes the read to fail. Primarily intended for instrumentation and testing.
-type VFSReadInterceptor interface {
-	BeforePageRead(name string, off int64, n int) error
-}
-
-// VFSReadInterceptorFunc adapts a function to the VFSReadInterceptor interface.
-type VFSReadInterceptorFunc func(name string, off int64, n int) error
-
-// BeforePageRead invokes fn if it is non-nil.
-func (fn VFSReadInterceptorFunc) BeforePageRead(name string, off int64, n int) error {
-	if fn == nil {
-		return nil
-	}
-	return fn(name, off, n)
-}
-
 type vfsContextKey string
 
 const pageFetchContextKey vfsContextKey = "litestream/vfs/page-fetch"
@@ -88,8 +71,6 @@ type VFS struct {
 	tempDir     string
 	tempDirErr  error
 	tempFiles   sync.Map // canonical name -> absolute path
-
-	readInterceptor VFSReadInterceptor
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -102,10 +83,6 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 }
 
 // SetReadInterceptor installs interceptor for page reads issued through this VFS.
-func (vfs *VFS) SetReadInterceptor(interceptor VFSReadInterceptor) {
-	vfs.readInterceptor = interceptor
-}
-
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	slog.Info("opening file", "name", name, "flags", flags)
 
@@ -123,7 +100,6 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
-	f.SetReadInterceptor(vfs.readInterceptor)
 	if err := f.Open(); err != nil {
 		return nil, 0, err
 	}
@@ -380,16 +356,15 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos             ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1        ltx.TXID // Last TXID read from level 1
-	index           map[uint32]ltx.PageIndexElem
-	pending         map[uint32]ltx.PageIndexElem
-	pendingReplace  bool
-	cache           *lru.Cache[uint32, []byte] // LRU cache for page data
-	lockType        sqlite3vfs.LockType        // Current lock state
-	pageSize        uint32
-	commit          uint32
-	readInterceptor VFSReadInterceptor
+	pos            ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1       ltx.TXID // Last TXID read from level 1
+	index          map[uint32]ltx.PageIndexElem
+	pending        map[uint32]ltx.PageIndexElem
+	pendingReplace bool
+	cache          *lru.Cache[uint32, []byte] // LRU cache for page data
+	lockType       sqlite3vfs.LockType        // Current lock state
+	pageSize       uint32
+	commit         uint32
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -413,11 +388,6 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 	}
 	f.ctx, f.cancel = context.WithCancel(context.Background())
 	return f
-}
-
-// SetReadInterceptor installs a read interceptor for the file.
-func (f *VFSFile) SetReadInterceptor(interceptor VFSReadInterceptor) {
-	f.readInterceptor = interceptor
 }
 
 // Pos returns the current position of the file.
@@ -531,10 +501,6 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	f.logger.Info("reading at", "off", off, "len", len(p))
 	pageSize, err := f.pageSizeBytes()
 	if err != nil {
-		return 0, err
-	}
-
-	if err := f.beforePageRead(off, len(p)); err != nil {
 		return 0, err
 	}
 
@@ -810,8 +776,10 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	// Apply updates and invalidate cache entries for updated pages
 	invalidateN := 0
 	target := f.index
+	targetIsMain := true
 	if f.lockType >= sqlite3vfs.LockShared {
 		target = f.pending
+		targetIsMain = false
 	} else {
 		f.pendingReplace = false
 	}
@@ -819,17 +787,19 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		if f.lockType < sqlite3vfs.LockShared {
 			f.index = make(map[uint32]ltx.PageIndexElem)
 			target = f.index
+			targetIsMain = true
 			f.pendingReplace = false
 		} else {
 			f.pending = make(map[uint32]ltx.PageIndexElem)
 			target = f.pending
+			targetIsMain = false
 			f.pendingReplace = true
 		}
 	}
 	for k, v := range combined {
 		target[k] = v
 		// Invalidate cache if we're updating the main index
-		if target == f.index {
+		if targetIsMain {
 			f.cache.Remove(k)
 			invalidateN++
 		}
@@ -922,13 +892,6 @@ func (f *VFSFile) pageSizeBytes() (uint32, error) {
 		return 0, fmt.Errorf("page size not initialized")
 	}
 	return pageSize, nil
-}
-
-func (f *VFSFile) beforePageRead(off int64, n int) error {
-	if f.readInterceptor == nil {
-		return nil
-	}
-	return f.readInterceptor.BeforePageRead(f.name, off, n)
 }
 
 func detectPageSizeFromInfos(ctx context.Context, client ReplicaClient, infos []*ltx.FileInfo) (uint32, error) {

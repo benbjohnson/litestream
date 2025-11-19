@@ -510,7 +510,6 @@ done:
 	if finalValue == initialValue {
 		t.Fatalf("expected updated value after commit")
 	}
->>>>>>> 95c60ce (test(vfs): add comprehensive integration and unit tests)
 }
 
 func TestVFS_HighLoadConcurrentReads(t *testing.T) {
