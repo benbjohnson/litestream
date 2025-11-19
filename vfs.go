@@ -30,30 +30,6 @@ const (
 	pageFetchRetryDelay    = 15 * time.Millisecond
 )
 
-type vfsContextKey string
-
-const pageFetchContextKey vfsContextKey = "litestream/vfs/page-fetch"
-
-func contextWithPageFetch(f *VFSFile) context.Context {
-	return context.WithValue(context.Background(), pageFetchContextKey, f)
-}
-
-// IsVFSPageFetchContext reports whether ctx originated from a VFS page read.
-func IsVFSPageFetchContext(ctx context.Context) bool {
-	_, ok := PageFetchFileName(ctx)
-	return ok
-}
-
-// PageFetchFileName returns the database file name associated with a VFS page
-// read context. Returns empty string & false if ctx did not originate from a
-// VFS page read.
-func PageFetchFileName(ctx context.Context) (string, bool) {
-	if f, ok := ctx.Value(pageFetchContextKey).(*VFSFile); ok && f != nil {
-		return f.name, true
-	}
-	return "", false
-}
-
 // VFS implements the SQLite VFS interface for Litestream.
 // It is intended to be used for read replicas that read directly from S3.
 type VFS struct {
@@ -82,7 +58,6 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 	}
 }
 
-// SetReadInterceptor installs interceptor for page reads issued through this VFS.
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
 	slog.Info("opening file", "name", name, "flags", flags)
 
@@ -532,7 +507,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 	var data []byte
 	var lastErr error
-	ctx := contextWithPageFetch(f)
+	ctx := f.ctx
 	for attempt := 0; attempt < pageFetchRetryAttempts; attempt++ {
 		_, data, lastErr = FetchPage(ctx, f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
 		if lastErr == nil {
