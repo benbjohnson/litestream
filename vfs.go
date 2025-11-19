@@ -47,6 +47,7 @@ type VFS struct {
 	tempDir     string
 	tempDirErr  error
 	tempFiles   sync.Map // canonical name -> absolute path
+	tempNames   sync.Map // canonical name -> struct{}{}
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -85,12 +86,17 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
 	slog.Info("deleting file", "name", name, "dirSync", dirSync)
-	if err := vfs.deleteTempFile(name); err == nil {
+	err := vfs.deleteTempFile(name)
+	if err == nil {
 		return nil
-	} else if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, errTempFileNotFound) {
-		return err
 	}
-	return fmt.Errorf("cannot delete vfs file")
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if errors.Is(err, errTempFileNotFound) {
+		return fmt.Errorf("cannot delete vfs file")
+	}
+	return err
 }
 
 func (vfs *VFS) Access(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
@@ -182,18 +188,42 @@ func (vfs *VFS) openTempFile(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs
 func (vfs *VFS) deleteTempFile(name string) error {
 	path, ok := vfs.loadTempFilePath(name)
 	if !ok {
+		if vfs.wasTempFileName(name) {
+			vfs.unregisterTempFile(name)
+			return os.ErrNotExist
+		}
 		return errTempFileNotFound
 	}
 	if err := os.Remove(path); err != nil {
-		return err
+		if !os.IsNotExist(err) {
+			return err
+		}
 	}
-	vfs.tempFiles.Delete(vfs.canonicalTempName(name))
+	vfs.unregisterTempFile(name)
 	return nil
 }
 
 func (vfs *VFS) isTempFileName(name string) bool {
 	_, ok := vfs.loadTempFilePath(name)
 	return ok
+}
+
+func (vfs *VFS) wasTempFileName(name string) bool {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return false
+	}
+	_, ok := vfs.tempNames.Load(canonical)
+	return ok
+}
+
+func (vfs *VFS) unregisterTempFile(name string) {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return
+	}
+	vfs.tempFiles.Delete(canonical)
+	vfs.tempNames.Delete(canonical)
 }
 
 func (vfs *VFS) accessTempFile(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
@@ -217,6 +247,7 @@ func (vfs *VFS) trackTempFile(name, path string) func() {
 		return func() {}
 	}
 	vfs.tempFiles.Store(canonical, path)
+	vfs.tempNames.Store(canonical, struct{}{})
 	return func() { vfs.tempFiles.Delete(canonical) }
 }
 
@@ -483,7 +514,8 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 	// Check cache first (cache is thread-safe)
 	if data, ok := f.cache.Get(pgno); ok {
-		n = copy(p, data[off%4096:])
+		pageOffset := int(off % int64(pageSize))
+		n = copy(p, data[pageOffset:])
 		f.logger.Info("cache hit", "page", pgno, "n", n)
 
 		// Update the first page to pretend like we are in journal mode.
