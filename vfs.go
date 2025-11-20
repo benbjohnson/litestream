@@ -98,12 +98,13 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos      ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1 ltx.TXID // Last TXID read from level 1
-	index    map[uint32]ltx.PageIndexElem
-	pending  map[uint32]ltx.PageIndexElem
-	cache    *lru.Cache[uint32, []byte] // LRU cache for page data
-	lockType sqlite3vfs.LockType        // Current lock state
+	pos        ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1   ltx.TXID // Last TXID read from level 1
+	index      map[uint32]ltx.PageIndexElem
+	pending    map[uint32]ltx.PageIndexElem
+	cache      *lru.Cache[uint32, []byte] // LRU cache for page data
+	targetTime *time.Time                 // Target view time; nil means latest
+	lockType   sqlite3vfs.LockType        // Current lock state
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -134,6 +135,17 @@ func (f *VFSFile) Pos() ltx.Pos {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.pos
+}
+
+// TargetTime returns the current target time for the VFS file (nil for latest).
+func (f *VFSFile) TargetTime() *time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.targetTime == nil {
+		return nil
+	}
+	t := *f.targetTime
+	return &t
 }
 
 // MaxTXID1 returns the last TXID read from level 1.
@@ -174,15 +186,8 @@ func (f *VFSFile) Open() error {
 		return fmt.Errorf("no backup files available") // TODO: Open even when no files available.
 	}
 
-	// Determine the current position based off the latest LTX file.
-	var pos ltx.Pos
-	if len(infos) > 0 {
-		pos = ltx.Pos{TXID: infos[len(infos)-1].MaxTXID}
-	}
-	f.pos = pos
-
 	// Build the page index so we can lookup individual pages.
-	if err := f.buildIndex(f.ctx, infos); err != nil {
+	if err := f.rebuildIndex(f.ctx, infos, nil); err != nil {
 		f.logger.Error("cannot build index", "error", err)
 		return fmt.Errorf("cannot build index: %w", err)
 	}
@@ -194,16 +199,77 @@ func (f *VFSFile) Open() error {
 	return nil
 }
 
-// buildIndex constructs a lookup of pgno to LTX file offsets.
-func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
+// SetTargetTime rebuilds the page index to view the database at a specific time.
+func (f *VFSFile) SetTargetTime(ctx context.Context, timestamp time.Time) error {
+	if timestamp.IsZero() {
+		return fmt.Errorf("target time required")
+	}
+
+	infos, err := CalcRestorePlan(ctx, f.client, 0, timestamp, f.logger)
+	if err != nil {
+		return fmt.Errorf("cannot calc restore plan: %w", err)
+	} else if len(infos) == 0 {
+		return fmt.Errorf("no backup files available")
+	}
+
+	return f.rebuildIndex(ctx, infos, &timestamp)
+}
+
+// ResetTime rebuilds the page index to the latest available state.
+func (f *VFSFile) ResetTime(ctx context.Context) error {
+	infos, err := CalcRestorePlan(ctx, f.client, 0, time.Time{}, f.logger)
+	if err != nil {
+		return fmt.Errorf("cannot calc restore plan: %w", err)
+	} else if len(infos) == 0 {
+		return fmt.Errorf("no backup files available")
+	}
+
+	return f.rebuildIndex(ctx, infos, nil)
+}
+
+// rebuildIndex constructs a fresh page index and swaps it into the VFSFile.
+func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, target *time.Time) error {
+	index, err := f.buildIndexMap(ctx, infos)
+	if err != nil {
+		return err
+	}
+
+	var pos ltx.Pos
+	if len(infos) > 0 {
+		pos = ltx.Pos{TXID: infos[len(infos)-1].MaxTXID}
+	}
+
+	maxTXID1 := maxLevelTXID(infos, 1)
+
+	f.mu.Lock()
+	f.index = index
+	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.pos = pos
+	f.maxTXID1 = maxTXID1
+	if f.cache != nil {
+		f.cache.Purge()
+	}
+	if target == nil {
+		f.targetTime = nil
+	} else {
+		t := *target
+		f.targetTime = &t
+	}
+	f.mu.Unlock()
+
+	return nil
+}
+
+// buildIndexMap constructs a lookup of pgno to LTX file offsets.
+func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
 	index := make(map[uint32]ltx.PageIndexElem)
 	for _, info := range infos {
 		f.logger.Debug("opening page index", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		// Read page index.
-		idx, err := FetchPageIndex(context.Background(), f.client, info)
+		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return fmt.Errorf("fetch page index: %w", err)
+			return nil, fmt.Errorf("fetch page index: %w", err)
 		}
 
 		// Replace pages in overall index with new pages.
@@ -212,16 +278,18 @@ func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 			index[k] = v
 		}
 	}
+	return index, nil
+}
 
-	f.mu.Lock()
-	f.index = index
-	f.mu.Unlock()
-
-	return nil
+// buildIndex constructs a lookup of pgno to LTX file offsets.
+func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
+	return f.rebuildIndex(ctx, infos, nil)
 }
 
 func (f *VFSFile) Close() error {
 	f.logger.Info("closing file")
+	f.cancel()
+	f.wg.Wait()
 	return nil
 }
 
@@ -361,6 +429,9 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			if f.hasTargetTime() {
+				continue
+			}
 			if err := f.pollReplicaClient(ctx); err != nil {
 				// Don't log context cancellation errors during shutdown
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -418,6 +489,22 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	return nil
+}
+
+func (f *VFSFile) hasTargetTime() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.targetTime != nil
+}
+
+func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
+	var maxTXID ltx.TXID
+	for _, info := range infos {
+		if info.Level == level && info.MaxTXID > maxTXID {
+			maxTXID = info.MaxTXID
+		}
+	}
+	return maxTXID
 }
 
 func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (ltx.TXID, error) {
