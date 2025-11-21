@@ -1,8 +1,8 @@
 module github.com/benbjohnson/litestream
 
-go 1.24
+go 1.25
 
-toolchain go1.24.3
+toolchain go1.25.4
 
 require (
 	cloud.google.com/go/storage v1.36.0
