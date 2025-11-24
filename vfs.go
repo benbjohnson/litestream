@@ -9,11 +9,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/markusmobius/go-dateparser"
 	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
 )
@@ -98,13 +100,15 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos        ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1   ltx.TXID // Last TXID read from level 1
-	index      map[uint32]ltx.PageIndexElem
-	pending    map[uint32]ltx.PageIndexElem
-	cache      *lru.Cache[uint32, []byte] // LRU cache for page data
-	targetTime *time.Time                 // Target view time; nil means latest
-	lockType   sqlite3vfs.LockType        // Current lock state
+	pos             ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1        ltx.TXID // Last TXID read from level 1
+	index           map[uint32]ltx.PageIndexElem
+	pending         map[uint32]ltx.PageIndexElem
+	cache           *lru.Cache[uint32, []byte] // LRU cache for page data
+	targetTime      *time.Time                 // Target view time; nil means latest
+	latestLTXTime   time.Time                  // Timestamp of most recent LTX file
+	lastPollSuccess time.Time                  // Time of last successful poll
+	lockType        sqlite3vfs.LockType        // Current lock state
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -160,6 +164,20 @@ func (f *VFSFile) LockType() sqlite3vfs.LockType {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lockType
+}
+
+// LatestLTXTime returns the timestamp of the most recent LTX file.
+func (f *VFSFile) LatestLTXTime() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.latestLTXTime
+}
+
+// LastPollSuccess returns the time of the last successful poll.
+func (f *VFSFile) LastPollSuccess() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastPollSuccess
 }
 
 func (f *VFSFile) Open() error {
@@ -247,6 +265,9 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
+	if len(infos) > 0 {
+		f.latestLTXTime = infos[len(infos)-1].CreatedAt
+	}
 	if f.cache != nil {
 		f.cache.Purge()
 	}
@@ -420,6 +441,32 @@ func (f *VFSFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
 	return 0
 }
 
+// parseTimeValue parses a timestamp string, trying RFC3339 first, then relative expressions.
+func parseTimeValue(value string) (time.Time, error) {
+	// Try RFC3339Nano first (existing behavior)
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t, nil
+	}
+
+	// Try RFC3339 (without nanoseconds)
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+
+	// Fall back to dateparser for relative expressions
+	cfg := &dateparser.Configuration{
+		CurrentTime: time.Now().UTC(),
+	}
+	result, err := dateparser.Parse(cfg, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid timestamp (expected RFC3339 or relative time like '5 minutes ago'): %s", value)
+	}
+	if result.Time.IsZero() {
+		return time.Time{}, fmt.Errorf("could not parse time: %s", value)
+	}
+	return result.Time.UTC(), nil
+}
+
 // FileControl handles file control operations, specifically PRAGMA commands for time travel.
 func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*string, error) {
 	const SQLITE_FCNTL_PRAGMA = 14
@@ -433,6 +480,27 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 	f.logger.Info("file control", "pragma", name, "value", pragmaValue)
 
 	switch name {
+	case "litestream_txid":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_txid is read-only")
+		}
+		txid := f.Pos().TXID
+		result := fmt.Sprintf("%d", txid)
+		return &result, nil
+
+	case "litestream_lag":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_lag is read-only")
+		}
+		lastPoll := f.LastPollSuccess()
+		if lastPoll.IsZero() {
+			result := "-1" // Never polled successfully
+			return &result, nil
+		}
+		lag := int64(time.Since(lastPoll).Seconds())
+		result := strconv.FormatInt(lag, 10)
+		return &result, nil
+
 	case "litestream_time":
 		if pragmaValue == nil {
 			result := f.currentTimeString()
@@ -446,9 +514,9 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, nil
 		}
 
-		t, err := time.Parse(time.RFC3339Nano, *pragmaValue)
+		t, err := parseTimeValue(*pragmaValue)
 		if err != nil {
-			return nil, fmt.Errorf("parse timestamp: %w", err)
+			return nil, err
 		}
 		if err := f.SetTargetTime(context.Background(), t); err != nil {
 			return nil, err
@@ -465,7 +533,10 @@ func (f *VFSFile) currentTimeString() string {
 	if t := f.TargetTime(); t != nil {
 		return t.Format(time.RFC3339Nano)
 	}
-	return "latest"
+	if t := f.LatestLTXTime(); !t.IsZero() {
+		return t.Format(time.RFC3339Nano)
+	}
+	return "latest" // Fallback if no LTX files loaded
 }
 
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
@@ -485,6 +556,11 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					f.logger.Error("cannot fetch new ltx files", "error", err)
 				}
+			} else {
+				// Track successful poll time
+				f.mu.Lock()
+				f.lastPollSuccess = time.Now()
+				f.mu.Unlock()
 			}
 		}
 	}
