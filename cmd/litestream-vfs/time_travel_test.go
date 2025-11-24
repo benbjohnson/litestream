@@ -8,16 +8,13 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
-	"reflect"
 	"testing"
 	"time"
-	"unsafe"
 
-	"github.com/mattn/go-sqlite3"
+	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
 
 	"github.com/benbjohnson/litestream"
-	vfsbin "github.com/benbjohnson/litestream/cmd/litestream-vfs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
@@ -50,7 +47,7 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	if _, err := sqldb0.Exec("INSERT INTO t (x) VALUES (100)"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(2 * db.MonitorInterval)
+	time.Sleep(6 * db.MonitorInterval)
 
 	firstCreatedAt := fetchLTXCreatedAt(t, ctx, client)
 
@@ -60,14 +57,7 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	}
 	time.Sleep(4 * db.MonitorInterval)
 
-	driverName := fmt.Sprintf("litestream-time-%d", time.Now().UnixNano())
-	sql.Register(driverName, &sqlite3.SQLiteDriver{
-		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
-			return registerTimeFunctions(t, conn)
-		},
-	})
-
-	sqldb1, err := sql.Open(driverName, "file:/tmp/time-travel.db?vfs=litestream-time")
+	sqldb1, err := sql.Open("sqlite3", "file:/tmp/time-travel.db?vfs=litestream-time")
 	if err != nil {
 		t.Fatalf("failed to open database: %v", err)
 	}
@@ -83,7 +73,7 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	}
 
 	target := firstCreatedAt.Add(1 * time.Millisecond).UTC().Format(time.RFC3339Nano)
-	if _, err := sqldb1.Exec("SELECT litestream_set_time(?)", target); err != nil {
+	if _, err := sqldb1.Exec(fmt.Sprintf("PRAGMA LITESTREAM_TIME = '%s'", target)); err != nil {
 		t.Fatalf("set target time: %v", err)
 	}
 
@@ -94,13 +84,13 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	}
 
 	var currentTime string
-	if err := sqldb1.QueryRow("SELECT litestream_current_time()").Scan(&currentTime); err != nil {
+	if err := sqldb1.QueryRow("PRAGMA litestream_time").Scan(&currentTime); err != nil {
 		t.Fatalf("current time: %v", err)
 	} else if currentTime != target {
 		t.Fatalf("current time mismatch: got %s, want %s", currentTime, target)
 	}
 
-	if _, err := sqldb1.Exec("SELECT litestream_reset_time()"); err != nil {
+	if _, err := sqldb1.Exec("PRAGMA LITESTREAM_TIME = LATEST"); err != nil {
 		t.Fatalf("reset time: %v", err)
 	}
 
@@ -110,59 +100,11 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 		t.Fatalf("reset value: got %d, want %d", got, want)
 	}
 
-	if err := sqldb1.QueryRow("SELECT litestream_current_time()").Scan(&currentTime); err != nil {
+	if err := sqldb1.QueryRow("PRAGMA litestream_time").Scan(&currentTime); err != nil {
 		t.Fatalf("current time after reset: %v", err)
 	} else if currentTime != "latest" {
 		t.Fatalf("current time after reset mismatch: got %s, want latest", currentTime)
 	}
-}
-
-func registerTimeFunctions(tb testing.TB, conn *sqlite3.SQLiteConn) error {
-	tb.Helper()
-
-	handle := sqliteHandle(conn)
-	if handle == nil {
-		return fmt.Errorf("nil sqlite handle")
-	}
-
-	fileID, err := vfsbin.LitestreamFileID(handle)
-	if err != nil {
-		return err
-	}
-
-	dbPtr := uintptr(handle)
-	if err := litestream.RegisterVFSConnection(dbPtr, fileID); err != nil {
-		return err
-	}
-	tb.Cleanup(func() {
-		litestream.UnregisterVFSConnection(dbPtr)
-	})
-
-	if err := conn.RegisterFunc("litestream_set_time", func(ts string) error {
-		return litestream.SetVFSConnectionTime(dbPtr, ts)
-	}, true); err != nil {
-		return err
-	}
-	if err := conn.RegisterFunc("litestream_reset_time", func() error {
-		return litestream.ResetVFSConnectionTime(dbPtr)
-	}, true); err != nil {
-		return err
-	}
-	if err := conn.RegisterFunc("litestream_current_time", func() (string, error) {
-		return litestream.CurrentVFSConnectionTime(dbPtr)
-	}, true); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func sqliteHandle(conn *sqlite3.SQLiteConn) unsafe.Pointer {
-	v := reflect.ValueOf(conn).Elem().FieldByName("db")
-	if !v.IsValid() || v.IsNil() {
-		return nil
-	}
-	return unsafe.Pointer(v.UnsafePointer())
 }
 
 func fetchLTXCreatedAt(tb testing.TB, ctx context.Context, client litestream.ReplicaClient) time.Time {

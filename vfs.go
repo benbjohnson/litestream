@@ -420,6 +420,54 @@ func (f *VFSFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
 	return 0
 }
 
+// FileControl handles file control operations, specifically PRAGMA commands for time travel.
+func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*string, error) {
+	const SQLITE_FCNTL_PRAGMA = 14
+
+	if op != SQLITE_FCNTL_PRAGMA {
+		return nil, fmt.Errorf("unsupported file control op: %d", op)
+	}
+
+	name := strings.ToLower(pragmaName)
+
+	f.logger.Info("file control", "pragma", name, "value", pragmaValue)
+
+	switch name {
+	case "litestream_time":
+		if pragmaValue == nil {
+			result := f.currentTimeString()
+			return &result, nil
+		}
+
+		if strings.EqualFold(*pragmaValue, "latest") {
+			if err := f.ResetTime(context.Background()); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		}
+
+		t, err := time.Parse(time.RFC3339Nano, *pragmaValue)
+		if err != nil {
+			return nil, fmt.Errorf("parse timestamp: %w", err)
+		}
+		if err := f.SetTargetTime(context.Background(), t); err != nil {
+			return nil, err
+		}
+		return nil, nil
+
+	default:
+		return nil, sqlite3vfs.NotFoundError
+	}
+}
+
+// currentTimeString returns the current target time as a string.
+func (f *VFSFile) currentTimeString() string {
+	if t := f.TargetTime(); t != nil {
+		return t.Format(time.RFC3339Nano)
+	}
+	return "latest"
+}
+
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 	ticker := time.NewTicker(f.PollInterval)
 	defer ticker.Stop()
