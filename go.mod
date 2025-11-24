@@ -120,4 +120,5 @@ require (
 	google.golang.org/protobuf v1.31.0 // indirect
 )
 
+// TODO: Remove this replace directive once https://github.com/psanford/sqlite3vfs/pull/15 is merged
 replace github.com/psanford/sqlite3vfs => github.com/corylanou/sqlite3vfs v0.0.0-20251124192245-ee0c382650c8
