@@ -60,6 +60,9 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	}
 	time.Sleep(4 * db.MonitorInterval)
 
+	latestCreatedAt := fetchLTXCreatedAt(t, ctx, client)
+	expectedLatest := latestCreatedAt.UTC().Format(time.RFC3339Nano)
+
 	driverName := fmt.Sprintf("litestream-time-%d", time.Now().UnixNano())
 	sql.Register(driverName, &sqlite3.SQLiteDriver{
 		ConnectHook: func(conn *sqlite3.SQLiteConn) error {
@@ -82,6 +85,13 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 		t.Fatalf("latest value: got %d, want %d", got, want)
 	}
 
+	var currentTime string
+	if err := sqldb1.QueryRow("SELECT litestream_current_time()").Scan(&currentTime); err != nil {
+		t.Fatalf("current time at latest: %v", err)
+	} else if got, want := currentTime, expectedLatest; got != want {
+		t.Fatalf("current time at latest mismatch: got %s, want %s", got, want)
+	}
+
 	target := firstCreatedAt.Add(1 * time.Millisecond).UTC().Format(time.RFC3339Nano)
 	if _, err := sqldb1.Exec("SELECT litestream_set_time(?)", target); err != nil {
 		t.Fatalf("set target time: %v", err)
@@ -93,7 +103,6 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 		t.Fatalf("historical value: got %d, want %d", got, want)
 	}
 
-	var currentTime string
 	if err := sqldb1.QueryRow("SELECT litestream_current_time()").Scan(&currentTime); err != nil {
 		t.Fatalf("current time: %v", err)
 	} else if currentTime != target {
@@ -112,8 +121,8 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 
 	if err := sqldb1.QueryRow("SELECT litestream_current_time()").Scan(&currentTime); err != nil {
 		t.Fatalf("current time after reset: %v", err)
-	} else if currentTime != "latest" {
-		t.Fatalf("current time after reset mismatch: got %s, want latest", currentTime)
+	} else if currentTime != expectedLatest {
+		t.Fatalf("current time after reset mismatch: got %s, want %s", currentTime, expectedLatest)
 	}
 }
 

@@ -98,13 +98,14 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos        ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1   ltx.TXID // Last TXID read from level 1
-	index      map[uint32]ltx.PageIndexElem
-	pending    map[uint32]ltx.PageIndexElem
-	cache      *lru.Cache[uint32, []byte] // LRU cache for page data
-	targetTime *time.Time                 // Target view time; nil means latest
-	lockType   sqlite3vfs.LockType        // Current lock state
+	pos           ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1      ltx.TXID // Last TXID read from level 1
+	index         map[uint32]ltx.PageIndexElem
+	pending       map[uint32]ltx.PageIndexElem
+	cache         *lru.Cache[uint32, []byte] // LRU cache for page data
+	targetTime    *time.Time                 // Target view time; nil means latest
+	latestLTXTime time.Time                  // Timestamp of most recent LTX file seen
+	lockType      sqlite3vfs.LockType        // Current lock state
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -148,6 +149,13 @@ func (f *VFSFile) TargetTime() *time.Time {
 	return &t
 }
 
+// LatestLTXTime returns the timestamp of the most recent LTX file observed by the VFSFile.
+func (f *VFSFile) LatestLTXTime() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.latestLTXTime
+}
+
 // MaxTXID1 returns the last TXID read from level 1.
 func (f *VFSFile) MaxTXID1() ltx.TXID {
 	f.mu.Lock()
@@ -160,6 +168,18 @@ func (f *VFSFile) LockType() sqlite3vfs.LockType {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lockType
+}
+
+func (f *VFSFile) updateLatestLTXTime(ts time.Time) {
+	if ts.IsZero() {
+		return
+	}
+
+	f.mu.Lock()
+	if f.latestLTXTime.IsZero() || ts.After(f.latestLTXTime) {
+		f.latestLTXTime = ts
+	}
+	f.mu.Unlock()
 }
 
 func (f *VFSFile) Open() error {
@@ -235,8 +255,10 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	}
 
 	var pos ltx.Pos
+	var latestLTXTime time.Time
 	if len(infos) > 0 {
 		pos = ltx.Pos{TXID: infos[len(infos)-1].MaxTXID}
+		latestLTXTime = infos[len(infos)-1].CreatedAt
 	}
 
 	maxTXID1 := maxLevelTXID(infos, 1)
@@ -254,6 +276,9 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	} else {
 		t := *target
 		f.targetTime = &t
+	}
+	if !latestLTXTime.IsZero() && (f.latestLTXTime.IsZero() || latestLTXTime.After(f.latestLTXTime)) {
+		f.latestLTXTime = latestLTXTime
 	}
 	f.mu.Unlock()
 
@@ -540,6 +565,8 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		if err != nil {
 			return maxTXID, fmt.Errorf("fetch page index: %w", err)
 		}
+
+		f.updateLatestLTXTime(info.CreatedAt)
 
 		// Update the page index & current position.
 		for k, v := range idx {

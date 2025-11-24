@@ -68,7 +68,11 @@ func CurrentVFSConnectionTime(dbPtr uintptr) (string, error) {
 	if t := file.TargetTime(); t != nil {
 		return t.Format(time.RFC3339Nano), nil
 	}
-	return "latest", nil
+	latestTime := file.LatestLTXTime()
+	if latestTime.IsZero() {
+		return "latest", nil
+	}
+	return latestTime.Format(time.RFC3339Nano), nil
 }
 
 func vfsFileForConnection(dbPtr uintptr) (*VFSFile, error) {
