@@ -242,6 +242,7 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	maxTXID1 := maxLevelTXID(infos, 1)
 
 	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.index = index
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pos = pos
@@ -255,7 +256,6 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 		t := *target
 		f.targetTime = &t
 	}
-	f.mu.Unlock()
 
 	return nil
 }
