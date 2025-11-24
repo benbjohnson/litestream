@@ -573,14 +573,14 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	index := make(map[uint32]ltx.PageIndexElem)
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
-	maxTXID0, err := f.pollLevel(ctx, 0, pos.TXID, index)
+	result0, err := f.pollLevel(ctx, 0, pos.TXID, index)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
 
-	maxTXID1, err := f.pollLevel(ctx, 1, f.maxTXID1, index)
+	result1, err := f.pollLevel(ctx, 1, f.maxTXID1, index)
 	if err != nil {
-		return fmt.Errorf("poll L0: %w", err)
+		return fmt.Errorf("poll L1: %w", err)
 	}
 
 	// Send updates to a pending list if there are active readers.
@@ -614,9 +614,17 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	}
 
 	// Update to max TXID
-	f.pos.TXID = max(maxTXID0, maxTXID1)
-	f.maxTXID1 = maxTXID1
+	f.pos.TXID = max(result0.maxTXID, result1.maxTXID)
+	f.maxTXID1 = result1.maxTXID
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
+
+	// Update latestLTXTime to the most recent timestamp from either level
+	if !result0.createdAt.IsZero() && result0.createdAt.After(f.latestLTXTime) {
+		f.latestLTXTime = result0.createdAt
+	}
+	if !result1.createdAt.IsZero() && result1.createdAt.After(f.latestLTXTime) {
+		f.latestLTXTime = result1.createdAt
+	}
 
 	return nil
 }
@@ -637,24 +645,30 @@ func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
 	return maxTXID
 }
 
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (ltx.TXID, error) {
+// pollLevelResult contains the results of polling a single level.
+type pollLevelResult struct {
+	maxTXID   ltx.TXID
+	createdAt time.Time // CreatedAt of the most recent LTX file processed
+}
+
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (pollLevelResult, error) {
 	// Start reading from the next LTX file after the current position.
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return 0, fmt.Errorf("ltx files: %w", err)
+		return pollLevelResult{}, fmt.Errorf("ltx files: %w", err)
 	}
 
 	// Build an update across all new LTX files.
-	maxTXID := prevMaxTXID
+	result := pollLevelResult{maxTXID: prevMaxTXID}
 	for itr.Next() {
 		info := itr.Item()
 
 		// Ensure we are fetching the next transaction from our current position.
 		f.mu.Lock()
-		isNextTXID := info.MinTXID == maxTXID+1
+		isNextTXID := info.MinTXID == result.maxTXID+1
 		f.mu.Unlock()
 		if !isNextTXID {
-			return maxTXID, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, prevMaxTXID, info.MinTXID, info.MaxTXID)
+			return result, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, prevMaxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
@@ -662,7 +676,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		// Read page index.
 		idx, err := FetchPageIndex(context.Background(), f.client, info)
 		if err != nil {
-			return maxTXID, fmt.Errorf("fetch page index: %w", err)
+			return result, fmt.Errorf("fetch page index: %w", err)
 		}
 
 		// Update the page index & current position.
@@ -670,8 +684,9 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
 			index[k] = v
 		}
-		maxTXID = info.MaxTXID
+		result.maxTXID = info.MaxTXID
+		result.createdAt = info.CreatedAt
 	}
 
-	return maxTXID, nil
+	return result, nil
 }
