@@ -1747,6 +1747,9 @@ func expand(s string) (string, error) {
 // from the given path. This allows users to use standard connection string formats
 // across their tooling while Litestream extracts just the file path.
 func StripSQLitePrefix(s string) string {
+	if len(s) < 9 || s[0] != 's' {
+		return s
+	}
 	for _, prefix := range []string{"sqlite3://", "sqlite://"} {
 		if strings.HasPrefix(s, prefix) {
 			return strings.TrimPrefix(s, prefix)
