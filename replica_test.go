@@ -391,6 +391,69 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 	})
 }
 
+func TestReplica_Restore_InvalidFileSize(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	t.Run("EmptyFile", func(t *testing.T) {
+		var c mock.ReplicaClient
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == litestream.SnapshotLevel {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+					Level:     litestream.SnapshotLevel,
+					MinTXID:   1,
+					MaxTXID:   10,
+					Size:      0, // Empty file - this should cause an error
+					CreatedAt: time.Now(),
+				}}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		r := litestream.NewReplicaWithClient(db, &c)
+		outputPath := t.TempDir() + "/restored.db"
+
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil {
+			t.Fatal("expected error for empty file, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid ltx file") {
+			t.Fatalf("expected 'invalid ltx file' error, got: %v", err)
+		}
+	})
+
+	t.Run("TruncatedFile", func(t *testing.T) {
+		var c mock.ReplicaClient
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == litestream.SnapshotLevel {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+					Level:     litestream.SnapshotLevel,
+					MinTXID:   1,
+					MaxTXID:   10,
+					Size:      50, // Less than ltx.HeaderSize (100) - should cause an error
+					CreatedAt: time.Now(),
+				}}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		r := litestream.NewReplicaWithClient(db, &c)
+		outputPath := t.TempDir() + "/restored.db"
+
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil {
+			t.Fatal("expected error for truncated file, got nil")
+		}
+		if !strings.Contains(err.Error(), "invalid ltx file") {
+			t.Fatalf("expected 'invalid ltx file' error, got: %v", err)
+		}
+	})
+}
+
 func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	// This test verifies that context cancellation errors are not logged during shutdown.
 	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded
