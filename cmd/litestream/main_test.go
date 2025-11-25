@@ -2584,3 +2584,90 @@ dbs:
 		}
 	})
 }
+
+func TestStripSQLitePrefix(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{"sqlite3 prefix", "sqlite3:///path/to/db.sqlite", "/path/to/db.sqlite"},
+		{"sqlite prefix", "sqlite:///path/to/db.sqlite", "/path/to/db.sqlite"},
+		{"sqlite3 relative path", "sqlite3://./data/db.sqlite", "./data/db.sqlite"},
+		{"sqlite relative path", "sqlite://./data/db.sqlite", "./data/db.sqlite"},
+		{"sqlite3 tilde path", "sqlite3://~/db.sqlite", "~/db.sqlite"},
+		{"sqlite tilde path", "sqlite://~/db.sqlite", "~/db.sqlite"},
+		{"no prefix", "/path/to/db.sqlite", "/path/to/db.sqlite"},
+		{"relative no prefix", "./data/db.sqlite", "./data/db.sqlite"},
+		{"tilde no prefix", "~/db.sqlite", "~/db.sqlite"},
+		{"empty string", "", ""},
+		{"sqlite3 windows path", "sqlite3://C:/data/db.sqlite", "C:/data/db.sqlite"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := main.StripSQLitePrefix(tt.input)
+			if got != tt.want {
+				t.Errorf("StripSQLitePrefix(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestReadConfigFile_SQLiteConnectionString(t *testing.T) {
+	t.Run("ConfigWithSQLitePrefix", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+
+		filename := filepath.Join(dir, "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: sqlite3://`+dbPath+`
+    replicas:
+      - url: file://`+filepath.Join(dir, "replica")+`
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, true)
+		if err != nil {
+			t.Fatalf("ReadConfigFile failed: %v", err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatalf("expected 1 database, got %d", len(config.DBs))
+		}
+
+		if got := config.DBs[0].Path; got != dbPath {
+			t.Errorf("DBs[0].Path = %q, want %q", got, dbPath)
+		}
+	})
+
+	t.Run("ConfigWithSQLite3Prefix", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+
+		filename := filepath.Join(dir, "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: sqlite://`+dbPath+`
+    replicas:
+      - url: file://`+filepath.Join(dir, "replica")+`
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, true)
+		if err != nil {
+			t.Fatalf("ReadConfigFile failed: %v", err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatalf("expected 1 database, got %d", len(config.DBs))
+		}
+
+		if got := config.DBs[0].Path; got != dbPath {
+			t.Errorf("DBs[0].Path = %q, want %q", got, dbPath)
+		}
+	})
+}
