@@ -24,6 +24,7 @@ import (
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/nats"
+	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	"github.com/benbjohnson/litestream/webdav"
@@ -102,6 +103,16 @@ var (
 	natsCreds    = flag.String("nats-creds", os.Getenv("LITESTREAM_NATS_CREDS"), "")
 	natsUsername = flag.String("nats-username", os.Getenv("LITESTREAM_NATS_USERNAME"), "")
 	natsPassword = flag.String("nats-password", os.Getenv("LITESTREAM_NATS_PASSWORD"), "")
+)
+
+// Alibaba Cloud OSS settings
+var (
+	ossAccessKeyID     = flag.String("oss-access-key-id", os.Getenv("LITESTREAM_OSS_ACCESS_KEY_ID"), "")
+	ossAccessKeySecret = flag.String("oss-access-key-secret", os.Getenv("LITESTREAM_OSS_ACCESS_KEY_SECRET"), "")
+	ossRegion          = flag.String("oss-region", os.Getenv("LITESTREAM_OSS_REGION"), "")
+	ossBucket          = flag.String("oss-bucket", os.Getenv("LITESTREAM_OSS_BUCKET"), "")
+	ossPath            = flag.String("oss-path", os.Getenv("LITESTREAM_OSS_PATH"), "")
+	ossEndpoint        = flag.String("oss-endpoint", os.Getenv("LITESTREAM_OSS_ENDPOINT"), "")
 )
 
 func Integration() bool {
@@ -215,6 +226,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewWebDAVReplicaClient(tb)
 	case nats.ReplicaClientType:
 		return NewNATSReplicaClient(tb)
+	case oss.ReplicaClientType:
+		return NewOSSReplicaClient(tb)
 	case "tigris":
 		return NewTigrisReplicaClient(tb)
 	default:
@@ -344,6 +357,20 @@ func NewNATSReplicaClient(tb testing.TB) *nats.ReplicaClient {
 	c.Creds = *natsCreds
 	c.Username = *natsUsername
 	c.Password = *natsPassword
+	return c
+}
+
+// NewOSSReplicaClient returns a new client for integration testing.
+func NewOSSReplicaClient(tb testing.TB) *oss.ReplicaClient {
+	tb.Helper()
+
+	c := oss.NewReplicaClient()
+	c.AccessKeyID = *ossAccessKeyID
+	c.AccessKeySecret = *ossAccessKeySecret
+	c.Region = *ossRegion
+	c.Bucket = *ossBucket
+	c.Path = path.Join(*ossPath, fmt.Sprintf("%016x", rand.Uint64()))
+	c.Endpoint = *ossEndpoint
 	return c
 }
 

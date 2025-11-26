@@ -86,6 +86,7 @@ CGO_ENABLED=1 go build -tags vfs -o bin/litestream-vfs ./cmd/litestream-vfs  # T
 go test -v ./replica_client_test.go -integration s3
 go test -v ./replica_client_test.go -integration gcs
 go test -v ./replica_client_test.go -integration abs
+go test -v ./replica_client_test.go -integration oss
 go test -v ./replica_client_test.go -integration sftp
 ```
 
@@ -112,7 +113,7 @@ pre-commit run --all-files
 
 **Replica (`replica.go`)**: Connects a database to replication destinations via ReplicaClient interface. Manages periodic synchronization and maintains replication position.
 
-**ReplicaClient Interface** (`replica_client.go`): Abstraction for different storage backends (S3, GCS, Azure Blob Storage, SFTP, file system, NATS). Each implementation handles snapshot/WAL segment upload and restoration. The `LTXFiles` method includes a `useMetadata` parameter: when true, it fetches accurate timestamps from backend metadata (required for point-in-time restores); when false, it uses fast timestamps for normal operations. During compaction, the system preserves the earliest CreatedAt timestamp from source files to maintain temporal granularity for restoration.
+**ReplicaClient Interface** (`replica_client.go`): Abstraction for different storage backends (S3, GCS, Azure Blob Storage, OSS, SFTP, file system, NATS). Each implementation handles snapshot/WAL segment upload and restoration. The `LTXFiles` method includes a `useMetadata` parameter: when true, it fetches accurate timestamps from backend metadata (required for point-in-time restores); when false, it uses fast timestamps for normal operations. During compaction, the system preserves the earliest CreatedAt timestamp from source files to maintain temporal granularity for restoration.
 
 **WAL Processing**: The system monitors SQLite WAL files for changes, segments them into LTX format files, and replicates these segments to configured destinations. Uses SQLite checksums for integrity verification.
 
@@ -121,6 +122,7 @@ pre-commit run --all-files
 - **S3** (`s3/replica_client.go`): AWS S3 and compatible storage
 - **GCS** (`gs/replica_client.go`): Google Cloud Storage
 - **ABS** (`abs/replica_client.go`): Azure Blob Storage
+- **OSS** (`oss/replica_client.go`): Alibaba Cloud Object Storage Service
 - **SFTP** (`sftp/replica_client.go`): SSH File Transfer Protocol
 - **File** (`file/replica_client.go`): Local file system replication
 - **NATS** (`nats/replica_client.go`): NATS JetStream object storage
