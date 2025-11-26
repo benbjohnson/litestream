@@ -2,8 +2,10 @@ package main_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -134,6 +136,46 @@ dbs:
 			t.Fatalf("Replica.URL=%v, want %v", got, want)
 		}
 	})
+}
+
+func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("user.Current failed: %v", err)
+	}
+	if u.HomeDir == "" {
+		t.Skip("no home directory available for expansion test")
+	}
+
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "db.sqlite")
+	replicaPath := filepath.Join(tmpDir, "replica")
+	if err := os.MkdirAll(replicaPath, 0o755); err != nil {
+		t.Fatalf("failed to create replica directory: %v", err)
+	}
+
+	metaPath := filepath.Join("~", "litestream-meta")
+	config := &main.DBConfig{
+		Path:     dbPath,
+		MetaPath: &metaPath,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: replicaPath,
+		},
+	}
+
+	db, err := main.NewDBFromConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBFromConfig failed: %v", err)
+	}
+
+	expectedMetaPath := filepath.Join(u.HomeDir, "litestream-meta")
+	if got := db.MetaPath(); got != expectedMetaPath {
+		t.Fatalf("MetaPath not expanded: got %s, want %s", got, expectedMetaPath)
+	}
+	if config.MetaPath == nil || *config.MetaPath != expectedMetaPath {
+		t.Fatalf("config MetaPath not updated: got %v, want %s", config.MetaPath, expectedMetaPath)
+	}
 }
 
 func TestNewFileReplicaFromConfig(t *testing.T) {
@@ -1792,6 +1834,74 @@ func TestNewDBsFromDirectoryConfig_UniquePaths(t *testing.T) {
 	}
 }
 
+// TestNewDBsFromDirectoryConfig_MetaPathPerDatabase ensures that each database
+// discovered via a directory config receives a unique metadata directory when a
+// base meta-path is provided.
+func TestNewDBsFromDirectoryConfig_MetaPathPerDatabase(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	rootDB := filepath.Join(tmpDir, "primary.db")
+	createSQLiteDB(t, rootDB)
+
+	nestedDir := filepath.Join(tmpDir, "team", "nested")
+	if err := os.MkdirAll(nestedDir, 0o755); err != nil {
+		t.Fatalf("failed to create nested directory: %v", err)
+	}
+	nestedDB := filepath.Join(nestedDir, "analytics.db")
+	createSQLiteDB(t, nestedDB)
+
+	u, err := user.Current()
+	if err != nil {
+		t.Skipf("user.Current failed: %v", err)
+	}
+	if u.HomeDir == "" {
+		t.Skip("no home directory available for expansion test")
+	}
+
+	metaRoot := filepath.Join("~", "meta-root")
+	expandedMetaRoot := filepath.Join(u.HomeDir, "meta-root")
+	replicaDir := filepath.Join(t.TempDir(), "replica")
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		MetaPath:  &metaRoot,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: replicaDir,
+		},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedMetaPaths := map[string]string{
+		rootDB:   filepath.Join(expandedMetaRoot, ".primary.db"+litestream.MetaDirSuffix),
+		nestedDB: filepath.Join(expandedMetaRoot, "team", "nested", ".analytics.db"+litestream.MetaDirSuffix),
+	}
+
+	metaSeen := make(map[string]struct{})
+	for _, db := range dbs {
+		metaPath := db.MetaPath()
+		want, ok := expectedMetaPaths[db.Path()]
+		if !ok {
+			t.Fatalf("unexpected database path returned: %s", db.Path())
+		}
+		if metaPath != want {
+			t.Fatalf("database %s meta path mismatch: got %s, want %s", db.Path(), metaPath, want)
+		}
+		if _, dup := metaSeen[metaPath]; dup {
+			t.Fatalf("duplicate meta path detected: %s", metaPath)
+		}
+		metaSeen[metaPath] = struct{}{}
+	}
+}
+
 // TestNewDBsFromDirectoryConfig_SubdirectoryPaths verifies that the relative
 // directory structure is preserved in replica paths when using recursive scanning.
 func TestNewDBsFromDirectoryConfig_SubdirectoryPaths(t *testing.T) {
@@ -2106,6 +2216,139 @@ func TestNewDBsFromDirectoryConfig_ReplicasArray(t *testing.T) {
 			t.Errorf("duplicate replica path: %s", replicaPath)
 		}
 		paths[replicaPath] = true
+	}
+}
+
+func TestNewDBsFromDirectoryConfig_EmptyDirectoryRequiresDatabases(t *testing.T) {
+	tmpDir := t.TempDir()
+	replicaDir := filepath.Join(tmpDir, "replica")
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	if _, err := main.NewDBsFromDirectoryConfig(config); err == nil {
+		t.Fatalf("expected error for empty directory when watch disabled")
+	}
+}
+
+func TestNewDBsFromDirectoryConfig_EmptyDirectoryWithWatch(t *testing.T) {
+	tmpDir := t.TempDir()
+	replicaDir := filepath.Join(tmpDir, "replica")
+
+	config := &main.DBConfig{
+		Dir:     tmpDir,
+		Pattern: "*.db",
+		Watch:   true,
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(dbs) != 0 {
+		t.Fatalf("expected 0 databases, got %d", len(dbs))
+	}
+}
+
+func TestDirectoryMonitor_DetectsDatabaseLifecycle(t *testing.T) {
+	ctx := context.Background()
+
+	rootDir := t.TempDir()
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	initialPath := filepath.Join(rootDir, "initial.db")
+	createSQLiteDB(t, initialPath)
+
+	config := &main.DBConfig{
+		Dir:     rootDir,
+		Pattern: "*.db",
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(dbs, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Fatalf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, dbs)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	newPath := filepath.Join(rootDir, "new.db")
+	createSQLiteDB(t, newPath)
+
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), newPath) }) {
+		t.Fatalf("expected new database %s to be detected", newPath)
+	}
+
+	if err := os.Remove(newPath); err != nil {
+		t.Fatalf("failed to remove database: %v", err)
+	}
+
+	if !waitForCondition(5*time.Second, func() bool { return !hasDBPath(store.DBs(), newPath) }) {
+		t.Fatalf("expected database %s to be removed", newPath)
+	}
+}
+
+func TestDirectoryMonitor_RecursiveDetectsNestedDatabases(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	config := &main.DBConfig{
+		Dir:       rootDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		Watch:     true,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(nil, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Fatalf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, nil)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	deepDir := filepath.Join(rootDir, "tenant", "nested", "deeper")
+	if err := os.MkdirAll(deepDir, 0755); err != nil {
+		t.Fatalf("failed to create nested directories: %v", err)
+	}
+	deepDB := filepath.Join(deepDir, "deep.db")
+	createSQLiteDB(t, deepDB)
+
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), deepDB) }) {
+		t.Fatalf("expected nested database %s to be detected", deepDB)
 	}
 }
 
@@ -2670,4 +2913,26 @@ dbs:
 			t.Errorf("DBs[0].Path = %q, want %q", got, dbPath)
 		}
 	})
+}
+
+func hasDBPath(dbs []*litestream.DB, path string) bool {
+	for _, db := range dbs {
+		if db.Path() == path {
+			return true
+		}
+	}
+	return false
+}
+
+func waitForCondition(timeout time.Duration, fn func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if fn() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return fn()
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 }
