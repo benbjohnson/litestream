@@ -14,7 +14,7 @@ extern char* GoLitestreamUnregisterConnection(void* db);
 extern char* GoLitestreamSetTime(void* db, const char* timestamp);
 extern char* GoLitestreamResetTime(void* db);
 extern char* GoLitestreamTime(void* db, char** out);
-extern char* GoLitestreamTxid(void* db, sqlite3_int64* out);
+extern char* GoLitestreamTxid(void* db, char** out);
 extern char* GoLitestreamLag(void* db, sqlite3_int64* out);
 
 /* Internal function declarations */
@@ -138,7 +138,7 @@ static void litestream_txid_impl(sqlite3_context* ctx, int argc, sqlite3_value**
   (void)argv;
 
   sqlite3* db = sqlite3_context_db_handle(ctx);
-  sqlite3_int64 out = 0;
+  char* out = 0;
   char* err = GoLitestreamTxid(db, &out);
   if (err != 0) {
     sqlite3_result_error(ctx, err, -1);
@@ -146,7 +146,8 @@ static void litestream_txid_impl(sqlite3_context* ctx, int argc, sqlite3_value**
     return;
   }
 
-  sqlite3_result_int64(ctx, out);
+  sqlite3_result_text(ctx, out, -1, SQLITE_TRANSIENT);
+  free(out);
 }
 
 static void litestream_lag_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv) {

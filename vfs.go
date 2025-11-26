@@ -496,7 +496,7 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, fmt.Errorf("litestream_txid is read-only")
 		}
 		txid := f.Pos().TXID
-		result := fmt.Sprintf("%d", txid)
+		result := txid.String()
 		return &result, nil
 
 	case "litestream_lag":
@@ -748,13 +748,13 @@ func GetVFSConnectionTime(dbPtr uintptr) (string, error) {
 	return file.currentTimeString(), nil
 }
 
-// GetVFSConnectionTXID returns the current transaction ID for a connection.
-func GetVFSConnectionTXID(dbPtr uintptr) (int64, error) {
+// GetVFSConnectionTXID returns the current transaction ID for a connection as a hex string.
+func GetVFSConnectionTXID(dbPtr uintptr) (string, error) {
 	file, err := vfsFileForConnection(dbPtr)
 	if err != nil {
-		return 0, err
+		return "", err
 	}
-	return int64(file.Pos().TXID), nil
+	return file.Pos().TXID.String(), nil
 }
 
 // GetVFSConnectionLag returns seconds since last successful poll for a connection.

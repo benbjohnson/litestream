@@ -118,13 +118,13 @@ func GoLitestreamTime(dbPtr unsafe.Pointer, out **C.char) *C.char {
 }
 
 //export GoLitestreamTxid
-func GoLitestreamTxid(dbPtr unsafe.Pointer, out *C.sqlite3_int64) *C.char {
+func GoLitestreamTxid(dbPtr unsafe.Pointer, out **C.char) *C.char {
 	value, err := litestream.GetVFSConnectionTXID(uintptr(dbPtr))
 	if err != nil {
 		return C.CString(err.Error())
 	}
 	if out != nil {
-		*out = C.sqlite3_int64(value)
+		*out = C.CString(value)
 	}
 	return nil
 }
