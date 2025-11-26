@@ -1717,7 +1717,11 @@ func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool
 }
 
 // expand returns an absolute path for s.
+// It also strips SQLite connection string prefixes (sqlite://, sqlite3://).
 func expand(s string) (string, error) {
+	// Strip SQLite connection string prefixes if present.
+	s = StripSQLitePrefix(s)
+
 	// Just expand to absolute path if there is no home directory prefix.
 	prefix := "~" + string(os.PathSeparator)
 	if s != "~" && !strings.HasPrefix(s, prefix) {
@@ -1737,6 +1741,21 @@ func expand(s string) (string, error) {
 		return u.HomeDir, nil
 	}
 	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
+}
+
+// StripSQLitePrefix removes SQLite connection string prefixes (sqlite://, sqlite3://)
+// from the given path. This allows users to use standard connection string formats
+// across their tooling while Litestream extracts just the file path.
+func StripSQLitePrefix(s string) string {
+	if len(s) < 9 || s[0] != 's' {
+		return s
+	}
+	for _, prefix := range []string{"sqlite3://", "sqlite://"} {
+		if strings.HasPrefix(s, prefix) {
+			return strings.TrimPrefix(s, prefix)
+		}
+	}
+	return s
 }
 
 // txidVar allows the flag package to parse index flags as hex-formatted TXIDs
