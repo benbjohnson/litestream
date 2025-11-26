@@ -7,7 +7,8 @@ docker:
 VFS_BUILD_TAGS := vfs,SQLITE3VFS_LOADABLE_EXT
 VFS_SRC := ./cmd/litestream-vfs
 VFS_C_SRC := src/litestream-vfs.c
-DARWIN_LDFLAGS := -framework CoreFoundation -framework Security -lresolv
+MACOSX_MIN_VERSION := 11.0
+DARWIN_LDFLAGS := -framework CoreFoundation -framework Security -lresolv -mmacosx-version-min=$(MACOSX_MIN_VERSION)
 LINUX_LDFLAGS := -lpthread -ldl -lm
 
 .PHONY: vfs
