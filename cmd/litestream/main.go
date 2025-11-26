@@ -29,6 +29,7 @@ import (
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/nats"
+	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 	"github.com/benbjohnson/litestream/webdav"
@@ -1059,6 +1060,10 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 		if r.Client, err = newNATSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
+	case "oss":
+		if r.Client, err = newOSSReplicaClientFromConfig(c, r); err != nil {
+			return nil, err
+		}
 	default:
 		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
 	}
@@ -1513,6 +1518,69 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	}
 	if c.Timeout != nil {
 		client.Timeout = *c.Timeout
+	}
+
+	return client, nil
+}
+
+// newOSSReplicaClientFromConfig returns a new instance of oss.ReplicaClient built from config.
+func newOSSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *oss.ReplicaClient, err error) {
+	// Ensure URL & constituent parts are not both specified.
+	if c.URL != "" && c.Path != "" {
+		return nil, fmt.Errorf("cannot specify url & path for oss replica")
+	} else if c.URL != "" && c.Bucket != "" {
+		return nil, fmt.Errorf("cannot specify url & bucket for oss replica")
+	}
+
+	bucket, configPath := c.Bucket, c.Path
+	region, endpoint := c.Region, c.Endpoint
+
+	// Apply settings from URL, if specified.
+	if c.URL != "" {
+		_, host, upath, err := ParseReplicaURL(c.URL)
+		if err != nil {
+			return nil, err
+		}
+
+		var (
+			ubucket string
+			uregion string
+		)
+
+		ubucket, uregion, _ = oss.ParseHost(host)
+
+		// Only apply URL parts to fields that have not been overridden.
+		if configPath == "" {
+			configPath = upath
+		}
+		if bucket == "" {
+			bucket = ubucket
+		}
+		if region == "" {
+			region = uregion
+		}
+	}
+
+	// Ensure required settings are set.
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for oss replica")
+	}
+
+	// Build replica client.
+	client := oss.NewReplicaClient()
+	client.AccessKeyID = c.AccessKeyID
+	client.AccessKeySecret = c.SecretAccessKey
+	client.Bucket = bucket
+	client.Path = configPath
+	client.Region = region
+	client.Endpoint = endpoint
+
+	// Apply upload configuration if specified.
+	if c.PartSize != nil {
+		client.PartSize = int64(*c.PartSize)
+	}
+	if c.Concurrency != nil {
+		client.Concurrency = *c.Concurrency
 	}
 
 	return client, nil
