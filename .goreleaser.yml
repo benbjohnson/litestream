@@ -162,6 +162,8 @@ release:
     | macOS Intel | `litestream-vfs-v{{.Version}}-darwin-amd64.tar.gz` |
     | macOS Apple Silicon | `litestream-vfs-v{{.Version}}-darwin-arm64.tar.gz` |
 
+    See the [VFS documentation](https://litestream.io/guides/vfs/) for usage instructions.
+
   # Signing configuration
   # signs:
   #   - id: macos
