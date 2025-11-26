@@ -23,7 +23,7 @@ Litestream is a **disaster recovery tool for SQLite** that runs as a background 
 - **Multi-level Compaction**: Hierarchical compaction keeps storage efficient (30s → 5m → 1h → snapshots)
 - **Single Replica Constraint**: Each database is replicated to exactly one remote destination
 - **Pure Go Build**: Uses `modernc.org/sqlite`, so no CGO dependency for the main binary
-- **Optional NATS JetStream Support**: Additional replica backend alongside S3/GCS/ABS/File/SFTP
+- **Optional NATS JetStream Support**: Additional replica backend alongside S3/GCS/ABS/OSS/File/SFTP
 - **Snapshot Compatibility**: Only LTX-based backups are supported—keep legacy v0.3.x binaries to restore old WAL snapshots
 
 **Key Design Principles:**
@@ -728,7 +728,7 @@ if offset < 0 {
 
 ```bash
 # Test eventual consistency
-go test -v ./replica_client_test.go -integration [s3|gcs|abs|sftp]
+go test -v ./replica_client_test.go -integration [s3|gcs|abs|oss|sftp]
 
 # Test partial reads
 # (Example) add targeted partial-read tests in your backend package

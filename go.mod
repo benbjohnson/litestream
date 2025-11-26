@@ -52,6 +52,8 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
+require github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.3.0
+
 require (
 	cloud.google.com/go v0.111.0 // indirect
 	cloud.google.com/go/compute v1.23.3 // indirect
