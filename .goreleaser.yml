@@ -157,10 +157,10 @@ release:
 
     | Platform | File |
     |----------|------|
-    | Linux x86_64 | `litestream-vfs-VERSION-linux-amd64.tar.gz` |
-    | Linux ARM64 | `litestream-vfs-VERSION-linux-arm64.tar.gz` |
-    | macOS Intel | `litestream-vfs-VERSION-darwin-amd64.tar.gz` |
-    | macOS Apple Silicon | `litestream-vfs-VERSION-darwin-arm64.tar.gz` |
+    | Linux x86_64 | `litestream-vfs-v{{.Version}}-linux-amd64.tar.gz` |
+    | Linux ARM64 | `litestream-vfs-v{{.Version}}-linux-arm64.tar.gz` |
+    | macOS Intel | `litestream-vfs-v{{.Version}}-darwin-amd64.tar.gz` |
+    | macOS Apple Silicon | `litestream-vfs-v{{.Version}}-darwin-arm64.tar.gz` |
 
     See the [VFS documentation](https://litestream.io/guides/vfs/) for usage instructions.
 

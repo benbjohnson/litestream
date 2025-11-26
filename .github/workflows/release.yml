@@ -64,7 +64,7 @@ jobs:
 
   vfs-build-linux:
     name: Build VFS (Linux ${{ matrix.arch }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-20.04  # Use older Ubuntu for broader glibc compatibility (2.31)
     needs: goreleaser
     strategy:
       matrix:
@@ -98,6 +98,14 @@ jobs:
 
       - name: Build VFS extension
         run: make vfs-linux-${{ matrix.arch }}
+
+      - name: Verify artifact
+        run: |
+          file dist/litestream-vfs-linux-${{ matrix.arch }}.so
+          # For native arch, verify it can be loaded by SQLite
+          if [ "${{ matrix.arch }}" == "amd64" ]; then
+            sqlite3 ':memory:' ".load dist/litestream-vfs-linux-amd64.so" ".exit" && echo "Extension loads successfully"
+          fi
 
       - name: Create archive
         run: |
@@ -147,6 +155,12 @@ jobs:
 
       - name: Build VFS extension
         run: make vfs-darwin-${{ matrix.arch }}
+
+      - name: Verify artifact
+        run: |
+          file dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
+          # Verify the extension can be loaded by SQLite
+          sqlite3 ':memory:' ".load dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib" ".exit" && echo "Extension loads successfully"
 
       - name: Create archive
         run: |
