@@ -115,9 +115,9 @@ jobs:
       - name: Create archive
         run: |
           cd dist
-          cp litestream-vfs-linux-${{ matrix.arch }}.so litestream-vfs.so
+          cp litestream-vfs-linux-${{ matrix.arch }}.so litestream.so
           tar -czvf litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz \
-            litestream-vfs.so
+            litestream.so
 
       - name: Generate checksum
         run: |
@@ -178,9 +178,9 @@ jobs:
       - name: Create archive
         run: |
           cd dist
-          cp litestream-vfs-darwin-${{ matrix.arch }}.dylib litestream-vfs.dylib
+          cp litestream-vfs-darwin-${{ matrix.arch }}.dylib litestream.dylib
           tar -czvf litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
-            litestream-vfs.dylib
+            litestream.dylib
 
       - name: Generate checksum
         run: |
