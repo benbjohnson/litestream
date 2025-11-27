@@ -125,12 +125,6 @@ jobs:
           sha256sum litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz \
             > litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
 
-      - name: Generate checksum
-        run: |
-          cd dist
-          sha256sum litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz \
-            > litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256
-
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -187,12 +181,6 @@ jobs:
           cp litestream-vfs-darwin-${{ matrix.arch }}.dylib litestream.dylib
           tar -czvf litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
             litestream.dylib
-
-      - name: Generate checksum
-        run: |
-          cd dist
-          shasum -a 256 litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
-            > litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz.sha256
 
       - name: Generate checksum
         run: |
