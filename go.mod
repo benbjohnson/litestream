@@ -26,7 +26,7 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/psanford/sqlite3vfs v0.0.0-20240315230605-24e1d98cf361 // direct
+	github.com/psanford/sqlite3vfs v0.0.0-20251127171934-4e34e03a991a // direct
 	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.0
 	golang.org/x/crypto v0.41.0
@@ -119,6 +119,3 @@ require (
 	google.golang.org/grpc v1.60.1 // indirect
 	google.golang.org/protobuf v1.31.0 // indirect
 )
-
-// TODO: Remove this replace directive once https://github.com/psanford/sqlite3vfs/pull/15 is merged
-replace github.com/psanford/sqlite3vfs => github.com/corylanou/sqlite3vfs v0.0.0-20251124192245-ee0c382650c8
