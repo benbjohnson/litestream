@@ -151,6 +151,17 @@ release:
     ### Binary installation
     Download the appropriate archive for your platform, extract, and move to your PATH.
 
+    ## VFS Extension (Experimental)
+
+    SQLite loadable extensions for read-only access to Litestream replicas are available for supported platforms:
+
+    | Platform | File |
+    |----------|------|
+    | Linux x86_64 | `litestream-vfs-v{{.Version}}-linux-amd64.tar.gz` |
+    | Linux ARM64 | `litestream-vfs-v{{.Version}}-linux-arm64.tar.gz` |
+    | macOS Intel | `litestream-vfs-v{{.Version}}-darwin-amd64.tar.gz` |
+    | macOS Apple Silicon | `litestream-vfs-v{{.Version}}-darwin-arm64.tar.gz` |
+
   # Signing configuration
   # signs:
   #   - id: macos
