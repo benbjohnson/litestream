@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
+	_ "unsafe"
 
 	lru "github.com/hashicorp/golang-lru/v2"
+	"github.com/markusmobius/go-dateparser"
 	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
 )
@@ -21,6 +24,16 @@ import (
 const (
 	DefaultPollInterval = 1 * time.Second
 	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
+)
+
+var (
+	//go:linkname sqlite3vfsFileMap github.com/psanford/sqlite3vfs.fileMap
+	sqlite3vfsFileMap map[uint64]sqlite3vfs.File
+
+	//go:linkname sqlite3vfsFileMux github.com/psanford/sqlite3vfs.fileMux
+	sqlite3vfsFileMux sync.Mutex
+
+	vfsConnectionMap sync.Map // map[uintptr]uint64
 )
 
 // VFS implements the SQLite VFS interface for Litestream.
@@ -98,13 +111,15 @@ type VFSFile struct {
 	client ReplicaClient
 	name   string
 
-	pos        ltx.Pos  // Last TXID read from level 0 or 1
-	maxTXID1   ltx.TXID // Last TXID read from level 1
-	index      map[uint32]ltx.PageIndexElem
-	pending    map[uint32]ltx.PageIndexElem
-	cache      *lru.Cache[uint32, []byte] // LRU cache for page data
-	targetTime *time.Time                 // Target view time; nil means latest
-	lockType   sqlite3vfs.LockType        // Current lock state
+	pos             ltx.Pos  // Last TXID read from level 0 or 1
+	maxTXID1        ltx.TXID // Last TXID read from level 1
+	index           map[uint32]ltx.PageIndexElem
+	pending         map[uint32]ltx.PageIndexElem
+	cache           *lru.Cache[uint32, []byte] // LRU cache for page data
+	targetTime      *time.Time                 // Target view time; nil means latest
+	latestLTXTime   time.Time                  // Timestamp of most recent LTX file
+	lastPollSuccess time.Time                  // Time of last successful poll
+	lockType        sqlite3vfs.LockType        // Current lock state
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -160,6 +175,20 @@ func (f *VFSFile) LockType() sqlite3vfs.LockType {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lockType
+}
+
+// LatestLTXTime returns the timestamp of the most recent LTX file.
+func (f *VFSFile) LatestLTXTime() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.latestLTXTime
+}
+
+// LastPollSuccess returns the time of the last successful poll.
+func (f *VFSFile) LastPollSuccess() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastPollSuccess
 }
 
 func (f *VFSFile) Open() error {
@@ -247,6 +276,9 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
+	if len(infos) > 0 {
+		f.latestLTXTime = infos[len(infos)-1].CreatedAt
+	}
 	if f.cache != nil {
 		f.cache.Purge()
 	}
@@ -420,6 +452,32 @@ func (f *VFSFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
 	return 0
 }
 
+// parseTimeValue parses a timestamp string, trying RFC3339 first, then relative expressions.
+func parseTimeValue(value string) (time.Time, error) {
+	// Try RFC3339Nano first (existing behavior)
+	if t, err := time.Parse(time.RFC3339Nano, value); err == nil {
+		return t, nil
+	}
+
+	// Try RFC3339 (without nanoseconds)
+	if t, err := time.Parse(time.RFC3339, value); err == nil {
+		return t, nil
+	}
+
+	// Fall back to dateparser for relative expressions
+	cfg := &dateparser.Configuration{
+		CurrentTime: time.Now().UTC(),
+	}
+	result, err := dateparser.Parse(cfg, value)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("invalid timestamp (expected RFC3339 or relative time like '5 minutes ago'): %s", value)
+	}
+	if result.Time.IsZero() {
+		return time.Time{}, fmt.Errorf("could not parse time: %s", value)
+	}
+	return result.Time.UTC(), nil
+}
+
 // FileControl handles file control operations, specifically PRAGMA commands for time travel.
 func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*string, error) {
 	const SQLITE_FCNTL_PRAGMA = 14
@@ -433,6 +491,27 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 	f.logger.Info("file control", "pragma", name, "value", pragmaValue)
 
 	switch name {
+	case "litestream_txid":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_txid is read-only")
+		}
+		txid := f.Pos().TXID
+		result := txid.String()
+		return &result, nil
+
+	case "litestream_lag":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_lag is read-only")
+		}
+		lastPoll := f.LastPollSuccess()
+		if lastPoll.IsZero() {
+			result := "-1" // Never polled successfully
+			return &result, nil
+		}
+		lag := int64(time.Since(lastPoll).Seconds())
+		result := strconv.FormatInt(lag, 10)
+		return &result, nil
+
 	case "litestream_time":
 		if pragmaValue == nil {
 			result := f.currentTimeString()
@@ -446,9 +525,9 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, nil
 		}
 
-		t, err := time.Parse(time.RFC3339Nano, *pragmaValue)
+		t, err := parseTimeValue(*pragmaValue)
 		if err != nil {
-			return nil, fmt.Errorf("parse timestamp: %w", err)
+			return nil, err
 		}
 		if err := f.SetTargetTime(context.Background(), t); err != nil {
 			return nil, err
@@ -465,7 +544,10 @@ func (f *VFSFile) currentTimeString() string {
 	if t := f.TargetTime(); t != nil {
 		return t.Format(time.RFC3339Nano)
 	}
-	return "latest"
+	if t := f.LatestLTXTime(); !t.IsZero() {
+		return t.Format(time.RFC3339Nano)
+	}
+	return "latest" // Fallback if no LTX files loaded
 }
 
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
@@ -485,6 +567,11 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					f.logger.Error("cannot fetch new ltx files", "error", err)
 				}
+			} else {
+				// Track successful poll time
+				f.mu.Lock()
+				f.lastPollSuccess = time.Now()
+				f.mu.Unlock()
 			}
 		}
 	}
@@ -497,14 +584,14 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	index := make(map[uint32]ltx.PageIndexElem)
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
-	maxTXID0, err := f.pollLevel(ctx, 0, pos.TXID, index)
+	result0, err := f.pollLevel(ctx, 0, pos.TXID, index)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
 
-	maxTXID1, err := f.pollLevel(ctx, 1, f.maxTXID1, index)
+	result1, err := f.pollLevel(ctx, 1, f.maxTXID1, index)
 	if err != nil {
-		return fmt.Errorf("poll L0: %w", err)
+		return fmt.Errorf("poll L1: %w", err)
 	}
 
 	// Send updates to a pending list if there are active readers.
@@ -538,9 +625,17 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	}
 
 	// Update to max TXID
-	f.pos.TXID = max(maxTXID0, maxTXID1)
-	f.maxTXID1 = maxTXID1
+	f.pos.TXID = max(result0.maxTXID, result1.maxTXID)
+	f.maxTXID1 = result1.maxTXID
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
+
+	// Update latestLTXTime to the most recent timestamp from either level
+	if !result0.createdAt.IsZero() && result0.createdAt.After(f.latestLTXTime) {
+		f.latestLTXTime = result0.createdAt
+	}
+	if !result1.createdAt.IsZero() && result1.createdAt.After(f.latestLTXTime) {
+		f.latestLTXTime = result1.createdAt
+	}
 
 	return nil
 }
@@ -561,24 +656,30 @@ func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
 	return maxTXID
 }
 
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (ltx.TXID, error) {
+// pollLevelResult contains the results of polling a single level.
+type pollLevelResult struct {
+	maxTXID   ltx.TXID
+	createdAt time.Time // CreatedAt of the most recent LTX file processed
+}
+
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (pollLevelResult, error) {
 	// Start reading from the next LTX file after the current position.
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return 0, fmt.Errorf("ltx files: %w", err)
+		return pollLevelResult{}, fmt.Errorf("ltx files: %w", err)
 	}
 
 	// Build an update across all new LTX files.
-	maxTXID := prevMaxTXID
+	result := pollLevelResult{maxTXID: prevMaxTXID}
 	for itr.Next() {
 		info := itr.Item()
 
 		// Ensure we are fetching the next transaction from our current position.
 		f.mu.Lock()
-		isNextTXID := info.MinTXID == maxTXID+1
+		isNextTXID := info.MinTXID == result.maxTXID+1
 		f.mu.Unlock()
 		if !isNextTXID {
-			return maxTXID, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, prevMaxTXID, info.MinTXID, info.MaxTXID)
+			return result, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, prevMaxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
@@ -586,7 +687,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		// Read page index.
 		idx, err := FetchPageIndex(context.Background(), f.client, info)
 		if err != nil {
-			return maxTXID, fmt.Errorf("fetch page index: %w", err)
+			return result, fmt.Errorf("fetch page index: %w", err)
 		}
 
 		// Update the page index & current position.
@@ -594,8 +695,106 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
 			index[k] = v
 		}
-		maxTXID = info.MaxTXID
+		result.maxTXID = info.MaxTXID
+		result.createdAt = info.CreatedAt
 	}
 
-	return maxTXID, nil
+	return result, nil
+}
+
+// RegisterVFSConnection maps a SQLite connection handle to its VFS file ID.
+func RegisterVFSConnection(dbPtr uintptr, fileID uint64) error {
+	if _, ok := lookupVFSFile(fileID); !ok {
+		return fmt.Errorf("vfs file not found: id=%d", fileID)
+	}
+	vfsConnectionMap.Store(dbPtr, fileID)
+	return nil
+}
+
+// UnregisterVFSConnection removes a connection mapping.
+func UnregisterVFSConnection(dbPtr uintptr) {
+	vfsConnectionMap.Delete(dbPtr)
+}
+
+// SetVFSConnectionTime rebuilds the VFS index for a connection at a timestamp.
+func SetVFSConnectionTime(dbPtr uintptr, timestamp string) error {
+	file, err := vfsFileForConnection(dbPtr)
+	if err != nil {
+		return err
+	}
+
+	t, err := parseTimeValue(timestamp)
+	if err != nil {
+		return err
+	}
+	return file.SetTargetTime(context.Background(), t)
+}
+
+// ResetVFSConnectionTime rebuilds the VFS index to the latest state.
+func ResetVFSConnectionTime(dbPtr uintptr) error {
+	file, err := vfsFileForConnection(dbPtr)
+	if err != nil {
+		return err
+	}
+	return file.ResetTime(context.Background())
+}
+
+// GetVFSConnectionTime returns the current time for a connection.
+func GetVFSConnectionTime(dbPtr uintptr) (string, error) {
+	file, err := vfsFileForConnection(dbPtr)
+	if err != nil {
+		return "", err
+	}
+	return file.currentTimeString(), nil
+}
+
+// GetVFSConnectionTXID returns the current transaction ID for a connection as a hex string.
+func GetVFSConnectionTXID(dbPtr uintptr) (string, error) {
+	file, err := vfsFileForConnection(dbPtr)
+	if err != nil {
+		return "", err
+	}
+	return file.Pos().TXID.String(), nil
+}
+
+// GetVFSConnectionLag returns seconds since last successful poll for a connection.
+func GetVFSConnectionLag(dbPtr uintptr) (int64, error) {
+	file, err := vfsFileForConnection(dbPtr)
+	if err != nil {
+		return 0, err
+	}
+	lastPoll := file.LastPollSuccess()
+	if lastPoll.IsZero() {
+		return -1, nil
+	}
+	return int64(time.Since(lastPoll).Seconds()), nil
+}
+
+func vfsFileForConnection(dbPtr uintptr) (*VFSFile, error) {
+	v, ok := vfsConnectionMap.Load(dbPtr)
+	if !ok {
+		return nil, fmt.Errorf("connection not registered")
+	}
+	fileID, ok := v.(uint64)
+	if !ok {
+		return nil, fmt.Errorf("invalid connection mapping")
+	}
+	file, ok := lookupVFSFile(fileID)
+	if !ok {
+		return nil, fmt.Errorf("vfs file not found: id=%d", fileID)
+	}
+	return file, nil
+}
+
+func lookupVFSFile(fileID uint64) (*VFSFile, bool) {
+	sqlite3vfsFileMux.Lock()
+	defer sqlite3vfsFileMux.Unlock()
+
+	file, ok := sqlite3vfsFileMap[fileID]
+	if !ok {
+		return nil, false
+	}
+
+	vfsFile, ok := file.(*VFSFile)
+	return vfsFile, ok
 }
