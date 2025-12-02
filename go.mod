@@ -1,8 +1,8 @@
 module github.com/benbjohnson/litestream
 
-go 1.24
+go 1.25
 
-toolchain go1.24.3
+toolchain go1.25.4
 
 require (
 	cloud.google.com/go/storage v1.36.0
@@ -26,6 +26,7 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
+	github.com/psanford/sqlite3vfs v0.0.0-20251127171934-4e34e03a991a // direct
 	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.0
 	golang.org/x/crypto v0.41.0
@@ -85,9 +86,14 @@ require (
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/googleapis/enterprise-certificate-proxy v0.3.2 // indirect
 	github.com/googleapis/gax-go/v2 v2.12.0 // indirect
+	github.com/hablullah/go-hijri v1.0.2 // indirect
+	github.com/hablullah/go-juliandays v1.0.0 // indirect
+	github.com/jalaali/go-jalaali v0.0.0-20210801064154-80525e88d958 // indirect
 	github.com/klauspost/compress v1.18.0 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/kylelemons/godebug v1.1.0 // indirect
+	github.com/magefile/mage v1.14.0 // indirect
+	github.com/markusmobius/go-dateparser v1.2.4 // indirect
 	github.com/mattn/go-colorable v0.1.13 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
@@ -98,8 +104,9 @@ require (
 	github.com/prometheus/client_model v0.5.0 // indirect
 	github.com/prometheus/common v0.45.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
-	github.com/psanford/sqlite3vfs v0.0.0-20240315230605-24e1d98cf361 // direct
 	github.com/spf13/cast v1.7.1 // indirect
+	github.com/tetratelabs/wazero v1.2.1 // indirect
+	github.com/wasilibs/go-re2 v1.3.0 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.46.1 // indirect

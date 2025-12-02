@@ -357,6 +357,49 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 	})
 
+	// Issue #847: When a level has overlapping files where a larger compacted file
+	// covers a smaller file's entire range, the smaller file should be skipped
+	// rather than causing a non-contiguous error.
+	t.Run("OverlappingFilesWithinLevel", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5},
+				}), nil
+			case 2:
+				// Simulates issue #847: Files are sorted by MinTXID (filename order).
+				// File 1 is a large compacted file covering 1-100.
+				// File 2 is a smaller file covering 50-60, which is fully within file 1's range.
+				// Before the fix, file 2 would pass the filter (MaxTXID 60 > infos.MaxTXID() 5)
+				// but then fail the contiguity check after file 1 is added.
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 2, MinTXID: 1, MaxTXID: 100},
+					{Level: 2, MinTXID: 50, MaxTXID: 60},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 100, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		// Plan should contain only snapshot and the large file, not the smaller overlapping file
+		if got, want := len(plan), 2; got != want {
+			t.Fatalf("n=%d, want %d", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[1], (ltx.FileInfo{Level: 2, MinTXID: 1, MaxTXID: 100}); got != want {
+			t.Fatalf("plan[1]=%#v, want %#v", got, want)
+		}
+	})
+
 	t.Run("ErrTxNotAvailable", func(t *testing.T) {
 		var c mock.ReplicaClient
 		r := litestream.NewReplicaWithClient(db, &c)

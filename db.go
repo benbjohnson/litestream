@@ -1149,7 +1149,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		}
 	} else {
 		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap); err != nil {
-			return fmt.Errorf("write ltx from db: %w", err)
+			return fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
 

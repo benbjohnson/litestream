@@ -549,6 +549,13 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 		// Append each storage path to the list
 		for _, info := range a {
+			// Skip if this file's range is already covered by previously added files.
+			// This can happen when a larger compacted file at the same level covers
+			// a smaller file's entire range (see issue #847).
+			if info.MaxTXID <= infos.MaxTXID() {
+				continue
+			}
+
 			// Ensure TXIDs are contiguous between each paths.
 			if !ltx.IsContiguous(infos.MaxTXID(), info.MinTXID, info.MaxTXID) {
 				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",
