@@ -1888,6 +1888,13 @@ func (f *injectingFile) ReadAt(p []byte, off int64) (int, error) {
 	return f.File.ReadAt(p, off)
 }
 
+func (f *injectingFile) FileControl(op int, pragmaName string, pragmaValue *string) (*string, error) {
+	if fc, ok := f.File.(sqlite3vfs.FileController); ok {
+		return fc.FileControl(op, pragmaName, pragmaValue)
+	}
+	return nil, sqlite3vfs.NotFoundError
+}
+
 func registerTestVFS(tb testing.TB, vfs sqlite3vfs.VFS) string {
 	tb.Helper()
 	name := fmt.Sprintf("litestream-%s-%d", strings.ToLower(tb.Name()), time.Now().UnixNano())

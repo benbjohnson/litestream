@@ -8,11 +8,13 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
+	"github.com/stretchr/testify/require"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -198,18 +200,15 @@ func TestVFS_PragmaLitestreamLag(t *testing.T) {
 	defer sqldb1.Close()
 	sqldb1.SetMaxOpenConns(1)
 
-	// Wait for at least one successful poll (poll runs on ticker, not immediately)
-	time.Sleep(5 * vfs.PollInterval)
-
+	// Wait for replica to catch up with polling.
 	var lag int64
-	if err := sqldb1.QueryRow("PRAGMA litestream_lag").Scan(&lag); err != nil {
-		t.Fatalf("query lag: %v", err)
-	}
-	// Lag should be -1 (never polled) or a small non-negative value after polling
-	// -1 is valid if no poll has succeeded yet
-	if lag < -1 || lag > 5 {
-		t.Fatalf("expected lag between -1 and 5 seconds, got %d", lag)
-	}
+	require.Eventually(t, func() bool {
+		if err := sqldb1.QueryRow("PRAGMA litestream_lag").Scan(&lag); err != nil {
+			t.Logf("query lag: %v", err)
+			return false
+		}
+		return lag >= 0
+	}, 10*time.Second, vfs.PollInterval, "lag should become >= 0")
 
 	// Test that setting litestream_lag fails (read-only)
 	if _, err := sqldb1.Exec("PRAGMA litestream_lag = 123"); err == nil {
@@ -259,12 +258,38 @@ func TestVFS_PragmaRelativeTime(t *testing.T) {
 	// The parse should succeed, but may return "no backup files available" if too far in past
 	now := time.Now()
 	_, err = sqldb1.Exec("PRAGMA litestream_time = '1 second ago'")
-	// This might fail if no LTX files exist at that time, which is expected
-	// The important thing is that the parsing worked (not a "parse timestamp" error)
-	if err != nil && err.Error() != "no backup files available" {
-		// Check if it's a parse error vs a "no files" error
-		if err.Error() == "invalid timestamp (expected RFC3339 or relative time like '5 minutes ago'): 1 second ago" {
-			t.Fatalf("relative time parsing failed: %v", err)
+	// This might fail if no LTX files exist at that time, which is expected.
+	// The important thing is that the parsing worked (not a "parse timestamp" error).
+	if err != nil {
+		errMsg := err.Error()
+		// These are expected errors that indicate parsing succeeded but time-travel
+		// couldn't be performed (no files at that time).
+		expectedErrors := []string{
+			"no backup files available",
+			"timestamp is before earliest LTX file",
+		}
+		expectedSubstrings := []string{
+			"transaction not available", // ErrTxNotAvailable when target is before earliest LTX
+			"SQL logic error",           // SQLite error during page index rebuild for time-travel
+		}
+		isExpected := false
+		for _, expected := range expectedErrors {
+			if errMsg == expected {
+				isExpected = true
+				break
+			}
+		}
+		if !isExpected {
+			for _, substr := range expectedSubstrings {
+				if strings.Contains(errMsg, substr) {
+					isExpected = true
+					break
+				}
+			}
+		}
+		if !isExpected {
+			// Fail on any unexpected error to catch regressions
+			t.Fatalf("unexpected error from relative time PRAGMA: %v", err)
 		}
 	}
 
