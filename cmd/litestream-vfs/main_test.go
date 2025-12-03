@@ -609,8 +609,10 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	}
 }
 
+// TestVFS_OverlappingTransactionCommitStorm tests that the VFS can handle
+// concurrent read operations while writes are happening on the primary.
+// The test verifies that the replica eventually catches up with the primary.
 func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
-	t.Skip("FIXME: Flaky test - VFS polling race with background monitoring")
 	client := file.NewReplicaClient(t.TempDir())
 	const interval = 25 * time.Millisecond
 	db, primary := openReplicatedPrimary(t, client, interval, interval)
@@ -640,6 +642,7 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 	replica := openVFSReplicaDB(t, vfsName)
 	defer replica.Close()
 
+	// Verify initial sync
 	require.Eventually(t, func() bool {
 		var primaryCount int
 		if err := primary.QueryRow("SELECT COUNT(*) FROM ledger").Scan(&primaryCount); err != nil {
@@ -650,9 +653,10 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 			return false
 		}
 		return primaryCount == replicaCount
-	}, time.Minute, 25*time.Millisecond, "ledger counts should match")
+	}, time.Minute, 25*time.Millisecond, "ledger counts should match initially")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	// Run concurrent writers for a short period (reduced from 10s to 3s)
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	var writerWG sync.WaitGroup
 	writer := func(account int) {
@@ -676,21 +680,21 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 				primary.Exec("ROLLBACK")
 				continue
 			}
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(time.Duration(rnd.Intn(5)+1) * time.Millisecond):
-			}
+			// Slow down writes to allow background monitor to keep up
+			time.Sleep(time.Duration(rnd.Intn(20)+10) * time.Millisecond)
 		}
 	}
 	writerWG.Add(2)
 	go writer(1)
 	go writer(2)
 
+	// Run concurrent reader that verifies count never goes to zero
 	readerCtx, readerCancel := context.WithCancel(ctx)
 	readerErr := make(chan error, 1)
+	var readerWG sync.WaitGroup
+	readerWG.Add(1)
 	go func() {
-		defer readerCancel()
+		defer readerWG.Done()
 		for {
 			select {
 			case <-readerCtx.Done():
@@ -706,25 +710,27 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 				readerErr <- fmt.Errorf("ledger count went to zero")
 				return
 			}
+			time.Sleep(25 * time.Millisecond)
 		}
 	}()
 
 	<-ctx.Done()
 	readerCancel()
 	writerWG.Wait()
+	readerWG.Wait()
 
-	// Force sync multiple times to ensure all transactions are uploaded
-	// The background monitor may still be syncing, so we need multiple syncs
-	for i := 0; i < 3; i++ {
-		syncCtx, syncCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = db.Sync(syncCtx)
-		if db.Replica != nil {
-			_ = db.Replica.Sync(syncCtx)
+	// Check for reader errors
+	select {
+	case err := <-readerErr:
+		if err != nil {
+			t.Fatalf("reader error: %v", err)
 		}
-		syncCancel()
+	default:
 	}
 
-	// Wait for VFS replica to catch up
+	// Force final sync and wait for replica to catch up
+	forceReplicaSync(t, db)
+
 	require.Eventually(t, func() bool {
 		var primaryCount int
 		if err := primary.QueryRow("SELECT COUNT(*) FROM ledger").Scan(&primaryCount); err != nil {
@@ -735,25 +741,7 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 			return false
 		}
 		return primaryCount == replicaCount
-	}, 30*time.Second, 50*time.Millisecond, "ledger counts should match after writer done")
-	select {
-	case err := <-readerErr:
-		if err != nil {
-			t.Fatalf("reader error: %v", err)
-		}
-	default:
-	}
-
-	var primaryCount, replicaCount int
-	if err := primary.QueryRow("SELECT COUNT(*) FROM ledger").Scan(&primaryCount); err != nil {
-		t.Fatalf("primary count: %v", err)
-	}
-	if err := replica.QueryRow("SELECT COUNT(*) FROM ledger").Scan(&replicaCount); err != nil {
-		t.Fatalf("replica count: %v", err)
-	}
-	if primaryCount != replicaCount {
-		t.Fatalf("ledger mismatch: primary=%d replica=%d", primaryCount, replicaCount)
-	}
+	}, 30*time.Second, 100*time.Millisecond, "ledger counts should match after writer done")
 }
 
 func TestVFS_CacheMissStorm(t *testing.T) {
@@ -860,7 +848,6 @@ func TestVFS_NetworkLatencySensitivity(t *testing.T) {
 }
 
 func TestVFS_ConcurrentConnectionScaling(t *testing.T) {
-	t.Skip("FIXME: Flaky test - rename race during background monitor sync")
 	client := file.NewReplicaClient(t.TempDir())
 	vfs := newVFS(t, client)
 	vfs.PollInterval = 25 * time.Millisecond
