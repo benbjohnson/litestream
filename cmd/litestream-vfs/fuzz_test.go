@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
@@ -56,7 +58,7 @@ func runVFSFuzzWorkload(tb testing.TB, corpus []byte) {
 	if err := os.MkdirAll(client.LTXLevelDir(0), 0o755); err != nil {
 		tb.Fatalf("init replica dir: %v", err)
 	}
-	db, primary := openReplicatedPrimary(tb, client, 15*time.Millisecond, 15*time.Millisecond)
+	_, primary := openReplicatedPrimary(tb, client, 15*time.Millisecond, 15*time.Millisecond)
 	defer testingutil.MustCloseSQLDB(tb, primary)
 
 	if _, err := primary.Exec(`CREATE TABLE fuzz (
@@ -74,7 +76,6 @@ func runVFSFuzzWorkload(tb testing.TB, corpus []byte) {
 			tb.Fatalf("seed insert: %v", err)
 		}
 	}
-	time.Sleep(5 * db.MonitorInterval)
 
 	vfs := newVFS(tb, client)
 	vfs.PollInterval = 15 * time.Millisecond
@@ -82,22 +83,16 @@ func runVFSFuzzWorkload(tb testing.TB, corpus []byte) {
 	replica := openVFSReplicaDB(tb, vfsName)
 	defer replica.Close()
 
-	deadline := time.Now().Add(5 * time.Second)
-	for {
+	require.Eventually(tb, func() bool {
 		var primaryCount, replicaCount int
 		if err := primary.QueryRow("SELECT COUNT(*) FROM fuzz").Scan(&primaryCount); err != nil {
-			tb.Fatalf("primary count: %v", err)
+			return false
 		}
-		if err := replica.QueryRow("SELECT COUNT(*) FROM fuzz").Scan(&replicaCount); err == nil {
-			if primaryCount == replicaCount {
-				break
-			}
+		if err := replica.QueryRow("SELECT COUNT(*) FROM fuzz").Scan(&replicaCount); err != nil {
+			return false
 		}
-		if time.Now().After(deadline) {
-			tb.Fatalf("replica never caught up: primary=%d", primaryCount)
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
+		return primaryCount == replicaCount
+	}, 5*time.Second, 20*time.Millisecond, "replica should catch up to primary")
 
 	const maxOps = 128
 	for i := 0; i < len(corpus) && i < maxOps; i++ {

@@ -37,8 +37,6 @@ func TestVFS_ChaosEngineering(t *testing.T) {
 		}
 	}
 
-	time.Sleep(5 * db.MonitorInterval)
-
 	chaosClient := newChaosReplicaClient(client)
 	vfs := newVFS(t, chaosClient)
 	vfs.PollInterval = 15 * time.Millisecond
