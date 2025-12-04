@@ -8,10 +8,15 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	_ "unsafe"
 
@@ -24,6 +29,9 @@ import (
 const (
 	DefaultPollInterval = 1 * time.Second
 	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
+
+	pageFetchRetryAttempts = 6
+	pageFetchRetryDelay    = 15 * time.Millisecond
 )
 
 var (
@@ -48,6 +56,12 @@ type VFS struct {
 
 	// CacheSize is the maximum size of the page cache in bytes.
 	CacheSize int
+
+	tempDirOnce sync.Once
+	tempDir     string
+	tempDirErr  error
+	tempFiles   sync.Map // canonical name -> absolute path
+	tempNames   sync.Map // canonical name -> struct{}{}
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -65,6 +79,8 @@ func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, s
 	switch {
 	case flags&sqlite3vfs.OpenMainDB != 0:
 		return vfs.openMainDB(name, flags)
+	case vfs.requiresTempFile(flags):
+		return vfs.openTempFile(name, flags)
 	default:
 		return nil, flags, sqlite3vfs.CantOpenError
 	}
@@ -84,7 +100,17 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
 	slog.Info("deleting file", "name", name, "dirSync", dirSync)
-	return fmt.Errorf("cannot delete vfs file")
+	err := vfs.deleteTempFile(name)
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if errors.Is(err, errTempFileNotFound) {
+		return fmt.Errorf("cannot delete vfs file")
+	}
+	return err
 }
 
 func (vfs *VFS) Access(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
@@ -92,6 +118,9 @@ func (vfs *VFS) Access(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
 
 	if strings.HasSuffix(name, "-wal") {
 		return vfs.accessWAL(name, flag)
+	}
+	if vfs.isTempFileName(name) {
+		return vfs.accessTempFile(name, flag)
 	}
 	return false, nil
 }
@@ -105,6 +134,260 @@ func (vfs *VFS) FullPathname(name string) string {
 	return name
 }
 
+func (vfs *VFS) requiresTempFile(flags sqlite3vfs.OpenFlag) bool {
+	const tempMask = sqlite3vfs.OpenTempDB |
+		sqlite3vfs.OpenTempJournal |
+		sqlite3vfs.OpenSubJournal |
+		sqlite3vfs.OpenSuperJournal |
+		sqlite3vfs.OpenTransientDB
+	if flags&tempMask != 0 {
+		return true
+	}
+	return flags&sqlite3vfs.OpenDeleteOnClose != 0
+}
+
+func (vfs *VFS) ensureTempDir() (string, error) {
+	vfs.tempDirOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "litestream-vfs-*")
+		if err != nil {
+			vfs.tempDirErr = fmt.Errorf("create temp dir: %w", err)
+			return
+		}
+		vfs.tempDir = dir
+	})
+	return vfs.tempDir, vfs.tempDirErr
+}
+
+func (vfs *VFS) canonicalTempName(name string) string {
+	if name == "" {
+		return ""
+	}
+	name = filepath.Clean(name)
+	if name == "." || name == string(filepath.Separator) {
+		return ""
+	}
+	return name
+}
+
+func tempFilenameFromCanonical(canonical string) (string, error) {
+	base := filepath.Base(canonical)
+	if base == "." || base == string(filepath.Separator) {
+		return "", fmt.Errorf("invalid temp file name: %q", canonical)
+	}
+
+	h := fnv.New64a()
+	if _, err := h.Write([]byte(canonical)); err != nil {
+		return "", fmt.Errorf("hash temp name: %w", err)
+	}
+	return fmt.Sprintf("%s-%016x", base, h.Sum64()), nil
+}
+
+func (vfs *VFS) openTempFile(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	dir, err := vfs.ensureTempDir()
+	if err != nil {
+		return nil, flags, err
+	}
+	deleteOnClose := flags&sqlite3vfs.OpenDeleteOnClose != 0 || name == ""
+	var f *os.File
+	var onClose func()
+	if name == "" {
+		f, err = os.CreateTemp(dir, "temp-*")
+		if err != nil {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+	} else {
+		canonical := vfs.canonicalTempName(name)
+		if canonical == "" {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+		fname, err := tempFilenameFromCanonical(canonical)
+		if err != nil {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+		path := filepath.Join(dir, fname)
+		flag := openFlagToOSFlag(flags)
+		if flag == 0 {
+			flag = os.O_RDWR
+		}
+		f, err = os.OpenFile(path, flag|os.O_CREATE, 0o600)
+		if err != nil {
+			return nil, flags, sqlite3vfs.CantOpenError
+		}
+		onClose = vfs.trackTempFile(canonical, path)
+	}
+
+	return newLocalTempFile(f, deleteOnClose, onClose), flags, nil
+}
+
+func (vfs *VFS) deleteTempFile(name string) error {
+	path, ok := vfs.loadTempFilePath(name)
+	if !ok {
+		if vfs.wasTempFileName(name) {
+			vfs.unregisterTempFile(name)
+			return os.ErrNotExist
+		}
+		return errTempFileNotFound
+	}
+	if err := os.Remove(path); err != nil {
+		if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	vfs.unregisterTempFile(name)
+	return nil
+}
+
+func (vfs *VFS) isTempFileName(name string) bool {
+	_, ok := vfs.loadTempFilePath(name)
+	return ok
+}
+
+func (vfs *VFS) wasTempFileName(name string) bool {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return false
+	}
+	_, ok := vfs.tempNames.Load(canonical)
+	return ok
+}
+
+func (vfs *VFS) unregisterTempFile(name string) {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return
+	}
+	vfs.tempFiles.Delete(canonical)
+}
+
+func (vfs *VFS) accessTempFile(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
+	path, ok := vfs.loadTempFilePath(name)
+	if !ok {
+		return false, nil
+	}
+	_, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+func (vfs *VFS) trackTempFile(canonical, path string) func() {
+	if canonical == "" {
+		return func() {}
+	}
+	vfs.tempFiles.Store(canonical, path)
+	vfs.tempNames.Store(canonical, struct{}{})
+	return func() { vfs.tempFiles.Delete(canonical) }
+}
+
+func (vfs *VFS) loadTempFilePath(name string) (string, bool) {
+	canonical := vfs.canonicalTempName(name)
+	if canonical == "" {
+		return "", false
+	}
+	if path, ok := vfs.tempFiles.Load(canonical); ok {
+		return path.(string), true
+	}
+	return "", false
+}
+
+func openFlagToOSFlag(flag sqlite3vfs.OpenFlag) int {
+	var v int
+	if flag&sqlite3vfs.OpenReadWrite != 0 {
+		v |= os.O_RDWR
+	} else if flag&sqlite3vfs.OpenReadOnly != 0 {
+		v |= os.O_RDONLY
+	}
+	if flag&sqlite3vfs.OpenCreate != 0 {
+		v |= os.O_CREATE
+	}
+	if flag&sqlite3vfs.OpenExclusive != 0 {
+		v |= os.O_EXCL
+	}
+	return v
+}
+
+var errTempFileNotFound = fmt.Errorf("temp file not tracked")
+
+// localTempFile fulfills sqlite3vfs.File solely for SQLite temp & transient files.
+// These files stay on the local filesystem and optionally delete themselves
+// when SQLite closes them (DeleteOnClose flag).
+type localTempFile struct {
+	f             *os.File
+	deleteOnClose bool
+	lockType      atomic.Int32
+	onClose       func()
+}
+
+func newLocalTempFile(f *os.File, deleteOnClose bool, onClose func()) *localTempFile {
+	return &localTempFile{f: f, deleteOnClose: deleteOnClose, onClose: onClose}
+}
+
+func (tf *localTempFile) Close() error {
+	err := tf.f.Close()
+	if tf.deleteOnClose {
+		if removeErr := os.Remove(tf.f.Name()); removeErr != nil && !os.IsNotExist(removeErr) && err == nil {
+			err = removeErr
+		}
+	}
+	if tf.onClose != nil {
+		tf.onClose()
+	}
+	return err
+}
+
+func (tf *localTempFile) ReadAt(p []byte, off int64) (n int, err error) {
+	return tf.f.ReadAt(p, off)
+}
+
+func (tf *localTempFile) WriteAt(b []byte, off int64) (n int, err error) {
+	return tf.f.WriteAt(b, off)
+}
+
+func (tf *localTempFile) Truncate(size int64) error {
+	return tf.f.Truncate(size)
+}
+
+func (tf *localTempFile) Sync(flag sqlite3vfs.SyncType) error {
+	return tf.f.Sync()
+}
+
+func (tf *localTempFile) FileSize() (int64, error) {
+	info, err := tf.f.Stat()
+	if err != nil {
+		return 0, err
+	}
+	return info.Size(), nil
+}
+
+func (tf *localTempFile) Lock(elock sqlite3vfs.LockType) error {
+	if elock == sqlite3vfs.LockNone {
+		return nil
+	}
+	tf.lockType.Store(int32(elock))
+	return nil
+}
+
+func (tf *localTempFile) Unlock(elock sqlite3vfs.LockType) error {
+	tf.lockType.Store(int32(elock))
+	return nil
+}
+
+func (tf *localTempFile) CheckReservedLock() (bool, error) {
+	return sqlite3vfs.LockType(tf.lockType.Load()) >= sqlite3vfs.LockReserved, nil
+}
+
+func (tf *localTempFile) SectorSize() int64 {
+	return 0
+}
+
+func (tf *localTempFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
+	return 0
+}
+
 // VFSFile implements the SQLite VFS file interface.
 type VFSFile struct {
 	mu     sync.Mutex
@@ -115,11 +398,14 @@ type VFSFile struct {
 	maxTXID1        ltx.TXID // Last TXID read from level 1
 	index           map[uint32]ltx.PageIndexElem
 	pending         map[uint32]ltx.PageIndexElem
+	pendingReplace  bool
 	cache           *lru.Cache[uint32, []byte] // LRU cache for page data
 	targetTime      *time.Time                 // Target view time; nil means latest
 	latestLTXTime   time.Time                  // Timestamp of most recent LTX file
 	lastPollSuccess time.Time                  // Time of last successful poll
 	lockType        sqlite3vfs.LockType        // Current lock state
+	pageSize        uint32
+	commit          uint32
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -152,17 +438,6 @@ func (f *VFSFile) Pos() ltx.Pos {
 	return f.pos
 }
 
-// TargetTime returns the current target time for the VFS file (nil for latest).
-func (f *VFSFile) TargetTime() *time.Time {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.targetTime == nil {
-		return nil
-	}
-	t := *f.targetTime
-	return &t
-}
-
 // MaxTXID1 returns the last TXID read from level 1.
 func (f *VFSFile) MaxTXID1() ltx.TXID {
 	f.mu.Lock()
@@ -175,6 +450,17 @@ func (f *VFSFile) LockType() sqlite3vfs.LockType {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lockType
+}
+
+// TargetTime returns the current target time for the VFS file (nil for latest).
+func (f *VFSFile) TargetTime() *time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.targetTime == nil {
+		return nil
+	}
+	t := *f.targetTime
+	return &t
 }
 
 // LatestLTXTime returns the timestamp of the most recent LTX file.
@@ -191,12 +477,29 @@ func (f *VFSFile) LastPollSuccess() time.Time {
 	return f.lastPollSuccess
 }
 
+func (f *VFSFile) hasTargetTime() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.targetTime != nil
+}
+
 func (f *VFSFile) Open() error {
 	f.logger.Info("opening file")
 
-	// Initialize page cache. Convert byte size to number of 4KB pages.
-	const pageSize = 4096
-	cacheEntries := f.CacheSize / pageSize
+	infos, err := f.waitForRestorePlan()
+	if err != nil {
+		return err
+	}
+
+	pageSize, err := detectPageSizeFromInfos(f.ctx, f.client, infos)
+	if err != nil {
+		f.logger.Error("cannot detect page size", "error", err)
+		return fmt.Errorf("detect page size: %w", err)
+	}
+	f.pageSize = pageSize
+
+	// Initialize page cache. Convert byte size to number of pages.
+	cacheEntries := f.CacheSize / int(pageSize)
 	if cacheEntries < 1 {
 		cacheEntries = 1
 	}
@@ -206,17 +509,15 @@ func (f *VFSFile) Open() error {
 	}
 	f.cache = cache
 
-	infos, err := CalcRestorePlan(context.Background(), f.client, 0, time.Time{}, f.logger)
-	if err != nil {
-		f.logger.Error("cannot calc restore plan", "error", err)
-		return fmt.Errorf("cannot calc restore plan: %w", err)
-	} else if len(infos) == 0 {
-		f.logger.Error("no backup files available")
-		return fmt.Errorf("no backup files available") // TODO: Open even when no files available.
+	// Determine the current position based off the latest LTX file.
+	var pos ltx.Pos
+	if len(infos) > 0 {
+		pos = ltx.Pos{TXID: infos[len(infos)-1].MaxTXID}
 	}
+	f.pos = pos
 
 	// Build the page index so we can lookup individual pages.
-	if err := f.rebuildIndex(f.ctx, infos, nil); err != nil {
+	if err := f.buildIndex(f.ctx, infos); err != nil {
 		f.logger.Error("cannot build index", "error", err)
 		return fmt.Errorf("cannot build index: %w", err)
 	}
@@ -274,6 +575,7 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	defer f.mu.Unlock()
 	f.index = index
 	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.pendingReplace = false
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
 	if len(infos) > 0 {
@@ -292,9 +594,20 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	return nil
 }
 
+func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
+	var maxTXID ltx.TXID
+	for _, info := range infos {
+		if info.Level == level && info.MaxTXID > maxTXID {
+			maxTXID = info.MaxTXID
+		}
+	}
+	return maxTXID
+}
+
 // buildIndexMap constructs a lookup of pgno to LTX file offsets.
 func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
 	index := make(map[uint32]ltx.PageIndexElem)
+	var commit uint32
 	for _, info := range infos {
 		f.logger.Debug("opening page index", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
@@ -309,11 +622,21 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 			f.logger.Debug("adding page index", "page", k, "elem", v)
 			index[k] = v
 		}
+		hdr, err := FetchLTXHeader(ctx, f.client, info)
+		if err != nil {
+			return nil, fmt.Errorf("fetch header: %w", err)
+		}
+		commit = hdr.Commit
 	}
+
+	f.mu.Lock()
+	f.commit = commit
+	f.mu.Unlock()
+
 	return index, nil
 }
 
-// buildIndex constructs a lookup of pgno to LTX file offsets.
+// buildIndex constructs a lookup of pgno to LTX file offsets (legacy wrapper).
 func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 	return f.rebuildIndex(ctx, infos, nil)
 }
@@ -327,11 +650,17 @@ func (f *VFSFile) Close() error {
 
 func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	f.logger.Info("reading at", "off", off, "len", len(p))
-	pgno := uint32(off/4096) + 1
+	pageSize, err := f.pageSizeBytes()
+	if err != nil {
+		return 0, err
+	}
+
+	pgno := uint32(off/int64(pageSize)) + 1
 
 	// Check cache first (cache is thread-safe)
 	if data, ok := f.cache.Get(pgno); ok {
-		n = copy(p, data[off%4096:])
+		pageOffset := int(off % int64(pageSize))
+		n = copy(p, data[pageOffset:])
 		f.logger.Info("cache hit", "page", pgno, "n", n)
 
 		// Update the first page to pretend like we are in journal mode.
@@ -353,17 +682,42 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		return 0, fmt.Errorf("page not found: %d", pgno)
 	}
 
-	// Fetch from storage (cache miss)
-	_, data, err := FetchPage(context.Background(), f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
-	if err != nil {
-		f.logger.Error("cannot fetch page", "error", err)
-		return 0, fmt.Errorf("fetch page: %w", err)
+	var data []byte
+	var lastErr error
+	ctx := f.ctx
+	for attempt := 0; attempt < pageFetchRetryAttempts; attempt++ {
+		_, data, lastErr = FetchPage(ctx, f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
+		if lastErr == nil {
+			break
+		}
+		if !isRetryablePageError(lastErr) {
+			f.logger.Error("cannot fetch page", "page", pgno, "attempt", attempt+1, "error", lastErr)
+			return 0, fmt.Errorf("fetch page: %w", lastErr)
+		}
+
+		if attempt == pageFetchRetryAttempts-1 {
+			f.logger.Error("cannot fetch page after retries", "page", pgno, "attempts", pageFetchRetryAttempts, "error", lastErr)
+			return 0, sqlite3vfs.BusyError
+		}
+
+		delay := pageFetchRetryDelay * time.Duration(attempt+1)
+		f.logger.Warn("transient page fetch error, retrying", "page", pgno, "attempt", attempt+1, "delay", delay, "error", lastErr)
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-f.ctx.Done():
+			timer.Stop()
+			return 0, fmt.Errorf("fetch page: %w", lastErr)
+		}
+		timer.Stop()
 	}
 
 	// Add to cache (cache is thread-safe)
 	f.cache.Add(pgno, data)
 
-	n = copy(p, data[off%4096:])
+	pageOffset := int(off % int64(pageSize))
+	n = copy(p, data[pageOffset:])
 	f.logger.Info("data read from storage", "page", pgno, "n", n, "data", len(data))
 
 	// Update the first page to pretend like we are in journal mode.
@@ -391,12 +745,20 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 }
 
 func (f *VFSFile) FileSize() (size int64, err error) {
-	const pageSize = 4096
+	pageSize, err := f.pageSizeBytes()
+	if err != nil {
+		return 0, err
+	}
 
 	f.mu.Lock()
 	for pgno := range f.index {
-		if int64(pgno)*pageSize > int64(size) {
-			size = int64(pgno * pageSize)
+		if v := int64(pgno) * int64(pageSize); v > size {
+			size = v
+		}
+	}
+	for pgno := range f.pending {
+		if v := int64(pgno) * int64(pageSize); v > size {
+			size = v
 		}
 	}
 	f.mu.Unlock()
@@ -411,6 +773,9 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if elock < f.lockType {
+		return fmt.Errorf("invalid lock downgrade: current=%s target=%s", f.lockType, elock)
+	}
 	f.lockType = elock
 	return nil
 }
@@ -421,25 +786,40 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
+	if elock != sqlite3vfs.LockShared && elock != sqlite3vfs.LockNone {
+		return fmt.Errorf("invalid unlock target: %s", elock)
+	}
+
 	f.lockType = elock
 
 	// Copy pending index to main index and invalidate affected pages in cache.
-	if len(f.pending) > 0 {
+	if f.pendingReplace {
+		// Replace entire index
+		count := len(f.index)
+		f.index = f.pending
+		f.logger.Debug("cache invalidated all pages", "count", count)
+		// Invalidate entire cache since we replaced the index
+		f.cache.Purge()
+	} else if len(f.pending) > 0 {
+		// Merge pending into index
 		count := len(f.pending)
 		for k, v := range f.pending {
 			f.index[k] = v
 			f.cache.Remove(k)
 		}
-		f.pending = make(map[uint32]ltx.PageIndexElem)
 		f.logger.Debug("cache invalidated pages", "count", count)
 	}
+	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.pendingReplace = false
 
 	return nil
 }
 
 func (f *VFSFile) CheckReservedLock() (bool, error) {
 	f.logger.Info("checking reserved lock")
-	return false, nil // TODO: Implement reserved lock checking
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lockType >= sqlite3vfs.LockReserved, nil
 }
 
 func (f *VFSFile) SectorSize() int64 {
@@ -550,6 +930,26 @@ func (f *VFSFile) currentTimeString() string {
 	return "latest" // Fallback if no LTX files loaded
 }
 
+func isRetryablePageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return true
+	}
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	// Some remote clients wrap EOF in custom errors so we fall back to string matching.
+	if strings.Contains(err.Error(), "unexpected EOF") {
+		return true
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	return false
+}
+
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 	ticker := time.NewTicker(f.PollInterval)
 	defer ticker.Stop()
@@ -581,17 +981,50 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 // the page index & the current position.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	pos := f.Pos()
-	index := make(map[uint32]ltx.PageIndexElem)
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
-	result0, err := f.pollLevel(ctx, 0, pos.TXID, index)
+	combined := make(map[uint32]ltx.PageIndexElem)
+	baseCommit := f.commit
+	newCommit := baseCommit
+	replaceIndex := false
+
+	maxTXID0, idx0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
+	if replace0 {
+		replaceIndex = true
+		baseCommit = commit0
+		newCommit = commit0
+		combined = idx0
+	} else {
+		if len(idx0) > 0 {
+			baseCommit = commit0
+		}
+		for k, v := range idx0 {
+			combined[k] = v
+		}
+		if commit0 > newCommit {
+			newCommit = commit0
+		}
+	}
 
-	result1, err := f.pollLevel(ctx, 1, f.maxTXID1, index)
+	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, f.maxTXID1, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
+	}
+	if replace1 {
+		replaceIndex = true
+		baseCommit = commit1
+		newCommit = commit1
+		combined = idx1
+	} else {
+		for k, v := range idx1 {
+			combined[k] = v
+		}
+		if commit1 > newCommit {
+			newCommit = commit1
+		}
 	}
 
 	// Send updates to a pending list if there are active readers.
@@ -606,100 +1039,183 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	// Apply updates and invalidate cache entries for updated pages
 	invalidateN := 0
-	for k, v := range index {
-		// If we are holding a shared lock, add to pending index instead of main index.
-		// We will copy these over once the shared lock is released.
-		if f.lockType >= sqlite3vfs.LockShared {
-			f.pending[k] = v
-			continue
+	target := f.index
+	targetIsMain := true
+	if f.lockType >= sqlite3vfs.LockShared {
+		target = f.pending
+		targetIsMain = false
+	} else {
+		f.pendingReplace = false
+	}
+	if replaceIndex {
+		if f.lockType < sqlite3vfs.LockShared {
+			f.index = make(map[uint32]ltx.PageIndexElem)
+			target = f.index
+			targetIsMain = true
+			f.pendingReplace = false
+		} else {
+			f.pending = make(map[uint32]ltx.PageIndexElem)
+			target = f.pending
+			targetIsMain = false
+			f.pendingReplace = true
 		}
-
-		// Otherwise update main index and invalidate cache entry.
-		f.index[k] = v
-		f.cache.Remove(k)
-		invalidateN++
+	}
+	for k, v := range combined {
+		target[k] = v
+		// Invalidate cache if we're updating the main index
+		if targetIsMain {
+			f.cache.Remove(k)
+			invalidateN++
+		}
 	}
 
 	if invalidateN > 0 {
 		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
-	// Update to max TXID
-	f.pos.TXID = max(result0.maxTXID, result1.maxTXID)
-	f.maxTXID1 = result1.maxTXID
-	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
+	if replaceIndex {
+		f.commit = newCommit
+	} else if len(combined) > 0 && newCommit > f.commit {
+		f.commit = newCommit
+	}
 
-	// Update latestLTXTime to the most recent timestamp from either level
-	if !result0.createdAt.IsZero() && result0.createdAt.After(f.latestLTXTime) {
-		f.latestLTXTime = result0.createdAt
+	if maxTXID0 > maxTXID1 {
+		f.pos.TXID = maxTXID0
+	} else {
+		f.pos.TXID = maxTXID1
 	}
-	if !result1.createdAt.IsZero() && result1.createdAt.After(f.latestLTXTime) {
-		f.latestLTXTime = result1.createdAt
-	}
+
+	f.maxTXID1 = maxTXID1
+	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	return nil
 }
 
-func (f *VFSFile) hasTargetTime() bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	return f.targetTime != nil
-}
-
-func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
-	var maxTXID ltx.TXID
-	for _, info := range infos {
-		if info.Level == level && info.MaxTXID > maxTXID {
-			maxTXID = info.MaxTXID
-		}
-	}
-	return maxTXID
-}
-
-// pollLevelResult contains the results of polling a single level.
-type pollLevelResult struct {
-	maxTXID   ltx.TXID
-	createdAt time.Time // CreatedAt of the most recent LTX file processed
-}
-
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, index map[uint32]ltx.PageIndexElem) (pollLevelResult, error) {
-	// Start reading from the next LTX file after the current position.
+// pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
+// any index updates, the latest commit value, and if the index should be replaced.
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, error) {
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return pollLevelResult{}, fmt.Errorf("ltx files: %w", err)
+		return prevMaxTXID, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
 	}
+	defer func() { _ = itr.Close() }()
 
-	// Build an update across all new LTX files.
-	result := pollLevelResult{maxTXID: prevMaxTXID}
+	index := make(map[uint32]ltx.PageIndexElem)
+	maxTXID := prevMaxTXID
+	lastCommit := baseCommit
+	newCommit := baseCommit
+	replaceIndex := false
+
 	for itr.Next() {
 		info := itr.Item()
 
-		// Ensure we are fetching the next transaction from our current position.
 		f.mu.Lock()
-		isNextTXID := info.MinTXID == result.maxTXID+1
+		isNextTXID := info.MinTXID == maxTXID+1
 		f.mu.Unlock()
 		if !isNextTXID {
-			return result, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, prevMaxTXID, info.MinTXID, info.MaxTXID)
+			if level == 0 && info.MinTXID > maxTXID+1 {
+				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
+				break
+			}
+			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		// Read page index.
-		idx, err := FetchPageIndex(context.Background(), f.client, info)
+		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return result, fmt.Errorf("fetch page index: %w", err)
+			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
+		}
+		hdr, err := FetchLTXHeader(ctx, f.client, info)
+		if err != nil {
+			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
 		}
 
-		// Update the page index & current position.
+		if hdr.Commit < lastCommit {
+			replaceIndex = true
+			index = make(map[uint32]ltx.PageIndexElem)
+		}
+		lastCommit = hdr.Commit
+		newCommit = hdr.Commit
+
 		for k, v := range idx {
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
 			index[k] = v
 		}
-		result.maxTXID = info.MaxTXID
-		result.createdAt = info.CreatedAt
+		maxTXID = info.MaxTXID
 	}
 
-	return result, nil
+	return maxTXID, index, newCommit, replaceIndex, nil
+}
+
+func (f *VFSFile) pageSizeBytes() (uint32, error) {
+	f.mu.Lock()
+	pageSize := f.pageSize
+	f.mu.Unlock()
+	if pageSize == 0 {
+		return 0, fmt.Errorf("page size not initialized")
+	}
+	return pageSize, nil
+}
+
+func detectPageSizeFromInfos(ctx context.Context, client ReplicaClient, infos []*ltx.FileInfo) (uint32, error) {
+	var lastErr error
+	for i := len(infos) - 1; i >= 0; i-- {
+		pageSize, err := readPageSizeFromInfo(ctx, client, infos[i])
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if !isSupportedPageSize(pageSize) {
+			return 0, fmt.Errorf("unsupported page size: %d", pageSize)
+		}
+		return pageSize, nil
+	}
+	if lastErr != nil {
+		return 0, fmt.Errorf("read ltx header: %w", lastErr)
+	}
+	return 0, fmt.Errorf("no ltx file available to determine page size")
+}
+
+func readPageSizeFromInfo(ctx context.Context, client ReplicaClient, info *ltx.FileInfo) (uint32, error) {
+	rc, err := client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, ltx.HeaderSize)
+	if err != nil {
+		return 0, fmt.Errorf("open ltx file: %w", err)
+	}
+	defer rc.Close()
+	dec := ltx.NewDecoder(rc)
+	if err := dec.DecodeHeader(); err != nil {
+		return 0, fmt.Errorf("decode ltx header: %w", err)
+	}
+	return dec.Header().PageSize, nil
+}
+
+func isSupportedPageSize(pageSize uint32) bool {
+	switch pageSize {
+	case 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536:
+		return true
+	default:
+		return false
+	}
+}
+
+func (f *VFSFile) waitForRestorePlan() ([]*ltx.FileInfo, error) {
+	for {
+		infos, err := CalcRestorePlan(f.ctx, f.client, 0, time.Time{}, f.logger)
+		if err == nil {
+			return infos, nil
+		}
+		if !errors.Is(err, ErrTxNotAvailable) {
+			return nil, fmt.Errorf("cannot calc restore plan: %w", err)
+		}
+
+		f.logger.Info("no backup files available yet, waiting", "interval", f.PollInterval)
+		select {
+		case <-time.After(f.PollInterval):
+		case <-f.ctx.Done():
+			return nil, fmt.Errorf("no backup files available: %w", f.ctx.Err())
+		}
+	}
 }
 
 // RegisterVFSConnection maps a SQLite connection handle to its VFS file ID.

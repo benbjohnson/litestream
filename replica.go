@@ -31,6 +31,8 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
+	syncMu sync.Mutex // protects Sync() from concurrent calls
+
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
 
@@ -122,7 +124,11 @@ func (r *Replica) Stop(hard bool) (err error) {
 }
 
 // Sync copies new WAL frames from the shadow WAL to the replica client.
+// Only one Sync can run at a time to prevent concurrent uploads of the same file.
 func (r *Replica) Sync(ctx context.Context) (err error) {
+	r.syncMu.Lock()
+	defer r.syncMu.Unlock()
+
 	// Clear last position if if an error occurs during sync.
 	defer func() {
 		if err != nil {

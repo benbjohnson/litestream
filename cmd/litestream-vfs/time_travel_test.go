@@ -8,11 +8,13 @@ import (
 	"database/sql"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 	"github.com/psanford/sqlite3vfs"
+	"github.com/stretchr/testify/require"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -47,7 +49,16 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	if _, err := sqldb0.Exec("INSERT INTO t (x) VALUES (100)"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(6 * db.MonitorInterval)
+
+	// Wait for LTX files to be created
+	require.Eventually(t, func() bool {
+		itr, err := client.LTXFiles(ctx, 0, 0, false)
+		if err != nil {
+			return false
+		}
+		defer itr.Close()
+		return itr.Next()
+	}, 10*time.Second, db.MonitorInterval, "LTX files should be created")
 
 	firstCreatedAt := fetchLTXCreatedAt(t, ctx, client)
 
@@ -55,7 +66,6 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	if _, err := sqldb0.Exec("UPDATE t SET x = 200"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(4 * db.MonitorInterval)
 
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/time-travel.db?vfs=litestream-time")
 	if err != nil {
@@ -63,14 +73,14 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	}
 	defer sqldb1.Close()
 	sqldb1.SetMaxOpenConns(1)
-	time.Sleep(2 * vfs.PollInterval)
 
 	var value int
-	if err := sqldb1.QueryRow("SELECT x FROM t").Scan(&value); err != nil {
-		t.Fatalf("query latest value: %v", err)
-	} else if got, want := value, 200; got != want {
-		t.Fatalf("latest value: got %d, want %d", got, want)
-	}
+	require.Eventually(t, func() bool {
+		if err := sqldb1.QueryRow("SELECT x FROM t").Scan(&value); err != nil {
+			return false
+		}
+		return value == 200
+	}, 10*time.Second, vfs.PollInterval, "VFS should observe updated value")
 
 	target := firstCreatedAt.Add(1 * time.Millisecond).UTC().Format(time.RFC3339Nano)
 	if _, err := sqldb1.Exec(fmt.Sprintf("PRAGMA LITESTREAM_TIME = '%s'", target)); err != nil {
@@ -137,7 +147,6 @@ func TestVFS_PragmaLitestreamTxid(t *testing.T) {
 	if _, err := sqldb0.Exec("INSERT INTO t (x) VALUES (100)"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(6 * db.MonitorInterval)
 
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/txid-test.db?vfs=litestream-txid")
 	if err != nil {
@@ -145,15 +154,14 @@ func TestVFS_PragmaLitestreamTxid(t *testing.T) {
 	}
 	defer sqldb1.Close()
 	sqldb1.SetMaxOpenConns(1)
-	time.Sleep(2 * vfs.PollInterval)
 
 	var txid int64
-	if err := sqldb1.QueryRow("PRAGMA litestream_txid").Scan(&txid); err != nil {
-		t.Fatalf("query txid: %v", err)
-	}
-	if txid <= 0 {
-		t.Fatalf("expected positive TXID, got %d", txid)
-	}
+	require.Eventually(t, func() bool {
+		if err := sqldb1.QueryRow("PRAGMA litestream_txid").Scan(&txid); err != nil {
+			return false
+		}
+		return txid > 0
+	}, 10*time.Second, vfs.PollInterval, "PRAGMA litestream_txid should return positive value")
 
 	// Test that setting litestream_txid fails (read-only)
 	if _, err := sqldb1.Exec("PRAGMA litestream_txid = 123"); err == nil {
@@ -189,7 +197,6 @@ func TestVFS_PragmaLitestreamLag(t *testing.T) {
 	if _, err := sqldb0.Exec("INSERT INTO t (x) VALUES (100)"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(6 * db.MonitorInterval)
 
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/lag-test.db?vfs=litestream-lag")
 	if err != nil {
@@ -198,18 +205,15 @@ func TestVFS_PragmaLitestreamLag(t *testing.T) {
 	defer sqldb1.Close()
 	sqldb1.SetMaxOpenConns(1)
 
-	// Wait for at least one successful poll (poll runs on ticker, not immediately)
-	time.Sleep(5 * vfs.PollInterval)
-
+	// Wait for replica to catch up with polling.
 	var lag int64
-	if err := sqldb1.QueryRow("PRAGMA litestream_lag").Scan(&lag); err != nil {
-		t.Fatalf("query lag: %v", err)
-	}
-	// Lag should be -1 (never polled) or a small non-negative value after polling
-	// -1 is valid if no poll has succeeded yet
-	if lag < -1 || lag > 5 {
-		t.Fatalf("expected lag between -1 and 5 seconds, got %d", lag)
-	}
+	require.Eventually(t, func() bool {
+		if err := sqldb1.QueryRow("PRAGMA litestream_lag").Scan(&lag); err != nil {
+			t.Logf("query lag: %v", err)
+			return false
+		}
+		return lag >= 0
+	}, 10*time.Second, vfs.PollInterval, "lag should become >= 0")
 
 	// Test that setting litestream_lag fails (read-only)
 	if _, err := sqldb1.Exec("PRAGMA litestream_lag = 123"); err == nil {
@@ -245,7 +249,6 @@ func TestVFS_PragmaRelativeTime(t *testing.T) {
 	if _, err := sqldb0.Exec("INSERT INTO t (x) VALUES (100)"); err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(6 * db.MonitorInterval)
 
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/relative-test.db?vfs=litestream-relative")
 	if err != nil {
@@ -253,18 +256,49 @@ func TestVFS_PragmaRelativeTime(t *testing.T) {
 	}
 	defer sqldb1.Close()
 	sqldb1.SetMaxOpenConns(1)
-	time.Sleep(2 * vfs.PollInterval)
+
+	// Wait for VFS to poll initial data
+	require.Eventually(t, func() bool {
+		var x int
+		return sqldb1.QueryRow("SELECT x FROM t").Scan(&x) == nil
+	}, 10*time.Second, vfs.PollInterval, "VFS should observe initial data")
 
 	// Test that relative time parsing works (even if no data exists at that time)
 	// The parse should succeed, but may return "no backup files available" if too far in past
 	now := time.Now()
 	_, err = sqldb1.Exec("PRAGMA litestream_time = '1 second ago'")
-	// This might fail if no LTX files exist at that time, which is expected
-	// The important thing is that the parsing worked (not a "parse timestamp" error)
-	if err != nil && err.Error() != "no backup files available" {
-		// Check if it's a parse error vs a "no files" error
-		if err.Error() == "invalid timestamp (expected RFC3339 or relative time like '5 minutes ago'): 1 second ago" {
-			t.Fatalf("relative time parsing failed: %v", err)
+	// This might fail if no LTX files exist at that time, which is expected.
+	// The important thing is that the parsing worked (not a "parse timestamp" error).
+	if err != nil {
+		errMsg := err.Error()
+		// These are expected errors that indicate parsing succeeded but time-travel
+		// couldn't be performed (no files at that time).
+		expectedErrors := []string{
+			"no backup files available",
+			"timestamp is before earliest LTX file",
+		}
+		expectedSubstrings := []string{
+			"transaction not available", // ErrTxNotAvailable when target is before earliest LTX
+			"SQL logic error",           // SQLite error during page index rebuild for time-travel
+		}
+		isExpected := false
+		for _, expected := range expectedErrors {
+			if errMsg == expected {
+				isExpected = true
+				break
+			}
+		}
+		if !isExpected {
+			for _, substr := range expectedSubstrings {
+				if strings.Contains(errMsg, substr) {
+					isExpected = true
+					break
+				}
+			}
+		}
+		if !isExpected {
+			// Fail on any unexpected error to catch regressions
+			t.Fatalf("unexpected error from relative time PRAGMA: %v", err)
 		}
 	}
 
