@@ -435,6 +435,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}()
 
 	for _, info := range infos {
+		// Validate file size - must be at least header size to be readable
+		if info.Size < ltx.HeaderSize {
+			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
+				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
+		}
+
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		// Add file to be compacted.
