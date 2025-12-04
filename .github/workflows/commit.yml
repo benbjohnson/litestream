@@ -48,6 +48,19 @@ jobs:
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
 
+  docker-build-test:
+    name: Docker Build Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: litestream:test
+
   build:
     name: Build & Unit Test
     runs-on: ubuntu-latest
