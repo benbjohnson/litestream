@@ -37,6 +37,7 @@ graph TB
         S3[s3/replica_client.go]
         GCS[gs/replica_client.go]
         ABS[abs/replica_client.go]
+        OSS[oss/replica_client.go]
         File[file/replica_client.go]
         SFTP[sftp/replica_client.go]
         NATS[nats/replica_client.go]
@@ -54,6 +55,7 @@ graph TB
     RC --> S3
     RC --> GCS
     RC --> ABS
+    RC --> OSS
     RC --> File
     RC --> SFTP
     RC --> NATS
@@ -61,6 +63,7 @@ graph TB
     S3 --> Cloud
     GCS --> Cloud
     ABS --> Cloud
+    OSS --> Cloud
 ```
 
 ### Layer Responsibilities

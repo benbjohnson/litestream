@@ -20,6 +20,7 @@ import (
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
 	"github.com/benbjohnson/litestream/nats"
+	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -183,6 +184,8 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			slogWith.Info("replicating to", "host", client.Host, "user", client.User, "path", client.Path)
 		case *nats.ReplicaClient:
 			slogWith.Info("replicating to", "bucket", client.BucketName, "url", client.URL)
+		case *oss.ReplicaClient:
+			slogWith.Info("replicating to", "bucket", client.Bucket, "path", client.Path, "region", client.Region)
 		default:
 			slogWith.Info("replicating to")
 		}
