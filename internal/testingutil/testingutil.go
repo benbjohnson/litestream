@@ -17,6 +17,7 @@ import (
 
 	sftpserver "github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
+	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
