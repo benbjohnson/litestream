@@ -17,7 +17,6 @@ import (
 	"strings"
 	"time"
 
-	"filippo.io/age"
 	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
 	"gopkg.in/yaml.v2"
@@ -1012,22 +1011,6 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	r := litestream.NewReplica(db)
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
-	}
-	for _, str := range c.Age.Identities {
-		identities, err := age.ParseIdentities(strings.NewReader(str))
-		if err != nil {
-			return nil, err
-		}
-
-		r.AgeIdentities = append(r.AgeIdentities, identities...)
-	}
-	for _, str := range c.Age.Recipients {
-		recipients, err := age.ParseRecipients(strings.NewReader(str))
-		if err != nil {
-			return nil, err
-		}
-
-		r.AgeRecipients = append(r.AgeRecipients, recipients...)
 	}
 
 	// Build and set client on replica.

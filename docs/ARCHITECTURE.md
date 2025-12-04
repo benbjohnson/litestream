@@ -162,10 +162,6 @@ type Replica struct {
     SyncInterval time.Duration
     MonitorEnabled bool
 
-    // Encryption
-    AgeIdentities []age.Identity
-    AgeRecipients []age.Recipient
-
     // Lifecycle
     cancel func()
     wg     sync.WaitGroup
@@ -711,41 +707,6 @@ func (r *Replica) syncWithRetry(ctx context.Context) error {
    - Compaction runs independently per level
 
 ## Security Considerations
-
-### Encryption (Age)
-
-```go
-// Encryption during write
-func (r *Replica) encryptData(data []byte) ([]byte, error) {
-    if len(r.AgeRecipients) == 0 {
-        return data, nil // No encryption
-    }
-
-    var buf bytes.Buffer
-    w, err := age.Encrypt(&buf, r.AgeRecipients...)
-    if err != nil {
-        return nil, err
-    }
-
-    _, err = w.Write(data)
-    w.Close()
-    return buf.Bytes(), err
-}
-
-// Decryption during read
-func (r *Replica) decryptData(data []byte) ([]byte, error) {
-    if len(r.AgeIdentities) == 0 {
-        return data, nil // No decryption needed
-    }
-
-    rd, err := age.Decrypt(bytes.NewReader(data), r.AgeIdentities...)
-    if err != nil {
-        return nil, err
-    }
-
-    return io.ReadAll(rd)
-}
-```
 
 ### Access Control
 

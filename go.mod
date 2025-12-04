@@ -6,7 +6,6 @@ toolchain go1.25.4
 
 require (
 	cloud.google.com/go/storage v1.36.0
-	filippo.io/age v1.1.1
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.2
 	github.com/Azure/azure-sdk-for-go/sdk/azidentity v1.11.0
 	github.com/Azure/azure-sdk-for-go/sdk/storage/azblob v1.6.2
@@ -52,7 +51,10 @@ require (
 	modernc.org/memory v1.11.0 // indirect
 )
 
-require github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.3.0
+require (
+	github.com/aliyun/alibabacloud-oss-go-sdk-v2 v1.3.0
+	github.com/markusmobius/go-dateparser v1.2.4
+)
 
 require (
 	github.com/markusmobius/go-dateparser v1.2.4
