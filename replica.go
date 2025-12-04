@@ -483,8 +483,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			return
 		}
 		c.HeaderFlags = ltx.HeaderFlagNoChecksum
-		compactErr := c.Compact(ctx)
-		_ = pw.CloseWithError(compactErr)
+		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
 	dec := ltx.NewDecoder(pr)
