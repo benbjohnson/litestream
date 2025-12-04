@@ -11,7 +11,6 @@ import (
 	"sync"
 	"time"
 
-	"filippo.io/age"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -46,10 +45,6 @@ type Replica struct {
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
-
-	// Encryption identities and recipients
-	AgeIdentities []age.Identity
-	AgeRecipients []age.Recipient
 }
 
 func NewReplica(db *DB) *Replica {
