@@ -11,7 +11,7 @@ extern const sqlite3_api_routines *sqlite3_api;
 /* Go function declarations */
 extern char* GoLitestreamRegisterConnection(void* db, sqlite3_uint64 file_id);
 extern char* GoLitestreamUnregisterConnection(void* db);
-extern char* GoLitestreamSetTime(void* db, const char* timestamp);
+extern char* GoLitestreamSetTime(void* db, char* timestamp);
 extern char* GoLitestreamResetTime(void* db);
 extern char* GoLitestreamTime(void* db, char** out);
 extern char* GoLitestreamTxid(void* db, char** out);
@@ -106,7 +106,7 @@ static void litestream_set_time_impl(sqlite3_context* ctx, int argc, sqlite3_val
   }
 
   sqlite3* db = sqlite3_context_db_handle(ctx);
-  char* err = GoLitestreamSetTime(db, (const char*)ts);
+  char* err = GoLitestreamSetTime(db, (char*)ts);
   if (err != 0) {
     sqlite3_result_error(ctx, err, -1);
     free(err);
