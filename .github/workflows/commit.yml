@@ -28,7 +28,7 @@ jobs:
       - uses: pre-commit/action@v3.0.0
 
   vfs-build-test:
-    name: VFS Build Test
+    name: VFS Build Test (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -42,6 +42,22 @@ jobs:
 
       - name: Verify shared library created
         run: file dist/litestream-vfs.so
+
+  vfs-build-test-linux:
+    name: VFS Build Test (Linux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build VFS Linux AMD64
+        run: make vfs-linux-amd64
+
+      - name: Verify shared library created
+        run: file dist/litestream-vfs-linux-amd64.so
 
   build-windows:
     name: Build Windows
