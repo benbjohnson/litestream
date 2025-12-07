@@ -43,6 +43,9 @@ jobs:
       - name: Verify shared library created
         run: file dist/litestream-vfs.so
 
+      - name: Smoke test - load extension into SQLite
+        run: sqlite3 ':memory:' ".load dist/litestream-vfs.so" ".exit" && echo "Extension loads successfully"
+
   vfs-build-test-linux:
     name: VFS Build Test (Linux)
     runs-on: ubuntu-latest
@@ -58,6 +61,9 @@ jobs:
 
       - name: Verify shared library created
         run: file dist/litestream-vfs-linux-amd64.so
+
+      - name: Smoke test - load extension into SQLite
+        run: sqlite3 ':memory:' ".load dist/litestream-vfs-linux-amd64.so" ".exit" && echo "Extension loads successfully"
 
   build-windows:
     name: Build Windows
