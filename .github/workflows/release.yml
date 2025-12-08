@@ -142,9 +142,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: macos-13
+            runner: macos-15
           - arch: arm64
-            runner: macos-14
+            runner: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -172,8 +172,10 @@ jobs:
       - name: Verify artifact
         run: |
           file dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
-          # Verify the extension can be loaded by SQLite
-          sqlite3 ':memory:' ".load dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib" ".exit" && echo "Extension loads successfully"
+          # Verify architecture matches target
+          lipo -info dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
+          # Verify the expected symbol exists (macOS sqlite3 doesn't support .load)
+          nm -gU dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib | grep sqlite3_litestreamvfs_init && echo "Entry point symbol found"
 
       - name: Create archive
         run: |
