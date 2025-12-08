@@ -6,9 +6,8 @@ package main
 // import C is necessary export to the c-archive .a file
 
 /*
-#include <stdint.h>
-typedef int64_t sqlite3_int64;
-typedef uint64_t sqlite3_uint64;
+typedef long long int sqlite3_int64;
+typedef unsigned long long int sqlite3_uint64;
 */
 import "C"
 
