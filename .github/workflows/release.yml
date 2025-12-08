@@ -64,7 +64,7 @@ jobs:
 
   vfs-build-linux:
     name: Build VFS (Linux ${{ matrix.arch }})
-    runs-on: ubuntu-20.04  # Use older Ubuntu for broader glibc compatibility (2.31)
+    runs-on: ubuntu-22.04  # glibc 2.35 (ubuntu-20.04 runners deprecated)
     needs: goreleaser
     strategy:
       matrix:
