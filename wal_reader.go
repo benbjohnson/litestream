@@ -215,6 +215,14 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 		}
 	}
 
+	// Remove pages that exceed the final commit size. This can occur when the
+	// database shrinks (e.g., via VACUUM) between transactions in the WAL.
+	for pgno := range m {
+		if pgno > commit {
+			delete(m, pgno)
+		}
+	}
+
 	// If full transactions available, return the original offset.
 	if len(m) == 0 {
 		return m, 0, 0, nil
