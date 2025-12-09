@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,6 +16,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("file", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "file"
@@ -35,6 +40,16 @@ func NewReplicaClient(path string) *ReplicaClient {
 		logger: slog.Default().WithGroup(ReplicaClientType),
 		path:   path,
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+	// For file URLs, the path is the full path
+	if urlPath == "" {
+		return nil, fmt.Errorf("file replica path required")
+	}
+	return NewReplicaClient(urlPath), nil
 }
 
 // db returns the database, if available.

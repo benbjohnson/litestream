@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"sort"
 	"strconv"
@@ -21,6 +22,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("nats", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "nats"
@@ -82,6 +87,27 @@ func NewReplicaClient() *ReplicaClient {
 		MaxPingsOut:      2,
 		ReconnectBufSize: 8 * 1024 * 1024, // 8MB
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: nats://host[:port]/bucket
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Reconstruct URL without bucket path
+	if host != "" {
+		client.URL = fmt.Sprintf("nats://%s", host)
+	}
+
+	// Extract bucket name from path
+	bucket := strings.Trim(urlPath, "/")
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for nats replica URL")
+	}
+	client.BucketName = bucket
+
+	return client, nil
 }
 
 // Type returns "nats" as the client type.

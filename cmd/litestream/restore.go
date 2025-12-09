@@ -46,7 +46,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Determine replica to restore from.
 	var r *litestream.Replica
-	if isURL(fs.Arg(0)) {
+	if litestream.IsURL(fs.Arg(0)) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}

@@ -23,6 +23,10 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 )
 
+func init() {
+	litestream.RegisterReplicaClientFactory("oss", NewReplicaClientFromURL)
+}
+
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "oss"
 
@@ -65,6 +69,24 @@ func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
 		logger: slog.Default().WithGroup(ReplicaClientType),
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: oss://bucket[.oss-region.aliyuncs.com]/path
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	bucket, region, _ := ParseHost(host)
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for oss replica URL")
+	}
+
+	client.Bucket = bucket
+	client.Region = region
+	client.Path = urlPath
+
+	return client, nil
 }
 
 // Type returns "oss" as the client type.

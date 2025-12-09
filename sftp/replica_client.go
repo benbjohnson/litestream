@@ -8,8 +8,10 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,6 +22,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("sftp", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "sftp"
@@ -59,6 +65,38 @@ func NewReplicaClient() *ReplicaClient {
 		DialTimeout:      DefaultDialTimeout,
 		ConcurrentWrites: true, // Default to true for better performance
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: sftp://[user[:password]@]host[:port]/path
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Parse userinfo from host if present
+	if idx := strings.Index(host, "@"); idx != -1 {
+		userinfo := host[:idx]
+		host = host[idx+1:]
+
+		if colonIdx := strings.Index(userinfo, ":"); colonIdx != -1 {
+			client.User = userinfo[:colonIdx]
+			client.Password = userinfo[colonIdx+1:]
+		} else {
+			client.User = userinfo
+		}
+	}
+
+	client.Host = host
+	client.Path = urlPath
+
+	if client.Host == "" {
+		return nil, fmt.Errorf("host required for sftp replica URL")
+	}
+	if client.User == "" {
+		return nil, fmt.Errorf("user required for sftp replica URL")
+	}
+
+	return client, nil
 }
 
 // Type returns "sftp" as the client type.
