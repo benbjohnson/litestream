@@ -16,14 +16,12 @@ import (
 	"log"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 	"unsafe"
 
 	"github.com/psanford/sqlite3vfs"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/s3"
 
 	// Import all replica backends to register their URL factories.
 	_ "github.com/benbjohnson/litestream/abs"
@@ -31,6 +29,7 @@ import (
 	_ "github.com/benbjohnson/litestream/gs"
 	_ "github.com/benbjohnson/litestream/nats"
 	_ "github.com/benbjohnson/litestream/oss"
+	_ "github.com/benbjohnson/litestream/s3"
 	_ "github.com/benbjohnson/litestream/sftp"
 	_ "github.com/benbjohnson/litestream/webdav"
 )
@@ -42,34 +41,10 @@ func LitestreamVFSRegister() {
 	var client litestream.ReplicaClient
 	var err error
 
-	// Try URL-based configuration first (LITESTREAM_REPLICA_URL)
-	if replicaURL := os.Getenv("LITESTREAM_REPLICA_URL"); replicaURL != "" {
-		client, err = litestream.NewReplicaClientFromURL(replicaURL)
-		if err != nil {
-			log.Fatalf("failed to create replica client from URL: %s", err)
-		}
-	} else {
-		// Fall back to legacy S3-specific environment variables
-		s3Client := s3.NewReplicaClient()
-		s3Client.AccessKeyID = os.Getenv("AWS_ACCESS_KEY_ID")
-		s3Client.SecretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
-		s3Client.Region = os.Getenv("LITESTREAM_S3_REGION")
-		s3Client.Bucket = os.Getenv("LITESTREAM_S3_BUCKET")
-		s3Client.Path = os.Getenv("LITESTREAM_S3_PATH")
-		s3Client.Endpoint = os.Getenv("LITESTREAM_S3_ENDPOINT")
-
-		if v := os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE"); v != "" {
-			if s3Client.ForcePathStyle, err = strconv.ParseBool(v); err != nil {
-				log.Fatalf("failed to parse LITESTREAM_S3_FORCE_PATH_STYLE: %s", err)
-			}
-		}
-
-		if v := os.Getenv("LITESTREAM_S3_SKIP_VERIFY"); v != "" {
-			if s3Client.SkipVerify, err = strconv.ParseBool(v); err != nil {
-				log.Fatalf("failed to parse LITESTREAM_S3_SKIP_VERIFY: %s", err)
-			}
-		}
-		client = s3Client
+	replicaURL := os.Getenv("LITESTREAM_REPLICA_URL")
+	client, err = litestream.NewReplicaClientFromURL(replicaURL)
+	if err != nil {
+		log.Fatalf("failed to create replica client from URL: %s", err)
 	}
 
 	// Initialize the client.

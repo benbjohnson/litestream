@@ -157,6 +157,18 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (li
 	// Check for Tigris endpoint
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
 
+	// Read authentication from environment variables
+	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
+		client.AccessKeyID = v
+	} else if v := os.Getenv("LITESTREAM_ACCESS_KEY_ID"); v != "" {
+		client.AccessKeyID = v
+	}
+	if v := os.Getenv("AWS_SECRET_ACCESS_KEY"); v != "" {
+		client.SecretAccessKey = v
+	} else if v := os.Getenv("LITESTREAM_SECRET_ACCESS_KEY"); v != "" {
+		client.SecretAccessKey = v
+	}
+
 	// Configure client
 	client.Bucket = bucket
 	client.Path = urlPath
