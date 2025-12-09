@@ -126,6 +126,8 @@ func newDelayedReplicaClient(delay time.Duration) *delayedReplicaClient {
 
 func (c *delayedReplicaClient) Type() string { return "delayed" }
 
+func (c *delayedReplicaClient) Init(context.Context) error { return nil }
+
 func (c *delayedReplicaClient) key(level int, min, max ltx.TXID) string {
 	return fmt.Sprintf("%d:%s:%s", level, min.String(), max.String())
 }

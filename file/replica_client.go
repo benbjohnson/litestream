@@ -65,6 +65,11 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
+// Init is a no-op for file replica client as no initialization is required.
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	return nil
+}
+
 // Path returns the destination path to replicate the database to.
 func (c *ReplicaClient) Path() string {
 	return c.path
