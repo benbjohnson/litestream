@@ -92,7 +92,13 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
-func (c *ReplicaClient) Init(ctx context.Context) (_ *gowebdav.Client, err error) {
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	_, err := c.init(ctx)
+	return err
+}
+
+// init initializes the connection and returns the WebDAV client.
+func (c *ReplicaClient) init(ctx context.Context) (_ *gowebdav.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -117,7 +123,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *gowebdav.Client, err error
 }
 
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
@@ -132,7 +138,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -232,7 +238,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 //   - https://github.com/nextcloud/server/issues/7995 (0-byte file bug)
 //   - https://evertpot.com/260/ (WebDAV chunked encoding compatibility)
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -297,7 +303,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 }
 
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -349,7 +355,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return err
 	}

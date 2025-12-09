@@ -1,7 +1,6 @@
 package litestream
 
 import (
-	"context"
 	"fmt"
 	"net/url"
 	"path"
@@ -9,12 +8,6 @@ import (
 	"strings"
 	"sync"
 )
-
-// ReplicaClientInitializer is an optional interface for replica clients that require initialization.
-// Clients that need to establish connections or perform setup should implement this interface.
-type ReplicaClientInitializer interface {
-	Init(ctx context.Context) error
-}
 
 // ReplicaClientFactory is a function that creates a ReplicaClient from URL components.
 type ReplicaClientFactory func(scheme, host, urlPath string, query url.Values) (ReplicaClient, error)

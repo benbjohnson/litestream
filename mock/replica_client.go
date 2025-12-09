@@ -12,6 +12,7 @@ import (
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 type ReplicaClient struct {
+	InitFunc           func(ctx context.Context) error
 	DeleteAllFunc      func(ctx context.Context) error
 	LTXFilesFunc       func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
 	OpenLTXFileFunc    func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
@@ -20,6 +21,13 @@ type ReplicaClient struct {
 }
 
 func (c *ReplicaClient) Type() string { return "mock" }
+
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	if c.InitFunc != nil {
+		return c.InitFunc(ctx)
+	}
+	return nil
+}
 
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	return c.DeleteAllFunc(ctx)

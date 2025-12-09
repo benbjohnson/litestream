@@ -72,11 +72,9 @@ func LitestreamVFSRegister() {
 		client = s3Client
 	}
 
-	// Initialize the client if it supports initialization.
-	if initializer, ok := client.(litestream.ReplicaClientInitializer); ok {
-		if err := initializer.Init(context.Background()); err != nil {
-			log.Fatalf("failed to initialize litestream replica client: %s", err)
-		}
+	// Initialize the client.
+	if err := client.Init(context.Background()); err != nil {
+		log.Fatalf("failed to initialize litestream replica client: %s", err)
 	}
 
 	var level slog.Level

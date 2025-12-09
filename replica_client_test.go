@@ -435,7 +435,7 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		c.Host = addr
 		c.HostKey = expectedHostKey
 
-		_, err = c.Init(context.Background())
+		err = c.Init(context.Background())
 		if err != nil {
 			t.Fatalf("SFTP connection failed: %v", err)
 		}
@@ -449,7 +449,7 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		c.Host = addr
 		c.HostKey = invalidHostKey
 
-		_, err = c.Init(context.Background())
+		err = c.Init(context.Background())
 		if err == nil {
 			t.Fatalf("SFTP connection established despite invalid host key")
 		}
@@ -475,7 +475,7 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		c.User = "foo"
 		c.Host = addr
 
-		_, err = c.Init(context.Background())
+		err = c.Init(context.Background())
 		if err != nil {
 			t.Fatalf("SFTP connection failed: %v", err)
 		}

@@ -19,6 +19,11 @@ type ReplicaClient interface {
 	// Type returns the type of client.
 	Type() string
 
+	// Init initializes the replica client connection.
+	// This may establish connections, validate configuration, etc.
+	// Implementations should be idempotent (no-op if already initialized).
+	Init(ctx context.Context) error
+
 	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
 	// If seek is specified, the iterator start from the given TXID or the next available if not found.
 	// If useMetadata is true, the iterator fetches accurate timestamps from metadata for timestamp-based restore.
