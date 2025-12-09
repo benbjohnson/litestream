@@ -613,7 +613,12 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("pos: %w", err)
 	}
 	db.txIDGauge.Set(float64(pos.TXID))
-	// db.shadowWALSizeGauge.Set(float64(size))
+
+	// Update file size metrics.
+	if fi, err := os.Stat(db.path); err == nil {
+		db.dbSizeGauge.Set(float64(fi.Size()))
+	}
+	db.walSizeGauge.Set(float64(newWALSize))
 
 	// Notify replicas of WAL changes.
 	// if changed {
@@ -1090,6 +1095,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) error
 		sz = maxOffset - info.offset
 	}
 	assert(sz >= 0, fmt.Sprintf("wal size must be positive: sz=%d, maxOffset=%d, info.offset=%d", sz, maxOffset, info.offset))
+
+	// Track total WAL bytes synced.
+	if sz > 0 {
+		db.totalWALBytesCounter.Add(float64(sz))
+	}
 
 	// Exit if we have no new WAL pages and we aren't snapshotting.
 	if !info.snapshotting && sz == 0 {
