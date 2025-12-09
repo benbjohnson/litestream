@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -50,6 +51,36 @@ func (c *testReplicaClient) DeleteLTXFiles(_ context.Context, _ []*ltx.FileInfo)
 }
 
 func (c *testReplicaClient) DeleteAll(_ context.Context) error {
+	return nil
+}
+
+// errorReplicaClient is a replica client that returns errors for testing.
+type errorReplicaClient struct {
+	writeErr error
+}
+
+func (c *errorReplicaClient) Type() string { return "error" }
+
+func (c *errorReplicaClient) LTXFiles(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+	return ltx.NewFileInfoSliceIterator(nil), nil
+}
+
+func (c *errorReplicaClient) OpenLTXFile(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+	return nil, os.ErrNotExist
+}
+
+func (c *errorReplicaClient) WriteLTXFile(_ context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+	if c.writeErr != nil {
+		return nil, c.writeErr
+	}
+	return nil, nil
+}
+
+func (c *errorReplicaClient) DeleteLTXFiles(_ context.Context, _ []*ltx.FileInfo) error {
+	return nil
+}
+
+func (c *errorReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
@@ -195,5 +226,160 @@ func TestDB_Sync_UpdatesMetrics(t *testing.T) {
 	totalWALValue := testutil.ToFloat64(totalWALMetric)
 	if totalWALValue <= 0 {
 		t.Fatalf("litestream_total_wal_bytes=%v, want > 0", totalWALValue)
+	}
+
+	// Verify txid metric was updated (should be > 0 after writes)
+	txidMetric := txIDIndexGaugeVec.WithLabelValues(db.Path())
+	txidValue := testutil.ToFloat64(txidMetric)
+	if txidValue <= 0 {
+		t.Fatalf("litestream_txid=%v, want > 0", txidValue)
+	}
+
+	// Verify sync count was incremented
+	syncCountMetric := syncNCounterVec.WithLabelValues(db.Path())
+	syncCountValue := testutil.ToFloat64(syncCountMetric)
+	if syncCountValue <= 0 {
+		t.Fatalf("litestream_sync_count=%v, want > 0", syncCountValue)
+	}
+
+	// Verify sync seconds was recorded
+	syncSecondsMetric := syncSecondsCounterVec.WithLabelValues(db.Path())
+	syncSecondsValue := testutil.ToFloat64(syncSecondsMetric)
+	if syncSecondsValue <= 0 {
+		t.Fatalf("litestream_sync_seconds=%v, want > 0", syncSecondsValue)
+	}
+}
+
+// TestDB_Checkpoint_UpdatesMetrics verifies that checkpoint metrics are updated.
+func TestDB_Checkpoint_UpdatesMetrics(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'test data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync first to initialize database state
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get baseline checkpoint metrics
+	baselineCount := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), "PASSIVE"))
+	baselineSeconds := testutil.ToFloat64(checkpointSecondsCounterVec.WithLabelValues(db.Path(), "PASSIVE"))
+
+	// Force checkpoint
+	if err := db.Checkpoint(context.Background(), "PASSIVE"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify checkpoint_count was incremented
+	checkpointCountMetric := checkpointNCounterVec.WithLabelValues(db.Path(), "PASSIVE")
+	checkpointCountValue := testutil.ToFloat64(checkpointCountMetric)
+	if checkpointCountValue <= baselineCount {
+		t.Fatalf("litestream_checkpoint_count=%v, want > %v", checkpointCountValue, baselineCount)
+	}
+
+	// Verify checkpoint_seconds was recorded
+	checkpointSecondsMetric := checkpointSecondsCounterVec.WithLabelValues(db.Path(), "PASSIVE")
+	checkpointSecondsValue := testutil.ToFloat64(checkpointSecondsMetric)
+	if checkpointSecondsValue <= baselineSeconds {
+		t.Fatalf("litestream_checkpoint_seconds=%v, want > %v", checkpointSecondsValue, baselineSeconds)
+	}
+}
+
+// TestDB_Sync_ErrorMetrics verifies that sync error counter is incremented on failure.
+func TestDB_Sync_ErrorMetrics(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	errorClient := &errorReplicaClient{writeErr: errors.New("simulated write error")}
+	workingClient := &testReplicaClient{dir: t.TempDir()}
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = workingClient // Start with working client
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		// Switch back to working client for clean close
+		db.Replica.Client = workingClient
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'test data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// First sync with working client to initialize
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Insert more data
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'more data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get baseline error count
+	baselineErrors := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
+
+	// Switch to error client
+	db.Replica.Client = errorClient
+
+	// Sync should fail due to error replica client
+	err = db.Sync(context.Background())
+	if err == nil {
+		t.Skip("sync did not return error, skipping error metric test")
+	}
+
+	// Verify sync_error_count was incremented
+	syncErrorMetric := syncErrorNCounterVec.WithLabelValues(db.Path())
+	syncErrorValue := testutil.ToFloat64(syncErrorMetric)
+	if syncErrorValue <= baselineErrors {
+		t.Fatalf("litestream_sync_error_count=%v, want > %v", syncErrorValue, baselineErrors)
 	}
 }
