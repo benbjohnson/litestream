@@ -496,7 +496,7 @@ snapshot:
 
 func TestParseReplicaURL_AccessPoint(t *testing.T) {
 	t.Run("WithPrefix", func(t *testing.T) {
-		scheme, host, urlPath, err := main.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/db-access/backups/prod")
+		scheme, host, urlPath, err := litestream.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/db-access/backups/prod")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -512,7 +512,7 @@ func TestParseReplicaURL_AccessPoint(t *testing.T) {
 	})
 
 	t.Run("Invalid", func(t *testing.T) {
-		if _, _, _, err := main.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/"); err == nil {
+		if _, _, _, err := litestream.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/"); err == nil {
 			t.Fatal("expected error")
 		}
 	})
@@ -1498,7 +1498,7 @@ func TestFindSQLiteDatabases(t *testing.T) {
 func TestParseReplicaURLWithQuery(t *testing.T) {
 	t.Run("S3WithEndpoint", func(t *testing.T) {
 		url := "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-east-1&forcePathStyle=true"
-		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1524,7 +1524,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("S3WithoutQuery", func(t *testing.T) {
 		url := "s3://mybucket/path/to/db"
-		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1544,7 +1544,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("FileURL", func(t *testing.T) {
 		url := "file:///path/to/db"
-		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1565,7 +1565,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 	t.Run("BackwardCompatibility", func(t *testing.T) {
 		// Test that ParseReplicaURL still works as before
 		url := "s3://mybucket/path/to/db?endpoint=localhost:9000"
-		scheme, host, path, err := main.ParseReplicaURL(url)
+		scheme, host, path, err := litestream.ParseReplicaURL(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1582,7 +1582,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("S3TigrisExample", func(t *testing.T) {
 		url := "s3://mybucket/db?endpoint=fly.storage.tigris.dev&region=auto"
-		scheme, host, path, query, err := main.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1605,7 +1605,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("S3WithSkipVerify", func(t *testing.T) {
 		url := "s3://mybucket/db?endpoint=self-signed.local&skipVerify=true"
-		_, _, _, query, err := main.ParseReplicaURLWithQuery(url)
+		_, _, _, query, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}

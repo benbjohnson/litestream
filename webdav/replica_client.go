@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -18,6 +20,11 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("webdav", NewReplicaClientFromURL)
+	litestream.RegisterReplicaClientFactory("webdavs", NewReplicaClientFromURL)
+}
 
 const ReplicaClientType = "webdav"
 
@@ -44,6 +51,41 @@ func NewReplicaClient() *ReplicaClient {
 		logger:  slog.Default().WithGroup(ReplicaClientType),
 		Timeout: DefaultTimeout,
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: webdav://[user[:password]@]host[:port]/path or webdavs://... (for HTTPS)
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Determine HTTP or HTTPS based on scheme
+	httpScheme := "http"
+	if scheme == "webdavs" {
+		httpScheme = "https"
+	}
+
+	// Parse userinfo from host if present
+	if idx := strings.Index(host, "@"); idx != -1 {
+		userinfo := host[:idx]
+		host = host[idx+1:]
+
+		if colonIdx := strings.Index(userinfo, ":"); colonIdx != -1 {
+			client.Username = userinfo[:colonIdx]
+			client.Password = userinfo[colonIdx+1:]
+		} else {
+			client.Username = userinfo
+		}
+	}
+
+	if host == "" {
+		return nil, fmt.Errorf("host required for webdav replica URL")
+	}
+
+	client.URL = fmt.Sprintf("%s://%s", httpScheme, host)
+	client.Path = urlPath
+
+	return client, nil
 }
 
 func (c *ReplicaClient) Type() string {

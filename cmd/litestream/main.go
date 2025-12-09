@@ -13,7 +13,6 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
-	"regexp"
 	"strings"
 	"time"
 
@@ -994,7 +993,7 @@ type ReplicaConfig struct {
 // NewReplicaFromConfig instantiates a replica for a DB based on a config.
 func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Replica, err error) {
 	// Ensure user did not specify URL in path.
-	if isURL(c.Path) {
+	if litestream.IsURL(c.Path) {
 		return nil, fmt.Errorf("replica path cannot be a url, please use the 'url' field instead: %s", c.Path)
 	}
 
@@ -1064,7 +1063,7 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	// Parse configPath from URL, if specified.
 	configPath := c.Path
 	if c.URL != "" {
-		if _, _, configPath, err = ParseReplicaURL(c.URL); err != nil {
+		if _, _, configPath, err = litestream.ParseReplicaURL(c.URL); err != nil {
 			return nil, err
 		}
 	}
@@ -1126,7 +1125,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 
 	if c.URL != "" {
-		_, host, upath, query, err := ParseReplicaURLWithQuery(c.URL)
+		_, host, upath, query, err := litestream.ParseReplicaURLWithQuery(c.URL)
 		if err != nil {
 			return nil, err
 		}
@@ -1140,7 +1139,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 		if strings.HasPrefix(host, "arn:") {
 			ubucket = host
-			uregion = regionFromS3ARN(host)
+			uregion = litestream.RegionFromS3ARN(host)
 		} else {
 			ubucket, uregion, uendpoint, uforcePathStyle = s3.ParseHost(host)
 		}
@@ -1168,11 +1167,11 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
 			skipVerify = qSkipVerify == "true"
 		}
-		if v, ok := boolQueryValue(query, "signPayload", "sign-payload"); ok {
+		if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
 			usignPayload = v
 			usignPayloadSet = true
 		}
-		if v, ok := boolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
+		if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
 		}
@@ -1206,8 +1205,8 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		return nil, fmt.Errorf("bucket required for s3 replica")
 	}
 
-	isTigris := isTigrisEndpoint(endpoint)
-	if !isTigris && !endpointWasSet && isTigrisEndpoint(c.Endpoint) {
+	isTigris := litestream.IsTigrisEndpoint(endpoint)
+	if !isTigris && !endpointWasSet && litestream.IsTigrisEndpoint(c.Endpoint) {
 		isTigris = true
 	}
 
@@ -1253,7 +1252,7 @@ func newGSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *g
 
 	// Apply settings from URL, if specified.
 	if c.URL != "" {
-		_, uhost, upath, err := ParseReplicaURL(c.URL)
+		_, uhost, upath, err := litestream.ParseReplicaURL(c.URL)
 		if err != nil {
 			return nil, err
 		}
@@ -1438,7 +1437,7 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	// Parse URL if provided to extract bucket name and server URL
 	var url, bucket string
 	if c.URL != "" {
-		scheme, host, bucketPath, err := ParseReplicaURL(c.URL)
+		scheme, host, bucketPath, err := litestream.ParseReplicaURL(c.URL)
 		if err != nil {
 			return nil, fmt.Errorf("invalid NATS URL: %w", err)
 		}
@@ -1520,7 +1519,7 @@ func newOSSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *
 
 	// Apply settings from URL, if specified.
 	if c.URL != "" {
-		_, host, upath, err := ParseReplicaURL(c.URL)
+		_, host, upath, err := litestream.ParseReplicaURL(c.URL)
 		if err != nil {
 			return nil, err
 		}
@@ -1585,128 +1584,6 @@ func applyLitestreamEnv() {
 	}
 }
 
-// ParseReplicaURL parses a replica URL.
-func ParseReplicaURL(s string) (scheme, host, urlpath string, err error) {
-	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
-		return parseS3AccessPointURL(s)
-	}
-
-	scheme, host, urlpath, _, err = ParseReplicaURLWithQuery(s)
-	return scheme, host, urlpath, err
-}
-
-// ParseReplicaURLWithQuery parses a replica URL and returns query parameters.
-func ParseReplicaURLWithQuery(s string) (scheme, host, urlpath string, query url.Values, err error) {
-	// Handle S3 Access Point ARNs which can't be parsed by standard url.Parse
-	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
-		scheme, host, urlpath, err := parseS3AccessPointURL(s)
-		return scheme, host, urlpath, nil, err
-	}
-
-	u, err := url.Parse(s)
-	if err != nil {
-		return "", "", "", nil, err
-	}
-
-	switch u.Scheme {
-	case "file":
-		scheme, u.Scheme = u.Scheme, ""
-		// Remove query params from path for file URLs
-		u.RawQuery = ""
-		return scheme, "", path.Clean(u.String()), nil, nil
-
-	case "":
-		return u.Scheme, u.Host, u.Path, nil, fmt.Errorf("replica url scheme required: %s", s)
-
-	default:
-		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), u.Query(), nil
-	}
-}
-
-func parseS3AccessPointURL(s string) (scheme, host, urlpath string, err error) {
-	const prefix = "s3://"
-	if !strings.HasPrefix(strings.ToLower(s), prefix) {
-		return "", "", "", fmt.Errorf("invalid s3 access point url: %s", s)
-	}
-
-	arnWithPath := s[len(prefix):]
-	bucket, key, err := splitS3AccessPointARN(arnWithPath)
-	if err != nil {
-		return "", "", "", err
-	}
-
-	return "s3", bucket, cleanReplicaURLPath(key), nil
-}
-
-func splitS3AccessPointARN(s string) (bucket, key string, err error) {
-	lower := strings.ToLower(s)
-	const marker = ":accesspoint/"
-	idx := strings.Index(lower, marker)
-	if idx == -1 {
-		return "", "", fmt.Errorf("invalid s3 access point arn: %s", s)
-	}
-
-	nameStart := idx + len(marker)
-	if nameStart >= len(s) {
-		return "", "", fmt.Errorf("invalid s3 access point arn: %s", s)
-	}
-
-	remainder := s[nameStart:]
-	slashIdx := strings.IndexByte(remainder, '/')
-	if slashIdx == -1 {
-		return s, "", nil
-	}
-
-	bucketEnd := nameStart + slashIdx
-	bucket = s[:bucketEnd]
-	key = remainder[slashIdx+1:]
-	return bucket, key, nil
-}
-
-func cleanReplicaURLPath(p string) string {
-	if p == "" {
-		return ""
-	}
-	cleaned := path.Clean("/" + p)
-	cleaned = strings.TrimPrefix(cleaned, "/")
-	if cleaned == "." {
-		return ""
-	}
-	return cleaned
-}
-
-func boolQueryValue(query url.Values, keys ...string) (bool, bool) {
-	if query == nil {
-		return false, false
-	}
-	for _, key := range keys {
-		if raw := query.Get(key); raw != "" {
-			switch strings.ToLower(raw) {
-			case "true", "1", "t", "yes":
-				return true, true
-			case "false", "0", "f", "no":
-				return false, true
-			default:
-				return false, true
-			}
-		}
-	}
-	return false, false
-}
-
-func isTigrisEndpoint(endpoint string) bool {
-	endpoint = strings.TrimSpace(strings.ToLower(endpoint))
-	if endpoint == "" {
-		return false
-	}
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
-			endpoint = u.Host
-		}
-	}
-	return endpoint == "fly.storage.tigris.dev"
-}
-
 type boolSetting struct {
 	value bool
 	set   bool
@@ -1727,27 +1604,10 @@ func (s *boolSetting) ApplyDefault(value bool) {
 	}
 }
 
-func regionFromS3ARN(arn string) string {
-	parts := strings.SplitN(arn, ":", 6)
-	if len(parts) >= 4 {
-		return parts[3]
-	}
-	return ""
-}
-
-// isURL returns true if s can be parsed and has a scheme.
-func isURL(s string) bool {
-	return regexp.MustCompile(`^\w+:\/\/`).MatchString(s)
-}
-
 // ReplicaType returns the type based on the type field or extracted from the URL.
 func (c *ReplicaConfig) ReplicaType() string {
-	scheme, _, _, _ := ParseReplicaURL(c.URL)
-	if scheme != "" {
-		if scheme == "webdavs" {
-			return "webdav"
-		}
-		return scheme
+	if replicaType := litestream.ReplicaTypeFromURL(c.URL); replicaType != "" {
+		return replicaType
 	} else if c.Type != "" {
 		return c.Type
 	}

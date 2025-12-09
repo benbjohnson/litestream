@@ -1,0 +1,215 @@
+package litestream
+
+import (
+	"context"
+	"fmt"
+	"net/url"
+	"path"
+	"regexp"
+	"strings"
+	"sync"
+)
+
+// ReplicaClientInitializer is an optional interface for replica clients that require initialization.
+// Clients that need to establish connections or perform setup should implement this interface.
+type ReplicaClientInitializer interface {
+	Init(ctx context.Context) error
+}
+
+// ReplicaClientFactory is a function that creates a ReplicaClient from URL components.
+type ReplicaClientFactory func(scheme, host, urlPath string, query url.Values) (ReplicaClient, error)
+
+var (
+	replicaClientFactories   = make(map[string]ReplicaClientFactory)
+	replicaClientFactoriesMu sync.RWMutex
+)
+
+// RegisterReplicaClientFactory registers a factory function for creating replica clients
+// for a given URL scheme. This is typically called from init() functions in backend packages.
+func RegisterReplicaClientFactory(scheme string, factory ReplicaClientFactory) {
+	replicaClientFactoriesMu.Lock()
+	defer replicaClientFactoriesMu.Unlock()
+	replicaClientFactories[scheme] = factory
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from a URL string.
+// The URL scheme determines which backend is used (s3, gs, abs, file, etc.).
+func NewReplicaClientFromURL(rawURL string) (ReplicaClient, error) {
+	scheme, host, urlPath, query, err := ParseReplicaURLWithQuery(rawURL)
+	if err != nil {
+		return nil, err
+	}
+
+	// Normalize webdavs to webdav
+	factoryScheme := scheme
+	if factoryScheme == "webdavs" {
+		factoryScheme = "webdav"
+	}
+
+	replicaClientFactoriesMu.RLock()
+	factory, ok := replicaClientFactories[factoryScheme]
+	replicaClientFactoriesMu.RUnlock()
+
+	if !ok {
+		return nil, fmt.Errorf("unsupported replica URL scheme: %q", scheme)
+	}
+
+	return factory(scheme, host, urlPath, query)
+}
+
+// ReplicaTypeFromURL returns the replica type from a URL string.
+// Returns empty string if the URL is invalid or has no scheme.
+func ReplicaTypeFromURL(rawURL string) string {
+	scheme, _, _, _ := ParseReplicaURL(rawURL)
+	if scheme == "" {
+		return ""
+	}
+	if scheme == "webdavs" {
+		return "webdav"
+	}
+	return scheme
+}
+
+// ParseReplicaURL parses a replica URL and returns the scheme, host, and path.
+func ParseReplicaURL(s string) (scheme, host, urlPath string, err error) {
+	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
+		return parseS3AccessPointURL(s)
+	}
+
+	scheme, host, urlPath, _, err = ParseReplicaURLWithQuery(s)
+	return scheme, host, urlPath, err
+}
+
+// ParseReplicaURLWithQuery parses a replica URL and returns query parameters.
+func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url.Values, err error) {
+	// Handle S3 Access Point ARNs which can't be parsed by standard url.Parse
+	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
+		scheme, host, urlPath, err := parseS3AccessPointURL(s)
+		return scheme, host, urlPath, nil, err
+	}
+
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+
+	switch u.Scheme {
+	case "file":
+		scheme, u.Scheme = u.Scheme, ""
+		// Remove query params from path for file URLs
+		u.RawQuery = ""
+		return scheme, "", path.Clean(u.String()), nil, nil
+
+	case "":
+		return u.Scheme, u.Host, u.Path, nil, fmt.Errorf("replica url scheme required: %s", s)
+
+	default:
+		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), u.Query(), nil
+	}
+}
+
+// parseS3AccessPointURL parses an S3 Access Point URL (s3://arn:...).
+func parseS3AccessPointURL(s string) (scheme, host, urlPath string, err error) {
+	const prefix = "s3://"
+	if !strings.HasPrefix(strings.ToLower(s), prefix) {
+		return "", "", "", fmt.Errorf("invalid s3 access point url: %s", s)
+	}
+
+	arnWithPath := s[len(prefix):]
+	bucket, key, err := splitS3AccessPointARN(arnWithPath)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	return "s3", bucket, CleanReplicaURLPath(key), nil
+}
+
+// splitS3AccessPointARN splits an S3 Access Point ARN into bucket and key components.
+func splitS3AccessPointARN(s string) (bucket, key string, err error) {
+	lower := strings.ToLower(s)
+	const marker = ":accesspoint/"
+	idx := strings.Index(lower, marker)
+	if idx == -1 {
+		return "", "", fmt.Errorf("invalid s3 access point arn: %s", s)
+	}
+
+	nameStart := idx + len(marker)
+	if nameStart >= len(s) {
+		return "", "", fmt.Errorf("invalid s3 access point arn: %s", s)
+	}
+
+	remainder := s[nameStart:]
+	slashIdx := strings.IndexByte(remainder, '/')
+	if slashIdx == -1 {
+		return s, "", nil
+	}
+
+	bucketEnd := nameStart + slashIdx
+	bucket = s[:bucketEnd]
+	key = remainder[slashIdx+1:]
+	return bucket, key, nil
+}
+
+// CleanReplicaURLPath cleans a URL path for use in replica storage.
+func CleanReplicaURLPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	cleaned := path.Clean("/" + p)
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	if cleaned == "." {
+		return ""
+	}
+	return cleaned
+}
+
+// RegionFromS3ARN extracts the region from an S3 ARN.
+func RegionFromS3ARN(arn string) string {
+	parts := strings.SplitN(arn, ":", 6)
+	if len(parts) >= 4 {
+		return parts[3]
+	}
+	return ""
+}
+
+// BoolQueryValue returns a boolean value from URL query parameters.
+// It checks multiple keys in order and returns the value and whether it was set.
+func BoolQueryValue(query url.Values, keys ...string) (value bool, ok bool) {
+	if query == nil {
+		return false, false
+	}
+	for _, key := range keys {
+		if raw := query.Get(key); raw != "" {
+			switch strings.ToLower(raw) {
+			case "true", "1", "t", "yes":
+				return true, true
+			case "false", "0", "f", "no":
+				return false, true
+			default:
+				return false, true
+			}
+		}
+	}
+	return false, false
+}
+
+// IsTigrisEndpoint returns true if the endpoint is the Tigris object storage service.
+func IsTigrisEndpoint(endpoint string) bool {
+	endpoint = strings.TrimSpace(strings.ToLower(endpoint))
+	if endpoint == "" {
+		return false
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+			endpoint = u.Host
+		}
+	}
+	return endpoint == "fly.storage.tigris.dev"
+}
+
+// IsURL returns true if s appears to be a URL (has a scheme).
+var isURLRegex = regexp.MustCompile(`^\w+:\/\/`)
+
+func IsURL(s string) bool {
+	return isURLRegex.MatchString(s)
+}
