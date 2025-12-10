@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path"
 	"sync"
@@ -19,6 +20,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("gs", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "gs"
@@ -45,6 +50,19 @@ func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
 		logger: slog.Default().WithGroup(ReplicaClientType),
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	if host == "" {
+		return nil, fmt.Errorf("bucket required for gs replica URL")
+	}
+
+	client := NewReplicaClient()
+	client.Bucket = host
+	client.Path = urlPath
+	return client, nil
 }
 
 // Type returns "gs" as the client type.

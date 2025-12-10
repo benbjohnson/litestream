@@ -38,6 +38,10 @@ import (
 	"github.com/benbjohnson/litestream/internal"
 )
 
+func init() {
+	litestream.RegisterReplicaClientFactory("s3", NewReplicaClientFromURL)
+}
+
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "s3"
 
@@ -88,6 +92,109 @@ func NewReplicaClient() *ReplicaClient {
 		logger:            slog.Default().WithGroup(ReplicaClientType),
 		RequireContentMD5: true,
 	}
+}
+
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	var (
+		bucket         string
+		region         string
+		endpoint       string
+		forcePathStyle bool
+		skipVerify     bool
+		signPayload    bool
+		signPayloadSet bool
+		requireMD5     bool
+		requireMD5Set  bool
+	)
+
+	// Parse host for bucket and region
+	if strings.HasPrefix(host, "arn:") {
+		bucket = host
+		region = litestream.RegionFromS3ARN(host)
+	} else {
+		bucket, region, endpoint, forcePathStyle = ParseHost(host)
+	}
+
+	// Override with query parameters if provided
+	if qEndpoint := query.Get("endpoint"); qEndpoint != "" {
+		// Ensure endpoint has a scheme
+		if !strings.HasPrefix(qEndpoint, "http://") && !strings.HasPrefix(qEndpoint, "https://") {
+			qEndpoint = "http://" + qEndpoint
+		}
+		endpoint = qEndpoint
+		// Default to path style for custom endpoints unless explicitly set to false
+		if query.Get("forcePathStyle") != "false" {
+			forcePathStyle = true
+		}
+	}
+	if qRegion := query.Get("region"); qRegion != "" {
+		region = qRegion
+	}
+	if qForcePathStyle := query.Get("forcePathStyle"); qForcePathStyle != "" {
+		forcePathStyle = qForcePathStyle == "true"
+	}
+	if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
+		skipVerify = qSkipVerify == "true"
+	}
+	if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
+		signPayload = v
+		signPayloadSet = true
+	}
+	if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
+		requireMD5 = v
+		requireMD5Set = true
+	}
+
+	// Ensure bucket is set
+	if bucket == "" {
+		return nil, fmt.Errorf("bucket required for s3 replica URL")
+	}
+
+	// Check for Tigris endpoint
+	isTigris := litestream.IsTigrisEndpoint(endpoint)
+
+	// Read authentication from environment variables
+	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
+		client.AccessKeyID = v
+	} else if v := os.Getenv("LITESTREAM_ACCESS_KEY_ID"); v != "" {
+		client.AccessKeyID = v
+	}
+	if v := os.Getenv("AWS_SECRET_ACCESS_KEY"); v != "" {
+		client.SecretAccessKey = v
+	} else if v := os.Getenv("LITESTREAM_SECRET_ACCESS_KEY"); v != "" {
+		client.SecretAccessKey = v
+	}
+
+	// Configure client
+	client.Bucket = bucket
+	client.Path = urlPath
+	client.Region = region
+	client.Endpoint = endpoint
+	client.ForcePathStyle = forcePathStyle
+	client.SkipVerify = skipVerify
+
+	// Apply Tigris defaults
+	if isTigris {
+		if !signPayloadSet {
+			signPayload, signPayloadSet = true, true
+		}
+		if !requireMD5Set {
+			requireMD5, requireMD5Set = false, true
+		}
+	}
+
+	if signPayloadSet {
+		client.SignPayload = signPayload
+	}
+	if requireMD5Set {
+		client.RequireContentMD5 = requireMD5
+	}
+
+	return client, nil
 }
 
 // Type returns "s3" as the client type.

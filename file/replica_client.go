@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"time"
@@ -15,6 +16,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("file", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "file"
@@ -37,6 +42,16 @@ func NewReplicaClient(path string) *ReplicaClient {
 	}
 }
 
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	// For file URLs, the path is the full path
+	if urlPath == "" {
+		return nil, fmt.Errorf("file replica path required")
+	}
+	return NewReplicaClient(urlPath), nil
+}
+
 // db returns the database, if available.
 func (c *ReplicaClient) db() *litestream.DB {
 	if c.Replica == nil {
@@ -48,6 +63,11 @@ func (c *ReplicaClient) db() *litestream.DB {
 // Type returns "file" as the client type.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
+}
+
+// Init is a no-op for file replica client as no initialization is required.
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	return nil
 }
 
 // Path returns the destination path to replicate the database to.

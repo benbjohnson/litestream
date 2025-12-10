@@ -16,43 +16,40 @@ import (
 	"log"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 	"unsafe"
 
 	"github.com/psanford/sqlite3vfs"
 
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/s3"
+
+	// Import all replica backends to register their URL factories.
+	_ "github.com/benbjohnson/litestream/abs"
+	_ "github.com/benbjohnson/litestream/file"
+	_ "github.com/benbjohnson/litestream/gs"
+	_ "github.com/benbjohnson/litestream/nats"
+	_ "github.com/benbjohnson/litestream/oss"
+	_ "github.com/benbjohnson/litestream/s3"
+	_ "github.com/benbjohnson/litestream/sftp"
+	_ "github.com/benbjohnson/litestream/webdav"
 )
 
 func main() {}
 
 //export LitestreamVFSRegister
 func LitestreamVFSRegister() {
+	var client litestream.ReplicaClient
 	var err error
-	client := s3.NewReplicaClient()
-	client.AccessKeyID = os.Getenv("AWS_ACCESS_KEY_ID")
-	client.SecretAccessKey = os.Getenv("AWS_SECRET_ACCESS_KEY")
-	client.Region = os.Getenv("LITESTREAM_S3_REGION")
-	client.Bucket = os.Getenv("LITESTREAM_S3_BUCKET")
-	client.Path = os.Getenv("LITESTREAM_S3_PATH")
-	client.Endpoint = os.Getenv("LITESTREAM_S3_ENDPOINT")
 
-	if v := os.Getenv("LITESTREAM_S3_FORCE_PATH_STYLE"); v != "" {
-		if client.ForcePathStyle, err = strconv.ParseBool(v); err != nil {
-			log.Fatalf("failed to parse LITESTREAM_S3_FORCE_PATH_STYLE: %s", err)
-		}
+	replicaURL := os.Getenv("LITESTREAM_REPLICA_URL")
+	client, err = litestream.NewReplicaClientFromURL(replicaURL)
+	if err != nil {
+		log.Fatalf("failed to create replica client from URL: %s", err)
 	}
 
-	if v := os.Getenv("LITESTREAM_S3_SKIP_VERIFY"); v != "" {
-		if client.SkipVerify, err = strconv.ParseBool(v); err != nil {
-			log.Fatalf("failed to parse LITESTREAM_S3_SKIP_VERIFY: %s", err)
-		}
-	}
-
+	// Initialize the client.
 	if err := client.Init(context.Background()); err != nil {
-		log.Fatalf("failed to initialize litestream s3 client: %s", err)
+		log.Fatalf("failed to initialize litestream replica client: %s", err)
 	}
 
 	var level slog.Level

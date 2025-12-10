@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/url"
 	"os"
 	"path"
 	"sync"
@@ -20,6 +21,10 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("sftp", NewReplicaClientFromURL)
+}
 
 // ReplicaClientType is the client type for this package.
 const ReplicaClientType = "sftp"
@@ -61,13 +66,44 @@ func NewReplicaClient() *ReplicaClient {
 	}
 }
 
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: sftp://[user[:password]@]host[:port]/path
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Extract credentials from userinfo
+	if userinfo != nil {
+		client.User = userinfo.Username()
+		client.Password, _ = userinfo.Password()
+	}
+
+	client.Host = host
+	client.Path = urlPath
+
+	if client.Host == "" {
+		return nil, fmt.Errorf("host required for sftp replica URL")
+	}
+	if client.User == "" {
+		return nil, fmt.Errorf("user required for sftp replica URL")
+	}
+
+	return client, nil
+}
+
 // Type returns "sftp" as the client type.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
 // Init initializes the connection to SFTP. No-op if already initialized.
-func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	_, err := c.init(ctx)
+	return err
+}
+
+// init initializes the connection and returns the SFTP client.
+func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -144,7 +180,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *sftp.Client, err error) {
 func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
@@ -188,7 +224,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -227,7 +263,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -287,7 +323,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +352,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
@@ -339,7 +375,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
 	defer func() { c.resetOnConnError(err) }()
 
-	sftpClient, err := c.Init(ctx)
+	sftpClient, err := c.init(ctx)
 	if err != nil {
 		return err
 	}

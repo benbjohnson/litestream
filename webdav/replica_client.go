@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path"
 	"sort"
@@ -18,6 +19,11 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
 )
+
+func init() {
+	litestream.RegisterReplicaClientFactory("webdav", NewReplicaClientFromURL)
+	litestream.RegisterReplicaClientFactory("webdavs", NewReplicaClientFromURL)
+}
 
 const ReplicaClientType = "webdav"
 
@@ -46,11 +52,45 @@ func NewReplicaClient() *ReplicaClient {
 	}
 }
 
+// NewReplicaClientFromURL creates a new ReplicaClient from URL components.
+// This is used by the replica client factory registration.
+// URL format: webdav://[user[:password]@]host[:port]/path or webdavs://... (for HTTPS)
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
+	client := NewReplicaClient()
+
+	// Determine HTTP or HTTPS based on scheme
+	httpScheme := "http"
+	if scheme == "webdavs" {
+		httpScheme = "https"
+	}
+
+	// Extract credentials from userinfo
+	if userinfo != nil {
+		client.Username = userinfo.Username()
+		client.Password, _ = userinfo.Password()
+	}
+
+	if host == "" {
+		return nil, fmt.Errorf("host required for webdav replica URL")
+	}
+
+	client.URL = fmt.Sprintf("%s://%s", httpScheme, host)
+	client.Path = urlPath
+
+	return client, nil
+}
+
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
-func (c *ReplicaClient) Init(ctx context.Context) (_ *gowebdav.Client, err error) {
+func (c *ReplicaClient) Init(ctx context.Context) error {
+	_, err := c.init(ctx)
+	return err
+}
+
+// init initializes the connection and returns the WebDAV client.
+func (c *ReplicaClient) init(ctx context.Context) (_ *gowebdav.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -75,7 +115,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (_ *gowebdav.Client, err error
 }
 
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
@@ -90,7 +130,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 }
 
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -190,7 +230,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 //   - https://github.com/nextcloud/server/issues/7995 (0-byte file bug)
 //   - https://evertpot.com/260/ (WebDAV chunked encoding compatibility)
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -255,7 +295,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 }
 
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -307,7 +347,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 }
 
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
-	client, err := c.Init(ctx)
+	client, err := c.init(ctx)
 	if err != nil {
 		return err
 	}
