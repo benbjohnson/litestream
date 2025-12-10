@@ -68,17 +68,15 @@ func NewReplicaClient() *ReplicaClient {
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
 // URL format: abs://[account-name@]container/path
-func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
 	client := NewReplicaClient()
 
-	// Parse account name from userinfo if present (abs://account@container/path)
-	if idx := strings.Index(host, "@"); idx != -1 {
-		client.AccountName = host[:idx]
-		client.Bucket = host[idx+1:]
-	} else {
-		client.Bucket = host
+	// Extract account name from userinfo if present (abs://account@container/path)
+	if userinfo != nil {
+		client.AccountName = userinfo.Username()
 	}
 
+	client.Bucket = host
 	client.Path = urlPath
 
 	if client.Bucket == "" {

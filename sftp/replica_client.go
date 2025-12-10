@@ -11,7 +11,6 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"strings"
 	"sync"
 	"time"
 
@@ -70,20 +69,13 @@ func NewReplicaClient() *ReplicaClient {
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
 // URL format: sftp://[user[:password]@]host[:port]/path
-func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
 	client := NewReplicaClient()
 
-	// Parse userinfo from host if present
-	if idx := strings.Index(host, "@"); idx != -1 {
-		userinfo := host[:idx]
-		host = host[idx+1:]
-
-		if colonIdx := strings.Index(userinfo, ":"); colonIdx != -1 {
-			client.User = userinfo[:colonIdx]
-			client.Password = userinfo[colonIdx+1:]
-		} else {
-			client.User = userinfo
-		}
+	// Extract credentials from userinfo
+	if userinfo != nil {
+		client.User = userinfo.Username()
+		client.Password, _ = userinfo.Password()
 	}
 
 	client.Host = host

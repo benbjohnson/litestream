@@ -44,7 +44,7 @@ func NewReplicaClient(path string) *ReplicaClient {
 
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
-func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
 	// For file URLs, the path is the full path
 	if urlPath == "" {
 		return nil, fmt.Errorf("file replica path required")

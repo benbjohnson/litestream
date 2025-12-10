@@ -10,7 +10,6 @@ import (
 	"os"
 	"path"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 
@@ -56,7 +55,7 @@ func NewReplicaClient() *ReplicaClient {
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
 // URL format: webdav://[user[:password]@]host[:port]/path or webdavs://... (for HTTPS)
-func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
 	client := NewReplicaClient()
 
 	// Determine HTTP or HTTPS based on scheme
@@ -65,17 +64,10 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (li
 		httpScheme = "https"
 	}
 
-	// Parse userinfo from host if present
-	if idx := strings.Index(host, "@"); idx != -1 {
-		userinfo := host[:idx]
-		host = host[idx+1:]
-
-		if colonIdx := strings.Index(userinfo, ":"); colonIdx != -1 {
-			client.Username = userinfo[:colonIdx]
-			client.Password = userinfo[colonIdx+1:]
-		} else {
-			client.Username = userinfo
-		}
+	// Extract credentials from userinfo
+	if userinfo != nil {
+		client.Username = userinfo.Username()
+		client.Password, _ = userinfo.Password()
 	}
 
 	if host == "" {

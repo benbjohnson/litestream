@@ -10,10 +10,8 @@ import (
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
+	"github.com/benbjohnson/litestream/sftp"
 	"github.com/benbjohnson/litestream/webdav"
-
-	// Register SFTP factory (not directly tested due to userinfo limitation)
-	_ "github.com/benbjohnson/litestream/sftp"
 )
 
 func TestNewReplicaClientFromURL(t *testing.T) {
@@ -118,9 +116,22 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 	})
 
-	// Note: URL userinfo (user@host) is stripped by Go's url.Parse before reaching factories.
-	// ABS account names in URL format are not currently supported via NewReplicaClientFromURL.
-	// Use config-based setup for specifying account names.
+	t.Run("ABS_WithAccount", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("abs://myaccount@mycontainer/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		absClient, ok := client.(*abs.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *abs.ReplicaClient, got %T", client)
+		}
+		if absClient.AccountName != "myaccount" {
+			t.Errorf("expected account 'myaccount', got %q", absClient.AccountName)
+		}
+		if absClient.Bucket != "mycontainer" {
+			t.Errorf("expected bucket 'mycontainer', got %q", absClient.Bucket)
+		}
+	})
 
 	t.Run("ABS_MissingBucket", func(t *testing.T) {
 		_, err := litestream.NewReplicaClientFromURL("abs:///path")
@@ -129,13 +140,47 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 	})
 
-	// Note: SFTP URLs with credentials (sftp://user@host) don't work via NewReplicaClientFromURL
-	// because Go's url.Parse strips userinfo before it reaches the factory function.
-	// SFTP replica URLs currently require host-only format and will fail validation.
-	// Use config-based setup for SFTP with authentication.
+	t.Run("SFTP", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("sftp://myuser@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "sftp" {
+			t.Errorf("expected type 'sftp', got %q", client.Type())
+		}
+		sftpClient, ok := client.(*sftp.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *sftp.ReplicaClient, got %T", client)
+		}
+		if sftpClient.Host != "host.example.com" {
+			t.Errorf("expected host 'host.example.com', got %q", sftpClient.Host)
+		}
+		if sftpClient.User != "myuser" {
+			t.Errorf("expected user 'myuser', got %q", sftpClient.User)
+		}
+		if sftpClient.Path != "path" {
+			t.Errorf("expected path 'path', got %q", sftpClient.Path)
+		}
+	})
+
+	t.Run("SFTP_WithPassword", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("sftp://myuser:secret@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sftpClient, ok := client.(*sftp.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *sftp.ReplicaClient, got %T", client)
+		}
+		if sftpClient.User != "myuser" {
+			t.Errorf("expected user 'myuser', got %q", sftpClient.User)
+		}
+		if sftpClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", sftpClient.Password)
+		}
+	})
+
 	t.Run("SFTP_RequiresUserError", func(t *testing.T) {
-		// URLs with userinfo like sftp://user@host don't work because url.Parse
-		// strips the userinfo before passing to the factory
 		_, err := litestream.NewReplicaClientFromURL("sftp://host.example.com/path")
 		if err == nil {
 			t.Fatal("expected error for missing user")
@@ -186,9 +231,45 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 	})
 
-	// Note: WebDAV URLs with credentials (webdav://user:pass@host) don't work via NewReplicaClientFromURL
-	// because Go's url.Parse strips userinfo before it reaches the factory function.
-	// Use config-based setup for WebDAV with authentication.
+	t.Run("WebDAV_WithCredentials", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("webdav://myuser:secret@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		webdavClient, ok := client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *webdav.ReplicaClient, got %T", client)
+		}
+		if webdavClient.Username != "myuser" {
+			t.Errorf("expected username 'myuser', got %q", webdavClient.Username)
+		}
+		if webdavClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", webdavClient.Password)
+		}
+		if webdavClient.URL != "http://host.example.com" {
+			t.Errorf("expected URL 'http://host.example.com', got %q", webdavClient.URL)
+		}
+	})
+
+	t.Run("WebDAVS_WithCredentials", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("webdavs://myuser:secret@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		webdavClient, ok := client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *webdav.ReplicaClient, got %T", client)
+		}
+		if webdavClient.Username != "myuser" {
+			t.Errorf("expected username 'myuser', got %q", webdavClient.Username)
+		}
+		if webdavClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", webdavClient.Password)
+		}
+		if webdavClient.URL != "https://host.example.com" {
+			t.Errorf("expected URL 'https://host.example.com', got %q", webdavClient.URL)
+		}
+	})
 
 	t.Run("WebDAV_MissingHost", func(t *testing.T) {
 		_, err := litestream.NewReplicaClientFromURL("webdav:///path")
@@ -214,6 +295,26 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 		if natsClient.BucketName != "mybucket" {
 			t.Errorf("expected bucket 'mybucket', got %q", natsClient.BucketName)
+		}
+	})
+
+	t.Run("NATS_WithCredentials", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("nats://myuser:secret@localhost:4222/mybucket")
+		if err != nil {
+			t.Fatal(err)
+		}
+		natsClient, ok := client.(*nats.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *nats.ReplicaClient, got %T", client)
+		}
+		if natsClient.Username != "myuser" {
+			t.Errorf("expected username 'myuser', got %q", natsClient.Username)
+		}
+		if natsClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", natsClient.Password)
+		}
+		if natsClient.URL != "nats://localhost:4222" {
+			t.Errorf("expected URL 'nats://localhost:4222', got %q", natsClient.URL)
 		}
 	})
 
