@@ -96,6 +96,31 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatalf("unexpected error: %s", err)
 		}
 	})
+
+	// Regression test for GitHub issue #877: level 9 compaction fails with
+	// "page size not initialized yet" error when attempted before DB initialization.
+	t.Run("DBNotReady", func(t *testing.T) {
+		db0 := testingutil.MustOpenDB(t)
+		defer testingutil.MustCloseDB(t, db0)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: 100 * time.Millisecond},
+		}
+		s := litestream.NewStore([]*litestream.DB{db0}, levels)
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		// Attempt snapshot before DB is initialized (page size not set).
+		// This reproduces the timing issue where level 9 compaction fires
+		// immediately at startup before db.Sync() has been called.
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrDBNotReady) {
+			t.Fatalf("expected ErrDBNotReady, got: %v", err)
+		}
+	})
 }
 
 func TestStore_Integration(t *testing.T) {
