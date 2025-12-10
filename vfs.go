@@ -74,7 +74,7 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	slog.Info("opening file", "name", name, "flags", flags)
+	slog.Debug("opening file", "name", name, "flags", flags)
 
 	switch {
 	case flags&sqlite3vfs.OpenMainDB != 0:
@@ -99,7 +99,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 }
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
-	slog.Info("deleting file", "name", name, "dirSync", dirSync)
+	slog.Debug("deleting file", "name", name, "dirSync", dirSync)
 	err := vfs.deleteTempFile(name)
 	if err == nil {
 		return nil
@@ -114,7 +114,7 @@ func (vfs *VFS) Delete(name string, dirSync bool) error {
 }
 
 func (vfs *VFS) Access(name string, flag sqlite3vfs.AccessFlag) (bool, error) {
-	slog.Info("accessing file", "name", name, "flag", flag)
+	slog.Debug("accessing file", "name", name, "flag", flag)
 
 	if strings.HasSuffix(name, "-wal") {
 		return vfs.accessWAL(name, flag)
@@ -130,7 +130,7 @@ func (vfs *VFS) accessWAL(name string, flag sqlite3vfs.AccessFlag) (bool, error)
 }
 
 func (vfs *VFS) FullPathname(name string) string {
-	slog.Info("full pathname", "name", name)
+	slog.Debug("full pathname", "name", name)
 	return name
 }
 
@@ -484,7 +484,7 @@ func (f *VFSFile) hasTargetTime() bool {
 }
 
 func (f *VFSFile) Open() error {
-	f.logger.Info("opening file")
+	f.logger.Debug("opening file")
 
 	infos, err := f.waitForRestorePlan()
 	if err != nil {
@@ -642,14 +642,14 @@ func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 }
 
 func (f *VFSFile) Close() error {
-	f.logger.Info("closing file")
+	f.logger.Debug("closing file")
 	f.cancel()
 	f.wg.Wait()
 	return nil
 }
 
 func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
-	f.logger.Info("reading at", "off", off, "len", len(p))
+	f.logger.Debug("reading at", "off", off, "len", len(p))
 	pageSize, err := f.pageSizeBytes()
 	if err != nil {
 		return 0, err
@@ -661,7 +661,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	if data, ok := f.cache.Get(pgno); ok {
 		pageOffset := int(off % int64(pageSize))
 		n = copy(p, data[pageOffset:])
-		f.logger.Info("cache hit", "page", pgno, "n", n)
+		f.logger.Debug("cache hit", "page", pgno, "n", n)
 
 		// Update the first page to pretend like we are in journal mode.
 		if off == 0 {
@@ -718,7 +718,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 	pageOffset := int(off % int64(pageSize))
 	n = copy(p, data[pageOffset:])
-	f.logger.Info("data read from storage", "page", pgno, "n", n, "data", len(data))
+	f.logger.Debug("data read from storage", "page", pgno, "n", n, "data", len(data))
 
 	// Update the first page to pretend like we are in journal mode.
 	if off == 0 {
@@ -730,17 +730,17 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 }
 
 func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
-	f.logger.Info("write at", "off", off, "len", len(b))
+	f.logger.Debug("write at", "off", off, "len", len(b))
 	return 0, fmt.Errorf("litestream is a read only vfs")
 }
 
 func (f *VFSFile) Truncate(size int64) error {
-	f.logger.Info("truncating file", "size", size)
+	f.logger.Debug("truncating file", "size", size)
 	return fmt.Errorf("litestream is a read only vfs")
 }
 
 func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
-	f.logger.Info("syncing file", "flag", flag)
+	f.logger.Debug("syncing file", "flag", flag)
 	return nil
 }
 
@@ -763,12 +763,12 @@ func (f *VFSFile) FileSize() (size int64, err error) {
 	}
 	f.mu.Unlock()
 
-	f.logger.Info("file size", "size", size)
+	f.logger.Debug("file size", "size", size)
 	return size, nil
 }
 
 func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
-	f.logger.Info("locking file", "lock", elock)
+	f.logger.Debug("locking file", "lock", elock)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -781,7 +781,7 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 }
 
 func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
-	f.logger.Info("unlocking file", "lock", elock)
+	f.logger.Debug("unlocking file", "lock", elock)
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -816,19 +816,19 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 }
 
 func (f *VFSFile) CheckReservedLock() (bool, error) {
-	f.logger.Info("checking reserved lock")
+	f.logger.Debug("checking reserved lock")
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.lockType >= sqlite3vfs.LockReserved, nil
 }
 
 func (f *VFSFile) SectorSize() int64 {
-	f.logger.Info("sector size")
+	f.logger.Debug("sector size")
 	return 0
 }
 
 func (f *VFSFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic {
-	f.logger.Info("device characteristics")
+	f.logger.Debug("device characteristics")
 	return 0
 }
 
@@ -868,7 +868,7 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 
 	name := strings.ToLower(pragmaName)
 
-	f.logger.Info("file control", "pragma", name, "value", pragmaValue)
+	f.logger.Debug("file control", "pragma", name, "value", pragmaValue)
 
 	switch name {
 	case "litestream_txid":
@@ -1209,7 +1209,7 @@ func (f *VFSFile) waitForRestorePlan() ([]*ltx.FileInfo, error) {
 			return nil, fmt.Errorf("cannot calc restore plan: %w", err)
 		}
 
-		f.logger.Info("no backup files available yet, waiting", "interval", f.PollInterval)
+		f.logger.Debug("no backup files available yet, waiting", "interval", f.PollInterval)
 		select {
 		case <-time.After(f.PollInterval):
 		case <-f.ctx.Done():
