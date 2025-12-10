@@ -1498,7 +1498,7 @@ func TestFindSQLiteDatabases(t *testing.T) {
 func TestParseReplicaURLWithQuery(t *testing.T) {
 	t.Run("S3WithEndpoint", func(t *testing.T) {
 		url := "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-east-1&forcePathStyle=true"
-		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, _, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1524,7 +1524,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("S3WithoutQuery", func(t *testing.T) {
 		url := "s3://mybucket/path/to/db"
-		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, _, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1544,7 +1544,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("FileURL", func(t *testing.T) {
 		url := "file:///path/to/db"
-		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, _, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1582,7 +1582,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("S3TigrisExample", func(t *testing.T) {
 		url := "s3://mybucket/db?endpoint=fly.storage.tigris.dev&region=auto"
-		scheme, host, path, query, err := litestream.ParseReplicaURLWithQuery(url)
+		scheme, host, path, query, _, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1605,7 +1605,7 @@ func TestParseReplicaURLWithQuery(t *testing.T) {
 
 	t.Run("S3WithSkipVerify", func(t *testing.T) {
 		url := "s3://mybucket/db?endpoint=self-signed.local&skipVerify=true"
-		_, _, _, query, err := litestream.ParseReplicaURLWithQuery(url)
+		_, _, _, query, _, err := litestream.ParseReplicaURLWithQuery(url)
 		if err != nil {
 			t.Fatal(err)
 		}

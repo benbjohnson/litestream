@@ -10,7 +10,8 @@ import (
 )
 
 // ReplicaClientFactory is a function that creates a ReplicaClient from URL components.
-type ReplicaClientFactory func(scheme, host, urlPath string, query url.Values) (ReplicaClient, error)
+// The userinfo parameter contains credentials from the URL (e.g., user:pass@host).
+type ReplicaClientFactory func(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (ReplicaClient, error)
 
 var (
 	replicaClientFactories   = make(map[string]ReplicaClientFactory)
@@ -28,7 +29,7 @@ func RegisterReplicaClientFactory(scheme string, factory ReplicaClientFactory) {
 // NewReplicaClientFromURL creates a new ReplicaClient from a URL string.
 // The URL scheme determines which backend is used (s3, gs, abs, file, etc.).
 func NewReplicaClientFromURL(rawURL string) (ReplicaClient, error) {
-	scheme, host, urlPath, query, err := ParseReplicaURLWithQuery(rawURL)
+	scheme, host, urlPath, query, userinfo, err := ParseReplicaURLWithQuery(rawURL)
 	if err != nil {
 		return nil, err
 	}
@@ -47,7 +48,7 @@ func NewReplicaClientFromURL(rawURL string) (ReplicaClient, error) {
 		return nil, fmt.Errorf("unsupported replica URL scheme: %q", scheme)
 	}
 
-	return factory(scheme, host, urlPath, query)
+	return factory(scheme, host, urlPath, query, userinfo)
 }
 
 // ReplicaTypeFromURL returns the replica type from a URL string.
@@ -69,21 +70,21 @@ func ParseReplicaURL(s string) (scheme, host, urlPath string, err error) {
 		return parseS3AccessPointURL(s)
 	}
 
-	scheme, host, urlPath, _, err = ParseReplicaURLWithQuery(s)
+	scheme, host, urlPath, _, _, err = ParseReplicaURLWithQuery(s)
 	return scheme, host, urlPath, err
 }
 
-// ParseReplicaURLWithQuery parses a replica URL and returns query parameters.
-func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url.Values, err error) {
+// ParseReplicaURLWithQuery parses a replica URL and returns query parameters and userinfo.
+func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo, err error) {
 	// Handle S3 Access Point ARNs which can't be parsed by standard url.Parse
 	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
 		scheme, host, urlPath, err := parseS3AccessPointURL(s)
-		return scheme, host, urlPath, nil, err
+		return scheme, host, urlPath, nil, nil, err
 	}
 
 	u, err := url.Parse(s)
 	if err != nil {
-		return "", "", "", nil, err
+		return "", "", "", nil, nil, err
 	}
 
 	switch u.Scheme {
@@ -91,13 +92,13 @@ func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url
 		scheme, u.Scheme = u.Scheme, ""
 		// Remove query params from path for file URLs
 		u.RawQuery = ""
-		return scheme, "", path.Clean(u.String()), nil, nil
+		return scheme, "", path.Clean(u.String()), nil, nil, nil
 
 	case "":
-		return u.Scheme, u.Host, u.Path, nil, fmt.Errorf("replica url scheme required: %s", s)
+		return u.Scheme, u.Host, u.Path, nil, nil, fmt.Errorf("replica url scheme required: %s", s)
 
 	default:
-		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), u.Query(), nil
+		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), u.Query(), u.User, nil
 	}
 }
 

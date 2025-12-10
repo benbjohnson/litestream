@@ -4,16 +4,14 @@ import (
 	"testing"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/gs"
+	"github.com/benbjohnson/litestream/nats"
+	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
-
-	// Import backends to register factories
-	_ "github.com/benbjohnson/litestream/abs"
-	_ "github.com/benbjohnson/litestream/gs"
-	_ "github.com/benbjohnson/litestream/nats"
-	_ "github.com/benbjohnson/litestream/oss"
-	_ "github.com/benbjohnson/litestream/sftp"
-	_ "github.com/benbjohnson/litestream/webdav"
+	"github.com/benbjohnson/litestream/sftp"
+	"github.com/benbjohnson/litestream/webdav"
 )
 
 func TestNewReplicaClientFromURL(t *testing.T) {
@@ -78,6 +76,345 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 		if client.Type() != "gs" {
 			t.Errorf("expected type 'gs', got %q", client.Type())
+		}
+		gsClient, ok := client.(*gs.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *gs.ReplicaClient, got %T", client)
+		}
+		if gsClient.Bucket != "mybucket" {
+			t.Errorf("expected bucket 'mybucket', got %q", gsClient.Bucket)
+		}
+		if gsClient.Path != "path" {
+			t.Errorf("expected path 'path', got %q", gsClient.Path)
+		}
+	})
+
+	t.Run("GS_MissingBucket", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("gs:///path")
+		if err == nil {
+			t.Fatal("expected error for missing bucket")
+		}
+	})
+
+	t.Run("ABS", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("abs://mycontainer/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "abs" {
+			t.Errorf("expected type 'abs', got %q", client.Type())
+		}
+		absClient, ok := client.(*abs.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *abs.ReplicaClient, got %T", client)
+		}
+		if absClient.Bucket != "mycontainer" {
+			t.Errorf("expected bucket 'mycontainer', got %q", absClient.Bucket)
+		}
+		if absClient.Path != "path" {
+			t.Errorf("expected path 'path', got %q", absClient.Path)
+		}
+	})
+
+	t.Run("ABS_WithAccount", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("abs://myaccount@mycontainer/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		absClient, ok := client.(*abs.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *abs.ReplicaClient, got %T", client)
+		}
+		if absClient.AccountName != "myaccount" {
+			t.Errorf("expected account 'myaccount', got %q", absClient.AccountName)
+		}
+		if absClient.Bucket != "mycontainer" {
+			t.Errorf("expected bucket 'mycontainer', got %q", absClient.Bucket)
+		}
+	})
+
+	t.Run("ABS_MissingBucket", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("abs:///path")
+		if err == nil {
+			t.Fatal("expected error for missing bucket")
+		}
+	})
+
+	t.Run("SFTP", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("sftp://myuser@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "sftp" {
+			t.Errorf("expected type 'sftp', got %q", client.Type())
+		}
+		sftpClient, ok := client.(*sftp.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *sftp.ReplicaClient, got %T", client)
+		}
+		if sftpClient.Host != "host.example.com" {
+			t.Errorf("expected host 'host.example.com', got %q", sftpClient.Host)
+		}
+		if sftpClient.User != "myuser" {
+			t.Errorf("expected user 'myuser', got %q", sftpClient.User)
+		}
+		if sftpClient.Path != "path" {
+			t.Errorf("expected path 'path', got %q", sftpClient.Path)
+		}
+	})
+
+	t.Run("SFTP_WithPassword", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("sftp://myuser:secret@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		sftpClient, ok := client.(*sftp.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *sftp.ReplicaClient, got %T", client)
+		}
+		if sftpClient.User != "myuser" {
+			t.Errorf("expected user 'myuser', got %q", sftpClient.User)
+		}
+		if sftpClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", sftpClient.Password)
+		}
+	})
+
+	t.Run("SFTP_RequiresUserError", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("sftp://host.example.com/path")
+		if err == nil {
+			t.Fatal("expected error for missing user")
+		}
+	})
+
+	t.Run("SFTP_MissingHost", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("sftp:///path")
+		if err == nil {
+			t.Fatal("expected error for missing host")
+		}
+	})
+
+	t.Run("WebDAV", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("webdav://host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "webdav" {
+			t.Errorf("expected type 'webdav', got %q", client.Type())
+		}
+		webdavClient, ok := client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *webdav.ReplicaClient, got %T", client)
+		}
+		if webdavClient.URL != "http://host.example.com" {
+			t.Errorf("expected URL 'http://host.example.com', got %q", webdavClient.URL)
+		}
+		if webdavClient.Path != "path" {
+			t.Errorf("expected path 'path', got %q", webdavClient.Path)
+		}
+	})
+
+	t.Run("WebDAVS", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("webdavs://host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "webdav" {
+			t.Errorf("expected type 'webdav', got %q", client.Type())
+		}
+		webdavClient, ok := client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *webdav.ReplicaClient, got %T", client)
+		}
+		if webdavClient.URL != "https://host.example.com" {
+			t.Errorf("expected URL 'https://host.example.com', got %q", webdavClient.URL)
+		}
+	})
+
+	t.Run("WebDAV_WithCredentials", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("webdav://myuser:secret@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		webdavClient, ok := client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *webdav.ReplicaClient, got %T", client)
+		}
+		if webdavClient.Username != "myuser" {
+			t.Errorf("expected username 'myuser', got %q", webdavClient.Username)
+		}
+		if webdavClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", webdavClient.Password)
+		}
+		if webdavClient.URL != "http://host.example.com" {
+			t.Errorf("expected URL 'http://host.example.com', got %q", webdavClient.URL)
+		}
+	})
+
+	t.Run("WebDAVS_WithCredentials", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("webdavs://myuser:secret@host.example.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		webdavClient, ok := client.(*webdav.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *webdav.ReplicaClient, got %T", client)
+		}
+		if webdavClient.Username != "myuser" {
+			t.Errorf("expected username 'myuser', got %q", webdavClient.Username)
+		}
+		if webdavClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", webdavClient.Password)
+		}
+		if webdavClient.URL != "https://host.example.com" {
+			t.Errorf("expected URL 'https://host.example.com', got %q", webdavClient.URL)
+		}
+	})
+
+	t.Run("WebDAV_MissingHost", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("webdav:///path")
+		if err == nil {
+			t.Fatal("expected error for missing host")
+		}
+	})
+
+	t.Run("NATS", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("nats://localhost:4222/mybucket")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "nats" {
+			t.Errorf("expected type 'nats', got %q", client.Type())
+		}
+		natsClient, ok := client.(*nats.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *nats.ReplicaClient, got %T", client)
+		}
+		if natsClient.URL != "nats://localhost:4222" {
+			t.Errorf("expected URL 'nats://localhost:4222', got %q", natsClient.URL)
+		}
+		if natsClient.BucketName != "mybucket" {
+			t.Errorf("expected bucket 'mybucket', got %q", natsClient.BucketName)
+		}
+	})
+
+	t.Run("NATS_WithCredentials", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("nats://myuser:secret@localhost:4222/mybucket")
+		if err != nil {
+			t.Fatal(err)
+		}
+		natsClient, ok := client.(*nats.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *nats.ReplicaClient, got %T", client)
+		}
+		if natsClient.Username != "myuser" {
+			t.Errorf("expected username 'myuser', got %q", natsClient.Username)
+		}
+		if natsClient.Password != "secret" {
+			t.Errorf("expected password 'secret', got %q", natsClient.Password)
+		}
+		if natsClient.URL != "nats://localhost:4222" {
+			t.Errorf("expected URL 'nats://localhost:4222', got %q", natsClient.URL)
+		}
+	})
+
+	t.Run("NATS_MissingBucket", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("nats://localhost:4222/")
+		if err == nil {
+			t.Fatal("expected error for missing bucket")
+		}
+	})
+
+	t.Run("OSS", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("oss://mybucket/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if client.Type() != "oss" {
+			t.Errorf("expected type 'oss', got %q", client.Type())
+		}
+		ossClient, ok := client.(*oss.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *oss.ReplicaClient, got %T", client)
+		}
+		if ossClient.Bucket != "mybucket" {
+			t.Errorf("expected bucket 'mybucket', got %q", ossClient.Bucket)
+		}
+		if ossClient.Path != "path" {
+			t.Errorf("expected path 'path', got %q", ossClient.Path)
+		}
+	})
+
+	t.Run("OSS_WithRegion", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("oss://mybucket.oss-cn-shanghai.aliyuncs.com/path")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ossClient, ok := client.(*oss.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *oss.ReplicaClient, got %T", client)
+		}
+		if ossClient.Bucket != "mybucket" {
+			t.Errorf("expected bucket 'mybucket', got %q", ossClient.Bucket)
+		}
+		// Note: Region is extracted without the 'oss-' prefix
+		if ossClient.Region != "cn-shanghai" {
+			t.Errorf("expected region 'cn-shanghai', got %q", ossClient.Region)
+		}
+	})
+
+	t.Run("OSS_MissingBucket", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("oss:///path")
+		if err == nil {
+			t.Fatal("expected error for missing bucket")
+		}
+	})
+
+	// Note: file:// with empty path returns "." due to path.Clean behavior.
+	// This is technically valid but may not be the intended behavior.
+	t.Run("File_EmptyPathReturnsDot", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("file://")
+		if err != nil {
+			t.Fatal(err)
+		}
+		fileClient, ok := client.(*file.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *file.ReplicaClient, got %T", client)
+		}
+		// path.Clean("") returns "." which passes the empty check
+		if fileClient.Path() != "." {
+			t.Errorf("expected path '.', got %q", fileClient.Path())
+		}
+	})
+
+	t.Run("S3_ARN", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/db-access/backups")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if s3Client.Bucket != "arn:aws:s3:us-east-1:123456789012:accesspoint/db-access" {
+			t.Errorf("expected bucket ARN, got %q", s3Client.Bucket)
+		}
+		if s3Client.Path != "backups" {
+			t.Errorf("expected path 'backups', got %q", s3Client.Path)
+		}
+	})
+
+	t.Run("S3_MissingBucket", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("s3:///path")
+		if err == nil {
+			t.Fatal("expected error for missing bucket")
+		}
+	})
+
+	t.Run("EmptyURL", func(t *testing.T) {
+		_, err := litestream.NewReplicaClientFromURL("")
+		if err == nil {
+			t.Fatal("expected error for empty URL")
 		}
 	})
 
@@ -195,4 +532,101 @@ func TestBoolQueryValue(t *testing.T) {
 			t.Error("BoolQueryValue should return true for second key")
 		}
 	})
+
+	t.Run("Nil query", func(t *testing.T) {
+		_, ok := litestream.BoolQueryValue(nil, "key")
+		if ok {
+			t.Error("BoolQueryValue with nil query should not be ok")
+		}
+	})
+
+	t.Run("Invalid value returns false with ok", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{"invalid"}
+		value, ok := litestream.BoolQueryValue(query, "key")
+		if !ok {
+			t.Error("BoolQueryValue with invalid value should be ok")
+		}
+		if value {
+			t.Error("BoolQueryValue with invalid value should be false")
+		}
+	})
+}
+
+func TestIsTigrisEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"fly.storage.tigris.dev", true},
+		{"FLY.STORAGE.TIGRIS.DEV", true},
+		{"https://fly.storage.tigris.dev", true},
+		{"http://fly.storage.tigris.dev", true},
+		{"s3.amazonaws.com", false},
+		{"localhost:9000", false},
+		{"", false},
+		{"   ", false},
+		{"https://s3.us-east-1.amazonaws.com", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsTigrisEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestRegionFromS3ARN(t *testing.T) {
+	tests := []struct {
+		arn      string
+		expected string
+	}{
+		{"arn:aws:s3:us-east-1:123456789012:accesspoint/db-access", "us-east-1"},
+		{"arn:aws:s3:eu-west-1:123456789012:accesspoint/db-access", "eu-west-1"},
+		{"arn:aws:s3:ap-southeast-2:123456789012:accesspoint/db-access", "ap-southeast-2"},
+		{"arn:aws:s3::123456789012:accesspoint/db-access", ""},
+		{"invalid-arn", ""},
+		{"", ""},
+		{"arn:aws:s3", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.arn, func(t *testing.T) {
+			got := litestream.RegionFromS3ARN(tt.arn)
+			if got != tt.expected {
+				t.Errorf("RegionFromS3ARN(%q) = %q, want %q", tt.arn, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestCleanReplicaURLPath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected string
+	}{
+		{"", ""},
+		{"path", "path"},
+		{"/path", "path"},
+		{"path/", "path"},
+		{"/path/", "path"},
+		{"path/to/db", "path/to/db"},
+		{"/path/to/db", "path/to/db"},
+		{"//path//to//db", "path/to/db"},
+		{".", ""},
+		{"/.", ""},
+		{"./path", "path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.path, func(t *testing.T) {
+			got := litestream.CleanReplicaURLPath(tt.path)
+			if got != tt.expected {
+				t.Errorf("CleanReplicaURLPath(%q) = %q, want %q", tt.path, got, tt.expected)
+			}
+		})
+	}
 }

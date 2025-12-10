@@ -91,13 +91,19 @@ func NewReplicaClient() *ReplicaClient {
 
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
-// URL format: nats://host[:port]/bucket
-func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values) (litestream.ReplicaClient, error) {
+// URL format: nats://[user:pass@]host[:port]/bucket
+func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
 	client := NewReplicaClient()
 
 	// Reconstruct URL without bucket path
 	if host != "" {
 		client.URL = fmt.Sprintf("nats://%s", host)
+	}
+
+	// Extract credentials from userinfo if present
+	if userinfo != nil {
+		client.Username = userinfo.Username()
+		client.Password, _ = userinfo.Password()
 	}
 
 	// Extract bucket name from path

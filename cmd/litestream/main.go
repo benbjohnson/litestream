@@ -1125,7 +1125,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 
 	if c.URL != "" {
-		_, host, upath, query, err := litestream.ParseReplicaURLWithQuery(c.URL)
+		_, host, upath, query, _, err := litestream.ParseReplicaURLWithQuery(c.URL)
 		if err != nil {
 			return nil, err
 		}
