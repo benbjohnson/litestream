@@ -180,10 +180,10 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	// Apply Tigris defaults
 	if isTigris {
 		if !signPayloadSet {
-			signPayload = true
+			signPayload, signPayloadSet = true, true
 		}
 		if !requireMD5Set {
-			requireMD5 = false
+			requireMD5, requireMD5Set = false, true
 		}
 	}
 
