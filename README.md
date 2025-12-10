@@ -3,7 +3,6 @@ Litestream
 ![Status](https://img.shields.io/badge/status-beta-blue)
 ![GitHub](https://img.shields.io/github/license/benbjohnson/litestream)
 [![Docker Pulls](https://img.shields.io/docker/pulls/litestream/litestream.svg?maxAge=604800)](https://hub.docker.com/r/litestream/litestream/)
-![test](https://github.com/benbjohnson/litestream/workflows/test/badge.svg)
 ==========
 
 Litestream is a standalone disaster recovery tool for SQLite. It runs as a
