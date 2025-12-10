@@ -20,6 +20,8 @@ type testReplicaClient struct {
 	dir string
 }
 
+func (c *testReplicaClient) Init(_ context.Context) error { return nil }
+
 func (c *testReplicaClient) Type() string { return "test" }
 
 func (c *testReplicaClient) LTXFiles(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
@@ -58,6 +60,8 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 type errorReplicaClient struct {
 	writeErr error
 }
+
+func (c *errorReplicaClient) Init(_ context.Context) error { return nil }
 
 func (c *errorReplicaClient) Type() string { return "error" }
 
