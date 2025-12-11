@@ -552,6 +552,13 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			if err := v4.AddContentSHA256HeaderMiddleware(stack); err != nil {
 				return err
 			}
+
+			// Disable AWS SDK v2's trailing checksum middleware which uses
+			// aws-chunked encoding that is incompatible with UNSIGNED-PAYLOAD.
+			// AWS S3 rejects requests with: "aws-chunked encoding is not supported
+			// when x-amz-content-sha256 UNSIGNED-PAYLOAD is supplied."
+			// See: https://github.com/aws/aws-sdk-go-v2/discussions/2960
+			stack.Finalize.Remove("addInputChecksumTrailer")
 		}
 
 		if !c.RequireContentMD5 {
