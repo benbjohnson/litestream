@@ -23,6 +23,10 @@ var (
 
 	// ErrTxNotAvailable is returned when a transaction does not exist.
 	ErrTxNotAvailable = errors.New("transaction not available")
+
+	// ErrDBNotReady is returned when compaction is attempted before the
+	// database has been initialized (e.g., page size not yet known).
+	ErrDBNotReady = errors.New("db not ready")
 )
 
 // Store defaults
@@ -199,6 +203,9 @@ LOOP:
 				} else if errors.Is(err, ErrCompactionTooEarly) {
 					slog.Debug("recently compacted, skipping", "level", lvl.Level, "path", db.Path())
 					continue
+				} else if errors.Is(err, ErrDBNotReady) {
+					slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path())
+					continue
 				} else if err != nil {
 					// Don't log or sleep on context cancellation errors during shutdown
 					if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
@@ -250,6 +257,11 @@ LOOP:
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
 // This function will only proceed if a compaction has not occurred before the last compaction time.
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	// Skip if database is not yet initialized (page size unknown).
+	if db.PageSize() == 0 {
+		return nil, ErrDBNotReady
+	}
+
 	dstLevel := lvl.Level
 
 	// Ensure we are not re-compacting before the most recent compaction time.
