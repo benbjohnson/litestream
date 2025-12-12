@@ -190,12 +190,12 @@ func (s *Store) AddDB(db *DB) error {
 	// Second check: verify database wasn't added by another goroutine while we were opening.
 	// If it was, close our instance and return without error.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	for _, existing := range s.dbs {
 		if existing.Path() == db.Path() {
 			// Another goroutine added this database while we were opening.
-			// Close our instance to avoid resource leaks.
+			// Release lock before closing to avoid potential deadlock.
+			s.mu.Unlock()
 			if err := db.Close(context.Background()); err != nil {
 				slog.Error("close duplicate db", "path", db.Path(), "error", err)
 			}
@@ -204,6 +204,7 @@ func (s *Store) AddDB(db *DB) error {
 	}
 
 	s.dbs = append(s.dbs, db)
+	s.mu.Unlock()
 	return nil
 }
 
@@ -214,7 +215,6 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	idx := -1
 	var db *DB
@@ -227,10 +227,12 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 	}
 
 	if db == nil {
+		s.mu.Unlock()
 		return nil
 	}
 
 	s.dbs = slices.Delete(s.dbs, idx, idx+1)
+	s.mu.Unlock()
 
 	if err := db.Close(ctx); err != nil {
 		return fmt.Errorf("close db: %w", err)

@@ -319,6 +319,10 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 	// Remove from store first, only delete from local map on success
 	for i, db := range toClose {
 		if db == nil {
+			// Clean up nil entries (in-progress databases) from local map
+			dm.mu.Lock()
+			delete(dm.dbs, toClosePaths[i])
+			dm.mu.Unlock()
 			continue
 		}
 		if err := dm.store.RemoveDB(dm.ctx, db.Path()); err != nil {
@@ -351,7 +355,6 @@ func (dm *DirectoryMonitor) scanDirectory(dir string) {
 	if !dm.recursive {
 		// Non-recursive mode: Only scan files in the immediate directory.
 		// Subdirectories and their contents are completely ignored.
-		// TODO: Document recursive behavior on litestream.io
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if !os.IsNotExist(err) {

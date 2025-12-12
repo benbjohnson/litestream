@@ -185,6 +185,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			for _, m := range c.directoryMonitors {
 				m.Close()
 			}
+			if closeErr := c.Store.Close(ctx); closeErr != nil {
+				slog.Error("failed to close store after monitor failure", "error", closeErr)
+			}
 			return fmt.Errorf("start directory monitor for %s: %w", entry.config.Dir, err)
 		}
 		c.directoryMonitors = append(c.directoryMonitors, monitor)
