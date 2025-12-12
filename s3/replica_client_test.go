@@ -153,6 +153,72 @@ func TestReplicaClientPayloadSigning(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_UnsignedPayload_NoChunkedEncoding(t *testing.T) {
+	data := mustLTX(t)
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		if r.Method == http.MethodPut {
+			select {
+			case headers <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+	client.SignPayload = false
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-headers:
+		if got := hdr.Get("x-amz-content-sha256"); got != "UNSIGNED-PAYLOAD" {
+			t.Errorf("x-amz-content-sha256 = %q, want UNSIGNED-PAYLOAD", got)
+		}
+
+		contentEnc := hdr.Get("Content-Encoding")
+		if strings.Contains(contentEnc, "aws-chunked") {
+			t.Errorf("Content-Encoding contains aws-chunked: %q; aws-chunked is incompatible with UNSIGNED-PAYLOAD", contentEnc)
+		}
+
+		transferEnc := hdr.Get("Transfer-Encoding")
+		if strings.Contains(transferEnc, "aws-chunked") {
+			t.Errorf("Transfer-Encoding contains aws-chunked: %q; aws-chunked is incompatible with UNSIGNED-PAYLOAD", transferEnc)
+		}
+
+		decoded := hdr.Get("X-Amz-Decoded-Content-Length")
+		if decoded != "" {
+			t.Errorf("X-Amz-Decoded-Content-Length = %q; this header indicates aws-chunked encoding which is incompatible with UNSIGNED-PAYLOAD", decoded)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for PUT request")
+	}
+}
+
 func mustLTX(t *testing.T) []byte {
 	t.Helper()
 
