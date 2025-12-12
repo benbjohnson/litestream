@@ -129,13 +129,11 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		slog.Error("no databases specified in configuration")
 	}
 
-	var (
-		dbs        []*litestream.DB
-		watchables []struct {
-			config *DBConfig
-			dbs    []*litestream.DB
-		}
-	)
+	var dbs []*litestream.DB
+	var watchables []struct {
+		config *DBConfig
+		dbs    []*litestream.DB
+	}
 	for _, dbConfig := range c.Config.DBs {
 		// Handle directory configuration
 		if dbConfig.Dir != "" {

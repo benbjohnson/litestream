@@ -39,7 +39,7 @@ type DirectoryMonitor struct {
 // NewDirectoryMonitor returns a new monitor for directory-based replication.
 func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBConfig, existing []*litestream.DB) (*DirectoryMonitor, error) {
 	if dbc == nil {
-		return nil, errors.New("directory config required")
+		return nil, errors.New("database config required")
 	}
 	if store == nil {
 		return nil, errors.New("store required")
@@ -141,17 +141,15 @@ func (dm *DirectoryMonitor) addDirectoryWatch(path string) error {
 	abspath := filepath.Clean(path)
 
 	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
 	if _, ok := dm.watchedDirs[abspath]; ok {
-		dm.mu.Unlock()
 		return nil
 	}
 	dm.watchedDirs[abspath] = struct{}{}
-	dm.mu.Unlock()
 
 	if err := dm.watcher.Add(abspath); err != nil {
-		dm.mu.Lock()
 		delete(dm.watchedDirs, abspath)
-		dm.mu.Unlock()
 		return err
 	}
 
@@ -163,12 +161,12 @@ func (dm *DirectoryMonitor) removeDirectoryWatch(path string) {
 	abspath := filepath.Clean(path)
 
 	dm.mu.Lock()
+	defer dm.mu.Unlock()
+
 	if _, ok := dm.watchedDirs[abspath]; !ok {
-		dm.mu.Unlock()
 		return
 	}
 	delete(dm.watchedDirs, abspath)
-	dm.mu.Unlock()
 
 	if err := dm.watcher.Remove(abspath); err != nil {
 		dm.logger.Debug("remove directory watch", "path", abspath, "error", err)
@@ -246,26 +244,31 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 	dm.dbs[path] = nil
 	dm.mu.Unlock()
 
+	var db *litestream.DB
+	success := false
+	defer func() {
+		if !success {
+			if db != nil {
+				_ = dm.store.RemoveDB(dm.ctx, db.Path())
+			}
+			dm.mu.Lock()
+			delete(dm.dbs, path)
+			dm.mu.Unlock()
+		}
+	}()
+
 	if !IsSQLiteDatabase(path) {
-		dm.mu.Lock()
-		delete(dm.dbs, path)
-		dm.mu.Unlock()
 		return
 	}
 
-	db, err := newDBFromDirectoryEntry(dm.config, dm.dirPath, path)
+	var err error
+	db, err = newDBFromDirectoryEntry(dm.config, dm.dirPath, path)
 	if err != nil {
-		dm.mu.Lock()
-		delete(dm.dbs, path)
-		dm.mu.Unlock()
 		dm.logger.Error("configure database", "path", path, "error", err)
 		return
 	}
 
 	if err := dm.store.AddDB(db); err != nil {
-		dm.mu.Lock()
-		delete(dm.dbs, path)
-		dm.mu.Unlock()
 		dm.logger.Error("add database to store", "path", path, "error", err)
 		return
 	}
@@ -274,6 +277,7 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 	dm.dbs[path] = db
 	dm.mu.Unlock()
 
+	success = true
 	dm.logger.Info("added database to replication", "path", path)
 }
 
