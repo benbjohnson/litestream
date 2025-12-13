@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
@@ -18,6 +19,70 @@ import (
 // testReplicaClient is a minimal mock for testing that doesn't cause import cycles.
 type testReplicaClient struct {
 	dir string
+}
+
+func TestNextExponentialBackoff(t *testing.T) {
+	t.Run("IncreasesAndCaps", func(t *testing.T) {
+		min := time.Second
+		max := 30 * time.Second
+
+		var d time.Duration
+		var got []time.Duration
+		for i := 0; i < 10; i++ {
+			d = nextExponentialBackoff(d, min, max)
+			got = append(got, d)
+		}
+
+		want := []time.Duration{
+			1 * time.Second,
+			2 * time.Second,
+			4 * time.Second,
+			8 * time.Second,
+			16 * time.Second,
+			30 * time.Second,
+			30 * time.Second,
+			30 * time.Second,
+			30 * time.Second,
+			30 * time.Second,
+		}
+		if len(got) != len(want) {
+			t.Fatalf("unexpected len: %d", len(got))
+		}
+		for i := range got {
+			if got[i] != want[i] {
+				t.Fatalf("backoff[%d]=%s, want %s", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("MaxBelowMin", func(t *testing.T) {
+		if got := nextExponentialBackoff(2*time.Second, 5*time.Second, 1*time.Second); got != 5*time.Second {
+			t.Fatalf("unexpected backoff: %s", got)
+		}
+	})
+}
+
+func TestCompactionErrorRetryCap(t *testing.T) {
+	t.Run("UsesIntervalWhenSmall", func(t *testing.T) {
+		if got := compactionErrorRetryCap(30 * time.Second); got != 30*time.Second {
+			t.Fatalf("unexpected cap: %s", got)
+		}
+	})
+
+	t.Run("CapsLargeIntervals", func(t *testing.T) {
+		if got := compactionErrorRetryCap(24 * time.Hour); got != 5*time.Minute {
+			t.Fatalf("unexpected cap: %s", got)
+		}
+	})
+
+	t.Run("DefaultForZeroOrNegative", func(t *testing.T) {
+		if got := compactionErrorRetryCap(0); got != 5*time.Minute {
+			t.Fatalf("unexpected cap: %s", got)
+		}
+		if got := compactionErrorRetryCap(-1 * time.Second); got != 5*time.Minute {
+			t.Fatalf("unexpected cap: %s", got)
+		}
+	})
 }
 
 func (c *testReplicaClient) Init(_ context.Context) error { return nil }
