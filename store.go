@@ -139,7 +139,11 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	for _, db := range s.dbs {
+	s.mu.Lock()
+	dbs := slices.Clone(s.dbs)
+	s.mu.Unlock()
+
+	for _, db := range dbs {
 		if e := db.Close(ctx); e != nil && err == nil {
 			err = e
 		}
@@ -156,6 +160,85 @@ func (s *Store) DBs() []*DB {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return slices.Clone(s.dbs)
+}
+
+// AddDB registers a new database with the store and starts monitoring it.
+func (s *Store) AddDB(db *DB) error {
+	if db == nil {
+		return fmt.Errorf("db required")
+	}
+
+	// First check: see if database already exists
+	s.mu.Lock()
+	for _, existing := range s.dbs {
+		if existing.Path() == db.Path() {
+			s.mu.Unlock()
+			return nil
+		}
+	}
+	s.mu.Unlock()
+
+	// Apply store-wide retention settings before opening the database.
+	db.L0Retention = s.L0Retention
+
+	// Open the database without holding the lock to avoid blocking other operations.
+	// The double-check pattern below handles the race condition.
+	if err := db.Open(); err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+
+	// Second check: verify database wasn't added by another goroutine while we were opening.
+	// If it was, close our instance and return without error.
+	s.mu.Lock()
+
+	for _, existing := range s.dbs {
+		if existing.Path() == db.Path() {
+			// Another goroutine added this database while we were opening.
+			// Release lock before closing to avoid potential deadlock.
+			s.mu.Unlock()
+			if err := db.Close(context.Background()); err != nil {
+				slog.Error("close duplicate db", "path", db.Path(), "error", err)
+			}
+			return nil
+		}
+	}
+
+	s.dbs = append(s.dbs, db)
+	s.mu.Unlock()
+	return nil
+}
+
+// RemoveDB stops monitoring the database at the provided path and closes it.
+func (s *Store) RemoveDB(ctx context.Context, path string) error {
+	if path == "" {
+		return fmt.Errorf("db path required")
+	}
+
+	s.mu.Lock()
+
+	idx := -1
+	var db *DB
+	for i, existing := range s.dbs {
+		if existing.Path() == path {
+			idx = i
+			db = existing
+			break
+		}
+	}
+
+	if db == nil {
+		s.mu.Unlock()
+		return nil
+	}
+
+	s.dbs = slices.Delete(s.dbs, idx, idx+1)
+	s.mu.Unlock()
+
+	if err := db.Close(ctx); err != nil {
+		return fmt.Errorf("close db: %w", err)
+	}
+
+	return nil
 }
 
 // SetL0Retention updates the retention window for L0 files and propagates it to

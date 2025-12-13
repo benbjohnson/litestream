@@ -328,6 +328,9 @@ func (c *Config) Validate() error {
 		if db.Dir != "" && db.Pattern == "" {
 			return fmt.Errorf("database config #%d: 'pattern' is required when using 'dir'", idx+1)
 		}
+		if db.Watch && db.Dir == "" {
+			return fmt.Errorf("database config #%d: 'watch' can only be enabled with a directory", idx+1)
+		}
 
 		// Use path or dir for identifying the config in error messages
 		dbIdentifier := db.Path
@@ -497,6 +500,7 @@ type DBConfig struct {
 	Dir                string         `yaml:"dir"`       // Directory to scan for databases
 	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
 	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
+	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
@@ -520,7 +524,12 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 
 	// Override default database settings if specified in configuration.
 	if dbc.MetaPath != nil {
-		db.SetMetaPath(*dbc.MetaPath)
+		expandedMetaPath, err := expand(*dbc.MetaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand meta path: %w", err)
+		}
+		dbc.MetaPath = &expandedMetaPath
+		db.SetMetaPath(expandedMetaPath)
 	}
 	if dbc.MonitorInterval != nil {
 		db.MonitorInterval = *dbc.MonitorInterval
@@ -587,56 +596,85 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 		return nil, fmt.Errorf("failed to scan directory %s: %w", dirPath, err)
 	}
 
-	if len(dbPaths) == 0 {
+	if len(dbPaths) == 0 && !dbc.Watch {
 		return nil, fmt.Errorf("no SQLite databases found in directory %s with pattern %s", dirPath, dbc.Pattern)
 	}
 
 	// Create DB instances for each found database
 	var dbs []*litestream.DB
+	metaPaths := make(map[string]string)
+
 	for _, dbPath := range dbPaths {
-		// Calculate relative path from directory root
-		relPath, err := filepath.Rel(dirPath, dbPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to calculate relative path for %s: %w", dbPath, err)
-		}
-
-		// Create a copy of the config for each database
-		dbConfigCopy := *dbc
-		dbConfigCopy.Path = dbPath
-		dbConfigCopy.Dir = ""          // Clear dir field for individual DB
-		dbConfigCopy.Pattern = ""      // Clear pattern field
-		dbConfigCopy.Recursive = false // Clear recursive flag
-
-		// Deep copy replica config and make path unique per database.
-		// This prevents all databases from writing to the same replica path.
-		if dbc.Replica != nil {
-			replicaCopy, err := cloneReplicaConfigWithRelativePath(dbc.Replica, relPath)
-			if err != nil {
-				return nil, fmt.Errorf("failed to configure replica for %s: %w", dbPath, err)
-			}
-			dbConfigCopy.Replica = replicaCopy
-		}
-
-		// Also handle deprecated 'replicas' array field.
-		if len(dbc.Replicas) > 0 {
-			dbConfigCopy.Replicas = make([]*ReplicaConfig, len(dbc.Replicas))
-			for i, replica := range dbc.Replicas {
-				replicaCopy, err := cloneReplicaConfigWithRelativePath(replica, relPath)
-				if err != nil {
-					return nil, fmt.Errorf("failed to configure replica %d for %s: %w", i, dbPath, err)
-				}
-				dbConfigCopy.Replicas[i] = replicaCopy
-			}
-		}
-
-		db, err := NewDBFromConfig(&dbConfigCopy)
+		db, err := newDBFromDirectoryEntry(dbc, dirPath, dbPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create DB for %s: %w", dbPath, err)
 		}
+
+		// Validate unique meta-path to prevent replication state corruption
+		if mp := db.MetaPath(); mp != "" {
+			if existingDB, exists := metaPaths[mp]; exists {
+				return nil, fmt.Errorf("meta-path collision: databases %s and %s would share meta-path %s, causing replication state corruption", existingDB, dbPath, mp)
+			}
+			metaPaths[mp] = dbPath
+		}
+
 		dbs = append(dbs, db)
 	}
 
 	return dbs, nil
+}
+
+// newDBFromDirectoryEntry creates a DB instance for a database discovered via directory replication.
+func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream.DB, error) {
+	// Calculate relative path from directory root
+	relPath, err := filepath.Rel(dirPath, dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to calculate relative path for %s: %w", dbPath, err)
+	}
+
+	// Create a copy of the config for the discovered database
+	dbConfigCopy := *dbc
+	dbConfigCopy.Path = dbPath
+	dbConfigCopy.Dir = ""          // Clear dir field for individual DB
+	dbConfigCopy.Pattern = ""      // Clear pattern field
+	dbConfigCopy.Recursive = false // Clear recursive flag
+	dbConfigCopy.Watch = false     // Individual DBs do not watch directories
+
+	// Ensure every database discovered beneath a directory receives a unique
+	// metadata path. Without this, all databases share the same meta-path and
+	// clobber each other's replication state.
+	if dbc.MetaPath != nil {
+		baseMetaPath, err := expand(*dbc.MetaPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand meta path for %s: %w", dbPath, err)
+		}
+		metaPathCopy := deriveMetaPathForDirectoryEntry(baseMetaPath, relPath)
+		dbConfigCopy.MetaPath = &metaPathCopy
+	}
+
+	// Deep copy replica config and make path unique per database.
+	// This prevents all databases from writing to the same replica path.
+	if dbc.Replica != nil {
+		replicaCopy, err := cloneReplicaConfigWithRelativePath(dbc.Replica, relPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to configure replica for %s: %w", dbPath, err)
+		}
+		dbConfigCopy.Replica = replicaCopy
+	}
+
+	// Also handle deprecated 'replicas' array field.
+	if len(dbc.Replicas) > 0 {
+		dbConfigCopy.Replicas = make([]*ReplicaConfig, len(dbc.Replicas))
+		for i, replica := range dbc.Replicas {
+			replicaCopy, err := cloneReplicaConfigWithRelativePath(replica, relPath)
+			if err != nil {
+				return nil, fmt.Errorf("failed to configure replica %d for %s: %w", i, dbPath, err)
+			}
+			dbConfigCopy.Replicas[i] = replicaCopy
+		}
+	}
+
+	return NewDBFromConfig(&dbConfigCopy)
 }
 
 // cloneReplicaConfigWithRelativePath returns a copy of the replica configuration with the
@@ -682,6 +720,24 @@ func cloneReplicaConfigWithRelativePath(base *ReplicaConfig, relPath string) (*R
 	}
 
 	return &replicaCopy, nil
+}
+
+// deriveMetaPathForDirectoryEntry returns a unique metadata directory for a
+// database discovered through directory replication by appending the database's
+// relative path and the standard Litestream suffix to the configured base path.
+func deriveMetaPathForDirectoryEntry(basePath, relPath string) string {
+	relPath = filepath.Clean(relPath)
+	if relPath == "." || relPath == "" {
+		return basePath
+	}
+
+	relDir, relFile := filepath.Split(relPath)
+	if relFile == "" || relFile == "." {
+		return filepath.Join(basePath, relPath)
+	}
+
+	metaDirName := "." + relFile + litestream.MetaDirSuffix
+	return filepath.Join(basePath, relDir, metaDirName)
 }
 
 // appendRelativePathToURL appends relPath to the URL's path component, ensuring

@@ -37,6 +37,9 @@ type ReplicateCommand struct {
 
 	// Manages the set of databases & compaction levels.
 	Store *litestream.Store
+
+	// Directory monitors for dynamic database discovery.
+	directoryMonitors []*DirectoryMonitor
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -127,6 +130,10 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	var dbs []*litestream.DB
+	var watchables []struct {
+		config *DBConfig
+		dbs    []*litestream.DB
+	}
 	for _, dbConfig := range c.Config.DBs {
 		// Handle directory configuration
 		if dbConfig.Dir != "" {
@@ -135,7 +142,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 				return err
 			}
 			dbs = append(dbs, dirDbs...)
-			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs))
+			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs), "watch", dbConfig.Watch)
+			if dbConfig.Watch {
+				watchables = append(watchables, struct {
+					config *DBConfig
+					dbs    []*litestream.DB
+				}{config: dbConfig, dbs: dirDbs})
+			}
 		} else {
 			// Handle single database configuration
 			db, err := NewDBFromConfig(dbConfig)
@@ -164,6 +177,20 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 	if err := c.Store.Open(ctx); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
+	}
+
+	for _, entry := range watchables {
+		monitor, err := NewDirectoryMonitor(ctx, c.Store, entry.config, entry.dbs)
+		if err != nil {
+			for _, m := range c.directoryMonitors {
+				m.Close()
+			}
+			if closeErr := c.Store.Close(ctx); closeErr != nil {
+				slog.Error("failed to close store after monitor failure", "error", closeErr)
+			}
+			return fmt.Errorf("start directory monitor for %s: %w", entry.config.Dir, err)
+		}
+		c.directoryMonitors = append(c.directoryMonitors, monitor)
 	}
 
 	// Notify user that initialization is done.
@@ -231,10 +258,17 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 // Close closes all open databases.
 func (c *ReplicateCommand) Close(ctx context.Context) error {
-	if err := c.Store.Close(ctx); err != nil {
-		slog.Error("failed to close database", "error", err)
+	for _, monitor := range c.directoryMonitors {
+		monitor.Close()
 	}
-	if c.Config.MCPAddr != "" {
+	c.directoryMonitors = nil
+
+	if c.Store != nil {
+		if err := c.Store.Close(ctx); err != nil {
+			slog.Error("failed to close database", "error", err)
+		}
+	}
+	if c.Config.MCPAddr != "" && c.MCP != nil {
 		if err := c.MCP.Close(); err != nil {
 			slog.Error("error closing MCP server", "error", err)
 		}
