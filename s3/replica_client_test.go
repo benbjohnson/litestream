@@ -219,6 +219,82 @@ func TestReplicaClient_UnsignedPayload_NoChunkedEncoding(t *testing.T) {
 	}
 }
 
+// TestReplicaClient_SignedPayload_CustomEndpoint_NoChunkedEncoding verifies that
+// aws-chunked encoding is disabled for custom endpoints even when SignPayload=true.
+// This is necessary for S3-compatible providers (Filebase, MinIO, Backblaze B2, etc.)
+// that don't support aws-chunked encoding at all. See issue #895.
+func TestReplicaClient_SignedPayload_CustomEndpoint_NoChunkedEncoding(t *testing.T) {
+	data := mustLTX(t)
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		if r.Method == http.MethodPut {
+			select {
+			case headers <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL // Custom endpoint (non-AWS)
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+	client.SignPayload = true // Signed payload, but still using custom endpoint
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-headers:
+		// With SignPayload=true, we expect an actual SHA256 hash (not UNSIGNED-PAYLOAD)
+		sha256Header := hdr.Get("x-amz-content-sha256")
+		if sha256Header == "" {
+			t.Error("x-amz-content-sha256 header should be set")
+		}
+		if sha256Header == "UNSIGNED-PAYLOAD" {
+			t.Error("x-amz-content-sha256 should be actual hash, not UNSIGNED-PAYLOAD, when SignPayload=true")
+		}
+
+		// But aws-chunked encoding should still be disabled for custom endpoints
+		contentEnc := hdr.Get("Content-Encoding")
+		if strings.Contains(contentEnc, "aws-chunked") {
+			t.Errorf("Content-Encoding contains aws-chunked: %q; aws-chunked is not supported by S3-compatible providers", contentEnc)
+		}
+
+		transferEnc := hdr.Get("Transfer-Encoding")
+		if strings.Contains(transferEnc, "aws-chunked") {
+			t.Errorf("Transfer-Encoding contains aws-chunked: %q; aws-chunked is not supported by S3-compatible providers", transferEnc)
+		}
+
+		decoded := hdr.Get("X-Amz-Decoded-Content-Length")
+		if decoded != "" {
+			t.Errorf("X-Amz-Decoded-Content-Length = %q; this header indicates aws-chunked encoding which is not supported by S3-compatible providers", decoded)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for PUT request")
+	}
+}
+
 func mustLTX(t *testing.T) []byte {
 	t.Helper()
 

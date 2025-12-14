@@ -154,8 +154,16 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		return nil, fmt.Errorf("bucket required for s3 replica URL")
 	}
 
-	// Check for Tigris endpoint
+	// Detect S3-compatible provider endpoints for applying appropriate defaults.
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
+	isDigitalOcean := litestream.IsDigitalOceanEndpoint(endpoint)
+	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
+	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
+	isScaleway := litestream.IsScalewayEndpoint(endpoint)
+	isMinIO := litestream.IsMinIOEndpoint(endpoint)
+
+	// Track if forcePathStyle was explicitly set via query parameter.
+	forcePathStyleSet := query.Get("forcePathStyle") != ""
 
 	// Read authentication from environment variables
 	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
@@ -169,16 +177,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		client.SecretAccessKey = v
 	}
 
-	// Configure client
-	client.Bucket = bucket
-	client.Path = urlPath
-	client.Region = region
-	client.Endpoint = endpoint
-	client.ForcePathStyle = forcePathStyle
-	client.SkipVerify = skipVerify
-
-	// Apply Tigris defaults
+	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
+		// Tigris: requires signed payloads, no MD5
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
@@ -186,6 +187,26 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			requireMD5, requireMD5Set = false, true
 		}
 	}
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
+		if !signPayloadSet {
+			signPayload, signPayloadSet = true, true
+		}
+	}
+	if !forcePathStyleSet {
+		// Filebase, Backblaze B2, and MinIO require path-style URLs
+		if isFilebase || isBackblaze || isMinIO {
+			forcePathStyle = true
+		}
+	}
+
+	// Configure client
+	client.Bucket = bucket
+	client.Path = urlPath
+	client.Region = region
+	client.Endpoint = endpoint
+	client.ForcePathStyle = forcePathStyle
+	client.SkipVerify = skipVerify
 
 	if signPayloadSet {
 		client.SignPayload = signPayload
@@ -552,12 +573,16 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			if err := v4.AddContentSHA256HeaderMiddleware(stack); err != nil {
 				return err
 			}
+		}
 
-			// Disable AWS SDK v2's trailing checksum middleware which uses
-			// aws-chunked encoding that is incompatible with UNSIGNED-PAYLOAD.
-			// AWS S3 rejects requests with: "aws-chunked encoding is not supported
-			// when x-amz-content-sha256 UNSIGNED-PAYLOAD is supplied."
-			// See: https://github.com/aws/aws-sdk-go-v2/discussions/2960
+		// Disable AWS SDK v2's trailing checksum middleware which uses
+		// aws-chunked encoding. This is required for:
+		// 1. UNSIGNED-PAYLOAD requests (aws-chunked + UNSIGNED-PAYLOAD is rejected by AWS)
+		// 2. S3-compatible providers (Filebase, MinIO, Backblaze B2, etc.) that don't
+		//    support aws-chunked encoding at all
+		// See: https://github.com/aws/aws-sdk-go-v2/discussions/2960
+		// See: https://github.com/benbjohnson/litestream/issues/895
+		if !c.SignPayload || c.Endpoint != "" {
 			stack.Finalize.Remove("addInputChecksumTrailer")
 		}
 
