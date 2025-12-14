@@ -160,6 +160,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
 	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
 	isScaleway := litestream.IsScalewayEndpoint(endpoint)
+	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set via query parameter.
@@ -187,7 +188,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			requireMD5, requireMD5Set = false, true
 		}
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true

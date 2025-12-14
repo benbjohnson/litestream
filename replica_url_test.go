@@ -719,6 +719,28 @@ func TestIsScalewayEndpoint(t *testing.T) {
 	}
 }
 
+func TestIsCloudflareR2Endpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://abcdef123456.r2.cloudflarestorage.com", true},
+		{"https://account-id.r2.cloudflarestorage.com", true},
+		{"abcdef123456.r2.cloudflarestorage.com", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsCloudflareR2Endpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsCloudflareR2Endpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsMinIOEndpoint(t *testing.T) {
 	tests := []struct {
 		endpoint string
