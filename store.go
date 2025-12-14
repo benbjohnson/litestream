@@ -264,7 +264,6 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 	slog.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
 
 	retryDeadline := time.Time{}
-	var errBackoff time.Duration
 	timer := time.NewTimer(time.Nanosecond)
 	defer timer.Stop()
 
@@ -280,7 +279,6 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		nextDelay := time.Until(lvl.NextCompactionAt(now))
 
 		var anyNotReady bool
-		var quickRetry bool
 
 		for _, db := range s.DBs() {
 			_, err := s.CompactDB(ctx, db, lvl)
@@ -292,14 +290,12 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 				anyNotReady = true
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				slog.Error("compaction failed", "level", lvl.Level, "error", err)
-				quickRetry = true
 			}
 
 			if lvl.Level == SnapshotLevel {
 				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
 					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					slog.Error("retention enforcement failed", "error", err)
-					quickRetry = true
 				}
 			}
 		}
@@ -318,52 +314,11 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			retryDeadline = time.Time{}
 		}
 
-		// Retry sooner on errors but with bounded exponential backoff to avoid tight loops.
-		// This lets transient errors clear quickly but prevents sustained 1s retries for persistent failures.
-		if quickRetry && !(anyNotReady && !timedOut) {
-			errBackoff = nextExponentialBackoff(errBackoff, time.Second, compactionErrorRetryCap(lvl.Interval))
-			nextDelay = errBackoff
-		} else {
-			errBackoff = 0
-		}
-
 		if nextDelay < 0 {
 			nextDelay = 0
 		}
 		timer.Reset(nextDelay)
 	}
-}
-
-func nextExponentialBackoff(prev, min, max time.Duration) time.Duration {
-	if max < min {
-		max = min
-	}
-
-	switch {
-	case prev <= 0:
-		return min
-	case prev >= max:
-		return max
-	}
-
-	next := prev * 2
-	if next < min {
-		next = min
-	}
-	if next > max {
-		next = max
-	}
-	return next
-}
-
-func compactionErrorRetryCap(interval time.Duration) time.Duration {
-	// Ensure we never retry in a tight loop indefinitely but also avoid waiting a full snapshot interval (e.g. daily)
-	// between retries when a transient backend error may clear quickly.
-	const maxCap = 5 * time.Minute
-	if interval <= 0 || interval > maxCap {
-		return maxCap
-	}
-	return interval
 }
 
 func (s *Store) monitorL0Retention(ctx context.Context) {
