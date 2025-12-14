@@ -1071,3 +1071,141 @@ func TestDB_SyncAfterVacuum(t *testing.T) {
 	}
 	t.Logf("Final position: TXID=%d", pos.TXID)
 }
+
+// TestDB_NoLTXFilesOnIdleSync verifies that syncing an idle database does not
+// create new LTX files when no external changes have been made. This tests the
+// fix for issue #896 where time-based checkpoints were creating LTX files even
+// when no actual database changes occurred.
+func TestDB_NoLTXFilesOnIdleSync(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Set CheckpointInterval to trigger time-based checkpoints
+	db.CheckpointInterval = time.Millisecond
+
+	// Create a table and insert some data to ensure we have WAL activity
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (data) VALUES ('test')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial sync to create first LTX file(s)
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for checkpoint interval to pass
+	time.Sleep(10 * time.Millisecond)
+
+	// Sync again to trigger checkpoint (this will write to _litestream_seq)
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Record the current TXID after checkpoint
+	posAfterCheckpoint, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("TXID after checkpoint: %d", posAfterCheckpoint.TXID)
+
+	// Wait for checkpoint interval to pass again
+	time.Sleep(10 * time.Millisecond)
+
+	// Now sync multiple times without any external database changes
+	// This is the key part of the test - with the bug, each sync would create
+	// a new LTX file because the time-based checkpoint would trigger
+	for i := 0; i < 3; i++ {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatalf("sync %d failed: %v", i, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Check final position - it should NOT have advanced significantly
+	// With the bug, TXID would increase by 3 (one for each sync)
+	posAfterIdle, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("TXID after idle syncs: %d", posAfterIdle.TXID)
+
+	// The TXID should not have advanced more than 1 from the checkpoint
+	// (accounting for the checkpoint's own _litestream_seq write)
+	if posAfterIdle.TXID > posAfterCheckpoint.TXID+1 {
+		t.Fatalf("expected TXID to stay at or below %d, got %d (bug: LTX files created without changes)",
+			posAfterCheckpoint.TXID+1, posAfterIdle.TXID)
+	}
+}
+
+// TestDB_DelayedCheckpointAfterWrite verifies that writes that happen before
+// the checkpoint interval elapses will still trigger a checkpoint later when
+// the interval does elapse. This ensures the syncedSinceCheckpoint flag
+// persists across sync calls. See issue #896.
+func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Use a longer checkpoint interval so we can control when it triggers
+	db.CheckpointInterval = 100 * time.Millisecond
+
+	// Create table and initial sync
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for interval to pass and sync to trigger initial checkpoint
+	time.Sleep(150 * time.Millisecond)
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Record TXID after first checkpoint
+	posAfterFirstCheckpoint, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("TXID after first checkpoint: %d", posAfterFirstCheckpoint.TXID)
+
+	// Insert data immediately (before interval elapses)
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (data) VALUES ('delayed checkpoint test')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync immediately - this should NOT trigger a checkpoint (interval hasn't elapsed)
+	// but should set syncedSinceCheckpoint = true
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	posAfterInsert, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("TXID after insert+sync: %d", posAfterInsert.TXID)
+
+	// Now wait for the interval to pass and sync again (no new data)
+	time.Sleep(150 * time.Millisecond)
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// A checkpoint should have been triggered because syncedSinceCheckpoint was true
+	// The TXID should have advanced due to the checkpoint
+	posAfterDelayedCheckpoint, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("TXID after delayed checkpoint: %d", posAfterDelayedCheckpoint.TXID)
+
+	// The TXID should have advanced from the insert position, indicating the checkpoint ran
+	if posAfterDelayedCheckpoint.TXID <= posAfterInsert.TXID {
+		t.Fatalf("expected TXID to advance after delayed checkpoint (syncedSinceCheckpoint should persist), got insert=%d delayed=%d",
+			posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
+	}
+}
