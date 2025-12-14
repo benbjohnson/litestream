@@ -1261,10 +1261,16 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		return nil, fmt.Errorf("bucket required for s3 replica")
 	}
 
+	// Check for known S3-compatible provider endpoints
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
 	if !isTigris && !endpointWasSet && litestream.IsTigrisEndpoint(c.Endpoint) {
 		isTigris = true
 	}
+	isDigitalOcean := litestream.IsDigitalOceanEndpoint(endpoint)
+	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
+	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
+	isScaleway := litestream.IsScalewayEndpoint(endpoint)
+	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 
 	// Build replica.
 	client := s3.NewReplicaClient()
@@ -1276,9 +1282,18 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+
+	// Apply Tigris defaults: requires signed payloads, no MD5
 	if isTigris {
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
+	}
+
+	// Apply defaults for S3-compatible providers that require signed payloads.
+	// These providers don't properly support UNSIGNED-PAYLOAD in the
+	// x-amz-content-sha256 header.
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+		signSetting.ApplyDefault(true)
 	}
 
 	client.SignPayload = signSetting.value

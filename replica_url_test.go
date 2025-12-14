@@ -52,6 +52,106 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 	})
 
+	// Test that S3-compatible providers default to signed payloads
+	t.Run("S3_DigitalOcean_SignPayloadDefault", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=https://sfo3.digitaloceanspaces.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if !s3Client.SignPayload {
+			t.Error("expected SignPayload=true for Digital Ocean Spaces")
+		}
+	})
+
+	t.Run("S3_Backblaze_SignPayloadDefault", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=https://s3.us-west-002.backblazeb2.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if !s3Client.SignPayload {
+			t.Error("expected SignPayload=true for Backblaze B2")
+		}
+	})
+
+	t.Run("S3_Filebase_SignPayloadDefault", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=https://s3.filebase.com")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if !s3Client.SignPayload {
+			t.Error("expected SignPayload=true for Filebase")
+		}
+	})
+
+	t.Run("S3_Scaleway_SignPayloadDefault", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=https://s3.fr-par.scw.cloud")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if !s3Client.SignPayload {
+			t.Error("expected SignPayload=true for Scaleway")
+		}
+	})
+
+	t.Run("S3_MinIO_SignPayloadDefault", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=localhost:9000")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if !s3Client.SignPayload {
+			t.Error("expected SignPayload=true for MinIO")
+		}
+	})
+
+	t.Run("S3_Tigris_SignPayloadDefault", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=https://fly.storage.tigris.dev")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if !s3Client.SignPayload {
+			t.Error("expected SignPayload=true for Tigris")
+		}
+	})
+
+	t.Run("S3_ExplicitSignPayloadOverride", func(t *testing.T) {
+		// Test that explicit sign-payload=false overrides the provider default
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/db?endpoint=https://sfo3.digitaloceanspaces.com&sign-payload=false")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client, ok := client.(*s3.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+		}
+		if s3Client.SignPayload {
+			t.Error("expected SignPayload=false when explicitly set")
+		}
+	})
+
 	t.Run("File", func(t *testing.T) {
 		client, err := litestream.NewReplicaClientFromURL("file:///tmp/replica")
 		if err != nil {
@@ -574,6 +674,144 @@ func TestIsTigrisEndpoint(t *testing.T) {
 			got := litestream.IsTigrisEndpoint(tt.endpoint)
 			if got != tt.expected {
 				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsDigitalOceanEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"sfo3.digitaloceanspaces.com", true},
+		{"nyc3.digitaloceanspaces.com", true},
+		{"https://sfo3.digitaloceanspaces.com", true},
+		{"http://nyc3.digitaloceanspaces.com", true},
+		{"SFO3.DIGITALOCEANSPACES.COM", true},
+		{"mybucket.sfo3.digitaloceanspaces.com", true},
+		{"s3.amazonaws.com", false},
+		{"localhost:9000", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsDigitalOceanEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsDigitalOceanEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsBackblazeEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"s3.us-west-002.backblazeb2.com", true},
+		{"s3.us-east-005.backblazeb2.com", true},
+		{"https://s3.us-west-002.backblazeb2.com", true},
+		{"http://s3.us-east-005.backblazeb2.com", true},
+		{"S3.US-WEST-002.BACKBLAZEB2.COM", true},
+		{"mybucket.s3.us-west-002.backblazeb2.com", true},
+		{"s3.amazonaws.com", false},
+		{"localhost:9000", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsBackblazeEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsBackblazeEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsFilebaseEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"s3.filebase.com", true},
+		{"https://s3.filebase.com", true},
+		{"http://s3.filebase.com", true},
+		{"S3.FILEBASE.COM", true},
+		{"filebase.com", false},
+		{"s3.amazonaws.com", false},
+		{"localhost:9000", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsFilebaseEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsFilebaseEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsScalewayEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"s3.fr-par.scw.cloud", true},
+		{"s3.nl-ams.scw.cloud", true},
+		{"https://s3.fr-par.scw.cloud", true},
+		{"http://s3.nl-ams.scw.cloud", true},
+		{"S3.FR-PAR.SCW.CLOUD", true},
+		{"mybucket.s3.fr-par.scw.cloud", true},
+		{"s3.amazonaws.com", false},
+		{"localhost:9000", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsScalewayEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsScalewayEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsMinIOEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"localhost:9000", true},
+		{"minio.local:9000", true},
+		{"192.168.1.100:9000", true},
+		{"http://localhost:9000", true},
+		{"https://minio.local:9000", true},
+		{"s3.amazonaws.com", false},
+		{"sfo3.digitaloceanspaces.com", false},
+		{"s3.us-west-002.backblazeb2.com", false},
+		{"s3.filebase.com", false},
+		{"s3.fr-par.scw.cloud", false},
+		{"fly.storage.tigris.dev", false},
+		{"localhost", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsMinIOEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsMinIOEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
 			}
 		})
 	}

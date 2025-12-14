@@ -201,6 +201,81 @@ func IsTigrisEndpoint(endpoint string) bool {
 	return endpoint == "fly.storage.tigris.dev"
 }
 
+// IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
+func IsDigitalOceanEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	return strings.HasSuffix(host, ".digitaloceanspaces.com")
+}
+
+// IsBackblazeEndpoint returns true if the endpoint is Backblaze B2.
+func IsBackblazeEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	return strings.HasSuffix(host, ".backblazeb2.com")
+}
+
+// IsFilebaseEndpoint returns true if the endpoint is Filebase.
+func IsFilebaseEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	return host == "s3.filebase.com"
+}
+
+// IsScalewayEndpoint returns true if the endpoint is Scaleway Object Storage.
+func IsScalewayEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	return strings.HasSuffix(host, ".scw.cloud")
+}
+
+// IsMinIOEndpoint returns true if the endpoint appears to be MinIO or similar
+// (a custom endpoint with a port number that is not a known cloud provider).
+func IsMinIOEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	// MinIO typically uses host:port format without .com domain
+	// Check for port number in the host
+	if !strings.Contains(host, ":") {
+		return false
+	}
+	// Exclude known cloud providers
+	if strings.Contains(host, ".amazonaws.com") ||
+		strings.Contains(host, ".digitaloceanspaces.com") ||
+		strings.Contains(host, ".backblazeb2.com") ||
+		strings.Contains(host, ".filebase.com") ||
+		strings.Contains(host, ".scw.cloud") ||
+		strings.Contains(host, "tigris.dev") {
+		return false
+	}
+	return true
+}
+
+// extractEndpointHost extracts the host from an endpoint URL or returns the
+// endpoint as-is if it's not a full URL.
+func extractEndpointHost(endpoint string) string {
+	endpoint = strings.TrimSpace(strings.ToLower(endpoint))
+	if endpoint == "" {
+		return ""
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+			return u.Host
+		}
+	}
+	return endpoint
+}
+
 // IsURL returns true if s appears to be a URL (has a scheme).
 var isURLRegex = regexp.MustCompile(`^\w+:\/\/`)
 
