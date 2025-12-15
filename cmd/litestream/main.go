@@ -908,6 +908,14 @@ type ReplicaSettings struct {
 	PartSize          *ByteSize `yaml:"part-size"`
 	Concurrency       *int      `yaml:"concurrency"`
 
+	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
+	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
+	SSECustomerKey       string `yaml:"sse-customer-key"`
+	SSECustomerKeyPath   string `yaml:"sse-customer-key-path"`
+
+	// S3 Server-Side Encryption (SSE-KMS: AWS Key Management Service)
+	SSEKMSKeyID string `yaml:"sse-kms-key-id"`
+
 	// ABS settings
 	AccountName string `yaml:"account-name"`
 	AccountKey  string `yaml:"account-key"`
@@ -989,6 +997,20 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
+	}
+
+	// S3 SSE settings
+	if rs.SSECustomerAlgorithm == "" {
+		rs.SSECustomerAlgorithm = src.SSECustomerAlgorithm
+	}
+	if rs.SSECustomerKey == "" {
+		rs.SSECustomerKey = src.SSECustomerKey
+	}
+	if rs.SSECustomerKeyPath == "" {
+		rs.SSECustomerKeyPath = src.SSECustomerKeyPath
+	}
+	if rs.SSEKMSKeyID == "" {
+		rs.SSEKMSKeyID = src.SSEKMSKeyID
 	}
 
 	// ABS settings
@@ -1344,6 +1366,39 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 	if c.Concurrency != nil {
 		client.Concurrency = *c.Concurrency
+	}
+
+	// Apply SSE-C configuration if specified.
+	if c.SSECustomerKey != "" || c.SSECustomerKeyPath != "" {
+		client.SSECustomerAlgorithm = c.SSECustomerAlgorithm
+		if client.SSECustomerAlgorithm == "" {
+			client.SSECustomerAlgorithm = "AES256"
+		}
+
+		// Read key from file if path is specified, otherwise use direct value.
+		if c.SSECustomerKeyPath != "" {
+			keyPath := c.SSECustomerKeyPath
+			// Expand ~ to home directory
+			if strings.HasPrefix(keyPath, "~") {
+				home, err := os.UserHomeDir()
+				if err != nil {
+					return nil, fmt.Errorf("cannot expand home directory for sse-customer-key-path: %w", err)
+				}
+				keyPath = home + keyPath[1:]
+			}
+			keyData, err := os.ReadFile(keyPath)
+			if err != nil {
+				return nil, fmt.Errorf("cannot read sse-customer-key-path %q: %w", c.SSECustomerKeyPath, err)
+			}
+			client.SSECustomerKey = strings.TrimSpace(string(keyData))
+		} else {
+			client.SSECustomerKey = c.SSECustomerKey
+		}
+	}
+
+	// Apply SSE-KMS configuration if specified.
+	if c.SSEKMSKeyID != "" {
+		client.SSEKMSKeyID = c.SSEKMSKeyID
 	}
 
 	return client, nil
