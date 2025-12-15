@@ -186,8 +186,10 @@ func (s *Store) AddDB(db *DB) error {
 	}
 	s.mu.Unlock()
 
-	// Apply store-wide retention settings before opening the database.
+	// Apply store-wide settings before opening the database.
 	db.L0Retention = s.L0Retention
+	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
+	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.

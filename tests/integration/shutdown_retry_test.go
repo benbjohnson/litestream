@@ -54,25 +54,20 @@ func TestShutdownSyncRetry_429Errors(t *testing.T) {
 	defer StopMinioTestContainer(t, containerName)
 	t.Logf("✓ MinIO running at: %s", minioEndpoint)
 
-	// Create MinIO bucket using mc command inside the container
+	// Create MinIO bucket by creating directory in /data (MinIO stores buckets as directories)
 	bucket := "litestream-test"
 	t.Logf("Creating bucket '%s'...", bucket)
-	createBucketCmd := exec.Command("docker", "exec", containerName,
-		"mc", "alias", "set", "myminio", "http://localhost:9000", "minioadmin", "minioadmin")
-	if out, err := createBucketCmd.CombinedOutput(); err != nil {
-		// Try alternative method - use mc mb directly
-		t.Logf("mc alias failed (expected for fresh container): %s", string(out))
-	}
 
-	// Wait for MinIO to be ready and create bucket
+	// Wait for MinIO to be ready
 	time.Sleep(2 * time.Second)
-	createBucketCmd = exec.Command("docker", "exec", containerName,
-		"mc", "mb", "--ignore-existing", "myminio/"+bucket)
+
+	// Create bucket directory directly - MinIO uses /data as the storage root
+	createBucketCmd := exec.Command("docker", "exec", containerName,
+		"mkdir", "-p", "/data/"+bucket)
 	if out, err := createBucketCmd.CombinedOutput(); err != nil {
-		// Alternative: use AWS CLI style
-		t.Logf("mc mb output: %s (may not have mc)", string(out))
+		t.Fatalf("Failed to create bucket directory: %v, output: %s", err, string(out))
 	}
-	t.Log("✓ Bucket created (or using auto-create)")
+	t.Log("✓ Bucket created")
 	t.Log("")
 
 	// Start rate-limiting proxy
