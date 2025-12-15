@@ -33,7 +33,7 @@ const (
 	DefaultBusyTimeout          = 1 * time.Second
 	DefaultMinCheckpointPageN   = 1000
 	DefaultTruncatePageN        = 121359 // ~500MB with 4KB page size
-	DefaultShutdownSyncTimeout  = 10 * time.Second
+	DefaultShutdownSyncTimeout  = 30 * time.Second
 	DefaultShutdownSyncInterval = 500 * time.Millisecond
 )
 

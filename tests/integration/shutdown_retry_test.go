@@ -294,7 +294,7 @@ func newRateLimitingProxy(t *testing.T, targetURL string, limit int) *rateLimiti
 		Director: func(req *http.Request) {
 			req.URL.Scheme = target.Scheme
 			req.URL.Host = target.Host
-			req.Host = target.Host
+			// Don't modify Host header - it's part of the AWS signature
 		},
 	}
 

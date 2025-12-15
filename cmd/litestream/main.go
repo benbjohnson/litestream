@@ -49,7 +49,7 @@ var (
 	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
 	ErrInvalidL0Retention              = errors.New("l0 retention must be greater than 0")
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
-	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown sync timeout must be greater than or equal to 0")
+	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
