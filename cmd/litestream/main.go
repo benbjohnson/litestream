@@ -49,6 +49,8 @@ var (
 	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
 	ErrInvalidL0Retention              = errors.New("l0 retention must be greater than 0")
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
+	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown sync timeout must be greater than or equal to 0")
+	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
@@ -219,6 +221,10 @@ type Config struct {
 	// MCP server options
 	MCPAddr string `yaml:"mcp-addr"`
 
+	// Shutdown sync retry settings
+	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
+	ShutdownSyncInterval *time.Duration `yaml:"shutdown-sync-interval"`
+
 	// Path to the config file
 	// This is only used internally to pass the config path to the MCP tool
 	ConfigPath string `yaml:"-"`
@@ -256,6 +262,8 @@ func DefaultConfig() Config {
 	defaultSnapshotRetention := 24 * time.Hour
 	defaultL0Retention := litestream.DefaultL0Retention
 	defaultL0RetentionCheckInterval := litestream.DefaultL0RetentionCheckInterval
+	defaultShutdownSyncTimeout := litestream.DefaultShutdownSyncTimeout
+	defaultShutdownSyncInterval := litestream.DefaultShutdownSyncInterval
 	return Config{
 		Levels: []*CompactionLevelConfig{
 			{Interval: 30 * time.Second},
@@ -268,6 +276,8 @@ func DefaultConfig() Config {
 		},
 		L0Retention:              &defaultL0Retention,
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
+		ShutdownSyncTimeout:      &defaultShutdownSyncTimeout,
+		ShutdownSyncInterval:     &defaultShutdownSyncInterval,
 	}
 }
 
@@ -300,6 +310,20 @@ func (c *Config) Validate() error {
 			Err:   ErrInvalidL0RetentionCheckInterval,
 			Field: "l0-retention-check-interval",
 			Value: *c.L0RetentionCheckInterval,
+		}
+	}
+	if c.ShutdownSyncTimeout != nil && *c.ShutdownSyncTimeout < 0 {
+		return &ConfigValidationError{
+			Err:   ErrInvalidShutdownSyncTimeout,
+			Field: "shutdown-sync-timeout",
+			Value: *c.ShutdownSyncTimeout,
+		}
+	}
+	if c.ShutdownSyncInterval != nil && *c.ShutdownSyncInterval <= 0 {
+		return &ConfigValidationError{
+			Err:   ErrInvalidShutdownSyncInterval,
+			Field: "shutdown-sync-interval",
+			Value: *c.ShutdownSyncInterval,
 		}
 	}
 

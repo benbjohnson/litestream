@@ -165,7 +165,8 @@ func MustOpenDB(tb testing.TB) *litestream.DB {
 func MustOpenDBAt(tb testing.TB, path string) *litestream.DB {
 	tb.Helper()
 	db := NewDB(tb, path)
-	db.MonitorInterval = 0 // disable background goroutine
+	db.MonitorInterval = 0     // disable background goroutine
+	db.ShutdownSyncTimeout = 0 // disable shutdown sync retry for faster tests
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = NewFileReplicaClient(tb)
 	db.Replica.MonitorEnabled = false // disable background goroutine
