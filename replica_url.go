@@ -190,7 +190,7 @@ func BoolQueryValue(query url.Values, keys ...string) (value bool, ok bool) {
 // IsTigrisEndpoint returns true if the endpoint is the Tigris object storage service.
 func IsTigrisEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)
-	return host == "fly.storage.tigris.dev"
+	return host == "fly.storage.tigris.dev" || host == "t3.storage.dev"
 }
 
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
@@ -257,7 +257,8 @@ func IsMinIOEndpoint(endpoint string) bool {
 		strings.Contains(host, ".filebase.com") ||
 		strings.Contains(host, ".scw.cloud") ||
 		strings.Contains(host, ".r2.cloudflarestorage.com") ||
-		strings.Contains(host, "tigris.dev") {
+		strings.Contains(host, "tigris.dev") ||
+		strings.Contains(host, "t3.storage.dev") {
 		return false
 	}
 	return true
