@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -385,5 +386,245 @@ func TestDB_Sync_ErrorMetrics(t *testing.T) {
 	syncErrorValue := testutil.ToFloat64(syncErrorMetric)
 	if syncErrorValue <= baselineErrors {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v", syncErrorValue, baselineErrors)
+	}
+}
+
+// TestDB_Verify_WALOffsetAtHeader tests that verify() handles the edge case where
+// an LTX file has WALOffset=WALHeaderSize and WALSize=0, which means we're at the
+// beginning of the WAL with no frames written yet.
+// Regression test for issue #900: prev WAL offset is less than the header size: -4088
+func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Perform initial sync to set up page size and initial state
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the WAL header to get current salt values
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt1 := binary.BigEndian.Uint32(walHdr[16:])
+	salt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	// Create an LTX file with WALOffset=WALHeaderSize (32) and WALSize=0
+	// This simulates the condition in issue #900
+	ltxDir := db.LTXLevelDir(0)
+	if err := os.MkdirAll(ltxDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get current position to determine next TXID
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextTXID := pos.TXID + 1
+
+	ltxPath := db.LTXPath(0, nextTXID, nextTXID)
+	f, err := os.Create(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enc, err := ltx.NewEncoder(f)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+
+	// Create header with WALOffset=32 (WALHeaderSize) and WALSize=0
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    2,
+		MinTXID:   nextTXID,
+		MaxTXID:   nextTXID,
+		Timestamp: 1000000,
+		WALOffset: WALHeaderSize, // 32 - at start of WAL
+		WALSize:   0,             // No WAL data - this triggers the bug
+		WALSalt1:  salt1,
+		WALSalt2:  salt2,
+	}
+
+	if err := enc.EncodeHeader(hdr); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now call verify - before the fix, this would fail with:
+	// "prev WAL offset is less than the header size: -4088"
+	info, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() returned error: %v", err)
+	}
+
+	// Verify the returned info is sensible
+	if info.offset != WALHeaderSize {
+		t.Errorf("expected offset=%d, got %d", WALHeaderSize, info.offset)
+	}
+	// Salt matches, so snapshotting should be false
+	if info.snapshotting {
+		t.Errorf("expected snapshotting=false when salt matches, got true")
+	}
+}
+
+// TestDB_Verify_WALOffsetAtHeader_SaltMismatch tests that verify() correctly
+// triggers a snapshot when WALOffset=WALHeaderSize, WALSize=0, and the salt
+// values don't match the current WAL header.
+// Companion test to TestDB_Verify_WALOffsetAtHeader for full branch coverage.
+func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Perform initial sync to set up page size and initial state
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the WAL header to get current salt values
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt1 := binary.BigEndian.Uint32(walHdr[16:])
+	salt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	// Create an LTX file with WALOffset=WALHeaderSize (32) and WALSize=0
+	// but with DIFFERENT salt values to simulate a salt reset
+	ltxDir := db.LTXLevelDir(0)
+	if err := os.MkdirAll(ltxDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Get current position to determine next TXID
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	nextTXID := pos.TXID + 1
+
+	ltxPath := db.LTXPath(0, nextTXID, nextTXID)
+	f, err := os.Create(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	enc, err := ltx.NewEncoder(f)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+
+	// Create header with WALOffset=32 (WALHeaderSize) and WALSize=0
+	// Use different salt values to trigger salt mismatch branch
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    2,
+		MinTXID:   nextTXID,
+		MaxTXID:   nextTXID,
+		Timestamp: 1000000,
+		WALOffset: WALHeaderSize, // 32 - at start of WAL
+		WALSize:   0,             // No WAL data
+		WALSalt1:  salt1 + 1,     // Different salt to trigger mismatch
+		WALSalt2:  salt2 + 1,     // Different salt to trigger mismatch
+	}
+
+	if err := enc.EncodeHeader(hdr); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call verify - should succeed but indicate snapshotting due to salt mismatch
+	info, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() returned error: %v", err)
+	}
+
+	// Verify the returned info indicates snapshotting due to salt reset
+	if info.offset != WALHeaderSize {
+		t.Errorf("expected offset=%d, got %d", WALHeaderSize, info.offset)
+	}
+	if !info.snapshotting {
+		t.Errorf("expected snapshotting=true when salt mismatches, got false")
+	}
+	if info.reason != "wal header salt reset, snapshotting" {
+		t.Errorf("expected reason='wal header salt reset, snapshotting', got %q", info.reason)
 	}
 }

@@ -905,6 +905,21 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
 	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
 
+	// Handle edge case where we're at WAL header (WALOffset=32, WALSize=0).
+	// This can happen when an LTX file represents a state at the beginning of the WAL
+	// with no frames written yet. We must check this before computing prevWALOffset
+	// to avoid underflow (32 - 4120 = -4088).
+	// See: https://github.com/benbjohnson/litestream/issues/900
+	if info.offset == WALHeaderSize {
+		slog.Debug("verify", "saltMatch", saltMatch, "atWALHeader", true)
+		if saltMatch {
+			info.snapshotting = false
+			return info, nil
+		}
+		info.reason = "wal header salt reset, snapshotting"
+		return info, nil
+	}
+
 	// If offset is at the beginning of the first page, we can't check for previous page.
 	prevWALOffset := info.offset - frameSize
 	slog.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
