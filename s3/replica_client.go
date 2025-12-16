@@ -80,6 +80,7 @@ type ReplicaClient struct {
 	SkipVerify        bool
 	SignPayload       bool
 	RequireContentMD5 bool
+	IsTigris          bool
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -181,6 +182,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
 		// Tigris: requires signed payloads, no MD5
+		client.IsTigris = true
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
@@ -559,6 +561,25 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			middleware.After,
 		); err != nil {
 			return err
+		}
+
+		if c.IsTigris {
+			if err := stack.Build.Add(
+				middleware.BuildMiddlewareFunc(
+					"LitestreamTigrisConsistent",
+					func(ctx context.Context, in middleware.BuildInput, next middleware.BuildHandler) (
+						out middleware.BuildOutput, metadata middleware.Metadata, err error,
+					) {
+						if req, ok := in.Request.(*smithyhttp.Request); ok {
+							req.Header.Set("X-Tigris-Consistent", "true")
+						}
+						return next.HandleBuild(ctx, in)
+					},
+				),
+				middleware.After,
+			); err != nil {
+				return err
+			}
 		}
 
 		// Many S3-compatible providers (e.g. Filebase) do not support SigV4

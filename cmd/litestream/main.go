@@ -1307,6 +1307,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	client.SignPayload = signSetting.value
 	client.RequireContentMD5 = requireSetting.value
+	client.IsTigris = isTigris
 
 	// Apply upload configuration if specified.
 	if c.PartSize != nil {
