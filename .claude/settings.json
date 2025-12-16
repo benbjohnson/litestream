@@ -1,70 +1,6 @@
 {
-  "project_name": "Planning Center Sync",
-  "description": "Planning Center Sync project for Parable",
-
-  "hooks": {
-    "PostToolUse": [
-      {
-        "matcher": "Edit|MultiEdit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/lint-files.sh",
-            "timeout": 30,
-            "run_in_background": false
-          }
-        ]
-      },
-      {
-        "matcher": "NotebookEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo 'Notebook edited - consider running tests'",
-            "timeout": 5
-          }
-        ]
-      }
-    ],
-
-    "PreToolUse": [
-      {
-        "matcher": "Edit|MultiEdit",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-edit-check.sh",
-            "timeout": 10
-          }
-        ]
-      }
-    ],
-
-    "UserPromptSubmit": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "echo '📝 Processing request for Planning Center Sync project for Parable...'",
-            "timeout": 2
-          }
-        ]
-      }
-    ],
-
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/session-summary.sh",
-            "timeout": 10,
-            "run_in_background": true
-          }
-        ]
-      }
-    ]
-  },
+  "project_name": "Litestream",
+  "description": "Standalone disaster recovery tool for SQLite",
 
   "auto_formatting": {
     "enabled": true,
@@ -76,11 +12,11 @@
       "enabled": true,
       "tool": "jq"
     }
- },
+  },
 
   "file_permissions": {
     "read_only_patterns": [
       "*.pdf"
     ]
- }
+  }
 }
