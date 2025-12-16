@@ -277,6 +277,7 @@ func NewTigrisReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.ForcePathStyle = true
 	c.SignPayload = true
 	c.RequireContentMD5 = false
+	c.IsTigris = true
 	return c
 }
 
