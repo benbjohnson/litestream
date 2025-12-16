@@ -1261,9 +1261,37 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		return nil, fmt.Errorf("bucket required for s3 replica")
 	}
 
+	// Detect S3-compatible provider endpoints for applying appropriate defaults.
+	// These providers require specific settings to work correctly with AWS SDK v2.
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
 	if !isTigris && !endpointWasSet && litestream.IsTigrisEndpoint(c.Endpoint) {
 		isTigris = true
+	}
+	isDigitalOcean := litestream.IsDigitalOceanEndpoint(endpoint)
+	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
+	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
+	isScaleway := litestream.IsScalewayEndpoint(endpoint)
+	isMinIO := litestream.IsMinIOEndpoint(endpoint)
+
+	// Track if forcePathStyle was explicitly set by user (config or URL query param).
+	forcePathStyleSet := c.ForcePathStyle != nil
+
+	// Apply provider-specific defaults for S3-compatible providers.
+	// These settings ensure compatibility with each provider's S3 implementation.
+	if isTigris {
+		// Tigris: requires signed payloads, no MD5
+		signSetting.ApplyDefault(true)
+		requireSetting.ApplyDefault(false)
+	}
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
+		signSetting.ApplyDefault(true)
+	}
+	if !forcePathStyleSet {
+		// Filebase, Backblaze B2, and MinIO require path-style URLs
+		if isFilebase || isBackblaze || isMinIO {
+			forcePathStyle = true
+		}
 	}
 
 	// Build replica.
@@ -1276,10 +1304,6 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
-	if isTigris {
-		signSetting.ApplyDefault(true)
-		requireSetting.ApplyDefault(false)
-	}
 
 	client.SignPayload = signSetting.value
 	client.RequireContentMD5 = requireSetting.value

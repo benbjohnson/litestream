@@ -630,3 +630,137 @@ func TestCleanReplicaURLPath(t *testing.T) {
 		})
 	}
 }
+
+func TestIsDigitalOceanEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://sfo3.digitaloceanspaces.com", true},
+		{"https://nyc3.digitaloceanspaces.com", true},
+		{"sfo3.digitaloceanspaces.com", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsDigitalOceanEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsDigitalOceanEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsBackblazeEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://s3.us-west-002.backblazeb2.com", true},
+		{"https://s3.eu-central-003.backblazeb2.com", true},
+		{"s3.us-west-002.backblazeb2.com", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsBackblazeEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsBackblazeEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsFilebaseEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://s3.filebase.com", true},
+		{"http://s3.filebase.com", true},
+		{"s3.filebase.com", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://sfo3.digitaloceanspaces.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsFilebaseEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsFilebaseEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsScalewayEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://s3.fr-par.scw.cloud", true},
+		{"https://s3.nl-ams.scw.cloud", true},
+		{"s3.fr-par.scw.cloud", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsScalewayEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsScalewayEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsCloudflareR2Endpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://abcdef123456.r2.cloudflarestorage.com", true},
+		{"https://account-id.r2.cloudflarestorage.com", true},
+		{"abcdef123456.r2.cloudflarestorage.com", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsCloudflareR2Endpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsCloudflareR2Endpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsMinIOEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"http://localhost:9000", true},
+		{"http://192.168.1.100:9000", true},
+		{"minio.local:9000", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"https://sfo3.digitaloceanspaces.com", false},
+		{"s3.filebase.com", false}, // No port, not MinIO
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsMinIOEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsMinIOEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
