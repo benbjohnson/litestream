@@ -27,7 +27,7 @@ require (
 	github.com/prometheus/client_golang v1.17.0
 	github.com/psanford/sqlite3vfs v0.0.0-20251127171934-4e34e03a991a // direct
 	github.com/studio-b12/gowebdav v0.11.0
-	github.com/superfly/ltx v0.5.0
+	github.com/superfly/ltx v0.5.1
 	golang.org/x/crypto v0.45.0
 	golang.org/x/sys v0.38.0
 	google.golang.org/api v0.154.0
@@ -37,7 +37,7 @@ require (
 
 require (
 	cloud.google.com/go/pubsub v1.33.0 // indirect
-	github.com/fsnotify/fsnotify v1.7.0 // indirect
+	github.com/fsnotify/fsnotify v1.7.0
 	github.com/google/renameio/v2 v2.0.0 // indirect
 	github.com/gorilla/handlers v1.5.1 // indirect
 	github.com/gorilla/mux v1.8.0 // indirect
