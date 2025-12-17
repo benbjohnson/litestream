@@ -87,6 +87,13 @@ func TestIsNotExists(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_DefaultSignPayload(t *testing.T) {
+	client := NewReplicaClient()
+	if !client.SignPayload {
+		t.Error("expected default SignPayload to be true")
+	}
+}
+
 func TestReplicaClientPayloadSigning(t *testing.T) {
 	data := mustLTX(t)
 	signedPayload := sha256.Sum256(data)
@@ -97,8 +104,8 @@ func TestReplicaClientPayloadSigning(t *testing.T) {
 		signPayload bool
 		wantHeader  string
 	}{
-		{name: "UnsignedByDefault", signPayload: false, wantHeader: "UNSIGNED-PAYLOAD"},
-		{name: "SignedWhenEnabled", signPayload: true, wantHeader: wantSigned},
+		{name: "UnsignedWhenDisabled", signPayload: false, wantHeader: "UNSIGNED-PAYLOAD"},
+		{name: "SignedByDefault", signPayload: true, wantHeader: wantSigned},
 	}
 
 	for _, tt := range tests {

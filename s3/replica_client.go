@@ -92,6 +92,7 @@ func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
 		logger:            slog.Default().WithGroup(ReplicaClientType),
 		RequireContentMD5: true,
+		SignPayload:       true,
 	}
 }
 
