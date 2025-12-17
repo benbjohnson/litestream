@@ -2111,6 +2111,56 @@ func TestHydrator_IsPageHydrated(t *testing.T) {
 	require.False(t, hydrator.IsPageHydrated(status.TotalPages+100))
 }
 
+func TestVFS_HydrationPRAGMAs(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	// Create and populate source database
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := primary.Exec("INSERT INTO t (value) VALUES (?)", fmt.Sprintf("value-%d", i)); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
+
+	if err := db.Replica.Stop(false); err != nil {
+		t.Fatalf("stop replica: %v", err)
+	}
+
+	// Test without hydration enabled (default)
+	t.Run("disabled", func(t *testing.T) {
+		vfs := newVFS(t, client)
+		vfsName := registerTestVFS(t, vfs)
+		replica := openVFSReplicaDB(t, vfsName)
+		defer replica.Close()
+
+		// Wait for replica to be ready
+		require.Eventually(t, func() bool {
+			var count int
+			return replica.QueryRow("SELECT COUNT(*) FROM t").Scan(&count) == nil && count == 100
+		}, 10*time.Second, 50*time.Millisecond)
+
+		// Check hydration status PRAGMA
+		var status string
+		err := replica.QueryRow("PRAGMA litestream_hydration_status").Scan(&status)
+		require.NoError(t, err)
+		require.Equal(t, "disabled", status)
+
+		// Check hydration progress PRAGMA
+		var progress string
+		err = replica.QueryRow("PRAGMA litestream_hydration_progress").Scan(&progress)
+		require.NoError(t, err)
+		require.Equal(t, "0", progress)
+	})
+}
+
 func newVFS(tb testing.TB, client litestream.ReplicaClient) *testVFS {
 	tb.Helper()
 

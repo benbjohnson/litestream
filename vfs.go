@@ -1074,6 +1074,29 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 		}
 		return nil, nil
 
+	case "litestream_hydration_status":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_hydration_status is read-only")
+		}
+		if f.hydrator == nil {
+			result := "disabled"
+			return &result, nil
+		}
+		result := f.hydrator.Status().State.String()
+		return &result, nil
+
+	case "litestream_hydration_progress":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_hydration_progress is read-only")
+		}
+		if f.hydrator == nil {
+			result := "0"
+			return &result, nil
+		}
+		progress := f.hydrator.Status().Progress() * 100
+		result := strconv.FormatFloat(progress, 'f', 1, 64)
+		return &result, nil
+
 	default:
 		return nil, sqlite3vfs.NotFoundError
 	}
