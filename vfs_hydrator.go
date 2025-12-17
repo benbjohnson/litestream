@@ -82,9 +82,8 @@ type Hydrator struct {
 	startTime    time.Time
 	completeTime time.Time
 
-	// Progress tracking (separate mutex for high-frequency reads)
-	statusMu sync.RWMutex
-	status   ltx.CompactorStatus
+	// Compactor reference for progress tracking
+	compactor *ltx.Compactor
 
 	// Lifecycle
 	ctx    context.Context
@@ -219,11 +218,9 @@ func (h *Hydrator) restore() error {
 	pr, pw := io.Pipe()
 
 	// Compactor goroutine
-	var compactor *ltx.Compactor
 	compactorErrCh := make(chan error, 1)
 	go func() {
-		var err error
-		compactor, err = ltx.NewCompactor(pw, rdrs)
+		compactor, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
 			compactorErrCh <- fmt.Errorf("new compactor: %w", err)
 			pw.CloseWithError(err)
@@ -232,12 +229,10 @@ func (h *Hydrator) restore() error {
 
 		compactor.HeaderFlags = ltx.HeaderFlagNoChecksum
 
-		// Monitor progress in background
-		h.wg.Add(1)
-		go func() {
-			defer h.wg.Done()
-			h.monitorProgress(compactor)
-		}()
+		// Store reference so Status() can query it directly
+		h.mu.Lock()
+		h.compactor = compactor
+		h.mu.Unlock()
 
 		err = compactor.Compact(h.ctx)
 		compactorErrCh <- err
@@ -263,26 +258,6 @@ func (h *Hydrator) restore() error {
 	return nil
 }
 
-// monitorProgress periodically updates status from the compactor.
-func (h *Hydrator) monitorProgress(c *ltx.Compactor) {
-	ticker := time.NewTicker(100 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-h.ctx.Done():
-			return
-		case <-h.done:
-			return
-		case <-ticker.C:
-			status := c.Status()
-			h.statusMu.Lock()
-			h.status = status
-			h.statusMu.Unlock()
-		}
-	}
-}
-
 // Status returns the current hydration status.
 // Safe to call concurrently.
 func (h *Hydrator) Status() HydrationStatus {
@@ -291,11 +266,13 @@ func (h *Hydrator) Status() HydrationStatus {
 	err := h.err
 	startTime := h.startTime
 	completeTime := h.completeTime
+	compactor := h.compactor
 	h.mu.RUnlock()
 
-	h.statusMu.RLock()
-	compactorStatus := h.status
-	h.statusMu.RUnlock()
+	var compactorStatus ltx.CompactorStatus
+	if compactor != nil {
+		compactorStatus = compactor.Status()
+	}
 
 	return HydrationStatus{
 		State:          state,
@@ -337,11 +314,14 @@ func (h *Hydrator) Stop() error {
 // Note: This returns true for pages 1 to N where N is the last page written
 // by the compactor (in page number order).
 func (h *Hydrator) IsPageHydrated(pgno uint32) bool {
-	h.statusMu.RLock()
-	n := h.status.N
-	h.statusMu.RUnlock()
+	h.mu.RLock()
+	compactor := h.compactor
+	h.mu.RUnlock()
 
-	return pgno <= n
+	if compactor == nil {
+		return false
+	}
+	return pgno <= compactor.Status().N
 }
 
 // OutputPath returns the path to the hydrating file.
