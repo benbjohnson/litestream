@@ -1820,6 +1820,297 @@ func TestVFS_PollIntervalEdgeCases(t *testing.T) {
 	}
 }
 
+func TestHydrator_BasicRestoration(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	// Create and populate source database
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	t.Log("creating table with data")
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Insert enough data to span multiple pages
+	for i := 0; i < 500; i++ {
+		if _, err := primary.Exec("INSERT INTO t (value) VALUES (?)", fmt.Sprintf("value-%d-padding-data-to-fill-pages", i)); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+
+	// Wait for LTX files and force sync
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
+
+	// Stop replica to ensure no more writes
+	if err := db.Replica.Stop(false); err != nil {
+		t.Fatalf("stop replica: %v", err)
+	}
+
+	// Create hydrator
+	outputDir := t.TempDir()
+	dbPath := filepath.Join(outputDir, "restored.db")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hydrator := litestream.NewHydrator(client, dbPath, logger)
+
+	// Verify initial status
+	status := hydrator.Status()
+	require.Equal(t, litestream.HydrationNotStarted, status.State)
+	require.False(t, status.IsComplete())
+
+	// Start hydration
+	t.Log("starting hydration")
+	err := hydrator.Start()
+	require.NoError(t, err)
+
+	// Verify status changes to in-progress
+	status = hydrator.Status()
+	require.Equal(t, litestream.HydrationInProgress, status.State)
+	require.False(t, status.StartTime.IsZero())
+
+	// Wait for completion
+	t.Log("waiting for hydration to complete")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = hydrator.Wait(ctx)
+	require.NoError(t, err)
+
+	// Verify final status
+	status = hydrator.Status()
+	require.Equal(t, litestream.HydrationCompleted, status.State)
+	require.True(t, status.IsComplete())
+	require.NoError(t, status.Err)
+	require.False(t, status.CompleteTime.IsZero())
+	require.Greater(t, status.TotalPages, uint32(0))
+	require.Equal(t, status.TotalPages, status.PagesCompleted)
+	require.InDelta(t, 1.0, status.Progress(), 0.01)
+
+	// Verify .hydrating file was renamed to final path
+	_, err = os.Stat(dbPath + ".hydrating")
+	require.True(t, os.IsNotExist(err), "hydrating file should be removed")
+
+	_, err = os.Stat(dbPath)
+	require.NoError(t, err, "final database file should exist")
+
+	// Open the restored database and verify data
+	t.Log("verifying restored database")
+	restoredDB, err := sql.Open("sqlite3", dbPath)
+	require.NoError(t, err)
+	defer restoredDB.Close()
+
+	// Verify integrity
+	var integrityResult string
+	err = restoredDB.QueryRow("PRAGMA integrity_check").Scan(&integrityResult)
+	require.NoError(t, err)
+	require.Equal(t, "ok", integrityResult)
+
+	// Verify row count
+	var count int
+	err = restoredDB.QueryRow("SELECT COUNT(*) FROM t").Scan(&count)
+	require.NoError(t, err)
+	require.Equal(t, 500, count)
+
+	// Verify sample data
+	var value string
+	err = restoredDB.QueryRow("SELECT value FROM t WHERE id = 250").Scan(&value)
+	require.NoError(t, err)
+	require.Contains(t, value, "value-249") // id 250 has index 249
+}
+
+func TestHydrator_ProgressTracking(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	// Create database with significant data
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Insert large blobs to create many pages
+	for i := 0; i < 100; i++ {
+		blob := make([]byte, 4000) // Near page size
+		if _, err := primary.Exec("INSERT INTO t (data) VALUES (?)", blob); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
+
+	if err := db.Replica.Stop(false); err != nil {
+		t.Fatalf("stop replica: %v", err)
+	}
+
+	// Create hydrator
+	outputDir := t.TempDir()
+	dbPath := filepath.Join(outputDir, "progress.db")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hydrator := litestream.NewHydrator(client, dbPath, logger)
+
+	err := hydrator.Start()
+	require.NoError(t, err)
+
+	// Wait for completion (local file operations are fast)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = hydrator.Wait(ctx)
+	require.NoError(t, err)
+
+	// Verify final progress state is accurate
+	status := hydrator.Status()
+	require.Equal(t, litestream.HydrationCompleted, status.State)
+	require.Greater(t, status.TotalPages, uint32(10), "should have multiple pages")
+	require.Equal(t, status.TotalPages, status.PagesCompleted, "all pages should be completed")
+	require.InDelta(t, 1.0, status.Progress(), 0.01, "progress should be 100%")
+}
+
+func TestHydrator_Stop(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	// Create database
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Insert large data to slow down hydration
+	for i := 0; i < 200; i++ {
+		blob := make([]byte, 4000)
+		if _, err := primary.Exec("INSERT INTO t (data) VALUES (?)", blob); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
+
+	if err := db.Replica.Stop(false); err != nil {
+		t.Fatalf("stop replica: %v", err)
+	}
+
+	// Create hydrator
+	outputDir := t.TempDir()
+	dbPath := filepath.Join(outputDir, "stopped.db")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hydrator := litestream.NewHydrator(client, dbPath, logger)
+
+	err := hydrator.Start()
+	require.NoError(t, err)
+
+	// Stop immediately
+	err = hydrator.Stop()
+	// Error is expected since we cancelled mid-operation
+	t.Logf("stop error (expected): %v", err)
+
+	// Verify state is either failed or completed (depending on timing)
+	status := hydrator.Status()
+	require.True(t, status.IsComplete(), "hydration should be complete after stop")
+
+	// The .hydrating file should be cleaned up on failure
+	if status.State == litestream.HydrationFailed {
+		_, err = os.Stat(dbPath + ".hydrating")
+		require.True(t, os.IsNotExist(err), "hydrating file should be removed on failure")
+	}
+}
+
+func TestHydrator_DoubleStart(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO t (id) VALUES (1)"); err != nil {
+		t.Fatalf("insert row: %v", err)
+	}
+
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
+
+	if err := db.Replica.Stop(false); err != nil {
+		t.Fatalf("stop replica: %v", err)
+	}
+
+	outputDir := t.TempDir()
+	dbPath := filepath.Join(outputDir, "double.db")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hydrator := litestream.NewHydrator(client, dbPath, logger)
+
+	// First start should succeed
+	err := hydrator.Start()
+	require.NoError(t, err)
+
+	// Second start should fail
+	err = hydrator.Start()
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "already started")
+
+	// Clean up
+	_ = hydrator.Stop()
+}
+
+func TestHydrator_IsPageHydrated(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	db, primary := openReplicatedPrimary(t, client, 50*time.Millisecond, 50*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Create multiple pages
+	for i := 0; i < 50; i++ {
+		blob := make([]byte, 4000)
+		if _, err := primary.Exec("INSERT INTO t (data) VALUES (?)", blob); err != nil {
+			t.Fatalf("insert row: %v", err)
+		}
+	}
+
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
+
+	if err := db.Replica.Stop(false); err != nil {
+		t.Fatalf("stop replica: %v", err)
+	}
+
+	outputDir := t.TempDir()
+	dbPath := filepath.Join(outputDir, "pages.db")
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	hydrator := litestream.NewHydrator(client, dbPath, logger)
+
+	// Before start, no pages are hydrated
+	require.False(t, hydrator.IsPageHydrated(1))
+
+	err := hydrator.Start()
+	require.NoError(t, err)
+
+	// Wait for completion
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err = hydrator.Wait(ctx)
+	require.NoError(t, err)
+
+	// After completion, pages should be hydrated
+	status := hydrator.Status()
+	require.Greater(t, status.TotalPages, uint32(0))
+
+	// All pages up to TotalPages should be hydrated
+	for pgno := uint32(1); pgno <= status.TotalPages; pgno++ {
+		require.True(t, hydrator.IsPageHydrated(pgno), "page %d should be hydrated", pgno)
+	}
+
+	// Pages beyond TotalPages should not be hydrated
+	require.False(t, hydrator.IsPageHydrated(status.TotalPages+100))
+}
+
 func newVFS(tb testing.TB, client litestream.ReplicaClient) *testVFS {
 	tb.Helper()
 
