@@ -57,6 +57,11 @@ type VFS struct {
 	// CacheSize is the maximum size of the page cache in bytes.
 	CacheSize int
 
+	// Hydration support
+	hydrateEnabled bool
+	hydratorMu     sync.Mutex
+	hydrators      map[string]*Hydrator // keyed by canonical database name
+
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
@@ -65,12 +70,22 @@ type VFS struct {
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
-	return &VFS{
-		client:       client,
-		logger:       logger.With("vfs", "true"),
-		PollInterval: DefaultPollInterval,
-		CacheSize:    DefaultCacheSize,
+	hydrateEnabled := os.Getenv("LITESTREAM_HYDRATE") == "1"
+
+	vfs := &VFS{
+		client:         client,
+		logger:         logger.With("vfs", "true"),
+		PollInterval:   DefaultPollInterval,
+		CacheSize:      DefaultCacheSize,
+		hydrateEnabled: hydrateEnabled,
+		hydrators:      make(map[string]*Hydrator),
 	}
+
+	if hydrateEnabled {
+		vfs.logger.Info("background hydration enabled")
+	}
+
+	return vfs
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
@@ -90,12 +105,71 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
+
+	// Attach hydrator if enabled
+	if hydrator, err := vfs.getOrCreateHydrator(name); err != nil {
+		return nil, 0, fmt.Errorf("get hydrator: %w", err)
+	} else if hydrator != nil {
+		f.hydrator = hydrator
+	}
+
 	if err := f.Open(); err != nil {
 		return nil, 0, err
 	}
 
 	flags |= sqlite3vfs.OpenReadOnly
 	return f, flags, nil
+}
+
+// getOrCreateHydrator returns the shared hydrator for a database path.
+// Returns nil if hydration is not enabled.
+func (vfs *VFS) getOrCreateHydrator(name string) (*Hydrator, error) {
+	if !vfs.hydrateEnabled {
+		return nil, nil
+	}
+
+	canonical := vfs.canonicalDBName(name)
+
+	vfs.hydratorMu.Lock()
+	defer vfs.hydratorMu.Unlock()
+
+	if h, exists := vfs.hydrators[canonical]; exists {
+		return h, nil
+	}
+
+	h := NewHydrator(vfs.client, name, vfs.logger)
+	if err := h.Start(); err != nil {
+		return nil, fmt.Errorf("start hydrator: %w", err)
+	}
+
+	vfs.hydrators[canonical] = h
+	return h, nil
+}
+
+// canonicalDBName normalizes database name for hydrator lookup.
+func (vfs *VFS) canonicalDBName(name string) string {
+	return filepath.Clean(name)
+}
+
+// Close stops all hydrators and releases resources.
+func (vfs *VFS) Close() error {
+	vfs.hydratorMu.Lock()
+	hydrators := make([]*Hydrator, 0, len(vfs.hydrators))
+	for _, h := range vfs.hydrators {
+		hydrators = append(hydrators, h)
+	}
+	// Clear map to prevent double-close and further hydrator creation
+	vfs.hydrators = make(map[string]*Hydrator)
+	vfs.hydratorMu.Unlock()
+
+	var firstErr error
+	for _, h := range hydrators {
+		if err := h.Stop(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	return firstErr
 }
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
@@ -407,6 +481,10 @@ type VFSFile struct {
 	pageSize        uint32
 	commit          uint32
 
+	// Hydration support
+	hydrator     *Hydrator // Optional: shared hydrator instance
+	hydratedFile *os.File  // Local file for hydrated pages
+
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -522,11 +600,53 @@ func (f *VFSFile) Open() error {
 		return fmt.Errorf("cannot build index: %w", err)
 	}
 
-	// Continuously monitor the replica client for new LTX files.
-	f.wg.Add(1)
-	go func() { defer f.wg.Done(); f.monitorReplicaClient(f.ctx) }()
+	// Open hydrated file if hydration is active
+	if f.hydrator != nil {
+		if err := f.openHydratedFile(); err != nil {
+			f.logger.Warn("failed to open hydrated file, falling back to remote-only", "error", err)
+			// Non-fatal: continue without hydration optimization
+			f.hydrator = nil
+		} else {
+			f.logger.Info("background hydration active, polling disabled")
+		}
+	}
+
+	// Start monitoring only if hydration is NOT enabled.
+	// When hydration is enabled, we read from the local file and don't poll for updates.
+	if f.hydrator == nil {
+		f.wg.Add(1)
+		go func() { defer f.wg.Done(); f.monitorReplicaClient(f.ctx) }()
+	}
 
 	return nil
+}
+
+// openHydratedFile opens the local hydrating file for optimized reads.
+func (f *VFSFile) openHydratedFile() error {
+	path := f.hydrator.OutputPath()
+
+	// Wait briefly for file to be created by the hydrator
+	for i := 0; i < 50; i++ {
+		file, err := os.Open(path)
+		if err == nil {
+			f.hydratedFile = file
+			f.logger.Debug("opened hydrated file for local reads", "path", path)
+			return nil
+		}
+
+		if !os.IsNotExist(err) {
+			return fmt.Errorf("open hydrated file: %w", err)
+		}
+
+		// File doesn't exist yet, wait for hydrator to create it
+		select {
+		case <-time.After(100 * time.Millisecond):
+		case <-f.ctx.Done():
+			return f.ctx.Err()
+		}
+	}
+
+	return fmt.Errorf("hydrated file not created within timeout: %s", path)
 }
 
 // SetTargetTime rebuilds the page index to view the database at a specific time.
@@ -645,6 +765,14 @@ func (f *VFSFile) Close() error {
 	f.logger.Debug("closing file")
 	f.cancel()
 	f.wg.Wait()
+
+	// Close hydrated file if open
+	if f.hydratedFile != nil {
+		if err := f.hydratedFile.Close(); err != nil {
+			f.logger.Warn("failed to close hydrated file", "error", err)
+		}
+	}
+
 	return nil
 }
 
@@ -670,6 +798,38 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 
 		return n, nil
+	}
+
+	// Try reading from hydrated file if available.
+	// Pages are written in order (1, 2, 3...) so we can read pages 1 to N
+	// where N is the last page written by the compactor.
+	// Capture pointers locally to avoid race conditions during Close().
+	hydratedFile := f.hydratedFile
+	hydrator := f.hydrator
+	if hydratedFile != nil && hydrator != nil && hydrator.IsPageHydrated(pgno) {
+		data := make([]byte, pageSize)
+		pageOff := int64(pgno-1) * int64(pageSize)
+		readN, readErr := hydratedFile.ReadAt(data, pageOff)
+		if readErr == nil && readN == int(pageSize) {
+			f.logger.Debug("hydrated file hit", "page", pgno)
+
+			// Cache the page for future reads
+			f.cache.Add(pgno, data)
+
+			pageOffset := int(off % int64(pageSize))
+			n = copy(p, data[pageOffset:])
+
+			// Update the first page to pretend like we are in journal mode.
+			if off == 0 {
+				p[18], p[19] = 0x01, 0x01
+				_, _ = rand.Read(p[24:28])
+			}
+
+			return n, nil
+		}
+
+		// Log but continue to remote fetch on error
+		f.logger.Debug("hydrated file read failed, falling back to remote", "page", pgno, "error", readErr)
 	}
 
 	// Get page index element
