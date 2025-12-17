@@ -1152,7 +1152,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
-	signSetting := newBoolSetting(false)
+	signSetting := newBoolSetting(true)
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
 	}
