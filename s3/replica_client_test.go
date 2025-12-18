@@ -90,7 +90,10 @@ func TestIsNotExists(t *testing.T) {
 func TestReplicaClient_DefaultSignPayload(t *testing.T) {
 	client := NewReplicaClient()
 	if !client.SignPayload {
-		t.Error("expected default SignPayload to be true")
+		t.Error("expected default SignPayload to be true for AWS S3 compatibility")
+	}
+	if !client.RequireContentMD5 {
+		t.Error("expected default RequireContentMD5 to be true for AWS S3 compatibility")
 	}
 }
 
