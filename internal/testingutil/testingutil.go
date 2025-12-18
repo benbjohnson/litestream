@@ -255,7 +255,6 @@ func NewS3ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Endpoint = *s3Endpoint
 	c.ForcePathStyle = *s3ForcePathStyle
 	c.SkipVerify = *s3SkipVerify
-	c.SignPayload = true
 	return c
 }
 
@@ -275,7 +274,6 @@ func NewTigrisReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Path = path.Join(defaultTigrisPathRoot, fmt.Sprintf("%016x", rand.Uint64()))
 	c.Endpoint = defaultTigrisEndpoint
 	c.ForcePathStyle = true
-	c.SignPayload = true
 	c.RequireContentMD5 = false
 	c.IsTigris = true
 	return c
