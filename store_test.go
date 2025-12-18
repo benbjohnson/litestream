@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
@@ -44,20 +46,23 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); err != nil {
-			t.Fatal(err)
-		}
+		_, err := s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
 
-		// Re-compacting immediately should return an error that it's too soon.
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); !errors.Is(err, litestream.ErrCompactionTooEarly) {
-			t.Fatalf("unexpected error: %s", err)
-		}
+		// Re-compacting immediately should return an error indicating compaction
+		// cannot proceed. This may be ErrCompactionTooEarly (detected timing conflict)
+		// or ErrNoCompaction (no new files to compact). Both are valid outcomes
+		// depending on whether we crossed a second boundary during the first compaction
+		// (PrevCompactionAt truncates to seconds, causing edge cases at boundaries).
+		_, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.True(t,
+			errors.Is(err, litestream.ErrCompactionTooEarly) || errors.Is(err, litestream.ErrNoCompaction),
+			"expected ErrCompactionTooEarly or ErrNoCompaction, got: %v", err)
 
 		// Re-compacting after the interval should show that there is nothing to compact.
 		time.Sleep(levels[1].Interval)
-		if _, err := s.CompactDB(t.Context(), db0, levels[1]); !errors.Is(err, litestream.ErrNoCompaction) {
-			t.Fatalf("unexpected error: %s", err)
-		}
+		_, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.ErrorIs(t, err, litestream.ErrNoCompaction)
 	})
 
 	t.Run("Snapshot", func(t *testing.T) {
