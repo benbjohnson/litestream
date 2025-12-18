@@ -80,7 +80,6 @@ type ReplicaClient struct {
 	SkipVerify        bool
 	SignPayload       bool
 	RequireContentMD5 bool
-	IsTigris          bool
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -183,7 +182,6 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
 		// Tigris: requires signed payloads, no MD5
-		client.IsTigris = true
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
@@ -575,7 +573,7 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			return err
 		}
 
-		if c.IsTigris {
+		if litestream.IsTigrisEndpoint(c.Endpoint) {
 			if err := stack.Build.Add(
 				middleware.BuildMiddlewareFunc(
 					"LitestreamTigrisConsistent",
