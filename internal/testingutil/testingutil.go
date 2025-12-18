@@ -285,7 +285,6 @@ func NewTigrisReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Endpoint = defaultTigrisEndpoint
 	c.ForcePathStyle = true
 	c.RequireContentMD5 = false
-	c.IsTigris = true
 	return c
 }
 

@@ -80,7 +80,6 @@ type ReplicaClient struct {
 	SkipVerify        bool
 	SignPayload       bool
 	RequireContentMD5 bool
-	IsTigris          bool
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -183,7 +182,6 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
 		// Tigris: requires signed payloads, no MD5
-		client.IsTigris = true
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
@@ -319,9 +317,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		},
 	}
 
-	// Tigris doesn't support aws-chunked content encoding used by default
-	// checksum calculation in AWS SDK Go v2 v1.73.0+. Disable it for Tigris.
-	if c.IsTigris {
+	// S3-compatible providers (Tigris, Backblaze B2, MinIO, Filebase, etc.) don't
+	// support aws-chunked content encoding used by default checksum calculation
+	// in AWS SDK Go v2 v1.73.0+. Disable automatic checksum calculation for all
+	// custom endpoints.
+	// See: https://github.com/benbjohnson/litestream/issues/918
+	if c.Endpoint != "" {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		})
@@ -572,7 +573,7 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			return err
 		}
 
-		if c.IsTigris {
+		if litestream.IsTigrisEndpoint(c.Endpoint) {
 			if err := stack.Build.Add(
 				middleware.BuildMiddlewareFunc(
 					"LitestreamTigrisConsistent",
