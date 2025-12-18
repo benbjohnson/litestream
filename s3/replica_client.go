@@ -319,9 +319,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		},
 	}
 
-	// Tigris doesn't support aws-chunked content encoding used by default
-	// checksum calculation in AWS SDK Go v2 v1.73.0+. Disable it for Tigris.
-	if c.IsTigris {
+	// S3-compatible providers (Tigris, Backblaze B2, MinIO, Filebase, etc.) don't
+	// support aws-chunked content encoding used by default checksum calculation
+	// in AWS SDK Go v2 v1.73.0+. Disable automatic checksum calculation for all
+	// custom endpoints.
+	// See: https://github.com/benbjohnson/litestream/issues/918
+	if c.Endpoint != "" {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		})
