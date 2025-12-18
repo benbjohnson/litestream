@@ -67,7 +67,8 @@ func ReplicaTypeFromURL(rawURL string) string {
 // ParseReplicaURL parses a replica URL and returns the scheme, host, and path.
 func ParseReplicaURL(s string) (scheme, host, urlPath string, err error) {
 	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
-		return parseS3AccessPointURL(s)
+		scheme, host, urlPath, _, err = parseS3AccessPointURL(s)
+		return scheme, host, urlPath, err
 	}
 
 	scheme, host, urlPath, _, _, err = ParseReplicaURLWithQuery(s)
@@ -78,8 +79,8 @@ func ParseReplicaURL(s string) (scheme, host, urlPath string, err error) {
 func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo, err error) {
 	// Handle S3 Access Point ARNs which can't be parsed by standard url.Parse
 	if strings.HasPrefix(strings.ToLower(s), "s3://arn:") {
-		scheme, host, urlPath, err := parseS3AccessPointURL(s)
-		return scheme, host, urlPath, nil, nil, err
+		scheme, host, urlPath, query, err := parseS3AccessPointURL(s)
+		return scheme, host, urlPath, query, nil, err
 	}
 
 	u, err := url.Parse(s)
@@ -103,19 +104,35 @@ func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url
 }
 
 // parseS3AccessPointURL parses an S3 Access Point URL (s3://arn:...).
-func parseS3AccessPointURL(s string) (scheme, host, urlPath string, err error) {
+func parseS3AccessPointURL(s string) (scheme, host, urlPath string, query url.Values, err error) {
 	const prefix = "s3://"
 	if !strings.HasPrefix(strings.ToLower(s), prefix) {
-		return "", "", "", fmt.Errorf("invalid s3 access point url: %s", s)
+		return "", "", "", nil, fmt.Errorf("invalid s3 access point url: %s", s)
 	}
 
 	arnWithPath := s[len(prefix):]
-	bucket, key, err := splitS3AccessPointARN(arnWithPath)
-	if err != nil {
-		return "", "", "", err
+
+	// Split off query string if present
+	var queryStr string
+	if idx := strings.IndexByte(arnWithPath, '?'); idx != -1 {
+		queryStr = arnWithPath[idx+1:]
+		arnWithPath = arnWithPath[:idx]
 	}
 
-	return "s3", bucket, CleanReplicaURLPath(key), nil
+	bucket, key, err := splitS3AccessPointARN(arnWithPath)
+	if err != nil {
+		return "", "", "", nil, err
+	}
+
+	// Parse query string if present
+	if queryStr != "" {
+		query, err = url.ParseQuery(queryStr)
+		if err != nil {
+			return "", "", "", nil, fmt.Errorf("parse query string: %w", err)
+		}
+	}
+
+	return "s3", bucket, CleanReplicaURLPath(key), query, nil
 }
 
 // splitS3AccessPointARN splits an S3 Access Point ARN into bucket and key components.
