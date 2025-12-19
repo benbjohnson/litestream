@@ -33,6 +33,7 @@ go build -o bin/litestream-test ./cmd/litestream-test
 | test-s3-retention-small-db.sh | S3 retention 50MB | ~8min | ✅ Stable |
 | test-s3-retention-large-db.sh | S3 retention 1.5GB | ~20min | ✅ Stable |
 | test-s3-retention-comprehensive.sh | Full S3 retention suite | ~30min | ✅ Stable |
+| test-s3-access-point.sh | S3 Access Point ARN support | ~2min | ✅ Stable |
 
 ## Test Categories
 
@@ -201,6 +202,26 @@ Tests upgrade with very large databases and long-running scenarios.
 ### S3 & Retention Tests
 
 For detailed S3 retention testing documentation, see [S3-RETENTION-TESTING.md](../S3-RETENTION-TESTING.md).
+
+#### test-s3-access-point.sh
+Tests S3 Access Point ARN support (Issue #923). Verifies that Access Point ARNs work automatically without manual endpoint configuration.
+
+```bash
+export LITESTREAM_S3_ACCESS_POINT_ARN='arn:aws:s3:us-east-2:123456789012:accesspoint/my-access-point'
+./cmd/litestream-test/scripts/test-s3-access-point.sh
+```
+
+**Tests:**
+- Replication to S3 Access Point using ARN
+- Automatic endpoint resolution (UseARNRegion)
+- Restore from Access Point ARN
+- Data integrity verification
+
+**Environment Variables:**
+- `LITESTREAM_S3_ACCESS_POINT_ARN` - Full ARN of the S3 Access Point (required)
+- `LITESTREAM_S3_REGION` - AWS region (optional, extracted from ARN)
+- `LITESTREAM_S3_PREFIX` - Path prefix in bucket (optional)
+- AWS credentials via standard methods (env vars, credentials file, IAM role)
 
 #### test-s3-retention-cleanup.sh
 Basic S3 LTX retention cleanup testing.
