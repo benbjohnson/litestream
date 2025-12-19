@@ -27,6 +27,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "modernc.org/sqlite"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/s3"
 )
@@ -94,8 +96,12 @@ func run(ctx context.Context) error {
 		}
 	}()
 
-	// 8. Use the underlying *sql.DB for normal operations
-	sqlDB := db.SQLDB()
+	// 8. Open your app's SQLite connection for normal operations
+	sqlDB, err := openAppDB(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("open app db: %w", err)
+	}
+	defer sqlDB.Close()
 	if err := initSchema(ctx, sqlDB); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
@@ -151,7 +157,7 @@ func restoreIfNotExists(ctx context.Context, client *s3.ReplicaClient, dbPath st
 	// Attempt restore
 	if err := replica.Restore(ctx, opt); err != nil {
 		// If no backup exists, that's OK - we'll create a fresh database
-		if errors.Is(err, litestream.ErrNoSnapshots) {
+		if errors.Is(err, litestream.ErrTxNotAvailable) || errors.Is(err, litestream.ErrNoSnapshots) {
 			log.Println("No backup found in S3, will create new database")
 			return nil
 		}
@@ -160,6 +166,22 @@ func restoreIfNotExists(ctx context.Context, client *s3.ReplicaClient, dbPath st
 
 	log.Println("Database restored from S3")
 	return nil
+}
+
+func openAppDB(ctx context.Context, path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = wal;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {

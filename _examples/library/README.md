@@ -54,8 +54,11 @@ This example:
 
 ```go
 import (
+    "context"
+    "database/sql"
     "github.com/benbjohnson/litestream"
     "github.com/benbjohnson/litestream/file"  // or s3, gs, abs, etc.
+    _ "modernc.org/sqlite"
 )
 
 // 1. Create database wrapper
@@ -69,6 +72,7 @@ client := file.NewReplicaClient("/path/to/replica")
 // 3. Attach replica to database
 replica := litestream.NewReplicaWithClient(db, client)
 db.Replica = replica
+client.Replica = replica // file backend only; preserves ownership/permissions
 
 // 4. Create compaction levels (L0 required, plus at least one more)
 levels := litestream.CompactionLevels{
@@ -83,8 +87,11 @@ store := litestream.NewStore([]*litestream.DB{db}, levels)
 if err := store.Open(ctx); err != nil { ... }
 defer store.Close(context.Background())
 
-// 7. Use db.SQLDB() for normal database operations
-sqlDB := db.SQLDB()
+// 7. Open your app's SQLite connection for normal database operations
+sqlDB, err := sql.Open("sqlite", "/path/to/db.sqlite")
+if err != nil { ... }
+if _, err := sqlDB.ExecContext(ctx, `PRAGMA journal_mode = wal;`); err != nil { ... }
+if _, err := sqlDB.ExecContext(ctx, `PRAGMA busy_timeout = 5000;`); err != nil { ... }
 ```
 
 ## Restore Pattern
@@ -99,7 +106,7 @@ opt.OutputPath = "/path/to/restored.db"
 // opt.Timestamp = time.Now().Add(-1 * time.Hour)
 
 if err := replica.Restore(ctx, opt); err != nil {
-    if errors.Is(err, litestream.ErrNoSnapshots) {
+    if errors.Is(err, litestream.ErrTxNotAvailable) || errors.Is(err, litestream.ErrNoSnapshots) {
         // No backup available, create fresh database
     }
     return err

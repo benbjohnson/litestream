@@ -16,6 +16,8 @@ import (
 	"syscall"
 	"time"
 
+	_ "modernc.org/sqlite"
+
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 )
@@ -40,6 +42,7 @@ func run(ctx context.Context) error {
 	// 3. Create a replica and attach it to the database
 	replica := litestream.NewReplicaWithClient(db, client)
 	db.Replica = replica
+	client.Replica = replica
 
 	// 4. Create compaction levels (L0 is required, plus at least one more level)
 	levels := litestream.CompactionLevels{
@@ -60,8 +63,12 @@ func run(ctx context.Context) error {
 		}
 	}()
 
-	// 7. Use the underlying *sql.DB for normal database operations
-	sqlDB := db.SQLDB()
+	// 7. Open your app's SQLite connection for normal database operations
+	sqlDB, err := openAppDB(ctx, dbPath)
+	if err != nil {
+		return fmt.Errorf("open app db: %w", err)
+	}
+	defer sqlDB.Close()
 	if err := initSchema(ctx, sqlDB); err != nil {
 		return fmt.Errorf("init schema: %w", err)
 	}
@@ -89,6 +96,22 @@ func run(ctx context.Context) error {
 			return nil
 		}
 	}
+}
+
+func openAppDB(ctx context.Context, path string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = wal;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000;`); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return db, nil
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {
