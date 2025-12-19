@@ -449,6 +449,38 @@ func NewOSSReplicaClient(tb testing.TB) *oss.ReplicaClient {
 	return c
 }
 
+// NewS3Leaser returns a new S3 leaser for integration testing.
+func NewS3Leaser(tb testing.TB) *s3.Leaser {
+	tb.Helper()
+
+	l := s3.NewLeaser()
+	l.AccessKeyID = *s3AccessKeyID
+	l.SecretAccessKey = *s3SecretAccessKey
+	l.Region = *s3Region
+	l.Bucket = *s3Bucket
+	l.Path = path.Join(*s3Path, "leases", fmt.Sprintf("%016x", rand.Uint64()))
+	l.Endpoint = *s3Endpoint
+	l.ForcePathStyle = *s3ForcePathStyle
+	l.SkipVerify = *s3SkipVerify
+	return l
+}
+
+// MustDeleteAllLeases deletes all lease objects for a leaser.
+func MustDeleteAllLeases(tb testing.TB, l litestream.Leaser) {
+	tb.Helper()
+
+	epochs, err := l.Epochs(context.Background())
+	if err != nil {
+		tb.Fatalf("cannot list lease epochs for deletion: %s", err)
+	}
+
+	for _, epoch := range epochs {
+		if err := l.DeleteLease(context.Background(), epoch); err != nil {
+			tb.Fatalf("cannot delete lease (epoch=%d): %s", epoch, err)
+		}
+	}
+}
+
 // MustDeleteAll deletes all objects under the client's path.
 func MustDeleteAll(tb testing.TB, c litestream.ReplicaClient) {
 	tb.Helper()
