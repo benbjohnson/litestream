@@ -129,6 +129,27 @@ go test -v -tags=integration ./tests/integration/... -run=TestRapidCheckpoints
 
 # 1GB boundary test
 go test -v -tags=integration ./tests/integration/... -run=Test1GBBoundary
+
+# S3 lease failover test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeaseFailover
+
+# S3 lease single-writer test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeaseSingleWriter
+
+# S3 lease pause/resume failover test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeasePauseLeader
+
+# S3 lease renewal partition test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeaseRenewalPartition
+
+# S3 lease clock skew test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeaseClockSkew
+
+# S3 lease rapid restart churn test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeaseRapidRestart
+
+# S3 lease stress churn test (requires Docker)
+go test -v -tags=integration ./tests/integration/... -run=TestS3LeaseStressChurn
 ```
 
 ### Short Mode
@@ -150,6 +171,15 @@ Core functionality tests that run in seconds to minutes:
 - `TestFreshStart` - Starting replication before database exists
 - `TestDatabaseIntegrity` - Complex schema and data integrity
 - `TestDatabaseDeletion` - Source database deletion during replication
+
+### S3 Leader Election Tests
+
+- `TestS3LeaseFailover` - MinIO-backed lease failover with crash recovery
+- `TestS3LeaseSingleWriter` - Concurrent writers, single lease epoch enforcement
+- `TestS3LeasePauseLeader` - Leader pause/resume with lease takeover
+- `TestS3LeaseRenewalPartition` - Lease renewal during S3 outage proxy
+- `TestS3LeaseClockSkew` - Lease validity skew delaying failover
+- `TestS3LeaseRapidRestart` - Rapid leader restart churn with monotonic epochs
 
 ### Concurrent Tests
 
