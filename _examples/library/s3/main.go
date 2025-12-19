@@ -74,18 +74,27 @@ func run(ctx context.Context) error {
 	replica := litestream.NewReplicaWithClient(db, client)
 	db.Replica = replica
 
-	// 5. Open database (starts background replication)
-	if err := db.Open(); err != nil {
-		return fmt.Errorf("open database: %w", err)
+	// 5. Create compaction levels (L0 is required, plus at least one more level)
+	levels := litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: 10 * time.Second},
+	}
+
+	// 6. Create a Store to manage the database and background compaction
+	store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+	// 7. Open store (opens all DBs and starts background monitors)
+	if err := store.Open(ctx); err != nil {
+		return fmt.Errorf("open store: %w", err)
 	}
 	defer func() {
-		log.Println("Closing database...")
-		if err := db.Close(context.Background()); err != nil {
-			log.Printf("close database: %v", err)
+		log.Println("Closing store...")
+		if err := store.Close(context.Background()); err != nil {
+			log.Printf("close store: %v", err)
 		}
 	}()
 
-	// 6. Use the underlying *sql.DB for normal operations
+	// 8. Use the underlying *sql.DB for normal operations
 	sqlDB := db.SQLDB()
 	if err := initSchema(ctx, sqlDB); err != nil {
 		return fmt.Errorf("init schema: %w", err)

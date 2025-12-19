@@ -70,11 +70,20 @@ client := file.NewReplicaClient("/path/to/replica")
 replica := litestream.NewReplicaWithClient(db, client)
 db.Replica = replica
 
-// 4. Open (starts background replication)
-if err := db.Open(); err != nil { ... }
-defer db.Close(context.Background())
+// 4. Create compaction levels (L0 required, plus at least one more)
+levels := litestream.CompactionLevels{
+    {Level: 0},
+    {Level: 1, Interval: 10 * time.Second},
+}
 
-// 5. Use db.SQLDB() for normal database operations
+// 5. Create Store to manage DB and background compaction
+store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+// 6. Open Store (opens all DBs, starts background monitors)
+if err := store.Open(ctx); err != nil { ... }
+defer store.Close(context.Background())
+
+// 7. Use db.SQLDB() for normal database operations
 sqlDB := db.SQLDB()
 ```
 
@@ -109,6 +118,14 @@ if err := replica.Restore(ctx, opt); err != nil {
 - `webdav` - WebDAV servers
 
 ## Key Configuration Options
+
+### Store Settings
+
+```go
+store.SnapshotInterval  = 24 * time.Hour  // How often to create snapshots
+store.SnapshotRetention = 24 * time.Hour  // How long to keep snapshots
+store.L0Retention       = 5 * time.Minute // How long to keep L0 files after compaction
+```
 
 ### DB Settings
 
