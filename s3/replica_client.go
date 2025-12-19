@@ -485,7 +485,6 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	metadata := map[string]string{
 		MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
 	}
-
 	out, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
 		Bucket:   aws.String(c.Bucket),
 		Key:      aws.String(key),

@@ -9,13 +9,14 @@ import (
 // DefaultLeaseTimeout is the default duration a lease is held before expiring.
 const DefaultLeaseTimeout = 30 * time.Second
 
-// LeaseRetryInterval is the interval between lease acquisition attempts when
-// an existing lease is held by another instance.
-const LeaseRetryInterval = 1 * time.Second
-
 // Leaser represents a client for a distributed leasing service.
 // It uses epoch-based leader election where each leadership change increments
 // the epoch, providing a fencing token to prevent split-brain scenarios.
+//
+// Leases are not zero-downtime: a graceful shutdown should ReleaseLease for
+// immediate takeover, otherwise a standby must wait for the lease to expire.
+// Leases are intended to be scoped globally across all databases managed by a
+// single process.
 type Leaser interface {
 	// Type returns the name of the implementation (e.g. "s3").
 	Type() string

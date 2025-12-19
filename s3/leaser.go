@@ -53,8 +53,9 @@ type Leaser struct {
 	SecretAccessKey string
 
 	// S3 bucket information
-	Region         string
-	Bucket         string
+	Region string
+	Bucket string
+	// Path is the lease prefix in the bucket (global across DBs).
 	Path           string
 	Endpoint       string
 	ForcePathStyle bool
@@ -65,6 +66,7 @@ type Leaser struct {
 func NewLeaser() *Leaser {
 	return &Leaser{
 		LeaseTimeout: litestream.DefaultLeaseTimeout,
+		Owner:        defaultOwner(),
 		logger:       slog.Default().WithGroup("s3-leaser"),
 	}
 }
@@ -84,12 +86,23 @@ func (l *Leaser) Init(ctx context.Context) error {
 	if l.Bucket == "" {
 		return fmt.Errorf("s3 leaser: bucket name is required")
 	}
+	if l.Owner == "" {
+		l.Owner = defaultOwner()
+	}
+	if l.Path == "" {
+		l.Path = "leases"
+	} else {
+		l.Path = strings.Trim(l.Path, "/")
+		if l.Path == "" {
+			l.Path = "leases"
+		}
+	}
 
 	region := l.Region
 	if region == "" {
 		if l.Endpoint == "" {
 			var err error
-			if region, err = findBucketRegion(ctx, l.Bucket); err != nil {
+			if region, err = l.findBucketRegion(ctx, l.Bucket); err != nil {
 				return fmt.Errorf("s3 leaser: cannot lookup bucket region: %w", err)
 			}
 		} else {
@@ -97,27 +110,7 @@ func (l *Leaser) Init(ctx context.Context) error {
 		}
 	}
 
-	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
-	}
-
-	if l.SkipVerify {
-		httpClient.Transport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
-		}
-	}
+	httpClient := l.newHTTPClient()
 
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
@@ -143,9 +136,12 @@ func (l *Leaser) Init(ctx context.Context) error {
 		},
 	}
 
-	if l.Endpoint != "" {
+	if endpoint, disableHTTPS := l.endpointWithScheme(); endpoint != "" {
 		s3Opts = append(s3Opts, func(o *s3.Options) {
-			o.BaseEndpoint = aws.String(l.Endpoint)
+			o.BaseEndpoint = aws.String(endpoint)
+			if disableHTTPS {
+				o.EndpointOptions.DisableHTTPS = true
+			}
 			o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		})
 	}
@@ -213,8 +209,16 @@ func (l *Leaser) acquireLease(ctx context.Context, prevEpoch int64) (*litestream
 	if len(epochs) > 0 {
 		epoch = epochs[len(epochs)-1]
 
-		// Check current lease only if not renewing or epoch doesn't match
-		if prevEpoch == 0 || epoch != prevEpoch {
+		if prevEpoch != 0 && epoch == prevEpoch {
+			lease, err := l.fetchLease(ctx, epoch)
+			if os.IsNotExist(err) {
+				// Lease was reaped, continue to acquire
+			} else if err != nil {
+				return nil, fmt.Errorf("fetch lease (epoch %d): %w", epoch, err)
+			} else if !lease.Expired() && lease.Owner != "" && l.Owner != "" && lease.Owner != l.Owner {
+				return nil, fmt.Errorf("cannot renew lease: owner mismatch (have %q, lease owner %q)", l.Owner, lease.Owner)
+			}
+		} else {
 			if lease, err := l.fetchLease(ctx, epoch); os.IsNotExist(err) {
 				// Lease was reaped, continue to acquire
 			} else if err != nil {
@@ -259,6 +263,9 @@ func (l *Leaser) ReleaseLease(ctx context.Context, epoch int64) error {
 		return fmt.Errorf("fetch lease: %w", err)
 	} else if lease.Timeout <= 0 {
 		return nil // already released
+	}
+	if lease.Owner != "" && l.Owner != "" && lease.Owner != l.Owner {
+		return fmt.Errorf("release lease: owner mismatch (have %q, lease owner %q)", l.Owner, lease.Owner)
 	}
 
 	lease.Timeout = 0
@@ -326,6 +333,13 @@ func (l *Leaser) createLease(ctx context.Context, epoch int64) (*litestream.Leas
 		return nil, fmt.Errorf("put lease: %w", err)
 	}
 
+	modTime, err := l.leaseModTime(ctx, epoch)
+	if err != nil {
+		_ = l.DeleteLease(ctx, epoch)
+		return nil, fmt.Errorf("get lease modtime: %w", err)
+	}
+	lease.ModTime = modTime
+
 	return lease, nil
 }
 
@@ -353,6 +367,19 @@ func (l *Leaser) leaseKey(epoch int64) string {
 	return fmt.Sprintf("%s/%016x%s", l.Path, epoch, LockFileExt)
 }
 
+func (l *Leaser) leaseModTime(ctx context.Context, epoch int64) (time.Time, error) {
+	output, err := l.s3.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket: aws.String(l.Bucket),
+		Key:    aws.String(l.leaseKey(epoch)),
+	})
+	if isNotExists(err) {
+		return time.Time{}, os.ErrNotExist
+	} else if err != nil {
+		return time.Time{}, fmt.Errorf("head lease: %w", err)
+	}
+	return aws.ToTime(output.LastModified), nil
+}
+
 // isPreconditionFailed checks if the error is a 412 Precondition Failed response.
 func isPreconditionFailed(err smithy.APIError) bool {
 	code := err.ErrorCode()
@@ -361,15 +388,38 @@ func isPreconditionFailed(err smithy.APIError) bool {
 
 var lockFileRegex = regexp.MustCompile(`^[0-9a-f]{16}\.lock$`)
 
-// findBucketRegion looks up the AWS region for a bucket.
-func findBucketRegion(ctx context.Context, bucket string) (string, error) {
-	cfg, err := config.LoadDefaultConfig(ctx)
+func (l *Leaser) findBucketRegion(ctx context.Context, bucket string) (string, error) {
+	configOpts := []func(*config.LoadOptions) error{
+		config.WithHTTPClient(l.newHTTPClient()),
+	}
+
+	if l.AccessKeyID != "" && l.SecretAccessKey != "" {
+		configOpts = append(configOpts, config.WithCredentialsProvider(
+			credentials.NewStaticCredentialsProvider(l.AccessKeyID, l.SecretAccessKey, ""),
+		))
+	}
+
+	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
 	if err != nil {
-		return "", fmt.Errorf("cannot load aws config for region lookup: %w", err)
+		return "", fmt.Errorf("s3 leaser: cannot load aws config for region lookup: %w", err)
 	}
 	cfg.Region = DefaultRegion
 
-	client := s3.NewFromConfig(cfg)
+	s3Opts := []func(*s3.Options){
+		func(o *s3.Options) {
+			o.UsePathStyle = l.ForcePathStyle
+		},
+	}
+	if endpoint, disableHTTPS := l.endpointWithScheme(); endpoint != "" {
+		s3Opts = append(s3Opts, func(o *s3.Options) {
+			o.BaseEndpoint = aws.String(endpoint)
+			if disableHTTPS {
+				o.EndpointOptions.DisableHTTPS = true
+			}
+		})
+	}
+
+	client := s3.NewFromConfig(cfg, s3Opts...)
 
 	out, err := client.GetBucketLocation(ctx, &s3.GetBucketLocationInput{
 		Bucket: aws.String(bucket),
@@ -382,4 +432,49 @@ func findBucketRegion(ctx context.Context, bucket string) (string, error) {
 		return DefaultRegion, nil
 	}
 	return string(out.LocationConstraint), nil
+}
+
+func (l *Leaser) endpointWithScheme() (string, bool) {
+	if l.Endpoint == "" {
+		return "", false
+	}
+	endpoint := l.Endpoint
+	if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+		endpoint = "https://" + endpoint
+	}
+	return endpoint, strings.HasPrefix(endpoint, "http://")
+}
+
+func (l *Leaser) newHTTPClient() *http.Client {
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	if l.SkipVerify {
+		httpClient.Transport = &http.Transport{
+			Proxy: http.ProxyFromEnvironment,
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: 1 * time.Second,
+			TLSClientConfig: &tls.Config{
+				InsecureSkipVerify: true,
+			},
+		}
+	}
+
+	return httpClient
+}
+
+func defaultOwner() string {
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
+	return fmt.Sprintf("%s:%d", host, os.Getpid())
 }
