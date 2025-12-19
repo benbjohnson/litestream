@@ -121,6 +121,7 @@ func (r *Replica) Stop(hard bool) (err error) {
 			err = e
 		}
 	}
+
 	return err
 }
 
@@ -180,7 +181,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
-	if _, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f); err != nil {
+	if _, err := r.WriteLTXFile(ctx, level, minTXID, maxTXID, f); err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
 	r.Logger().Debug("ltx file uploaded", "filename", filename, "minTXID", minTXID, "maxTXID", maxTXID)
@@ -190,6 +191,21 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
 
 	return nil
+}
+
+// WriteLTXFile writes an LTX file to the replica.
+func (r *Replica) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (*ltx.FileInfo, error) {
+	return r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, rd)
+}
+
+// DeleteLTXFiles deletes LTX files from the replica.
+func (r *Replica) DeleteLTXFiles(ctx context.Context, files []*ltx.FileInfo) error {
+	return r.Client.DeleteLTXFiles(ctx, files)
+}
+
+// DeleteAll removes all replica data.
+func (r *Replica) DeleteAll(ctx context.Context) error {
+	return r.Client.DeleteAll(ctx)
 }
 
 // calcPos returns the last position saved to the replica for level 0.

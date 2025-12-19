@@ -62,6 +62,10 @@ func TestLeaser_AcquireLease_Fresh(t *testing.T) {
 			w.Header().Set("ETag", `"abc123"`)
 			w.WriteHeader(http.StatusOK)
 
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, ".lock"):
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+
 		default:
 			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
 			w.WriteHeader(http.StatusBadRequest)
@@ -77,6 +81,9 @@ func TestLeaser_AcquireLease_Fresh(t *testing.T) {
 	l.ForcePathStyle = true
 	l.AccessKeyID = "test-key"
 	l.SecretAccessKey = "test-secret"
+	l.Owner = "my-instance"
+	l.Owner = "my-instance"
+	l.Owner = "my-instance"
 	l.Owner = "test-owner"
 
 	ctx := context.Background()
@@ -152,6 +159,7 @@ func TestLeaser_AcquireLease_ExistingActive(t *testing.T) {
 	l.ForcePathStyle = true
 	l.AccessKeyID = "test-key"
 	l.SecretAccessKey = "test-secret"
+	l.Owner = "my-instance"
 
 	ctx := context.Background()
 	_, err := l.AcquireLease(ctx)
@@ -205,6 +213,10 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 			w.Header().Set("ETag", `"abc123"`)
 			w.WriteHeader(http.StatusOK)
 
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, ".lock"):
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+
 		case r.Method == http.MethodDelete:
 			// Background reaping of old lease
 			w.WriteHeader(http.StatusNoContent)
@@ -224,6 +236,7 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 	l.ForcePathStyle = true
 	l.AccessKeyID = "test-key"
 	l.SecretAccessKey = "test-secret"
+	l.Owner = "my-instance"
 
 	ctx := context.Background()
 	lease, err := l.AcquireLease(ctx)
@@ -311,6 +324,12 @@ func TestLeaser_RenewLease(t *testing.T) {
 	var putPath string
 	var deleteReceived atomic.Bool
 
+	existingLease := &litestream.Lease{
+		Epoch:   5,
+		Timeout: 30 * time.Second,
+		Owner:   "my-instance",
+	}
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && strings.Contains(r.URL.RawQuery, "list-type=2"):
@@ -332,6 +351,17 @@ func TestLeaser_RenewLease(t *testing.T) {
 			w.Header().Set("ETag", `"abc123"`)
 			w.WriteHeader(http.StatusOK)
 
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, ".lock"):
+			body, _ := json.Marshal(existingLease)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, ".lock"):
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+
 		case r.Method == http.MethodDelete:
 			deleteReceived.Store(true)
 			w.WriteHeader(http.StatusNoContent)
@@ -351,12 +381,7 @@ func TestLeaser_RenewLease(t *testing.T) {
 	l.ForcePathStyle = true
 	l.AccessKeyID = "test-key"
 	l.SecretAccessKey = "test-secret"
-
-	existingLease := &litestream.Lease{
-		Epoch:   5,
-		Timeout: 30 * time.Second,
-		Owner:   "my-instance",
-	}
+	l.Owner = "my-instance"
 
 	ctx := context.Background()
 	newLease, err := l.RenewLease(ctx, existingLease)
@@ -416,6 +441,7 @@ func TestLeaser_ReleaseLease(t *testing.T) {
 	l.ForcePathStyle = true
 	l.AccessKeyID = "test-key"
 	l.SecretAccessKey = "test-secret"
+	l.Owner = "my-instance"
 
 	ctx := context.Background()
 	err := l.ReleaseLease(ctx, 3)
@@ -468,11 +494,55 @@ func TestLeaser_ReleaseLease_AlreadyReleased(t *testing.T) {
 	l.ForcePathStyle = true
 	l.AccessKeyID = "test-key"
 	l.SecretAccessKey = "test-secret"
+	l.Owner = "my-instance"
 
 	ctx := context.Background()
 	err := l.ReleaseLease(ctx, 3)
 	if err != nil {
 		t.Fatalf("ReleaseLease() error: %v", err)
+	}
+}
+
+func TestLeaser_ReleaseLease_OwnerMismatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.Contains(r.URL.Path, ".lock"):
+			activeLease := &litestream.Lease{
+				Epoch:   3,
+				Timeout: 30 * time.Second,
+				Owner:   "other-instance",
+			}
+			body, _ := json.Marshal(activeLease)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(body)
+
+		case r.Method == http.MethodPut:
+			t.Error("should not PUT when owner mismatches")
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusBadRequest)
+		}
+	}))
+	defer server.Close()
+
+	l := NewLeaser()
+	l.Bucket = "test-bucket"
+	l.Path = "leases"
+	l.Region = "us-east-1"
+	l.Endpoint = server.URL
+	l.ForcePathStyle = true
+	l.AccessKeyID = "test-key"
+	l.SecretAccessKey = "test-secret"
+	l.Owner = "my-instance"
+
+	ctx := context.Background()
+	err := l.ReleaseLease(ctx, 3)
+	if err == nil {
+		t.Fatal("ReleaseLease() expected owner mismatch error")
 	}
 }
 
@@ -645,6 +715,10 @@ func TestLeaser_ConcurrentAcquire(t *testing.T) {
 			w.Header().Set("Last-Modified", time.Now().Format(http.TimeFormat))
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write(body)
+
+		case r.Method == http.MethodHead && strings.Contains(r.URL.Path, ".lock"):
+			w.Header().Set("Last-Modified", time.Now().UTC().Format(http.TimeFormat))
+			w.WriteHeader(http.StatusOK)
 
 		default:
 			w.WriteHeader(http.StatusOK)
