@@ -127,7 +127,11 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Wait for signal to stop program.
 		select {
 		case err = <-c.execCh:
-			slog.Info("subprocess exited, litestream shutting down")
+			if c.cmd != nil {
+				slog.Info("subprocess exited, litestream shutting down")
+			} else {
+				slog.Info("replication complete, litestream shutting down")
+			}
 		case sig := <-signalCh:
 			slog.Info("signal received, litestream shutting down")
 
