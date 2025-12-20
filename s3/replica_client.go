@@ -306,32 +306,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Useful for debugging S3-compatible providers (signing issues, request/response bodies).
 	// Supports comma-separated values: signing,request,retries
 	// Values: signing, request, request-with-body, response, response-with-body, retries, all
-	if v := os.Getenv("LITESTREAM_S3_DEBUG"); v != "" {
-		var logMode aws.ClientLogMode
-		for _, mode := range strings.Split(v, ",") {
-			switch strings.ToLower(strings.TrimSpace(mode)) {
-			case "signing":
-				logMode |= aws.LogSigning
-			case "request":
-				logMode |= aws.LogRequest
-			case "request-with-body":
-				logMode |= aws.LogRequestWithBody
-			case "response":
-				logMode |= aws.LogResponse
-			case "response-with-body":
-				logMode |= aws.LogResponseWithBody
-			case "retries":
-				logMode |= aws.LogRetries
-			case "all":
-				logMode |= aws.LogSigning | aws.LogRequest | aws.LogRequestWithBody |
-					aws.LogResponse | aws.LogResponseWithBody | aws.LogRetries
-			default:
-				c.logger.Warn("unknown LITESTREAM_S3_DEBUG value, expected: signing, request, request-with-body, response, response-with-body, retries, all", "value", mode)
-			}
-		}
-		if logMode != 0 {
-			configOpts = append(configOpts, config.WithClientLogMode(logMode))
-		}
+	if logMode := parseS3DebugEnv(); logMode != 0 {
+		configOpts = append(configOpts, config.WithClientLogMode(logMode))
 	}
 
 	// Load AWS configuration
@@ -1167,4 +1143,37 @@ func deleteOutputError(out *s3.DeleteObjectsOutput) error {
 		fmt.Fprintf(&b, "\n%s: %s", aws.ToString(err.Key), aws.ToString(err.Message))
 	}
 	return errors.New(b.String())
+}
+
+// parseS3DebugEnv parses the LITESTREAM_S3_DEBUG environment variable and returns
+// the corresponding AWS SDK ClientLogMode. Supports comma-separated values.
+func parseS3DebugEnv() aws.ClientLogMode {
+	v := os.Getenv("LITESTREAM_S3_DEBUG")
+	if v == "" {
+		return 0
+	}
+
+	var logMode aws.ClientLogMode
+	for _, mode := range strings.Split(v, ",") {
+		switch strings.ToLower(strings.TrimSpace(mode)) {
+		case "signing":
+			logMode |= aws.LogSigning
+		case "request":
+			logMode |= aws.LogRequest
+		case "request-with-body":
+			logMode |= aws.LogRequestWithBody
+		case "response":
+			logMode |= aws.LogResponse
+		case "response-with-body":
+			logMode |= aws.LogResponseWithBody
+		case "retries":
+			logMode |= aws.LogRetries
+		case "all":
+			logMode |= aws.LogSigning | aws.LogRequest | aws.LogRequestWithBody |
+				aws.LogResponse | aws.LogResponseWithBody | aws.LogRetries
+		default:
+			slog.Warn("unknown LITESTREAM_S3_DEBUG value, expected: signing, request, request-with-body, response, response-with-body, retries, all", "value", mode)
+		}
+	}
+	return logMode
 }

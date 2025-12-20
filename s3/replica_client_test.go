@@ -1079,6 +1079,96 @@ func TestReplicaClient_AccessPointARN(t *testing.T) {
 	})
 }
 
+func TestReplicaClient_S3DebugEnvVar(t *testing.T) {
+	tests := []struct {
+		name        string
+		envValue    string
+		wantLogMode aws.ClientLogMode
+		wantWarning bool
+	}{
+		{
+			name:        "Empty",
+			envValue:    "",
+			wantLogMode: 0,
+		},
+		{
+			name:        "Signing",
+			envValue:    "signing",
+			wantLogMode: aws.LogSigning,
+		},
+		{
+			name:        "Request",
+			envValue:    "request",
+			wantLogMode: aws.LogRequest,
+		},
+		{
+			name:        "RequestWithBody",
+			envValue:    "request-with-body",
+			wantLogMode: aws.LogRequestWithBody,
+		},
+		{
+			name:        "Response",
+			envValue:    "response",
+			wantLogMode: aws.LogResponse,
+		},
+		{
+			name:        "ResponseWithBody",
+			envValue:    "response-with-body",
+			wantLogMode: aws.LogResponseWithBody,
+		},
+		{
+			name:        "Retries",
+			envValue:    "retries",
+			wantLogMode: aws.LogRetries,
+		},
+		{
+			name:        "All",
+			envValue:    "all",
+			wantLogMode: aws.LogSigning | aws.LogRequest | aws.LogRequestWithBody | aws.LogResponse | aws.LogResponseWithBody | aws.LogRetries,
+		},
+		{
+			name:        "CommaSeparated",
+			envValue:    "signing,request,retries",
+			wantLogMode: aws.LogSigning | aws.LogRequest | aws.LogRetries,
+		},
+		{
+			name:        "CommaSeparatedWithSpaces",
+			envValue:    "signing, request, retries",
+			wantLogMode: aws.LogSigning | aws.LogRequest | aws.LogRetries,
+		},
+		{
+			name:        "CaseInsensitive",
+			envValue:    "SIGNING,REQUEST",
+			wantLogMode: aws.LogSigning | aws.LogRequest,
+		},
+		{
+			name:        "Unknown",
+			envValue:    "invalid",
+			wantLogMode: 0,
+			wantWarning: true,
+		},
+		{
+			name:        "MixedValidAndInvalid",
+			envValue:    "signing,invalid,request",
+			wantLogMode: aws.LogSigning | aws.LogRequest,
+			wantWarning: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envValue != "" {
+				t.Setenv("LITESTREAM_S3_DEBUG", tt.envValue)
+			}
+
+			gotLogMode := parseS3DebugEnv()
+			if gotLogMode != tt.wantLogMode {
+				t.Errorf("parseS3DebugEnv() = %v, want %v", gotLogMode, tt.wantLogMode)
+			}
+		})
+	}
+}
+
 func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	// Test that non-Tigris endpoints do NOT send the X-Tigris-Consistent header.
 	// The Tigris case (header sent) requires an actual Tigris endpoint and is
