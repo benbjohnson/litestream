@@ -304,27 +304,30 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Enable AWS SDK debug logging if LITESTREAM_S3_DEBUG is set.
 	// Useful for debugging S3-compatible providers (signing issues, request/response bodies).
+	// Supports comma-separated values: signing,request,retries
 	// Values: signing, request, request-with-body, response, response-with-body, retries, all
 	if v := os.Getenv("LITESTREAM_S3_DEBUG"); v != "" {
 		var logMode aws.ClientLogMode
-		switch strings.ToLower(v) {
-		case "signing":
-			logMode = aws.LogSigning
-		case "request":
-			logMode = aws.LogRequest
-		case "request-with-body":
-			logMode = aws.LogRequestWithBody
-		case "response":
-			logMode = aws.LogResponse
-		case "response-with-body":
-			logMode = aws.LogResponseWithBody
-		case "retries":
-			logMode = aws.LogRetries
-		case "all":
-			logMode = aws.LogSigning | aws.LogRequest | aws.LogRequestWithBody |
-				aws.LogResponse | aws.LogResponseWithBody | aws.LogRetries
-		default:
-			c.logger.Warn("unknown LITESTREAM_S3_DEBUG value, expected: signing, request, request-with-body, response, response-with-body, retries, all", "value", v)
+		for _, mode := range strings.Split(v, ",") {
+			switch strings.ToLower(strings.TrimSpace(mode)) {
+			case "signing":
+				logMode |= aws.LogSigning
+			case "request":
+				logMode |= aws.LogRequest
+			case "request-with-body":
+				logMode |= aws.LogRequestWithBody
+			case "response":
+				logMode |= aws.LogResponse
+			case "response-with-body":
+				logMode |= aws.LogResponseWithBody
+			case "retries":
+				logMode |= aws.LogRetries
+			case "all":
+				logMode |= aws.LogSigning | aws.LogRequest | aws.LogRequestWithBody |
+					aws.LogResponse | aws.LogResponseWithBody | aws.LogRetries
+			default:
+				c.logger.Warn("unknown LITESTREAM_S3_DEBUG value, expected: signing, request, request-with-body, response, response-with-body, retries, all", "value", mode)
+			}
 		}
 		if logMode != 0 {
 			configOpts = append(configOpts, config.WithClientLogMode(logMode))
