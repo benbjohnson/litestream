@@ -8,6 +8,83 @@ import (
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 )
 
+func TestReplicateCommand_ParseFlags_OnceFlags(t *testing.T) {
+	t.Run("OnceFlag", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-once", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("OnceWithForceSnapshot", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-once", "-force-snapshot", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("OnceWithEnforceRetention", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-once", "-enforce-retention", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("OnceWithAllFlags", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-once", "-force-snapshot", "-enforce-retention", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ForceSnapshotRequiresOnce", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-force-snapshot", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err == nil {
+			t.Fatal("expected error when -force-snapshot is used without -once")
+		}
+		expectedError := "cannot specify -force-snapshot flag without -once"
+		if !strings.Contains(err.Error(), expectedError) {
+			t.Errorf("expected error message to contain %q, got %q", expectedError, err.Error())
+		}
+	})
+
+	t.Run("EnforceRetentionRequiresOnce", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-enforce-retention", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err == nil {
+			t.Fatal("expected error when -enforce-retention is used without -once")
+		}
+		expectedError := "cannot specify -enforce-retention flag without -once"
+		if !strings.Contains(err.Error(), expectedError) {
+			t.Errorf("expected error message to contain %q, got %q", expectedError, err.Error())
+		}
+	})
+
+	t.Run("OnceAndExecMutuallyExclusive", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-once", "-exec", "echo test", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err == nil {
+			t.Fatal("expected error when -once and -exec are both specified")
+		}
+		expectedError := "cannot specify -once flag with -exec"
+		if !strings.Contains(err.Error(), expectedError) {
+			t.Errorf("expected error message to contain %q, got %q", expectedError, err.Error())
+		}
+	})
+}
+
 func TestReplicateCommand_ParseFlags_FlagPositioning(t *testing.T) {
 	t.Run("ExecFlagAfterPositionalArgs", func(t *testing.T) {
 		cmd := main.NewReplicateCommand()
