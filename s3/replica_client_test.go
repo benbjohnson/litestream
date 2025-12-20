@@ -1157,9 +1157,8 @@ func TestReplicaClient_S3DebugEnvVar(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.envValue != "" {
-				t.Setenv("LITESTREAM_S3_DEBUG", tt.envValue)
-			}
+			// Always set env var (even to empty) to isolate tests from caller's environment
+			t.Setenv("LITESTREAM_S3_DEBUG", tt.envValue)
 
 			gotLogMode := parseS3DebugEnv()
 			if gotLogMode != tt.wantLogMode {
