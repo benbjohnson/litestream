@@ -51,6 +51,8 @@ var (
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
 	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
+	ErrInvalidHeartbeatURL             = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
+	ErrInvalidHeartbeatInterval        = errors.New("heartbeat interval must be at least 1 minute")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
@@ -212,6 +214,10 @@ type Config struct {
 	L0Retention              *time.Duration `yaml:"l0-retention"`
 	L0RetentionCheckInterval *time.Duration `yaml:"l0-retention-check-interval"`
 
+	// Heartbeat settings (global defaults)
+	HeartbeatURL      string         `yaml:"heartbeat-url"`
+	HeartbeatInterval *time.Duration `yaml:"heartbeat-interval"`
+
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
 
@@ -256,6 +262,22 @@ func (c *Config) propagateGlobalSettings() {
 		}
 		for _, rc := range dbc.Replicas {
 			rc.SetDefaults(&c.ReplicaSettings)
+		}
+	}
+}
+
+// propagateHeartbeatSettings copies global heartbeat settings to DBConfigs
+// that don't have their own heartbeat settings.
+func (c *Config) propagateHeartbeatSettings() {
+	for _, dbc := range c.DBs {
+		// If per-db heartbeat URL is not set, use global
+		if dbc.HeartbeatURL == nil && c.HeartbeatURL != "" {
+			url := c.HeartbeatURL
+			dbc.HeartbeatURL = &url
+		}
+		// If per-db heartbeat interval is not set, use global
+		if dbc.HeartbeatInterval == nil && c.HeartbeatInterval != nil {
+			dbc.HeartbeatInterval = c.HeartbeatInterval
 		}
 	}
 }
@@ -331,6 +353,22 @@ func (c *Config) Validate() error {
 		}
 	}
 
+	// Validate global heartbeat settings
+	if c.HeartbeatURL != "" && !isValidHeartbeatURL(c.HeartbeatURL) {
+		return &ConfigValidationError{
+			Err:   ErrInvalidHeartbeatURL,
+			Field: "heartbeat-url",
+			Value: c.HeartbeatURL,
+		}
+	}
+	if c.HeartbeatInterval != nil && *c.HeartbeatInterval < litestream.MinHeartbeatInterval {
+		return &ConfigValidationError{
+			Err:   ErrInvalidHeartbeatInterval,
+			Field: "heartbeat-interval",
+			Value: *c.HeartbeatInterval,
+		}
+	}
+
 	// Validate compaction level intervals
 	for i, level := range c.Levels {
 		if level.Interval <= 0 {
@@ -381,6 +419,22 @@ func (c *Config) Validate() error {
 					Field: fmt.Sprintf("dbs[%s].replicas[%d].sync-interval", dbIdentifier, i),
 					Value: *replica.SyncInterval,
 				}
+			}
+		}
+
+		// Validate per-db heartbeat settings
+		if db.HeartbeatURL != nil && *db.HeartbeatURL != "" && !isValidHeartbeatURL(*db.HeartbeatURL) {
+			return &ConfigValidationError{
+				Err:   ErrInvalidHeartbeatURL,
+				Field: fmt.Sprintf("dbs[%s].heartbeat-url", dbIdentifier),
+				Value: *db.HeartbeatURL,
+			}
+		}
+		if db.HeartbeatInterval != nil && *db.HeartbeatInterval < litestream.MinHeartbeatInterval {
+			return &ConfigValidationError{
+				Err:   ErrInvalidHeartbeatInterval,
+				Field: fmt.Sprintf("dbs[%s].heartbeat-interval", dbIdentifier),
+				Value: *db.HeartbeatInterval,
 			}
 		}
 	}
@@ -496,8 +550,9 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		}
 	}
 
-	// Propage settings from global config to replica configs.
+	// Propagate settings from global config to individual configs.
 	config.propagateGlobalSettings()
+	config.propagateHeartbeatSettings()
 
 	// Validate configuration
 	if err := config.Validate(); err != nil {
@@ -538,6 +593,10 @@ type DBConfig struct {
 
 	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
 
+	// Heartbeat settings (per-db override, pointer to distinguish "not set" from "empty/disable")
+	HeartbeatURL      *string        `yaml:"heartbeat-url"`
+	HeartbeatInterval *time.Duration `yaml:"heartbeat-interval"`
+
 	Replica  *ReplicaConfig   `yaml:"replica"`
 	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
 }
@@ -575,6 +634,15 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.TruncatePageN != nil {
 		db.TruncatePageN = *dbc.TruncatePageN
+	}
+
+	// Configure heartbeat if URL is specified.
+	if dbc.HeartbeatURL != nil && *dbc.HeartbeatURL != "" {
+		interval := litestream.DefaultHeartbeatInterval
+		if dbc.HeartbeatInterval != nil {
+			interval = *dbc.HeartbeatInterval
+		}
+		db.Heartbeat = litestream.NewHeartbeatClient(*dbc.HeartbeatURL, interval)
 	}
 
 	// Instantiate and attach replica.
@@ -1790,6 +1858,11 @@ func DefaultConfigPath() string {
 func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
 	return fs.String("config", "", "config path"),
 		fs.Bool("no-expand-env", false, "do not expand env vars in config")
+}
+
+// isValidHeartbeatURL checks if the URL is a valid HTTP or HTTPS URL.
+func isValidHeartbeatURL(u string) bool {
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
 }
 
 // expand returns an absolute path for s.

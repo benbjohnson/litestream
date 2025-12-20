@@ -44,6 +44,10 @@ const (
 	// enforced. This interval should be more frequent than the L1 compaction
 	// interval so that VFS read replicas have time to observe new files.
 	DefaultL0RetentionCheckInterval = 15 * time.Second
+
+	// DefaultHeartbeatCheckInterval controls how frequently the heartbeat
+	// monitor checks if heartbeat pings should be sent.
+	DefaultHeartbeatCheckInterval = 15 * time.Second
 )
 
 // Store represents the top-level container for databases.
@@ -75,6 +79,12 @@ type Store struct {
 	// Shutdown sync retry settings.
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
+
+	// How often to check if heartbeat pings should be sent.
+	HeartbeatCheckInterval time.Duration
+
+	// heartbeatMonitorRunning tracks whether the heartbeat monitor goroutine is running.
+	heartbeatMonitorRunning bool
 }
 
 func NewStore(dbs []*DB, levels CompactionLevels) *Store {
@@ -89,6 +99,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		CompactionMonitorEnabled: true,
 		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
+		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
 	}
 
 	for _, db := range dbs {
@@ -142,6 +153,9 @@ func (s *Store) Open(ctx context.Context) error {
 			s.monitorL0Retention(s.ctx)
 		}()
 	}
+
+	// Start heartbeat monitor if any database has heartbeat configured.
+	s.startHeartbeatMonitorIfNeeded()
 
 	return nil
 }
@@ -215,6 +229,10 @@ func (s *Store) AddDB(db *DB) error {
 
 	s.dbs = append(s.dbs, db)
 	s.mu.Unlock()
+
+	// Start heartbeat monitor if this DB has heartbeat config and monitor isn't running.
+	s.startHeartbeatMonitorIfNeeded()
+
 	return nil
 }
 
@@ -376,6 +394,103 @@ LOOP:
 			}
 		}
 	}
+}
+
+// startHeartbeatMonitorIfNeeded starts the heartbeat monitor goroutine if:
+// - HeartbeatCheckInterval is configured
+// - At least one database has heartbeat configured
+// - The monitor is not already running
+func (s *Store) startHeartbeatMonitorIfNeeded() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if s.heartbeatMonitorRunning {
+		return
+	}
+	if s.HeartbeatCheckInterval <= 0 {
+		return
+	}
+	if !s.hasHeartbeatConfigLocked() {
+		return
+	}
+
+	s.heartbeatMonitorRunning = true
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.monitorHeartbeats(s.ctx)
+	}()
+}
+
+// hasHeartbeatConfigLocked returns true if any database has heartbeat configured.
+// Must be called with s.mu held.
+func (s *Store) hasHeartbeatConfigLocked() bool {
+	for _, db := range s.dbs {
+		if db.Heartbeat != nil && db.Heartbeat.URL != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// monitorHeartbeats periodically checks if heartbeat pings should be sent
+// for databases with heartbeat configuration.
+func (s *Store) monitorHeartbeats(ctx context.Context) {
+	slog.Info("starting heartbeat monitor", "interval", s.HeartbeatCheckInterval)
+
+	ticker := time.NewTicker(s.HeartbeatCheckInterval)
+	defer ticker.Stop()
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-ticker.C:
+		}
+
+		for _, db := range s.DBs() {
+			s.sendHeartbeatIfNeeded(ctx, db)
+		}
+	}
+}
+
+// sendHeartbeatIfNeeded sends a heartbeat ping for a database if:
+// - Heartbeat is configured
+// - Enough time has passed since the last ping attempt
+// - A successful sync has occurred since the last ping
+func (s *Store) sendHeartbeatIfNeeded(ctx context.Context, db *DB) {
+	hb := db.Heartbeat
+	if hb == nil || hb.URL == "" {
+		return
+	}
+
+	if !hb.ShouldPing() {
+		return
+	}
+
+	// Check if there has been a successful sync since the last ping.
+	lastSync := db.LastSuccessfulSyncAt()
+	if lastSync.IsZero() {
+		return
+	}
+
+	lastPing := hb.LastPingAt()
+	if !lastPing.IsZero() && lastSync.Before(lastPing) {
+		return
+	}
+
+	// Record ping attempt time before making the request to ensure we respect
+	// the configured interval even if the ping fails. This prevents rapid
+	// retries that could overwhelm the endpoint.
+	hb.RecordPing()
+
+	if err := hb.Ping(ctx); err != nil {
+		slog.Error("heartbeat ping failed", "db", db.Path(), "url", hb.URL, "error", err)
+		return
+	}
+
+	slog.Debug("heartbeat ping sent", "db", db.Path(), "url", hb.URL)
 }
 
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
