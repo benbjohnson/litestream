@@ -1017,6 +1017,68 @@ func TestParseHost(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_AccessPointARN(t *testing.T) {
+	t.Run("ARNAsBucketName", func(t *testing.T) {
+		arn := "arn:aws:s3:us-east-2:123456789012:accesspoint/my-access-point"
+
+		c := NewReplicaClient()
+		c.Bucket = arn
+		c.Region = "us-east-2"
+		c.AccessKeyID = "test-access-key"
+		c.SecretAccessKey = "test-secret-key"
+
+		if c.Bucket != arn {
+			t.Errorf("expected bucket to be ARN, got %s", c.Bucket)
+		}
+		if c.Region != "us-east-2" {
+			t.Errorf("expected region to be us-east-2, got %s", c.Region)
+		}
+	})
+
+	t.Run("ARNWithPath", func(t *testing.T) {
+		arn := "arn:aws:s3:us-west-2:111122223333:accesspoint/prod-access-point"
+
+		c := NewReplicaClient()
+		c.Bucket = arn
+		c.Path = "my-db/replica"
+		c.Region = "us-west-2"
+
+		if c.Bucket != arn {
+			t.Errorf("expected bucket to be ARN, got %s", c.Bucket)
+		}
+		if c.Path != "my-db/replica" {
+			t.Errorf("expected path to be my-db/replica, got %s", c.Path)
+		}
+	})
+
+	t.Run("ARNRejectsPathStyle", func(t *testing.T) {
+		arn := "arn:aws:s3:us-east-1:123456789012:accesspoint/test-ap"
+
+		c := NewReplicaClient()
+		c.Bucket = arn
+		c.Path = "replica"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://localhost:9000"
+		c.ForcePathStyle = true
+		c.AccessKeyID = "test-access-key"
+		c.SecretAccessKey = "test-secret-key"
+
+		ctx := context.Background()
+		if err := c.Init(ctx); err != nil {
+			t.Fatalf("Init() with ARN bucket should not fail: %v", err)
+		}
+
+		data := mustLTX(t)
+		_, err := c.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data))
+		if err == nil {
+			t.Fatal("expected error when using path-style with ARN bucket")
+		}
+		if !strings.Contains(err.Error(), "Path-style addressing cannot be used with ARN") {
+			t.Errorf("expected path-style ARN error, got: %v", err)
+		}
+	})
+}
+
 func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	// Test that non-Tigris endpoints do NOT send the X-Tigris-Consistent header.
 	// The Tigris case (header sent) requires an actual Tigris endpoint and is

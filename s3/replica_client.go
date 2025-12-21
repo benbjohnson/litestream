@@ -312,6 +312,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	s3Opts := []func(*s3.Options){
 		func(o *s3.Options) {
 			o.UsePathStyle = c.ForcePathStyle
+			o.UseARNRegion = true
 			// Add User-Agent and optional middleware.
 			o.APIOptions = append(o.APIOptions, c.middlewareOption())
 		},
