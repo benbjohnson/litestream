@@ -1,4 +1,4 @@
-package library_test
+package litestream_test
 
 import (
 	"context"
