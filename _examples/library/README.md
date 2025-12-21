@@ -9,6 +9,12 @@ The Litestream library API is not considered stable and may change between
 versions. The CLI interface is more stable for production use. Use the library
 API at your own risk, and pin to specific versions.
 
+Note (macOS): macOS uses per-process locks for SQLite, not per-handle locks.
+If you open the same database with two different SQLite driver implementations
+in the same process and close one of them, you can hit locking issues. Prefer
+using the same driver for your app and Litestream (these examples use
+`modernc.org/sqlite`).
+
 ## Examples
 
 ### Basic (File Backend)
