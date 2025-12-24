@@ -107,6 +107,10 @@ jobs:
 
       - run: go install ./cmd/litestream
 
+      - run: go build -o /dev/null ./_examples/library/basic
+      - run: go build -o /dev/null ./_examples/library/s3
+      - run: go test -v ./_examples/library
+
       - run: go test -v .
       - run: go test -v ./internal
       - run: go test -v ./abs
