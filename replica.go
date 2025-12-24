@@ -300,6 +300,8 @@ func (r *Replica) deleteBeforeTXID(ctx context.Context, level int, txID ltx.TXID
 */
 
 // monitor runs in a separate goroutine and continuously replicates the DB.
+// Implements exponential backoff on repeated sync errors to prevent log spam
+// and reduce load when persistent errors occur. See issue #927.
 func (r *Replica) monitor(ctx context.Context) {
 	ticker := time.NewTicker(r.SyncInterval)
 	defer ticker.Stop()
@@ -309,6 +311,10 @@ func (r *Replica) monitor(ctx context.Context) {
 	close(ch)
 	var notify <-chan struct{} = ch
 
+	var backoff time.Duration
+	var lastLogTime time.Time
+	var consecutiveErrs int
+
 	for initial := true; ; initial = false {
 		// Enforce a minimum time between synchronization.
 		if !initial {
@@ -316,6 +322,15 @@ func (r *Replica) monitor(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+			}
+		}
+
+		// If in backoff mode, wait additional time before retrying.
+		if backoff > 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(backoff):
 			}
 		}
 
@@ -333,10 +348,36 @@ func (r *Replica) monitor(ctx context.Context) {
 		if err := r.Sync(ctx); err != nil {
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-				r.Logger().Error("monitor error", "error", err)
+				consecutiveErrs++
+
+				// Exponential backoff: SyncInterval -> 2x -> 4x -> ... -> max
+				if backoff == 0 {
+					backoff = r.SyncInterval
+				} else {
+					backoff *= 2
+					if backoff > DefaultSyncBackoffMax {
+						backoff = DefaultSyncBackoffMax
+					}
+				}
+
+				// Log with rate limiting to avoid log spam during persistent errors.
+				if time.Since(lastLogTime) >= SyncErrorLogInterval {
+					r.Logger().Error("monitor error",
+						"error", err,
+						"consecutive_errors", consecutiveErrs,
+						"backoff", backoff)
+					lastLogTime = time.Now()
+				}
 			}
 			continue
 		}
+
+		// Success - reset backoff and error counter.
+		if consecutiveErrs > 0 {
+			r.Logger().Info("replica sync recovered", "previous_errors", consecutiveErrs)
+		}
+		backoff = 0
+		consecutiveErrs = 0
 	}
 }
 
