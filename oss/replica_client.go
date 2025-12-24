@@ -163,13 +163,16 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
-// When useMetadata is true, fetches accurate timestamps from OSS metadata via HeadObject.
-// When false, uses fast LastModified timestamps from LIST operation.
+// Always uses fast LastModified timestamps from LIST operation to avoid O(N) HeadObject
+// calls which can cause restore hangs with many LTX files (see issue #930). LastModified
+// is sufficiently accurate for timestamp-based restore since files are uploaded immediately
+// after creation (typically within milliseconds of LTX header timestamp).
+// The useMetadata parameter is accepted for interface compatibility but ignored.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newFileIterator(ctx, c, level, seek, useMetadata), nil
+	return newFileIterator(ctx, c, level, seek), nil
 }
 
 // OpenLTXFile returns a reader for an LTX file.
@@ -375,12 +378,11 @@ func (c *ReplicaClient) ltxPath(level int, filename string) string {
 
 // fileIterator represents an iterator over LTX files in OSS.
 type fileIterator struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	client      *ReplicaClient
-	level       int
-	seek        ltx.TXID
-	useMetadata bool // When true, fetch accurate timestamps from metadata
+	ctx    context.Context
+	cancel context.CancelFunc
+	client *ReplicaClient
+	level  int
+	seek   ltx.TXID
 
 	paginator   *oss.ListObjectsV2Paginator
 	page        *oss.ListObjectsV2Result
@@ -392,16 +394,15 @@ type fileIterator struct {
 	info   *ltx.FileInfo
 }
 
-func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
+func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
 	itr := &fileIterator{
-		ctx:         ctx,
-		cancel:      cancel,
-		client:      client,
-		level:       level,
-		seek:        seek,
-		useMetadata: useMetadata,
+		ctx:    ctx,
+		cancel: cancel,
+		client: client,
+		level:  level,
+		seek:   seek,
 	}
 
 	return itr
@@ -486,38 +487,14 @@ func (itr *fileIterator) Next() bool {
 			// Set file info
 			info.Size = obj.Size
 
-			// Use fast LastModified timestamp by default
-			var createdAt time.Time
+			// Use LastModified timestamp from LIST operation.
+			// This is sufficiently accurate for timestamp-based restore and avoids
+			// O(N) HeadObject API calls that cause hangs with large backup histories.
 			if obj.LastModified != nil {
-				createdAt = obj.LastModified.UTC()
+				info.CreatedAt = obj.LastModified.UTC()
 			} else {
-				createdAt = time.Now().UTC()
+				info.CreatedAt = time.Now().UTC()
 			}
-
-			// Only fetch accurate timestamp from metadata when requested (timestamp-based restore)
-			if itr.useMetadata {
-				head, err := itr.client.client.HeadObject(itr.ctx, &oss.HeadObjectRequest{
-					Bucket: oss.Ptr(itr.client.Bucket),
-					Key:    obj.Key,
-				})
-				if err != nil {
-					itr.err = fmt.Errorf("fetch object metadata: %w", err)
-					return false
-				}
-
-				if head.Metadata != nil {
-					if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
-						if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-							createdAt = parsed
-						} else {
-							itr.err = fmt.Errorf("parse timestamp from metadata: %w", err)
-							return false
-						}
-					}
-				}
-			}
-
-			info.CreatedAt = createdAt
 			itr.info = info
 			return true
 		}

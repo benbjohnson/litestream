@@ -418,13 +418,16 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 }
 
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
-// When useMetadata is true, fetches accurate timestamps from S3 metadata via HeadObject.
-// When false, uses fast LastModified timestamps from LIST operation.
+// Always uses fast LastModified timestamps from LIST operation to avoid O(N) HeadObject
+// calls which can cause restore hangs with many LTX files (see issue #930). LastModified
+// is sufficiently accurate for timestamp-based restore since files are uploaded immediately
+// after creation (typically within milliseconds of LTX header timestamp).
+// The useMetadata parameter is accepted for interface compatibility but ignored.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newFileIterator(ctx, c, level, seek, useMetadata), nil
+	return newFileIterator(ctx, c, level, seek), nil
 }
 
 // OpenLTXFile returns a reader for an LTX file
@@ -881,12 +884,11 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 // fileIterator represents an iterator over LTX files in S3.
 type fileIterator struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	client      *ReplicaClient
-	level       int
-	seek        ltx.TXID
-	useMetadata bool // When true, fetch accurate timestamps from metadata
+	ctx    context.Context
+	cancel context.CancelFunc
+	client *ReplicaClient
+	level  int
+	seek   ltx.TXID
 
 	paginator *s3.ListObjectsV2Paginator
 	page      *s3.ListObjectsV2Output
@@ -897,16 +899,15 @@ type fileIterator struct {
 	info   *ltx.FileInfo
 }
 
-func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
+func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
 	itr := &fileIterator{
-		ctx:         ctx,
-		cancel:      cancel,
-		client:      client,
-		level:       level,
-		seek:        seek,
-		useMetadata: useMetadata,
+		ctx:    ctx,
+		cancel: cancel,
+		client: client,
+		level:  level,
+		seek:   seek,
 	}
 
 	// Create paginator for listing objects with level prefix
@@ -981,33 +982,11 @@ func (itr *fileIterator) Next() bool {
 			// Set file info
 			info.Size = aws.ToInt64(obj.Size)
 
-			// Use fast LastModified timestamp by default
-			createdAt := aws.ToTime(obj.LastModified).UTC()
-
-			// Only fetch accurate timestamp from metadata when requested (timestamp-based restore)
-			if itr.useMetadata {
-				head, err := itr.client.s3.HeadObject(itr.ctx, &s3.HeadObjectInput{
-					Bucket: aws.String(itr.client.Bucket),
-					Key:    obj.Key,
-				})
-				if err != nil {
-					itr.err = fmt.Errorf("fetch object metadata: %w", err)
-					return false
-				}
-
-				if head.Metadata != nil {
-					if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
-						if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-							createdAt = parsed
-						} else {
-							itr.err = fmt.Errorf("parse timestamp from metadata: %w", err)
-							return false
-						}
-					}
-				}
-			}
-
-			info.CreatedAt = createdAt
+			// Use LastModified from LIST operation for timestamp.
+			// This avoids O(N) HeadObject calls which caused restore hangs (issue #930).
+			// LastModified is when the file was uploaded to S3, which is typically
+			// within milliseconds of the LTX header timestamp for newly uploaded files.
+			info.CreatedAt = aws.ToTime(obj.LastModified).UTC()
 			itr.info = info
 			return true
 		}
