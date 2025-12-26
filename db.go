@@ -1379,7 +1379,9 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Release write lock before exiting.
-	if err := tx.Rollback(); err != nil {
+	// Use rollback() helper for consistency with releaseReadLock() and the
+	// defer above. See issue #934.
+	if err := rollback(tx); err != nil {
 		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
 	}
 
