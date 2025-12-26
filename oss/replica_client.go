@@ -18,6 +18,8 @@ import (
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -39,6 +41,10 @@ const MaxKeys = 1000
 
 // DefaultRegion is the region used if one is not specified.
 const DefaultRegion = "cn-hangzhou"
+
+// DefaultMetadataConcurrency is the default number of concurrent HeadObject calls
+// for fetching accurate timestamps during timestamp-based restore.
+const DefaultMetadataConcurrency = 50
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
@@ -62,6 +68,11 @@ type ReplicaClient struct {
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
 	Concurrency int   // Number of concurrent parts to upload (default: 3)
+
+	// MetadataConcurrency controls parallel HeadObject calls for timestamp-based restore.
+	// Higher values improve restore speed for large backup histories.
+	// Default: 50
+	MetadataConcurrency int
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -163,16 +174,15 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 }
 
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
-// Always uses fast LastModified timestamps from LIST operation to avoid O(N) HeadObject
-// calls which can cause restore hangs with many LTX files (see issue #930). LastModified
-// is sufficiently accurate for timestamp-based restore since files are uploaded immediately
-// after creation (typically within milliseconds of LTX header timestamp).
-// The useMetadata parameter is accepted for interface compatibility but ignored.
+// When useMetadata is true, fetches accurate timestamps from OSS metadata via HeadObject.
+// This uses parallel batched requests (controlled by MetadataConcurrency) to avoid hangs
+// with large backup histories (see issue #930).
+// When false, uses fast LastModified timestamps from LIST operation.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newFileIterator(ctx, c, level, seek), nil
+	return newFileIterator(ctx, c, level, seek, useMetadata), nil
 }
 
 // OpenLTXFile returns a reader for an LTX file.
@@ -384,6 +394,9 @@ type fileIterator struct {
 	level  int
 	seek   ltx.TXID
 
+	useMetadata   bool                 // When true, fetch accurate timestamps from metadata
+	metadataCache map[string]time.Time // key -> timestamp cache for batch fetches
+
 	paginator   *oss.ListObjectsV2Paginator
 	page        *oss.ListObjectsV2Result
 	pageIndex   int
@@ -394,18 +407,83 @@ type fileIterator struct {
 	info   *ltx.FileInfo
 }
 
-func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID) *fileIterator {
+func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
 	itr := &fileIterator{
-		ctx:    ctx,
-		cancel: cancel,
-		client: client,
-		level:  level,
-		seek:   seek,
+		ctx:           ctx,
+		cancel:        cancel,
+		client:        client,
+		level:         level,
+		seek:          seek,
+		useMetadata:   useMetadata,
+		metadataCache: make(map[string]time.Time),
 	}
 
 	return itr
+}
+
+// fetchMetadataBatch fetches timestamps from OSS metadata for a batch of keys in parallel.
+func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// Determine concurrency limit
+	concurrency := itr.client.MetadataConcurrency
+	if concurrency <= 0 {
+		concurrency = DefaultMetadataConcurrency
+	}
+
+	// Pre-allocate results map to avoid lock contention during writes
+	results := make(map[string]time.Time, len(keys))
+	var mu sync.Mutex
+
+	// Use x/sync/semaphore for precise concurrency control with context support
+	sem := semaphore.NewWeighted(int64(concurrency))
+	g, ctx := errgroup.WithContext(itr.ctx)
+
+	for _, key := range keys {
+		key := key // capture for goroutine
+
+		g.Go(func() error {
+			// Acquire semaphore slot (blocking with context cancellation)
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return err // context cancelled
+			}
+			defer sem.Release(1)
+
+			head, err := itr.client.client.HeadObject(ctx, &oss.HeadObjectRequest{
+				Bucket: oss.Ptr(itr.client.Bucket),
+				Key:    oss.Ptr(key),
+			})
+			if err != nil {
+				// Non-fatal: file might not have metadata, use LastModified
+				return nil
+			}
+
+			if head.Metadata != nil {
+				if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
+					if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+						mu.Lock()
+						results[key] = parsed
+						mu.Unlock()
+					}
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Merge results into cache
+	for k, v := range results {
+		itr.metadataCache[k] = v
+	}
+	return nil
 }
 
 // initPaginator initializes the paginator lazily.
@@ -454,6 +532,22 @@ func (itr *fileIterator) Next() bool {
 				return false
 			}
 			itr.pageIndex = 0
+
+			// Batch fetch metadata for the entire page when useMetadata is true.
+			// This uses parallel HeadObject calls controlled by MetadataConcurrency
+			// to avoid the O(N) sequential calls that caused restore hangs (issue #930).
+			if itr.useMetadata && len(itr.page.Contents) > 0 {
+				keys := make([]string, 0, len(itr.page.Contents))
+				for _, obj := range itr.page.Contents {
+					if obj.Key != nil {
+						keys = append(keys, *obj.Key)
+					}
+				}
+				if err := itr.fetchMetadataBatch(keys); err != nil {
+					itr.err = err
+					return false
+				}
+			}
 		}
 
 		// Process current object
@@ -466,7 +560,8 @@ func (itr *fileIterator) Next() bool {
 			}
 
 			// Extract file info from key
-			key := path.Base(*obj.Key)
+			fullKey := *obj.Key
+			key := path.Base(fullKey)
 			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
 				continue // Skip non-LTX files
@@ -487,14 +582,24 @@ func (itr *fileIterator) Next() bool {
 			// Set file info
 			info.Size = obj.Size
 
-			// Use LastModified timestamp from LIST operation.
-			// This is sufficiently accurate for timestamp-based restore and avoids
-			// O(N) HeadObject API calls that cause hangs with large backup histories.
-			if obj.LastModified != nil {
-				info.CreatedAt = obj.LastModified.UTC()
+			// Use cached metadata timestamp if available (from batch fetch),
+			// otherwise fallback to LastModified from LIST operation.
+			if itr.useMetadata {
+				if ts, ok := itr.metadataCache[fullKey]; ok {
+					info.CreatedAt = ts
+				} else if obj.LastModified != nil {
+					info.CreatedAt = obj.LastModified.UTC()
+				} else {
+					info.CreatedAt = time.Now().UTC()
+				}
 			} else {
-				info.CreatedAt = time.Now().UTC()
+				if obj.LastModified != nil {
+					info.CreatedAt = obj.LastModified.UTC()
+				} else {
+					info.CreatedAt = time.Now().UTC()
+				}
 			}
+
 			itr.info = info
 			return true
 		}
