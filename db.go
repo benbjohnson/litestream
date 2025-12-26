@@ -1607,7 +1607,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
-	info, err := db.Replica.Client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	info, err := db.Replica.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)
 	}
@@ -1636,7 +1636,7 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
+	info, err := db.Replica.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
 		return info, err
 	}
@@ -1684,7 +1684,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	}
 
 	// Remove all files marked for deletion from both remote and local storage.
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := db.Replica.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -1774,7 +1774,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := db.Replica.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
@@ -1820,7 +1820,7 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 	}
 
 	// Remove all files marked for deletion from both remote and local storage.
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if err := db.Replica.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
 	}
 
