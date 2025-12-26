@@ -628,3 +628,67 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 		t.Errorf("expected reason='wal header salt reset, snapshotting', got %q", info.reason)
 	}
 }
+
+// TestDB_releaseReadLock_DoubleRollback verifies that calling releaseReadLock()
+// after the read transaction has already been rolled back does not return an error.
+// This can happen during shutdown when concurrent checkpoint and close operations
+// both attempt to release the read lock.
+// Regression test for issue #934.
+func TestDB_releaseReadLock_DoubleRollback(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open SQL connection to create a WAL database
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync to initialize the database and acquire read lock
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify read transaction exists
+	if db.rtx == nil {
+		t.Fatal("expected read transaction to exist after Sync")
+	}
+
+	// First rollback - simulates what happens in execCheckpoint()
+	if err := db.rtx.Rollback(); err != nil {
+		t.Fatalf("first rollback failed: %v", err)
+	}
+
+	// Second call to releaseReadLock() - simulates what happens in Close()
+	// This should NOT return an error even though the transaction is already rolled back.
+	// Before the fix, this would return "sql: transaction has already been committed or rolled back"
+	if err := db.releaseReadLock(); err != nil {
+		t.Fatalf("releaseReadLock() returned error after double rollback: %v", err)
+	}
+
+	// Clean up - set rtx to nil since we manually rolled it back
+	db.rtx = nil
+
+	// Close should work without error
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatalf("Close() failed: %v", err)
+	}
+}
