@@ -71,6 +71,10 @@ type Store struct {
 
 	// If true, compaction is run in the background according to compaction levels.
 	CompactionMonitorEnabled bool
+
+	// Shutdown sync retry settings.
+	ShutdownSyncTimeout  time.Duration
+	ShutdownSyncInterval time.Duration
 }
 
 func NewStore(dbs []*DB, levels CompactionLevels) *Store {
@@ -83,10 +87,14 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		L0Retention:              DefaultL0Retention,
 		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
 		CompactionMonitorEnabled: true,
+		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
+		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
 	}
 
 	for _, db := range dbs {
 		db.L0Retention = s.L0Retention
+		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
+		db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -178,8 +186,10 @@ func (s *Store) AddDB(db *DB) error {
 	}
 	s.mu.Unlock()
 
-	// Apply store-wide retention settings before opening the database.
+	// Apply store-wide settings before opening the database.
 	db.L0Retention = s.L0Retention
+	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
+	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.
@@ -249,6 +259,28 @@ func (s *Store) SetL0Retention(d time.Duration) {
 	s.L0Retention = d
 	for _, db := range s.dbs {
 		db.L0Retention = d
+	}
+}
+
+// SetShutdownSyncTimeout updates the shutdown sync timeout and propagates it to
+// all managed databases.
+func (s *Store) SetShutdownSyncTimeout(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ShutdownSyncTimeout = d
+	for _, db := range s.dbs {
+		db.ShutdownSyncTimeout = d
+	}
+}
+
+// SetShutdownSyncInterval updates the shutdown sync interval and propagates it to
+// all managed databases.
+func (s *Store) SetShutdownSyncInterval(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ShutdownSyncInterval = d
+	for _, db := range s.dbs {
+		db.ShutdownSyncInterval = d
 	}
 }
 
