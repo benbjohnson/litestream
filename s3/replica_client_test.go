@@ -1220,3 +1220,441 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 		t.Fatal("timeout waiting for PUT request")
 	}
 }
+
+// TestReplicaClient_SSE_C_Validation tests SSE-C configuration validation
+func TestReplicaClient_SSE_C_Validation(t *testing.T) {
+	// Generate a valid 256-bit key (32 bytes)
+	validKey := base64.StdEncoding.EncodeToString([]byte("12345678901234567890123456789012"))
+
+	t.Run("ValidSSECKey", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "https://s3.example.com"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected no error for valid SSE-C key, got: %v", err)
+		}
+
+		// Verify algorithm was auto-set
+		if c.SSECustomerAlgorithm != "AES256" {
+			t.Errorf("expected algorithm to be AES256, got %q", c.SSECustomerAlgorithm)
+		}
+
+		// Verify MD5 was auto-computed
+		if c.SSECustomerKeyMD5 == "" {
+			t.Error("expected MD5 to be auto-computed")
+		}
+	})
+
+	t.Run("InvalidBase64Key", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "https://s3.example.com"
+		c.SSECustomerKey = "not-valid-base64!!!"
+
+		err := c.validateSSEConfig()
+		if err == nil {
+			t.Error("expected error for invalid base64 key")
+		}
+		if !strings.Contains(err.Error(), "valid base64") {
+			t.Errorf("expected base64 error, got: %v", err)
+		}
+	})
+
+	t.Run("WrongKeyLength", func(t *testing.T) {
+		// 16-byte key instead of 32-byte
+		shortKey := base64.StdEncoding.EncodeToString([]byte("1234567890123456"))
+
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "https://s3.example.com"
+		c.SSECustomerKey = shortKey
+
+		err := c.validateSSEConfig()
+		if err == nil {
+			t.Error("expected error for wrong key length")
+		}
+		if !strings.Contains(err.Error(), "256-bit") {
+			t.Errorf("expected key length error, got: %v", err)
+		}
+	})
+
+	t.Run("InvalidAlgorithm", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "https://s3.example.com"
+		c.SSECustomerKey = validKey
+		c.SSECustomerAlgorithm = "AES128" // Invalid
+
+		err := c.validateSSEConfig()
+		if err == nil {
+			t.Error("expected error for invalid algorithm")
+		}
+		if !strings.Contains(err.Error(), "AES256") {
+			t.Errorf("expected algorithm error, got: %v", err)
+		}
+	})
+
+	t.Run("MutualExclusivity", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.SSECustomerKey = validKey
+		c.SSEKMSKeyID = "arn:aws:kms:us-east-1:123456789:key/12345678-1234-1234-1234-123456789012"
+
+		err := c.validateSSEConfig()
+		if err == nil {
+			t.Error("expected error when both SSE-C and SSE-KMS are set")
+		}
+		if !strings.Contains(err.Error(), "mutually exclusive") {
+			t.Errorf("expected mutual exclusivity error, got: %v", err)
+		}
+	})
+
+	t.Run("HTTPEndpointBlockedExceptLocalhost", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://external-server.example.com"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err == nil {
+			t.Error("expected error for HTTP endpoint with SSE-C")
+		}
+		if !strings.Contains(err.Error(), "HTTPS") {
+			t.Errorf("expected HTTPS requirement error, got: %v", err)
+		}
+	})
+
+	t.Run("LocalhostHTTPAllowed", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://localhost:9000"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected localhost HTTP to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("127.0.0.1HTTPAllowed", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://127.0.0.1:9000"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected 127.0.0.1 HTTP to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("PrivateNetworkHTTPAllowed", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://192.168.1.100:9000"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected private network HTTP to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("PrivateNetwork172RangeHTTPAllowed", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://172.17.0.2:9000"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected 172.x private network HTTP to be allowed, got: %v", err)
+		}
+	})
+
+	t.Run("PrivateNetwork10RangeHTTPAllowed", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.Endpoint = "http://10.0.0.5:9000"
+		c.SSECustomerKey = validKey
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected 10.x private network HTTP to be allowed, got: %v", err)
+		}
+	})
+}
+
+// TestReplicaClient_SSE_KMS_Configuration tests SSE-KMS configuration
+func TestReplicaClient_SSE_KMS_Configuration(t *testing.T) {
+	t.Run("ValidKMSKeyID", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.SSEKMSKeyID = "arn:aws:kms:us-east-1:123456789:key/12345678-1234-1234-1234-123456789012"
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected no error for valid KMS key ID, got: %v", err)
+		}
+	})
+
+	t.Run("KMSKeyAlias", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Region = "us-east-1"
+		c.SSEKMSKeyID = "alias/my-key"
+
+		err := c.validateSSEConfig()
+		if err != nil {
+			t.Errorf("expected no error for KMS key alias, got: %v", err)
+		}
+	})
+}
+
+// TestReplicaClient_SSE_C_Headers tests that SSE-C headers are passed to S3 operations
+func TestReplicaClient_SSE_C_Headers(t *testing.T) {
+	validKey := base64.StdEncoding.EncodeToString([]byte("12345678901234567890123456789012"))
+	keyBytes, _ := base64.StdEncoding.DecodeString(validKey)
+	keyMD5Sum := md5.Sum(keyBytes)
+	expectedMD5 := base64.StdEncoding.EncodeToString(keyMD5Sum[:])
+
+	data := mustLTX(t)
+
+	t.Run("WriteLTXFile_SSEC", func(t *testing.T) {
+		headers := make(chan http.Header, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			_, _ = io.Copy(io.Discard, r.Body)
+
+			if r.Method == http.MethodPut {
+				select {
+				case headers <- r.Header.Clone():
+				default:
+				}
+				w.Header().Set("ETag", `"test-etag"`)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client := NewReplicaClient()
+		client.Bucket = "test-bucket"
+		client.Path = "replica"
+		client.Region = "us-east-1"
+		client.Endpoint = server.URL
+		client.ForcePathStyle = true
+		client.AccessKeyID = "test-access-key"
+		client.SecretAccessKey = "test-secret-key"
+		client.SSECustomerKey = validKey
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+
+		if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+			t.Fatalf("WriteLTXFile() error: %v", err)
+		}
+
+		select {
+		case hdr := <-headers:
+			if got := hdr.Get("x-amz-server-side-encryption-customer-algorithm"); got != "AES256" {
+				t.Errorf("SSE-C algorithm header = %q, want AES256", got)
+			}
+			if got := hdr.Get("x-amz-server-side-encryption-customer-key"); got != validKey {
+				t.Errorf("SSE-C key header = %q, want %q", got, validKey)
+			}
+			if got := hdr.Get("x-amz-server-side-encryption-customer-key-md5"); got != expectedMD5 {
+				t.Errorf("SSE-C key MD5 header = %q, want %q", got, expectedMD5)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for PUT request")
+		}
+	})
+
+	t.Run("OpenLTXFile_SSEC", func(t *testing.T) {
+		headers := make(chan http.Header, 1)
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				select {
+				case headers <- r.Header.Clone():
+				default:
+				}
+				w.Header().Set("Content-Length", "100")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte("test-data"))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client := NewReplicaClient()
+		client.Bucket = "test-bucket"
+		client.Path = "replica"
+		client.Region = "us-east-1"
+		client.Endpoint = server.URL
+		client.ForcePathStyle = true
+		client.AccessKeyID = "test-access-key"
+		client.SecretAccessKey = "test-secret-key"
+		client.SSECustomerKey = validKey
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+
+		rc, err := client.OpenLTXFile(ctx, 0, 2, 2, 0, 0)
+		if err != nil {
+			t.Fatalf("OpenLTXFile() error: %v", err)
+		}
+		rc.Close()
+
+		select {
+		case hdr := <-headers:
+			if got := hdr.Get("x-amz-server-side-encryption-customer-algorithm"); got != "AES256" {
+				t.Errorf("SSE-C algorithm header = %q, want AES256", got)
+			}
+			if got := hdr.Get("x-amz-server-side-encryption-customer-key"); got != validKey {
+				t.Errorf("SSE-C key header = %q, want %q", got, validKey)
+			}
+			if got := hdr.Get("x-amz-server-side-encryption-customer-key-md5"); got != expectedMD5 {
+				t.Errorf("SSE-C key MD5 header = %q, want %q", got, expectedMD5)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("timeout waiting for GET request")
+		}
+	})
+}
+
+// TestReplicaClient_SSE_KMS_Headers tests that SSE-KMS headers are passed to write operations
+func TestReplicaClient_SSE_KMS_Headers(t *testing.T) {
+	kmsKeyID := "arn:aws:kms:us-east-1:123456789:key/12345678-1234-1234-1234-123456789012"
+	data := mustLTX(t)
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		if r.Method == http.MethodPut {
+			select {
+			case headers <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+	client.SSEKMSKeyID = kmsKeyID
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-headers:
+		if got := hdr.Get("x-amz-server-side-encryption"); got != "aws:kms" {
+			t.Errorf("SSE-KMS encryption header = %q, want aws:kms", got)
+		}
+		if got := hdr.Get("x-amz-server-side-encryption-aws-kms-key-id"); got != kmsKeyID {
+			t.Errorf("SSE-KMS key ID header = %q, want %q", got, kmsKeyID)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for PUT request")
+	}
+}
+
+// TestReplicaClient_NoSSE_Headers tests that no SSE headers are sent when SSE is not configured
+func TestReplicaClient_NoSSE_Headers(t *testing.T) {
+	data := mustLTX(t)
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		if r.Method == http.MethodPut {
+			select {
+			case headers <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+	// No SSE configuration
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-headers:
+		if got := hdr.Get("x-amz-server-side-encryption-customer-algorithm"); got != "" {
+			t.Errorf("unexpected SSE-C algorithm header: %q", got)
+		}
+		if got := hdr.Get("x-amz-server-side-encryption-customer-key"); got != "" {
+			t.Errorf("unexpected SSE-C key header: %q", got)
+		}
+		if got := hdr.Get("x-amz-server-side-encryption"); got != "" {
+			t.Errorf("unexpected SSE-KMS header: %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for PUT request")
+	}
+}

@@ -96,6 +96,16 @@ type ReplicaClient struct {
 	// Higher values improve restore speed for large backup histories.
 	// Default: 50 (S3 can handle 5,500+ HEAD/s per prefix)
 	MetadataConcurrency int
+
+	// Server-Side Encryption - Customer Provided Keys (SSE-C)
+	// Works with all S3-compatible providers (AWS, MinIO, Exoscale, etc.)
+	SSECustomerAlgorithm string // Must be "AES256" if set
+	SSECustomerKey       string // Base64-encoded 256-bit (32 byte) encryption key
+	SSECustomerKeyMD5    string // Base64-encoded MD5 of key (auto-computed if not set)
+
+	// Server-Side Encryption - AWS KMS (SSE-KMS)
+	// Only works with AWS S3 (not S3-compatible providers)
+	SSEKMSKeyID string // KMS key ID, ARN, or alias
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -229,6 +239,30 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		client.RequireContentMD5 = requireMD5
 	}
 
+	// Parse SSE-C parameters from query string
+	if v := query.Get("sseCustomerAlgorithm"); v != "" {
+		client.SSECustomerAlgorithm = v
+	} else if v := query.Get("sse-customer-algorithm"); v != "" {
+		client.SSECustomerAlgorithm = v
+	}
+	if v := query.Get("sseCustomerKey"); v != "" {
+		client.SSECustomerKey = v
+	} else if v := query.Get("sse-customer-key"); v != "" {
+		client.SSECustomerKey = v
+	}
+	if v := query.Get("sseCustomerKeyMD5"); v != "" {
+		client.SSECustomerKeyMD5 = v
+	} else if v := query.Get("sse-customer-key-md5"); v != "" {
+		client.SSECustomerKeyMD5 = v
+	}
+
+	// Parse SSE-KMS parameters from query string
+	if v := query.Get("sseKmsKeyId"); v != "" {
+		client.SSEKMSKeyID = v
+	} else if v := query.Get("sse-kms-key-id"); v != "" {
+		client.SSEKMSKeyID = v
+	}
+
 	return client, nil
 }
 
@@ -249,6 +283,11 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Validate required configuration
 	if c.Bucket == "" {
 		return fmt.Errorf("s3: bucket name is required")
+	}
+
+	// Validate SSE configuration
+	if err := c.validateSSEConfig(); err != nil {
+		return err
 	}
 
 	// Look up region if not specified and no endpoint is used.
@@ -393,6 +432,63 @@ func (c *ReplicaClient) configureEndpoint(opts *[]func(*s3.Options)) {
 	}
 }
 
+// validateSSEConfig validates server-side encryption configuration.
+func (c *ReplicaClient) validateSSEConfig() error {
+	// Check mutual exclusivity: SSE-C and SSE-KMS cannot both be set
+	if c.SSECustomerKey != "" && c.SSEKMSKeyID != "" {
+		return fmt.Errorf("s3: cannot use both sse-customer-key and sse-kms-key-id; they are mutually exclusive")
+	}
+
+	// Validate SSE-C configuration
+	if c.SSECustomerKey != "" {
+		// Algorithm must be AES256 (or default to it)
+		if c.SSECustomerAlgorithm == "" {
+			c.SSECustomerAlgorithm = "AES256"
+		} else if c.SSECustomerAlgorithm != "AES256" {
+			return fmt.Errorf("s3: sse-customer-algorithm must be AES256, got %q", c.SSECustomerAlgorithm)
+		}
+
+		// Validate key is valid base64 and correct length (256 bits = 32 bytes)
+		keyBytes, err := base64.StdEncoding.DecodeString(c.SSECustomerKey)
+		if err != nil {
+			return fmt.Errorf("s3: sse-customer-key must be valid base64: %w", err)
+		}
+		if len(keyBytes) != 32 {
+			return fmt.Errorf("s3: sse-customer-key must be 256-bit (32 bytes) when decoded, got %d bytes", len(keyBytes))
+		}
+
+		// Auto-compute MD5 if not provided
+		if c.SSECustomerKeyMD5 == "" {
+			sum := md5.Sum(keyBytes)
+			c.SSECustomerKeyMD5 = base64.StdEncoding.EncodeToString(sum[:])
+		}
+
+		// SSE-C requires HTTPS (except for localhost/private networks for testing)
+		if c.Endpoint != "" {
+			endpoint := c.Endpoint
+			if !strings.HasPrefix(endpoint, "http://") && !strings.HasPrefix(endpoint, "https://") {
+				endpoint = "https://" + endpoint
+			}
+			if strings.HasPrefix(endpoint, "http://") {
+				u, err := url.Parse(endpoint)
+				if err == nil {
+					host := u.Hostname()
+					// Allow localhost by name
+					if host == "localhost" {
+						// OK - localhost is allowed
+					} else if ip := net.ParseIP(host); ip != nil && (ip.IsLoopback() || ip.IsPrivate()) {
+						// OK - loopback (127.x.x.x) or private RFC1918 ranges (10.x, 172.16-31.x, 192.168.x)
+					} else {
+						return fmt.Errorf("s3: sse-customer-key requires HTTPS endpoint (HTTP only allowed for localhost/private networks)")
+					}
+				}
+			}
+		}
+	}
+
+	return nil
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Build a config with credentials but no region
@@ -466,11 +562,22 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	// Build the key from the file info
 	filename := ltx.FormatFilename(minTXID, maxTXID)
 	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
-	out, err := c.s3.GetObject(ctx, &s3.GetObjectInput{
+
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
 		Key:    aws.String(key),
 		Range:  aws.String(rangeStr),
-	})
+	}
+
+	// Add SSE-C parameters if configured (required for reading SSE-C encrypted objects)
+	// Note: SSE-KMS does not require parameters on read - decryption is automatic
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
 	if err != nil {
 		if isNotExists(err) {
 			return nil, os.ErrNotExist
@@ -509,12 +616,27 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
 	}
 
-	out, err := c.uploader.Upload(ctx, &s3.PutObjectInput{
+	input := &s3.PutObjectInput{
 		Bucket:   aws.String(c.Bucket),
 		Key:      aws.String(key),
 		Body:     rc,
 		Metadata: metadata,
-	})
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	// Add SSE-KMS parameters if configured
+	if c.SSEKMSKeyID != "" {
+		input.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		input.SSEKMSKeyId = aws.String(c.SSEKMSKeyID)
+	}
+
+	out, err := c.uploader.Upload(ctx, input)
 	if err != nil {
 		return nil, fmt.Errorf("s3: upload to %s: %w", key, err)
 	}
@@ -974,10 +1096,20 @@ func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
 			}
 			defer sem.Release(1)
 
-			head, err := itr.client.s3.HeadObject(ctx, &s3.HeadObjectInput{
+			headInput := &s3.HeadObjectInput{
 				Bucket: aws.String(itr.client.Bucket),
 				Key:    aws.String(key),
-			})
+			}
+
+			// Add SSE-C parameters if configured (required for reading SSE-C encrypted objects)
+			// Note: SSE-KMS does not require parameters on HeadObject - access is automatic
+			if itr.client.SSECustomerKey != "" {
+				headInput.SSECustomerAlgorithm = aws.String(itr.client.SSECustomerAlgorithm)
+				headInput.SSECustomerKey = aws.String(itr.client.SSECustomerKey)
+				headInput.SSECustomerKeyMD5 = aws.String(itr.client.SSECustomerKeyMD5)
+			}
+
+			head, err := itr.client.s3.HeadObject(ctx, headInput)
 			if err != nil {
 				// Non-fatal: file might not have metadata, use LastModified
 				return nil
