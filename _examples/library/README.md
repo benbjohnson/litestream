@@ -9,11 +9,28 @@ The Litestream library API is not considered stable and may change between
 versions. The CLI interface is more stable for production use. Use the library
 API at your own risk, and pin to specific versions.
 
-Note (macOS): macOS uses per-process locks for SQLite, not per-handle locks.
-If you open the same database with two different SQLite driver implementations
-in the same process and close one of them, you can hit locking issues. Prefer
-using the same driver for your app and Litestream (these examples use
-`modernc.org/sqlite`).
+**Note (POSIX platforms):** All POSIX platforms (Linux, macOS, BSD, etc.) use
+per-process locks for SQLite, not per-handle locks. If you open the same
+database with two different SQLite driver implementations in the same process
+and close one of them, you can hit locking issues. You **must** use
+`modernc.org/sqlite` for your app since Litestream uses it internally.
+
+## Important Constraints
+
+When using Litestream as a library, be aware of these critical requirements:
+
+1. **Required Driver**: You must use `modernc.org/sqlite`. Litestream uses this
+   driver internally, and mixing drivers causes lock conflicts on POSIX systems.
+
+2. **Lifecycle Management**: You cannot call `litestream.DB.Close()` or
+   `Replica.Stop(true)` while your application still has open database
+   connections. Either close all your app's database connections first, or only
+   close Litestream when your process is shutting down.
+
+3. **PRAGMA Configuration**: Use DSN parameters (e.g.,
+   `?_pragma=busy_timeout(5000)`) instead of `PRAGMA` statements via
+   `ExecContext`. An `sql.DB` is a connection pool, and `ExecContext` only
+   applies the PRAGMA to one random connection from the pool.
 
 ## Examples
 
@@ -94,10 +111,10 @@ if err := store.Open(ctx); err != nil { ... }
 defer store.Close(context.Background())
 
 // 7. Open your app's SQLite connection for normal database operations
-sqlDB, err := sql.Open("sqlite", "/path/to/db.sqlite")
+// Use DSN params for PRAGMAs to ensure they apply to all connections in the pool
+dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", "/path/to/db.sqlite")
+sqlDB, err := sql.Open("sqlite", dsn)
 if err != nil { ... }
-if _, err := sqlDB.ExecContext(ctx, `PRAGMA journal_mode = wal;`); err != nil { ... }
-if _, err := sqlDB.ExecContext(ctx, `PRAGMA busy_timeout = 5000;`); err != nil { ... }
 ```
 
 ## Restore Pattern

@@ -168,20 +168,9 @@ func restoreIfNotExists(ctx context.Context, client *s3.ReplicaClient, dbPath st
 	return nil
 }
 
-func openAppDB(ctx context.Context, path string) (*sql.DB, error) {
-	db, err := sql.Open("sqlite", path)
-	if err != nil {
-		return nil, err
-	}
-	if _, err := db.ExecContext(ctx, `PRAGMA journal_mode = wal;`); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	if _, err := db.ExecContext(ctx, `PRAGMA busy_timeout = 5000;`); err != nil {
-		_ = db.Close()
-		return nil, err
-	}
-	return db, nil
+func openAppDB(_ context.Context, path string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", path)
+	return sql.Open("sqlite", dsn)
 }
 
 func initSchema(ctx context.Context, db *sql.DB) error {
