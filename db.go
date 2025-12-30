@@ -479,7 +479,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)",
+	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
 		db.path, db.BusyTimeout.Milliseconds())
 
 	if db.db, err = sql.Open("sqlite", dsn); err != nil {
@@ -514,11 +514,6 @@ func (db *DB) init(ctx context.Context) (err error) {
 		return err
 	} else if mode != "wal" {
 		return fmt.Errorf("enable wal failed, mode=%q", mode)
-	}
-
-	// Disable autocheckpoint for litestream's connection.
-	if _, err := db.db.ExecContext(ctx, `PRAGMA wal_autocheckpoint = 0;`); err != nil {
-		return fmt.Errorf("disable autocheckpoint: %w", err)
 	}
 
 	// Create a table to force writes to the WAL when empty.
