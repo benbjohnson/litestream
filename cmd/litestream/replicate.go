@@ -31,6 +31,11 @@ type ReplicateCommand struct {
 	cmd    *exec.Cmd  // subcommand
 	execCh chan error // subcommand error channel
 
+	// One-shot replication flags
+	once             bool // replicate once and exit
+	forceSnapshot    bool // force snapshot to all replicas
+	enforceRetention bool // enforce retention of old snapshots
+
 	Config Config
 
 	// MCP server
@@ -54,6 +59,9 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
 	restoreIfDBNotExists := fs.Bool("restore-if-db-not-exists", false, "restore from replica if database doesn't exist")
+	onceFlag := fs.Bool("once", false, "replicate once and exit")
+	forceSnapshotFlag := fs.Bool("force-snapshot", false, "force snapshot when replicating once")
+	enforceRetentionFlag := fs.Bool("enforce-retention", false, "enforce retention of old snapshots when replicating once")
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -120,6 +128,22 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		}
 	}
 
+	// Set one-shot replication flags and validate their usage.
+	c.once = *onceFlag
+	c.forceSnapshot = *forceSnapshotFlag
+	c.enforceRetention = *enforceRetentionFlag
+
+	// Validate flag combinations.
+	if c.once && c.Config.Exec != "" {
+		return fmt.Errorf("cannot specify -once flag with -exec")
+	}
+	if c.forceSnapshot && !c.once {
+		return fmt.Errorf("cannot specify -force-snapshot flag without -once")
+	}
+	if c.enforceRetention && !c.once {
+		return fmt.Errorf("cannot specify -enforce-retention flag without -once")
+	}
+
 	return nil
 }
 
@@ -183,6 +207,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 	levels := c.Config.CompactionLevels()
 	c.Store = litestream.NewStore(dbs, levels)
+
 	// Only override default snapshot interval if explicitly set in config
 	if c.Config.Snapshot.Interval != nil {
 		c.Store.SnapshotInterval = *c.Config.Snapshot.Interval
@@ -203,6 +228,20 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.ShutdownSyncInterval != nil {
 		c.Store.SetShutdownSyncInterval(*c.Config.ShutdownSyncInterval)
 	}
+
+	// Disable all background monitors when running once.
+	// This must be done after config settings are applied.
+	if c.once {
+		c.Store.CompactionMonitorEnabled = false
+		c.Store.L0RetentionCheckInterval = 0
+		for _, db := range dbs {
+			db.MonitorInterval = 0
+			if db.Replica != nil {
+				db.Replica.MonitorEnabled = false
+			}
+		}
+	}
+
 	if err := c.Store.Open(ctx); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
@@ -279,9 +318,55 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot start exec command: %w", err)
 		}
 		go func() { c.execCh <- c.cmd.Wait() }()
+	} else if c.once {
+		// Run one-shot replication in a goroutine so the caller can wait on execCh.
+		go c.runOnce(ctx)
 	}
 
 	return nil
+}
+
+// runOnce performs one-shot replication for all databases.
+// It syncs all databases, optionally takes snapshots, and enforces retention.
+func (c *ReplicateCommand) runOnce(ctx context.Context) {
+	var err error
+	defer func() { c.execCh <- err }()
+
+	for _, db := range c.Store.DBs() {
+		slog.Info("syncing database", "path", db.Path())
+
+		// Sync the database to process any pending WAL changes.
+		if err = db.Sync(ctx); err != nil {
+			err = fmt.Errorf("sync database %s: %w", db.Path(), err)
+			return
+		}
+
+		// Sync the replica to upload any pending LTX files.
+		if err = db.Replica.Sync(ctx); err != nil {
+			err = fmt.Errorf("sync replica for %s: %w", db.Path(), err)
+			return
+		}
+
+		// Force a snapshot if requested.
+		if c.forceSnapshot {
+			slog.Info("taking snapshot", "path", db.Path())
+			if _, err = db.Snapshot(ctx); err != nil {
+				err = fmt.Errorf("snapshot %s: %w", db.Path(), err)
+				return
+			}
+		}
+
+		// Enforce retention if requested.
+		if c.enforceRetention {
+			slog.Info("enforcing retention", "path", db.Path())
+			if err = c.Store.EnforceSnapshotRetention(ctx, db); err != nil {
+				err = fmt.Errorf("enforce retention for %s: %w", db.Path(), err)
+				return
+			}
+		}
+	}
+
+	slog.Info("one-shot replication complete")
 }
 
 // Close closes all open databases.
@@ -375,6 +460,20 @@ Arguments:
 	-exec CMD
 	    Executes a subcommand. Litestream will exit when the child
 	    process exits. Useful for simple process management.
+
+	-once
+	    Replicate once and exit. This performs a single sync of all
+	    databases and their replicas, then exits. Cannot be used with -exec.
+
+	-force-snapshot
+	    Force a snapshot to be taken for all databases. Requires -once.
+	    This is useful for creating a complete backup before maintenance
+	    or when migrating databases between hosts.
+
+	-enforce-retention
+	    Enforce retention policies for old snapshots. Requires -once.
+	    This removes snapshots that are older than the configured
+	    snapshot retention period.
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
