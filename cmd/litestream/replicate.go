@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -52,6 +53,7 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
+	restoreIfDBNotExists := fs.Bool("restore-if-db-not-exists", false, "restore from replica if database doesn't exist")
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -83,7 +85,10 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		c.Config = DefaultConfig()
 		initLog(os.Stdout, "INFO", "text")
 
-		dbConfig := &DBConfig{Path: fs.Arg(0)}
+		dbConfig := &DBConfig{
+			Path:                 fs.Arg(0),
+			RestoreIfDBNotExists: *restoreIfDBNotExists,
+		}
 		for _, u := range fs.Args()[1:] {
 			// Check if this looks like a flag that was placed after positional arguments
 			if strings.HasPrefix(u, "-") {
@@ -107,6 +112,14 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		c.Config.Exec = *execFlag
 	}
 
+	// Apply restore-if-db-not-exists flag to all databases if specified.
+	// This allows the CLI flag to work with config files.
+	if *restoreIfDBNotExists {
+		for _, dbConfig := range c.Config.DBs {
+			dbConfig.RestoreIfDBNotExists = true
+		}
+	}
+
 	return nil
 }
 
@@ -127,6 +140,15 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	// Setup databases.
 	if len(c.Config.DBs) == 0 {
 		slog.Error("no databases specified in configuration")
+	}
+
+	// Attempt restore for databases that need it (before creating DB objects)
+	for _, dbConfig := range c.Config.DBs {
+		if dbConfig.RestoreIfDBNotExists && dbConfig.Path != "" {
+			if err := c.restoreIfNeeded(ctx, dbConfig); err != nil {
+				return err
+			}
+		}
 	}
 
 	var dbs []*litestream.DB
@@ -282,6 +304,54 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	return nil
 }
 
+// restoreIfNeeded restores a database from its replica if the database doesn't
+// exist and the RestoreIfDBNotExists option is enabled. If no backup exists
+// (first start scenario), it returns nil to allow fresh replication to begin.
+func (c *ReplicateCommand) restoreIfNeeded(ctx context.Context, dbConfig *DBConfig) error {
+	dbPath, err := expand(dbConfig.Path)
+	if err != nil {
+		return err
+	}
+
+	// Skip if database already exists
+	if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+		slog.Info("database exists, skipping restore", "path", dbPath)
+		return nil
+	}
+
+	// Get replica config (handles both Replica and Replicas fields)
+	var rc *ReplicaConfig
+	if dbConfig.Replica != nil {
+		rc = dbConfig.Replica
+	} else if len(dbConfig.Replicas) > 0 {
+		rc = dbConfig.Replicas[0]
+	} else {
+		return fmt.Errorf("no replica configured for database: %s", dbPath)
+	}
+
+	// Create replica from config (nil db since we're just restoring)
+	r, err := NewReplicaFromConfig(rc, nil)
+	if err != nil {
+		return fmt.Errorf("cannot create replica for restore: %w", err)
+	}
+
+	// Attempt restore
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = dbPath
+
+	slog.Info("attempting restore before replication", "path", dbPath)
+	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
+		// No backup exists yet (first start) - this is OK
+		slog.Info("no backup found, starting fresh", "path", dbPath)
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("restore failed: %w", err)
+	}
+
+	slog.Info("restore completed", "path", dbPath)
+	return nil
+}
+
 // Usage prints the help screen to STDOUT.
 func (c *ReplicateCommand) Usage() {
 	fmt.Printf(`
@@ -308,6 +378,10 @@ Arguments:
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
+
+	-restore-if-db-not-exists
+	    Restores the database from the replica if it doesn't exist.
+	    On first start with no backup, proceeds normally.
 
 `[1:], DefaultConfigPath())
 }

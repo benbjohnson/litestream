@@ -532,6 +532,8 @@ type DBConfig struct {
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
 
+	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
+
 	Replica  *ReplicaConfig   `yaml:"replica"`
 	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
 }
