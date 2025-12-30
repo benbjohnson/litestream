@@ -33,6 +33,8 @@ import (
 	smithytime "github.com/aws/smithy-go/time"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -53,6 +55,11 @@ const MaxKeys = 1000
 
 // DefaultRegion is the region used if one is not specified.
 const DefaultRegion = "us-east-1"
+
+// DefaultMetadataConcurrency is the default number of concurrent HeadObject calls
+// for fetching accurate timestamps during timestamp-based restore.
+// S3 can handle 5,500+ HEAD requests per second per prefix.
+const DefaultMetadataConcurrency = 50
 
 // contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
 // through the middleware stack from Serialize to Finalize phase.
@@ -84,6 +91,11 @@ type ReplicaClient struct {
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
 	Concurrency int   // Number of concurrent parts to upload (default: 5)
+
+	// MetadataConcurrency controls parallel HeadObject calls for timestamp-based restore.
+	// Higher values improve restore speed for large backup histories.
+	// Default: 50 (S3 can handle 5,500+ HEAD/s per prefix)
+	MetadataConcurrency int
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -427,6 +439,8 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
 // When useMetadata is true, fetches accurate timestamps from S3 metadata via HeadObject.
+// This uses parallel batched requests (controlled by MetadataConcurrency) to avoid hangs
+// with large backup histories (see issue #930).
 // When false, uses fast LastModified timestamps from LIST operation.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
@@ -889,12 +903,14 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 // fileIterator represents an iterator over LTX files in S3.
 type fileIterator struct {
-	ctx         context.Context
-	cancel      context.CancelFunc
-	client      *ReplicaClient
-	level       int
-	seek        ltx.TXID
-	useMetadata bool // When true, fetch accurate timestamps from metadata
+	ctx    context.Context
+	cancel context.CancelFunc
+	client *ReplicaClient
+	level  int
+	seek   ltx.TXID
+
+	useMetadata   bool                 // When true, fetch accurate timestamps from metadata
+	metadataCache map[string]time.Time // key -> timestamp cache for batch fetches
 
 	paginator *s3.ListObjectsV2Paginator
 	page      *s3.ListObjectsV2Output
@@ -909,12 +925,13 @@ func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek
 	ctx, cancel := context.WithCancel(ctx)
 
 	itr := &fileIterator{
-		ctx:         ctx,
-		cancel:      cancel,
-		client:      client,
-		level:       level,
-		seek:        seek,
-		useMetadata: useMetadata,
+		ctx:           ctx,
+		cancel:        cancel,
+		client:        client,
+		level:         level,
+		seek:          seek,
+		useMetadata:   useMetadata,
+		metadataCache: make(map[string]time.Time),
 	}
 
 	// Create paginator for listing objects with level prefix
@@ -925,6 +942,69 @@ func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek
 	})
 
 	return itr
+}
+
+// fetchMetadataBatch fetches timestamps from S3 metadata for a batch of keys in parallel.
+func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
+	if len(keys) == 0 {
+		return nil
+	}
+
+	// Determine concurrency limit
+	concurrency := itr.client.MetadataConcurrency
+	if concurrency <= 0 {
+		concurrency = DefaultMetadataConcurrency
+	}
+
+	// Pre-allocate results map to avoid lock contention during writes
+	results := make(map[string]time.Time, len(keys))
+	var mu sync.Mutex
+
+	// Use x/sync/semaphore for precise concurrency control with context support
+	sem := semaphore.NewWeighted(int64(concurrency))
+	g, ctx := errgroup.WithContext(itr.ctx)
+
+	for _, key := range keys {
+		key := key // capture for goroutine
+
+		g.Go(func() error {
+			// Acquire semaphore slot (blocking with context cancellation)
+			if err := sem.Acquire(ctx, 1); err != nil {
+				return err // context cancelled
+			}
+			defer sem.Release(1)
+
+			head, err := itr.client.s3.HeadObject(ctx, &s3.HeadObjectInput{
+				Bucket: aws.String(itr.client.Bucket),
+				Key:    aws.String(key),
+			})
+			if err != nil {
+				// Non-fatal: file might not have metadata, use LastModified
+				return nil
+			}
+
+			if head.Metadata != nil {
+				if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
+					if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
+						mu.Lock()
+						results[key] = parsed
+						mu.Unlock()
+					}
+				}
+			}
+			return nil
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	// Merge results into cache
+	for k, v := range results {
+		itr.metadataCache[k] = v
+	}
+	return nil
 }
 
 // Close stops iteration.
@@ -955,6 +1035,20 @@ func (itr *fileIterator) Next() bool {
 				return false
 			}
 			itr.pageIndex = 0
+
+			// Batch fetch metadata for the entire page when useMetadata is true.
+			// This uses parallel HeadObject calls controlled by MetadataConcurrency
+			// to avoid the O(N) sequential calls that caused restore hangs (issue #930).
+			if itr.useMetadata && len(itr.page.Contents) > 0 {
+				keys := make([]string, 0, len(itr.page.Contents))
+				for _, obj := range itr.page.Contents {
+					keys = append(keys, aws.ToString(obj.Key))
+				}
+				if err := itr.fetchMetadataBatch(keys); err != nil {
+					itr.err = err
+					return false
+				}
+			}
 		}
 
 		// Process current object
@@ -963,7 +1057,8 @@ func (itr *fileIterator) Next() bool {
 			itr.pageIndex++
 
 			// Extract file info from key
-			key := path.Base(aws.ToString(obj.Key))
+			fullKey := aws.ToString(obj.Key)
+			key := path.Base(fullKey)
 			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
 				continue // Skip non-LTX files
@@ -989,33 +1084,18 @@ func (itr *fileIterator) Next() bool {
 			// Set file info
 			info.Size = aws.ToInt64(obj.Size)
 
-			// Use fast LastModified timestamp by default
-			createdAt := aws.ToTime(obj.LastModified).UTC()
-
-			// Only fetch accurate timestamp from metadata when requested (timestamp-based restore)
+			// Use cached metadata timestamp if available (from batch fetch),
+			// otherwise fallback to LastModified from LIST operation.
 			if itr.useMetadata {
-				head, err := itr.client.s3.HeadObject(itr.ctx, &s3.HeadObjectInput{
-					Bucket: aws.String(itr.client.Bucket),
-					Key:    obj.Key,
-				})
-				if err != nil {
-					itr.err = fmt.Errorf("fetch object metadata: %w", err)
-					return false
+				if ts, ok := itr.metadataCache[fullKey]; ok {
+					info.CreatedAt = ts
+				} else {
+					info.CreatedAt = aws.ToTime(obj.LastModified).UTC()
 				}
-
-				if head.Metadata != nil {
-					if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
-						if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-							createdAt = parsed
-						} else {
-							itr.err = fmt.Errorf("parse timestamp from metadata: %w", err)
-							return false
-						}
-					}
-				}
+			} else {
+				info.CreatedAt = aws.ToTime(obj.LastModified).UTC()
 			}
 
-			info.CreatedAt = createdAt
 			itr.info = info
 			return true
 		}
