@@ -51,6 +51,8 @@ var (
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
 	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
+	ErrInvalidHeartbeatURL             = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
+	ErrInvalidHeartbeatInterval        = errors.New("heartbeat interval must be at least 1 minute")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
@@ -212,6 +214,10 @@ type Config struct {
 	L0Retention              *time.Duration `yaml:"l0-retention"`
 	L0RetentionCheckInterval *time.Duration `yaml:"l0-retention-check-interval"`
 
+	// Heartbeat settings (global defaults)
+	HeartbeatURL      string         `yaml:"heartbeat-url"`
+	HeartbeatInterval *time.Duration `yaml:"heartbeat-interval"`
+
 	// List of databases to manage.
 	DBs []*DBConfig `yaml:"dbs"`
 
@@ -328,6 +334,22 @@ func (c *Config) Validate() error {
 			Err:   ErrInvalidShutdownSyncInterval,
 			Field: "shutdown-sync-interval",
 			Value: *c.ShutdownSyncInterval,
+		}
+	}
+
+	// Validate global heartbeat settings
+	if c.HeartbeatURL != "" && !isValidHeartbeatURL(c.HeartbeatURL) {
+		return &ConfigValidationError{
+			Err:   ErrInvalidHeartbeatURL,
+			Field: "heartbeat-url",
+			Value: c.HeartbeatURL,
+		}
+	}
+	if c.HeartbeatInterval != nil && *c.HeartbeatInterval < litestream.MinHeartbeatInterval {
+		return &ConfigValidationError{
+			Err:   ErrInvalidHeartbeatInterval,
+			Field: "heartbeat-interval",
+			Value: *c.HeartbeatInterval,
 		}
 	}
 
@@ -496,7 +518,7 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		}
 	}
 
-	// Propage settings from global config to replica configs.
+	// Propagate settings from global config to individual configs.
 	config.propagateGlobalSettings()
 
 	// Validate configuration
@@ -1790,6 +1812,11 @@ func DefaultConfigPath() string {
 func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
 	return fs.String("config", "", "config path"),
 		fs.Bool("no-expand-env", false, "do not expand env vars in config")
+}
+
+// isValidHeartbeatURL checks if the URL is a valid HTTP or HTTPS URL.
+func isValidHeartbeatURL(u string) bool {
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
 }
 
 // expand returns an absolute path for s.
