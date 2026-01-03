@@ -692,3 +692,195 @@ func TestDB_releaseReadLock_DoubleRollback(t *testing.T) {
 		t.Fatalf("Close() failed: %v", err)
 	}
 }
+
+// TestDB_CheckpointDoesNotTriggerSnapshot verifies that a checkpoint
+// followed by a sync does not trigger an unnecessary full snapshot.
+// This is a regression test for issue #927 (runaway disk usage).
+//
+// The bug: After checkpoint truncates WAL, verify() sees old LTX position
+// is beyond new WAL size and triggers snapshotting=true unnecessarily.
+func TestDB_CheckpointDoesNotTriggerSnapshot(t *testing.T) {
+	t.Run("TruncateMode", func(t *testing.T) {
+		testCheckpointSnapshot(t, CheckpointModeTruncate)
+	})
+	t.Run("PassiveMode", func(t *testing.T) {
+		testCheckpointSnapshot(t, CheckpointModePassive)
+	})
+}
+
+func testCheckpointSnapshot(t *testing.T, mode string) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0    // Disable background monitor
+	db.CheckpointInterval = 0 // Disable time-based checkpoints
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create initial data
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	// Insert enough data to have a meaningful WAL
+	for i := 0; i < 100; i++ {
+		data := fmt.Sprintf("test data padding row %d with extra content", i)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+
+	// Perform initial sync
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos1, _ := db.Pos()
+	t.Logf("After initial sync: TXID=%d", pos1.TXID)
+
+	// Make a change and sync to establish "normal" state
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (9999, 'before checkpoint')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos2, _ := db.Pos()
+	t.Logf("After pre-checkpoint sync: TXID=%d", pos2.TXID)
+
+	// Call verify() BEFORE checkpoint to confirm snapshotting=false
+	info1, err := db.verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Before checkpoint: verify() snapshotting=%v reason=%q", info1.snapshotting, info1.reason)
+
+	// Perform checkpoint - this may restart the WAL with new salt
+	if err := db.Checkpoint(ctx, mode); err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("Checkpoint mode=%s completed", mode)
+	posAfterChk, _ := db.Pos()
+	t.Logf("After checkpoint: TXID=%d", posAfterChk.TXID)
+
+	// Make a small change to create some WAL data
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (10000, 'after checkpoint')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Call verify() AFTER checkpoint - THIS IS THE BUG CHECK
+	// With the bug, snapshotting=true because verify() sees:
+	// - Old LTX has WALOffset+WALSize pointing to old (larger) WAL
+	// - New WAL is truncated (smaller)
+	// - Line 973: info.offset > fi.Size() → "wal truncated" → snapshotting=true
+	info2, err := db.verify(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("After checkpoint: verify() snapshotting=%v reason=%q", info2.snapshotting, info2.reason)
+
+	// The key assertion: after OUR checkpoint (not external process),
+	// we should NOT require a full snapshot.
+	if info2.snapshotting {
+		t.Errorf("verify() returned snapshotting=true after checkpoint, reason=%q. "+
+			"This is the bug: checkpoint followed by sync should NOT require full snapshot.",
+			info2.reason)
+	}
+}
+
+// TestDB_MultipleCheckpointsWithWrites tests that multiple checkpoint cycles
+// don't trigger excessive snapshots. This simulates the scenario from issue #927
+// where users reported 5GB snapshots every 3-4 minutes.
+func TestDB_MultipleCheckpointsWithWrites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	snapshotCount := 0
+
+	// Simulate multiple checkpoint cycles with writes
+	for cycle := 0; cycle < 5; cycle++ {
+		// Insert some data
+		for i := 0; i < 10; i++ {
+			if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, cycle*100+i, "data"); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		// Sync
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		// Check if this was a snapshot
+		info, err := db.verify(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.snapshotting {
+			snapshotCount++
+			t.Logf("Cycle %d: SNAPSHOT triggered, reason=%q", cycle, info.reason)
+		} else {
+			t.Logf("Cycle %d: incremental sync", cycle)
+		}
+
+		// Checkpoint
+		if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// We expect only 1 snapshot (the initial one), not one per cycle
+	// With the bug, we'd see a snapshot after every checkpoint
+	if snapshotCount > 1 {
+		t.Errorf("Too many snapshots triggered: %d (expected 1 for initial sync)", snapshotCount)
+	}
+}

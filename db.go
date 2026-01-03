@@ -73,6 +73,14 @@ type DB struct {
 	// otherwise create unnecessary LTX files. See issue #896.
 	syncedSinceCheckpoint bool
 
+	// syncedToWALEnd tracks whether the last successful sync reached the
+	// exact end of the WAL file. When true, a subsequent WAL truncation
+	// (from checkpoint) is expected and should NOT trigger a full snapshot.
+	// This prevents issue #927 where every checkpoint triggers unnecessary
+	// full snapshots because verify() sees the old LTX position exceeds
+	// the new (truncated) WAL size.
+	syncedToWALEnd bool
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -966,11 +974,35 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
 
-	// If LTX WAL offset is larger than real WAL then the WAL has been truncated
-	// so we cannot determine our last state.
+	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
 		return info, fmt.Errorf("open wal file: %w", err)
 	} else if info.offset > fi.Size() {
+		// If we previously synced to the exact end of the WAL, this truncation
+		// is expected (normal checkpoint behavior). Reset position and continue
+		// incrementally rather than triggering a full snapshot. See issue #927.
+		if db.syncedToWALEnd {
+			db.syncedToWALEnd = false // Clear flag
+
+			// Read new WAL header to get current salt values
+			hdr, err := readWALHeader(db.WALPath())
+			if err != nil {
+				return info, fmt.Errorf("read wal header after expected truncation: %w", err)
+			}
+
+			info.offset = WALHeaderSize
+			info.salt1 = binary.BigEndian.Uint32(hdr[16:])
+			info.salt2 = binary.BigEndian.Uint32(hdr[20:])
+			info.snapshotting = false
+			info.reason = ""
+
+			db.Logger.Log(ctx, internal.LevelTrace, "wal truncated after sync to end (expected checkpoint)",
+				"new_salt1", info.salt1,
+				"new_salt2", info.salt2)
+
+			return info, nil
+		}
+
 		info.reason = "wal truncated by another process"
 		return info, nil
 	}
@@ -1309,6 +1341,16 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 		Size:      enc.N(),
 	}
 	db.maxLTXFileInfos.Unlock()
+
+	// Track if we synced to the exact end of the WAL file.
+	// This is used by verify() to distinguish expected checkpoint truncation
+	// from unexpected external WAL modifications. See issue #927.
+	if walSize, err := db.walFileSize(); err == nil {
+		finalOffset := info.offset + sz
+		db.syncedToWALEnd = finalOffset == walSize
+	} else {
+		db.syncedToWALEnd = false
+	}
 
 	db.Logger.Debug("db sync", "status", "ok")
 
