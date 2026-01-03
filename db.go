@@ -144,9 +144,6 @@ type DB struct {
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
 
-	// Heartbeat client for health check pings.
-	Heartbeat *HeartbeatClient
-
 	// lastSuccessfulSyncAt tracks when replication last succeeded.
 	// Used by heartbeat monitoring to determine if a ping should be sent.
 	lastSuccessfulSyncMu sync.RWMutex

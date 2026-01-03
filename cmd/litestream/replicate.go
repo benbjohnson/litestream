@@ -228,6 +228,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.ShutdownSyncInterval != nil {
 		c.Store.SetShutdownSyncInterval(*c.Config.ShutdownSyncInterval)
 	}
+	if c.Config.HeartbeatURL != "" {
+		interval := litestream.DefaultHeartbeatInterval
+		if c.Config.HeartbeatInterval != nil {
+			interval = *c.Config.HeartbeatInterval
+		}
+		c.Store.Heartbeat = litestream.NewHeartbeatClient(c.Config.HeartbeatURL, interval)
+	}
 
 	// Disable all background monitors when running once.
 	// This must be done after config settings are applied.
