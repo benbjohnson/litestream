@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
@@ -690,5 +691,85 @@ func TestDB_releaseReadLock_DoubleRollback(t *testing.T) {
 	// Close should work without error
 	if err := db.Close(context.Background()); err != nil {
 		t.Fatalf("Close() failed: %v", err)
+	}
+}
+
+// TestDB_Monitor_CheapChangeDetection verifies that the monitor loop skips
+// expensive Sync() calls when the WAL file hasn't changed.
+func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
+	// Create temp directory for test database.
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	// Set up litestream DB with short monitor interval.
+	db := NewDB(dbPath)
+	db.MonitorInterval = 50 * time.Millisecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false // disable replica monitor to avoid hangs
+
+	// Open litestream database.
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	// Open SQL connection and create WAL.
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (x INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial sync to complete.
+	time.Sleep(150 * time.Millisecond)
+
+	// Record sync count after initial sync.
+	syncMetric := syncNCounterVec.WithLabelValues(db.Path())
+	initialSyncCount := testutil.ToFloat64(syncMetric)
+	if initialSyncCount < 1 {
+		t.Fatalf("expected at least 1 initial sync, got %v", initialSyncCount)
+	}
+	t.Logf("initial sync count: %v", initialSyncCount)
+
+	// Wait for several monitor intervals with no WAL changes.
+	// The cheap change detection should skip Sync() calls.
+	time.Sleep(300 * time.Millisecond) // ~6 monitor intervals
+
+	idleSyncCount := testutil.ToFloat64(syncMetric)
+	t.Logf("sync count after idle period: %v", idleSyncCount)
+
+	// Sync count should not have increased significantly during idle period.
+	// Allow for 1 extra sync due to timing.
+	if idleSyncCount > initialSyncCount+1 {
+		t.Fatalf("sync count increased during idle period: initial=%v, after=%v (expected no increase)",
+			initialSyncCount, idleSyncCount)
+	}
+
+	// Now write to the database - this should trigger a sync.
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for monitor to detect the change and sync.
+	time.Sleep(150 * time.Millisecond)
+
+	finalSyncCount := testutil.ToFloat64(syncMetric)
+	t.Logf("sync count after write: %v", finalSyncCount)
+
+	// Sync count should have increased after the write.
+	if finalSyncCount <= idleSyncCount {
+		t.Fatalf("sync count did not increase after write: idle=%v, final=%v",
+			idleSyncCount, finalSyncCount)
 	}
 }
