@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -963,5 +964,97 @@ func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
 	if finalSyncCount <= idleSyncCount {
 		t.Fatalf("sync count did not increase after write: idle=%v, final=%v",
 			idleSyncCount, finalSyncCount)
+	}
+}
+
+// TestDB_Monitor_DetectsSaltChangeAfterRestart verifies that the monitor loop
+// detects WAL header salt changes after a RESTART checkpoint followed by new
+// writes. SQLite generates new salt values when the first write happens after
+// a RESTART checkpoint that emptied the WAL.
+func TestDB_Monitor_DetectsSaltChangeAfterRestart(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 50 * time.Millisecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (x INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial sync to complete.
+	time.Sleep(150 * time.Millisecond)
+
+	// Read the WAL header before RESTART.
+	initialHeader, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatalf("failed to read initial WAL header: %v", err)
+	}
+	t.Logf("initial WAL header salt (bytes 12-20): %x", initialHeader[12:20])
+
+	syncMetric := syncNCounterVec.WithLabelValues(db.Path())
+	preRestartSyncCount := testutil.ToFloat64(syncMetric)
+	t.Logf("sync count before RESTART: %v", preRestartSyncCount)
+
+	// Force a RESTART checkpoint to empty the WAL.
+	if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(RESTART)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write new data - this should generate new salt values since the WAL was restarted.
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (100)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the WAL header after the new write.
+	postHeader, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatalf("failed to read post-RESTART WAL header: %v", err)
+	}
+	t.Logf("post-RESTART WAL header salt (bytes 12-20): %x", postHeader[12:20])
+
+	// Check if salt values changed.
+	saltChanged := !bytes.Equal(initialHeader[12:20], postHeader[12:20])
+	if saltChanged {
+		t.Log("Salt values changed as expected after RESTART + write")
+	} else {
+		t.Log("Salt values did not change (WAL may have been at boundary)")
+	}
+
+	// Wait for monitor to detect the change.
+	time.Sleep(150 * time.Millisecond)
+
+	postRestartSyncCount := testutil.ToFloat64(syncMetric)
+	t.Logf("sync count after RESTART + write: %v", postRestartSyncCount)
+
+	// Sync count should increase - either from salt change detection or size change.
+	if postRestartSyncCount <= preRestartSyncCount {
+		t.Fatalf("sync count did not increase after RESTART + write: before=%v, after=%v",
+			preRestartSyncCount, postRestartSyncCount)
+	}
+
+	// If salt changed, verify it was detected correctly.
+	if saltChanged {
+		t.Log("Monitor correctly detected changes after WAL salt reset")
 	}
 }

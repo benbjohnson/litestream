@@ -1998,6 +1998,8 @@ func (db *DB) monitor() {
 				if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 					db.Logger.Error("sync error", "error", err)
 				}
+			} else {
+				db.Logger.Warn("failed to stat WAL file", "path", walPath, "error", err)
 			}
 			continue
 		}
