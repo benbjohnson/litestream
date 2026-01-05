@@ -391,6 +391,40 @@ func TestReplicaClient_UploaderConfiguration(t *testing.T) {
 			t.Errorf("expected default Concurrency to be 0, got %d", c.Concurrency)
 		}
 	})
+
+	t.Run("R2DefaultConcurrency", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Endpoint = "https://account123.r2.cloudflarestorage.com"
+
+		// Verify initial concurrency is 0
+		if c.Concurrency != 0 {
+			t.Errorf("expected initial Concurrency to be 0, got %d", c.Concurrency)
+		}
+
+		// After Init(), R2 endpoints should get concurrency default of 2
+		// Note: Init() will fail without valid credentials, but the concurrency
+		// default is applied before AWS SDK initialization attempts
+		_ = c.Init(context.Background())
+
+		if c.Concurrency != 2 {
+			t.Errorf("expected R2 default Concurrency to be 2, got %d", c.Concurrency)
+		}
+	})
+
+	t.Run("R2ExplicitConcurrencyNotOverridden", func(t *testing.T) {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Endpoint = "https://account123.r2.cloudflarestorage.com"
+		c.Concurrency = 5 // Explicit setting
+
+		// Init should not override explicit concurrency
+		_ = c.Init(context.Background())
+
+		if c.Concurrency != 5 {
+			t.Errorf("expected explicit Concurrency to be preserved, got %d", c.Concurrency)
+		}
+	})
 }
 
 // TestReplicaClient_ConfigureEndpoint tests the endpoint configuration helper

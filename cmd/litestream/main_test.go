@@ -2584,6 +2584,67 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			t.Error("expected manual RequireContentMD5 override to take precedence")
 		}
 	})
+
+	t.Run("R2ConcurrencyDefault", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:   "mybucket",
+				Endpoint: "https://account123.r2.cloudflarestorage.com",
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// R2 has a strict limit of 2-3 concurrent part uploads, default should be 2
+		if client.Concurrency != 2 {
+			t.Errorf("expected R2 default Concurrency to be 2, got %d", client.Concurrency)
+		}
+		if !client.SignPayload {
+			t.Error("expected SignPayload to be true for R2 endpoint")
+		}
+	})
+
+	t.Run("R2ConcurrencyConfigOverride", func(t *testing.T) {
+		concurrency := 3
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:      "mybucket",
+				Endpoint:    "https://account123.r2.cloudflarestorage.com",
+				Concurrency: &concurrency,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Explicit config should override R2 default
+		if client.Concurrency != 3 {
+			t.Errorf("expected explicit Concurrency to be 3, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("R2URLEndpoint", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?endpoint=account123.r2.cloudflarestorage.com&region=auto",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// R2 should get default concurrency of 2 even via URL
+		if client.Concurrency != 2 {
+			t.Errorf("expected R2 default Concurrency to be 2 via URL, got %d", client.Concurrency)
+		}
+	})
 }
 func TestGlobalDefaults(t *testing.T) {
 	// Test comprehensive global defaults functionality

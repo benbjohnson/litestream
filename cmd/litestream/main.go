@@ -1323,6 +1323,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
 	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
 	isScaleway := litestream.IsScalewayEndpoint(endpoint)
+	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set by user (config or URL query param).
@@ -1335,7 +1336,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
@@ -1366,6 +1367,11 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	}
 	if c.Concurrency != nil {
 		client.Concurrency = *c.Concurrency
+	} else if isCloudflareR2 {
+		// R2 has a strict limit of 2-3 concurrent part uploads per multipart upload.
+		// Default to 2 to avoid 500 errors on larger database uploads.
+		// See: https://github.com/benbjohnson/litestream/issues/948
+		client.Concurrency = 2
 	}
 
 	// Apply SSE-C configuration if specified.

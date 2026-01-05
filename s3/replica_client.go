@@ -394,6 +394,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Create S3 client
 	c.s3 = s3.NewFromConfig(cfg, s3Opts...)
 
+	// Apply R2-specific defaults for library users who don't go through config parsing.
+	// R2 has a strict limit of 2-3 concurrent part uploads per multipart upload.
+	// See: https://github.com/benbjohnson/litestream/issues/948
+	if c.Concurrency == 0 && litestream.IsCloudflareR2Endpoint(c.Endpoint) {
+		c.Concurrency = 2
+	}
+
 	// Configure uploader with custom options if specified
 	uploaderOpts := []func(*manager.Uploader){}
 	if c.PartSize > 0 {

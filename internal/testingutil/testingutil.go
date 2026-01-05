@@ -313,6 +313,7 @@ func NewR2ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Endpoint = *r2Endpoint
 	c.ForcePathStyle = true
 	c.SignPayload = true
+	c.Concurrency = 2 // R2 has a strict limit of 2-3 concurrent part uploads
 	return c
 }
 
