@@ -1,0 +1,388 @@
+name: Pre-Release Checklist
+
+# Advisory workflow to verify release readiness
+# This workflow reports results but does NOT block releases
+# Run manually before tagging a new release
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version being released (e.g., v0.5.6)'
+        required: true
+        type: string
+      create_issue:
+        description: 'Create a GitHub issue with results'
+        required: false
+        default: true
+        type: boolean
+      test_cloud_providers:
+        description: 'Run cloud provider integration tests (S3, GCS, ABS, R2)'
+        required: false
+        default: true
+        type: boolean
+      test_multipart:
+        description: 'Run multipart upload stress tests'
+        required: false
+        default: true
+        type: boolean
+
+jobs:
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run unit tests
+        id: test
+        run: go test -v -race ./...
+
+  build-verification:
+    name: Build Verification
+    runs-on: ubuntu-latest
+    outputs:
+      result: ${{ steps.build.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build main binary
+        id: build
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          ./bin/litestream version
+
+      - name: Verify binary runs
+        run: |
+          ./bin/litestream --help
+          ./bin/litestream databases --help
+          ./bin/litestream replicate --help
+          ./bin/litestream restore --help
+
+  s3-integration:
+    name: S3 Integration (AWS)
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_cloud_providers == 'true'
+    outputs:
+      result: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run S3 integration tests
+        id: test
+        continue-on-error: true
+        run: go test -v ./replica_client_test.go -integration -replica-clients=s3
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+  gcs-integration:
+    name: GCS Integration
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_cloud_providers == 'true'
+    outputs:
+      result: ${{ steps.test.outcome }}
+    steps:
+      - name: Extract GCP credentials
+        run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run GCS integration tests
+        id: test
+        continue-on-error: true
+        run: go test -v ./replica_client_test.go -integration -replica-clients=gs
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp.json
+          LITESTREAM_GS_BUCKET: litestream-github-workflows
+
+  abs-integration:
+    name: Azure Blob Storage Integration
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_cloud_providers == 'true'
+    outputs:
+      result: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run ABS integration tests
+        id: test
+        continue-on-error: true
+        run: go test -v ./replica_client_test.go -integration -replica-clients=abs
+        env:
+          LITESTREAM_ABS_ACCOUNT_NAME: ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
+          LITESTREAM_ABS_ACCOUNT_KEY: ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
+          LITESTREAM_ABS_BUCKET: integration
+
+  r2-integration:
+    name: Cloudflare R2 Integration
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_cloud_providers == 'true'
+    outputs:
+      result: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run R2 integration tests
+        id: test
+        continue-on-error: true
+        run: go test -v ./replica_client_test.go -integration -replica-clients=r2
+        env:
+          LITESTREAM_R2_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_R2_ACCESS_KEY_ID }}
+          LITESTREAM_R2_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_R2_SECRET_ACCESS_KEY }}
+          LITESTREAM_R2_ENDPOINT: ${{ secrets.LITESTREAM_R2_ENDPOINT }}
+          LITESTREAM_R2_BUCKET: ${{ secrets.LITESTREAM_R2_BUCKET }}
+
+  multipart-stress:
+    name: Multipart Upload Stress Tests
+    runs-on: ubuntu-latest
+    if: github.event.inputs.test_multipart == 'true'
+    outputs:
+      result: ${{ steps.test.outcome }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Run multipart stress tests
+        id: test
+        continue-on-error: true
+        run: |
+          go test -v ./replica_client_test.go -integration -replica-clients=s3 \
+            -run "TestReplicaClient_S3_Multipart|TestReplicaClient_S3_Concurrency" \
+            -timeout 30m
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+  generate-checklist:
+    name: Generate Release Checklist
+    runs-on: ubuntu-latest
+    needs:
+      - unit-tests
+      - build-verification
+      - s3-integration
+      - gcs-integration
+      - abs-integration
+      - r2-integration
+      - multipart-stress
+    if: always()
+    steps:
+      - name: Generate checklist summary
+        id: checklist
+        run: |
+          echo "## Pre-Release Checklist for ${{ github.event.inputs.version }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "### Core Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.unit-tests.result }}" == "success" ]; then
+            echo "- [x] Unit tests passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] Unit tests **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.build-verification.result }}" == "success" ]; then
+            echo "- [x] Build verification passed" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] Build verification **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Cloud Provider Integration Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.s3-integration.result }}" == "success" ]; then
+            echo "- [x] AWS S3 integration passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.s3-integration.result }}" == "skipped" ]; then
+            echo "- [ ] AWS S3 integration (skipped)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] AWS S3 integration **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.gcs-integration.result }}" == "success" ]; then
+            echo "- [x] Google Cloud Storage integration passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.gcs-integration.result }}" == "skipped" ]; then
+            echo "- [ ] Google Cloud Storage integration (skipped)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] Google Cloud Storage integration **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.abs-integration.result }}" == "success" ]; then
+            echo "- [x] Azure Blob Storage integration passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.abs-integration.result }}" == "skipped" ]; then
+            echo "- [ ] Azure Blob Storage integration (skipped)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] Azure Blob Storage integration **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.r2-integration.result }}" == "success" ]; then
+            echo "- [x] Cloudflare R2 integration passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.r2-integration.result }}" == "skipped" ]; then
+            echo "- [ ] Cloudflare R2 integration (skipped)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] Cloudflare R2 integration **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Stress Tests" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ needs.multipart-stress.result }}" == "success" ]; then
+            echo "- [x] Multipart upload stress tests passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.multipart-stress.result }}" == "skipped" ]; then
+            echo "- [ ] Multipart upload stress tests (skipped)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- [ ] Multipart upload stress tests **FAILED**" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Note:** This checklist is advisory only." >> $GITHUB_STEP_SUMMARY
+          echo "Review failed items before proceeding with the release." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "[View full run details](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+
+          # Create issue body for later use
+          cat > /tmp/issue_body.md << 'ISSUE_EOF'
+          ## Pre-Release Checklist for ${{ github.event.inputs.version }}
+
+          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')
+          **Triggered by:** @${{ github.actor }}
+          **Workflow Run:** https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          ### Core Tests
+
+          | Test | Status |
+          |------|--------|
+          | Unit Tests | ${{ needs.unit-tests.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+          | Build Verification | ${{ needs.build-verification.result == 'success' && '✅ Passed' || '❌ Failed' }} |
+
+          ### Cloud Provider Integration Tests
+
+          | Provider | Status |
+          |----------|--------|
+          | AWS S3 | ${{ needs.s3-integration.result == 'success' && '✅ Passed' || needs.s3-integration.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | Google Cloud Storage | ${{ needs.gcs-integration.result == 'success' && '✅ Passed' || needs.gcs-integration.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | Azure Blob Storage | ${{ needs.abs-integration.result == 'success' && '✅ Passed' || needs.abs-integration.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+          | Cloudflare R2 | ${{ needs.r2-integration.result == 'success' && '✅ Passed' || needs.r2-integration.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+
+          ### Stress Tests
+
+          | Test | Status |
+          |------|--------|
+          | Multipart Uploads | ${{ needs.multipart-stress.result == 'success' && '✅ Passed' || needs.multipart-stress.result == 'skipped' && '⏭️ Skipped' || '❌ Failed' }} |
+
+          ---
+
+          **Note:** This checklist is advisory only. Review any failed items before proceeding with the release.
+          ISSUE_EOF
+
+      - name: Create GitHub Issue
+        if: github.event.inputs.create_issue == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = '${{ github.event.inputs.version }}';
+            const runUrl = `https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}`;
+
+            // Determine overall status
+            const results = {
+              unit: '${{ needs.unit-tests.result }}',
+              build: '${{ needs.build-verification.result }}',
+              s3: '${{ needs.s3-integration.result }}',
+              gcs: '${{ needs.gcs-integration.result }}',
+              abs: '${{ needs.abs-integration.result }}',
+              r2: '${{ needs.r2-integration.result }}',
+              multipart: '${{ needs.multipart-stress.result }}'
+            };
+
+            const failed = Object.entries(results)
+              .filter(([_, v]) => v === 'failure')
+              .map(([k, _]) => k);
+
+            const status = failed.length === 0 ? '✅' : '⚠️';
+            const title = `${status} Pre-Release Checklist: ${version}`;
+
+            let body = `## Pre-Release Checklist for ${version}\n\n`;
+            body += `**Workflow Run:** [View Details](${runUrl})\n\n`;
+
+            body += `### Results Summary\n\n`;
+            body += `| Test | Status |\n`;
+            body += `|------|--------|\n`;
+            body += `| Unit Tests | ${results.unit === 'success' ? '✅' : '❌'} |\n`;
+            body += `| Build | ${results.build === 'success' ? '✅' : '❌'} |\n`;
+            body += `| AWS S3 | ${results.s3 === 'success' ? '✅' : results.s3 === 'skipped' ? '⏭️' : '❌'} |\n`;
+            body += `| GCS | ${results.gcs === 'success' ? '✅' : results.gcs === 'skipped' ? '⏭️' : '❌'} |\n`;
+            body += `| Azure | ${results.abs === 'success' ? '✅' : results.abs === 'skipped' ? '⏭️' : '❌'} |\n`;
+            body += `| R2 | ${results.r2 === 'success' ? '✅' : results.r2 === 'skipped' ? '⏭️' : '❌'} |\n`;
+            body += `| Multipart | ${results.multipart === 'success' ? '✅' : results.multipart === 'skipped' ? '⏭️' : '❌'} |\n\n`;
+
+            if (failed.length > 0) {
+              body += `### ⚠️ Failed Tests\n\n`;
+              body += `The following tests failed and should be reviewed:\n`;
+              failed.forEach(f => body += `- ${f}\n`);
+              body += `\n`;
+            }
+
+            body += `---\n`;
+            body += `*This issue was automatically created by the pre-release checklist workflow.*\n`;
+
+            try {
+              await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: title,
+                body: body,
+                labels: ['release-checklist']
+              });
+              console.log('Created release checklist issue');
+            } catch (error) {
+              console.log(`Failed to create issue: ${error.message}`);
+            }

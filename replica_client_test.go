@@ -701,3 +701,261 @@ func TestReplicaClient_S3_ConcurrencyLimits(t *testing.T) {
 		})
 	}
 }
+
+// TestReplicaClient_PITR_ManyLTXFiles tests point-in-time restore with many LTX files.
+// This is a regression test for issue #930 where HeadObject calls with 100+ LTX files
+// caused the restore operation to hang.
+func TestReplicaClient_PITR_ManyLTXFiles(t *testing.T) {
+	tests := []struct {
+		name      string
+		fileCount int
+		timeout   time.Duration
+	}{
+		{"100_Files", 100, 2 * time.Minute},
+		{"500_Files", 500, 5 * time.Minute},
+		{"1000_Files", 1000, 10 * time.Minute},
+	}
+
+	for _, tt := range tests {
+		RunWithReplicaClient(t, tt.name, func(t *testing.T, c litestream.ReplicaClient) {
+			t.Helper()
+
+			// Skip very long tests unless explicitly enabled
+			if tt.fileCount > 100 && os.Getenv("LITESTREAM_PITR_STRESS_TEST") == "" {
+				t.Skipf("Skipping %d file stress test (set LITESTREAM_PITR_STRESS_TEST=1 to enable)", tt.fileCount)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), tt.timeout)
+			defer cancel()
+
+			baseTime := time.Now().Add(-time.Duration(tt.fileCount) * time.Minute)
+			t.Logf("Creating %d LTX files starting from %v", tt.fileCount, baseTime)
+
+			// Create snapshot at TXID 1
+			snapshot := createLTXDataWithTimestamp(1, 1, baseTime, []byte("snapshot"))
+			if _, err := c.WriteLTXFile(ctx, litestream.SnapshotLevel, 1, 1, bytes.NewReader(snapshot)); err != nil {
+				t.Fatalf("WriteLTXFile(snapshot): %v", err)
+			}
+
+			// Create many L0 files with incrementing timestamps
+			for i := 2; i <= tt.fileCount; i++ {
+				ts := baseTime.Add(time.Duration(i-1) * time.Minute)
+				data := createLTXDataWithTimestamp(ltx.TXID(i), ltx.TXID(i), ts, []byte(fmt.Sprintf("file-%d", i)))
+				if _, err := c.WriteLTXFile(ctx, 0, ltx.TXID(i), ltx.TXID(i), bytes.NewReader(data)); err != nil {
+					t.Fatalf("WriteLTXFile(%d): %v", i, err)
+				}
+				if i%100 == 0 {
+					t.Logf("Created %d/%d files", i, tt.fileCount)
+				}
+			}
+
+			// Test 1: Iterate all L0 files without metadata (fast path)
+			t.Log("Testing L0 file iteration without metadata")
+			startFast := time.Now()
+			itr, err := c.LTXFiles(ctx, 0, 0, false)
+			if err != nil {
+				t.Fatalf("LTXFiles(useMetadata=false): %v", err)
+			}
+			var countFast int
+			for itr.Next() {
+				countFast++
+			}
+			if err := itr.Close(); err != nil {
+				t.Fatalf("Iterator close: %v", err)
+			}
+			durationFast := time.Since(startFast)
+			t.Logf("Fast iteration: %d files in %v", countFast, durationFast)
+
+			if countFast != tt.fileCount-1 {
+				t.Errorf("Fast iteration count: got %d, want %d", countFast, tt.fileCount-1)
+			}
+
+			// Test 2: Iterate all L0 files with metadata (required for PITR)
+			// This is the path that was hanging in issue #930
+			t.Log("Testing L0 file iteration with metadata (PITR path)")
+			startMeta := time.Now()
+			itrMeta, err := c.LTXFiles(ctx, 0, 0, true)
+			if err != nil {
+				t.Fatalf("LTXFiles(useMetadata=true): %v", err)
+			}
+			var countMeta int
+			for itrMeta.Next() {
+				countMeta++
+			}
+			if err := itrMeta.Close(); err != nil {
+				t.Fatalf("Iterator close: %v", err)
+			}
+			durationMeta := time.Since(startMeta)
+			t.Logf("Metadata iteration: %d files in %v", countMeta, durationMeta)
+
+			if countMeta != tt.fileCount-1 {
+				t.Errorf("Metadata iteration count: got %d, want %d", countMeta, tt.fileCount-1)
+			}
+
+			// Verify metadata iteration completed within reasonable time
+			// (issue #930 caused this to hang indefinitely)
+			if durationMeta > tt.timeout/2 {
+				t.Errorf("Metadata iteration took too long: %v (should be < %v)", durationMeta, tt.timeout/2)
+			}
+		})
+	}
+}
+
+// TestReplicaClient_PITR_TimestampFiltering tests that PITR correctly filters files
+// by timestamp across a range of LTX files.
+func TestReplicaClient_PITR_TimestampFiltering(t *testing.T) {
+	RunWithReplicaClient(t, "TimestampFilter", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
+
+		ctx := context.Background()
+		fileCount := 50
+		baseTime := time.Now().Add(-time.Duration(fileCount) * time.Minute)
+
+		// Create snapshot at TXID 1
+		snapshot := createLTXDataWithTimestamp(1, 1, baseTime, []byte("snapshot"))
+		if _, err := c.WriteLTXFile(ctx, litestream.SnapshotLevel, 1, 1, bytes.NewReader(snapshot)); err != nil {
+			t.Fatalf("WriteLTXFile(snapshot): %v", err)
+		}
+
+		// Create L0 files with known timestamps
+		for i := 2; i <= fileCount; i++ {
+			ts := baseTime.Add(time.Duration(i-1) * time.Minute)
+			data := createLTXDataWithTimestamp(ltx.TXID(i), ltx.TXID(i), ts, []byte(fmt.Sprintf("file-%d", i)))
+			if _, err := c.WriteLTXFile(ctx, 0, ltx.TXID(i), ltx.TXID(i), bytes.NewReader(data)); err != nil {
+				t.Fatalf("WriteLTXFile(%d): %v", i, err)
+			}
+		}
+
+		// Test filtering at various timestamp points
+		testPoints := []struct {
+			name        string
+			offsetMins  int
+			expectCount int
+		}{
+			{"Beginning", 5, 4},                   // Files 2-5 (4 files)
+			{"Quarter", 12, 11},                   // Files 2-12 (11 files)
+			{"Middle", 25, 24},                    // Files 2-25 (24 files)
+			{"ThreeQuarters", 37, 36},             // Files 2-37 (36 files)
+			{"End", fileCount - 1, fileCount - 2}, // All but last
+		}
+
+		for _, tp := range testPoints {
+			t.Run(tp.name, func(t *testing.T) {
+				targetTime := baseTime.Add(time.Duration(tp.offsetMins) * time.Minute)
+				t.Logf("Filtering files before %v (offset: %d mins)", targetTime, tp.offsetMins)
+
+				// Use LTXFiles with metadata to get accurate timestamps
+				itr, err := c.LTXFiles(ctx, 0, 0, true)
+				if err != nil {
+					t.Fatalf("LTXFiles: %v", err)
+				}
+				defer itr.Close()
+
+				var count int
+				for itr.Next() {
+					info := itr.Item()
+					if info.CreatedAt.Before(targetTime) {
+						count++
+					}
+				}
+
+				// Allow for timestamp precision variance
+				if count < tp.expectCount-1 || count > tp.expectCount+1 {
+					t.Errorf("Files before %v: got %d, expected ~%d", targetTime, count, tp.expectCount)
+				}
+			})
+		}
+	})
+}
+
+// TestReplicaClient_PITR_CalcRestorePlanWithManyFiles tests CalcRestorePlan with
+// a large number of LTX files. This ensures restore planning doesn't hang.
+func TestReplicaClient_PITR_CalcRestorePlanWithManyFiles(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	RunWithReplicaClient(t, "RestorePlan", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+
+		fileCount := 100
+		baseTime := time.Now().Add(-time.Duration(fileCount) * time.Minute)
+
+		// Create snapshot
+		snapshot := createLTXDataWithTimestamp(1, 1, baseTime, []byte("snapshot"))
+		if _, err := c.WriteLTXFile(ctx, litestream.SnapshotLevel, 1, 1, bytes.NewReader(snapshot)); err != nil {
+			t.Fatalf("WriteLTXFile(snapshot): %v", err)
+		}
+
+		// Create L0 files
+		for i := 2; i <= fileCount; i++ {
+			ts := baseTime.Add(time.Duration(i-1) * time.Minute)
+			data := createLTXDataWithTimestamp(ltx.TXID(i), ltx.TXID(i), ts, []byte(fmt.Sprintf("file-%d", i)))
+			if _, err := c.WriteLTXFile(ctx, 0, ltx.TXID(i), ltx.TXID(i), bytes.NewReader(data)); err != nil {
+				t.Fatalf("WriteLTXFile(%d): %v", i, err)
+			}
+		}
+
+		// Test restore plan calculation at various points
+		testTargets := []struct {
+			name     string
+			txID     ltx.TXID
+			minFiles int
+		}{
+			{"EarlyTXID", 10, 2},                   // snapshot + some L0
+			{"MidTXID", 50, 2},                     // snapshot + more L0
+			{"LateTXID", 90, 2},                    // snapshot + most L0
+			{"LatestTXID", ltx.TXID(fileCount), 2}, // all files
+		}
+
+		logger := slog.Default()
+
+		for _, target := range testTargets {
+			t.Run(target.name, func(t *testing.T) {
+				startTime := time.Now()
+
+				plan, err := litestream.CalcRestorePlan(ctx, c, target.txID, time.Time{}, logger)
+				if err != nil {
+					t.Fatalf("CalcRestorePlan(%d): %v", target.txID, err)
+				}
+
+				duration := time.Since(startTime)
+				t.Logf("CalcRestorePlan(txid=%d): %d files in %v", target.txID, len(plan), duration)
+
+				if len(plan) < target.minFiles {
+					t.Errorf("Plan has too few files: got %d, want >= %d", len(plan), target.minFiles)
+				}
+
+				// Verify plan doesn't take excessively long
+				if duration > 30*time.Second {
+					t.Errorf("CalcRestorePlan took too long: %v (should be < 30s)", duration)
+				}
+			})
+		}
+
+		// Test timestamp-based restore plan
+		t.Run("TimestampBased", func(t *testing.T) {
+			// Target halfway through the files
+			targetTime := baseTime.Add(time.Duration(fileCount/2) * time.Minute)
+			startTime := time.Now()
+
+			plan, err := litestream.CalcRestorePlan(ctx, c, 0, targetTime, logger)
+			if err != nil {
+				t.Fatalf("CalcRestorePlan(timestamp=%v): %v", targetTime, err)
+			}
+
+			duration := time.Since(startTime)
+			t.Logf("CalcRestorePlan(timestamp=%v): %d files in %v", targetTime, len(plan), duration)
+
+			if len(plan) < 2 {
+				t.Errorf("Plan has too few files: got %d, want >= 2", len(plan))
+			}
+
+			if duration > 60*time.Second {
+				t.Errorf("Timestamp-based CalcRestorePlan took too long: %v", duration)
+			}
+		})
+	})
+}
