@@ -499,16 +499,20 @@ func TestVFSFile_WriteBuffer(t *testing.T) {
 		t.Error("buffer file should not be empty")
 	}
 
-	// Close the file
-	f.Close()
+	// Don't call f.Close() - simulate a crash by just abandoning the file handle
+	// Close just the buffer file directly to release the handle
+	if f.bufferFile != nil {
+		f.bufferFile.Close()
+	}
+	f.cancel() // Stop any goroutines
 
 	// Verify buffer file still has content (simulating crash before sync)
 	stat, err = os.Stat(bufferPath)
 	if err != nil {
-		t.Fatalf("buffer file should still exist after close: %v", err)
+		t.Fatalf("buffer file should still exist after crash: %v", err)
 	}
 	if stat.Size() == 0 {
-		t.Error("buffer file should still have content after close")
+		t.Error("buffer file should still have content after crash")
 	}
 }
 
@@ -544,8 +548,12 @@ func TestVFSFile_WriteBufferRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Close without syncing (simulating crash)
-	f1.Close()
+	// Simulate crash by abandoning the file handle without syncing
+	// Close just the buffer file to release the handle
+	if f1.bufferFile != nil {
+		f1.bufferFile.Close()
+	}
+	f1.cancel() // Stop any goroutines
 
 	// Second: create a new VFSFile and recover from buffer
 	f2 := NewVFSFile(client, "test.db", logger)
@@ -564,13 +572,13 @@ func TestVFSFile_WriteBufferRecovery(t *testing.T) {
 		t.Errorf("expected 1 dirty page after recovery, got %d", len(f2.dirty))
 	}
 
-	// Read back the data from dirty page
-	readBuf := make([]byte, 18) // "recovery test data"
+	// Read back the data from dirty page (need full page buffer for proper read)
+	readBuf := make([]byte, pageSize)
 	if _, err := f2.ReadAt(readBuf, 0); err != nil {
 		t.Fatal(err)
 	}
-	if string(readBuf) != "recovery test data" {
-		t.Errorf("expected 'recovery test data', got %q", readBuf)
+	if string(readBuf[:18]) != "recovery test data" {
+		t.Errorf("expected 'recovery test data', got %q", string(readBuf[:18]))
 	}
 }
 

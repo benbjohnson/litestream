@@ -743,6 +743,13 @@ func (f *VFSFile) Close() error {
 		f.syncTicker.Stop()
 	}
 
+	// Final sync of dirty pages before closing
+	if f.writeEnabled && len(f.dirty) > 0 {
+		if err := f.syncToRemote(); err != nil {
+			f.logger.Error("failed to sync on close", "error", err)
+		}
+	}
+
 	f.cancel()
 	f.wg.Wait()
 
