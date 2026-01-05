@@ -73,6 +73,14 @@ var (
 	r2Bucket          = flag.String("r2-bucket", os.Getenv("LITESTREAM_R2_BUCKET"), "")
 )
 
+// Backblaze B2 settings (S3-compatible)
+var (
+	b2KeyID          = flag.String("b2-key-id", os.Getenv("LITESTREAM_B2_KEY_ID"), "")
+	b2ApplicationKey = flag.String("b2-application-key", os.Getenv("LITESTREAM_B2_APPLICATION_KEY"), "")
+	b2Endpoint       = flag.String("b2-endpoint", os.Getenv("LITESTREAM_B2_ENDPOINT"), "")
+	b2Bucket         = flag.String("b2-bucket", os.Getenv("LITESTREAM_B2_BUCKET"), "")
+)
+
 // Google cloud storage settings
 var (
 	gsBucket = flag.String("gs-bucket", os.Getenv("LITESTREAM_GS_BUCKET"), "")
@@ -241,6 +249,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewTigrisReplicaClient(tb)
 	case "r2":
 		return NewR2ReplicaClient(tb)
+	case "b2":
+		return NewB2ReplicaClient(tb)
 	default:
 		tb.Fatalf("invalid replica client type: %q", typ)
 		return nil
@@ -311,6 +321,33 @@ func NewR2ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Bucket = *r2Bucket
 	c.Path = path.Join("integration-tests", fmt.Sprintf("%016x", rand.Uint64()))
 	c.Endpoint = *r2Endpoint
+	c.ForcePathStyle = true
+	c.SignPayload = true
+	return c
+}
+
+// NewB2ReplicaClient returns a new Backblaze B2 client for integration testing.
+// B2 uses S3-compatible API with path-style URLs and signed payloads.
+func NewB2ReplicaClient(tb testing.TB) *s3.ReplicaClient {
+	tb.Helper()
+
+	if *b2KeyID == "" || *b2ApplicationKey == "" {
+		tb.Skip("b2 credentials not configured (set LITESTREAM_B2_KEY_ID/APPLICATION_KEY)")
+	}
+	if *b2Endpoint == "" {
+		tb.Skip("b2 endpoint not configured (set LITESTREAM_B2_ENDPOINT)")
+	}
+	if *b2Bucket == "" {
+		tb.Skip("b2 bucket not configured (set LITESTREAM_B2_BUCKET)")
+	}
+
+	c := s3.NewReplicaClient()
+	c.AccessKeyID = *b2KeyID
+	c.SecretAccessKey = *b2ApplicationKey
+	c.Region = "us-west-002" // B2 uses region in endpoint format
+	c.Bucket = *b2Bucket
+	c.Path = path.Join("integration-tests", fmt.Sprintf("%016x", rand.Uint64()))
+	c.Endpoint = *b2Endpoint
 	c.ForcePathStyle = true
 	c.SignPayload = true
 	return c

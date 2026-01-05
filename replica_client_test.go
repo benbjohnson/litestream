@@ -544,3 +544,160 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 
 	})
 }
+
+// TestReplicaClient_S3_MultipartThresholds tests multipart upload behavior at various
+// size thresholds. These tests are critical for catching S3-compatible provider issues
+// like #940, #941, #947 where multipart uploads fail with certain providers.
+//
+// NOTE: These tests skip moto due to multipart checksum validation issues (moto#8762).
+// They should be run against real cloud providers using the manual integration workflow.
+func TestReplicaClient_S3_MultipartThresholds(t *testing.T) {
+	if !slices.Contains(testingutil.ReplicaClientTypes(), "s3") {
+		t.Skip("Skipping S3-specific multipart threshold tests")
+	}
+
+	// Skip if using mock endpoint (moto has multipart checksum issues)
+	if endpoint := os.Getenv("LITESTREAM_S3_ENDPOINT"); endpoint != "" {
+		if strings.Contains(endpoint, "127.0.0.1") || strings.Contains(endpoint, "localhost") {
+			t.Skip("Skipping multipart tests with mock endpoint (moto has checksum issues)")
+		}
+	}
+
+	tests := []struct {
+		name     string
+		sizeMB   int
+		partSize int64
+	}{
+		{
+			name:     "AtThreshold_5MB",
+			sizeMB:   5,
+			partSize: 5 * 1024 * 1024,
+		},
+		{
+			name:     "AboveThreshold_10MB",
+			sizeMB:   10,
+			partSize: 5 * 1024 * 1024,
+		},
+		{
+			name:     "Large_50MB",
+			sizeMB:   50,
+			partSize: 10 * 1024 * 1024,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if !testingutil.Integration() {
+				t.Skip("skipping integration test, use -integration flag to run")
+			}
+
+			c := testingutil.NewS3ReplicaClient(t)
+			c.Path = fmt.Sprintf("multipart-test/%016x", rand.Uint64())
+			c.PartSize = tt.partSize
+			c.Concurrency = 3
+			defer testingutil.MustDeleteAll(t, c)
+
+			ctx := context.Background()
+			if err := c.Init(ctx); err != nil {
+				t.Fatalf("Init() error: %v", err)
+			}
+
+			size := tt.sizeMB * 1024 * 1024
+			payload := make([]byte, size)
+			for i := range payload {
+				payload[i] = byte(i % 256)
+			}
+			ltxData := createLTXData(1, 100, payload)
+
+			t.Logf("Testing %dMB file with %dMB parts", tt.sizeMB, tt.partSize/(1024*1024))
+
+			if _, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(100), bytes.NewReader(ltxData)); err != nil {
+				t.Fatalf("WriteLTXFile() error: %v", err)
+			}
+
+			r, err := c.OpenLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(100), 0, 0)
+			if err != nil {
+				t.Fatalf("OpenLTXFile() error: %v", err)
+			}
+			defer r.Close()
+
+			buf, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("ReadAll() error: %v", err)
+			}
+
+			if len(buf) != len(ltxData) {
+				t.Errorf("size mismatch: got %d, want %d", len(buf), len(ltxData))
+			}
+
+			if !bytes.Equal(buf, ltxData) {
+				t.Errorf("data mismatch: uploaded and downloaded data do not match")
+			}
+		})
+	}
+}
+
+// TestReplicaClient_S3_ConcurrencyLimits tests that concurrency limits are respected
+// during multipart uploads. This is important for providers like Cloudflare R2 that
+// have strict concurrent upload limits (issue #948).
+func TestReplicaClient_S3_ConcurrencyLimits(t *testing.T) {
+	if !slices.Contains(testingutil.ReplicaClientTypes(), "s3") {
+		t.Skip("Skipping S3-specific concurrency test")
+	}
+
+	// Skip if using mock endpoint
+	if endpoint := os.Getenv("LITESTREAM_S3_ENDPOINT"); endpoint != "" {
+		if strings.Contains(endpoint, "127.0.0.1") || strings.Contains(endpoint, "localhost") {
+			t.Skip("Skipping concurrency test with mock endpoint")
+		}
+	}
+
+	if !testingutil.Integration() {
+		t.Skip("skipping integration test, use -integration flag to run")
+	}
+
+	concurrencyLevels := []int{1, 2, 5}
+
+	for _, concurrency := range concurrencyLevels {
+		t.Run(fmt.Sprintf("Concurrency_%d", concurrency), func(t *testing.T) {
+			c := testingutil.NewS3ReplicaClient(t)
+			c.Path = fmt.Sprintf("concurrency-test/%016x", rand.Uint64())
+			c.PartSize = 5 * 1024 * 1024
+			c.Concurrency = concurrency
+			defer testingutil.MustDeleteAll(t, c)
+
+			ctx := context.Background()
+			if err := c.Init(ctx); err != nil {
+				t.Fatalf("Init() error: %v", err)
+			}
+
+			size := 15 * 1024 * 1024
+			payload := make([]byte, size)
+			for i := range payload {
+				payload[i] = byte(i % 256)
+			}
+			ltxData := createLTXData(1, 100, payload)
+
+			t.Logf("Testing 15MB file with concurrency=%d", concurrency)
+
+			if _, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(100), bytes.NewReader(ltxData)); err != nil {
+				t.Fatalf("WriteLTXFile() with concurrency=%d error: %v", concurrency, err)
+			}
+
+			r, err := c.OpenLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(100), 0, 0)
+			if err != nil {
+				t.Fatalf("OpenLTXFile() error: %v", err)
+			}
+			defer r.Close()
+
+			buf, err := io.ReadAll(r)
+			if err != nil {
+				t.Fatalf("ReadAll() error: %v", err)
+			}
+
+			if !bytes.Equal(buf, ltxData) {
+				t.Errorf("data mismatch at concurrency=%d", concurrency)
+			}
+		})
+	}
+}
