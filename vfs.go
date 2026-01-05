@@ -1223,10 +1223,10 @@ func (f *VFSFile) recoverWriteBuffer() (bool, error) {
 		return false, nil
 	}
 
-	// Read expected TXID
+	// Read expected TXID and page size from header
 	bufferTXID := ltx.TXID(binary.BigEndian.Uint64(hdr[8:16]))
 	pageSize := binary.BigEndian.Uint32(hdr[16:20])
-	pageCount := binary.BigEndian.Uint32(hdr[20:24])
+	// Note: pageCount at hdr[20:24] is not used; we read until EOF instead
 
 	// Validate expected TXID matches current remote state
 	if bufferTXID != f.expectedTXID {
@@ -1244,14 +1244,19 @@ func (f *VFSFile) recoverWriteBuffer() (bool, error) {
 		return false, nil
 	}
 
-	// Read pages
+	// Read all pages until EOF (not relying on pageCount since the same page
+	// may have been written multiple times, with later entries overwriting earlier).
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	for i := uint32(0); i < pageCount; i++ {
+	var maxPgno uint32
+	for {
 		// Read page number
 		var pgno uint32
 		if err := binary.Read(file, binary.BigEndian, &pgno); err != nil {
+			if err == io.EOF {
+				break // Normal end of file
+			}
 			f.logger.Warn("failed to read page number from buffer", "error", err)
 			break
 		}
@@ -1264,10 +1269,20 @@ func (f *VFSFile) recoverWriteBuffer() (bool, error) {
 		}
 
 		f.dirty[pgno] = data
+		if pgno > maxPgno {
+			maxPgno = pgno
+		}
+	}
+
+	// Update commit to reflect any pages that extend the database
+	if maxPgno > f.commit {
+		f.commit = maxPgno
 	}
 
 	f.logger.Info("recovered dirty pages from buffer",
 		"pages", len(f.dirty),
+		"maxPgno", maxPgno,
+		"commit", f.commit,
 		"txid", bufferTXID)
 
 	return len(f.dirty) > 0, nil

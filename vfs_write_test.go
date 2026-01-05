@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sort"
 	"sync"
 	"testing"
 	"time"
@@ -159,8 +160,15 @@ func createTestLTXFile(t *testing.T, client *writeTestReplicaClient, txid ltx.TX
 		t.Fatal(err)
 	}
 
-	for pgno, data := range pages {
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+	// Sort page numbers to ensure proper encoding order (page 1 must be first for snapshots)
+	pgnos := make([]uint32, 0, len(pages))
+	for pgno := range pages {
+		pgnos = append(pgnos, pgno)
+	}
+	sort.Slice(pgnos, func(i, j int) bool { return pgnos[i] < pgnos[j] })
+
+	for _, pgno := range pgnos {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, pages[pgno]); err != nil {
 			t.Fatal(err)
 		}
 	}
