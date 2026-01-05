@@ -191,7 +191,8 @@ func (vfs *VFS) requiresTempFile(flags sqlite3vfs.OpenFlag) bool {
 		sqlite3vfs.OpenTempJournal |
 		sqlite3vfs.OpenSubJournal |
 		sqlite3vfs.OpenSuperJournal |
-		sqlite3vfs.OpenTransientDB
+		sqlite3vfs.OpenTransientDB |
+		sqlite3vfs.OpenMainJournal
 	if flags&tempMask != 0 {
 		return true
 	}
