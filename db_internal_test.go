@@ -1058,3 +1058,106 @@ func TestDB_Monitor_DetectsSaltChangeAfterRestart(t *testing.T) {
 		t.Log("Monitor correctly detected changes after WAL salt reset")
 	}
 }
+
+// TestIsDiskFullError tests the disk full error detection helper.
+func TestIsDiskFullError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "no space left on device",
+			err:      errors.New("write /tmp/file: no space left on device"),
+			expected: true,
+		},
+		{
+			name:     "No Space Left On Device (uppercase)",
+			err:      errors.New("No Space Left On Device"),
+			expected: true,
+		},
+		{
+			name:     "disk quota exceeded",
+			err:      errors.New("write: disk quota exceeded"),
+			expected: true,
+		},
+		{
+			name:     "ENOSPC",
+			err:      errors.New("ENOSPC: cannot write file"),
+			expected: true,
+		},
+		{
+			name:     "EDQUOT",
+			err:      errors.New("error EDQUOT while writing"),
+			expected: true,
+		},
+		{
+			name:     "regular error",
+			err:      errors.New("connection refused"),
+			expected: false,
+		},
+		{
+			name:     "permission denied",
+			err:      errors.New("permission denied"),
+			expected: false,
+		},
+		{
+			name:     "wrapped disk full error",
+			err:      fmt.Errorf("sync failed: %w", errors.New("no space left on device")),
+			expected: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isDiskFullError(tt.err)
+			if result != tt.expected {
+				t.Errorf("isDiskFullError(%v) = %v, want %v", tt.err, result, tt.expected)
+			}
+		})
+	}
+}
+
+// TestIsSQLiteBusyError tests the SQLite busy error detection helper.
+func TestIsSQLiteBusyError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "database is locked",
+			err:      errors.New("database is locked"),
+			expected: true,
+		},
+		{
+			name:     "SQLITE_BUSY",
+			err:      errors.New("SQLITE_BUSY: cannot commit"),
+			expected: true,
+		},
+		{
+			name:     "regular error",
+			err:      errors.New("connection refused"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isSQLiteBusyError(tt.err)
+			if result != tt.expected {
+				t.Errorf("isSQLiteBusyError(%v) = %v, want %v", tt.err, result, tt.expected)
+			}
+		})
+	}
+}

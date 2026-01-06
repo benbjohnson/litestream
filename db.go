@@ -35,6 +35,11 @@ const (
 	DefaultTruncatePageN        = 121359 // ~500MB with 4KB page size
 	DefaultShutdownSyncTimeout  = 30 * time.Second
 	DefaultShutdownSyncInterval = 500 * time.Millisecond
+
+	// Sync error backoff configuration.
+	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
+	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
+	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -851,6 +856,19 @@ func isSQLiteBusyError(err error) bool {
 	errStr := err.Error()
 	return strings.Contains(errStr, "database is locked") ||
 		strings.Contains(errStr, "SQLITE_BUSY")
+}
+
+// isDiskFullError returns true if the error indicates disk space issues.
+// This includes "no space left on device" (ENOSPC) and "disk quota exceeded" (EDQUOT).
+func isDiskFullError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := strings.ToLower(err.Error())
+	return strings.Contains(errStr, "no space left on device") ||
+		strings.Contains(errStr, "disk quota exceeded") ||
+		strings.Contains(errStr, "enospc") ||
+		strings.Contains(errStr, "edquot")
 }
 
 // walFileSize returns the size of the WAL file in bytes.
@@ -1993,6 +2011,9 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // When a change is detected, we call Sync() which performs full verification
 // and replication. The cost per tick is just one stat() call plus a 32-byte
 // read, which is negligible.
+//
+// Implements exponential backoff on repeated sync errors to prevent disk churn
+// when persistent errors (like disk full) occur. See issue #927.
 func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
@@ -2001,12 +2022,26 @@ func (db *DB) monitor() {
 	var lastWALSize int64
 	var lastWALHeader []byte
 
+	// Backoff state for error handling.
+	var backoff time.Duration
+	var lastLogTime time.Time
+	var consecutiveErrs int
+
 	for {
 		// Wait for ticker or context close.
 		select {
 		case <-db.ctx.Done():
 			return
 		case <-ticker.C:
+		}
+
+		// If in backoff mode, wait additional time before retrying.
+		if backoff > 0 {
+			select {
+			case <-db.ctx.Done():
+				return
+			case <-time.After(backoff):
+			}
 		}
 
 		// Check if WAL has changed before doing expensive sync.
@@ -2045,8 +2080,43 @@ func (db *DB) monitor() {
 		lastWALHeader = walHeader
 
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-			db.Logger.Error("sync error", "error", err)
+			consecutiveErrs++
+
+			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
+			if backoff == 0 {
+				backoff = db.MonitorInterval
+			} else {
+				backoff *= 2
+				if backoff > DefaultSyncBackoffMax {
+					backoff = DefaultSyncBackoffMax
+				}
+			}
+
+			// Log with rate limiting to avoid log spam during persistent errors.
+			if time.Since(lastLogTime) >= SyncErrorLogInterval {
+				db.Logger.Error("sync error",
+					"error", err,
+					"consecutive_errors", consecutiveErrs,
+					"backoff", backoff)
+				lastLogTime = time.Now()
+			}
+
+			// Try to clean up stale temp files after persistent disk errors.
+			if isDiskFullError(err) && consecutiveErrs >= 3 {
+				db.Logger.Warn("attempting temp file cleanup due to persistent disk errors")
+				if cleanupErr := removeTmpFiles(db.metaPath); cleanupErr != nil {
+					db.Logger.Error("temp file cleanup failed", "error", cleanupErr)
+				}
+			}
+			continue
 		}
+
+		// Success - reset backoff and error counter.
+		if consecutiveErrs > 0 {
+			db.Logger.Info("sync recovered", "previous_errors", consecutiveErrs)
+		}
+		backoff = 0
+		consecutiveErrs = 0
 	}
 }
 
