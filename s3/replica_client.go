@@ -396,6 +396,18 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Configure uploader with custom options if specified
 	uploaderOpts := []func(*manager.Uploader){}
+
+	// For S3-compatible providers, disable automatic checksum calculation on the Uploader.
+	// The S3 client's RequestChecksumCalculation setting only affects single-part uploads.
+	// Multipart uploads via the Uploader require this separate setting (added in s3/manager v1.20.0).
+	// See: https://github.com/benbjohnson/litestream/issues/948
+	// See: https://github.com/aws/aws-sdk-go-v2/issues/3007
+	if c.Endpoint != "" {
+		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
+			u.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		})
+	}
+
 	if c.PartSize > 0 {
 		uploaderOpts = append(uploaderOpts, func(u *manager.Uploader) {
 			u.PartSize = c.PartSize
