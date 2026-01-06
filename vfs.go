@@ -1069,7 +1069,8 @@ func (f *VFSFile) syncToRemote() error {
 
 	// Clear write buffer after successful sync
 	if err := f.clearWriteBuffer(); err != nil {
-		f.logger.Warn("failed to clear write buffer", "error", err)
+		f.logger.Error("failed to clear write buffer", "error", err)
+		return fmt.Errorf("clear write buffer: %w", err)
 	}
 
 	return nil
