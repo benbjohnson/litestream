@@ -371,7 +371,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 					"level", lvl.Level,
 					"dbs", notReadyDBs,
 					"timeout", DefaultDBInitTimeout,
-					"hint", "database may have corrupted local state or blocked transactions; try removing .sqlite-litestream directory and restarting")
+					"hint", "database may have corrupted local state or blocked transactions; try removing -litestream directory and restarting")
 			}
 			retryDeadline = time.Time{}
 		}
