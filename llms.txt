@@ -1,83 +1,63 @@
 # Litestream
 
-Disaster recovery tool for SQLite that runs as a background process and safely replicates changes incrementally to S3, GCS, Azure Blob Storage, SFTP, or another file system.
+Disaster recovery tool for SQLite. Replicates WAL changes to S3, GCS, Azure, SFTP, or local filesystem.
 
-## Core Documentation
+## Quick Start for AI Contributors
 
-- [AGENTS.md](AGENTS.md): AI agent instructions, architectural patterns, and anti-patterns
-- [docs/SQLITE_INTERNALS.md](docs/SQLITE_INTERNALS.md): Critical SQLite knowledge including WAL format and 1GB lock page
-- [docs/LTX_FORMAT.md](docs/LTX_FORMAT.md): LTX (Log Transaction) format specification for replication
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): Deep technical details of Litestream components
+1. Read [AI_PR_GUIDE.md](AI_PR_GUIDE.md) - PR quality requirements
+2. Read [AGENTS.md](AGENTS.md) - Project overview and checklist
+3. Check [CONTRIBUTING.md](CONTRIBUTING.md) - What we accept
+4. Show investigation evidence in PRs
 
-## Implementation Guides
+## PR Checklist
 
-- [docs/REPLICA_CLIENT_GUIDE.md](docs/REPLICA_CLIENT_GUIDE.md): Guide for implementing storage backends
-- [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md): Comprehensive testing strategies including >1GB database tests
+- [ ] Evidence of problem (logs, file patterns)
+- [ ] Clear scope (what PR does/doesn't do)
+- [ ] Runnable test commands
+- [ ] Race detector tested (`go test -race`)
 
-## Core Components
+## Documentation
 
-- [db.go](db.go): Database monitoring, WAL reading, checkpoint management
-- [replica.go](replica.go): Replication management, position tracking, synchronization
-- [store.go](store.go): Multi-database coordination, compaction scheduling
-- [replica_client.go](replica_client.go): Interface definition for storage backends
+| Document | Purpose |
+|----------|---------|
+| [AGENTS.md](AGENTS.md) | Project overview, critical rules |
+| [AI_PR_GUIDE.md](AI_PR_GUIDE.md) | PR templates, common mistakes |
+| [docs/PATTERNS.md](docs/PATTERNS.md) | Code patterns and anti-patterns |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Component details |
+| [docs/SQLITE_INTERNALS.md](docs/SQLITE_INTERNALS.md) | WAL format, 1GB lock page |
+| [docs/LTX_FORMAT.md](docs/LTX_FORMAT.md) | Replication format |
+| [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md) | Test strategies |
+| [docs/REPLICA_CLIENT_GUIDE.md](docs/REPLICA_CLIENT_GUIDE.md) | Storage backends |
+
+## Core Files
+
+| File | Purpose |
+|------|---------|
+| `db.go` | Database monitoring, WAL, checkpoints |
+| `replica.go` | Replication management |
+| `store.go` | Multi-database coordination |
+| `replica_client.go` | Storage backend interface |
 
 ## Storage Backends
 
-- [s3/replica_client.go](s3/replica_client.go): AWS S3 and compatible storage implementation
-- [gs/replica_client.go](gs/replica_client.go): Google Cloud Storage implementation
-- [abs/replica_client.go](abs/replica_client.go): Azure Blob Storage implementation
-- [sftp/replica_client.go](sftp/replica_client.go): SFTP implementation
-- [file/replica_client.go](file/replica_client.go): Local file system implementation
-- [nats/replica_client.go](nats/replica_client.go): NATS JetStream implementation
+- `s3/replica_client.go` - AWS S3
+- `gs/replica_client.go` - Google Cloud Storage
+- `abs/replica_client.go` - Azure Blob Storage
+- `sftp/replica_client.go` - SFTP
+- `file/replica_client.go` - Local filesystem
+- `nats/replica_client.go` - NATS JetStream
 
 ## Critical Concepts
 
-### SQLite Lock Page
-The lock page at exactly 1GB (0x40000000) must always be skipped during replication. Page number varies by page size: 262145 for 4KB pages, 131073 for 8KB pages.
+- **Lock page at 1GB** - Always skip page at 0x40000000
+- **LTX files are immutable** - Never modify after creation
+- **Single replica per DB** - One destination per database
+- **Layer boundaries** - DB handles state, Replica handles replication
 
-### LTX Format
-Immutable, append-only files containing database changes. Files are named by transaction ID ranges (e.g., 0000000001-0000000064.ltx).
+## Build
 
-### Compaction Levels
-- Level 0: Raw LTX files (no compaction)
-- Level 1: 30-second windows
-- Level 2: 5-minute windows
-- Level 3: 1-hour windows
-- Snapshots: Daily full database state
-
-### Architectural Boundaries
-- **DB Layer (db.go)**: Handles database state, restoration logic, monitoring
-- **Replica Layer (replica.go)**: Focuses solely on replication concerns
-- **Storage Layer**: Implements ReplicaClient interface for various backends
-
-## Key Patterns
-
-### Atomic File Operations
-Always write to temporary file then rename for atomicity.
-
-### Error Handling
-Return errors immediately, don't log and continue.
-
-### Eventual Consistency
-Always prefer local files during compaction to handle eventually consistent storage.
-
-### Locking
-Use Lock() for writes, RLock() for reads. Never use RLock() when modifying state.
-
-## Testing Requirements
-
-- Test with databases >1GB to verify lock page handling
-- Run with race detector enabled (-race flag)
-- Test with various page sizes (4KB, 8KB, 16KB, 32KB)
-- Verify eventual consistency handling with storage backends
-
-## Configuration
-
-Primary configuration via YAML file (etc/litestream.yml) or environment variables. Each database replicates to exactly one remote destination.
-
-## Build Requirements
-
-- Go 1.24+
-- No CGO required for main binary (uses modernc.org/sqlite)
-- CGO required only for VFS functionality (build with -tags vfs)
-- Always build binaries into bin/ directory (gitignored)
+```bash
+go build -o bin/litestream ./cmd/litestream
+go test -race -v ./...
+pre-commit run --all-files
+```

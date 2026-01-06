@@ -1,81 +1,42 @@
-# GEMINI.md - Gemini Code Assist Configuration for Litestream
+# GEMINI.md - Gemini Code Assist Configuration
 
-This file provides Gemini-specific configuration and notes. For comprehensive project documentation, see AGENTS.md.
+Gemini-specific configuration for Litestream. See [AGENTS.md](AGENTS.md) for project documentation.
 
-## Primary Documentation
+## Before Contributing
 
-**See AGENTS.md** for complete architectural guidance, patterns, and anti-patterns for working with Litestream.
+1. Read [AI_PR_GUIDE.md](AI_PR_GUIDE.md) - PR quality requirements
+2. Read [AGENTS.md](AGENTS.md) - Project overview and checklist
+3. Check [CONTRIBUTING.md](CONTRIBUTING.md) - What we accept
 
-## Gemini-Specific Configuration
+## File Exclusions
 
-### File Exclusions
-Check `.aiexclude` file for patterns of files that should not be shared with Gemini (similar to `.gitignore`).
+Check `.aiexclude` for patterns of files that should not be shared with Gemini.
 
-### Strengths for This Project
+## Gemini Strengths for This Project
 
-1. **Test Generation**: Excellent at creating comprehensive test suites
-2. **Documentation**: Strong at generating and updating documentation
-3. **Code Review**: Good at identifying potential issues and security concerns
-4. **Local Codebase Awareness**: Enable for full repository understanding
+- **Test generation** - Creating comprehensive test suites
+- **Documentation** - Generating and updating docs
+- **Code review** - Identifying issues and security concerns
+- **Local codebase awareness** - Enable for full repository understanding
 
-## Key Project Concepts
+## Documentation
 
-### SQLite Lock Page
-- Must skip page at 1GB boundary (0x40000000)
-- Page number varies by page size (262145 for 4KB pages)
-- See docs/SQLITE_INTERNALS.md for details
+Load as needed:
 
-### LTX Format
-- Immutable replication files
-- Named by transaction ID ranges
-- See docs/LTX_FORMAT.md for specification
+- [docs/PATTERNS.md](docs/PATTERNS.md) - Code patterns when writing code
+- [docs/SQLITE_INTERNALS.md](docs/SQLITE_INTERNALS.md) - For WAL/page work
+- [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md) - For test generation
 
-### Architectural Boundaries
-- DB layer (db.go): Database state and restoration
-- Replica layer (replica.go): Replication only
-- Storage layer: ReplicaClient implementations
+## Critical Rules
 
-## Testing Focus
+- **Lock page at 1GB** - Skip page at 0x40000000
+- **LTX files are immutable** - Never modify after creation
+- **Layer boundaries** - DB handles state, Replica handles replication
 
-When generating tests:
-- Include >1GB database tests for lock page verification
-- Add race condition tests with -race flag
-- Test various page sizes (4KB, 8KB, 16KB, 32KB)
-- Include eventual consistency scenarios
-
-## Common Tasks
-
-### Adding Storage Backend
-1. Implement ReplicaClient interface
-2. Follow existing patterns (s3/, gs/, abs/)
-3. Handle eventual consistency
-4. Generate comprehensive tests
-
-### Refactoring
-1. Respect layer boundaries (DB vs Replica)
-2. Maintain current constraints (single replica authority, LTX-only restores)
-3. Use atomic file operations
-4. Return errors properly (don't just log)
-
-## Build and Test Commands
+## Quick Commands
 
 ```bash
-# Build without CGO
 go build -o bin/litestream ./cmd/litestream
-
-# Test with race detection
 go test -race -v ./...
-
-# Test specific backend
-go test -v ./replica_client_test.go -integration s3
+pre-commit run --all-files
 ```
-
-## Configuration Reference
-
-See `etc/litestream.yml` for configuration examples. Remember: each database replicates to exactly one remote destination.
-
-## Additional Resources
-
-- llms.txt: Quick navigation index
-- docs/: Deep technical documentation
-- .claude/commands/: Task-specific commands (if using with Claude Code)
