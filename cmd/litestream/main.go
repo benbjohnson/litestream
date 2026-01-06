@@ -159,6 +159,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
+	case "status":
+		return (&StatusCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	case "ltx":
@@ -191,6 +193,7 @@ The commands are:
 	ltx          list available LTX files for a database
 	replicate    runs a server to replicate databases
 	restore      recovers database backup from a replica
+	status       display replication status for databases
 	version      prints the binary version
 `[1:])
 }
