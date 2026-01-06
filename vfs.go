@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -35,11 +34,6 @@ const (
 
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
-
-	// Write buffer file format constants
-	writeBufferMagic   = "LSWB"            // Litestream Write Buffer
-	writeBufferVersion = uint32(1)         // Format version
-	writeBufferHdrSize = 4 + 4 + 8 + 4 + 4 // magic(4) + version(4) + expectedTXID(8) + pageSize(4) + pageCount(4)
 )
 
 // ErrConflict is returned when the remote replica has newer transactions than expected.
@@ -117,7 +111,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	// Initialize write support if enabled
 	if vfs.WriteEnabled {
 		f.writeEnabled = true
-		f.dirty = make(map[uint32][]byte)
+		f.dirty = make(map[uint32]int64)
 		f.syncInterval = vfs.WriteSyncInterval
 		if f.syncInterval == 0 {
 			f.syncInterval = DefaultSyncInterval
@@ -455,15 +449,16 @@ type VFSFile struct {
 	commit          uint32
 
 	// Write support fields (only used when writeEnabled is true)
-	writeEnabled  bool              // Whether write support is enabled
-	dirty         map[uint32][]byte // Dirty pages: pgno -> page data
-	pendingTXID   ltx.TXID          // Next TXID to use for sync
-	expectedTXID  ltx.TXID          // Expected remote TXID (for conflict detection)
-	bufferFile    *os.File          // Temp file for durability
-	bufferPath    string            // Path to buffer file
-	syncTicker    *time.Ticker      // Ticker for periodic sync
-	syncInterval  time.Duration     // Interval for periodic sync
-	inTransaction bool              // True during active write transaction
+	writeEnabled   bool             // Whether write support is enabled
+	dirty          map[uint32]int64 // Dirty pages: pgno -> offset in buffer file
+	pendingTXID    ltx.TXID         // Next TXID to use for sync
+	expectedTXID   ltx.TXID         // Expected remote TXID (for conflict detection)
+	bufferFile     *os.File         // Temp file for durability
+	bufferPath     string           // Path to buffer file
+	bufferNextOff  int64            // Next write offset in buffer file
+	syncTicker     *time.Ticker     // Ticker for periodic sync
+	syncInterval   time.Duration    // Interval for periodic sync
+	inTransaction  bool             // True during active write transaction
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -580,14 +575,7 @@ func (f *VFSFile) Open() error {
 		f.pendingTXID = pos.TXID + 1
 		f.logger.Debug("write support enabled", "expectedTXID", f.expectedTXID, "pendingTXID", f.pendingTXID)
 
-		// Attempt to recover dirty pages from write buffer
-		if recovered, err := f.recoverWriteBuffer(); err != nil {
-			f.logger.Warn("failed to recover write buffer", "error", err)
-		} else if recovered {
-			f.logger.Info("recovered dirty pages from write buffer")
-		}
-
-		// Initialize write buffer file for durability
+		// Initialize write buffer file for durability (discards any existing buffer)
 		if err := f.initWriteBuffer(); err != nil {
 			f.logger.Warn("failed to initialize write buffer", "error", err)
 		}
@@ -768,7 +756,13 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	// Check dirty pages first (takes priority over cache and remote)
 	if f.writeEnabled {
 		f.mu.Lock()
-		if data, ok := f.dirty[pgno]; ok {
+		if bufferOff, ok := f.dirty[pgno]; ok {
+			// Read page from buffer file
+			data := make([]byte, pageSize)
+			if _, err := f.bufferFile.ReadAt(data, bufferOff); err != nil {
+				f.mu.Unlock()
+				return 0, fmt.Errorf("read dirty page from buffer: %w", err)
+			}
 			n = copy(p, data[pageOffset:])
 			f.mu.Unlock()
 			f.logger.Debug("dirty page hit", "page", pgno, "n", n)
@@ -879,11 +873,15 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	// Get or create dirty page
-	page, ok := f.dirty[pgno]
-	if !ok {
-		// Read existing page data first
-		page = make([]byte, pageSize)
+	// Get page data - either from buffer file (if dirty) or from cache/remote
+	page := make([]byte, pageSize)
+	if bufferOff, ok := f.dirty[pgno]; ok {
+		// Page is already dirty - read from buffer file
+		if _, err := f.bufferFile.ReadAt(page, bufferOff); err != nil {
+			return 0, fmt.Errorf("read dirty page from buffer: %w", err)
+		}
+	} else {
+		// Page is not dirty - read from cache/remote
 		if err := f.readPageForWrite(pgno, page); err != nil {
 			// If page doesn't exist, use zero-filled page
 			f.logger.Debug("page not found, using empty page", "pgno", pgno)
@@ -892,14 +890,13 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 
 	// Apply write to page
 	n = copy(page[pageOffset:], b)
-	f.dirty[pgno] = page
 
 	// Update commit count if this extends the database
 	if pgno > f.commit {
 		f.commit = pgno
 	}
 
-	// Write to buffer for durability
+	// Write to buffer for durability (this updates f.dirty with the offset)
 	if err := f.writeToBuffer(pgno, page); err != nil {
 		f.logger.Error("failed to write to buffer", "error", err)
 		return 0, fmt.Errorf("write to buffer: %w", err)
@@ -1052,20 +1049,22 @@ func (f *VFSFile) syncToRemote() error {
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
 
 	// Update index with synced pages and update cache
-	for pgno, data := range f.dirty {
+	for pgno, bufferOff := range f.dirty {
 		f.index[pgno] = ltx.PageIndexElem{
 			Level:   0,
 			MinTXID: info.MinTXID,
 			MaxTXID: info.MaxTXID,
 		}
-		// Copy data to cache
-		cachedData := make([]byte, len(data))
-		copy(cachedData, data)
+		// Read data from buffer and copy to cache
+		cachedData := make([]byte, f.pageSize)
+		if _, err := f.bufferFile.ReadAt(cachedData, bufferOff); err != nil {
+			return fmt.Errorf("read page %d from buffer for cache: %w", pgno, err)
+		}
 		f.cache.Add(pgno, cachedData)
 	}
 
 	// Clear dirty pages
-	f.dirty = make(map[uint32][]byte)
+	f.dirty = make(map[uint32]int64)
 
 	// Clear write buffer after successful sync
 	if err := f.clearWriteBuffer(); err != nil {
@@ -1146,7 +1145,13 @@ func (f *VFSFile) createLTXFromDirty() ([]byte, error) {
 			continue // Skip lock page
 		}
 
-		data := f.dirty[pgno]
+		// Read page data from buffer file
+		bufferOff := f.dirty[pgno]
+		data := make([]byte, f.pageSize)
+		if _, err := f.bufferFile.ReadAt(data, bufferOff); err != nil {
+			return nil, fmt.Errorf("read page %d from buffer: %w", pgno, err)
+		}
+
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 			return nil, fmt.Errorf("encode page %d: %w", pgno, err)
 		}
@@ -1161,7 +1166,7 @@ func (f *VFSFile) createLTXFromDirty() ([]byte, error) {
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
-// Must be called with f.mu held.
+// Any existing buffer content is discarded since unsync'd changes are lost on restart.
 func (f *VFSFile) initWriteBuffer() error {
 	if f.bufferPath == "" {
 		return nil // No buffer configured
@@ -1172,175 +1177,43 @@ func (f *VFSFile) initWriteBuffer() error {
 		return fmt.Errorf("create buffer directory: %w", err)
 	}
 
-	// Open or create buffer file
-	file, err := os.OpenFile(f.bufferPath, os.O_RDWR|os.O_CREATE, 0644)
+	// Open or create buffer file, truncating any existing content
+	file, err := os.OpenFile(f.bufferPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0644)
 	if err != nil {
 		return fmt.Errorf("open buffer file: %w", err)
 	}
 	f.bufferFile = file
+	f.bufferNextOff = 0
 
 	return nil
 }
 
-// recoverWriteBuffer attempts to recover dirty pages from the write buffer.
-// Returns true if recovery was successful, false if buffer was stale/invalid.
-func (f *VFSFile) recoverWriteBuffer() (bool, error) {
-	if f.bufferPath == "" {
-		return false, nil
-	}
-
-	file, err := os.Open(f.bufferPath)
-	if os.IsNotExist(err) {
-		return false, nil
-	} else if err != nil {
-		return false, fmt.Errorf("open buffer file: %w", err)
-	}
-	defer file.Close()
-
-	// Check file size
-	stat, err := file.Stat()
-	if err != nil {
-		return false, fmt.Errorf("stat buffer file: %w", err)
-	}
-	if stat.Size() < int64(writeBufferHdrSize) {
-		f.logger.Debug("buffer file too small, discarding")
-		return false, nil
-	}
-
-	// Read header
-	hdr := make([]byte, writeBufferHdrSize)
-	if _, err := io.ReadFull(file, hdr); err != nil {
-		return false, fmt.Errorf("read buffer header: %w", err)
-	}
-
-	// Validate magic
-	if string(hdr[0:4]) != writeBufferMagic {
-		f.logger.Debug("invalid buffer magic, discarding")
-		return false, nil
-	}
-
-	// Validate version
-	version := binary.BigEndian.Uint32(hdr[4:8])
-	if version != writeBufferVersion {
-		f.logger.Debug("incompatible buffer version", "version", version)
-		return false, nil
-	}
-
-	// Read expected TXID and page size from header
-	bufferTXID := ltx.TXID(binary.BigEndian.Uint64(hdr[8:16]))
-	pageSize := binary.BigEndian.Uint32(hdr[16:20])
-	// Note: pageCount at hdr[20:24] is not used; we read until EOF instead
-
-	// Validate expected TXID matches current remote state
-	if bufferTXID != f.expectedTXID {
-		f.logger.Info("buffer TXID mismatch, discarding",
-			"buffer", bufferTXID,
-			"expected", f.expectedTXID)
-		return false, nil
-	}
-
-	// Validate page size matches
-	if pageSize != f.pageSize {
-		f.logger.Info("buffer page size mismatch, discarding",
-			"buffer", pageSize,
-			"expected", f.pageSize)
-		return false, nil
-	}
-
-	// Read all pages until EOF (not relying on pageCount since the same page
-	// may have been written multiple times, with later entries overwriting earlier).
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	var maxPgno uint32
-	for {
-		// Read page number
-		var pgno uint32
-		if err := binary.Read(file, binary.BigEndian, &pgno); err != nil {
-			if err == io.EOF {
-				break // Normal end of file
-			}
-			f.logger.Warn("failed to read page number from buffer", "error", err)
-			break
-		}
-
-		// Read page data
-		data := make([]byte, pageSize)
-		if _, err := io.ReadFull(file, data); err != nil {
-			f.logger.Warn("failed to read page data from buffer", "error", err)
-			break
-		}
-
-		f.dirty[pgno] = data
-		if pgno > maxPgno {
-			maxPgno = pgno
-		}
-	}
-
-	// Update commit to reflect any pages that extend the database
-	if maxPgno > f.commit {
-		f.commit = maxPgno
-	}
-
-	f.logger.Info("recovered dirty pages from buffer",
-		"pages", len(f.dirty),
-		"maxPgno", maxPgno,
-		"commit", f.commit,
-		"txid", bufferTXID)
-
-	return len(f.dirty) > 0, nil
-}
-
-// writeToBuffer appends a dirty page to the write buffer for durability.
+// writeToBuffer writes a dirty page to the write buffer for durability.
+// If the page already exists in the buffer, it overwrites at the same offset.
+// Otherwise, it appends to the end of the file.
 // Must be called with f.mu held.
 func (f *VFSFile) writeToBuffer(pgno uint32, data []byte) error {
 	if f.bufferFile == nil {
 		return nil // No buffer configured
 	}
 
-	// Get current file size to determine if we need to write header
-	stat, err := f.bufferFile.Stat()
-	if err != nil {
-		return fmt.Errorf("stat buffer file: %w", err)
+	var writeOffset int64
+	if existingOff, ok := f.dirty[pgno]; ok {
+		// Page already exists - overwrite at same offset
+		writeOffset = existingOff
+	} else {
+		// New page - append to end of file
+		writeOffset = f.bufferNextOff
+		f.bufferNextOff += int64(len(data))
 	}
 
-	writeOffset := stat.Size()
-	if stat.Size() == 0 {
-		// Write header
-		hdr := make([]byte, writeBufferHdrSize)
-		copy(hdr[0:4], writeBufferMagic)
-		binary.BigEndian.PutUint32(hdr[4:8], writeBufferVersion)
-		binary.BigEndian.PutUint64(hdr[8:16], uint64(f.expectedTXID))
-		binary.BigEndian.PutUint32(hdr[16:20], f.pageSize)
-		binary.BigEndian.PutUint32(hdr[20:24], 0) // pageCount placeholder
-
-		if _, err := f.bufferFile.WriteAt(hdr, 0); err != nil {
-			return fmt.Errorf("write buffer header: %w", err)
-		}
-		writeOffset = writeBufferHdrSize
-	}
-
-	// Append page entry at end of file
-	entry := make([]byte, 4+len(data))
-	binary.BigEndian.PutUint32(entry[0:4], pgno)
-	copy(entry[4:], data)
-
-	if _, err := f.bufferFile.WriteAt(entry, writeOffset); err != nil {
+	// Write page data (no header, just raw page data)
+	if _, err := f.bufferFile.WriteAt(data, writeOffset); err != nil {
 		return fmt.Errorf("write page to buffer: %w", err)
 	}
 
-	// Update page count in header
-	pageCount := uint32(len(f.dirty))
-	countBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(countBuf, pageCount)
-	if _, err := f.bufferFile.WriteAt(countBuf, 20); err != nil {
-		return fmt.Errorf("update buffer page count: %w", err)
-	}
-
-	// Sync buffer to disk for durability
-	if err := f.bufferFile.Sync(); err != nil {
-		return fmt.Errorf("sync buffer: %w", err)
-	}
+	// Update dirty map with offset
+	f.dirty[pgno] = writeOffset
 
 	return nil
 }
@@ -1356,15 +1229,8 @@ func (f *VFSFile) clearWriteBuffer() error {
 		return fmt.Errorf("truncate buffer: %w", err)
 	}
 
-	// Seek to beginning
-	if _, err := f.bufferFile.Seek(0, 0); err != nil {
-		return fmt.Errorf("seek buffer: %w", err)
-	}
-
-	// Sync truncation
-	if err := f.bufferFile.Sync(); err != nil {
-		return fmt.Errorf("sync buffer truncation: %w", err)
-	}
+	// Reset next write offset
+	f.bufferNextOff = 0
 
 	return nil
 }

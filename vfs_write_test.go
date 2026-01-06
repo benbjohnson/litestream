@@ -190,6 +190,35 @@ func createTestLTXFile(t *testing.T, client *writeTestReplicaClient, txid ltx.TX
 	client.mu.Unlock()
 }
 
+// setupWriteableVFSFile creates a VFSFile with write support enabled and a buffer file.
+func setupWriteableVFSFile(t *testing.T, client *writeTestReplicaClient) *VFSFile {
+	t.Helper()
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "test.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+
+	// Create a temporary buffer file
+	tmpFile, err := os.CreateTemp("", "litestream-test-buffer-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.bufferFile = tmpFile
+	f.bufferPath = tmpFile.Name()
+	f.bufferNextOff = 0
+
+	t.Cleanup(func() {
+		if f.bufferFile != nil {
+			f.bufferFile.Close()
+		}
+		os.Remove(f.bufferPath)
+	})
+
+	return f
+}
+
 func TestVFSFile_WriteEnabled(t *testing.T) {
 	client := newWriteTestReplicaClient()
 
@@ -203,7 +232,7 @@ func TestVFSFile_WriteEnabled(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
+	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 
 	if err := f.Open(); err != nil {
@@ -229,12 +258,8 @@ func TestVFSFile_WriteAt(t *testing.T) {
 	copy(initialPage, "initial data")
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	// Create VFSFile directly with write enabled
-	logger := slog.Default()
-	f := NewVFSFile(client, "test.db", logger)
-	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
-	f.syncInterval = 0
+	// Create VFSFile with write support
+	f := setupWriteableVFSFile(t, client)
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -278,12 +303,8 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 	initialPage := make([]byte, pageSize)
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	// Create VFSFile directly with write enabled
-	logger := slog.Default()
-	f := NewVFSFile(client, "test.db", logger)
-	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
-	f.syncInterval = 0
+	// Create VFSFile with write support
+	f := setupWriteableVFSFile(t, client)
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -327,12 +348,8 @@ func TestVFSFile_ConflictDetection(t *testing.T) {
 	initialPage := make([]byte, pageSize)
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	// Create VFSFile directly with write enabled
-	logger := slog.Default()
-	f := NewVFSFile(client, "test.db", logger)
-	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
-	f.syncInterval = 0
+	// Create VFSFile with write support
+	f := setupWriteableVFSFile(t, client)
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -365,12 +382,8 @@ func TestVFSFile_TransactionTracking(t *testing.T) {
 	initialPage := make([]byte, pageSize)
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	// Create VFSFile directly with write enabled
-	logger := slog.Default()
-	f := NewVFSFile(client, "test.db", logger)
-	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
-	f.syncInterval = 0
+	// Create VFSFile with write support
+	f := setupWriteableVFSFile(t, client)
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -426,12 +439,8 @@ func TestVFSFile_Truncate(t *testing.T) {
 	page2 := make([]byte, pageSize)
 	createTestLTXFile(t, client, 1, pageSize, 2, map[uint32][]byte{1: page1, 2: page2})
 
-	// Create VFSFile directly with write enabled
-	logger := slog.Default()
-	f := NewVFSFile(client, "test.db", logger)
-	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
-	f.syncInterval = 0
+	// Create VFSFile with write support
+	f := setupWriteableVFSFile(t, client)
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -476,7 +485,7 @@ func TestVFSFile_WriteBuffer(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
+	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
 
@@ -516,7 +525,8 @@ func TestVFSFile_WriteBuffer(t *testing.T) {
 	}
 }
 
-func TestVFSFile_WriteBufferRecovery(t *testing.T) {
+func TestVFSFile_WriteBufferDiscardedOnOpen(t *testing.T) {
+	// Test that unsync'd buffer contents are discarded on open (no recovery)
 	client := newWriteTestReplicaClient()
 
 	// Create initial LTX file
@@ -533,7 +543,7 @@ func TestVFSFile_WriteBufferRecovery(t *testing.T) {
 	logger := slog.Default()
 	f1 := NewVFSFile(client, "test.db", logger)
 	f1.writeEnabled = true
-	f1.dirty = make(map[uint32][]byte)
+	f1.dirty = make(map[uint32]int64)
 	f1.syncInterval = 0
 	f1.bufferPath = bufferPath
 
@@ -543,22 +553,21 @@ func TestVFSFile_WriteBufferRecovery(t *testing.T) {
 
 	// Write data (will be written to buffer)
 	writeData := make([]byte, pageSize)
-	copy(writeData, "recovery test data")
+	copy(writeData, "unsync'd data that should be lost")
 	if _, err := f1.WriteAt(writeData, 0); err != nil {
 		t.Fatal(err)
 	}
 
 	// Simulate crash by abandoning the file handle without syncing
-	// Close just the buffer file to release the handle
 	if f1.bufferFile != nil {
 		f1.bufferFile.Close()
 	}
-	f1.cancel() // Stop any goroutines
+	f1.cancel()
 
-	// Second: create a new VFSFile and recover from buffer
+	// Second: create a new VFSFile - buffer should be discarded
 	f2 := NewVFSFile(client, "test.db", logger)
 	f2.writeEnabled = true
-	f2.dirty = make(map[uint32][]byte)
+	f2.dirty = make(map[uint32]int64)
 	f2.syncInterval = 0
 	f2.bufferPath = bufferPath
 
@@ -567,18 +576,18 @@ func TestVFSFile_WriteBufferRecovery(t *testing.T) {
 	}
 	defer f2.Close()
 
-	// Check dirty pages were recovered
-	if len(f2.dirty) != 1 {
-		t.Errorf("expected 1 dirty page after recovery, got %d", len(f2.dirty))
+	// Dirty pages should NOT be recovered - buffer is discarded on open
+	if len(f2.dirty) != 0 {
+		t.Errorf("expected 0 dirty pages (buffer should be discarded), got %d", len(f2.dirty))
 	}
 
-	// Read back the data from dirty page (need full page buffer for proper read)
+	// Reading should return original data from replica, not unsync'd data
 	readBuf := make([]byte, pageSize)
 	if _, err := f2.ReadAt(readBuf, 0); err != nil {
 		t.Fatal(err)
 	}
-	if string(readBuf[:18]) != "recovery test data" {
-		t.Errorf("expected 'recovery test data', got %q", string(readBuf[:18]))
+	if string(readBuf[:12]) != "initial data" {
+		t.Errorf("expected 'initial data' (from replica), got %q", string(readBuf[:12]))
 	}
 }
 
@@ -598,7 +607,7 @@ func TestVFSFile_WriteBufferClearAfterSync(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
-	f.dirty = make(map[uint32][]byte)
+	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
 

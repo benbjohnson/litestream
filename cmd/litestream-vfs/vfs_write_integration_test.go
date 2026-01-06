@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"os"
@@ -319,11 +318,12 @@ func TestVFS_ManualSyncOnly(t *testing.T) {
 }
 
 // =============================================================================
-// Crash Recovery Tests
+// Write Buffer Tests
 // =============================================================================
 
-// TestVFS_WriteBufferRecovery tests recovery from write buffer after crash.
-func TestVFS_WriteBufferRecovery(t *testing.T) {
+// TestVFS_WriteBufferDiscardedOnOpen tests that write buffer is discarded on open
+// (unsynced data is lost after crash).
+func TestVFS_WriteBufferDiscardedOnOpen(t *testing.T) {
 	replicaDir := t.TempDir()
 	bufferDir := t.TempDir()
 	client := file.NewReplicaClient(replicaDir)
@@ -332,7 +332,7 @@ func TestVFS_WriteBufferRecovery(t *testing.T) {
 
 	// Open VFS and write data
 	vfs := newWritableVFS(t, client, 1*time.Hour, bufferDir) // Long interval, won't auto-sync
-	vfsName := fmt.Sprintf("litestream-recover1-%d", time.Now().UnixNano())
+	vfsName := fmt.Sprintf("litestream-discard1-%d", time.Now().UnixNano())
 	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
 
 	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
@@ -349,23 +349,24 @@ func TestVFS_WriteBufferRecovery(t *testing.T) {
 	// Simulate crash by not closing properly (don't call sqldb.Close())
 	// Just abandon the connection
 
-	// Reopen with new VFS - should recover from buffer
+	// Reopen with new VFS - buffer should be discarded
 	vfs2 := newWritableVFS(t, client, 1*time.Second, bufferDir)
-	vfsName2 := fmt.Sprintf("litestream-recover2-%d", time.Now().UnixNano())
+	vfsName2 := fmt.Sprintf("litestream-discard2-%d", time.Now().UnixNano())
 	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName2, vfs2))
 
 	sqldb2, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName2))
 	require.NoError(t, err)
 	defer sqldb2.Close()
 
-	// Data should be recovered
-	var name string
-	err = sqldb2.QueryRow("SELECT name FROM users WHERE id = 2").Scan(&name)
+	// Data should NOT be recovered (buffer is discarded on open)
+	var count int
+	err = sqldb2.QueryRow("SELECT COUNT(*) FROM users WHERE id = 2").Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, "Bob", name)
+	require.Equal(t, 0, count, "unsynced data should be lost after crash")
 }
 
-// TestVFS_WriteBufferDuplicatePages tests recovery with duplicate page writes.
+// TestVFS_WriteBufferDuplicatePages tests that duplicate page writes within
+// a session correctly overwrite previous values in the buffer.
 func TestVFS_WriteBufferDuplicatePages(t *testing.T) {
 	replicaDir := t.TempDir()
 	bufferDir := t.TempDir()
@@ -379,6 +380,7 @@ func TestVFS_WriteBufferDuplicatePages(t *testing.T) {
 
 	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
 	require.NoError(t, err)
+	defer sqldb.Close()
 
 	// Write to same row multiple times (updates same pages)
 	_, err = sqldb.Exec("INSERT INTO users (id, name) VALUES (2, 'Bob')")
@@ -388,10 +390,17 @@ func TestVFS_WriteBufferDuplicatePages(t *testing.T) {
 	_, err = sqldb.Exec("UPDATE users SET name = 'Bobby' WHERE id = 2")
 	require.NoError(t, err)
 
-	// Simulate crash - don't close
+	// Should have latest value (read-your-writes within session)
+	var name string
+	err = sqldb.QueryRow("SELECT name FROM users WHERE id = 2").Scan(&name)
+	require.NoError(t, err)
+	require.Equal(t, "Bobby", name)
 
-	// Recover
-	vfs2 := newWritableVFS(t, client, 1*time.Second, bufferDir)
+	// Close to trigger sync
+	sqldb.Close()
+
+	// Verify data persists in replica after sync
+	vfs2 := newWritableVFS(t, client, 1*time.Second, t.TempDir())
 	vfsName2 := fmt.Sprintf("litestream-dup2-%d", time.Now().UnixNano())
 	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName2, vfs2))
 
@@ -399,40 +408,38 @@ func TestVFS_WriteBufferDuplicatePages(t *testing.T) {
 	require.NoError(t, err)
 	defer sqldb2.Close()
 
-	// Should have latest value
-	var name string
+	// Should have latest value from synced data
 	err = sqldb2.QueryRow("SELECT name FROM users WHERE id = 2").Scan(&name)
 	require.NoError(t, err)
 	require.Equal(t, "Bobby", name)
 }
 
-// TestVFS_WriteBufferTXIDMismatch tests that stale buffer is discarded.
-func TestVFS_WriteBufferTXIDMismatch(t *testing.T) {
+// TestVFS_ExistingBufferDiscarded tests that any existing buffer file is discarded on open.
+func TestVFS_ExistingBufferDiscarded(t *testing.T) {
 	replicaDir := t.TempDir()
 	bufferDir := t.TempDir()
 	client := file.NewReplicaClient(replicaDir)
 
 	setupInitialDB(t, client)
 
-	// Create a stale write buffer with wrong TXID
+	// Create a pre-existing write buffer file with some content
 	bufferPath := filepath.Join(bufferDir, ".litestream-write-buffer")
-	staleBuffer := createStaleWriteBuffer(t, ltx.TXID(999), 4096) // Wrong TXID
-	require.NoError(t, os.WriteFile(bufferPath, staleBuffer, 0644))
+	require.NoError(t, os.WriteFile(bufferPath, []byte("stale data"), 0644))
 
-	// Open VFS - should discard stale buffer
+	// Open VFS - should discard existing buffer
 	vfs := newWritableVFS(t, client, 1*time.Second, bufferDir)
-	vfsName := fmt.Sprintf("litestream-stale-%d", time.Now().UnixNano())
+	vfsName := fmt.Sprintf("litestream-existing-%d", time.Now().UnixNano())
 	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
 
 	sqldb, err := sql.Open("sqlite3", fmt.Sprintf("file:test.db?vfs=%s", vfsName))
 	require.NoError(t, err)
 	defer sqldb.Close()
 
-	// Should only see original data (stale buffer discarded)
+	// Should only see original data (existing buffer discarded)
 	var count int
 	err = sqldb.QueryRow("SELECT COUNT(*) FROM users").Scan(&count)
 	require.NoError(t, err)
-	require.Equal(t, 1, count, "stale buffer should be discarded")
+	require.Equal(t, 1, count, "existing buffer should be discarded")
 }
 
 // TestVFS_WriteBufferCorrupted tests handling of corrupted buffer file.
@@ -1038,21 +1045,6 @@ func countLTXFiles(t *testing.T, client litestream.ReplicaClient) int {
 		count++
 	}
 	return count
-}
-
-// createStaleWriteBuffer creates a write buffer with the given TXID.
-func createStaleWriteBuffer(t *testing.T, txid ltx.TXID, pageSize uint32) []byte {
-	t.Helper()
-
-	// Buffer format: Magic (4) + Version (4) + ExpectedTXID (8) + PageSize (4) + PageCount (4)
-	buf := make([]byte, 24)
-	copy(buf[0:4], "LSWB")
-	binary.BigEndian.PutUint32(buf[4:8], 1)             // version
-	binary.BigEndian.PutUint64(buf[8:16], uint64(txid)) // TXID
-	binary.BigEndian.PutUint32(buf[16:20], pageSize)    // pageSize
-	binary.BigEndian.PutUint32(buf[20:24], 0)           // pageCount
-
-	return buf
 }
 
 // addExternalLTXFile adds an LTX file to simulate an external writer.
