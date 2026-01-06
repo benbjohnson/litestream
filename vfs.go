@@ -449,16 +449,16 @@ type VFSFile struct {
 	commit          uint32
 
 	// Write support fields (only used when writeEnabled is true)
-	writeEnabled   bool             // Whether write support is enabled
-	dirty          map[uint32]int64 // Dirty pages: pgno -> offset in buffer file
-	pendingTXID    ltx.TXID         // Next TXID to use for sync
-	expectedTXID   ltx.TXID         // Expected remote TXID (for conflict detection)
-	bufferFile     *os.File         // Temp file for durability
-	bufferPath     string           // Path to buffer file
-	bufferNextOff  int64            // Next write offset in buffer file
-	syncTicker     *time.Ticker     // Ticker for periodic sync
-	syncInterval   time.Duration    // Interval for periodic sync
-	inTransaction  bool             // True during active write transaction
+	writeEnabled  bool             // Whether write support is enabled
+	dirty         map[uint32]int64 // Dirty pages: pgno -> offset in buffer file
+	pendingTXID   ltx.TXID         // Next TXID to use for sync
+	expectedTXID  ltx.TXID         // Expected remote TXID (for conflict detection)
+	bufferFile    *os.File         // Temp file for durability
+	bufferPath    string           // Path to buffer file
+	bufferNextOff int64            // Next write offset in buffer file
+	syncTicker    *time.Ticker     // Ticker for periodic sync
+	syncInterval  time.Duration    // Interval for periodic sync
+	inTransaction bool             // True during active write transaction
 
 	wg     sync.WaitGroup
 	ctx    context.Context
