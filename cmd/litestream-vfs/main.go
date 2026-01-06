@@ -66,18 +66,18 @@ func LitestreamVFSRegister() {
 
 	// Configure write support if enabled.
 	if strings.ToLower(os.Getenv("LITESTREAM_WRITE_ENABLED")) == "true" {
-		vfs.WriteConfig.Enabled = true
+		vfs.WriteEnabled = true
 
 		if s := os.Getenv("LITESTREAM_SYNC_INTERVAL"); s != "" {
 			d, err := time.ParseDuration(s)
 			if err != nil {
 				log.Fatalf("invalid LITESTREAM_SYNC_INTERVAL: %s", err)
 			}
-			vfs.WriteConfig.SyncInterval = d
+			vfs.WriteSyncInterval = d
 		}
 
 		if s := os.Getenv("LITESTREAM_LOCAL_PATH"); s != "" {
-			vfs.WriteConfig.LocalPath = s
+			vfs.WriteLocalPath = s
 		}
 	}
 

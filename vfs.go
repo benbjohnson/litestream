@@ -45,20 +45,6 @@ const (
 // ErrConflict is returned when the remote replica has newer transactions than expected.
 var ErrConflict = errors.New("remote has newer transactions than expected")
 
-// WriteConfig configures write support for the VFS.
-type WriteConfig struct {
-	// Enabled activates write support for the VFS.
-	Enabled bool
-
-	// SyncInterval is how often to sync dirty pages to remote storage.
-	// Default: 1 second. Set to 0 for manual sync only.
-	SyncInterval time.Duration
-
-	// LocalPath is the path for local write buffer persistence.
-	// If empty, uses temp directory.
-	LocalPath string
-}
-
 var (
 	//go:linkname sqlite3vfsFileMap github.com/psanford/sqlite3vfs.fileMap
 	sqlite3vfsFileMap map[uint64]sqlite3vfs.File
@@ -71,7 +57,7 @@ var (
 
 // VFS implements the SQLite VFS interface for Litestream.
 // It is intended to be used for read replicas that read directly from S3.
-// When WriteConfig.Enabled is true, also supports writes with periodic sync.
+// When WriteEnabled is true, also supports writes with periodic sync.
 type VFS struct {
 	client ReplicaClient
 	logger *slog.Logger
@@ -83,8 +69,16 @@ type VFS struct {
 	// CacheSize is the maximum size of the page cache in bytes.
 	CacheSize int
 
-	// WriteConfig enables and configures write support.
-	WriteConfig WriteConfig
+	// WriteEnabled activates write support for the VFS.
+	WriteEnabled bool
+
+	// WriteSyncInterval is how often to sync dirty pages to remote storage.
+	// Default: 1 second. Set to 0 for manual sync only.
+	WriteSyncInterval time.Duration
+
+	// WriteLocalPath is the path for local write buffer persistence.
+	// If empty, uses temp directory.
+	WriteLocalPath string
 
 	tempDirOnce sync.Once
 	tempDir     string
@@ -121,17 +115,17 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	f.CacheSize = vfs.CacheSize
 
 	// Initialize write support if enabled
-	if vfs.WriteConfig.Enabled {
+	if vfs.WriteEnabled {
 		f.writeEnabled = true
 		f.dirty = make(map[uint32][]byte)
-		f.syncInterval = vfs.WriteConfig.SyncInterval
+		f.syncInterval = vfs.WriteSyncInterval
 		if f.syncInterval == 0 {
 			f.syncInterval = DefaultSyncInterval
 		}
 
 		// Set up write buffer path
-		if vfs.WriteConfig.LocalPath != "" {
-			f.bufferPath = filepath.Join(vfs.WriteConfig.LocalPath, ".litestream-write-buffer")
+		if vfs.WriteLocalPath != "" {
+			f.bufferPath = filepath.Join(vfs.WriteLocalPath, ".litestream-write-buffer")
 		}
 	}
 
@@ -140,7 +134,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	// Set appropriate flags based on write mode
-	if vfs.WriteConfig.Enabled {
+	if vfs.WriteEnabled {
 		flags &^= sqlite3vfs.OpenReadOnly
 		flags |= sqlite3vfs.OpenReadWrite
 	} else {

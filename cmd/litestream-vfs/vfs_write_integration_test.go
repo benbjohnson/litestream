@@ -978,9 +978,9 @@ func newWritableVFS(tb testing.TB, client litestream.ReplicaClient, syncInterval
 
 	vfs := litestream.NewVFS(client, logger)
 	vfs.PollInterval = 100 * time.Millisecond
-	vfs.WriteConfig.Enabled = true
-	vfs.WriteConfig.SyncInterval = syncInterval
-	vfs.WriteConfig.LocalPath = localPath
+	vfs.WriteEnabled = true
+	vfs.WriteSyncInterval = syncInterval
+	vfs.WriteLocalPath = localPath
 
 	return vfs
 }
