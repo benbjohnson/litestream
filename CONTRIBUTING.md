@@ -22,6 +22,22 @@ Thank you for your interest in contributing to Litestream! We value community co
 - **Large external feature contributions**: Features carry a long-term maintenance burden. To reduce burnout and maintain code quality, we typically implement major features internally. This allows us to ensure consistency with the overall architecture and maintain the high reliability that Litestream users depend on for disaster recovery
 - **Breaking changes**: Changes that break backward compatibility require extensive discussion
 
+## AI-Assisted Contributions
+
+We welcome AI-assisted contributions for bug fixes and small improvements. Whether you're using Claude, Copilot, Cursor, or other AI tools:
+
+**Requirements:**
+
+- **Show your investigation** - Include evidence (logs, file patterns, debug output) proving the problem exists
+- **Define scope clearly** - State what the PR does and does not do
+- **Include runnable test commands** - Actual `go test` commands, not just descriptions
+- **Human review before submission** - You're responsible for the code you submit
+
+**Resources:**
+
+- [AI_PR_GUIDE.md](AI_PR_GUIDE.md) - Detailed guide with templates and examples
+- [AGENTS.md](AGENTS.md) - Project overview for AI assistants
+
 ## How to Contribute
 
 ### Reporting Bugs
