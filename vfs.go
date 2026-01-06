@@ -901,7 +901,8 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 
 	// Write to buffer for durability
 	if err := f.writeToBuffer(pgno, page); err != nil {
-		f.logger.Warn("failed to write to buffer", "error", err)
+		f.logger.Error("failed to write to buffer", "error", err)
+		return 0, fmt.Errorf("write to buffer: %w", err)
 	}
 
 	f.logger.Debug("wrote to dirty page", "pgno", pgno, "offset", pageOffset, "len", n, "commit", f.commit)
