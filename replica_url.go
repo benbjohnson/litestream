@@ -281,6 +281,52 @@ func IsMinIOEndpoint(endpoint string) bool {
 	return true
 }
 
+// IsLocalEndpoint returns true if the endpoint appears to be a local development
+// endpoint (localhost, 127.0.0.1, or private network addresses).
+// These endpoints typically use HTTP instead of HTTPS.
+func IsLocalEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	// Remove port if present
+	if idx := strings.LastIndex(host, ":"); idx != -1 {
+		host = host[:idx]
+	}
+	// Check for common local/development hostnames
+	return host == "localhost" ||
+		host == "127.0.0.1" ||
+		strings.HasPrefix(host, "192.168.") ||
+		strings.HasPrefix(host, "10.") ||
+		strings.HasPrefix(host, "172.16.") ||
+		strings.HasPrefix(host, "172.17.") ||
+		strings.HasPrefix(host, "172.18.") ||
+		strings.HasPrefix(host, "172.19.") ||
+		strings.HasPrefix(host, "172.2") || // 172.20-172.29
+		strings.HasPrefix(host, "172.30.") ||
+		strings.HasPrefix(host, "172.31.") ||
+		strings.HasSuffix(host, ".local") ||
+		strings.HasSuffix(host, ".localhost")
+}
+
+// EnsureEndpointScheme ensures an endpoint has an HTTP(S) scheme.
+// For local endpoints (localhost, private IPs), it defaults to http://.
+// For all other endpoints (cloud providers), it defaults to https://.
+// Returns the endpoint with scheme and a boolean indicating if a scheme was added.
+func EnsureEndpointScheme(endpoint string) (string, bool) {
+	if endpoint == "" {
+		return "", false
+	}
+	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
+		return endpoint, false
+	}
+	// Default to HTTP for local development endpoints, HTTPS for everything else
+	if IsLocalEndpoint(endpoint) {
+		return "http://" + endpoint, true
+	}
+	return "https://" + endpoint, true
+}
+
 // extractEndpointHost extracts the host from an endpoint URL or returns the
 // endpoint as-is if it's not a full URL.
 func extractEndpointHost(endpoint string) string {

@@ -2465,8 +2465,8 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if client.Bucket != "my-tigris-bucket" {
 			t.Errorf("expected bucket 'my-tigris-bucket', got %q", client.Bucket)
 		}
-		if client.Endpoint != "http://fly.storage.tigris.dev" {
-			t.Errorf("expected Tigris endpoint, got %q", client.Endpoint)
+		if client.Endpoint != "https://fly.storage.tigris.dev" {
+			t.Errorf("expected Tigris endpoint with https scheme, got %q", client.Endpoint)
 		}
 		if client.Region != "auto" {
 			t.Errorf("expected region 'auto' for Tigris, got %q", client.Region)

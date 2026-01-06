@@ -895,3 +895,100 @@ func TestIsMinIOEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestIsLocalEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		// Localhost variants
+		{"localhost", true},
+		{"localhost:9000", true},
+		{"http://localhost:9000", true},
+		{"https://localhost:9000", true},
+
+		// Loopback IP
+		{"127.0.0.1", true},
+		{"127.0.0.1:9000", true},
+		{"http://127.0.0.1:9000", true},
+
+		// Private network ranges (RFC1918)
+		{"192.168.1.100", true},
+		{"192.168.1.100:9000", true},
+		{"http://192.168.1.100:9000", true},
+		{"10.0.0.1", true},
+		{"10.0.0.1:9000", true},
+		{"172.16.0.1", true},
+		{"172.31.255.255", true},
+
+		// .local and .localhost TLDs
+		{"minio.local", true},
+		{"minio.local:9000", true},
+		{"http://minio.local:9000", true},
+		{"dev.localhost", true},
+		{"test.localhost:8080", true},
+
+		// Non-local endpoints (cloud providers)
+		{"s3.amazonaws.com", false},
+		{"https://s3.amazonaws.com", false},
+		{"abcdef.r2.cloudflarestorage.com", false},
+		{"https://abcdef.r2.cloudflarestorage.com", false},
+		{"fly.storage.tigris.dev", false},
+		{"s3.us-west-000.backblazeb2.com", false},
+		{"sfo3.digitaloceanspaces.com", false},
+		{"s3.filebase.com", false},
+
+		// Empty
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsLocalEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsLocalEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestEnsureEndpointScheme(t *testing.T) {
+	tests := []struct {
+		input       string
+		expected    string
+		schemeAdded bool
+	}{
+		// Already has scheme - no change
+		{"https://example.com", "https://example.com", false},
+		{"http://localhost:9000", "http://localhost:9000", false},
+		{"http://192.168.1.1:9000", "http://192.168.1.1:9000", false},
+
+		// Local endpoints get http://
+		{"localhost:9000", "http://localhost:9000", true},
+		{"127.0.0.1:9000", "http://127.0.0.1:9000", true},
+		{"192.168.1.100:9000", "http://192.168.1.100:9000", true},
+		{"10.0.0.1:9000", "http://10.0.0.1:9000", true},
+		{"minio.local:9000", "http://minio.local:9000", true},
+
+		// Cloud endpoints get https:// (THIS IS THE KEY FIX)
+		{"abcdef.r2.cloudflarestorage.com", "https://abcdef.r2.cloudflarestorage.com", true},
+		{"s3.us-west-000.backblazeb2.com", "https://s3.us-west-000.backblazeb2.com", true},
+		{"fly.storage.tigris.dev", "https://fly.storage.tigris.dev", true},
+		{"sfo3.digitaloceanspaces.com", "https://sfo3.digitaloceanspaces.com", true},
+		{"s3.filebase.com", "https://s3.filebase.com", true},
+		{"s3.fr-par.scw.cloud", "https://s3.fr-par.scw.cloud", true},
+
+		// Empty returns empty
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got, added := litestream.EnsureEndpointScheme(tt.input)
+			if got != tt.expected {
+				t.Errorf("EnsureEndpointScheme(%q) = %q, want %q", tt.input, got, tt.expected)
+			}
+			if added != tt.schemeAdded {
+				t.Errorf("EnsureEndpointScheme(%q) schemeAdded = %v, want %v", tt.input, added, tt.schemeAdded)
+			}
+		})
+	}
+}

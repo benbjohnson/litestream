@@ -1276,11 +1276,8 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 		// Override with query parameters if provided
 		if qEndpoint := query.Get("endpoint"); qEndpoint != "" {
-			// Ensure endpoint has a scheme
-			if !strings.HasPrefix(qEndpoint, "http://") && !strings.HasPrefix(qEndpoint, "https://") {
-				// Default to http for non-TLS endpoints (common for local/dev)
-				qEndpoint = "http://" + qEndpoint
-			}
+			// Ensure endpoint has a scheme (defaults to https:// for cloud, http:// for local)
+			qEndpoint, _ = litestream.EnsureEndpointScheme(qEndpoint)
 			uendpoint = qEndpoint
 			// Default to path style for custom endpoints unless explicitly set to false
 			if query.Get("forcePathStyle") != "false" {
