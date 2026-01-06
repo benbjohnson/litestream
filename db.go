@@ -1960,9 +1960,26 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 }
 
 // monitor runs in a separate goroutine and monitors the database & WAL.
+//
+// Change Detection Strategy:
+// To reduce CPU usage when idle, we use cheap change detection to avoid
+// unnecessary Sync() calls when the WAL hasn't changed:
+//
+//  1. stat() the WAL file to get its size (changes on any write)
+//  2. Read the 32-byte WAL header which contains salt values that change
+//     when SQLite restarts the WAL (e.g., after checkpoint)
+//
+// If both size and header are unchanged since last check, we skip Sync().
+// When a change is detected, we call Sync() which performs full verification
+// and replication. The cost per tick is just one stat() call plus a 32-byte
+// read, which is negligible.
 func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
+
+	// Track last known WAL state for cheap change detection.
+	var lastWALSize int64
+	var lastWALHeader []byte
 
 	for {
 		// Wait for ticker or context close.
@@ -1972,7 +1989,41 @@ func (db *DB) monitor() {
 		case <-ticker.C:
 		}
 
-		// Sync the database to the shadow WAL.
+		// Check if WAL has changed before doing expensive sync.
+		walPath := db.WALPath()
+		fi, err := os.Stat(walPath)
+		if err != nil {
+			// WAL doesn't exist yet - do a sync which may create it.
+			if os.IsNotExist(err) {
+				if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+					db.Logger.Error("sync error", "error", err)
+				}
+			} else {
+				db.Logger.Warn("failed to stat WAL file", "path", walPath, "error", err)
+			}
+			continue
+		}
+
+		// Read WAL header (32 bytes) for change detection.
+		walHeader, err := readWALHeader(walPath)
+		if err != nil {
+			// Can't read header - fall back to sync.
+			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				db.Logger.Error("sync error", "error", err)
+			}
+			continue
+		}
+
+		// Skip sync if WAL size and header are unchanged.
+		walSize := fi.Size()
+		if walSize == lastWALSize && bytes.Equal(walHeader, lastWALHeader) {
+			continue
+		}
+
+		// WAL changed - update cached state and sync.
+		lastWALSize = walSize
+		lastWALHeader = walHeader
+
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			db.Logger.Error("sync error", "error", err)
 		}
