@@ -1027,13 +1027,15 @@ func (f *VFSFile) syncToRemote() error {
 	}
 
 	// Create LTX file from dirty pages
-	ltxData, err := f.createLTXFromDirty()
+	ltxReader, err := f.createLTXFromDirty()
 	if err != nil {
 		return fmt.Errorf("create LTX: %w", err)
 	}
 
+	ltxSize := ltxReader.Len()
+
 	// Upload LTX file to remote
-	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, bytes.NewReader(ltxData))
+	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
 	if err != nil {
 		return fmt.Errorf("upload LTX: %w", err)
 	}
@@ -1041,7 +1043,7 @@ func (f *VFSFile) syncToRemote() error {
 	f.logger.Info("synced to remote",
 		"txid", info.MaxTXID,
 		"pages", len(f.dirty),
-		"size", len(ltxData))
+		"size", ltxSize)
 
 	// Update local state
 	f.expectedTXID = f.pendingTXID
@@ -1109,8 +1111,9 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 }
 
 // createLTXFromDirty creates an LTX file from dirty pages.
+// Returns a reader for the LTX data.
 // Must be called with f.mu held.
-func (f *VFSFile) createLTXFromDirty() ([]byte, error) {
+func (f *VFSFile) createLTXFromDirty() (*bytes.Reader, error) {
 	var buf bytes.Buffer
 
 	enc, err := ltx.NewEncoder(&buf)
@@ -1162,7 +1165,7 @@ func (f *VFSFile) createLTXFromDirty() ([]byte, error) {
 		return nil, fmt.Errorf("close encoder: %w", err)
 	}
 
-	return buf.Bytes(), nil
+	return bytes.NewReader(buf.Bytes()), nil
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
