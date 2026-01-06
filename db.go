@@ -152,6 +152,11 @@ type DB struct {
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
 
+	// lastSuccessfulSyncAt tracks when replication last succeeded.
+	// Used by heartbeat monitoring to determine if a ping should be sent.
+	lastSuccessfulSyncMu sync.RWMutex
+	lastSuccessfulSyncAt time.Time
+
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
 }
@@ -301,6 +306,21 @@ func (db *DB) PageSize() int {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
 	return db.pageSize
+}
+
+// RecordSuccessfulSync marks the current time as a successful sync.
+// Used by heartbeat monitoring to determine if a ping should be sent.
+func (db *DB) RecordSuccessfulSync() {
+	db.lastSuccessfulSyncMu.Lock()
+	defer db.lastSuccessfulSyncMu.Unlock()
+	db.lastSuccessfulSyncAt = time.Now()
+}
+
+// LastSuccessfulSyncAt returns the time of the last successful sync.
+func (db *DB) LastSuccessfulSyncAt() time.Time {
+	db.lastSuccessfulSyncMu.RLock()
+	defer db.lastSuccessfulSyncMu.RUnlock()
+	return db.lastSuccessfulSyncAt
 }
 
 // Open initializes the background monitoring goroutine.

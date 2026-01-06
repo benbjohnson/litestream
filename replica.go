@@ -160,6 +160,9 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		r.SetPos(ltx.Pos{TXID: txID})
 	}
 
+	// Record successful sync for heartbeat monitoring.
+	r.db.RecordSuccessfulSync()
+
 	return nil
 }
 
