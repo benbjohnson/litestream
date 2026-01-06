@@ -48,6 +48,10 @@ const (
 	// DefaultHeartbeatCheckInterval controls how frequently the heartbeat
 	// monitor checks if heartbeat pings should be sent.
 	DefaultHeartbeatCheckInterval = 15 * time.Second
+
+	// DefaultDBInitTimeout is the maximum time to wait for a database to be
+	// initialized (page size known) before logging a warning.
+	DefaultDBInitTimeout = 30 * time.Second
 )
 
 // Store represents the top-level container for databases.
@@ -332,7 +336,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		now := time.Now()
 		nextDelay := time.Until(lvl.NextCompactionAt(now))
 
-		var anyNotReady bool
+		var notReadyDBs []string
 
 		for _, db := range s.DBs() {
 			_, err := s.CompactDB(ctx, db, lvl)
@@ -341,7 +345,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 				slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
 				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path())
-				anyNotReady = true
+				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				slog.Error("compaction failed", "level", lvl.Level, "error", err)
 			}
@@ -355,15 +359,19 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		}
 
 		timedOut := !retryDeadline.IsZero() && now.After(retryDeadline)
-		if anyNotReady && !timedOut {
+		if len(notReadyDBs) > 0 && !timedOut {
 			if retryDeadline.IsZero() {
-				retryDeadline = now.Add(30 * time.Second)
+				retryDeadline = now.Add(DefaultDBInitTimeout)
 			}
 			nextDelay = time.Second
 			slog.Debug("scheduling retry for unready dbs", "level", lvl.Level)
 		} else {
 			if timedOut {
-				slog.Warn("timeout waiting for db initialization", "level", lvl.Level)
+				slog.Warn("timeout waiting for db initialization",
+					"level", lvl.Level,
+					"dbs", notReadyDBs,
+					"timeout", DefaultDBInitTimeout,
+					"hint", "database may have corrupted local state or blocked transactions; try removing .sqlite-litestream directory and restarting")
 			}
 			retryDeadline = time.Time{}
 		}
