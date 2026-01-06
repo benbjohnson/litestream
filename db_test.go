@@ -1209,3 +1209,54 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 			posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
 	}
 }
+
+// TestDB_ResetLocalState verifies that ResetLocalState clears the LTX directory.
+func TestDB_ResetLocalState(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create table and insert some data to create LTX files
+	if _, err := sqldb.Exec(`CREATE TABLE t (x TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (x) VALUES ('foo')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify LTX directory exists and has files
+	ltxDir := db.LTXDir()
+	if _, err := os.Stat(ltxDir); os.IsNotExist(err) {
+		t.Fatal("LTX directory should exist after sync")
+	}
+
+	// Get position before reset
+	posBefore, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posBefore.TXID == 0 {
+		t.Fatal("expected non-zero TXID before reset")
+	}
+
+	// Reset local state
+	if err := db.ResetLocalState(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify LTX directory is gone
+	if _, err := os.Stat(ltxDir); !os.IsNotExist(err) {
+		t.Fatal("LTX directory should not exist after reset")
+	}
+
+	// Get position after reset - should be zero since no LTX files
+	posAfter, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if posAfter.TXID != 0 {
+		t.Fatalf("expected zero TXID after reset, got %d", posAfter.TXID)
+	}
+}

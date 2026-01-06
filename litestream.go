@@ -32,7 +32,51 @@ const (
 var (
 	ErrNoSnapshots      = errors.New("no snapshots available")
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
+	ErrLTXCorrupted     = errors.New("ltx file corrupted")
+	ErrLTXMissing       = errors.New("ltx file missing")
 )
+
+// LTXError provides detailed context for LTX file errors with recovery hints.
+type LTXError struct {
+	Op      string // Operation that failed (e.g., "open", "read", "validate")
+	Path    string // File path
+	Level   int    // LTX level (0 = L0, etc.)
+	MinTXID uint64 // Minimum transaction ID
+	MaxTXID uint64 // Maximum transaction ID
+	Err     error  // Underlying error
+	Hint    string // Recovery hint for users
+}
+
+func (e *LTXError) Error() string {
+	if e.Path != "" {
+		return e.Op + " ltx file " + e.Path + ": " + e.Err.Error()
+	}
+	return e.Op + " ltx file: " + e.Err.Error()
+}
+
+func (e *LTXError) Unwrap() error { return e.Err }
+
+// NewLTXError creates a new LTX error with appropriate hints based on the error type.
+func NewLTXError(op, path string, level int, minTXID, maxTXID uint64, err error) *LTXError {
+	ltxErr := &LTXError{
+		Op:      op,
+		Path:    path,
+		Level:   level,
+		MinTXID: minTXID,
+		MaxTXID: maxTXID,
+		Err:     err,
+	}
+
+	// Set appropriate hint based on error type
+	if os.IsNotExist(err) || errors.Is(err, ErrLTXMissing) {
+		ltxErr.Hint = "LTX file is missing. This can happen after VACUUM, manual checkpoint, or state corruption. " +
+			"Run 'litestream reset <db>' or delete the .sqlite-litestream directory and restart."
+	} else if errors.Is(err, ErrLTXCorrupted) || errors.Is(err, ErrChecksumMismatch) {
+		ltxErr.Hint = "LTX file is corrupted. Delete the .sqlite-litestream directory and restart to recover from replica."
+	}
+
+	return ltxErr
+}
 
 // SQLite WAL constants.
 const (

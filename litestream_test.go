@@ -3,6 +3,9 @@ package litestream_test
 import (
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
+	"os"
+	"strings"
 	"testing"
 
 	"github.com/superfly/ltx"
@@ -66,4 +69,68 @@ func MustDecodeHexString(s string) []byte {
 		panic(err)
 	}
 	return b
+}
+
+func TestNewLTXError(t *testing.T) {
+	t.Run("MissingFile", func(t *testing.T) {
+		err := litestream.NewLTXError("open", "/path/to/file.ltx", 0, 1, 1, os.ErrNotExist)
+		if err.Hint == "" {
+			t.Fatal("expected hint for missing file error")
+		}
+		if !strings.Contains(err.Hint, "missing") {
+			t.Errorf("hint should mention missing file, got: %s", err.Hint)
+		}
+		if !strings.Contains(err.Hint, "litestream reset") {
+			t.Errorf("hint should mention reset command, got: %s", err.Hint)
+		}
+	})
+
+	t.Run("CorruptedFile", func(t *testing.T) {
+		err := litestream.NewLTXError("decode", "/path/to/file.ltx", 0, 1, 1, litestream.ErrLTXCorrupted)
+		if err.Hint == "" {
+			t.Fatal("expected hint for corrupted file error")
+		}
+		if !strings.Contains(err.Hint, "corrupted") {
+			t.Errorf("hint should mention corruption, got: %s", err.Hint)
+		}
+	})
+
+	t.Run("ChecksumMismatch", func(t *testing.T) {
+		err := litestream.NewLTXError("validate", "/path/to/file.ltx", 0, 1, 1, litestream.ErrChecksumMismatch)
+		if err.Hint == "" {
+			t.Fatal("expected hint for checksum mismatch error")
+		}
+	})
+
+	t.Run("ErrorString", func(t *testing.T) {
+		err := litestream.NewLTXError("open", "/path/to/file.ltx", 0, 1, 1, os.ErrNotExist)
+		errStr := err.Error()
+		if !strings.Contains(errStr, "open") {
+			t.Errorf("error should contain operation, got: %s", errStr)
+		}
+		if !strings.Contains(errStr, "/path/to/file.ltx") {
+			t.Errorf("error should contain path, got: %s", errStr)
+		}
+	})
+
+	t.Run("Unwrap", func(t *testing.T) {
+		underlying := errors.New("underlying error")
+		err := litestream.NewLTXError("read", "/path/to/file.ltx", 0, 1, 1, underlying)
+		if !errors.Is(err, underlying) {
+			t.Error("LTXError should unwrap to underlying error")
+		}
+	})
+}
+
+func TestLTXErrorHints(t *testing.T) {
+	// Test that ErrLTXMissing also triggers appropriate hints
+	t.Run("ErrLTXMissing", func(t *testing.T) {
+		err := litestream.NewLTXError("open", "/path/to/file.ltx", 0, 1, 1, litestream.ErrLTXMissing)
+		if err.Hint == "" {
+			t.Fatal("expected hint for ErrLTXMissing")
+		}
+		if !strings.Contains(err.Hint, "litestream reset") {
+			t.Errorf("hint should mention reset command, got: %s", err.Hint)
+		}
+	})
 }
