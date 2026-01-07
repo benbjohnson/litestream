@@ -1,0 +1,178 @@
+# Litestream Configuration Example
+# Full reference: https://litestream.io/reference/config/
+
+# =============================================================================
+# GLOBAL SETTINGS
+# =============================================================================
+
+# Prometheus metrics endpoint (optional)
+# addr: ":9090"
+
+# Global AWS/S3 credentials (inherited by all S3 replicas)
+# access-key-id: ${AWS_ACCESS_KEY_ID}
+# secret-access-key: ${AWS_SECRET_ACCESS_KEY}
+# region: us-east-1
+
+# Global sync interval for all replicas (default: 1s)
+# sync-interval: 1s
+
+# =============================================================================
+# COMPACTION LEVELS
+# =============================================================================
+
+# Multi-level compaction reduces storage overhead
+# Each level merges files from the previous level
+levels:
+  - interval: 30s     # L1: Compact L0 files every 30 seconds
+  - interval: 5m      # L2: Compact L1 files every 5 minutes
+  - interval: 1h      # L3: Compact L2 files hourly
+
+# Snapshot configuration
+snapshot:
+  interval: 24h       # Create daily snapshots
+  retention: 24h      # Keep snapshots for 24 hours
+
+# L0 file retention
+# l0-retention: 1h
+# l0-retention-check-interval: 5m
+
+# =============================================================================
+# LOGGING
+# =============================================================================
+
+logging:
+  level: info         # debug, info, warn, error
+  type: text          # text or json
+  # stderr: true      # Output to stderr instead of stdout
+
+# =============================================================================
+# HEARTBEAT (optional health monitoring)
+# =============================================================================
+
+# heartbeat-url: https://healthchecks.io/ping/your-uuid
+# heartbeat-interval: 5m
+
+# =============================================================================
+# SHUTDOWN SETTINGS
+# =============================================================================
+
+# shutdown-sync-timeout: 30s    # Max wait for final sync on shutdown
+# shutdown-sync-interval: 100ms # Retry interval during shutdown
+
+# =============================================================================
+# DATABASE CONFIGURATIONS
+# =============================================================================
+
+dbs:
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 1: Basic S3 Replication
+  # ---------------------------------------------------------------------------
+  - path: /data/app.db
+    replica:
+      url: s3://my-bucket/app-backup
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 2: S3 with Full Configuration
+  # ---------------------------------------------------------------------------
+  # - path: /data/production.db
+  #   monitor-interval: 10ms        # How often to check WAL (default: 10ms)
+  #   checkpoint-interval: 1m       # Time-based checkpoint interval
+  #   min-checkpoint-page-count: 1000  # Page threshold for checkpoint
+  #   busy-timeout: 5s              # SQLite busy timeout
+  #   replica:
+  #     url: s3://my-bucket/production
+  #     access-key-id: ${AWS_ACCESS_KEY_ID}
+  #     secret-access-key: ${AWS_SECRET_ACCESS_KEY}
+  #     region: us-west-2
+  #     sync-interval: 1s
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 3: S3-Compatible Storage (MinIO, R2, Tigris, etc.)
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   replica:
+  #     # Cloudflare R2
+  #     url: s3://bucket/path?endpoint=account-id.r2.cloudflarestorage.com
+  #
+  #     # Fly.io Tigris (auto-configures signing)
+  #     url: s3://bucket/path?endpoint=fly.storage.tigris.dev&region=auto
+  #
+  #     # MinIO (local)
+  #     url: s3://bucket/path?endpoint=localhost:9000&skipVerify=true
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 4: Google Cloud Storage
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   replica:
+  #     url: gs://my-bucket/backups/app
+  #     # Uses GOOGLE_APPLICATION_CREDENTIALS environment variable
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 5: Azure Blob Storage
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   replica:
+  #     url: abs://container@storageaccount/path
+  #     account-name: ${AZURE_STORAGE_ACCOUNT}
+  #     account-key: ${AZURE_STORAGE_KEY}
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 6: SFTP
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   replica:
+  #     url: sftp://user@backup-server.example.com:22/backups/app
+  #     key-path: /etc/litestream/sftp_key
+  #     # Recommended: Specify host key for security
+  #     # Get from: ssh-keyscan backup-server.example.com
+  #     host-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI...
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 7: NATS JetStream
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   replica:
+  #     type: nats
+  #     url: nats://nats.example.com:4222
+  #     bucket: litestream-backups
+  #     # Optional TLS:
+  #     # tls: true
+  #     # root-cas: [/path/to/ca.pem]
+  #     # client-cert: /path/to/client.pem
+  #     # client-key: /path/to/client.key
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 8: Local File Backup
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   replica:
+  #     path: /mnt/backup/app-replica
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 9: Directory Replication
+  # ---------------------------------------------------------------------------
+  # - dir: /data/databases          # Directory containing databases
+  #   pattern: "*.db"               # Match SQLite files
+  #   recursive: true               # Include subdirectories
+  #   watch: true                   # Monitor for new databases
+  #   replica:
+  #     url: s3://my-bucket/all-databases
+
+  # ---------------------------------------------------------------------------
+  # EXAMPLE 10: Auto-Restore on Startup
+  # ---------------------------------------------------------------------------
+  # - path: /data/app.db
+  #   restore-if-db-not-exists: true  # Restore from backup if DB missing
+  #   replica:
+  #     url: s3://my-bucket/app-backup
+
+# =============================================================================
+# EXEC: Run Application Alongside Replication
+# =============================================================================
+
+# Litestream can run your application as a subprocess
+# It will start replication first, then exec your command
+# When your application exits, Litestream shuts down gracefully
+
+# exec: "/usr/bin/myapp serve --port 8080"
