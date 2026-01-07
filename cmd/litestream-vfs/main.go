@@ -42,14 +42,21 @@ func LitestreamVFSRegister() {
 	var err error
 
 	replicaURL := os.Getenv("LITESTREAM_REPLICA_URL")
+	if replicaURL == "" {
+		log.Printf("litestream-vfs: LITESTREAM_REPLICA_URL environment variable required")
+		return
+	}
+
 	client, err = litestream.NewReplicaClientFromURL(replicaURL)
 	if err != nil {
-		log.Fatalf("failed to create replica client from URL: %s", err)
+		log.Printf("litestream-vfs: failed to create replica client from URL: %s", err)
+		return
 	}
 
 	// Initialize the client.
 	if err := client.Init(context.Background()); err != nil {
-		log.Fatalf("failed to initialize litestream replica client: %s", err)
+		log.Printf("litestream-vfs: failed to initialize replica client: %s", err)
+		return
 	}
 
 	var level slog.Level
@@ -64,7 +71,8 @@ func LitestreamVFSRegister() {
 	vfs := litestream.NewVFS(client, logger)
 
 	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
-		log.Fatalf("failed to register litestream vfs: %s", err)
+		log.Printf("litestream-vfs: failed to register VFS: %s", err)
+		return
 	}
 }
 
