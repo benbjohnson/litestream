@@ -4,7 +4,6 @@
 package litestream
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"errors"
@@ -1027,12 +1026,7 @@ func (f *VFSFile) syncToRemote() error {
 	}
 
 	// Create LTX file from dirty pages
-	ltxReader, err := f.createLTXFromDirty()
-	if err != nil {
-		return fmt.Errorf("create LTX: %w", err)
-	}
-
-	ltxSize := ltxReader.Len()
+	ltxReader := f.createLTXFromDirty()
 
 	// Upload LTX file to remote
 	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
@@ -1043,7 +1037,7 @@ func (f *VFSFile) syncToRemote() error {
 	f.logger.Info("synced to remote",
 		"txid", info.MaxTXID,
 		"pages", len(f.dirty),
-		"size", ltxSize)
+		"size", info.Size)
 
 	// Update local state
 	f.expectedTXID = f.pendingTXID
@@ -1111,28 +1105,11 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 }
 
 // createLTXFromDirty creates an LTX file from dirty pages.
-// Returns a reader for the LTX data.
+// Returns a streaming reader for the LTX data using io.Pipe to avoid loading
+// all data into memory at once.
 // Must be called with f.mu held.
-func (f *VFSFile) createLTXFromDirty() (*bytes.Reader, error) {
-	var buf bytes.Buffer
-
-	enc, err := ltx.NewEncoder(&buf)
-	if err != nil {
-		return nil, err
-	}
-
-	// Encode header
-	if err := enc.EncodeHeader(ltx.Header{
-		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
-		PageSize:  f.pageSize,
-		Commit:    f.commit,
-		MinTXID:   f.pendingTXID,
-		MaxTXID:   f.pendingTXID,
-		Timestamp: time.Now().UnixMilli(),
-	}); err != nil {
-		return nil, fmt.Errorf("encode header: %w", err)
-	}
+func (f *VFSFile) createLTXFromDirty() io.Reader {
+	pr, pw := io.Pipe()
 
 	// Sort page numbers (LTX encoder requires ordered pages)
 	pgnos := make([]uint32, 0, len(f.dirty))
@@ -1141,31 +1118,73 @@ func (f *VFSFile) createLTXFromDirty() (*bytes.Reader, error) {
 	}
 	slices.Sort(pgnos)
 
-	// Encode each dirty page
-	lockPgno := ltx.LockPgno(f.pageSize)
-	for _, pgno := range pgnos {
-		if pgno == lockPgno {
-			continue // Skip lock page
-		}
-
-		// Read page data from buffer file
-		bufferOff := f.dirty[pgno]
-		data := make([]byte, f.pageSize)
-		if _, err := f.bufferFile.ReadAt(data, bufferOff); err != nil {
-			return nil, fmt.Errorf("read page %d from buffer: %w", pgno, err)
-		}
-
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
-			return nil, fmt.Errorf("encode page %d: %w", pgno, err)
-		}
+	// Copy dirty map offsets for goroutine access
+	dirtyOffsets := make(map[uint32]int64, len(f.dirty))
+	for pgno, off := range f.dirty {
+		dirtyOffsets[pgno] = off
 	}
 
-	// Close encoder (writes trailer and page index)
-	if err := enc.Close(); err != nil {
-		return nil, fmt.Errorf("close encoder: %w", err)
-	}
+	// Capture values for goroutine
+	pageSize := f.pageSize
+	commit := f.commit
+	pendingTXID := f.pendingTXID
+	bufferFile := f.bufferFile
 
-	return bytes.NewReader(buf.Bytes()), nil
+	go func() {
+		var err error
+		defer func() {
+			pw.CloseWithError(err)
+		}()
+
+		enc, encErr := ltx.NewEncoder(pw)
+		if encErr != nil {
+			err = encErr
+			return
+		}
+
+		// Encode header
+		if err = enc.EncodeHeader(ltx.Header{
+			Version:   ltx.Version,
+			Flags:     ltx.HeaderFlagNoChecksum,
+			PageSize:  pageSize,
+			Commit:    commit,
+			MinTXID:   pendingTXID,
+			MaxTXID:   pendingTXID,
+			Timestamp: time.Now().UnixMilli(),
+		}); err != nil {
+			err = fmt.Errorf("encode header: %w", err)
+			return
+		}
+
+		// Encode each dirty page
+		lockPgno := ltx.LockPgno(pageSize)
+		for _, pgno := range pgnos {
+			if pgno == lockPgno {
+				continue // Skip lock page
+			}
+
+			// Read page data from buffer file
+			bufferOff := dirtyOffsets[pgno]
+			data := make([]byte, pageSize)
+			if _, err = bufferFile.ReadAt(data, bufferOff); err != nil {
+				err = fmt.Errorf("read page %d from buffer: %w", pgno, err)
+				return
+			}
+
+			if err = enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+				err = fmt.Errorf("encode page %d: %w", pgno, err)
+				return
+			}
+		}
+
+		// Close encoder (writes trailer and page index)
+		if err = enc.Close(); err != nil {
+			err = fmt.Errorf("close encoder: %w", err)
+			return
+		}
+	}()
+
+	return pr
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
