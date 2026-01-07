@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"os"
 	"strings"
+	"time"
 	"unsafe"
 
 	"github.com/psanford/sqlite3vfs"
@@ -62,6 +63,23 @@ func LitestreamVFSRegister() {
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
 
 	vfs := litestream.NewVFS(client, logger)
+
+	// Configure write support if enabled.
+	if strings.ToLower(os.Getenv("LITESTREAM_WRITE_ENABLED")) == "true" {
+		vfs.WriteEnabled = true
+
+		if s := os.Getenv("LITESTREAM_SYNC_INTERVAL"); s != "" {
+			d, err := time.ParseDuration(s)
+			if err != nil {
+				log.Fatalf("invalid LITESTREAM_SYNC_INTERVAL: %s", err)
+			}
+			vfs.WriteSyncInterval = d
+		}
+
+		if s := os.Getenv("LITESTREAM_BUFFER_PATH"); s != "" {
+			vfs.WriteBufferPath = s
+		}
+	}
 
 	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
 		log.Fatalf("failed to register litestream vfs: %s", err)
