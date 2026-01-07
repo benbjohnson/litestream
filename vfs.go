@@ -69,9 +69,9 @@ type VFS struct {
 	// Default: 1 second. Set to 0 for manual sync only.
 	WriteSyncInterval time.Duration
 
-	// WriteLocalPath is the path for local write buffer persistence.
-	// If empty, uses temp directory.
-	WriteLocalPath string
+	// WriteBufferPath is the path for local write buffer persistence.
+	// If empty, uses a temp file.
+	WriteBufferPath string
 
 	tempDirOnce sync.Once
 	tempDir     string
@@ -117,8 +117,15 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 		}
 
 		// Set up write buffer path
-		if vfs.WriteLocalPath != "" {
-			f.bufferPath = filepath.Join(vfs.WriteLocalPath, ".litestream-write-buffer")
+		if vfs.WriteBufferPath != "" {
+			f.bufferPath = vfs.WriteBufferPath
+		} else {
+			// Use a temp file if no path specified
+			dir, err := vfs.ensureTempDir()
+			if err != nil {
+				return nil, 0, fmt.Errorf("create temp dir for write buffer: %w", err)
+			}
+			f.bufferPath = filepath.Join(dir, "write-buffer")
 		}
 	}
 
@@ -1044,14 +1051,8 @@ func (f *VFSFile) syncToRemote() error {
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
 
-	// Update index with synced pages and update cache
+	// Update cache with synced pages (index will be populated naturally when pages are fetched)
 	for pgno, bufferOff := range f.dirty {
-		f.index[pgno] = ltx.PageIndexElem{
-			Level:   0,
-			MinTXID: info.MinTXID,
-			MaxTXID: info.MaxTXID,
-		}
-		// Read data from buffer and copy to cache
 		cachedData := make([]byte, f.pageSize)
 		if _, err := f.bufferFile.ReadAt(cachedData, bufferOff); err != nil {
 			return fmt.Errorf("read page %d from buffer for cache: %w", pgno, err)

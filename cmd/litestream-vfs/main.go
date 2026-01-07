@@ -76,8 +76,8 @@ func LitestreamVFSRegister() {
 			vfs.WriteSyncInterval = d
 		}
 
-		if s := os.Getenv("LITESTREAM_LOCAL_PATH"); s != "" {
-			vfs.WriteLocalPath = s
+		if s := os.Getenv("LITESTREAM_BUFFER_PATH"); s != "" {
+			vfs.WriteBufferPath = s
 		}
 	}
 
