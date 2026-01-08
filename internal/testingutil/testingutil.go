@@ -284,7 +284,7 @@ func NewTigrisReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	tb.Helper()
 
 	if *tigrisAccessKeyID == "" || *tigrisSecretAccessKey == "" {
-		tb.Fatalf("tigris credentials not configured (set LITESTREAM_TIGRIS_ACCESS_KEY_ID/SECRET_ACCESS_KEY)")
+		tb.Skip("tigris credentials not configured (set LITESTREAM_TIGRIS_ACCESS_KEY_ID/SECRET_ACCESS_KEY)")
 	}
 
 	c := s3.NewReplicaClient()

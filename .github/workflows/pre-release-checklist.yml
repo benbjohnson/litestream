@@ -81,14 +81,27 @@ jobs:
     outputs:
       result: ${{ steps.test.outcome }}
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::S3 integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
       - name: Run S3 integration tests
         id: test
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         continue-on-error: true
         run: go test -v ./replica_client_test.go -integration -replica-clients=s3
         env:
@@ -104,20 +117,34 @@ jobs:
     outputs:
       result: ${{ steps.test.outcome }}
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}" ]; then
+            echo "::notice title=Skipped::GCS integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Extract GCP credentials
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
         shell: bash
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
 
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
       - name: Run GCS integration tests
         id: test
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         continue-on-error: true
         run: go test -v ./replica_client_test.go -integration -replica-clients=gs
         env:
@@ -131,14 +158,27 @@ jobs:
     outputs:
       result: ${{ steps.test.outcome }}
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}" ]; then
+            echo "::notice title=Skipped::Azure Blob Storage integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
       - name: Run ABS integration tests
         id: test
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         continue-on-error: true
         run: go test -v ./replica_client_test.go -integration -replica-clients=abs
         env:
@@ -153,14 +193,27 @@ jobs:
     outputs:
       result: ${{ steps.test.outcome }}
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_R2_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::R2 integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
       - name: Run R2 integration tests
         id: test
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         continue-on-error: true
         run: go test -v ./replica_client_test.go -integration -replica-clients=r2
         env:
@@ -176,14 +229,27 @@ jobs:
     outputs:
       result: ${{ steps.test.outcome }}
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::Multipart stress tests skipped - S3 credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
       - name: Run multipart stress tests
         id: test
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         continue-on-error: true
         run: |
           go test -v ./replica_client_test.go -integration -replica-clients=s3 \
