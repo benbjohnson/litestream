@@ -67,7 +67,7 @@ if grep -q "replicas:" "$CONFIG_PATH"; then
     echo "   WARNING: 'replicas:' array is deprecated, use single 'replica:' instead"
 fi
 
-if grep -q "name:" "$CONFIG_PATH" | grep -v "account-name"; then
+if grep "name:" "$CONFIG_PATH" | grep -qv "account-name"; then
     echo "   NOTE: Replica 'name:' field is deprecated"
 fi
 
