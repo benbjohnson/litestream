@@ -142,7 +142,7 @@ echo "=== Testing Builds ==="
 go build -o bin/litestream ./cmd/litestream
 
 # Test VFS build (requires CGO)
-CGO_ENABLED=1 go build -tags vfs -o bin/litestream-vfs ./cmd/litestream-vfs
+make vfs
 
 # Test cross-compilation
 GOOS=linux GOARCH=amd64 go build -o bin/litestream-linux-amd64 ./cmd/litestream

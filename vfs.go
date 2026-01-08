@@ -30,6 +30,7 @@ import (
 const (
 	DefaultPollInterval = 1 * time.Second
 	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
+	DefaultPageSize     = 4096             // SQLite default page size
 
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
@@ -545,8 +546,15 @@ func (f *VFSFile) hasTargetTime() bool {
 func (f *VFSFile) Open() error {
 	f.logger.Debug("opening file")
 
+	// Try to get restore plan. For write-enabled VFS, we can create a new database
+	// if no LTX files exist yet.
 	infos, err := f.waitForRestorePlan()
 	if err != nil {
+		// If write mode is enabled and no files exist, we can create a new database
+		if f.writeEnabled && errors.Is(err, ErrTxNotAvailable) {
+			f.logger.Info("no existing database found, creating new database")
+			return f.openNewDatabase()
+		}
 		return err
 	}
 
@@ -599,6 +607,55 @@ func (f *VFSFile) Open() error {
 
 	// Start periodic sync goroutine if write support is enabled
 	if f.writeEnabled && f.syncInterval > 0 {
+		f.syncTicker = time.NewTicker(f.syncInterval)
+		f.wg.Add(1)
+		go func() { defer f.wg.Done(); f.syncLoop() }()
+	}
+
+	return nil
+}
+
+// openNewDatabase initializes the VFSFile for a brand new database with no existing data.
+// This is called when write mode is enabled and no LTX files exist yet.
+func (f *VFSFile) openNewDatabase() error {
+	f.logger.Debug("initializing new database")
+
+	// Use default page size for new databases
+	f.pageSize = DefaultPageSize
+
+	// Initialize page cache
+	cacheEntries := f.CacheSize / int(f.pageSize)
+	if cacheEntries < 1 {
+		cacheEntries = 1
+	}
+	cache, err := lru.New[uint32, []byte](cacheEntries)
+	if err != nil {
+		return fmt.Errorf("create page cache: %w", err)
+	}
+	f.cache = cache
+
+	// Initialize empty index - no pages exist yet
+	f.index = make(map[uint32]ltx.PageIndexElem)
+	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.pos = ltx.Pos{TXID: 0}
+	f.commit = 0
+
+	// Initialize write support for new database
+	f.expectedTXID = 0
+	f.pendingTXID = 1
+	f.logger.Debug("write support enabled for new database", "expectedTXID", f.expectedTXID, "pendingTXID", f.pendingTXID)
+
+	// Initialize write buffer file for durability
+	if err := f.initWriteBuffer(); err != nil {
+		f.logger.Warn("failed to initialize write buffer", "error", err)
+	}
+
+	// Start monitoring for new LTX files (in case another writer creates the database)
+	f.wg.Add(1)
+	go func() { defer f.wg.Done(); f.monitorReplicaClient(f.ctx) }()
+
+	// Start periodic sync goroutine
+	if f.syncInterval > 0 {
 		f.syncTicker = time.NewTicker(f.syncInterval)
 		f.wg.Add(1)
 		go func() { defer f.wg.Done(); f.syncLoop() }()
@@ -804,6 +861,15 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	f.mu.Unlock()
 
 	if !ok {
+		// For write-enabled VFS with a new database (no existing pages),
+		// return zeros to indicate empty page. SQLite will initialize the database.
+		if f.writeEnabled {
+			f.logger.Debug("page not found, returning zeros for new database", "page", pgno)
+			for i := range p {
+				p[i] = 0
+			}
+			return len(p), nil
+		}
 		f.logger.Error("page not found", "page", pgno)
 		return 0, fmt.Errorf("page not found: %d", pgno)
 	}
@@ -1733,6 +1799,17 @@ func isSupportedPageSize(pageSize uint32) bool {
 }
 
 func (f *VFSFile) waitForRestorePlan() ([]*ltx.FileInfo, error) {
+	// If write mode is enabled, don't wait - return immediately so we can
+	// create a new database if no files exist.
+	if f.writeEnabled {
+		infos, err := CalcRestorePlan(f.ctx, f.client, 0, time.Time{}, f.logger)
+		if err != nil {
+			return nil, err
+		}
+		return infos, nil
+	}
+
+	// For read-only mode, wait for files to become available
 	for {
 		infos, err := CalcRestorePlan(f.ctx, f.client, 0, time.Time{}, f.logger)
 		if err == nil {

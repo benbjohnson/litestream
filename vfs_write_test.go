@@ -638,3 +638,190 @@ func TestVFSFile_WriteBufferClearAfterSync(t *testing.T) {
 		t.Errorf("buffer should be empty after sync, got size %d", stat.Size())
 	}
 }
+
+func TestVFSFile_OpenNewDatabase(t *testing.T) {
+	// Test opening a VFSFile with write mode enabled when no LTX files exist (new database)
+	client := newWriteTestReplicaClient()
+	// Note: No LTX files created - simulating a brand new database
+
+	// Create temp directory for buffer
+	tmpDir := t.TempDir()
+	bufferPath := tmpDir + "/.litestream-write-buffer"
+
+	// Create VFSFile with write support - no existing data
+	logger := slog.Default()
+	f := NewVFSFile(client, "new.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+	f.bufferPath = bufferPath
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Verify it opened successfully as a new database
+	if f.pageSize != DefaultPageSize {
+		t.Errorf("expected page size %d, got %d", DefaultPageSize, f.pageSize)
+	}
+
+	if f.pos.TXID != 0 {
+		t.Errorf("expected TXID 0 for new database, got %d", f.pos.TXID)
+	}
+
+	if f.expectedTXID != 0 {
+		t.Errorf("expected expectedTXID 0, got %d", f.expectedTXID)
+	}
+
+	if f.pendingTXID != 1 {
+		t.Errorf("expected pendingTXID 1, got %d", f.pendingTXID)
+	}
+
+	if f.commit != 0 {
+		t.Errorf("expected commit 0 for new database, got %d", f.commit)
+	}
+}
+
+func TestVFSFile_NewDatabase_ReadReturnsZeros(t *testing.T) {
+	// Test that reading from a new database returns zeros
+	client := newWriteTestReplicaClient()
+
+	tmpDir := t.TempDir()
+	bufferPath := tmpDir + "/.litestream-write-buffer"
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "new.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+	f.bufferPath = bufferPath
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Read page 1 - should return zeros for new database
+	readBuf := make([]byte, 100)
+	n, err := f.ReadAt(readBuf, 0)
+	if err != nil {
+		t.Fatalf("expected no error reading from new database, got: %v", err)
+	}
+	if n != len(readBuf) {
+		t.Errorf("expected %d bytes, got %d", len(readBuf), n)
+	}
+
+	// Verify all zeros
+	for i, b := range readBuf {
+		if b != 0 {
+			t.Errorf("expected zero at position %d, got %d", i, b)
+			break
+		}
+	}
+}
+
+func TestVFSFile_NewDatabase_WriteAndSync(t *testing.T) {
+	// Test writing to a new database and syncing to remote
+	client := newWriteTestReplicaClient()
+
+	tmpDir := t.TempDir()
+	bufferPath := tmpDir + "/.litestream-write-buffer"
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "new.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+	f.bufferPath = bufferPath
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Write data to page 1
+	writeData := []byte("new database content")
+	n, err := f.WriteAt(writeData, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != len(writeData) {
+		t.Errorf("expected %d bytes written, got %d", len(writeData), n)
+	}
+
+	// Verify dirty page exists
+	if len(f.dirty) != 1 {
+		t.Errorf("expected 1 dirty page, got %d", len(f.dirty))
+	}
+
+	// Sync to remote
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify TXID advanced
+	if f.expectedTXID != 1 {
+		t.Errorf("expected expectedTXID 1 after sync, got %d", f.expectedTXID)
+	}
+	if f.pendingTXID != 2 {
+		t.Errorf("expected pendingTXID 2 after sync, got %d", f.pendingTXID)
+	}
+
+	// Verify LTX file was written
+	client.mu.Lock()
+	if len(client.ltxFiles[0]) != 1 {
+		t.Errorf("expected 1 LTX file after sync, got %d", len(client.ltxFiles[0]))
+	}
+	if len(client.ltxFiles[0]) > 0 {
+		info := client.ltxFiles[0][0]
+		if info.MinTXID != 1 || info.MaxTXID != 1 {
+			t.Errorf("expected TXID 1, got min=%d max=%d", info.MinTXID, info.MaxTXID)
+		}
+	}
+	client.mu.Unlock()
+}
+
+func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
+	// Test that FileSize returns 0 for a new empty database
+	client := newWriteTestReplicaClient()
+
+	tmpDir := t.TempDir()
+	bufferPath := tmpDir + "/.litestream-write-buffer"
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "new.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+	f.bufferPath = bufferPath
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// FileSize should be 0 for empty database
+	size, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != 0 {
+		t.Errorf("expected size 0 for new database, got %d", size)
+	}
+
+	// Write a page
+	data := make([]byte, DefaultPageSize)
+	if _, err := f.WriteAt(data, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// FileSize should now reflect the dirty page
+	size, err = f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if size != int64(DefaultPageSize) {
+		t.Errorf("expected size %d after write, got %d", DefaultPageSize, size)
+	}
+}
