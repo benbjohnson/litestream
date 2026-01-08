@@ -229,11 +229,15 @@ func TestVFSFile_WriteEnabled(t *testing.T) {
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
 	// Create VFSFile directly with write enabled
+	tmpDir := t.TempDir()
+	bufferPath := tmpDir + "/write-buffer"
+
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
+	f.bufferPath = bufferPath
 
 	if err := f.Open(); err != nil {
 		t.Fatal(err)
@@ -636,6 +640,54 @@ func TestVFSFile_WriteBufferClearAfterSync(t *testing.T) {
 	stat, _ = os.Stat(bufferPath)
 	if stat.Size() != 0 {
 		t.Errorf("buffer should be empty after sync, got size %d", stat.Size())
+	}
+}
+
+func TestVFSFile_OpenFailsWithInvalidBufferPath(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "test.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+	f.bufferPath = "/nonexistent/path/that/cannot/be/created/buffer"
+
+	err := f.Open()
+	if err == nil {
+		f.Close()
+		t.Fatal("expected Open to fail with invalid buffer path")
+	}
+}
+
+func TestVFSFile_BufferFileAlwaysCreatedWhenWriteEnabled(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	tmpDir := t.TempDir()
+	bufferPath := tmpDir + "/write-buffer"
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "test.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+	f.bufferPath = bufferPath
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if f.bufferFile == nil {
+		t.Fatal("bufferFile should never be nil when writeEnabled is true")
 	}
 }
 
