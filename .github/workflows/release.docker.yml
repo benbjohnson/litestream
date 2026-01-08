@@ -15,7 +15,7 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     env:
-      # VFS extension requires CGO which doesn't cross-compile well for arm/v7
+      # CGO cross-compilation supported platforms
       PLATFORMS: "linux/amd64,linux/arm64"
       VERSION: "${{ github.event_name == 'release' && github.event.release.name || github.sha }}"
 
