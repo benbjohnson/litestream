@@ -591,7 +591,7 @@ func (f *VFSFile) Open() error {
 
 		// Initialize write buffer file for durability (discards any existing buffer)
 		if err := f.initWriteBuffer(); err != nil {
-			f.logger.Warn("failed to initialize write buffer", "error", err)
+			return fmt.Errorf("initialize write buffer: %w", err)
 		}
 	}
 
@@ -1256,11 +1256,8 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 
 // initWriteBuffer initializes the write buffer file for durability.
 // Any existing buffer content is discarded since unsync'd changes are lost on restart.
+// This function is only called when writeEnabled is true, which guarantees bufferPath is set.
 func (f *VFSFile) initWriteBuffer() error {
-	if f.bufferPath == "" {
-		return nil // No buffer configured
-	}
-
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(f.bufferPath), 0755); err != nil {
 		return fmt.Errorf("create buffer directory: %w", err)
@@ -1282,10 +1279,6 @@ func (f *VFSFile) initWriteBuffer() error {
 // Otherwise, it appends to the end of the file.
 // Must be called with f.mu held.
 func (f *VFSFile) writeToBuffer(pgno uint32, data []byte) error {
-	if f.bufferFile == nil {
-		return nil // No buffer configured
-	}
-
 	var writeOffset int64
 	if existingOff, ok := f.dirty[pgno]; ok {
 		// Page already exists - overwrite at same offset
@@ -1309,10 +1302,6 @@ func (f *VFSFile) writeToBuffer(pgno uint32, data []byte) error {
 
 // clearWriteBuffer clears and resets the write buffer after successful sync.
 func (f *VFSFile) clearWriteBuffer() error {
-	if f.bufferFile == nil {
-		return nil
-	}
-
 	// Truncate file to zero
 	if err := f.bufferFile.Truncate(0); err != nil {
 		return fmt.Errorf("truncate buffer: %w", err)
