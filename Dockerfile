@@ -8,7 +8,7 @@ COPY . .
 
 ARG LITESTREAM_VERSION=latest
 
-# Build litestream binary (unchanged from original)
+# Build litestream binary
 RUN --mount=type=cache,target=/root/.cache/go-build \
 	--mount=type=cache,target=/go/pkg \
 	go build -ldflags "-s -w -X 'main.Version=${LITESTREAM_VERSION}' -extldflags '-static'" -tags osusergo,netgo,sqlite_omit_load_extension -o /usr/local/bin/litestream ./cmd/litestream
