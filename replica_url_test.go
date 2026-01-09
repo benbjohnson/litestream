@@ -951,6 +951,100 @@ func TestIsLocalEndpoint(t *testing.T) {
 	}
 }
 
+// TestS3ProviderDefaults tests that provider-specific defaults are applied
+// when creating S3 clients from URLs with provider endpoints.
+// These tests ensure edge case bugs like #912, #918, #940, #947 don't regress.
+func TestS3ProviderDefaults(t *testing.T) {
+	tests := []struct {
+		name               string
+		url                string
+		wantSignPayload    bool
+		wantForcePathStyle bool
+		wantRequireMD5     bool
+	}{
+		{
+			name:               "CloudflareR2_SignPayload",
+			url:                "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
+			wantSignPayload:    true,
+			wantForcePathStyle: true, // Custom endpoint default
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "BackblazeB2_SignPayloadAndPathStyle",
+			url:                "s3://mybucket/path?endpoint=https://s3.us-west-002.backblazeb2.com",
+			wantSignPayload:    true,
+			wantForcePathStyle: true,
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "DigitalOcean_SignPayload",
+			url:                "s3://mybucket/path?endpoint=https://sfo3.digitaloceanspaces.com",
+			wantSignPayload:    true,
+			wantForcePathStyle: true, // Custom endpoint default
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "Scaleway_SignPayload",
+			url:                "s3://mybucket/path?endpoint=https://s3.fr-par.scw.cloud",
+			wantSignPayload:    true,
+			wantForcePathStyle: true, // Custom endpoint default
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "Filebase_SignPayloadAndPathStyle",
+			url:                "s3://mybucket/path?endpoint=https://s3.filebase.com",
+			wantSignPayload:    true,
+			wantForcePathStyle: true,
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "Tigris_SignPayloadNoMD5",
+			url:                "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev",
+			wantSignPayload:    true,
+			wantForcePathStyle: true, // Custom endpoint default
+			wantRequireMD5:     false,
+		},
+		{
+			name:               "MinIO_SignPayloadAndPathStyle",
+			url:                "s3://mybucket/path?endpoint=http://localhost:9000",
+			wantSignPayload:    true,
+			wantForcePathStyle: true,
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "AWS_Defaults",
+			url:                "s3://mybucket/path",
+			wantSignPayload:    true, // Default
+			wantForcePathStyle: false,
+			wantRequireMD5:     true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatalf("NewReplicaClientFromURL(%q) error: %v", tt.url, err)
+			}
+
+			s3Client, ok := client.(*s3.ReplicaClient)
+			if !ok {
+				t.Fatalf("expected *s3.ReplicaClient, got %T", client)
+			}
+
+			if s3Client.SignPayload != tt.wantSignPayload {
+				t.Errorf("SignPayload = %v, want %v", s3Client.SignPayload, tt.wantSignPayload)
+			}
+			if s3Client.ForcePathStyle != tt.wantForcePathStyle {
+				t.Errorf("ForcePathStyle = %v, want %v", s3Client.ForcePathStyle, tt.wantForcePathStyle)
+			}
+			if s3Client.RequireContentMD5 != tt.wantRequireMD5 {
+				t.Errorf("RequireContentMD5 = %v, want %v", s3Client.RequireContentMD5, tt.wantRequireMD5)
+			}
+		})
+	}
+}
+
 func TestEnsureEndpointScheme(t *testing.T) {
 	tests := []struct {
 		input       string
@@ -991,4 +1085,41 @@ func TestEnsureEndpointScheme(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestS3ProviderDefaults_QueryParamOverrides tests that explicit query parameters
+// override provider-specific defaults.
+func TestS3ProviderDefaults_QueryParamOverrides(t *testing.T) {
+	t.Run("SignPayload_ExplicitFalse", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com&sign-payload=false")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client := client.(*s3.ReplicaClient)
+		if s3Client.SignPayload != false {
+			t.Errorf("SignPayload = %v, want false (explicit override)", s3Client.SignPayload)
+		}
+	})
+
+	t.Run("ForcePathStyle_ExplicitFalse", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/path?endpoint=https://s3.us-west-002.backblazeb2.com&forcePathStyle=false")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client := client.(*s3.ReplicaClient)
+		if s3Client.ForcePathStyle != false {
+			t.Errorf("ForcePathStyle = %v, want false (explicit override)", s3Client.ForcePathStyle)
+		}
+	})
+
+	t.Run("RequireMD5_ExplicitTrue_Tigris", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket/path?endpoint=https://fly.storage.tigris.dev&require-content-md5=true")
+		if err != nil {
+			t.Fatal(err)
+		}
+		s3Client := client.(*s3.ReplicaClient)
+		if s3Client.RequireContentMD5 != true {
+			t.Errorf("RequireContentMD5 = %v, want true (explicit override)", s3Client.RequireContentMD5)
+		}
+	})
 }

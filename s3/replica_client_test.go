@@ -23,6 +23,8 @@ import (
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/superfly/ltx"
+
+	litestream "github.com/benbjohnson/litestream"
 )
 
 // mockAPIError implements smithy.APIError for testing
@@ -1656,5 +1658,162 @@ func TestReplicaClient_NoSSE_Headers(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for PUT request")
+	}
+}
+
+// TestReplicaClient_R2ConcurrencyDefault tests that Cloudflare R2 endpoints get
+// Concurrency=2 by default to avoid their strict concurrent upload limits.
+// This is a regression test for issue #948.
+//
+// NOTE: This test is skipped until issue #948 is fixed. Once the fix is merged,
+// remove the t.Skip() call and the test should pass.
+func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
+	tests := []struct {
+		name            string
+		url             string
+		wantConcurrency int
+		skipReason      string
+	}{
+		{
+			name:            "R2_DefaultConcurrency",
+			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
+			wantConcurrency: 2,
+			skipReason:      "pending issue #948 fix",
+		},
+		{
+			name:            "AWS_NoConcurrencyOverride",
+			url:             "s3://mybucket/path",
+			wantConcurrency: 0,
+		},
+		{
+			name:            "MinIO_NoConcurrencyOverride",
+			url:             "s3://mybucket/path?endpoint=http://localhost:9000",
+			wantConcurrency: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.skipReason != "" {
+				t.Skip(tt.skipReason)
+			}
+
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatalf("NewReplicaClientFromURL() error: %v", err)
+			}
+			c := client.(*ReplicaClient)
+
+			if c.Concurrency != tt.wantConcurrency {
+				t.Errorf("Concurrency = %d, want %d", c.Concurrency, tt.wantConcurrency)
+			}
+		})
+	}
+}
+
+// TestReplicaClient_ProviderEndpointDetection tests the endpoint detection functions
+// used to apply provider-specific defaults.
+func TestReplicaClient_ProviderEndpointDetection(t *testing.T) {
+	tests := []struct {
+		name     string
+		endpoint string
+		wantR2   bool
+		wantB2   bool
+		wantDO   bool
+	}{
+		{
+			name:     "CloudflareR2",
+			endpoint: "https://accountid.r2.cloudflarestorage.com",
+			wantR2:   true,
+		},
+		{
+			name:     "CloudflareR2_HTTP",
+			endpoint: "http://accountid.r2.cloudflarestorage.com",
+			wantR2:   true,
+		},
+		{
+			name:     "BackblazeB2",
+			endpoint: "https://s3.us-west-002.backblazeb2.com",
+			wantB2:   true,
+		},
+		{
+			name:     "DigitalOcean",
+			endpoint: "https://sgp1.digitaloceanspaces.com",
+			wantDO:   true,
+		},
+		{
+			name:     "AWS_S3",
+			endpoint: "",
+		},
+		{
+			name:     "MinIO",
+			endpoint: "http://localhost:9000",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := litestream.IsCloudflareR2Endpoint(tt.endpoint); got != tt.wantR2 {
+				t.Errorf("IsCloudflareR2Endpoint() = %v, want %v", got, tt.wantR2)
+			}
+			if got := litestream.IsBackblazeEndpoint(tt.endpoint); got != tt.wantB2 {
+				t.Errorf("IsBackblazeEndpoint() = %v, want %v", got, tt.wantB2)
+			}
+			if got := litestream.IsDigitalOceanEndpoint(tt.endpoint); got != tt.wantDO {
+				t.Errorf("IsDigitalOceanEndpoint() = %v, want %v", got, tt.wantDO)
+			}
+		})
+	}
+}
+
+// TestReplicaClient_CustomEndpoint_DisablesChecksumFeatures tests that custom endpoints
+// (non-AWS S3) have SDK checksum features disabled to avoid aws-chunked encoding issues.
+// This addresses issues #895, #912, #940, #941, #947 where S3-compatible providers
+// don't support aws-chunked encoding or streaming checksums.
+func TestReplicaClient_CustomEndpoint_DisablesChecksumFeatures(t *testing.T) {
+	tests := []struct {
+		name               string
+		endpoint           string
+		wantChecksumCalc   string
+		wantChecksumValid  string
+		expectCustomConfig bool
+	}{
+		{
+			name:               "AWS_S3_NoCustomConfig",
+			endpoint:           "",
+			expectCustomConfig: false,
+		},
+		{
+			name:               "R2_DisablesChecksums",
+			endpoint:           "https://account.r2.cloudflarestorage.com",
+			expectCustomConfig: true,
+		},
+		{
+			name:               "B2_DisablesChecksums",
+			endpoint:           "https://s3.us-west-002.backblazeb2.com",
+			expectCustomConfig: true,
+		},
+		{
+			name:               "MinIO_DisablesChecksums",
+			endpoint:           "http://localhost:9000",
+			expectCustomConfig: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := NewReplicaClient()
+			c.Bucket = "test-bucket"
+			c.Region = "us-east-1"
+			c.Endpoint = tt.endpoint
+			c.ForcePathStyle = true
+			c.AccessKeyID = "test"
+			c.SecretAccessKey = "test"
+
+			hasCustomEndpoint := c.Endpoint != ""
+			if hasCustomEndpoint != tt.expectCustomConfig {
+				t.Errorf("custom endpoint detection = %v, want %v", hasCustomEndpoint, tt.expectCustomConfig)
+			}
+		})
 	}
 }

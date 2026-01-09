@@ -41,6 +41,16 @@ on:
         required: false
         default: false
         type: boolean
+      test_b2:
+        description: 'Run Backblaze B2 integration tests'
+        required: false
+        default: false
+        type: boolean
+      test_multipart:
+        description: 'Run multipart upload stress tests (5MB-50MB files)'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   setup:
@@ -73,7 +83,9 @@ jobs:
              [ "${{ github.event.inputs.test_gcs }}" != "true" ] && \
              [ "${{ github.event.inputs.test_abs }}" != "true" ] && \
              [ "${{ github.event.inputs.test_tigris }}" != "true" ] && \
-             [ "${{ github.event.inputs.test_r2 }}" != "true" ]; then
+             [ "${{ github.event.inputs.test_r2 }}" != "true" ] && \
+             [ "${{ github.event.inputs.test_b2 }}" != "true" ] && \
+             [ "${{ github.event.inputs.test_multipart }}" != "true" ]; then
             echo "::error::At least one test type must be selected"
             exit 1
           fi
@@ -88,6 +100,8 @@ jobs:
           echo "- Azure Blob Storage: ${{ github.event.inputs.test_abs }}" >> $GITHUB_STEP_SUMMARY
           echo "- Fly.io Tigris: ${{ github.event.inputs.test_tigris }}" >> $GITHUB_STEP_SUMMARY
           echo "- Cloudflare R2: ${{ github.event.inputs.test_r2 }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Backblaze B2: ${{ github.event.inputs.test_b2 }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Multipart Stress Tests: ${{ github.event.inputs.test_multipart }}" >> $GITHUB_STEP_SUMMARY
 
   s3-integration:
     name: S3 Integration Tests (AWS)
@@ -98,19 +112,37 @@ jobs:
       group: integration-test-s3-manual
       cancel-in-progress: false
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::S3 integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
-      - run: go env
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
 
-      - run: go install ./cmd/litestream
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration -replica-clients=s3
+      - name: Run S3 integration tests
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go test -v ./replica_client_test.go -integration -replica-clients=s3
         env:
           LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
           LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
@@ -141,19 +173,37 @@ jobs:
       group: integration-test-tigris-manual
       cancel-in-progress: false
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_TIGRIS_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::Tigris integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
-      - run: go env
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
 
-      - run: go install ./cmd/litestream
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration -replica-clients=tigris
+      - name: Run Tigris integration tests
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go test -v ./replica_client_test.go -integration -replica-clients=tigris
         env:
           LITESTREAM_TIGRIS_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_TIGRIS_ACCESS_KEY_ID }}
           LITESTREAM_TIGRIS_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_TIGRIS_SECRET_ACCESS_KEY }}
@@ -182,19 +232,37 @@ jobs:
       group: integration-test-r2-manual
       cancel-in-progress: false
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_R2_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::R2 integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
-      - run: go env
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
 
-      - run: go install ./cmd/litestream
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration -replica-clients=r2
+      - name: Run R2 integration tests
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go test -v ./replica_client_test.go -integration -replica-clients=r2
         env:
           LITESTREAM_R2_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_R2_ACCESS_KEY_ID }}
           LITESTREAM_R2_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_R2_SECRET_ACCESS_KEY }}
@@ -216,6 +284,131 @@ jobs:
             *.log
             test-results/
 
+  b2-integration:
+    name: Backblaze B2 Integration Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event.inputs.test_b2 == 'true'
+    concurrency:
+      group: integration-test-b2-manual
+      cancel-in-progress: false
+    steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_B2_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::B2 integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+
+      - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        with:
+          go-version-file: "go.mod"
+
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
+
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
+
+      - name: Run B2 integration tests
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go test -v ./replica_client_test.go -integration -replica-clients=b2
+        env:
+          LITESTREAM_B2_KEY_ID: ${{ secrets.LITESTREAM_B2_KEY_ID }}
+          LITESTREAM_B2_APPLICATION_KEY: ${{ secrets.LITESTREAM_B2_APPLICATION_KEY }}
+          LITESTREAM_B2_ENDPOINT: ${{ secrets.LITESTREAM_B2_ENDPOINT }}
+          LITESTREAM_B2_BUCKET: ${{ secrets.LITESTREAM_B2_BUCKET }}
+
+      - name: Create test results directory
+        if: always()
+        run: |
+          mkdir -p test-results
+          echo "Test completed at $(date)" > test-results/b2-test.log
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b2-test-results
+          path: |
+            *.log
+            test-results/
+
+  multipart-stress:
+    name: Multipart Upload Stress Tests
+    runs-on: ubuntu-latest
+    needs: setup
+    if: github.event.inputs.test_multipart == 'true'
+    concurrency:
+      group: integration-test-multipart-manual
+      cancel-in-progress: false
+    steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}" ]; then
+            echo "::notice title=Skipped::Multipart stress tests skipped - S3 credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        with:
+          ref: ${{ needs.setup.outputs.ref }}
+
+      - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        with:
+          go-version-file: "go.mod"
+
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
+
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
+
+      - name: Run multipart threshold tests (AWS S3)
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: |
+          go test -v ./replica_client_test.go -integration -replica-clients=s3 \
+            -run "TestReplicaClient_S3_Multipart|TestReplicaClient_S3_Concurrency" \
+            -timeout 30m
+        env:
+          LITESTREAM_S3_ACCESS_KEY_ID: ${{ secrets.LITESTREAM_S3_ACCESS_KEY_ID }}
+          LITESTREAM_S3_SECRET_ACCESS_KEY: ${{ secrets.LITESTREAM_S3_SECRET_ACCESS_KEY }}
+          LITESTREAM_S3_REGION: us-east-1
+          LITESTREAM_S3_BUCKET: integration.litestream.io
+
+      - name: Create test results directory
+        if: always()
+        run: |
+          mkdir -p test-results
+          echo "Test completed at $(date)" > test-results/multipart-test.log
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: multipart-test-results
+          path: |
+            *.log
+            test-results/
+
   gcs-integration:
     name: Google Cloud Storage Integration Tests
     runs-on: ubuntu-latest
@@ -225,25 +418,44 @@ jobs:
       group: integration-test-gcp-manual
       cancel-in-progress: false
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.GOOGLE_APPLICATION_CREDENTIALS }}" ]; then
+            echo "::notice title=Skipped::GCS integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - name: Extract GCP credentials
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         run: 'echo "$GOOGLE_APPLICATION_CREDENTIALS" > /opt/gcp.json'
         shell: bash
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
 
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
-      - run: go env
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
 
-      - run: go install ./cmd/litestream
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration -replica-clients=gs
+      - name: Run GCS integration tests
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go test -v ./replica_client_test.go -integration -replica-clients=gs
         env:
           GOOGLE_APPLICATION_CREDENTIALS: /opt/gcp.json
           LITESTREAM_GS_BUCKET: litestream-github-workflows
@@ -272,19 +484,37 @@ jobs:
       group: integration-test-abs-manual
       cancel-in-progress: false
     steps:
+      - name: Check for required secrets
+        id: check-secrets
+        run: |
+          if [ -z "${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}" ]; then
+            echo "::notice title=Skipped::Azure Blob Storage integration tests skipped - credentials not configured"
+            echo "has_secrets=false" >> $GITHUB_OUTPUT
+          else
+            echo "has_secrets=true" >> $GITHUB_OUTPUT
+          fi
+
       - uses: actions/checkout@v4
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
       - uses: actions/setup-go@v5
+        if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
 
-      - run: go env
+      - name: Show Go environment
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go env
 
-      - run: go install ./cmd/litestream
+      - name: Install litestream
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration -replica-clients=abs
+      - name: Run Azure Blob Storage integration tests
+        if: steps.check-secrets.outputs.has_secrets == 'true'
+        run: go test -v ./replica_client_test.go -integration -replica-clients=abs
         env:
           LITESTREAM_ABS_ACCOUNT_NAME: ${{ secrets.LITESTREAM_ABS_ACCOUNT_NAME }}
           LITESTREAM_ABS_ACCOUNT_KEY: ${{ secrets.LITESTREAM_ABS_ACCOUNT_KEY }}
@@ -308,7 +538,7 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [setup, s3-integration, gcs-integration, abs-integration, tigris-integration, r2-integration]
+    needs: [setup, s3-integration, gcs-integration, abs-integration, tigris-integration, r2-integration, b2-integration, multipart-stress]
     if: always()
     steps:
       - name: Download all artifacts
@@ -364,6 +594,22 @@ jobs:
             echo "⏭️ **Cloudflare R2:** Skipped" >> $GITHUB_STEP_SUMMARY
           fi
 
+          if [ "${{ needs.b2-integration.result }}" == "success" ]; then
+            echo "✅ **Backblaze B2:** Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.b2-integration.result }}" == "failure" ]; then
+            echo "❌ **Backblaze B2:** Failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.b2-integration.result }}" == "skipped" ]; then
+            echo "⏭️ **Backblaze B2:** Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "${{ needs.multipart-stress.result }}" == "success" ]; then
+            echo "✅ **Multipart Stress Tests:** Passed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.multipart-stress.result }}" == "failure" ]; then
+            echo "❌ **Multipart Stress Tests:** Failed" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.multipart-stress.result }}" == "skipped" ]; then
+            echo "⏭️ **Multipart Stress Tests:** Skipped" >> $GITHUB_STEP_SUMMARY
+          fi
+
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
@@ -388,6 +634,8 @@ jobs:
             if ('${{ needs.abs-integration.result }}' === 'failure') failedJobs.push('Azure');
             if ('${{ needs.tigris-integration.result }}' === 'failure') failedJobs.push('Tigris');
             if ('${{ needs.r2-integration.result }}' === 'failure') failedJobs.push('R2');
+            if ('${{ needs.b2-integration.result }}' === 'failure') failedJobs.push('B2');
+            if ('${{ needs.multipart-stress.result }}' === 'failure') failedJobs.push('Multipart');
 
             if (failedJobs.length > 0) {
               statusEmoji = '❌';
