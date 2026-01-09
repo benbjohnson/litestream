@@ -79,8 +79,8 @@ type VFS struct {
 	// reads from the local file once complete, eliminating remote fetch latency.
 	HydrationEnabled bool
 
-	// HydrationPath is the directory path for local hydration files.
-	// Required if HydrationEnabled is true.
+	// HydrationPath is the file path for local hydration file.
+	// If empty and HydrationEnabled is true, a temp file will be used.
 	HydrationPath string
 
 	tempDirOnce sync.Once
@@ -140,12 +140,19 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	// Initialize hydration support if enabled
-	if vfs.HydrationEnabled && vfs.HydrationPath != "" {
+	if vfs.HydrationEnabled {
 		f.hydrationEnabled = true
-		// Generate unique hydration file path based on database name
-		safeName := strings.ReplaceAll(name, "/", "_")
-		safeName = strings.ReplaceAll(safeName, "\\", "_")
-		f.hydrationPath = filepath.Join(vfs.HydrationPath, safeName+".hydration.db")
+		if vfs.HydrationPath != "" {
+			// Use provided path directly
+			f.hydrationPath = vfs.HydrationPath
+		} else {
+			// Use a temp file if no path specified
+			dir, err := vfs.ensureTempDir()
+			if err != nil {
+				return nil, 0, fmt.Errorf("create temp dir for hydration: %w", err)
+			}
+			f.hydrationPath = filepath.Join(dir, "hydration.db")
+		}
 	}
 
 	if err := f.Open(); err != nil {
