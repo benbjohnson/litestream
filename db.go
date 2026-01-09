@@ -253,6 +253,28 @@ func (db *DB) LTXDir() string {
 	return filepath.Join(db.metaPath, "ltx")
 }
 
+// ResetLocalState removes local LTX files, forcing a fresh snapshot on next sync.
+// This is useful for recovering from corrupted or missing LTX files.
+// The database file itself is not modified.
+func (db *DB) ResetLocalState(ctx context.Context) error {
+	db.Logger.Info("resetting local litestream state",
+		"meta_path", db.metaPath,
+		"ltx_dir", db.LTXDir())
+
+	// Remove all LTX files
+	if err := os.RemoveAll(db.LTXDir()); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove ltx directory: %w", err)
+	}
+
+	// Clear cached LTX file info
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.maxLTXFileInfos.Unlock()
+
+	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
+	return nil
+}
+
 // LTXLevelDir returns path of the given LTX compaction level.
 // Panics if level is negative.
 func (db *DB) LTXLevelDir(level int) string {
@@ -1041,15 +1063,21 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	}
 
 	// Determine last WAL offset we save from.
-	ltxFile, err := os.Open(db.LTXPath(0, pos.TXID, pos.TXID))
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	ltxFile, err := os.Open(ltxPath)
 	if err != nil {
-		return info, fmt.Errorf("open ltx file: %w", err)
+		if os.IsNotExist(err) {
+			return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+		}
+		return info, fmt.Errorf("open ltx file %s: %w", ltxPath, err)
 	}
 	defer func() { _ = ltxFile.Close() }()
 
 	dec := ltx.NewDecoder(ltxFile)
 	if err := dec.DecodeHeader(); err != nil {
-		return info, fmt.Errorf("decode ltx file: %w", err)
+		// Decode failure indicates corruption
+		ltxErr := NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+		return info, ltxErr
 	}
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
 	info.salt1 = dec.Header().WALSalt1

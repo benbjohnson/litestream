@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -191,7 +192,7 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 		t.Helper()
 		t.Parallel()
 
-		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(1), 0, 0); !os.IsNotExist(err) {
+		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(1), 0, 0); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
@@ -216,10 +217,10 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), 0, 0); !os.IsNotExist(err) {
+		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(1), ltx.TXID(2), 0, 0); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
-		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(3), ltx.TXID(4), 0, 0); !os.IsNotExist(err) {
+		if _, err := c.OpenLTXFile(context.Background(), 0, ltx.TXID(3), ltx.TXID(4), 0, 0); !errors.Is(err, os.ErrNotExist) {
 			t.Fatalf("expected not exist, got %#v", err)
 		}
 	})
@@ -388,7 +389,7 @@ func TestReplicaClient_S3_ErrorContext(t *testing.T) {
 		}
 
 		// Should return os.ErrNotExist for S3 NoSuchKey
-		if !os.IsNotExist(err) {
+		if !errors.Is(err, os.ErrNotExist) {
 			t.Errorf("expected os.ErrNotExist, got %v", err)
 		}
 	})

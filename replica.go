@@ -47,6 +47,12 @@ type Replica struct {
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
 	MonitorEnabled bool
+
+	// If true, automatically reset local state when LTX errors are detected.
+	// This allows recovery from corrupted/missing LTX files by resetting
+	// the position file and removing local LTX files, forcing a fresh sync.
+	// Disabled by default to prevent silent data loss scenarios.
+	AutoRecoverEnabled bool
 }
 
 func NewReplica(db *DB) *Replica {
@@ -363,13 +369,49 @@ func (r *Replica) monitor(ctx context.Context) {
 					}
 				}
 
-				// Log with rate limiting to avoid log spam during persistent errors.
-				if time.Since(lastLogTime) >= SyncErrorLogInterval {
-					r.Logger().Error("monitor error",
-						"error", err,
-						"consecutive_errors", consecutiveErrs,
-						"backoff", backoff)
-					lastLogTime = time.Now()
+				// Check for LTX errors and include recovery hints
+				var ltxErr *LTXError
+				if errors.As(err, &ltxErr) {
+					// Log with rate limiting to avoid log spam during persistent errors.
+					if time.Since(lastLogTime) >= SyncErrorLogInterval {
+						if ltxErr.Hint != "" {
+							r.Logger().Error("monitor error",
+								"error", err,
+								"path", ltxErr.Path,
+								"hint", ltxErr.Hint,
+								"consecutive_errors", consecutiveErrs,
+								"backoff", backoff)
+						} else {
+							r.Logger().Error("monitor error",
+								"error", err,
+								"path", ltxErr.Path,
+								"consecutive_errors", consecutiveErrs,
+								"backoff", backoff)
+						}
+						lastLogTime = time.Now()
+					}
+
+					// Attempt auto-recovery if enabled
+					if r.AutoRecoverEnabled {
+						r.Logger().Warn("auto-recovery enabled, resetting local state")
+						if resetErr := r.db.ResetLocalState(ctx); resetErr != nil {
+							r.Logger().Error("auto-recovery failed", "error", resetErr)
+						} else {
+							r.Logger().Info("auto-recovery complete, resuming replication")
+							// Reset backoff after successful recovery
+							backoff = 0
+							consecutiveErrs = 0
+						}
+					}
+				} else {
+					// Log with rate limiting to avoid log spam during persistent errors.
+					if time.Since(lastLogTime) >= SyncErrorLogInterval {
+						r.Logger().Error("monitor error",
+							"error", err,
+							"consecutive_errors", consecutiveErrs,
+							"backoff", backoff)
+						lastLogTime = time.Now()
+					}
 				}
 			}
 			continue

@@ -127,9 +127,13 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 // OpenLTXFile returns a reader for an LTX file at the given position.
 // Returns os.ErrNotExist if no matching index/offset is found.
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
-	f, err := os.Open(c.LTXFilePath(level, minTXID, maxTXID))
+	path := c.LTXFilePath(level, minTXID, maxTXID)
+	f, err := os.Open(path)
 	if err != nil {
-		return nil, err
+		if os.IsNotExist(err) {
+			return nil, litestream.NewLTXError("open", path, level, uint64(minTXID), uint64(maxTXID), err)
+		}
+		return nil, fmt.Errorf("open ltx file %s: %w", path, err)
 	}
 
 	if offset > 0 {

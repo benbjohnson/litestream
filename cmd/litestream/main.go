@@ -157,6 +157,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		slog.Info("litestream shut down")
 		return err
 
+	case "reset":
+		return (&ResetCommand{}).Run(ctx, args)
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "status":
@@ -192,6 +194,7 @@ The commands are:
 	databases    list databases specified in config file
 	ltx          list available LTX files for a database
 	replicate    runs a server to replicate databases
+	reset        reset local state for a database
 	restore      recovers database backup from a replica
 	status       display replication status for databases
 	version      prints the binary version
@@ -920,6 +923,11 @@ type ReplicaSettings struct {
 	SyncInterval       *time.Duration `yaml:"sync-interval"`
 	ValidationInterval *time.Duration `yaml:"validation-interval"`
 
+	// If true, automatically reset local state when LTX errors are detected.
+	// This allows recovery from corrupted/missing LTX files by forcing a fresh sync.
+	// Disabled by default to prevent silent data loss scenarios.
+	AutoRecover *bool `yaml:"auto-recover"`
+
 	// S3 settings
 	AccessKeyID       string    `yaml:"access-key-id"`
 	SecretAccessKey   string    `yaml:"secret-access-key"`
@@ -993,6 +1001,11 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.ValidationInterval == nil && src.ValidationInterval != nil {
 		rs.ValidationInterval = src.ValidationInterval
+	}
+
+	// Recovery settings
+	if rs.AutoRecover == nil && src.AutoRecover != nil {
+		rs.AutoRecover = src.AutoRecover
 	}
 
 	// S3 settings
@@ -1143,6 +1156,9 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	r := litestream.NewReplica(db)
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
+	}
+	if v := c.AutoRecover; v != nil {
+		r.AutoRecoverEnabled = *v
 	}
 
 	// Build and set client on replica.
