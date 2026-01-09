@@ -2,6 +2,7 @@
 /src/litestream-vfs.h
 /dist
 .vscode
+.sprite
 
 # Claude-related files (force include despite global gitignore)
 !.claude/
