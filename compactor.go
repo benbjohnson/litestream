@@ -27,15 +27,13 @@ type Compactor struct {
 	// If nil, only remote files are deleted.
 	LocalFileDeleter func(level int, minTXID, maxTXID ltx.TXID) error
 
-	// Cache optionally stores MaxLTXFileInfo per level.
+	// CacheGetter optionally retrieves cached MaxLTXFileInfo for a level.
 	// If nil, max file info is always fetched from remote.
-	Cache MaxLTXFileInfoCache
-}
+	CacheGetter func(level int) (*ltx.FileInfo, bool)
 
-// MaxLTXFileInfoCache provides optional caching for max LTX file info.
-type MaxLTXFileInfoCache interface {
-	Get(level int) (*ltx.FileInfo, bool)
-	Set(level int, info *ltx.FileInfo)
+	// CacheSetter optionally stores MaxLTXFileInfo for a level.
+	// If nil, max file info is not cached.
+	CacheSetter func(level int, info *ltx.FileInfo)
 }
 
 // NewCompactor creates a new Compactor with the given client and logger.
@@ -63,8 +61,8 @@ func (c *Compactor) SetClient(client ReplicaClient) {
 // MaxLTXFileInfo returns metadata for the last LTX file in a level.
 // Uses cache if available, otherwise fetches from remote.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
-	if c.Cache != nil {
-		if info, ok := c.Cache.Get(level); ok {
+	if c.CacheGetter != nil {
+		if info, ok := c.CacheGetter(level); ok {
 			return *info, nil
 		}
 	}
@@ -83,8 +81,8 @@ func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo
 		}
 	}
 
-	if c.Cache != nil && info.MaxTXID > 0 {
-		c.Cache.Set(level, &info)
+	if c.CacheSetter != nil && info.MaxTXID > 0 {
+		c.CacheSetter(level, &info)
 	}
 
 	return info, itr.Close()
@@ -162,8 +160,8 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		return nil, fmt.Errorf("write ltx file: %w", err)
 	}
 
-	if c.Cache != nil {
-		c.Cache.Set(dstLevel, info)
+	if c.CacheSetter != nil {
+		c.CacheSetter(dstLevel, info)
 	}
 
 	return info, nil

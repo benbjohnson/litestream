@@ -101,8 +101,8 @@ func TestVFSFile_Snapshot(t *testing.T) {
 
 func TestDefaultCompactionLevels(t *testing.T) {
 	levels := litestream.DefaultCompactionLevels
-	if len(levels) != 3 {
-		t.Fatalf("DefaultCompactionLevels length=%d, want 3", len(levels))
+	if len(levels) != 4 {
+		t.Fatalf("DefaultCompactionLevels length=%d, want 4", len(levels))
 	}
 
 	// Verify L0 (raw files, no interval)
@@ -113,20 +113,28 @@ func TestDefaultCompactionLevels(t *testing.T) {
 		t.Errorf("levels[0].Interval=%v, want 0", levels[0].Interval)
 	}
 
-	// Verify L1 (hourly compaction)
+	// Verify L1 (30 second compaction)
 	if levels[1].Level != 1 {
 		t.Errorf("levels[1].Level=%d, want 1", levels[1].Level)
 	}
-	if levels[1].Interval != time.Hour {
-		t.Errorf("levels[1].Interval=%v, want 1h", levels[1].Interval)
+	if levels[1].Interval != 30*time.Second {
+		t.Errorf("levels[1].Interval=%v, want 30s", levels[1].Interval)
 	}
 
-	// Verify L2 (daily compaction)
+	// Verify L2 (5 minute compaction)
 	if levels[2].Level != 2 {
 		t.Errorf("levels[2].Level=%d, want 2", levels[2].Level)
 	}
-	if levels[2].Interval != 24*time.Hour {
-		t.Errorf("levels[2].Interval=%v, want 24h", levels[2].Interval)
+	if levels[2].Interval != 5*time.Minute {
+		t.Errorf("levels[2].Interval=%v, want 5m", levels[2].Interval)
+	}
+
+	// Verify L3 (hourly compaction)
+	if levels[3].Level != 3 {
+		t.Errorf("levels[3].Level=%d, want 3", levels[3].Level)
+	}
+	if levels[3].Interval != time.Hour {
+		t.Errorf("levels[3].Interval=%v, want 1h", levels[3].Interval)
 	}
 
 	// Verify they validate

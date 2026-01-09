@@ -170,24 +170,6 @@ type DB struct {
 	Logger *slog.Logger
 }
 
-// dbMaxLTXCache adapts DB's maxLTXFileInfos to the MaxLTXFileInfoCache interface.
-type dbMaxLTXCache struct {
-	db *DB
-}
-
-func (c *dbMaxLTXCache) Get(level int) (*ltx.FileInfo, bool) {
-	c.db.maxLTXFileInfos.Lock()
-	defer c.db.maxLTXFileInfos.Unlock()
-	info, ok := c.db.maxLTXFileInfos.m[level]
-	return info, ok
-}
-
-func (c *dbMaxLTXCache) Set(level int, info *ltx.FileInfo) {
-	c.db.maxLTXFileInfos.Lock()
-	defer c.db.maxLTXFileInfos.Unlock()
-	c.db.maxLTXFileInfos.m[level] = info
-}
-
 // NewDB returns a new instance of DB for a given path.
 func NewDB(path string) *DB {
 	dir, file := filepath.Split(path)
@@ -226,7 +208,17 @@ func NewDB(path string) *DB {
 	db.compactor = NewCompactor(nil, db.Logger)
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
-	db.compactor.Cache = &dbMaxLTXCache{db: db}
+	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
+		db.maxLTXFileInfos.Lock()
+		defer db.maxLTXFileInfos.Unlock()
+		info, ok := db.maxLTXFileInfos.m[level]
+		return info, ok
+	}
+	db.compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
+		db.maxLTXFileInfos.Lock()
+		defer db.maxLTXFileInfos.Unlock()
+		db.maxLTXFileInfos.m[level] = info
+	}
 
 	return db
 }

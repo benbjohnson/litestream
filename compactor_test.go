@@ -119,7 +119,16 @@ func TestCompactor_MaxLTXFileInfo(t *testing.T) {
 	t.Run("WithCache", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
-		compactor.Cache = &testCache{m: make(map[int]*ltx.FileInfo)}
+
+		// Use callbacks for caching
+		cache := make(map[int]*ltx.FileInfo)
+		compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
+			info, ok := cache[level]
+			return info, ok
+		}
+		compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
+			cache[level] = info
+		}
 
 		createTestLTXFile(t, client, 0, 1, 3)
 
@@ -310,20 +319,6 @@ func TestCompactor_EnforceSnapshotRetention(t *testing.T) {
 			t.Errorf("snapshot count=%d, want 2", count)
 		}
 	})
-}
-
-// testCache implements MaxLTXFileInfoCache for testing.
-type testCache struct {
-	m map[int]*ltx.FileInfo
-}
-
-func (c *testCache) Get(level int) (*ltx.FileInfo, bool) {
-	info, ok := c.m[level]
-	return info, ok
-}
-
-func (c *testCache) Set(level int, info *ltx.FileInfo) {
-	c.m[level] = info
 }
 
 // createTestLTXFile creates a minimal LTX file for testing.

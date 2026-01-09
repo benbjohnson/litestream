@@ -8,12 +8,14 @@ import (
 // SnapshotLevel represents the level which full snapshots are held.
 const SnapshotLevel = 9
 
-// DefaultCompactionLevels provides a reasonable default compaction configuration.
-// Level 0 is raw LTX files, Level 1 compacts hourly, Level 2 compacts daily.
+// DefaultCompactionLevels provides the canonical default compaction configuration.
+// Level 0 is raw LTX files, higher levels compact at increasing intervals.
+// These values are also used by cmd/litestream DefaultConfig().
 var DefaultCompactionLevels = CompactionLevels{
 	{Level: 0, Interval: 0},
-	{Level: 1, Interval: time.Hour},
-	{Level: 2, Interval: 24 * time.Hour},
+	{Level: 1, Interval: 30 * time.Second},
+	{Level: 2, Interval: 5 * time.Minute},
+	{Level: 3, Interval: time.Hour},
 }
 
 // CompactionLevel represents a single part of a multi-level compaction.
