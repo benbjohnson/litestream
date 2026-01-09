@@ -874,6 +874,10 @@ func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
 	}
 
 	f.hydrationComplete.Store(true)
+
+	// Clear cache since we'll now read from hydration file
+	f.cache.Purge()
+
 	f.logger.Info("hydration complete", "path", f.hydrationPath, "txid", f.hydrationTXID.String())
 }
 
