@@ -1054,7 +1054,6 @@ func TestVFSFile_Hydration_Basic(t *testing.T) {
 
 	// Create VFSFile with hydration enabled
 	f := NewVFSFile(client, "test.db", slog.Default())
-	f.hydrationEnabled = true
 	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
 	f.PollInterval = 100 * time.Millisecond
 
@@ -1065,7 +1064,7 @@ func TestVFSFile_Hydration_Basic(t *testing.T) {
 
 	// Wait for hydration to complete
 	deadline := time.Now().Add(5 * time.Second)
-	for !f.hydrationComplete.Load() {
+	for f.hydrator == nil || !f.hydrator.Complete() {
 		if time.Now().After(deadline) {
 			t.Fatalf("hydration did not complete in time")
 		}
@@ -1099,7 +1098,6 @@ func TestVFSFile_Hydration_ReadsDuringHydration(t *testing.T) {
 	hydrationDir := t.TempDir()
 
 	f := NewVFSFile(client, "test.db", slog.Default())
-	f.hydrationEnabled = true
 	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
 	f.PollInterval = 100 * time.Millisecond
 
@@ -1130,7 +1128,6 @@ func TestVFSFile_Hydration_CloseEarly(t *testing.T) {
 	hydrationDir := t.TempDir()
 
 	f := NewVFSFile(client, "test.db", slog.Default())
-	f.hydrationEnabled = true
 	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
 	f.PollInterval = 100 * time.Millisecond
 
@@ -1155,7 +1152,7 @@ func TestVFSFile_Hydration_Disabled(t *testing.T) {
 	client.addFixture(t, buildLTXFixture(t, 1, 'd'))
 
 	f := NewVFSFile(client, "test.db", slog.Default())
-	// hydrationEnabled is false by default
+	// hydrationPath is empty by default (hydration disabled)
 	f.PollInterval = 100 * time.Millisecond
 
 	if err := f.Open(); err != nil {
@@ -1163,14 +1160,9 @@ func TestVFSFile_Hydration_Disabled(t *testing.T) {
 	}
 	defer f.Close()
 
-	// Hydration should not be complete (it's disabled)
-	if f.hydrationComplete.Load() {
-		t.Fatalf("hydration should not be complete when disabled")
-	}
-
-	// Hydration file should not exist
-	if f.hydrationFile != nil {
-		t.Fatalf("hydration file should be nil when disabled")
+	// Hydrator should be nil when hydration is disabled
+	if f.hydrator != nil {
+		t.Fatalf("hydrator should be nil when disabled")
 	}
 
 	// Reads should still work via cache/remote
@@ -1188,7 +1180,6 @@ func TestVFSFile_Hydration_IncrementalUpdates(t *testing.T) {
 	hydrationDir := t.TempDir()
 
 	f := NewVFSFile(client, "test.db", slog.Default())
-	f.hydrationEnabled = true
 	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
 	f.PollInterval = 50 * time.Millisecond
 
@@ -1199,7 +1190,7 @@ func TestVFSFile_Hydration_IncrementalUpdates(t *testing.T) {
 
 	// Wait for hydration to complete
 	deadline := time.Now().Add(5 * time.Second)
-	for !f.hydrationComplete.Load() {
+	for f.hydrator == nil || !f.hydrator.Complete() {
 		if time.Now().After(deadline) {
 			t.Fatalf("hydration did not complete in time")
 		}
