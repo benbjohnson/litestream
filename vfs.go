@@ -947,16 +947,49 @@ func (f *VFSFile) catchUpHydration(fromTXID, toTXID ltx.TXID) error {
 			break
 		}
 
-		idx, err := FetchPageIndex(f.ctx, f.client, info)
-		if err != nil {
-			return fmt.Errorf("fetch page index: %w", err)
-		}
-
-		if err := f.applyUpdatesToHydratedFile(idx); err != nil {
-			return fmt.Errorf("apply catch-up updates: %w", err)
+		if err := f.applyLTXToHydratedFile(info); err != nil {
+			return fmt.Errorf("apply ltx to hydrated file: %w", err)
 		}
 
 		f.hydrationTXID = info.MaxTXID
+	}
+
+	return nil
+}
+
+// applyLTXToHydratedFile fetches an entire LTX file and applies its pages to the hydration file.
+func (f *VFSFile) applyLTXToHydratedFile(info *ltx.FileInfo) error {
+	f.logger.Debug("applying ltx to hydration file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+
+	// Fetch entire LTX file
+	rc, err := f.client.OpenLTXFile(f.ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open ltx file: %w", err)
+	}
+	defer rc.Close()
+
+	dec := ltx.NewDecoder(rc)
+	if err := dec.DecodeHeader(); err != nil {
+		return fmt.Errorf("decode header: %w", err)
+	}
+
+	f.hydrationMu.Lock()
+	defer f.hydrationMu.Unlock()
+
+	// Apply each page to the hydration file
+	for {
+		var phdr ltx.PageHeader
+		data := make([]byte, f.pageSize)
+		if err := dec.DecodePage(&phdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode page: %w", err)
+		}
+
+		off := int64(phdr.Pgno-1) * int64(f.pageSize)
+		if _, err := f.hydrationFile.WriteAt(data, off); err != nil {
+			return fmt.Errorf("write page %d: %w", phdr.Pgno, err)
+		}
 	}
 
 	return nil
