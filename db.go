@@ -151,6 +151,10 @@ type DB struct {
 	// Must be set before calling Open().
 	Replica *Replica
 
+	// Compactor handles shared compaction logic.
+	// Created in NewDB, client set when Replica is assigned.
+	compactor *Compactor
+
 	// Shutdown sync retry settings.
 	// ShutdownSyncTimeout is the total time to retry syncing on shutdown.
 	// ShutdownSyncInterval is the time between retry attempts.
@@ -200,6 +204,22 @@ func NewDB(path string) *DB {
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
+	// Initialize compactor with nil client (will be set when Replica is assigned).
+	db.compactor = NewCompactor(nil, db.Logger)
+	db.compactor.LocalFileOpener = db.openLocalLTXFile
+	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
+	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
+		db.maxLTXFileInfos.Lock()
+		defer db.maxLTXFileInfos.Unlock()
+		info, ok := db.maxLTXFileInfos.m[level]
+		return info, ok
+	}
+	db.compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
+		db.maxLTXFileInfos.Lock()
+		defer db.maxLTXFileInfos.Unlock()
+		db.maxLTXFileInfos.m[level] = info
+	}
+
 	return db
 }
 
@@ -244,6 +264,29 @@ func (db *DB) LTXLevelDir(level int) string {
 func (db *DB) LTXPath(level int, minTXID, maxTXID ltx.TXID) string {
 	assert(level >= 0, "level cannot be negative")
 	return filepath.Join(db.LTXLevelDir(level), ltx.FormatFilename(minTXID, maxTXID))
+}
+
+// openLocalLTXFile opens a local LTX file for reading.
+// Used by the Compactor to prefer local files over remote.
+func (db *DB) openLocalLTXFile(level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+	return os.Open(db.LTXPath(level, minTXID, maxTXID))
+}
+
+// deleteLocalLTXFile deletes a local LTX file.
+// Used by the Compactor for retention enforcement.
+func (db *DB) deleteLocalLTXFile(level int, minTXID, maxTXID ltx.TXID) error {
+	path := db.LTXPath(level, minTXID, maxTXID)
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
+// ensureCompactorClient ensures the compactor has the current replica client.
+func (db *DB) ensureCompactorClient() {
+	if db.Replica != nil && db.compactor.Client() != db.Replica.Client {
+		db.compactor.SetClient(db.Replica.Client)
+	}
 }
 
 // MaxLTX returns the last LTX file written to level 0.
@@ -1696,87 +1739,12 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 // Returns metadata for the newly written compaction file. Returns ErrNoCompaction
 // if no new files are available to be compacted.
 func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
-	srcLevel := dstLevel - 1
+	db.ensureCompactorClient()
 
-	prevMaxInfo, err := db.Replica.MaxLTXFileInfo(ctx, dstLevel)
+	info, err := db.compactor.Compact(ctx, dstLevel)
 	if err != nil {
-		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
+		return nil, err
 	}
-	seekTXID := prevMaxInfo.MaxTXID + 1
-
-	// Collect files after last compaction.
-	// Normal operation - use fast timestamps
-	itr, err := db.Replica.Client.LTXFiles(ctx, srcLevel, seekTXID, false)
-	if err != nil {
-		return nil, fmt.Errorf("source ltx files after %s: %w", seekTXID, err)
-	}
-	defer itr.Close()
-
-	// Ensure all readers are closed by the end, even if an error occurs.
-	var rdrs []io.Reader
-	defer func() {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-	}()
-
-	// Build a list of input files to compact from.
-	var minTXID, maxTXID ltx.TXID
-	for itr.Next() {
-		info := itr.Item()
-
-		// Track TXID bounds of all files being compacted.
-		if minTXID == 0 || info.MinTXID < minTXID {
-			minTXID = info.MinTXID
-		}
-		if maxTXID == 0 || info.MaxTXID > maxTXID {
-			maxTXID = info.MaxTXID
-		}
-
-		// Prefer the on-disk LTX file when available so compaction is not subject
-		// to eventual consistency quirks of remote storage providers. Fallback to
-		// downloading the file from the replica client if the local copy has been
-		// removed.
-		if f, err := os.Open(db.LTXPath(srcLevel, info.MinTXID, info.MaxTXID)); err == nil {
-			rdrs = append(rdrs, f)
-			continue
-		} else if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("open local ltx file: %w", err)
-		}
-
-		f, err := db.Replica.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-		if err != nil {
-			return nil, fmt.Errorf("open ltx file: %w", err)
-		}
-		rdrs = append(rdrs, f)
-	}
-	if len(rdrs) == 0 {
-		return nil, ErrNoCompaction
-	}
-
-	// Stream compaction to destination in level.
-	pr, pw := io.Pipe()
-	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
-			return
-		}
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(c.Compact(ctx))
-	}()
-
-	info, err := db.Replica.Client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
-	if err != nil {
-		return nil, fmt.Errorf("write ltx file: %w", err)
-	}
-
-	// Cache last metadata for the level.
-	db.maxLTXFileInfos.Lock()
-	db.maxLTXFileInfos.m[dstLevel] = info
-	db.maxLTXFileInfos.Unlock()
 
 	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
@@ -1955,48 +1923,8 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 // EnforceRetentionByTXID enforces retention so that any LTX files below
 // the target TXID are deleted. Always keep at least one file.
 func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) (err error) {
-	db.Logger.Debug("enforcing retention", "level", level, "txid", txID)
-
-	// Normal operation - use fast timestamps
-	itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, false)
-	if err != nil {
-		return fmt.Errorf("fetch ltx files: %w", err)
-	}
-	defer itr.Close()
-
-	var deleted []*ltx.FileInfo
-	var lastInfo *ltx.FileInfo
-	for itr.Next() {
-		info := itr.Item()
-		lastInfo = info
-
-		// If this file's maxTXID is below the target TXID, mark it for deletion.
-		if info.MaxTXID < txID {
-			deleted = append(deleted, info)
-			continue
-		}
-	}
-
-	// Ensure we don't delete the last file.
-	if len(deleted) > 0 && deleted[len(deleted)-1] == lastInfo {
-		deleted = deleted[:len(deleted)-1]
-	}
-
-	// Remove all files marked for deletion from both remote and local storage.
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
-		return fmt.Errorf("remove ltx files: %w", err)
-	}
-
-	for _, info := range deleted {
-		localPath := db.LTXPath(level, info.MinTXID, info.MaxTXID)
-		db.Logger.Debug("deleting local ltx file", "level", level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
-
-		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
-		}
-	}
-
-	return nil
+	db.ensureCompactorClient()
+	return db.compactor.EnforceRetentionByTXID(ctx, level, txID)
 }
 
 // monitor runs in a separate goroutine and monitors the database & WAL.

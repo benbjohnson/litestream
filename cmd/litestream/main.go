@@ -279,9 +279,9 @@ func DefaultConfig() Config {
 	defaultShutdownSyncInterval := litestream.DefaultShutdownSyncInterval
 	return Config{
 		Levels: []*CompactionLevelConfig{
-			{Interval: 30 * time.Second},
-			{Interval: 5 * time.Minute},
-			{Interval: 1 * time.Hour},
+			{Interval: litestream.DefaultCompactionLevels[1].Interval},
+			{Interval: litestream.DefaultCompactionLevels[2].Interval},
+			{Interval: litestream.DefaultCompactionLevels[3].Interval},
 		},
 		Snapshot: SnapshotConfig{
 			Interval:  &defaultSnapshotInterval,
