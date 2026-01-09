@@ -1947,6 +1947,8 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		}
 	}
 
+	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
+
 	return nil
 }
 

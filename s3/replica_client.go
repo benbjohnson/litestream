@@ -972,13 +972,24 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	for len(objIDs) > 0 {
 		n := min(len(objIDs), MaxKeys)
 
+		c.logger.Debug("deleting ltx files batch", "count", n)
+
 		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
-			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
+			Delete: &types.Delete{Objects: objIDs[:n]},
 		})
 		if err != nil {
 			return fmt.Errorf("s3: delete batch of %d objects: %w", n, err)
-		} else if err := deleteOutputError(out); err != nil {
+		}
+
+		deleted := 0
+		if out != nil {
+			deleted = len(out.Deleted)
+		}
+		c.logger.Debug("delete batch completed", "requested", n, "deleted", deleted, "errors", len(out.Errors))
+		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Add(float64(deleted))
+
+		if err := deleteOutputError(out); err != nil {
 			return err
 		}
 
