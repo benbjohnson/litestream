@@ -13,7 +13,7 @@ import "C"
 
 import (
 	"context"
-	"log"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -38,19 +38,23 @@ import (
 func main() {}
 
 //export LitestreamVFSRegister
-func LitestreamVFSRegister() {
+func LitestreamVFSRegister() *C.char {
 	var client litestream.ReplicaClient
 	var err error
 
 	replicaURL := os.Getenv("LITESTREAM_REPLICA_URL")
+	if replicaURL == "" {
+		return C.CString("LITESTREAM_REPLICA_URL environment variable required")
+	}
+
 	client, err = litestream.NewReplicaClientFromURL(replicaURL)
 	if err != nil {
-		log.Fatalf("failed to create replica client from URL: %s", err)
+		return C.CString(fmt.Sprintf("failed to create replica client: %s", err))
 	}
 
 	// Initialize the client.
 	if err := client.Init(context.Background()); err != nil {
-		log.Fatalf("failed to initialize litestream replica client: %s", err)
+		return C.CString(fmt.Sprintf("failed to initialize replica client: %s", err))
 	}
 
 	var level slog.Level
@@ -71,7 +75,7 @@ func LitestreamVFSRegister() {
 		if s := os.Getenv("LITESTREAM_SYNC_INTERVAL"); s != "" {
 			d, err := time.ParseDuration(s)
 			if err != nil {
-				log.Fatalf("invalid LITESTREAM_SYNC_INTERVAL: %s", err)
+				return C.CString(fmt.Sprintf("invalid LITESTREAM_SYNC_INTERVAL: %s", err))
 			}
 			vfs.WriteSyncInterval = d
 		}
@@ -82,8 +86,10 @@ func LitestreamVFSRegister() {
 	}
 
 	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
-		log.Fatalf("failed to register litestream vfs: %s", err)
+		return C.CString(fmt.Sprintf("failed to register VFS: %s", err))
 	}
+
+	return nil
 }
 
 //export GoLitestreamRegisterConnection

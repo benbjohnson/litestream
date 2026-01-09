@@ -9,6 +9,7 @@
 extern const sqlite3_api_routines *sqlite3_api;
 
 /* Go function declarations */
+extern char* LitestreamVFSRegister(void);
 extern char* GoLitestreamRegisterConnection(void* db, sqlite3_uint64 file_id);
 extern char* GoLitestreamUnregisterConnection(void* db);
 extern char* GoLitestreamSetTime(void* db, char* timestamp);
@@ -31,8 +32,13 @@ int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_r
   int rc = SQLITE_OK;
   SQLITE_EXTENSION_INIT2(pApi);
 
-  /* call into Go to register the VFS */
-  LitestreamVFSRegister();
+  /* Call into Go to register the VFS and check for errors. */
+  char* err = LitestreamVFSRegister();
+  if (err != NULL) {
+    *pzErrMsg = sqlite3_mprintf("%s", err);
+    free(err);
+    return SQLITE_ERROR;
+  }
 
   /* Register SQL functions for new connections. */
   rc = sqlite3_auto_extension((void (*)(void))litestream_auto_extension);
