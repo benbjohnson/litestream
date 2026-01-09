@@ -1006,6 +1006,130 @@ func TestDB_EnforceL0RetentionByTime(t *testing.T) {
 	checkExists(true)
 }
 
+// TestDB_EnforceL0RetentionByTime_Failsafe tests that L0 files are deleted when
+// they exceed the absolute maximum age, even when no L1 files exist (compaction
+// is not running). This is the failsafe behavior to prevent unbounded L0 accumulation.
+// This test verifies the fix for issue #976.
+func TestDB_EnforceL0RetentionByTime_Failsafe(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	replicaPath := filepath.Join(t.TempDir(), "replica")
+	client := file.NewReplicaClient(replicaPath)
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+
+	// Use a short retention so the absolute max age (10x retention, min 1hr) is 1 hour.
+	db.L0Retention = 5 * time.Minute
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	// Create some L0 files
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (val) VALUES (?)`, fmt.Sprintf("value-%d", i)); err != nil {
+			t.Fatalf("insert %d: %v", i, err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync db %d: %v", i, err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatalf("sync replica %d: %v", i, err)
+		}
+	}
+
+	// Verify L0 files exist but do NOT compact to L1 (simulating broken compaction)
+	itr, err := client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		t.Fatalf("list L0 files: %v", err)
+	}
+	l0Files, err := ltx.SliceFileIterator(itr)
+	if err != nil {
+		t.Fatalf("slice iterator: %v", err)
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatalf("close iterator: %v", err)
+	}
+	if len(l0Files) < 2 {
+		t.Fatalf("expected at least two L0 files, got %d", len(l0Files))
+	}
+
+	// Verify no L1 files exist (to confirm compaction hasn't run)
+	l1Itr, err := client.LTXFiles(ctx, 1, 0, false)
+	if err != nil {
+		t.Fatalf("list L1 files: %v", err)
+	}
+	l1Files, err := ltx.SliceFileIterator(l1Itr)
+	if err != nil {
+		t.Fatalf("slice L1 iterator: %v", err)
+	}
+	if err := l1Itr.Close(); err != nil {
+		t.Fatalf("close L1 iterator: %v", err)
+	}
+	if len(l1Files) != 0 {
+		t.Fatalf("expected zero L1 files, got %d", len(l1Files))
+	}
+
+	// With recent files and no L1, enforcement should not delete anything
+	if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+		t.Fatalf("enforce recent retention: %v", err)
+	}
+	for _, info := range l0Files {
+		remotePath := client.LTXFilePath(0, info.MinTXID, info.MaxTXID)
+		if _, err := os.Stat(remotePath); err != nil {
+			t.Fatalf("expected L0 file to still exist: %s (%v)", remotePath, err)
+		}
+	}
+
+	// Age the files so they exceed the absolute maximum age threshold (1 hour minimum).
+	// With L0Retention=5m, absoluteMaxAge = max(50m, 1h) = 1h
+	oldTime := time.Now().Add(-2 * time.Hour)
+	for _, info := range l0Files {
+		remotePath := client.LTXFilePath(0, info.MinTXID, info.MaxTXID)
+		if err := os.Chtimes(remotePath, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes remote: %v", err)
+		}
+		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
+		if err := os.Chtimes(localPath, oldTime, oldTime); err != nil {
+			t.Fatalf("chtimes local: %v", err)
+		}
+	}
+
+	// Now enforce retention - files should be deleted via failsafe even without L1 files
+	if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+		t.Fatalf("enforce aged retention (failsafe): %v", err)
+	}
+
+	// Verify all but the newest L0 file was deleted (failsafe behavior)
+	for idx, info := range l0Files {
+		remotePath := client.LTXFilePath(0, info.MinTXID, info.MaxTXID)
+		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
+		_, remoteErr := os.Stat(remotePath)
+		_, localErr := os.Stat(localPath)
+
+		if idx < len(l0Files)-1 {
+			// All but the last file should be deleted
+			if !os.IsNotExist(remoteErr) {
+				t.Errorf("expected remote file to be deleted by failsafe: %s", remotePath)
+			}
+			if !os.IsNotExist(localErr) {
+				t.Errorf("expected local file to be deleted by failsafe: %s", localPath)
+			}
+		} else {
+			// Last file should be preserved
+			if remoteErr != nil {
+				t.Errorf("expected newest remote file to be preserved: %s (%v)", remotePath, remoteErr)
+			}
+			if localErr != nil {
+				t.Errorf("expected newest local file to be preserved: %s (%v)", localPath, localErr)
+			}
+		}
+	}
+}
+
 // TestDB_SyncAfterVacuum verifies that syncing works correctly after a database
 // shrinks via VACUUM. This tests the fix for issue #875 where page numbers from
 // earlier transactions in the WAL could exceed the new commit size after shrinking.

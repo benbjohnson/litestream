@@ -1862,7 +1862,9 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 }
 
 // EnforceL0RetentionByTime retains L0 files until they have been compacted into
-// L1 and have existed for at least L0Retention.
+// L1 and have existed for at least L0Retention. As a failsafe, files older than
+// the absolute maximum age (10x L0Retention, minimum 1 hour) are deleted even if
+// L1 compaction has not occurred.
 func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	if db.L0Retention <= 0 {
 		return nil
@@ -1885,11 +1887,25 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	if err := itr.Close(); err != nil {
 		return fmt.Errorf("close l1 iterator: %w", err)
 	}
-	if maxL1TXID == 0 {
-		return nil
+
+	// Calculate absolute maximum age as a failsafe (10x L0Retention, minimum 1 hour).
+	// This prevents unbounded L0 accumulation when compaction is failing or not running.
+	absoluteMaxAge := 10 * db.L0Retention
+	if absoluteMaxAge < time.Hour {
+		absoluteMaxAge = time.Hour
 	}
 
-	threshold := time.Now().Add(-db.L0Retention)
+	// Warn if no L1 files exist - compaction may not be running.
+	if maxL1TXID == 0 {
+		db.Logger.Warn("no L1 files found during L0 retention check; compaction may not be running",
+			"l0_retention", db.L0Retention,
+			"absolute_max_age", absoluteMaxAge)
+	}
+
+	now := time.Now()
+	threshold := now.Add(-db.L0Retention)
+	absoluteThreshold := now.Add(-absoluteMaxAge)
+
 	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch l0 files: %w", err)
@@ -1921,7 +1937,10 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			break
 		}
 
-		if info.MaxTXID <= maxL1TXID {
+		// Delete if either:
+		// 1. File has been compacted into L1 (normal retention), OR
+		// 2. File exceeds absolute max age (failsafe for broken compaction)
+		if (maxL1TXID > 0 && info.MaxTXID <= maxL1TXID) || createdAt.Before(absoluteThreshold) {
 			deleted = append(deleted, info)
 		}
 	}
