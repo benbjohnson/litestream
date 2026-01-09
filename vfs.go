@@ -74,6 +74,15 @@ type VFS struct {
 	// If empty, uses a temp file.
 	WriteBufferPath string
 
+	// HydrationEnabled activates background hydration of the database to a local file.
+	// When enabled, the VFS will restore the database in the background and serve
+	// reads from the local file once complete, eliminating remote fetch latency.
+	HydrationEnabled bool
+
+	// HydrationPath is the directory path for local hydration files.
+	// Required if HydrationEnabled is true.
+	HydrationPath string
+
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
@@ -128,6 +137,15 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 			}
 			f.bufferPath = filepath.Join(dir, "write-buffer")
 		}
+	}
+
+	// Initialize hydration support if enabled
+	if vfs.HydrationEnabled && vfs.HydrationPath != "" {
+		f.hydrationEnabled = true
+		// Generate unique hydration file path based on database name
+		safeName := strings.ReplaceAll(name, "/", "_")
+		safeName = strings.ReplaceAll(safeName, "\\", "_")
+		f.hydrationPath = filepath.Join(vfs.HydrationPath, safeName+".hydration.db")
 	}
 
 	if err := f.Open(); err != nil {
@@ -467,6 +485,15 @@ type VFSFile struct {
 	syncInterval  time.Duration    // Interval for periodic sync
 	inTransaction bool             // True during active write transaction
 
+	// Hydration state (only used when hydrationEnabled is true)
+	hydrationEnabled  bool        // Whether hydration is enabled
+	hydrationPath     string      // Full path to hydration file
+	hydrationFile     *os.File    // Local database file
+	hydrationComplete atomic.Bool // True when restore completes
+	hydrationTXID     ltx.TXID    // TXID the hydrated file is at
+	hydrationMu       sync.Mutex  // Protects hydration file writes
+	hydrationErr      error       // Stores fatal hydration error
+
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -601,6 +628,14 @@ func (f *VFSFile) Open() error {
 		return fmt.Errorf("cannot build index: %w", err)
 	}
 
+	// Start background hydration if enabled
+	if f.hydrationEnabled {
+		if err := f.initHydration(infos); err != nil {
+			f.logger.Warn("hydration initialization failed, continuing without hydration", "error", err)
+			f.hydrationEnabled = false
+		}
+	}
+
 	// Continuously monitor the replica client for new LTX files.
 	f.wg.Add(1)
 	go func() { defer f.wg.Done(); f.monitorReplicaClient(f.ctx) }()
@@ -675,6 +710,12 @@ func (f *VFSFile) SetTargetTime(ctx context.Context, timestamp time.Time) error 
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	} else if len(infos) == 0 {
 		return fmt.Errorf("no backup files available")
+	}
+
+	// Disable hydrated reads during time travel - hydrated file is at latest state
+	if f.hydrationEnabled && f.hydrationComplete.Load() {
+		f.hydrationComplete.Store(false)
+		f.logger.Debug("hydration disabled for time travel", "target", timestamp)
 	}
 
 	return f.rebuildIndex(ctx, infos, &timestamp)
@@ -780,6 +821,201 @@ func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 	return f.rebuildIndex(ctx, infos, nil)
 }
 
+// initHydration starts the background hydration process.
+func (f *VFSFile) initHydration(infos []*ltx.FileInfo) error {
+	// Create parent directory if needed
+	if err := os.MkdirAll(filepath.Dir(f.hydrationPath), 0755); err != nil {
+		return fmt.Errorf("create hydration directory: %w", err)
+	}
+
+	// Create/truncate local database file
+	file, err := os.OpenFile(f.hydrationPath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return fmt.Errorf("create hydration file: %w", err)
+	}
+	f.hydrationFile = file
+
+	// Start background restore
+	f.wg.Add(1)
+	go f.runHydration(infos)
+
+	return nil
+}
+
+// runHydration performs the background hydration process.
+func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
+	defer f.wg.Done()
+
+	if err := f.restoreToHydrationFile(infos); err != nil {
+		f.hydrationErr = err
+		f.logger.Error("hydration failed", "error", err)
+		return
+	}
+
+	// Check if we need to catch up with polling
+	f.mu.Lock()
+	currentTXID := f.pos.TXID
+	hydrationTXID := f.hydrationTXID
+	f.mu.Unlock()
+
+	if currentTXID > hydrationTXID {
+		if err := f.catchUpHydration(hydrationTXID, currentTXID); err != nil {
+			f.hydrationErr = err
+			f.logger.Error("hydration catch-up failed", "error", err)
+			return
+		}
+	}
+
+	f.hydrationComplete.Store(true)
+	f.logger.Info("hydration complete", "path", f.hydrationPath, "txid", f.hydrationTXID.String())
+}
+
+// restoreToHydrationFile restores the database from LTX files to the hydration file.
+func (f *VFSFile) restoreToHydrationFile(infos []*ltx.FileInfo) error {
+	// Open all LTX files as readers
+	rdrs := make([]io.Reader, 0, len(infos))
+	defer func() {
+		for _, rd := range rdrs {
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+	}()
+
+	for _, info := range infos {
+		f.logger.Debug("opening ltx file for hydration", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+		rc, err := f.client.OpenLTXFile(f.ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+		if err != nil {
+			return fmt.Errorf("open ltx file: %w", err)
+		}
+		rdrs = append(rdrs, rc)
+	}
+
+	if len(rdrs) == 0 {
+		return fmt.Errorf("no ltx files for hydration")
+	}
+
+	// Compact and decode using io.Pipe pattern
+	pr, pw := io.Pipe()
+	go func() {
+		c, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
+		_ = pw.CloseWithError(c.Compact(f.ctx))
+	}()
+
+	f.hydrationMu.Lock()
+	defer f.hydrationMu.Unlock()
+
+	dec := ltx.NewDecoder(pr)
+	if err := dec.DecodeDatabaseTo(f.hydrationFile); err != nil {
+		return fmt.Errorf("decode database: %w", err)
+	}
+
+	if err := f.hydrationFile.Sync(); err != nil {
+		return fmt.Errorf("sync hydration file: %w", err)
+	}
+
+	f.hydrationTXID = infos[len(infos)-1].MaxTXID
+	return nil
+}
+
+// catchUpHydration applies updates that arrived during initial hydration.
+func (f *VFSFile) catchUpHydration(fromTXID, toTXID ltx.TXID) error {
+	f.logger.Debug("catching up hydration", "from", fromTXID, "to", toTXID)
+
+	// Fetch LTX files from fromTXID+1 to toTXID
+	itr, err := f.client.LTXFiles(f.ctx, 0, fromTXID+1, false)
+	if err != nil {
+		return fmt.Errorf("list ltx files for catch-up: %w", err)
+	}
+	defer itr.Close()
+
+	for itr.Next() {
+		info := itr.Item()
+		if info.MaxTXID > toTXID {
+			break
+		}
+
+		idx, err := FetchPageIndex(f.ctx, f.client, info)
+		if err != nil {
+			return fmt.Errorf("fetch page index: %w", err)
+		}
+
+		if err := f.applyUpdatesToHydratedFile(idx); err != nil {
+			return fmt.Errorf("apply catch-up updates: %w", err)
+		}
+
+		f.hydrationTXID = info.MaxTXID
+	}
+
+	return nil
+}
+
+// readFromHydratedFile reads data from the hydrated local file.
+func (f *VFSFile) readFromHydratedFile(p []byte, off int64) (int, error) {
+	f.hydrationMu.Lock()
+	n, err := f.hydrationFile.ReadAt(p, off)
+	f.hydrationMu.Unlock()
+
+	if err != nil && err != io.EOF {
+		return n, fmt.Errorf("read hydrated file: %w", err)
+	}
+
+	// Update the first page to pretend like we are in journal mode
+	if off == 0 && len(p) >= 28 {
+		p[18], p[19] = 0x01, 0x01
+		_, _ = rand.Read(p[24:28])
+	}
+
+	return n, nil
+}
+
+// applyUpdatesToHydratedFile fetches updated pages and writes them to the hydrated file.
+func (f *VFSFile) applyUpdatesToHydratedFile(updates map[uint32]ltx.PageIndexElem) error {
+	f.hydrationMu.Lock()
+	defer f.hydrationMu.Unlock()
+
+	for pgno, elem := range updates {
+		_, data, err := FetchPage(f.ctx, f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
+		if err != nil {
+			return fmt.Errorf("fetch updated page %d: %w", pgno, err)
+		}
+
+		off := int64(pgno-1) * int64(f.pageSize)
+		if _, err := f.hydrationFile.WriteAt(data, off); err != nil {
+			return fmt.Errorf("write updated page %d: %w", pgno, err)
+		}
+	}
+
+	return nil
+}
+
+// applySyncedPagesToHydratedFile writes synced dirty pages to the hydrated file.
+// Must be called with f.mu held.
+func (f *VFSFile) applySyncedPagesToHydratedFile() error {
+	f.hydrationMu.Lock()
+	defer f.hydrationMu.Unlock()
+
+	for pgno, bufferOff := range f.dirty {
+		data := make([]byte, f.pageSize)
+		if _, err := f.bufferFile.ReadAt(data, bufferOff); err != nil {
+			return fmt.Errorf("read dirty page %d from buffer: %w", pgno, err)
+		}
+
+		off := int64(pgno-1) * int64(f.pageSize)
+		if _, err := f.hydrationFile.WriteAt(data, off); err != nil {
+			return fmt.Errorf("write page %d to hydrated file: %w", pgno, err)
+		}
+	}
+
+	f.hydrationTXID = f.expectedTXID
+	return nil
+}
+
 func (f *VFSFile) Close() error {
 	f.logger.Debug("closing file")
 
@@ -801,6 +1037,14 @@ func (f *VFSFile) Close() error {
 	// Close buffer file if open
 	if f.bufferFile != nil {
 		f.bufferFile.Close()
+	}
+
+	// Close and remove hydration file
+	if f.hydrationFile != nil {
+		f.hydrationFile.Close()
+		if err := os.Remove(f.hydrationPath); err != nil && !os.IsNotExist(err) {
+			f.logger.Warn("failed to remove hydration file", "error", err)
+		}
 	}
 
 	return nil
@@ -839,6 +1083,11 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 			return n, nil
 		}
 		f.mu.Unlock()
+	}
+
+	// If hydration complete, read from local file
+	if f.hydrationEnabled && f.hydrationComplete.Load() {
+		return f.readFromHydratedFile(p, off)
 	}
 
 	// Check cache (cache is thread-safe)
@@ -1037,6 +1286,19 @@ func (f *VFSFile) Truncate(size int64) error {
 
 	f.commit = newCommit
 	f.logger.Debug("truncated", "newCommit", newCommit)
+
+	// Truncate hydrated file if hydration is complete
+	if f.hydrationEnabled && f.hydrationComplete.Load() {
+		f.hydrationMu.Lock()
+		if err := f.hydrationFile.Truncate(size); err != nil {
+			f.hydrationMu.Unlock()
+			f.logger.Error("failed to truncate hydration file", "error", err)
+			// Don't fail the operation - continue with degraded performance
+		} else {
+			f.hydrationMu.Unlock()
+		}
+	}
+
 	return nil
 }
 
@@ -1124,6 +1386,15 @@ func (f *VFSFile) syncToRemote() error {
 			return fmt.Errorf("read page %d from buffer for cache: %w", pgno, err)
 		}
 		f.cache.Add(pgno, cachedData)
+	}
+
+	// Apply synced pages to hydrated file if hydration is complete
+	// Must be done before clearing f.dirty since we need the page offsets
+	if f.hydrationEnabled && f.hydrationComplete.Load() {
+		if err := f.applySyncedPagesToHydratedFile(); err != nil {
+			f.logger.Error("failed to apply synced pages to hydrated file", "error", err)
+			// Don't fail the sync - hydration will catch up on next poll
+		}
 	}
 
 	// Clear dirty pages
@@ -1675,6 +1946,13 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
+
+	// Apply updates to hydrated file if hydration is complete
+	if f.hydrationEnabled && f.hydrationComplete.Load() && len(combined) > 0 {
+		if err := f.applyUpdatesToHydratedFile(combined); err != nil {
+			f.logger.Error("failed to apply updates to hydrated file", "error", err)
+		}
+	}
 
 	return nil
 }

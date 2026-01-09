@@ -1043,3 +1043,185 @@ func buildLTXFixtureWithPages(tb testing.TB, txid ltx.TXID, pageSize uint32, pgn
 
 	return &ltxFixture{info: info, data: buf.Bytes()}
 }
+
+// TestVFSFile_Hydration_Basic tests that hydration completes and reads from local file.
+func TestVFSFile_Hydration_Basic(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+
+	// Create temp directory for hydration
+	hydrationDir := t.TempDir()
+
+	// Create VFSFile with hydration enabled
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationEnabled = true
+	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
+	f.PollInterval = 100 * time.Millisecond
+
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	// Wait for hydration to complete
+	deadline := time.Now().Add(5 * time.Second)
+	for !f.hydrationComplete.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("hydration did not complete in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify hydration file exists
+	if _, err := os.Stat(f.hydrationPath); err != nil {
+		t.Fatalf("hydration file not found: %v", err)
+	}
+
+	// Read a page - should come from hydrated file
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read at: %v", err)
+	}
+
+	// Check that the data matches (excluding modified header bytes)
+	for i := 28; i < len(buf); i++ {
+		if buf[i] != 'a' {
+			t.Fatalf("expected byte 'a' at position %d, got %q", i, buf[i])
+		}
+	}
+}
+
+// TestVFSFile_Hydration_ReadsDuringHydration tests that reads work via cache/remote during hydration.
+func TestVFSFile_Hydration_ReadsDuringHydration(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'b'))
+
+	hydrationDir := t.TempDir()
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationEnabled = true
+	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
+	f.PollInterval = 100 * time.Millisecond
+
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	// Read immediately - should work even if hydration is still in progress
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read at during hydration: %v", err)
+	}
+
+	// Data should be correct regardless of hydration status
+	for i := 28; i < len(buf); i++ {
+		if buf[i] != 'b' {
+			t.Fatalf("expected byte 'b' at position %d, got %q", i, buf[i])
+		}
+	}
+}
+
+// TestVFSFile_Hydration_CloseEarly tests clean shutdown during hydration.
+func TestVFSFile_Hydration_CloseEarly(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'c'))
+
+	hydrationDir := t.TempDir()
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationEnabled = true
+	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
+	f.PollInterval = 100 * time.Millisecond
+
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+
+	// Close immediately without waiting for hydration
+	if err := f.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// Hydration file should be removed
+	if _, err := os.Stat(f.hydrationPath); !os.IsNotExist(err) {
+		t.Fatalf("hydration file should be removed after close")
+	}
+}
+
+// TestVFSFile_Hydration_Disabled tests that hydration has no effect when disabled.
+func TestVFSFile_Hydration_Disabled(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'd'))
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	// hydrationEnabled is false by default
+	f.PollInterval = 100 * time.Millisecond
+
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	// Hydration should not be complete (it's disabled)
+	if f.hydrationComplete.Load() {
+		t.Fatalf("hydration should not be complete when disabled")
+	}
+
+	// Hydration file should not exist
+	if f.hydrationFile != nil {
+		t.Fatalf("hydration file should be nil when disabled")
+	}
+
+	// Reads should still work via cache/remote
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read at: %v", err)
+	}
+}
+
+// TestVFSFile_Hydration_IncrementalUpdates tests that new LTX files are applied to hydrated file.
+func TestVFSFile_Hydration_IncrementalUpdates(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'e'))
+
+	hydrationDir := t.TempDir()
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationEnabled = true
+	f.hydrationPath = filepath.Join(hydrationDir, "test.db.hydration.db")
+	f.PollInterval = 50 * time.Millisecond
+
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	// Wait for hydration to complete
+	deadline := time.Now().Add(5 * time.Second)
+	for !f.hydrationComplete.Load() {
+		if time.Now().After(deadline) {
+			t.Fatalf("hydration did not complete in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Add a new LTX file
+	client.addFixture(t, buildLTXFixture(t, 2, 'f'))
+
+	// Wait for poll to pick up the update
+	time.Sleep(200 * time.Millisecond)
+
+	// Read the page - should have updated data
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read at: %v", err)
+	}
+
+	// Data should be updated (excluding header bytes)
+	for i := 28; i < len(buf); i++ {
+		if buf[i] != 'f' {
+			t.Fatalf("expected byte 'f' at position %d, got %q", i, buf[i])
+		}
+	}
+}
