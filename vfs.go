@@ -83,6 +83,26 @@ type VFS struct {
 	// If empty and HydrationEnabled is true, a temp file will be used.
 	HydrationPath string
 
+	// CompactionEnabled activates background compaction for the VFS.
+	// Requires WriteEnabled to be true.
+	CompactionEnabled bool
+
+	// CompactionLevels defines the compaction intervals for each level.
+	// If nil, uses default compaction levels.
+	CompactionLevels CompactionLevels
+
+	// SnapshotInterval is how often to create full database snapshots.
+	// Set to 0 to disable automatic snapshots.
+	SnapshotInterval time.Duration
+
+	// SnapshotRetention is how long to keep old snapshots.
+	// Set to 0 to keep all snapshots.
+	SnapshotRetention time.Duration
+
+	// L0Retention is how long to keep L0 files after compaction into L1.
+	// Set to 0 to delete immediately after compaction.
+	L0Retention time.Duration
+
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
@@ -116,6 +136,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
+	f.vfs = vfs // Store reference to parent VFS for config access
 
 	// Initialize write support if enabled
 	if vfs.WriteEnabled {
@@ -136,6 +157,12 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 				return nil, 0, fmt.Errorf("create temp dir for write buffer: %w", err)
 			}
 			f.bufferPath = filepath.Join(dir, "write-buffer")
+		}
+
+		// Initialize compaction if enabled
+		if vfs.CompactionEnabled {
+			f.compactor = NewCompactor(vfs.client, f.logger)
+			// VFS has no local files, so leave LocalFileOpener/LocalFileDeleter nil
 		}
 	}
 
@@ -502,6 +529,13 @@ type VFSFile struct {
 
 	PollInterval time.Duration
 	CacheSize    int
+
+	// Compaction support (only used when VFS.CompactionEnabled is true)
+	vfs              *VFS       // Reference back to parent VFS for config
+	compactor        *Compactor // Shared compaction logic
+	compactionWg     sync.WaitGroup
+	compactionCtx    context.Context
+	compactionCancel context.CancelFunc
 }
 
 // Hydrator handles background hydration of the database to a local file.
@@ -920,6 +954,11 @@ func (f *VFSFile) Open() error {
 		go func() { defer f.wg.Done(); f.syncLoop() }()
 	}
 
+	// Start compaction monitors if enabled
+	if f.compactor != nil && f.vfs != nil {
+		f.startCompactionMonitors()
+	}
+
 	return nil
 }
 
@@ -967,6 +1006,11 @@ func (f *VFSFile) openNewDatabase() error {
 		f.syncTicker = time.NewTicker(f.syncInterval)
 		f.wg.Add(1)
 		go func() { defer f.wg.Done(); f.syncLoop() }()
+	}
+
+	// Start compaction monitors if enabled
+	if f.compactor != nil && f.vfs != nil {
+		f.startCompactionMonitors()
 	}
 
 	return nil
@@ -1164,6 +1208,12 @@ func (f *VFSFile) Close() error {
 	// Stop sync ticker if running
 	if f.syncTicker != nil {
 		f.syncTicker.Stop()
+	}
+
+	// Stop compaction monitors if running
+	if f.compactionCancel != nil {
+		f.compactionCancel()
+		f.compactionWg.Wait()
 	}
 
 	// Final sync of dirty pages before closing
@@ -2327,4 +2377,224 @@ func lookupVFSFile(fileID uint64) (*VFSFile, bool) {
 
 	vfsFile, ok := file.(*VFSFile)
 	return vfsFile, ok
+}
+
+// startCompactionMonitors starts background goroutines for compaction and snapshots.
+func (f *VFSFile) startCompactionMonitors() {
+	f.compactionCtx, f.compactionCancel = context.WithCancel(f.ctx)
+
+	// Use configured levels or defaults
+	levels := f.vfs.CompactionLevels
+	if levels == nil {
+		levels = DefaultCompactionLevels
+	}
+
+	// Start compaction monitors for each level
+	for _, lvl := range levels {
+		if lvl.Level == 0 {
+			continue // L0 doesn't need compaction (source level)
+		}
+		f.compactionWg.Add(1)
+		go func(level *CompactionLevel) {
+			defer f.compactionWg.Done()
+			f.monitorCompaction(f.compactionCtx, level)
+		}(lvl)
+	}
+
+	// Start snapshot monitor if configured
+	if f.vfs.SnapshotInterval > 0 {
+		f.compactionWg.Add(1)
+		go func() {
+			defer f.compactionWg.Done()
+			f.monitorSnapshots(f.compactionCtx)
+		}()
+	}
+
+	// Start L0 retention monitor if configured
+	if f.vfs.L0Retention > 0 {
+		f.compactionWg.Add(1)
+		go func() {
+			defer f.compactionWg.Done()
+			f.monitorL0Retention(f.compactionCtx)
+		}()
+	}
+
+	f.logger.Info("compaction monitors started",
+		"levels", len(levels),
+		"snapshotInterval", f.vfs.SnapshotInterval,
+		"l0Retention", f.vfs.L0Retention)
+}
+
+// Compact compacts source level files into the destination level.
+// Returns ErrNoCompaction if there are no files to compact.
+func (f *VFSFile) Compact(ctx context.Context, level int) (*ltx.FileInfo, error) {
+	if f.compactor == nil {
+		return nil, fmt.Errorf("compaction not enabled")
+	}
+	return f.compactor.Compact(ctx, level)
+}
+
+// Snapshot creates a full database snapshot from remote LTX files.
+// Unlike DB.Snapshot(), this reads from remote rather than local WAL.
+func (f *VFSFile) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
+	if f.compactor == nil {
+		return nil, fmt.Errorf("compaction not enabled")
+	}
+
+	f.mu.Lock()
+	pageSize := f.pageSize
+	commit := f.commit
+	pos := f.pos
+	pages := make(map[uint32]ltx.PageIndexElem, len(f.index))
+	for pgno, elem := range f.index {
+		pages[pgno] = elem
+	}
+	f.mu.Unlock()
+
+	if pageSize == 0 {
+		return nil, fmt.Errorf("page size not initialized")
+	}
+
+	// Sort page numbers for consistent output
+	pgnos := make([]uint32, 0, len(pages))
+	for pgno := range pages {
+		pgnos = append(pgnos, pgno)
+	}
+	slices.Sort(pgnos)
+
+	// Stream snapshot creation
+	pr, pw := io.Pipe()
+	go func() {
+		enc, err := ltx.NewEncoder(pw)
+		if err != nil {
+			pw.CloseWithError(err)
+			return
+		}
+
+		if err := enc.EncodeHeader(ltx.Header{
+			Version:   ltx.Version,
+			Flags:     ltx.HeaderFlagNoChecksum,
+			PageSize:  pageSize,
+			Commit:    commit,
+			MinTXID:   1,
+			MaxTXID:   pos.TXID,
+			Timestamp: time.Now().UnixMilli(),
+		}); err != nil {
+			pw.CloseWithError(fmt.Errorf("encode header: %w", err))
+			return
+		}
+
+		for _, pgno := range pgnos {
+			elem := pages[pgno]
+			_, data, err := FetchPage(ctx, f.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
+			if err != nil {
+				pw.CloseWithError(fmt.Errorf("fetch page %d: %w", pgno, err))
+				return
+			}
+			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+				pw.CloseWithError(fmt.Errorf("encode page %d: %w", pgno, err))
+				return
+			}
+		}
+
+		if err := enc.Close(); err != nil {
+			pw.CloseWithError(fmt.Errorf("close encoder: %w", err))
+			return
+		}
+		pw.Close()
+	}()
+
+	return f.client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, pr)
+}
+
+// monitorCompaction runs periodic compaction for a level.
+func (f *VFSFile) monitorCompaction(ctx context.Context, lvl *CompactionLevel) {
+	f.logger.Info("starting VFS compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
+
+	ticker := time.NewTicker(lvl.Interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := f.Compact(ctx, lvl.Level)
+			if err != nil {
+				if !errors.Is(err, ErrNoCompaction) &&
+					!errors.Is(err, context.Canceled) &&
+					!errors.Is(err, context.DeadlineExceeded) {
+					f.logger.Error("compaction failed", "level", lvl.Level, "error", err)
+				}
+			} else {
+				f.logger.Debug("compaction completed",
+					"level", lvl.Level,
+					"minTXID", info.MinTXID,
+					"maxTXID", info.MaxTXID,
+					"size", info.Size)
+			}
+		}
+	}
+}
+
+// monitorSnapshots runs periodic snapshot creation.
+func (f *VFSFile) monitorSnapshots(ctx context.Context) {
+	f.logger.Info("starting VFS snapshot monitor", "interval", f.vfs.SnapshotInterval)
+
+	ticker := time.NewTicker(f.vfs.SnapshotInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			info, err := f.Snapshot(ctx)
+			if err != nil {
+				if !errors.Is(err, context.Canceled) &&
+					!errors.Is(err, context.DeadlineExceeded) {
+					f.logger.Error("snapshot failed", "error", err)
+				}
+			} else {
+				f.logger.Debug("snapshot created",
+					"maxTXID", info.MaxTXID,
+					"size", info.Size)
+
+				// Enforce snapshot retention after creating new snapshot
+				if f.vfs.SnapshotRetention > 0 {
+					if _, err := f.compactor.EnforceSnapshotRetention(ctx, f.vfs.SnapshotRetention); err != nil {
+						f.logger.Error("snapshot retention failed", "error", err)
+					}
+				}
+			}
+		}
+	}
+}
+
+// monitorL0Retention runs periodic L0 retention enforcement.
+func (f *VFSFile) monitorL0Retention(ctx context.Context) {
+	f.logger.Info("starting VFS L0 retention monitor", "retention", f.vfs.L0Retention)
+
+	// Check more frequently than the retention period
+	checkInterval := f.vfs.L0Retention / 4
+	if checkInterval < time.Minute {
+		checkInterval = time.Minute
+	}
+
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := f.compactor.EnforceL0Retention(ctx, f.vfs.L0Retention); err != nil {
+				if !errors.Is(err, context.Canceled) &&
+					!errors.Is(err, context.DeadlineExceeded) {
+					f.logger.Error("L0 retention enforcement failed", "error", err)
+				}
+			}
+		}
+	}
 }

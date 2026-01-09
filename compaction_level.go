@@ -8,6 +8,14 @@ import (
 // SnapshotLevel represents the level which full snapshots are held.
 const SnapshotLevel = 9
 
+// DefaultCompactionLevels provides a reasonable default compaction configuration.
+// Level 0 is raw LTX files, Level 1 compacts hourly, Level 2 compacts daily.
+var DefaultCompactionLevels = CompactionLevels{
+	{Level: 0, Interval: 0},
+	{Level: 1, Interval: time.Hour},
+	{Level: 2, Interval: 24 * time.Hour},
+}
+
 // CompactionLevel represents a single part of a multi-level compaction.
 // Each level merges LTX files from the previous level into larger time granularities.
 type CompactionLevel struct {
