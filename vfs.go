@@ -926,10 +926,6 @@ func (f *VFSFile) restoreToHydrationFile(infos []*ltx.FileInfo) error {
 		return fmt.Errorf("decode database: %w", err)
 	}
 
-	if err := f.hydrationFile.Sync(); err != nil {
-		return fmt.Errorf("sync hydration file: %w", err)
-	}
-
 	f.hydrationTXID = infos[len(infos)-1].MaxTXID
 	return nil
 }
