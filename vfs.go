@@ -491,7 +491,7 @@ type VFSFile struct {
 	syncInterval  time.Duration    // Interval for periodic sync
 	inTransaction bool             // True during active write transaction
 
-	hydrator     *Hydrator // Background hydration (nil if disabled)
+	hydrator      *Hydrator // Background hydration (nil if disabled)
 	hydrationPath string    // Path for hydration file (set during Open)
 
 	wg     sync.WaitGroup
@@ -506,13 +506,13 @@ type VFSFile struct {
 
 // Hydrator handles background hydration of the database to a local file.
 type Hydrator struct {
-	path     string       // Full path to hydration file
-	file     *os.File     // Local database file
-	complete atomic.Bool  // True when restore completes
-	txid     ltx.TXID     // TXID the hydrated file is at
-	mu       sync.Mutex   // Protects hydration file writes
-	err      error        // Stores fatal hydration error
-	pageSize uint32       // Page size of the database
+	path     string      // Full path to hydration file
+	file     *os.File    // Local database file
+	complete atomic.Bool // True when restore completes
+	txid     ltx.TXID    // TXID the hydrated file is at
+	mu       sync.Mutex  // Protects hydration file writes
+	err      error       // Stores fatal hydration error
+	pageSize uint32      // Page size of the database
 	client   ReplicaClient
 	logger   *slog.Logger
 }
