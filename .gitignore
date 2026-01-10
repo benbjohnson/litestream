@@ -16,3 +16,4 @@ CLAUDE.md
 
 # Binary
 bin/
+.claude/*.loop.local.md
