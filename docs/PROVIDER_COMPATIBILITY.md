@@ -232,10 +232,24 @@ replicas:
     account-key: your-account-key
 ```
 
+**Using SAS Token** (for granular container-level access):
+
+```yaml
+replicas:
+  - url: abs://container-name/path
+    account-name: your-account-name
+    sas-token: "sv=2023-01-03&ss=b&srt=co&sp=rwdlacx..."
+```
+
+Or via environment variable: `LITESTREAM_AZURE_SAS_TOKEN`
+
 **Alternative Authentication**:
 
-- Connection string: `AZURE_STORAGE_CONNECTION_STRING`
-- Managed identity on Azure
+- SAS token: `sas-token` config or `LITESTREAM_AZURE_SAS_TOKEN` env var
+- Account key: `account-key` config or `LITESTREAM_AZURE_ACCOUNT_KEY` env var
+- Managed identity on Azure (via DefaultAzureCredential)
+
+**Authentication Priority**: SAS token > Account key > Default credential chain
 
 ## Alibaba Cloud OSS
 

@@ -91,6 +91,7 @@ var (
 var (
 	absAccountName = flag.String("abs-account-name", os.Getenv("LITESTREAM_ABS_ACCOUNT_NAME"), "")
 	absAccountKey  = flag.String("abs-account-key", os.Getenv("LITESTREAM_ABS_ACCOUNT_KEY"), "")
+	absSASToken    = flag.String("abs-sas-token", os.Getenv("LITESTREAM_ABS_SAS_TOKEN"), "")
 	absBucket      = flag.String("abs-bucket", os.Getenv("LITESTREAM_ABS_BUCKET"), "")
 	absPath        = flag.String("abs-path", os.Getenv("LITESTREAM_ABS_PATH"), "")
 )
@@ -390,6 +391,7 @@ func NewABSReplicaClient(tb testing.TB) *abs.ReplicaClient {
 	c := abs.NewReplicaClient()
 	c.AccountName = *absAccountName
 	c.AccountKey = *absAccountKey
+	c.SASToken = *absSASToken
 	c.Bucket = *absBucket
 	c.Path = path.Join(*absPath, fmt.Sprintf("%016x", rand.Uint64()))
 	return c
