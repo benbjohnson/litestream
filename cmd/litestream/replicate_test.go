@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -244,6 +245,34 @@ func TestReplicateCommand_ParseFlags_LogLevel(t *testing.T) {
 		expectedError := `flag "-log-level" must be positioned before DB_PATH and REPLICA_URL arguments`
 		if !strings.Contains(err.Error(), expectedError) {
 			t.Errorf("expected error message to contain %q, got %q", expectedError, err.Error())
+		}
+	})
+
+	t.Run("LogLevelFlagOverridesEnvVar", func(t *testing.T) {
+		// Set LOG_LEVEL env var to a different value
+		oldEnv := os.Getenv("LOG_LEVEL")
+		os.Setenv("LOG_LEVEL", "error")
+		defer func() {
+			if oldEnv == "" {
+				os.Unsetenv("LOG_LEVEL")
+			} else {
+				os.Setenv("LOG_LEVEL", oldEnv)
+			}
+		}()
+
+		cmd := main.NewReplicateCommand()
+		args := []string{"-log-level", "debug", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// CLI flag should take precedence, setting LOG_LEVEL env var to "debug"
+		if got := os.Getenv("LOG_LEVEL"); got != "debug" {
+			t.Errorf("expected LOG_LEVEL env var to be %q (CLI flag), got %q", "debug", got)
+		}
+		if cmd.Config.Logging.Level != "debug" {
+			t.Errorf("expected config log level to be %q, got %q", "debug", cmd.Config.Logging.Level)
 		}
 	})
 }

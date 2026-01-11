@@ -79,9 +79,11 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
 			return err
 		}
-		// Override log level if CLI flag provided
+		// Override log level if CLI flag provided (takes precedence over env var)
 		if *logLevelFlag != "" {
 			c.Config.Logging.Level = *logLevelFlag
+			// Set env var so initLog sees CLI flag as highest priority
+			os.Setenv("LOG_LEVEL", *logLevelFlag)
 			logOutput := os.Stdout
 			if c.Config.Logging.Stderr {
 				logOutput = os.Stderr
@@ -104,6 +106,8 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		logLevel := "INFO"
 		if *logLevelFlag != "" {
 			logLevel = *logLevelFlag
+			// Set env var so initLog sees CLI flag as highest priority
+			os.Setenv("LOG_LEVEL", *logLevelFlag)
 		}
 		c.Config.Logging.Level = logLevel
 		initLog(os.Stdout, logLevel, "text")
