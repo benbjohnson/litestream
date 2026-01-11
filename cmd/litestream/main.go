@@ -952,6 +952,7 @@ type ReplicaSettings struct {
 	// ABS settings
 	AccountName string `yaml:"account-name"`
 	AccountKey  string `yaml:"account-key"`
+	SASToken    string `yaml:"sas-token"`
 
 	// SFTP settings
 	Host             string `yaml:"host"`
@@ -1057,6 +1058,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.AccountKey == "" {
 		rs.AccountKey = src.AccountKey
+	}
+	if rs.SASToken == "" {
+		rs.SASToken = src.SASToken
 	}
 
 	// SFTP settings
@@ -1494,6 +1498,7 @@ func newABSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *
 	client := abs.NewReplicaClient()
 	client.AccountName = c.AccountName
 	client.AccountKey = c.AccountKey
+	client.SASToken = c.SASToken
 	client.Bucket = c.Bucket
 	client.Path = c.Path
 	client.Endpoint = c.Endpoint

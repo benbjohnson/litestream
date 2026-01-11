@@ -51,6 +51,7 @@ type ReplicaClient struct {
 	// Azure credentials
 	AccountName string
 	AccountKey  string
+	SASToken    string // SAS token for container-level access
 	Endpoint    string
 
 	// Azure Blob Storage container information
@@ -137,6 +138,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		},
 	}
 
+	// Check for SAS token first (highest priority for explicit credentials)
+	sasToken := c.SASToken
+	if sasToken == "" {
+		sasToken = os.Getenv("LITESTREAM_AZURE_SAS_TOKEN")
+	}
+
 	// Check if we have explicit credentials or should use default credential chain
 	accountKey := c.AccountKey
 	if accountKey == "" {
@@ -144,8 +151,22 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 
 	// Create Azure Blob Storage client with appropriate authentication
+	// Priority: SAS token > Shared key > Default credential chain
 	var client *azblob.Client
-	if accountKey != "" && c.AccountName != "" {
+	if sasToken != "" {
+		// SAS token authentication - append token to endpoint URL
+		if accountKey != "" {
+			slog.Warn("both SAS token and account key configured, using SAS token")
+		} else {
+			slog.Debug("using SAS token authentication")
+		}
+		// Strip leading "?" if present to avoid double "?"
+		endpointWithSAS := fmt.Sprintf("%s?%s", endpoint, strings.TrimPrefix(sasToken, "?"))
+		client, err = azblob.NewClientWithNoCredential(endpointWithSAS, clientOptions)
+		if err != nil {
+			return fmt.Errorf("abs: cannot create azure blob client with SAS token: %w", err)
+		}
+	} else if accountKey != "" && c.AccountName != "" {
 		// Use shared key authentication (existing behavior)
 		slog.Debug("using shared key authentication")
 		credential, err := azblob.NewSharedKeyCredential(c.AccountName, accountKey)
