@@ -75,6 +75,8 @@ func (e *ConfigValidationError) Unwrap() error {
 }
 
 func main() {
+	initLog(os.Stdout, "INFO", "text")
+
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
 		os.Exit(1)

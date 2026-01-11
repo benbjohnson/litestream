@@ -37,6 +37,8 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("too many arguments")
 	}
 
+	initLog(os.Stdout, "INFO", "text")
+
 	// Parse timestamp, if specified.
 	if *timestampStr != "" {
 		if opt.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
@@ -85,8 +87,6 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	if opt.OutputPath == "" {
 		return nil, fmt.Errorf("output path required")
 	}
-
-	initLog(os.Stdout, "INFO", "text")
 
 	// Exit successfully if the output file already exists.
 	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
