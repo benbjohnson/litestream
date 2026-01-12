@@ -34,8 +34,12 @@ sqlite3 /tmp/test.db "INSERT INTO test (data) VALUES ('test');"
 
 # Start Litestream in background
 echo "Starting Litestream..."
-source .envrc
-./bin/litestream replicate -config "$CONFIG_FILE" &
+# Get script directory and repo root
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+source "$REPO_ROOT/.envrc"
+"$REPO_ROOT/bin/litestream" replicate -config "$SCRIPT_DIR/$CONFIG_FILE" &
 LITESTREAM_PID=$!
 
 echo "Litestream PID: $LITESTREAM_PID"
