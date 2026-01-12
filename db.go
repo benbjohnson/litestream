@@ -576,6 +576,144 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 	}
 }
 
+// CloseWithSignal is like Close but accepts a signal channel that can interrupt
+// the shutdown sync retry loop. A second signal on the channel will cause
+// immediate exit from retry attempts. If signalCh is nil, it behaves like Close.
+func (db *DB) CloseWithSignal(ctx context.Context, signalCh <-chan os.Signal) (err error) {
+	db.cancel()
+	db.wg.Wait()
+
+	// Perform a final db sync, if initialized.
+	if db.db != nil {
+		if e := db.Sync(ctx); e != nil {
+			err = e
+		}
+	}
+
+	// Ensure replicas perform a final sync and stop replicating.
+	if db.Replica != nil {
+		if db.db != nil {
+			if e := db.syncReplicaWithRetryAndSignal(ctx, signalCh); e != nil && err == nil {
+				err = e
+			}
+		}
+		db.Replica.Stop(true)
+	}
+
+	// Release the read lock to allow other applications to handle checkpointing.
+	if db.rtx != nil {
+		if e := db.releaseReadLock(); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	if db.db != nil {
+		if e := db.db.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	if db.f != nil {
+		if e := db.f.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	return err
+}
+
+// syncReplicaWithRetryAndSignal attempts to sync the replica with retry logic for shutdown.
+// It can be interrupted early by a signal on signalCh (e.g., second Ctrl+C).
+// If signalCh is nil, it behaves like syncReplicaWithRetry.
+func (db *DB) syncReplicaWithRetryAndSignal(ctx context.Context, signalCh <-chan os.Signal) error {
+	if db.Replica == nil {
+		return nil
+	}
+
+	timeout := db.ShutdownSyncTimeout
+	interval := db.ShutdownSyncInterval
+
+	// If timeout is zero, just try once (no retry)
+	if timeout == 0 {
+		return db.Replica.Sync(ctx)
+	}
+
+	// Use default interval if not set
+	if interval == 0 {
+		interval = DefaultShutdownSyncInterval
+	}
+
+	// Create deadline context for total retry duration
+	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr error
+	attempt := 0
+	startTime := time.Now()
+
+	for {
+		attempt++
+
+		// Try sync
+		if err := db.Replica.Sync(deadlineCtx); err == nil {
+			if attempt > 1 {
+				db.Logger.Info("shutdown sync succeeded after retry",
+					"attempts", attempt,
+					"duration", time.Since(startTime))
+			}
+			return nil
+		} else {
+			lastErr = err
+		}
+
+		// Check if we should stop retrying (signal or timeout)
+		select {
+		case <-deadlineCtx.Done():
+			db.Logger.Error("shutdown sync failed after timeout",
+				"attempts", attempt,
+				"duration", time.Since(startTime),
+				"lastError", lastErr)
+			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
+		case sig := <-signalCh:
+			db.Logger.Warn("shutdown sync interrupted by signal",
+				"signal", sig,
+				"attempts", attempt,
+				"duration", time.Since(startTime),
+				"lastError", lastErr)
+			return fmt.Errorf("shutdown sync interrupted by %v after %d attempts: %w", sig, attempt, lastErr)
+		default:
+		}
+
+		// Log retry with hint about second signal
+		if signalCh != nil {
+			db.Logger.Warn("shutdown sync failed, retrying (press Ctrl+C again to skip)",
+				"attempt", attempt,
+				"error", lastErr,
+				"elapsed", time.Since(startTime),
+				"remaining", time.Until(startTime.Add(timeout)))
+		} else {
+			db.Logger.Warn("shutdown sync failed, retrying",
+				"attempt", attempt,
+				"error", lastErr,
+				"elapsed", time.Since(startTime),
+				"remaining", time.Until(startTime.Add(timeout)))
+		}
+
+		// Wait before retry, but also listen for signals
+		select {
+		case <-time.After(interval):
+		case <-deadlineCtx.Done():
+			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
+		case sig := <-signalCh:
+			db.Logger.Warn("shutdown sync interrupted by signal",
+				"signal", sig,
+				"attempts", attempt,
+				"duration", time.Since(startTime))
+			return fmt.Errorf("shutdown sync interrupted by %v after %d attempts: %w", sig, attempt, lastErr)
+		}
+	}
+}
+
 // setPersistWAL sets the PERSIST_WAL file control on the database connection.
 // This prevents SQLite from removing the WAL file when connections close.
 func (db *DB) setPersistWAL(ctx context.Context) error {

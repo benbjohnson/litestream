@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -229,6 +231,109 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 
 		// Close should succeed immediately
 		if err := db.Close(context.Background()); err != nil {
+			t.Fatalf("expected success, got: %v", err)
+		}
+		// Should have made exactly 1 attempt
+		if got := atomic.LoadInt32(&attempts); got != 1 {
+			t.Fatalf("expected exactly 1 attempt, got %d", got)
+		}
+	})
+
+	t.Run("SignalInterruptsCancelRetryLoop", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+
+		// Write some data
+		if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create mock client that always fails
+		var attempts int32
+		client := &mock.ReplicaClient{
+			LTXFilesFunc: func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			},
+			WriteLTXFileFunc: func(_ context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+				atomic.AddInt32(&attempts, 1)
+				return nil, errors.New("persistent error")
+			},
+		}
+
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+		db.ShutdownSyncTimeout = 10 * time.Second // Long timeout
+		db.ShutdownSyncInterval = 50 * time.Millisecond
+
+		// Create signal channel and send signal after short delay
+		signalCh := make(chan os.Signal, 2)
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			signalCh <- syscall.SIGINT
+		}()
+
+		// Close should be interrupted by signal
+		start := time.Now()
+		err := db.CloseWithSignal(context.Background(), signalCh)
+		elapsed := time.Since(start)
+
+		// Should exit quickly (well before 10 second timeout)
+		if elapsed > 1*time.Second {
+			t.Fatalf("took too long to respond to signal: %v", elapsed)
+		}
+
+		// Should have error mentioning interrupt
+		if err == nil {
+			t.Fatal("expected error after signal interrupt")
+		}
+		if !strings.Contains(err.Error(), "interrupted") {
+			t.Fatalf("expected interrupted error, got: %v", err)
+		}
+
+		// Should have made at least 1 attempt before being interrupted
+		if got := atomic.LoadInt32(&attempts); got < 1 {
+			t.Fatalf("expected at least 1 attempt, got %d", got)
+		}
+	})
+
+	t.Run("NilSignalChannelFallsBackToNormalBehavior", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+
+		// Write some data
+		if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create mock client that succeeds immediately
+		var attempts int32
+		client := &mock.ReplicaClient{
+			LTXFilesFunc: func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			},
+			WriteLTXFileFunc: func(_ context.Context, _ int, _, _ ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+				atomic.AddInt32(&attempts, 1)
+				// Drain the reader
+				_, _ = io.Copy(io.Discard, r)
+				return &ltx.FileInfo{}, nil
+			},
+		}
+
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+		db.ShutdownSyncTimeout = 5 * time.Second
+		db.ShutdownSyncInterval = 50 * time.Millisecond
+
+		// CloseWithSignal with nil channel should work like Close
+		if err := db.CloseWithSignal(context.Background(), nil); err != nil {
 			t.Fatalf("expected success, got: %v", err)
 		}
 		// Should have made exactly 1 attempt

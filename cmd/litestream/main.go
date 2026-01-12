@@ -122,8 +122,9 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			return err
 		}
 
-		// Setup signal handler.
+		// Setup signal handler and pass to command for interrupt handling.
 		signalCh := signalChan()
+		c.SetSignalChan(signalCh)
 
 		if err := c.Run(ctx); err != nil {
 			return err
@@ -138,7 +139,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 				slog.Info("replication complete, litestream shutting down")
 			}
 		case sig := <-signalCh:
-			slog.Info("signal received, litestream shutting down")
+			slog.Info("signal received, litestream shutting down", "signal", sig)
 
 			if c.cmd != nil {
 				slog.Info("sending signal to exec process")
