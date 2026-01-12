@@ -2120,11 +2120,17 @@ func (db *DB) monitorWithFsnotify() {
 	}
 	defer watcher.Close()
 
-	// Watch the WAL file
+	// Track whether we're actively watching the WAL file
 	walPath := db.WALPath()
+	walWatched := false
+
+	// Try to watch the WAL file
 	if err := watcher.Add(walPath); err != nil {
-		// WAL may not exist yet - that's okay, we'll try to sync anyway
-		db.Logger.Warn("failed to watch WAL file, will retry", "path", walPath, "error", err)
+		// WAL may not exist yet - that's okay, we'll retry on fallback ticker
+		db.Logger.Warn("failed to watch WAL file initially, will retry", "path", walPath, "error", err)
+	} else {
+		walWatched = true
+		db.Logger.Debug("watching WAL file", "path", walPath)
 	}
 
 	// Fallback ticker at 10x the normal interval in case fsnotify misses events
@@ -2217,6 +2223,14 @@ func (db *DB) monitorWithFsnotify() {
 
 		case <-ticker.C:
 			// Fallback ticker - ensure we sync even if fsnotify missed an event
+			// Also retry adding the watch if WAL wasn't being watched initially
+			if !walWatched {
+				if err := watcher.Add(walPath); err == nil {
+					walWatched = true
+					db.Logger.Info("successfully added WAL watch", "path", walPath)
+				}
+			}
+
 			db.Logger.Debug("fallback ticker fired, syncing")
 			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 				db.Logger.Error("fallback sync error", "error", err)
