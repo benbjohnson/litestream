@@ -5,8 +5,7 @@ This directory contains test scripts and configurations for measuring Litestream
 ## Files
 
 - `test-cpu-usage.sh` - Automated CPU monitoring script
-- `litestream-test-polling.yml` - Config for testing default polling mode
-- `litestream-test-fsnotify.yml` - Config for testing event-driven fsnotify mode
+- `litestream-test-polling.yml` - Config for testing with S3 replication
 
 ## Prerequisites
 
@@ -31,14 +30,11 @@ This directory contains test scripts and configurations for measuring Litestream
 From this directory, run:
 
 ```bash
-# Test polling mode (default) for 60 seconds
-./test-cpu-usage.sh polling 60
-
-# Test fsnotify mode (event-driven) for 60 seconds
-./test-cpu-usage.sh fsnotify 60
+# Test for 60 seconds
+./test-cpu-usage.sh 60
 
 # Longer test (5 minutes)
-./test-cpu-usage.sh polling 300
+./test-cpu-usage.sh 300
 ```
 
 ## What It Tests
@@ -55,11 +51,10 @@ The script:
 
 Based on testing for PR #993:
 
-- **Polling mode (with S3 fix):** ~0.0067% CPU (99% improvement)
-- **Fsnotify mode:** ~0.093% CPU (87% improvement)
+- **With S3 transport fix:** ~0.0067% CPU (99% improvement)
 - **Original (v0.5.6):** ~0.7% CPU
 
-Both modes achieve near-zero idle CPU usage, validating the fix.
+The S3 transport fix achieves near-zero idle CPU usage, validating the fix.
 
 ## Output
 

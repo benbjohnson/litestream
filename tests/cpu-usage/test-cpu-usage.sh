@@ -1,22 +1,11 @@
 #!/bin/bash
 set -e
 
-# Test script for measuring Litestream idle CPU usage
-# Tests both polling and fsnotify modes with real S3 replication
+# Test script for measuring Litestream idle CPU usage with S3 replication
 
-CONFIG_MODE=${1:-"polling"}
-DURATION=${2:-300}  # Default 5 minutes
-
-if [ "$CONFIG_MODE" = "polling" ]; then
-    CONFIG_FILE="litestream-test-polling.yml"
-    MODE_DESC="Polling mode (1s interval)"
-elif [ "$CONFIG_MODE" = "fsnotify" ]; then
-    CONFIG_FILE="litestream-test-fsnotify.yml"
-    MODE_DESC="Fsnotify mode (event-driven)"
-else
-    echo "Usage: $0 [polling|fsnotify] [duration_seconds]"
-    exit 1
-fi
+DURATION=${1:-300}  # Default 5 minutes
+CONFIG_FILE="litestream-test-polling.yml"
+MODE_DESC="Polling mode (1s interval)"
 
 echo "========================================="
 echo "Litestream CPU Usage Test"

@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/fsnotify/fsnotify"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
@@ -142,12 +141,6 @@ type DB struct {
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
 
-	// Monitor mode for WAL change detection. Options: "poll" (default), "fsnotify".
-	// "poll" uses periodic file stat/read (MonitorInterval-based).
-	// "fsnotify" uses OS-level file change events with polling fallback.
-	// See: https://github.com/benbjohnson/litestream/issues/992
-	MonitorMode string
-
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
 
@@ -190,7 +183,6 @@ func NewDB(path string) *DB {
 		TruncatePageN:        DefaultTruncatePageN,
 		CheckpointInterval:   DefaultCheckpointInterval,
 		MonitorInterval:      DefaultMonitorInterval,
-		MonitorMode:          "poll", // default to polling
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
 		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
@@ -1964,16 +1956,6 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 }
 
 // monitor runs in a separate goroutine and monitors the database & WAL.
-// Dispatches to either polling or fsnotify-based monitoring based on MonitorMode.
-func (db *DB) monitor() {
-	if db.MonitorMode == "fsnotify" {
-		db.monitorWithFsnotify()
-		return
-	}
-	db.monitorWithPolling()
-}
-
-// monitorWithPolling uses periodic polling to detect WAL changes.
 //
 // Change Detection Strategy:
 // To reduce CPU usage when idle, we use cheap change detection to avoid
@@ -1990,7 +1972,7 @@ func (db *DB) monitor() {
 //
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
-func (db *DB) monitorWithPolling() {
+func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
 
@@ -2093,149 +2075,6 @@ func (db *DB) monitorWithPolling() {
 		}
 		backoff = 0
 		consecutiveErrs = 0
-	}
-}
-
-// monitorWithFsnotify uses OS-level file change events to detect WAL changes.
-//
-// Event-Driven Strategy:
-// Uses fsnotify to watch the WAL file for changes (Write events). This reduces
-// idle CPU usage significantly compared to polling. A fallback ticker runs at
-// 10x the normal MonitorInterval to catch any missed events (fsnotify can miss
-// events under very high write load).
-//
-// Trade-offs:
-// - Lower idle CPU usage (~90% reduction)
-// - Slight delay on first write after idle period (event propagation)
-// - May miss events under extreme write load (fallback ticker catches these)
-//
-// See: https://github.com/benbjohnson/litestream/issues/992
-func (db *DB) monitorWithFsnotify() {
-	// Create fsnotify watcher
-	watcher, err := fsnotify.NewWatcher()
-	if err != nil {
-		db.Logger.Error("failed to create fsnotify watcher, falling back to polling", "error", err)
-		db.monitorWithPolling()
-		return
-	}
-	defer watcher.Close()
-
-	// Track whether we're actively watching the WAL file
-	walPath := db.WALPath()
-	walWatched := false
-
-	// Try to watch the WAL file
-	if err := watcher.Add(walPath); err != nil {
-		// WAL may not exist yet - that's okay, we'll retry on fallback ticker
-		db.Logger.Warn("failed to watch WAL file initially, will retry", "path", walPath, "error", err)
-	} else {
-		walWatched = true
-		db.Logger.Debug("watching WAL file", "path", walPath)
-	}
-
-	// Fallback ticker at 10x the normal interval in case fsnotify misses events
-	fallbackInterval := db.MonitorInterval * 10
-	if fallbackInterval < 10*time.Second {
-		fallbackInterval = 10 * time.Second
-	}
-	ticker := time.NewTicker(fallbackInterval)
-	defer ticker.Stop()
-
-	// Backoff state for error handling (same as polling mode)
-	var backoff time.Duration
-	var lastLogTime time.Time
-	var consecutiveErrs int
-
-	db.Logger.Info("using fsnotify monitor mode", "fallback_interval", fallbackInterval)
-
-	for {
-		select {
-		case <-db.ctx.Done():
-			return
-
-		case event, ok := <-watcher.Events:
-			if !ok {
-				// Watcher closed - fall back to polling
-				db.Logger.Warn("fsnotify watcher closed, falling back to polling")
-				db.monitorWithPolling()
-				return
-			}
-
-			// Only sync on Write events (ignore Chmod, Rename, etc.)
-			if event.Op&fsnotify.Write == 0 {
-				continue
-			}
-
-			// WAL changed - perform sync
-			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-				consecutiveErrs++
-
-				// Exponential backoff
-				if backoff == 0 {
-					backoff = db.MonitorInterval
-				} else {
-					backoff *= 2
-					if backoff > DefaultSyncBackoffMax {
-						backoff = DefaultSyncBackoffMax
-					}
-				}
-
-				// Rate-limited error logging
-				if time.Since(lastLogTime) >= SyncErrorLogInterval {
-					db.Logger.Error("sync error (fsnotify)",
-						"error", err,
-						"consecutive_errors", consecutiveErrs,
-						"backoff", backoff)
-					lastLogTime = time.Now()
-				}
-
-				// Disk cleanup on persistent errors
-				if isDiskFullError(err) && consecutiveErrs >= 3 {
-					db.Logger.Warn("attempting temp file cleanup due to persistent disk errors")
-					if cleanupErr := removeTmpFiles(db.metaPath); cleanupErr != nil {
-						db.Logger.Error("temp file cleanup failed", "error", cleanupErr)
-					}
-				}
-
-				// Wait for backoff period
-				if backoff > 0 {
-					select {
-					case <-db.ctx.Done():
-						return
-					case <-time.After(backoff):
-					}
-				}
-				continue
-			}
-
-			// Success - reset backoff and error counter
-			if consecutiveErrs > 0 {
-				db.Logger.Info("sync recovered (fsnotify)", "previous_errors", consecutiveErrs)
-			}
-			backoff = 0
-			consecutiveErrs = 0
-
-		case err, ok := <-watcher.Errors:
-			if !ok {
-				return
-			}
-			db.Logger.Error("fsnotify watcher error", "error", err)
-
-		case <-ticker.C:
-			// Fallback ticker - ensure we sync even if fsnotify missed an event
-			// Also retry adding the watch if WAL wasn't being watched initially
-			if !walWatched {
-				if err := watcher.Add(walPath); err == nil {
-					walWatched = true
-					db.Logger.Info("successfully added WAL watch", "path", walPath)
-				}
-			}
-
-			db.Logger.Debug("fallback ticker fired, syncing")
-			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-				db.Logger.Error("fallback sync error", "error", err)
-			}
-		}
 	}
 }
 
