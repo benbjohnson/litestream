@@ -148,4 +148,20 @@ var (
 		Name: "litestream_replica_operation_bytes",
 		Help: "The number of bytes used by replica operations",
 	}, []string{"replica_type", "operation"})
+
+	OperationDurationHistogramVec = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Name:    "litestream_replica_operation_duration_seconds",
+		Help:    "Duration of replica operations by type and operation",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 5, 10, 30, 60},
+	}, []string{"replica_type", "operation"})
+
+	OperationErrorCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_replica_operation_errors_total",
+		Help: "Number of replica operation errors by type, operation, and error code",
+	}, []string{"replica_type", "operation", "code"})
+
+	L0RetentionGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_l0_retention_files_total",
+		Help: "Number of L0 files by status during retention enforcement",
+	}, []string{"db", "status"})
 )
