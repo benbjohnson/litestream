@@ -178,11 +178,20 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	// Write LTX file to temporary file next to destination path.
-	f, err := internal.CreateFile(filename+".tmp", fileInfo)
+	tmpFilename := filename + ".tmp"
+	f, err := internal.CreateFile(tmpFilename, fileInfo)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
+
+	// Clean up temp file on error. On successful rename, the temp file
+	// becomes the final file and should not be removed.
+	defer func() {
+		_ = f.Close()
+		if err != nil {
+			_ = os.Remove(tmpFilename)
+		}
+	}()
 
 	if _, err := io.Copy(f, fullReader); err != nil {
 		return nil, err
@@ -209,7 +218,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 
 	// Move LTX file to final path when it has been written & synced to disk.
-	if err := os.Rename(filename+".tmp", filename); err != nil {
+	if err := os.Rename(tmpFilename, filename); err != nil {
 		return nil, err
 	}
 
