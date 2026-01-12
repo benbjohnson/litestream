@@ -86,6 +86,14 @@ type DB struct {
 	// the new (truncated) WAL size.
 	syncedToWALEnd bool
 
+	// lastSyncedWALOffset tracks the logical end of the WAL content after
+	// the last successful sync. This is the WALOffset + WALSize from the
+	// last LTX file. Used for checkpoint threshold decisions instead of
+	// file size, which may include stale frames with old salt values after
+	// a checkpoint. This prevents issue #997 where PASSIVE checkpoints
+	// trigger a feedback loop because stale file size exceeds threshold.
+	lastSyncedWALOffset int64
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -818,10 +826,16 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 }
 
 func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSize, newWALSize int64, synced bool, err error) {
-	// Capture WAL size before sync for checkpoint threshold checks.
-	origWALSize, err = db.walFileSize()
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("stat wal before sync: %w", err)
+	// Use the last synced WAL offset as the logical size for checkpoint decisions.
+	// This avoids using file size which may include stale frames with old salt
+	// values after a checkpoint. See issue #997.
+	origWALSize = db.lastSyncedWALOffset
+	if origWALSize == 0 {
+		// First sync - use file size as fallback
+		origWALSize, err = db.walFileSize()
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("stat wal before sync: %w", err)
+		}
 	}
 
 	// Verify our last sync matches the current state of the WAL.
@@ -837,11 +851,10 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSiz
 		return 0, 0, false, fmt.Errorf("sync: %w", err)
 	}
 
-	// Capture WAL size after sync for checkpoint threshold checks.
-	newWALSize, err = db.walFileSize()
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("stat wal after sync: %w", err)
-	}
+	// Use the logical WAL offset (from LTX) for checkpoint decisions.
+	// After sync, db.lastSyncedWALOffset is updated to reflect the actual
+	// content position, not the file size.
+	newWALSize = db.lastSyncedWALOffset
 
 	return origWALSize, newWALSize, synced, nil
 }
@@ -1451,11 +1464,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	}
 	db.maxLTXFileInfos.Unlock()
 
+	// Track the logical end of WAL content for checkpoint decisions.
+	// This is the WALOffset + WALSize from the LTX we just created.
+	// Using this instead of file size prevents issue #997 where stale
+	// frames with old salt values cause perpetual checkpoint triggering.
+	finalOffset := info.offset + sz
+	db.lastSyncedWALOffset = finalOffset
+
 	// Track if we synced to the exact end of the WAL file.
 	// This is used by verify() to distinguish expected checkpoint truncation
 	// from unexpected external WAL modifications. See issue #927.
 	if walSize, err := db.walFileSize(); err == nil {
-		finalOffset := info.offset + sz
 		db.syncedToWALEnd = finalOffset == walSize
 	} else {
 		db.syncedToWALEnd = false
