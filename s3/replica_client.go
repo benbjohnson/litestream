@@ -307,22 +307,26 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		Timeout: 24 * time.Hour,
 	}
 
-	// Configure transport for insecure connections if needed
+	// Always configure custom HTTP Transport with controlled keepalive settings
+	// to reduce idle CPU usage from default transport's aggressive keepalives.
+	// See: https://github.com/benbjohnson/litestream/issues/992
+	httpClient.Transport = &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+
+	// Configure TLS to skip verification if requested
 	if c.SkipVerify {
-		httpClient.Transport = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: 1 * time.Second,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: true,
-			},
+		httpClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
 		}
 	}
 
