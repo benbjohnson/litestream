@@ -1,0 +1,12 @@
+# Litestream test configuration - POLLING MODE
+# Tests idle CPU usage with default polling (1s interval)
+
+dbs:
+  - path: /tmp/test.db
+    replicas:
+      - type: s3
+        bucket: sprite-litestream-debugging
+        region: us-east-2
+        path: test-db-polling
+        # Default: monitor-interval: 1s
+        # Default: monitor-mode: poll
