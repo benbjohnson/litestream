@@ -184,12 +184,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, err
 	}
 
-	// Track success to determine whether to clean up temp file.
-	// On successful rename, the temp file becomes the final file and should not be removed.
-	var success bool
+	// Clean up temp file on error. On successful rename, the temp file
+	// becomes the final file and should not be removed.
 	defer func() {
 		_ = f.Close()
-		if !success {
+		if err != nil {
 			_ = os.Remove(tmpFilename)
 		}
 	}()
@@ -222,9 +221,6 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err := os.Rename(tmpFilename, filename); err != nil {
 		return nil, err
 	}
-
-	// Mark success to prevent defer cleanup
-	success = true
 
 	// Set file ModTime to preserve original timestamp
 	if err := os.Chtimes(filename, timestamp, timestamp); err != nil {
