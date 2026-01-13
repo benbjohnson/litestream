@@ -187,6 +187,13 @@ func (s *ControlServer) handleStart(req *RPCRequest) *RPCResponse {
 		return newErrorResponse(req.ID, -32602, "path required", nil)
 	}
 
+	// If config is provided, load and register the database
+	if params.Config != "" {
+		if err := s.loadAndRegisterDB(params.Path, params.Config); err != nil {
+			return newErrorResponse(req.ID, -32001, fmt.Sprintf("failed to load config: %v", err), nil)
+		}
+	}
+
 	ctx := s.ctx
 	if params.Wait {
 		if params.Timeout == 0 {
@@ -345,4 +352,49 @@ func (s *ControlServer) handleDatabases(req *RPCRequest) *RPCResponse {
 	}
 
 	return newSuccessResponse(req.ID, result)
+}
+
+// loadAndRegisterDB loads a database configuration from a file and registers it with the store.
+func (s *ControlServer) loadAndRegisterDB(dbPath, configPath string) error {
+	// Load config file
+	config, err := ReadConfigFile(configPath, true)
+	if err != nil {
+		return fmt.Errorf("read config file: %w", err)
+	}
+
+	// Find the database config that matches the requested path
+	var dbConfig *DBConfig
+	for _, dbc := range config.DBs {
+		expandedPath, err := expand(dbc.Path)
+		if err != nil {
+			continue
+		}
+		if expandedPath == dbPath {
+			dbConfig = dbc
+			break
+		}
+	}
+
+	if dbConfig == nil {
+		return fmt.Errorf("database path %s not found in config file %s", dbPath, configPath)
+	}
+
+	// Create DB instance from config
+	db, err := NewDBFromConfig(dbConfig)
+	if err != nil {
+		return fmt.Errorf("create database from config: %w", err)
+	}
+
+	// Apply store-level settings to the database
+	// These are normally applied during store initialization
+	db.L0Retention = s.store.L0Retention
+	db.ShutdownSyncTimeout = s.store.ShutdownSyncTimeout
+	db.ShutdownSyncInterval = s.store.ShutdownSyncInterval
+
+	// Register the database with the store (doesn't open it)
+	if err := s.store.RegisterDB(db); err != nil {
+		return fmt.Errorf("register database: %w", err)
+	}
+
+	return nil
 }
