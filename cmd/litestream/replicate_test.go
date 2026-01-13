@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 
@@ -169,6 +170,109 @@ func TestReplicateCommand_ParseFlags_FlagPositioning(t *testing.T) {
 		expectedError := "must specify at least one replica URL"
 		if !strings.Contains(err.Error(), expectedError) {
 			t.Errorf("expected error message to contain %q, got %q", expectedError, err.Error())
+		}
+	})
+}
+
+func TestReplicateCommand_ParseFlags_LogLevel(t *testing.T) {
+	t.Run("LogLevelWithCLIArgs", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-log-level", "debug", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cmd.Config.Logging.Level != "debug" {
+			t.Errorf("expected log level to be %q, got %q", "debug", cmd.Config.Logging.Level)
+		}
+	})
+
+	t.Run("LogLevelTrace", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-log-level", "trace", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cmd.Config.Logging.Level != "trace" {
+			t.Errorf("expected log level to be %q, got %q", "trace", cmd.Config.Logging.Level)
+		}
+	})
+
+	t.Run("LogLevelError", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-log-level", "error", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cmd.Config.Logging.Level != "error" {
+			t.Errorf("expected log level to be %q, got %q", "error", cmd.Config.Logging.Level)
+		}
+	})
+
+	t.Run("LogLevelDefaultsToInfo", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cmd.Config.Logging.Level != "INFO" {
+			t.Errorf("expected log level to default to %q, got %q", "INFO", cmd.Config.Logging.Level)
+		}
+	})
+
+	t.Run("LogLevelWithOtherFlags", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"-log-level", "warn", "-once", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if cmd.Config.Logging.Level != "warn" {
+			t.Errorf("expected log level to be %q, got %q", "warn", cmd.Config.Logging.Level)
+		}
+	})
+
+	t.Run("LogLevelAfterPositionalArgs", func(t *testing.T) {
+		cmd := main.NewReplicateCommand()
+		args := []string{"test.db", "file:///tmp/replica", "-log-level", "debug"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err == nil {
+			t.Fatal("expected error when -log-level flag is positioned after positional arguments")
+		}
+		expectedError := `flag "-log-level" must be positioned before DB_PATH and REPLICA_URL arguments`
+		if !strings.Contains(err.Error(), expectedError) {
+			t.Errorf("expected error message to contain %q, got %q", expectedError, err.Error())
+		}
+	})
+
+	t.Run("LogLevelFlagOverridesEnvVar", func(t *testing.T) {
+		// Set LOG_LEVEL env var to a different value
+		oldEnv := os.Getenv("LOG_LEVEL")
+		os.Setenv("LOG_LEVEL", "error")
+		defer func() {
+			if oldEnv == "" {
+				os.Unsetenv("LOG_LEVEL")
+			} else {
+				os.Setenv("LOG_LEVEL", oldEnv)
+			}
+		}()
+
+		cmd := main.NewReplicateCommand()
+		args := []string{"-log-level", "debug", "test.db", "file:///tmp/replica"}
+		err := cmd.ParseFlags(context.Background(), args)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// CLI flag should take precedence, setting LOG_LEVEL env var to "debug"
+		if got := os.Getenv("LOG_LEVEL"); got != "debug" {
+			t.Errorf("expected LOG_LEVEL env var to be %q (CLI flag), got %q", "debug", got)
+		}
+		if cmd.Config.Logging.Level != "debug" {
+			t.Errorf("expected config log level to be %q, got %q", "debug", cmd.Config.Logging.Level)
 		}
 	})
 }

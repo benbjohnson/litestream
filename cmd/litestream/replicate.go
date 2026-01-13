@@ -58,6 +58,7 @@ func NewReplicateCommand() *ReplicateCommand {
 func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-replicate", flag.ContinueOnError)
 	execFlag := fs.String("exec", "", "execute subcommand")
+	logLevelFlag := fs.String("log-level", "", "log level (trace, debug, info, warn, error)")
 	restoreIfDBNotExists := fs.Bool("restore-if-db-not-exists", false, "restore from replica if database doesn't exist")
 	onceFlag := fs.Bool("once", false, "replicate once and exit")
 	forceSnapshotFlag := fs.Bool("force-snapshot", false, "force snapshot when replicating once")
@@ -78,6 +79,17 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
 			return err
 		}
+		// Override log level if CLI flag provided (takes precedence over env var)
+		if *logLevelFlag != "" {
+			c.Config.Logging.Level = *logLevelFlag
+			// Set env var so initLog sees CLI flag as highest priority
+			os.Setenv("LOG_LEVEL", *logLevelFlag)
+			logOutput := os.Stdout
+			if c.Config.Logging.Stderr {
+				logOutput = os.Stderr
+			}
+			initLog(logOutput, c.Config.Logging.Level, c.Config.Logging.Type)
+		}
 
 	case 1:
 		// Only database path provided, missing replica URL
@@ -91,7 +103,14 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 
 		// Initialize config with defaults when using command-line arguments
 		c.Config = DefaultConfig()
-		initLog(os.Stdout, "INFO", "text")
+		logLevel := "INFO"
+		if *logLevelFlag != "" {
+			logLevel = *logLevelFlag
+			// Set env var so initLog sees CLI flag as highest priority
+			os.Setenv("LOG_LEVEL", *logLevelFlag)
+		}
+		c.Config.Logging.Level = logLevel
+		initLog(os.Stdout, logLevel, "text")
 
 		dbConfig := &DBConfig{
 			Path:                 fs.Arg(0),
@@ -481,6 +500,10 @@ Arguments:
 	    Enforce retention policies for old snapshots. Requires -once.
 	    This removes snapshots that are older than the configured
 	    snapshot retention period.
+
+	-log-level LEVEL
+	    Sets the log level. Overrides the config file setting.
+	    Valid values: trace, debug, info, warn, error
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
