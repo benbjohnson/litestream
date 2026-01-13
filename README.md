@@ -10,6 +10,10 @@ background process and safely replicates changes incrementally to another file
 or S3. Litestream only communicates with SQLite through the SQLite API so it
 will not corrupt your database.
 
+Litestream also provides runtime control commands for dynamically managing
+database replication without restarting the daemon. See [docs/IPC_CONTROL.md](docs/IPC_CONTROL.md)
+for details on using `start`, `stop`, `sync`, and `status` commands.
+
 If you need support or have ideas for improving Litestream, please join the
 [Litestream Slack][slack] or visit the [GitHub Discussions](https://github.com/benbjohnson/litestream/discussions).
 Please visit the [Litestream web site](https://litestream.io) for installation
