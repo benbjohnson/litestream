@@ -338,6 +338,10 @@ func (s *Store) EnableDB(ctx context.Context, path string) error {
 		return fmt.Errorf("database already enabled: %s", path)
 	}
 
+	if db.Replica == nil {
+		return fmt.Errorf("database has no replica configured: %s", path)
+	}
+
 	// Open starts replication
 	if err := db.Open(); err != nil {
 		return fmt.Errorf("open db: %w", err)
