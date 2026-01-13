@@ -83,6 +83,12 @@ graph TB
 #### 4. Storage Implementations
 - Backend-specific logic (authentication, retries, optimizations)
 
+#### 5. Control Layer
+- **Control Server**: Runtime control via Unix socket and HTTP API
+- **IPC Commands**: Dynamic database management (start, stop, sync, status)
+
+See [IPC_CONTROL.md](IPC_CONTROL.md) for detailed documentation on runtime control commands.
+
 ## Core Components
 
 ### DB Component (db.go)
@@ -201,6 +207,48 @@ type Store struct {
     wg     sync.WaitGroup
 }
 ```
+
+### Control Server Component (cmd/litestream/control.go)
+
+Provides runtime control for dynamic database management via Unix socket and HTTP API:
+
+```go
+type ControlServer struct {
+    store      *Store
+    configPath string
+
+    // Unix socket
+    socketPath     string
+    socketPerms    uint32
+    socketListener net.Listener
+
+    // HTTP API
+    httpMux *http.ServeMux  // Shared with metrics server
+
+    // Lifecycle
+    ctx    context.Context
+    cancel context.CancelFunc
+    wg     sync.WaitGroup
+}
+```
+
+**Key Features:**
+- **Dynamic Control**: Start/stop replication without daemon restart
+- **JSON-RPC 2.0**: Consistent protocol over Unix socket and HTTP
+- **Graceful Operations**: Blocking commands with timeout support
+- **Secure by Default**: Unix socket with 0600 permissions
+
+**Runtime Operations:**
+
+```go
+// Dynamic database management
+func (s *Store) RegisterDB(db *DB) error
+func (s *Store) FindDB(path string) *DB
+func (s *Store) EnableDB(ctx context.Context, path string) error
+func (s *Store) DisableDB(ctx context.Context, path string) error
+```
+
+See [IPC_CONTROL.md](IPC_CONTROL.md) for usage examples and detailed documentation.
 
 ## LTX File Format
 
