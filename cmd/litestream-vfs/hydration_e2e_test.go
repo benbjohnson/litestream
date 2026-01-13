@@ -259,11 +259,13 @@ func runSQLiteCLI(t *testing.T, extPath string, env []string, query string) stri
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
-		// Check if it's just a warning about extension loading on macOS
 		outputStr := string(output)
+		// Check for common extension loading failures
 		if strings.Contains(outputStr, "Error: unknown command") ||
-			strings.Contains(outputStr, "not authorized") {
-			t.Skipf("skipping: sqlite3 cannot load extensions: %s", outputStr)
+			strings.Contains(outputStr, "not authorized") ||
+			strings.Contains(outputStr, "symbol not found") ||
+			strings.Contains(outputStr, "dlsym") {
+			t.Skipf("skipping: sqlite3 cannot load extensions (common on macOS): %s", outputStr)
 		}
 		t.Logf("sqlite3 output: %s", outputStr)
 		t.Fatalf("sqlite3 command failed: %v", err)
