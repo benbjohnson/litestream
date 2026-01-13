@@ -41,6 +41,9 @@ type ReplicateCommand struct {
 	// MCP server
 	MCP *MCPServer
 
+	// Control server for IPC commands
+	Control *ControlServer
+
 	// Manages the set of databases & compaction levels.
 	Store *litestream.Store
 
@@ -311,8 +314,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 	}
 
-	// Serve metrics over HTTP if enabled.
+	// Create shared HTTP mux for metrics and control API
+	var httpMux *http.ServeMux
 	if c.Config.Addr != "" {
+		httpMux = http.NewServeMux()
+		httpMux.Handle("/metrics", promhttp.Handler())
+
 		hostport := c.Config.Addr
 		if host, port, _ := net.SplitHostPort(c.Config.Addr); port == "" {
 			return fmt.Errorf("must specify port for bind address: %q", c.Config.Addr)
@@ -322,11 +329,18 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 		slog.Info("serving metrics on", "url", fmt.Sprintf("http://%s/metrics", hostport))
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
+			if err := http.ListenAndServe(c.Config.Addr, httpMux); err != nil {
 				slog.Error("cannot start metrics server", "error", err)
 			}
 		}()
+	}
+
+	// Start control server if socket is configured
+	if c.Config.Socket != "" {
+		c.Control = NewControlServer(c.Store, c.Config.ConfigPath, c.Config.Socket, c.Config.SocketPermissions, httpMux)
+		if err := c.Control.Start(); err != nil {
+			slog.Warn("failed to start control server", "error", err)
+		}
 	}
 
 	// Parse exec commands args & start subprocess.
@@ -401,6 +415,12 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		monitor.Close()
 	}
 	c.directoryMonitors = nil
+
+	if c.Control != nil {
+		if err := c.Control.Close(); err != nil {
+			slog.Error("error closing control server", "error", err)
+		}
+	}
 
 	if c.Store != nil {
 		if err := c.Store.Close(ctx); err != nil {

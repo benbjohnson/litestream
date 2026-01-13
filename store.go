@@ -277,6 +277,105 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 	return nil
 }
 
+// RegisterDB adds a database to the store WITHOUT opening it.
+// Used for databases that will be started via IPC commands.
+func (s *Store) RegisterDB(db *DB) error {
+	if db == nil {
+		return fmt.Errorf("db required")
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check if already registered
+	for _, existing := range s.dbs {
+		if existing.Path() == db.Path() {
+			return nil // Already registered
+		}
+	}
+
+	// Apply store-wide settings but don't open
+	db.L0Retention = s.L0Retention
+	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
+	db.ShutdownSyncInterval = s.ShutdownSyncInterval
+
+	s.dbs = append(s.dbs, db)
+	return nil
+}
+
+// FindDB finds a database by path.
+// Returns nil if not found.
+func (s *Store) FindDB(path string) *DB {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, db := range s.dbs {
+		if db.Path() == path {
+			return db
+		}
+	}
+	return nil
+}
+
+// EnableDB starts replication for a registered database.
+// Returns error if database not found or already enabled.
+func (s *Store) EnableDB(ctx context.Context, path string) error {
+	s.mu.Lock()
+	var db *DB
+	for _, existing := range s.dbs {
+		if existing.Path() == path {
+			db = existing
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if db.IsOpen() {
+		return fmt.Errorf("database already enabled: %s", path)
+	}
+
+	// Open starts replication
+	if err := db.Open(); err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+
+	s.startHeartbeatMonitorIfNeeded()
+	return nil
+}
+
+// DisableDB stops replication for a database.
+// Returns error if database not found or already disabled.
+func (s *Store) DisableDB(ctx context.Context, path string) error {
+	s.mu.Lock()
+	var db *DB
+	for _, existing := range s.dbs {
+		if existing.Path() == path {
+			db = existing
+			break
+		}
+	}
+	s.mu.Unlock()
+
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if !db.IsOpen() {
+		return fmt.Errorf("database already disabled: %s", path)
+	}
+
+	// Close stops replication with proper shutdown sync
+	if err := db.Close(ctx); err != nil {
+		return fmt.Errorf("close db: %w", err)
+	}
+
+	return nil
+}
+
 // SetL0Retention updates the retention window for L0 files and propagates it to
 // all managed databases.
 func (s *Store) SetL0Retention(d time.Duration) {
