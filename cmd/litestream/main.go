@@ -115,6 +115,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	switch cmd {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
+	case "start":
+		return (&StartCommand{}).Run(ctx, args)
+	case "stop":
+		return (&StopCommand{}).Run(ctx, args)
+	case "sync":
+		return (&SyncCommand{}).Run(ctx, args)
 	case "replicate":
 		c := NewReplicateCommand()
 		if err := c.ParseFlags(ctx, args); err != nil {
@@ -198,7 +204,10 @@ The commands are:
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
 	restore      recovers database backup from a replica
+	start        start replication for a database
 	status       display replication status for databases
+	stop         stop replication for a database
+	sync         force immediate sync for a database
 	version      prints the binary version
 `[1:])
 }
@@ -238,6 +247,11 @@ type Config struct {
 
 	// MCP server options
 	MCPAddr string `yaml:"mcp-addr"`
+
+	// Unix socket for control commands (default: /var/run/litestream.sock)
+	// Set to "" to disable socket
+	Socket            string `yaml:"socket"`
+	SocketPermissions uint32 `yaml:"socket-permissions"`
 
 	// Shutdown sync retry settings
 	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
@@ -296,6 +310,8 @@ func DefaultConfig() Config {
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
 		ShutdownSyncTimeout:      &defaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     &defaultShutdownSyncInterval,
+		Socket:                   "/var/run/litestream.sock",
+		SocketPermissions:        0600,
 	}
 }
 

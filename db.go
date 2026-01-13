@@ -228,6 +228,13 @@ func (db *DB) SQLDB() *sql.DB {
 	return db.db
 }
 
+// IsOpen returns true if the database is currently open and replicating.
+func (db *DB) IsOpen() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.db != nil
+}
+
 // Path returns the path to the database.
 func (db *DB) Path() string {
 	return db.path
