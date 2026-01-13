@@ -540,15 +540,16 @@ type VFSFile struct {
 
 // Hydrator handles background hydration of the database to a local file.
 type Hydrator struct {
-	path     string      // Full path to hydration file
-	file     *os.File    // Local database file
-	complete atomic.Bool // True when restore completes
-	txid     ltx.TXID    // TXID the hydrated file is at
-	mu       sync.Mutex  // Protects hydration file writes
-	err      error       // Stores fatal hydration error
-	pageSize uint32      // Page size of the database
-	client   ReplicaClient
-	logger   *slog.Logger
+	path      string         // Full path to hydration file
+	file      *os.File       // Local database file
+	complete  atomic.Bool    // True when restore completes
+	txid      ltx.TXID       // TXID the hydrated file is at
+	mu        sync.Mutex     // Protects hydration file writes
+	err       error          // Stores fatal hydration error
+	compactor *ltx.Compactor // Tracks compaction progress during restore
+	pageSize  uint32         // Page size of the database
+	client    ReplicaClient
+	logger    *slog.Logger
 }
 
 // NewHydrator creates a new Hydrator instance.
@@ -620,6 +621,14 @@ func (h *Hydrator) SetErr(err error) {
 	h.err = err
 }
 
+// Status returns the current compaction progress during restore.
+func (h *Hydrator) Status() ltx.CompactorStatus {
+	if h.compactor == nil {
+		return ltx.CompactorStatus{}
+	}
+	return h.compactor.Status()
+}
+
 // Restore restores the database from LTX files to the hydration file.
 func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	// Open all LTX files as readers
@@ -647,13 +656,14 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 
 	// Compact and decode using io.Pipe pattern
 	pr, pw := io.Pipe()
+	c, err := ltx.NewCompactor(pw, rdrs)
+	if err != nil {
+		return fmt.Errorf("new ltx compactor: %w", err)
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	h.compactor = c
+
 	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
-			return
-		}
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
@@ -1959,6 +1969,18 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, err
 		}
 		return nil, nil
+
+	case "litestream_hydration_progress":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_hydration_progress is read-only")
+		}
+		if f.hydrator == nil {
+			result := "0"
+			return &result, nil
+		}
+		pct := f.hydrator.Status().Pct() * 100
+		result := strconv.FormatFloat(pct, 'f', 1, 64)
+		return &result, nil
 
 	default:
 		return nil, sqlite3vfs.NotFoundError
