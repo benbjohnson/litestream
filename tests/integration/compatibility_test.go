@@ -458,7 +458,7 @@ func TestVersionMigration_DirectoryLayout(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Test current v0.5.x layout (ltx/0/, ltx/1/, ltx/snapshot/)
+	// Test current v0.5.x layout (ltx/0/, ltx/1/, ltx/9/)
 	t.Run("CurrentLayout", func(t *testing.T) {
 		replicaDir := t.TempDir()
 		client := file.NewReplicaClient(replicaDir)
@@ -477,7 +477,7 @@ func TestVersionMigration_DirectoryLayout(t *testing.T) {
 		}
 
 		// Verify structure
-		snapshotDir := filepath.Join(replicaDir, "ltx", "snapshot")
+		snapshotDir := filepath.Join(replicaDir, "ltx", fmt.Sprintf("%d", litestream.SnapshotLevel))
 		l0Dir := filepath.Join(replicaDir, "ltx", "0")
 
 		if _, err := os.Stat(snapshotDir); err != nil {

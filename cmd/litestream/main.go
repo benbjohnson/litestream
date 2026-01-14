@@ -115,6 +115,10 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	switch cmd {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
+	case "info":
+		return (&InfoCommand{}).Run(ctx, args)
+	case "list":
+		return (&ListCommand{}).Run(ctx, args)
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
 	case "stop":
@@ -200,6 +204,8 @@ Usage:
 The commands are:
 
 	databases    list databases specified in config file
+	info         show daemon information
+	list         list databases managed by daemon
 	ltx          list available LTX files for a database
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
@@ -252,6 +258,7 @@ type Config struct {
 	// Set to "" to disable socket
 	Socket            string `yaml:"socket"`
 	SocketPermissions uint32 `yaml:"socket-permissions"`
+	PersistToConfig   bool   `yaml:"persist-to-config"`
 
 	// Shutdown sync retry settings
 	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
@@ -583,6 +590,9 @@ type DBConfig struct {
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
 
 	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
+
+	AutoReplicate *bool `yaml:"auto-replicate,omitempty"`
+	Enabled       *bool `yaml:"enabled,omitempty"`
 
 	Replica  *ReplicaConfig   `yaml:"replica"`
 	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
