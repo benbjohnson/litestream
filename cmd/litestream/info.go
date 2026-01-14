@@ -8,27 +8,20 @@ import (
 	"net"
 )
 
-// StopCommand represents the command to stop replication for a database.
-type StopCommand struct{}
+// InfoCommand represents the command to show daemon information.
+type InfoCommand struct{}
 
-// Run executes the stop command.
-func (c *StopCommand) Run(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("litestream-stop", flag.ContinueOnError)
-	timeout := fs.Int("timeout", 30, "timeout in seconds")
+// Run executes the info command.
+func (c *InfoCommand) Run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("litestream-info", flag.ContinueOnError)
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-
-	if fs.NArg() == 0 {
-		return fmt.Errorf("database path required")
-	}
-	if fs.NArg() > 1 {
+	if fs.NArg() != 0 {
 		return fmt.Errorf("too many arguments")
 	}
-
-	dbPath := fs.Arg(0)
 
 	// Connect to control socket
 	conn, err := net.Dial("unix", *socketPath)
@@ -37,19 +30,14 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 	}
 	defer conn.Close()
 
-	// Build request
-	params := StopParams{
-		Path:    dbPath,
-		Timeout: *timeout,
-	}
-	paramsJSON, err := json.Marshal(params)
+	paramsJSON, err := json.Marshal(map[string]interface{}{})
 	if err != nil {
 		return fmt.Errorf("failed to marshal params: %w", err)
 	}
 
 	req := RPCRequest{
 		JSONRPC: "2.0",
-		Method:  "stop",
+		Method:  "info",
 		Params:  paramsJSON,
 		ID:      1,
 	}
@@ -65,33 +53,26 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to read response: %w", err)
 	}
 
-	// Check for error
 	if resp.Error != nil {
-		return fmt.Errorf("stop failed: %s", resp.Error.Message)
+		return fmt.Errorf("info failed: %s", resp.Error.Message)
 	}
 
-	// Print result
 	resultJSON, err := json.MarshalIndent(resp.Result, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal result: %w", err)
 	}
 	fmt.Println(string(resultJSON))
-
 	return nil
 }
 
-// Usage prints the help text for the stop command.
-func (c *StopCommand) Usage() {
+// Usage prints the help text for the info command.
+func (c *InfoCommand) Usage() {
 	fmt.Println(`
-usage: litestream stop [OPTIONS] DB_PATH
+usage: litestream info [OPTIONS]
 
-Stop replication for a database.
-Stop always waits for shutdown and final sync.
+Show daemon information.
 
 Options:
-  -timeout SECONDS
-      Maximum time to wait in seconds (default: 30).
-
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 `[1:])

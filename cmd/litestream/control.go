@@ -11,13 +11,17 @@ import (
 	"sync"
 	"time"
 
+	"gopkg.in/yaml.v3"
+
 	"github.com/benbjohnson/litestream"
 )
 
 // ControlServer manages runtime control via Unix socket and HTTP API.
 type ControlServer struct {
 	store      *litestream.Store
+	config     *Config
 	configPath string
+	configLock sync.RWMutex
 
 	socketPath     string
 	socketPerms    uint32
@@ -29,21 +33,24 @@ type ControlServer struct {
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 
-	logger *slog.Logger
+	startedAt time.Time
+	logger    *slog.Logger
 }
 
 // NewControlServer creates a new ControlServer instance.
-func NewControlServer(store *litestream.Store, configPath, socketPath string, socketPerms uint32, httpMux *http.ServeMux) *ControlServer {
+func NewControlServer(store *litestream.Store, config *Config, configPath, socketPath string, socketPerms uint32, httpMux *http.ServeMux) *ControlServer {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &ControlServer{
 		store:       store,
+		config:      config,
 		configPath:  configPath,
 		socketPath:  socketPath,
 		socketPerms: socketPerms,
 		httpMux:     httpMux,
 		ctx:         ctx,
 		cancel:      cancel,
+		startedAt:   time.Now(),
 		logger:      slog.Default(),
 	}
 }
@@ -171,6 +178,10 @@ func (s *ControlServer) handleRequest(req *RPCRequest) *RPCResponse {
 		return s.handleStatus(req)
 	case "databases":
 		return s.handleDatabases(req)
+	case "list":
+		return s.handleDatabases(req)
+	case "info":
+		return s.handleInfo(req)
 	default:
 		return newErrorResponse(req.ID, -32601, "Method not found", nil)
 	}
@@ -187,10 +198,25 @@ func (s *ControlServer) handleStart(req *RPCRequest) *RPCResponse {
 		return newErrorResponse(req.ID, -32602, "path required", nil)
 	}
 
-	// If config is provided, load and register the database
+	// Expand path for consistent comparison
+	expandedPath, err := expand(params.Path)
+	if err != nil {
+		return newErrorResponse(req.ID, -32602, fmt.Sprintf("invalid path: %v", err), nil)
+	}
+
+	var dbConfig *DBConfig
+	var dbConfigNode *yaml.Node
+
+	// If config is provided, load and register the database.
 	if params.Config != "" {
-		if err := s.loadAndRegisterDB(params.Path, params.Config); err != nil {
+		var err error
+		dbConfig, err = s.loadAndRegisterDB(expandedPath, params.Config)
+		if err != nil {
 			return newErrorResponse(req.ID, -32001, fmt.Sprintf("failed to load config: %v", err), nil)
+		}
+		dbConfigNode, err = LoadDBConfigNode(params.Config, expandedPath)
+		if err != nil {
+			return newErrorResponse(req.ID, -32001, fmt.Sprintf("failed to load config node: %v", err), nil)
 		}
 	}
 
@@ -204,8 +230,15 @@ func (s *ControlServer) handleStart(req *RPCRequest) *RPCResponse {
 		defer cancel()
 	}
 
-	if err := s.store.EnableDB(ctx, params.Path); err != nil {
+	if err := s.store.EnableDB(ctx, expandedPath); err != nil {
 		return newErrorResponse(req.ID, -32001, err.Error(), nil)
+	}
+
+	// Persist to config if enabled
+	if s.config != nil && s.config.PersistToConfig {
+		if err := s.persistDBEnabled(expandedPath, true, dbConfig, dbConfigNode); err != nil {
+			s.logger.Warn("failed to persist config", "error", err)
+		}
 	}
 
 	if params.Wait {
@@ -217,11 +250,11 @@ func (s *ControlServer) handleStart(req *RPCRequest) *RPCResponse {
 			case <-ctx.Done():
 				return newErrorResponse(req.ID, -32004, "timeout waiting for start", nil)
 			case <-ticker.C:
-				db := s.store.FindDB(params.Path)
-				if db != nil && db.IsOpen() {
+				db := s.store.FindDB(expandedPath)
+				if db != nil && db.IsInitialized() {
 					return newSuccessResponse(req.ID, map[string]interface{}{
 						"status": "started",
-						"path":   params.Path,
+						"path":   expandedPath,
 					})
 				}
 			}
@@ -230,7 +263,7 @@ func (s *ControlServer) handleStart(req *RPCRequest) *RPCResponse {
 
 	return newSuccessResponse(req.ID, map[string]interface{}{
 		"status": "started",
-		"path":   params.Path,
+		"path":   expandedPath,
 	})
 }
 
@@ -245,23 +278,32 @@ func (s *ControlServer) handleStop(req *RPCRequest) *RPCResponse {
 		return newErrorResponse(req.ID, -32602, "path required", nil)
 	}
 
-	ctx := s.ctx
-	if params.Wait {
-		if params.Timeout == 0 {
-			params.Timeout = 30
-		}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(params.Timeout)*time.Second)
-		defer cancel()
+	// Expand path for consistent comparison
+	expandedPath, err := expand(params.Path)
+	if err != nil {
+		return newErrorResponse(req.ID, -32602, fmt.Sprintf("invalid path: %v", err), nil)
 	}
 
-	if err := s.store.DisableDB(ctx, params.Path); err != nil {
+	if params.Timeout == 0 {
+		params.Timeout = 30
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(params.Timeout)*time.Second)
+	defer cancel()
+
+	if err := s.store.DisableDB(ctx, expandedPath); err != nil {
 		return newErrorResponse(req.ID, -32001, err.Error(), nil)
+	}
+
+	// Persist to config if enabled
+	if s.config != nil && s.config.PersistToConfig {
+		if err := s.persistDBEnabled(expandedPath, false, nil, nil); err != nil {
+			s.logger.Warn("failed to persist config", "error", err)
+		}
 	}
 
 	return newSuccessResponse(req.ID, map[string]interface{}{
 		"status": "stopped",
-		"path":   params.Path,
+		"path":   expandedPath,
 	})
 }
 
@@ -276,7 +318,12 @@ func (s *ControlServer) handleSync(req *RPCRequest) *RPCResponse {
 		return newErrorResponse(req.ID, -32602, "path required", nil)
 	}
 
-	db := s.store.FindDB(params.Path)
+	expandedPath, err := expand(params.Path)
+	if err != nil {
+		return newErrorResponse(req.ID, -32602, fmt.Sprintf("invalid path: %v", err), nil)
+	}
+
+	db := s.store.FindDB(expandedPath)
 	if db == nil {
 		return newErrorResponse(req.ID, -32001, "database not found", nil)
 	}
@@ -301,7 +348,7 @@ func (s *ControlServer) handleSync(req *RPCRequest) *RPCResponse {
 
 	return newSuccessResponse(req.ID, map[string]interface{}{
 		"status": "synced",
-		"path":   params.Path,
+		"path":   expandedPath,
 	})
 }
 
@@ -316,7 +363,12 @@ func (s *ControlServer) handleStatus(req *RPCRequest) *RPCResponse {
 		return newErrorResponse(req.ID, -32602, "path required", nil)
 	}
 
-	db := s.store.FindDB(params.Path)
+	expandedPath, err := expand(params.Path)
+	if err != nil {
+		return newErrorResponse(req.ID, -32602, fmt.Sprintf("invalid path: %v", err), nil)
+	}
+
+	db := s.store.FindDB(expandedPath)
 	if db == nil {
 		return newErrorResponse(req.ID, -32001, "database not found", nil)
 	}
@@ -329,7 +381,7 @@ func (s *ControlServer) handleStatus(req *RPCRequest) *RPCResponse {
 	}
 
 	return newSuccessResponse(req.ID, map[string]interface{}{
-		"path":   params.Path,
+		"path":   expandedPath,
 		"status": status,
 	})
 }
@@ -354,12 +406,50 @@ func (s *ControlServer) handleDatabases(req *RPCRequest) *RPCResponse {
 	return newSuccessResponse(req.ID, result)
 }
 
+// handleInfo handles the info command.
+func (s *ControlServer) handleInfo(req *RPCRequest) *RPCResponse {
+	dbs := s.store.DBs()
+	openCount := 0
+	for _, db := range dbs {
+		if db.IsOpen() {
+			openCount++
+		}
+	}
+
+	httpAddr := ""
+	persistToConfig := false
+	if s.config != nil {
+		httpAddr = s.config.Addr
+		persistToConfig = s.config.PersistToConfig
+	}
+
+	result := map[string]interface{}{
+		"version":           Version,
+		"pid":               os.Getpid(),
+		"config_path":       s.configPath,
+		"socket_path":       s.socketPath,
+		"http_addr":         httpAddr,
+		"persist_to_config": persistToConfig,
+		"databases":         len(dbs),
+		"open_databases":    openCount,
+		"started_at":        s.startedAt.UTC().Format(time.RFC3339),
+	}
+
+	return newSuccessResponse(req.ID, result)
+}
+
 // loadAndRegisterDB loads a database configuration from a file and registers it with the store.
-func (s *ControlServer) loadAndRegisterDB(dbPath, configPath string) error {
+func (s *ControlServer) loadAndRegisterDB(dbPath, configPath string) (*DBConfig, error) {
 	// Load config file
 	config, err := ReadConfigFile(configPath, true)
 	if err != nil {
-		return fmt.Errorf("read config file: %w", err)
+		return nil, fmt.Errorf("read config file: %w", err)
+	}
+
+	// Expand the requested db path for comparison
+	expandedDBPath, err := expand(dbPath)
+	if err != nil {
+		return nil, fmt.Errorf("expand db path: %w", err)
 	}
 
 	// Find the database config that matches the requested path
@@ -369,20 +459,20 @@ func (s *ControlServer) loadAndRegisterDB(dbPath, configPath string) error {
 		if err != nil {
 			continue
 		}
-		if expandedPath == dbPath {
+		if expandedPath == expandedDBPath {
 			dbConfig = dbc
 			break
 		}
 	}
 
 	if dbConfig == nil {
-		return fmt.Errorf("database path %s not found in config file %s", dbPath, configPath)
+		return nil, fmt.Errorf("database path %s not found in config file %s", dbPath, configPath)
 	}
 
 	// Create DB instance from config
 	db, err := NewDBFromConfig(dbConfig)
 	if err != nil {
-		return fmt.Errorf("create database from config: %w", err)
+		return nil, fmt.Errorf("create database from config: %w", err)
 	}
 
 	// Apply store-level settings to the database
@@ -393,8 +483,59 @@ func (s *ControlServer) loadAndRegisterDB(dbPath, configPath string) error {
 
 	// Register the database with the store (doesn't open it)
 	if err := s.store.RegisterDB(db); err != nil {
-		return fmt.Errorf("register database: %w", err)
+		return nil, fmt.Errorf("register database: %w", err)
 	}
 
+	return dbConfig, nil
+}
+
+// persistDBEnabled updates config file with enabled state.
+func (s *ControlServer) persistDBEnabled(dbPath string, enabled bool, dbConfig *DBConfig, dbConfigNode *yaml.Node) error {
+	s.configLock.Lock()
+	defer s.configLock.Unlock()
+
+	// Find DB config
+	_, found := UpdateDBConfigInMemory(s.config, dbPath, func(dbc *DBConfig) {
+		dbc.Enabled = &enabled
+	})
+
+	if found {
+		// Write config atomically without expanding defaults.
+		if _, err := WriteConfigEnabled(s.configPath, dbPath, enabled); err != nil {
+			return fmt.Errorf("write config: %w", err)
+		}
+		s.logger.Info("persisted db state to config", "path", dbPath, "enabled", enabled)
+		return nil
+	}
+
+	foundOnDisk, err := WriteConfigEnabled(s.configPath, dbPath, enabled)
+	if err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+	if foundOnDisk {
+		s.config.DBs = append(s.config.DBs, &DBConfig{
+			Path:    dbPath,
+			Enabled: &enabled,
+		})
+		s.logger.Info("persisted db state to config", "path", dbPath, "enabled", enabled)
+		return nil
+	}
+
+	if dbConfig == nil || dbConfigNode == nil {
+		// DB not in config - this is okay for dynamic DBs without config.
+		return nil
+	}
+
+	dbCopy := *dbConfig
+	dbCopy.Path = dbPath
+	dbCopy.Enabled = &enabled
+	s.config.DBs = append(s.config.DBs, &dbCopy)
+
+	SetDBNodeEnabled(dbConfigNode, enabled)
+	if err := WriteConfigAddDB(s.configPath, dbConfigNode); err != nil {
+		return fmt.Errorf("write config: %w", err)
+	}
+
+	s.logger.Info("persisted db state to config", "path", dbPath, "enabled", enabled)
 	return nil
 }

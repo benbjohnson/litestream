@@ -11,7 +11,8 @@ Litestream provides runtime control commands for dynamically managing database r
   - [stop](#stop)
   - [sync](#sync)
   - [status](#status)
-  - [databases](#databases)
+  - [list](#list)
+  - [info](#info)
 - [Usage Examples](#usage-examples)
 - [HTTP API](#http-api)
 - [Use Cases](#use-cases)
@@ -119,20 +120,19 @@ litestream stop [OPTIONS] DB_PATH
 ```
 
 **Options:**
-- `-wait` - Block until fully stopped and synced
 - `-timeout SECONDS` - Maximum wait time (default: 30)
 - `-socket PATH` - Control socket path
 
-The stop command performs a graceful shutdown, flushing any pending WAL changes to the replica before stopping.
+The stop command always waits for a graceful shutdown, flushing any pending WAL changes to the replica before stopping.
 
 **Examples:**
 
 ```bash
-# Stop replication (async)
+# Stop replication
 litestream stop /data/app.db
 
-# Stop and wait for final sync
-litestream stop /data/app.db --wait
+# Stop with a custom timeout
+litestream stop /data/app.db --timeout 60
 ```
 
 **Errors:**
@@ -191,16 +191,18 @@ Status values:
 - `open` - Database is open and replicating
 - `closed` - Database is registered but not replicating
 
-### databases
+### list
 
 List all databases managed by the daemon.
 
 ```bash
-litestream databases [OPTIONS]
+litestream list [OPTIONS]
 ```
 
 **Options:**
 - `-socket PATH` - Control socket path
+
+**Note:** The HTTP/IPC method name `databases` is supported as an alias for `list`.
 
 **Output:**
 
@@ -215,6 +217,33 @@ litestream databases [OPTIONS]
     "status": "closed"
   }
 ]
+```
+
+### info
+
+Show daemon information.
+
+```bash
+litestream info [OPTIONS]
+```
+
+**Options:**
+- `-socket PATH` - Control socket path
+
+**Output:**
+
+```json
+{
+  "version": "v0.4.0",
+  "pid": 1234,
+  "config_path": "/etc/litestream.yml",
+  "socket_path": "/var/run/litestream.sock",
+  "http_addr": "localhost:9090",
+  "persist_to_config": false,
+  "databases": 2,
+  "open_databases": 1,
+  "started_at": "2024-01-01T00:00:00Z"
+}
 ```
 
 ## Usage Examples
@@ -237,7 +266,7 @@ litestream status /data/tenant-abc.db
 litestream sync /data/tenant-abc.db --wait
 
 # Stop replication when tenant is inactive
-litestream stop /data/tenant-abc.db --wait
+litestream stop /data/tenant-abc.db
 ```
 
 ### Failover with External Locks
@@ -255,7 +284,7 @@ if acquire_lock "db-primary-lock"; then
     ./my-app
 
     # Clean shutdown - stop replication
-    litestream stop /data/app.db --wait
+    litestream stop /data/app.db
 
     # Release lock
     release_lock "db-primary-lock"
@@ -271,7 +300,7 @@ Ensure all changes are synced before stopping:
 litestream sync /data/app.db --wait --timeout 60
 
 # Stop the database
-litestream stop /data/app.db --wait
+litestream stop /data/app.db
 
 # Now safe to stop daemon
 kill $LITESTREAM_PID
@@ -329,7 +358,9 @@ The control API is available via HTTP when the metrics server is enabled:
 - `stop` - Stop replication
 - `sync` - Force sync
 - `status` - Query status
-- `databases` - List databases
+- `list` - List databases
+- `info` - Show daemon information
+- `databases` - Alias for `list`
 
 **Example with curl:**
 
@@ -338,7 +369,7 @@ curl -X POST http://localhost:9090/control/ \
   -H "Content-Type: application/json" \
   -d '{
     "jsonrpc": "2.0",
-    "method": "databases",
+    "method": "list",
     "id": 1
   }'
 ```
@@ -360,7 +391,7 @@ socket: /var/run/litestream.sock
 litestream start /data/tenant-${ID}.db --config tenant-config.yml
 
 # When tenant becomes inactive
-litestream stop /data/tenant-${ID}.db --wait
+litestream stop /data/tenant-${ID}.db
 ```
 
 ### 2. Active-Passive Failover
@@ -372,7 +403,7 @@ Use external coordination (etcd, Consul) to determine which node replicates:
 if is_primary; then
     litestream start /data/app.db --wait
 else
-    litestream stop /data/app.db --wait
+    litestream stop /data/app.db
 fi
 ```
 
@@ -382,7 +413,7 @@ Stop replication during maintenance, resume after:
 
 ```bash
 # Before maintenance
-litestream stop /data/app.db --wait
+litestream stop /data/app.db
 
 # Perform maintenance
 ./maintenance-script.sh
@@ -397,7 +428,7 @@ Disable replication during off-hours for cost savings:
 
 ```bash
 # Cron: Stop replication at night
-0 22 * * * litestream stop /data/app.db --wait
+0 22 * * * litestream stop /data/app.db
 
 # Cron: Resume in the morning
 0 6 * * * litestream start /data/app.db --wait

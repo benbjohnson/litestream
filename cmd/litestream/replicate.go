@@ -198,18 +198,38 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	var dbs []*litestream.DB
+	var registeredDBs []*litestream.DB
 	var watchables []struct {
 		config *DBConfig
 		dbs    []*litestream.DB
 	}
+
+	shouldAutoStart := func(dbConfig *DBConfig) bool {
+		autoReplicate := true
+		if dbConfig.AutoReplicate != nil {
+			autoReplicate = *dbConfig.AutoReplicate
+		}
+		enabled := true
+		if dbConfig.Enabled != nil {
+			enabled = *dbConfig.Enabled
+		}
+		return autoReplicate && enabled
+	}
+
 	for _, dbConfig := range c.Config.DBs {
-		// Handle directory configuration
 		if dbConfig.Dir != "" {
 			dirDbs, err := NewDBsFromDirectoryConfig(dbConfig)
 			if err != nil {
 				return err
 			}
-			dbs = append(dbs, dirDbs...)
+
+			if shouldAutoStart(dbConfig) {
+				dbs = append(dbs, dirDbs...)
+			} else {
+				registeredDBs = append(registeredDBs, dirDbs...)
+				slog.Info("databases registered but not auto-started", "dir", dbConfig.Dir, "count", len(dirDbs))
+			}
+
 			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs), "watch", dbConfig.Watch)
 			if dbConfig.Watch {
 				watchables = append(watchables, struct {
@@ -217,13 +237,19 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 					dbs    []*litestream.DB
 				}{config: dbConfig, dbs: dirDbs})
 			}
-		} else {
-			// Handle single database configuration
-			db, err := NewDBFromConfig(dbConfig)
-			if err != nil {
-				return err
-			}
+			continue
+		}
+
+		db, err := NewDBFromConfig(dbConfig)
+		if err != nil {
+			return err
+		}
+
+		if shouldAutoStart(dbConfig) {
 			dbs = append(dbs, db)
+		} else {
+			registeredDBs = append(registeredDBs, db)
+			slog.Info("database registered but not auto-started", "path", dbConfig.Path)
 		}
 	}
 
@@ -273,6 +299,18 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 	if err := c.Store.Open(ctx); err != nil {
 		return fmt.Errorf("cannot open store: %w", err)
+	}
+
+	// Register databases that won't be auto-started (auto-replicate=false or enabled=false)
+	// These can be started later via IPC commands.
+	for _, db := range registeredDBs {
+		db.L0Retention = c.Store.L0Retention
+		db.ShutdownSyncTimeout = c.Store.ShutdownSyncTimeout
+		db.ShutdownSyncInterval = c.Store.ShutdownSyncInterval
+
+		if err := c.Store.RegisterDB(db); err != nil {
+			return fmt.Errorf("register database: %w", err)
+		}
 	}
 
 	for _, entry := range watchables {
@@ -337,7 +375,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 	// Start control server if socket is configured
 	if c.Config.Socket != "" {
-		c.Control = NewControlServer(c.Store, c.Config.ConfigPath, c.Config.Socket, c.Config.SocketPermissions, httpMux)
+		c.Control = NewControlServer(c.Store, &c.Config, c.Config.ConfigPath, c.Config.Socket, c.Config.SocketPermissions, httpMux)
 		if err := c.Control.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
 		}

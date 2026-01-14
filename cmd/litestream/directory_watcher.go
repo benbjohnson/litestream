@@ -22,6 +22,7 @@ type DirectoryMonitor struct {
 	dirPath   string
 	pattern   string
 	recursive bool
+	autoStart bool
 
 	watcher *fsnotify.Watcher
 	ctx     context.Context
@@ -60,12 +61,20 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 	}
 
 	monitorCtx, cancel := context.WithCancel(ctx)
+	autoStart := true
+	if dbc.AutoReplicate != nil {
+		autoStart = *dbc.AutoReplicate
+	}
+	if dbc.Enabled != nil {
+		autoStart = autoStart && *dbc.Enabled
+	}
 	dm := &DirectoryMonitor{
 		store:       store,
 		config:      dbc,
 		dirPath:     dirPath,
 		pattern:     dbc.Pattern,
 		recursive:   dbc.Recursive,
+		autoStart:   autoStart,
 		watcher:     watcher,
 		ctx:         monitorCtx,
 		cancel:      cancel,
@@ -268,9 +277,16 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 		return
 	}
 
-	if err := dm.store.AddDB(db); err != nil {
-		dm.logger.Error("add database to store", "path", path, "error", err)
-		return
+	if dm.autoStart {
+		if err := dm.store.AddDB(db); err != nil {
+			dm.logger.Error("add database to store", "path", path, "error", err)
+			return
+		}
+	} else {
+		if err := dm.store.RegisterDB(db); err != nil {
+			dm.logger.Error("register database", "path", path, "error", err)
+			return
+		}
 	}
 
 	dm.mu.Lock()
@@ -278,7 +294,11 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 	dm.mu.Unlock()
 
 	success = true
-	dm.logger.Info("added database to replication", "path", path)
+	if dm.autoStart {
+		dm.logger.Info("added database to replication", "path", path)
+	} else {
+		dm.logger.Info("registered database for replication", "path", path)
+	}
 }
 
 func (dm *DirectoryMonitor) removeDatabase(path string) {

@@ -60,7 +60,6 @@ type StartParams struct {
 // StopParams contains parameters for the stop command.
 type StopParams struct {
 	Path    string `json:"path"`
-	Wait    bool   `json:"wait"`
 	Timeout int    `json:"timeout"`
 }
 
