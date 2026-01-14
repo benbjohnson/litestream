@@ -85,6 +85,15 @@ func LitestreamVFSRegister() *C.char {
 		}
 	}
 
+	// Configure hydration support if enabled.
+	if strings.ToLower(os.Getenv("LITESTREAM_HYDRATION_ENABLED")) == "true" {
+		vfs.HydrationEnabled = true
+
+		if s := os.Getenv("LITESTREAM_HYDRATION_PATH"); s != "" {
+			vfs.HydrationPath = s
+		}
+	}
+
 	if err := sqlite3vfs.RegisterVFS("litestream", vfs); err != nil {
 		return C.CString(fmt.Sprintf("failed to register VFS: %s", err))
 	}
