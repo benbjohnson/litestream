@@ -1864,7 +1864,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	db.Logger.Debug("enforcing l0 retention", "retention", db.L0Retention)
+	db.Logger.Debug("starting l0 retention enforcement", "retention", db.L0Retention)
+
+	dbName := filepath.Base(db.Path())
 
 	// Determine the highest TXID that has been compacted into L1.
 	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
@@ -1882,6 +1884,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return fmt.Errorf("close l1 iterator: %w", err)
 	}
 	if maxL1TXID == 0 {
+		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
+		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
+		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(0)
 		return nil
 	}
 
@@ -1893,13 +1898,17 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	defer itr.Close()
 
 	var (
-		deleted      []*ltx.FileInfo
-		lastInfo     *ltx.FileInfo
-		processedAll = true
+		deleted           []*ltx.FileInfo
+		lastInfo          *ltx.FileInfo
+		processedAll      = true
+		totalFiles        int
+		notCompactedCount int
+		tooRecentCount    int
 	)
 	for itr.Next() {
 		info := itr.Item()
 		lastInfo = info
+		totalFiles++
 
 		createdAt := info.CreatedAt
 		if createdAt.IsZero() {
@@ -1914,11 +1923,21 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			// L0 entries are ordered; once we reach a newer file we stop so we don't
 			// create gaps between retained files. VFS expects contiguous coverage.
 			processedAll = false
+			tooRecentCount++
 			break
 		}
 
 		if info.MaxTXID <= maxL1TXID {
 			deleted = append(deleted, info)
+		} else {
+			notCompactedCount++
+		}
+	}
+
+	// Count remaining files as too_recent if we stopped early
+	if !processedAll {
+		for itr.Next() {
+			tooRecentCount++
 		}
 	}
 
@@ -1926,6 +1945,17 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	if processedAll && len(deleted) > 0 && lastInfo != nil && deleted[len(deleted)-1] == lastInfo {
 		deleted = deleted[:len(deleted)-1]
 	}
+
+	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(float64(len(deleted)))
+	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(float64(notCompactedCount))
+	internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(float64(tooRecentCount))
+
+	db.Logger.Debug("l0 retention scan complete",
+		"total_l0_files", totalFiles,
+		"eligible_for_deletion", len(deleted),
+		"not_compacted_yet", notCompactedCount,
+		"too_recent", tooRecentCount,
+		"max_l1_txid", maxL1TXID)
 
 	if len(deleted) == 0 {
 		return nil
