@@ -1191,7 +1191,7 @@ func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
 	// Clear cache since we'll now read from hydration file
 	f.cache.Purge()
 
-	f.logger.Info("hydration complete", "path", f.hydrationPath, "txid", f.hydrator.TXID().String())
+	f.logger.Debug("hydration complete", "path", f.hydrationPath, "txid", f.hydrator.TXID().String())
 }
 
 // applySyncedPagesToHydratedFile writes synced dirty pages to the hydrated file.
@@ -1980,6 +1980,13 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 		}
 		pct := f.hydrator.Status().Pct() * 100
 		result := strconv.FormatFloat(pct, 'f', 1, 64)
+		return &result, nil
+
+	case "litestream_hydration_file":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_hydration_file is read-only")
+		}
+		result := f.hydrationPath
 		return &result, nil
 
 	default:
