@@ -516,6 +516,7 @@ type VFSFile struct {
 	bufferNextOff int64            // Next write offset in buffer file
 	syncTicker    *time.Ticker     // Ticker for periodic sync
 	syncInterval  time.Duration    // Interval for periodic sync
+	syncStop      chan struct{}    // Signal to stop sync loop
 	inTransaction bool             // True during active write transaction
 
 	hydrator      *Hydrator // Background hydration (nil if disabled)
@@ -960,6 +961,7 @@ func (f *VFSFile) Open() error {
 	// Start periodic sync goroutine if write support is enabled
 	if f.writeEnabled && f.syncInterval > 0 {
 		f.syncTicker = time.NewTicker(f.syncInterval)
+		f.syncStop = make(chan struct{})
 		f.wg.Add(1)
 		go func() { defer f.wg.Done(); f.syncLoop() }()
 	}
@@ -1014,6 +1016,7 @@ func (f *VFSFile) openNewDatabase() error {
 	// Start periodic sync goroutine
 	if f.syncInterval > 0 {
 		f.syncTicker = time.NewTicker(f.syncInterval)
+		f.syncStop = make(chan struct{})
 		f.wg.Add(1)
 		go func() { defer f.wg.Done(); f.syncLoop() }()
 	}
@@ -1215,10 +1218,16 @@ func (f *VFSFile) applySyncedPagesToHydratedFile() error {
 func (f *VFSFile) Close() error {
 	f.logger.Debug("closing file")
 
-	// Stop sync ticker if running
+	// Stop sync loop and ticker if running (need mutex for syncStop)
+	f.mu.Lock()
+	if f.syncStop != nil {
+		close(f.syncStop)
+		f.syncStop = nil
+	}
 	if f.syncTicker != nil {
 		f.syncTicker.Stop()
 	}
+	f.mu.Unlock()
 
 	// Stop compaction monitors if running
 	if f.compactionCancel != nil {
@@ -1524,15 +1533,147 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 	return f.syncToRemote()
 }
 
+// SetWriteEnabled enables or disables write support at runtime.
+//
+// When disabling (enabled=false):
+//   - If called during an active transaction, waits up to 30 seconds for completion
+//   - Syncs all dirty pages to replica before returning
+//   - Returns error if sync fails (writes remain enabled)
+//   - Stops the sync ticker if running
+//
+// When enabling (enabled=true):
+//   - Initializes buffer file if not already present (cold enable)
+//   - Starts sync ticker if syncInterval > 0 and not already running
+func (f *VFSFile) SetWriteEnabled(enabled bool) error {
+	f.mu.Lock()
+
+	// No-op if already in the requested state
+	if f.writeEnabled == enabled {
+		f.mu.Unlock()
+		return nil
+	}
+
+	if !enabled {
+		// DISABLING writes
+
+		// Wait for active transaction to complete (with timeout)
+		const maxWait = 30 * time.Second
+		deadline := time.Now().Add(maxWait)
+		for f.inTransaction {
+			if time.Now().After(deadline) {
+				f.mu.Unlock()
+				return fmt.Errorf("timeout waiting for transaction to complete (waited %v)", maxWait)
+			}
+			f.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			f.mu.Lock()
+		}
+
+		// Sync dirty pages if any exist
+		if len(f.dirty) > 0 {
+			f.mu.Unlock()
+			if err := f.syncToRemote(); err != nil {
+				return fmt.Errorf("sync before disable: %w", err)
+			}
+			f.mu.Lock()
+		}
+
+		// Stop sync loop and ticker if running
+		if f.syncStop != nil {
+			close(f.syncStop)
+			f.syncStop = nil
+		}
+		if f.syncTicker != nil {
+			f.syncTicker.Stop()
+			f.syncTicker = nil
+		}
+
+		f.writeEnabled = false
+		f.logger.Info("write support disabled")
+		f.mu.Unlock()
+		return nil
+	}
+
+	// ENABLING writes (cold enable supported)
+
+	// Initialize dirty map if not present
+	if f.dirty == nil {
+		f.dirty = make(map[uint32]int64)
+	}
+
+	// Set sync interval from VFS config if not set (preserve 0 = no periodic sync)
+	if f.syncInterval == 0 && f.vfs != nil {
+		f.syncInterval = f.vfs.WriteSyncInterval
+	}
+
+	// Set buffer path if not set
+	if f.bufferPath == "" {
+		if f.vfs != nil && f.vfs.WriteBufferPath != "" {
+			f.bufferPath = f.vfs.WriteBufferPath
+		} else if f.vfs != nil {
+			// Use VFS temp directory
+			dir, err := f.vfs.ensureTempDir()
+			if err != nil {
+				f.mu.Unlock()
+				return fmt.Errorf("create temp dir for write buffer: %w", err)
+			}
+			f.bufferPath = filepath.Join(dir, "write-buffer")
+		} else {
+			// Fallback to os.TempDir() for cold enable without VFS reference
+			f.bufferPath = filepath.Join(os.TempDir(), "litestream-write-buffer")
+		}
+	}
+
+	// Initialize buffer file if not present
+	if f.bufferFile == nil {
+		f.mu.Unlock()
+		if err := f.initWriteBuffer(); err != nil {
+			return fmt.Errorf("init write buffer: %w", err)
+		}
+		f.mu.Lock()
+	}
+
+	// Initialize write tracking state if this is a cold enable
+	if f.pendingTXID == 0 {
+		f.expectedTXID = f.pos.TXID
+		f.pendingTXID = f.pos.TXID + 1
+	}
+
+	// Start sync ticker if not running and interval > 0
+	// (syncInterval == 0 means no periodic sync, only manual Sync() calls)
+	if f.syncTicker == nil && f.syncInterval > 0 {
+		f.syncTicker = time.NewTicker(f.syncInterval)
+		f.syncStop = make(chan struct{})
+		f.wg.Add(1)
+		go func() { defer f.wg.Done(); f.syncLoop() }()
+	}
+
+	f.writeEnabled = true
+	f.logger.Info("write support enabled", "pendingTXID", f.pendingTXID)
+	f.mu.Unlock()
+	return nil
+}
+
 // syncLoop runs periodic sync in the background.
+// It uses a local copy of the stop channel to avoid races with SetWriteEnabled.
 func (f *VFSFile) syncLoop() {
 	f.logger.Debug("starting sync loop", "interval", f.syncInterval)
+
+	// Capture references under mutex to avoid races
+	f.mu.Lock()
+	stopCh := f.syncStop
+	tickerCh := f.syncTicker.C
+	f.mu.Unlock()
+
 	for {
 		select {
 		case <-f.ctx.Done():
-			f.logger.Debug("sync loop stopped")
+			f.logger.Debug("sync loop stopped (context cancelled)")
 			return
-		case <-f.syncTicker.C:
+		case <-stopCh:
+			f.logger.Debug("sync loop stopped (write disabled)")
+			return
+		case <-tickerCh:
 			if err := f.Sync(0); err != nil {
 				f.logger.Error("periodic sync failed", "error", err)
 			}
@@ -1988,6 +2129,32 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 		}
 		result := f.hydrationPath
 		return &result, nil
+
+	case "litestream_write_enabled":
+		if pragmaValue == nil {
+			// READ mode - return current state
+			if f.writeEnabled {
+				result := "1"
+				return &result, nil
+			}
+			result := "0"
+			return &result, nil
+		}
+		// WRITE mode - enable or disable
+		switch strings.ToLower(*pragmaValue) {
+		case "0", "false", "off":
+			if err := f.SetWriteEnabled(false); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		case "1", "true", "on":
+			if err := f.SetWriteEnabled(true); err != nil {
+				return nil, err
+			}
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("invalid value for litestream_write_enabled: %s (use 0 or 1)", *pragmaValue)
+		}
 
 	default:
 		return nil, sqlite3vfs.NotFoundError
