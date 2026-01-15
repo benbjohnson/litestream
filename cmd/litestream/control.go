@@ -235,7 +235,7 @@ func (s *ControlServer) handleStart(req *RPCRequest) *RPCResponse {
 	}
 
 	// Persist to config if enabled
-	if s.config != nil && s.config.PersistToConfig {
+	if s.config != nil && s.config.Socket.PersistToConfig {
 		if err := s.persistDBEnabled(expandedPath, true, dbConfig, dbConfigNode); err != nil {
 			s.logger.Warn("failed to persist config", "error", err)
 		}
@@ -295,7 +295,7 @@ func (s *ControlServer) handleStop(req *RPCRequest) *RPCResponse {
 	}
 
 	// Persist to config if enabled
-	if s.config != nil && s.config.PersistToConfig {
+	if s.config != nil && s.config.Socket.PersistToConfig {
 		if err := s.persistDBEnabled(expandedPath, false, nil, nil); err != nil {
 			s.logger.Warn("failed to persist config", "error", err)
 		}
@@ -420,7 +420,7 @@ func (s *ControlServer) handleInfo(req *RPCRequest) *RPCResponse {
 	persistToConfig := false
 	if s.config != nil {
 		httpAddr = s.config.Addr
-		persistToConfig = s.config.PersistToConfig
+		persistToConfig = s.config.Socket.PersistToConfig
 	}
 
 	result := map[string]interface{}{

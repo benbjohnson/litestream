@@ -14,10 +14,13 @@ type InfoCommand struct{}
 // Run executes the info command.
 func (c *InfoCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-info", flag.ContinueOnError)
-	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
+	socketPath := fs.String("socket", "", "control socket path (required)")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *socketPath == "" {
+		return fmt.Errorf("socket path required; use -socket flag")
 	}
 	if fs.NArg() != 0 {
 		return fmt.Errorf("too many arguments")
@@ -74,6 +77,6 @@ Show daemon information.
 
 Options:
   -socket PATH
-      Path to control socket (default: /var/run/litestream.sock).
+      Path to control socket (required).
 `[1:])
 }

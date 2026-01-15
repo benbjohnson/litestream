@@ -125,8 +125,10 @@ func TestControlServer_handleHTTP_ListInfo(t *testing.T) {
 
 	store := litestream.NewStore([]*litestream.DB{db1, db2}, nil)
 	config := &Config{
-		Addr:            "127.0.0.1:9090",
-		PersistToConfig: true,
+		Addr: "127.0.0.1:9090",
+		Socket: SocketConfig{
+			PersistToConfig: true,
+		},
 	}
 	controlServer := NewControlServer(store, config, "/tmp/litestream.yml", "/tmp/litestream.sock", 0600, nil)
 

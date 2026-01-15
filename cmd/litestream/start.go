@@ -17,12 +17,15 @@ func (c *StartCommand) Run(ctx context.Context, args []string) error {
 	configPath := fs.String("config", "", "config file path")
 	wait := fs.Bool("wait", false, "wait for replication to start")
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
-	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
+	socketPath := fs.String("socket", "", "control socket path (required)")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
+	if *socketPath == "" {
+		return fmt.Errorf("socket path required; use -socket flag")
+	}
 	if fs.NArg() == 0 {
 		return fmt.Errorf("database path required")
 	}
@@ -102,6 +105,6 @@ Options:
       Maximum time to wait in seconds (default: 30).
 
   -socket PATH
-      Path to control socket (default: /var/run/litestream.sock).
+      Path to control socket (required).
 `[1:])
 }

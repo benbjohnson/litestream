@@ -24,24 +24,32 @@ The IPC control system consists of two components:
 1. **Control Server**: Runs alongside the `litestream replicate` daemon, accepting commands via Unix socket or HTTP
 2. **CLI Commands**: Send commands to the control server to manage database replication at runtime
 
-By default, the control server listens on a Unix socket at `/var/run/litestream.sock`. You can also access the control API via HTTP if the metrics server is enabled.
+The control server is opt-in: configure a socket path to enable it. You can also access the control API via HTTP if the metrics server is enabled.
 
 ## Configuration
 
-### Unix Socket (Default)
+### Unix Socket (Opt-In)
 
-The Unix socket is enabled by default with secure permissions:
+The Unix socket must be explicitly enabled. This is because users often run multiple Litestream instances, and a default socket path would cause conflicts.
 
 ```yaml
 # litestream.yml
-socket: /var/run/litestream.sock  # Default location
-socket-permissions: 0600           # Owner-only access (default)
+socket:
+  path: /var/run/litestream.sock  # Required to enable control socket
+  permissions: 0600                # Owner-only access (default)
+  persist-to-config: false         # Persist enabled state to config (optional)
 ```
 
-To disable the Unix socket:
+When running multiple Litestream instances, use unique socket paths:
 
 ```yaml
-socket: ""  # Disabled
+# Instance 1
+socket:
+  path: /var/run/litestream-app1.sock
+
+# Instance 2
+socket:
+  path: /var/run/litestream-app2.sock
 ```
 
 ### HTTP API
@@ -90,19 +98,19 @@ litestream start [OPTIONS] DB_PATH
 - `-config PATH` - Path to config file with replica settings
 - `-wait` - Block until replication has started
 - `-timeout SECONDS` - Maximum wait time (default: 30)
-- `-socket PATH` - Control socket path (default: /var/run/litestream.sock)
+- `-socket PATH` - Control socket path (required)
 
 **Examples:**
 
 ```bash
 # Start replication (async)
-litestream start /data/app.db
+litestream start -socket /var/run/litestream.sock /data/app.db
 
 # Start with explicit config and wait for confirmation
-litestream start /data/app.db --config app-replica.yml --wait
+litestream start -socket /var/run/litestream.sock -config app-replica.yml -wait /data/app.db
 
 # Start with custom timeout
-litestream start /data/app.db --wait --timeout 60
+litestream start -socket /var/run/litestream.sock -wait -timeout 60 /data/app.db
 ```
 
 **Errors:**
@@ -121,7 +129,7 @@ litestream stop [OPTIONS] DB_PATH
 
 **Options:**
 - `-timeout SECONDS` - Maximum wait time (default: 30)
-- `-socket PATH` - Control socket path
+- `-socket PATH` - Control socket path (required)
 
 The stop command always waits for a graceful shutdown, flushing any pending WAL changes to the replica before stopping.
 
@@ -129,10 +137,10 @@ The stop command always waits for a graceful shutdown, flushing any pending WAL 
 
 ```bash
 # Stop replication
-litestream stop /data/app.db
+litestream stop -socket /var/run/litestream.sock /data/app.db
 
 # Stop with a custom timeout
-litestream stop /data/app.db --timeout 60
+litestream stop -socket /var/run/litestream.sock -timeout 60 /data/app.db
 ```
 
 **Errors:**
@@ -150,16 +158,16 @@ litestream sync [OPTIONS] DB_PATH
 **Options:**
 - `-wait` - Block until sync completes
 - `-timeout SECONDS` - Maximum wait time (default: 30)
-- `-socket PATH` - Control socket path
+- `-socket PATH` - Control socket path (required)
 
 **Examples:**
 
 ```bash
 # Trigger sync (async)
-litestream sync /data/app.db
+litestream sync -socket /var/run/litestream.sock /data/app.db
 
 # Trigger sync and wait for completion
-litestream sync /data/app.db --wait
+litestream sync -socket /var/run/litestream.sock -wait /data/app.db
 ```
 
 **Errors:**
@@ -176,7 +184,7 @@ litestream status [OPTIONS] DB_PATH
 ```
 
 **Options:**
-- `-socket PATH` - Control socket path
+- `-socket PATH` - Control socket path (required)
 
 **Output:**
 
@@ -200,7 +208,7 @@ litestream list [OPTIONS]
 ```
 
 **Options:**
-- `-socket PATH` - Control socket path
+- `-socket PATH` - Control socket path (required)
 
 **Note:** The HTTP/IPC method name `databases` is supported as an alias for `list`.
 
@@ -228,7 +236,7 @@ litestream info [OPTIONS]
 ```
 
 **Options:**
-- `-socket PATH` - Control socket path
+- `-socket PATH` - Control socket path (required)
 
 **Output:**
 
@@ -253,20 +261,20 @@ litestream info [OPTIONS]
 Managing per-tenant databases with runtime control:
 
 ```bash
-# Start the daemon
+# Start the daemon with socket enabled
 litestream replicate -config /etc/litestream.yml
 
 # Dynamically add a new tenant database
-litestream start /data/tenant-abc.db --config tenant-replica.yml --wait
+litestream start -socket /var/run/litestream.sock -config tenant-replica.yml -wait /data/tenant-abc.db
 
 # Check status
-litestream status /data/tenant-abc.db
+litestream status -socket /var/run/litestream.sock /data/tenant-abc.db
 
 # Force a sync before maintenance
-litestream sync /data/tenant-abc.db --wait
+litestream sync -socket /var/run/litestream.sock -wait /data/tenant-abc.db
 
 # Stop replication when tenant is inactive
-litestream stop /data/tenant-abc.db
+litestream stop -socket /var/run/litestream.sock /data/tenant-abc.db
 ```
 
 ### Failover with External Locks
@@ -275,16 +283,18 @@ Using control commands with distributed locks:
 
 ```bash
 #!/bin/bash
+SOCKET=/var/run/litestream.sock
+
 # Acquire distributed lock for this database
 if acquire_lock "db-primary-lock"; then
     # We have the lock - start replication
-    litestream start /data/app.db --wait
+    litestream start -socket $SOCKET -wait /data/app.db
 
     # Run application
     ./my-app
 
     # Clean shutdown - stop replication
-    litestream stop /data/app.db
+    litestream stop -socket $SOCKET /data/app.db
 
     # Release lock
     release_lock "db-primary-lock"
@@ -296,11 +306,13 @@ fi
 Ensure all changes are synced before stopping:
 
 ```bash
+SOCKET=/var/run/litestream.sock
+
 # Force final sync before stopping daemon
-litestream sync /data/app.db --wait --timeout 60
+litestream sync -socket $SOCKET -wait -timeout 60 /data/app.db
 
 # Stop the database
-litestream stop /data/app.db
+litestream stop -socket $SOCKET /data/app.db
 
 # Now safe to stop daemon
 kill $LITESTREAM_PID
@@ -383,15 +395,18 @@ Dynamically start/stop replication for tenant databases based on activity:
 ```yaml
 # Main config - no databases configured
 dbs: []
-socket: /var/run/litestream.sock
+socket:
+  path: /var/run/litestream.sock
 ```
 
 ```bash
+SOCKET=/var/run/litestream.sock
+
 # When tenant signs up
-litestream start /data/tenant-${ID}.db --config tenant-config.yml
+litestream start -socket $SOCKET -config tenant-config.yml /data/tenant-${ID}.db
 
 # When tenant becomes inactive
-litestream stop /data/tenant-${ID}.db
+litestream stop -socket $SOCKET /data/tenant-${ID}.db
 ```
 
 ### 2. Active-Passive Failover
@@ -399,11 +414,13 @@ litestream stop /data/tenant-${ID}.db
 Use external coordination (etcd, Consul) to determine which node replicates:
 
 ```bash
+SOCKET=/var/run/litestream.sock
+
 # On primary node
 if is_primary; then
-    litestream start /data/app.db --wait
+    litestream start -socket $SOCKET -wait /data/app.db
 else
-    litestream stop /data/app.db
+    litestream stop -socket $SOCKET /data/app.db
 fi
 ```
 
@@ -412,14 +429,16 @@ fi
 Stop replication during maintenance, resume after:
 
 ```bash
+SOCKET=/var/run/litestream.sock
+
 # Before maintenance
-litestream stop /data/app.db
+litestream stop -socket $SOCKET /data/app.db
 
 # Perform maintenance
 ./maintenance-script.sh
 
 # Resume replication
-litestream start /data/app.db --wait
+litestream start -socket $SOCKET -wait /data/app.db
 ```
 
 ### 4. Cost Optimization
@@ -428,13 +447,25 @@ Disable replication during off-hours for cost savings:
 
 ```bash
 # Cron: Stop replication at night
-0 22 * * * litestream stop /data/app.db
+0 22 * * * litestream stop -socket /var/run/litestream.sock /data/app.db
 
 # Cron: Resume in the morning
-0 6 * * * litestream start /data/app.db --wait
+0 6 * * * litestream start -socket /var/run/litestream.sock -wait /data/app.db
 ```
 
 ## Troubleshooting
+
+### Socket Path Required
+
+```
+Error: socket path required; use -socket flag
+```
+
+**Solution:**
+The `-socket` flag is required for all control commands. Specify the socket path:
+```bash
+litestream start -socket /var/run/litestream.sock /data/app.db
+```
 
 ### Socket Connection Failed
 
@@ -444,7 +475,7 @@ Error: failed to connect to control socket: dial unix /var/run/litestream.sock: 
 
 **Solutions:**
 1. Check that `litestream replicate` is running
-2. Verify socket is not disabled in config (`socket: ""`)
+2. Verify socket is enabled in config with `socket.path` set
 3. Check socket path matches config
 4. Verify permissions on `/var/run` directory
 

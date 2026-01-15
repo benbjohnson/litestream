@@ -254,11 +254,8 @@ type Config struct {
 	// MCP server options
 	MCPAddr string `yaml:"mcp-addr"`
 
-	// Unix socket for control commands (default: /var/run/litestream.sock)
-	// Set to "" to disable socket
-	Socket            string `yaml:"socket"`
-	SocketPermissions uint32 `yaml:"socket-permissions"`
-	PersistToConfig   bool   `yaml:"persist-to-config"`
+	// Socket configuration for control commands (opt-in, disabled by default)
+	Socket SocketConfig `yaml:"socket"`
 
 	// Shutdown sync retry settings
 	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
@@ -280,6 +277,14 @@ type LoggingConfig struct {
 	Level  string `yaml:"level"`
 	Type   string `yaml:"type"`
 	Stderr bool   `yaml:"stderr"`
+}
+
+// SocketConfig configures the Unix socket for control commands.
+// Socket is opt-in: set Path to enable control commands.
+type SocketConfig struct {
+	Path            string `yaml:"path"`
+	Permissions     uint32 `yaml:"permissions"`
+	PersistToConfig bool   `yaml:"persist-to-config"`
 }
 
 // propagateGlobalSettings copies global replica settings to individual replica configs.
@@ -317,8 +322,10 @@ func DefaultConfig() Config {
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
 		ShutdownSyncTimeout:      &defaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     &defaultShutdownSyncInterval,
-		Socket:                   "/var/run/litestream.sock",
-		SocketPermissions:        0600,
+		Socket: SocketConfig{
+			Path:        "", // Empty = disabled (opt-in)
+			Permissions: 0600,
+		},
 	}
 }
 

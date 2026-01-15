@@ -374,8 +374,8 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	// Start control server if socket is configured
-	if c.Config.Socket != "" {
-		c.Control = NewControlServer(c.Store, &c.Config, c.Config.ConfigPath, c.Config.Socket, c.Config.SocketPermissions, httpMux)
+	if c.Config.Socket.Path != "" {
+		c.Control = NewControlServer(c.Store, &c.Config, c.Config.ConfigPath, c.Config.Socket.Path, c.Config.Socket.Permissions, httpMux)
 		if err := c.Control.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
 		}
