@@ -1174,9 +1174,11 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	case "s3":
-		if r.Client, err = NewS3ReplicaClientFromConfig(c, r); err != nil {
+		var client *s3.ReplicaClient
+		if client, err = NewS3ReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
 		}
+		r.Client = client
 	case "gs":
 		if r.Client, err = newGSReplicaClientFromConfig(c, r); err != nil {
 			return nil, err
