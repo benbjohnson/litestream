@@ -333,6 +333,81 @@ func (db *DB) ensureCompactorClient() {
 	}
 }
 
+// LTXStats holds aggregated statistics about LTX files.
+type LTXStats struct {
+	TotalFiles int64
+	TotalBytes int64
+	ByLevel    map[int]LTXLevelStats
+}
+
+// LTXLevelStats holds statistics for a single compaction level.
+type LTXLevelStats struct {
+	Files int64
+	Bytes int64
+}
+
+// LocalLTXStats returns statistics about local LTX files in the metadata directory.
+// Scans the LTX directory and aggregates file counts and sizes.
+func (db *DB) LocalLTXStats() (LTXStats, error) {
+	var stats LTXStats
+
+	ltxDir := db.LTXDir()
+	entries, err := os.ReadDir(ltxDir)
+	if os.IsNotExist(err) {
+		return stats, nil
+	} else if err != nil {
+		return stats, fmt.Errorf("read ltx dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Skip non-numeric directories
+		if _, err := strconv.Atoi(entry.Name()); err != nil {
+			continue
+		}
+
+		subdir := filepath.Join(ltxDir, entry.Name())
+		files, err := os.ReadDir(subdir)
+		if err != nil {
+			continue
+		}
+
+		for _, file := range files {
+			if file.IsDir() {
+				continue
+			}
+			if _, _, err := ltx.ParseFilename(file.Name()); err != nil {
+				continue // skip non-LTX files
+			}
+
+			info, err := file.Info()
+			if err != nil {
+				continue
+			}
+
+			stats.TotalFiles++
+			stats.TotalBytes += info.Size()
+		}
+	}
+
+	return stats, nil
+}
+
+// updateLocalLTXMetrics updates Prometheus metrics for local LTX files.
+func (db *DB) updateLocalLTXMetrics() {
+	stats, err := db.LocalLTXStats()
+	if err != nil {
+		db.Logger.Debug("failed to collect local LTX stats", "error", err)
+		return
+	}
+
+	localLTXFilesGaugeVec.WithLabelValues(db.path).Set(float64(stats.TotalFiles))
+	localLTXBytesGaugeVec.WithLabelValues(db.path).Set(float64(stats.TotalBytes))
+}
+
 // MaxLTX returns the last LTX file written to level 0.
 func (db *DB) MaxLTX() (minTXID, maxTXID ltx.TXID, err error) {
 	ents, err := os.ReadDir(db.LTXLevelDir(0))
@@ -853,6 +928,9 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		db.dbSizeGauge.Set(float64(fi.Size()))
 	}
 	db.walSizeGauge.Set(float64(newWALSize))
+
+	// Update local LTX file metrics.
+	db.updateLocalLTXMetrics()
 
 	// Notify replicas of WAL changes.
 	// if changed {
@@ -2309,4 +2387,25 @@ var (
 		Name: "litestream_compaction_verify_error_count",
 		Help: "Number of post-compaction verification failures",
 	}, []string{"db"})
+	// Local LTX file metrics
+	localLTXFilesGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_local_ltx_files",
+		Help: "Total number of LTX files in local metadata directory",
+	}, []string{"db"})
+
+	localLTXBytesGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_local_ltx_bytes",
+		Help: "Total size of LTX files in local metadata directory",
+	}, []string{"db"})
+
+	// Replica LTX file metrics
+	replicaLTXFilesGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_replica_ltx_files",
+		Help: "Number of LTX files by compaction level (replica)",
+	}, []string{"db", "replica_type", "level"})
+
+	replicaLTXBytesGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_replica_ltx_bytes",
+		Help: "Size of LTX files by compaction level (replica)",
+	}, []string{"db", "replica_type", "level"})
 )

@@ -1260,3 +1260,44 @@ func TestDB_ResetLocalState(t *testing.T) {
 		t.Fatalf("expected zero TXID after reset, got %d", posAfter.TXID)
 	}
 }
+
+// TestDB_LocalLTXStats verifies that LocalLTXStats returns correct file counts and sizes.
+func TestDB_LocalLTXStats(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Initially, no LTX files should exist
+	stats, err := db.LocalLTXStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalFiles != 0 {
+		t.Fatalf("expected 0 files initially, got %d", stats.TotalFiles)
+	}
+	if stats.TotalBytes != 0 {
+		t.Fatalf("expected 0 bytes initially, got %d", stats.TotalBytes)
+	}
+
+	// Create table and insert data to generate LTX files
+	if _, err := sqldb.Exec(`CREATE TABLE t (x TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (x) VALUES ('test data for ltx stats')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now we should have LTX files
+	stats, err = db.LocalLTXStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.TotalFiles == 0 {
+		t.Fatal("expected at least 1 LTX file after sync")
+	}
+	if stats.TotalBytes == 0 {
+		t.Fatal("expected non-zero bytes after sync")
+	}
+}
