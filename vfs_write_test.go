@@ -877,3 +877,403 @@ func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
 		t.Errorf("expected size %d after write, got %d", DefaultPageSize, size)
 	}
 }
+
+func TestSetWriteEnabled_ReadValue(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	// Test with write disabled
+	logger := slog.Default()
+	f := NewVFSFile(client, "test.db", logger)
+	f.writeEnabled = false
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Read via FileControl (simulates PRAGMA litestream_write_enabled)
+	result, err := f.FileControl(14, "litestream_write_enabled", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || *result != "0" {
+		t.Errorf("expected '0' for disabled write support, got %v", result)
+	}
+}
+
+func TestSetWriteEnabled_ReadValueEnabled(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	// Test with write enabled
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Read via FileControl
+	result, err := f.FileControl(14, "litestream_write_enabled", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result == nil || *result != "1" {
+		t.Errorf("expected '1' for enabled write support, got %v", result)
+	}
+}
+
+func TestSetWriteEnabled_DisableSyncsDirtyPages(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Write data to create dirty pages
+	writeData := []byte("dirty data")
+	if _, err := f.WriteAt(writeData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(f.dirty) == 0 {
+		t.Fatal("expected dirty pages")
+	}
+
+	// Disable writes via SetWriteEnabled
+	if err := f.SetWriteEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Dirty pages should be synced
+	if len(f.dirty) != 0 {
+		t.Errorf("expected 0 dirty pages after disable, got %d", len(f.dirty))
+	}
+
+	// Write support should be disabled
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false")
+	}
+
+	// LTX file should have been written
+	client.mu.Lock()
+	if len(client.ltxFiles[0]) != 2 {
+		t.Errorf("expected 2 LTX files (initial + synced), got %d", len(client.ltxFiles[0]))
+	}
+	client.mu.Unlock()
+}
+
+func TestSetWriteEnabled_DisableWaitsForTransaction(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Start a transaction (acquire RESERVED lock)
+	if err := f.Lock(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write some data
+	if _, err := f.WriteAt([]byte("tx data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start disable in a goroutine (it should wait for transaction)
+	done := make(chan error, 1)
+	go func() {
+		done <- f.SetWriteEnabled(false)
+	}()
+
+	// Give SetWriteEnabled time to start waiting
+	time.Sleep(50 * time.Millisecond)
+
+	// Write should still be enabled (waiting for transaction)
+	f.mu.Lock()
+	stillEnabled := f.writeEnabled
+	f.mu.Unlock()
+	if !stillEnabled {
+		t.Error("expected writeEnabled to still be true while in transaction")
+	}
+
+	// End transaction (release lock)
+	if err := f.Unlock(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for disable to complete
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("SetWriteEnabled failed: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("SetWriteEnabled timed out")
+	}
+
+	// Write should now be disabled
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false after transaction ended")
+	}
+}
+
+func TestSetWriteEnabled_EnableAfterDisable(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Disable writes
+	if err := f.SetWriteEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false")
+	}
+
+	// Re-enable writes
+	if err := f.SetWriteEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to be true")
+	}
+
+	// Verify we can write again
+	writeData := []byte("after re-enable")
+	if _, err := f.WriteAt(writeData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(f.dirty) == 0 {
+		t.Error("expected dirty pages after write")
+	}
+}
+
+func TestSetWriteEnabled_ColdEnable(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	// Create VFSFile WITHOUT write enabled initially
+	logger := slog.Default()
+	f := NewVFSFile(client, "test.db", logger)
+	f.writeEnabled = false
+	// Note: dirty, bufferPath, etc. are NOT set - simulating cold start
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Verify writes are disabled
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false initially")
+	}
+
+	// Enable writes via SetWriteEnabled (cold enable)
+	if err := f.SetWriteEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify writes are now enabled
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to be true after cold enable")
+	}
+
+	// Verify buffer was initialized
+	if f.bufferFile == nil {
+		t.Error("expected bufferFile to be initialized")
+	}
+
+	// Verify dirty map was initialized
+	if f.dirty == nil {
+		t.Error("expected dirty map to be initialized")
+	}
+
+	// Verify TXID state was initialized
+	if f.pendingTXID == 0 {
+		t.Error("expected pendingTXID to be initialized")
+	}
+
+	// Verify we can write
+	writeData := []byte("cold enable test")
+	if _, err := f.WriteAt(writeData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(f.dirty) == 0 {
+		t.Error("expected dirty pages after write")
+	}
+}
+
+func TestSetWriteEnabled_NoOpWhenAlreadyInState(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Enable when already enabled should be no-op
+	if err := f.SetWriteEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to remain true")
+	}
+
+	// Disable
+	if err := f.SetWriteEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Disable when already disabled should be no-op
+	if err := f.SetWriteEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to remain false")
+	}
+}
+
+func TestSetWriteEnabled_FileControlWrite(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Disable via FileControl (PRAGMA litestream_write_enabled = 0)
+	value := "0"
+	_, err := f.FileControl(14, "litestream_write_enabled", &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false after PRAGMA = 0")
+	}
+
+	// Enable via FileControl (PRAGMA litestream_write_enabled = 1)
+	value = "1"
+	_, err = f.FileControl(14, "litestream_write_enabled", &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to be true after PRAGMA = 1")
+	}
+
+	// Test alternate values
+	value = "off"
+	_, err = f.FileControl(14, "litestream_write_enabled", &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false after PRAGMA = off")
+	}
+
+	value = "on"
+	_, err = f.FileControl(14, "litestream_write_enabled", &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to be true after PRAGMA = on")
+	}
+
+	value = "false"
+	_, err = f.FileControl(14, "litestream_write_enabled", &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false after PRAGMA = false")
+	}
+
+	value = "true"
+	_, err = f.FileControl(14, "litestream_write_enabled", &value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to be true after PRAGMA = true")
+	}
+}
+
+func TestSetWriteEnabled_InvalidValue(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Invalid value should return error
+	value := "invalid"
+	_, err := f.FileControl(14, "litestream_write_enabled", &value)
+	if err == nil {
+		t.Error("expected error for invalid value")
+	}
+	if err.Error() != "invalid value for litestream_write_enabled: invalid (use 0 or 1)" {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
