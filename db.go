@@ -168,6 +168,8 @@ type DB struct {
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
+
+	opened bool
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -226,6 +228,20 @@ func NewDB(path string) *DB {
 // SQLDB returns a reference to the underlying sql.DB connection.
 func (db *DB) SQLDB() *sql.DB {
 	return db.db
+}
+
+// IsOpen returns true if the database is currently open and replicating.
+func (db *DB) IsOpen() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.opened
+}
+
+// IsInitialized returns true if the database connection has been initialized.
+func (db *DB) IsInitialized() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.db != nil
 }
 
 // Path returns the path to the database.
@@ -405,6 +421,13 @@ func (db *DB) Open() (err error) {
 		return fmt.Errorf("cannot remove tmp files: %w", err)
 	}
 
+	db.mu.Lock()
+	if db.ctx == nil || db.ctx.Err() != nil {
+		db.ctx, db.cancel = context.WithCancel(context.Background())
+	}
+	db.opened = true
+	db.mu.Unlock()
+
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {
 		db.wg.Add(1)
@@ -455,6 +478,16 @@ func (db *DB) Close(ctx context.Context) (err error) {
 			err = e
 		}
 	}
+
+	db.mu.Lock()
+	db.db = nil
+	db.f = nil
+	db.rtx = nil
+	db.pageSize = 0
+	db.fileInfo = nil
+	db.dirInfo = nil
+	db.opened = false
+	db.mu.Unlock()
 
 	return err
 }

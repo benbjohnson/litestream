@@ -41,6 +41,9 @@ type ReplicateCommand struct {
 	// MCP server
 	MCP *MCPServer
 
+	// Control server for IPC commands
+	Control *ControlServer
+
 	// Manages the set of databases & compaction levels.
 	Store *litestream.Store
 
@@ -195,18 +198,38 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	var dbs []*litestream.DB
+	var registeredDBs []*litestream.DB
 	var watchables []struct {
 		config *DBConfig
 		dbs    []*litestream.DB
 	}
+
+	shouldAutoStart := func(dbConfig *DBConfig) bool {
+		autoReplicate := true
+		if dbConfig.AutoReplicate != nil {
+			autoReplicate = *dbConfig.AutoReplicate
+		}
+		enabled := true
+		if dbConfig.Enabled != nil {
+			enabled = *dbConfig.Enabled
+		}
+		return autoReplicate && enabled
+	}
+
 	for _, dbConfig := range c.Config.DBs {
-		// Handle directory configuration
 		if dbConfig.Dir != "" {
 			dirDbs, err := NewDBsFromDirectoryConfig(dbConfig)
 			if err != nil {
 				return err
 			}
-			dbs = append(dbs, dirDbs...)
+
+			if shouldAutoStart(dbConfig) {
+				dbs = append(dbs, dirDbs...)
+			} else {
+				registeredDBs = append(registeredDBs, dirDbs...)
+				slog.Info("databases registered but not auto-started", "dir", dbConfig.Dir, "count", len(dirDbs))
+			}
+
 			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs), "watch", dbConfig.Watch)
 			if dbConfig.Watch {
 				watchables = append(watchables, struct {
@@ -214,13 +237,19 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 					dbs    []*litestream.DB
 				}{config: dbConfig, dbs: dirDbs})
 			}
-		} else {
-			// Handle single database configuration
-			db, err := NewDBFromConfig(dbConfig)
-			if err != nil {
-				return err
-			}
+			continue
+		}
+
+		db, err := NewDBFromConfig(dbConfig)
+		if err != nil {
+			return err
+		}
+
+		if shouldAutoStart(dbConfig) {
 			dbs = append(dbs, db)
+		} else {
+			registeredDBs = append(registeredDBs, db)
+			slog.Info("database registered but not auto-started", "path", dbConfig.Path)
 		}
 	}
 
@@ -272,6 +301,18 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
+	// Register databases that won't be auto-started (auto-replicate=false or enabled=false)
+	// These can be started later via IPC commands.
+	for _, db := range registeredDBs {
+		db.L0Retention = c.Store.L0Retention
+		db.ShutdownSyncTimeout = c.Store.ShutdownSyncTimeout
+		db.ShutdownSyncInterval = c.Store.ShutdownSyncInterval
+
+		if err := c.Store.RegisterDB(db); err != nil {
+			return fmt.Errorf("register database: %w", err)
+		}
+	}
+
 	for _, entry := range watchables {
 		monitor, err := NewDirectoryMonitor(ctx, c.Store, entry.config, entry.dbs)
 		if err != nil {
@@ -311,8 +352,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 	}
 
-	// Serve metrics over HTTP if enabled.
+	// Create shared HTTP mux for metrics and control API
+	var httpMux *http.ServeMux
 	if c.Config.Addr != "" {
+		httpMux = http.NewServeMux()
+		httpMux.Handle("/metrics", promhttp.Handler())
+
 		hostport := c.Config.Addr
 		if host, port, _ := net.SplitHostPort(c.Config.Addr); port == "" {
 			return fmt.Errorf("must specify port for bind address: %q", c.Config.Addr)
@@ -322,11 +367,18 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 		slog.Info("serving metrics on", "url", fmt.Sprintf("http://%s/metrics", hostport))
 		go func() {
-			http.Handle("/metrics", promhttp.Handler())
-			if err := http.ListenAndServe(c.Config.Addr, nil); err != nil {
+			if err := http.ListenAndServe(c.Config.Addr, httpMux); err != nil {
 				slog.Error("cannot start metrics server", "error", err)
 			}
 		}()
+	}
+
+	// Start control server if socket is configured
+	if c.Config.Socket != "" {
+		c.Control = NewControlServer(c.Store, &c.Config, c.Config.ConfigPath, c.Config.Socket, c.Config.SocketPermissions, httpMux)
+		if err := c.Control.Start(); err != nil {
+			slog.Warn("failed to start control server", "error", err)
+		}
 	}
 
 	// Parse exec commands args & start subprocess.
@@ -401,6 +453,12 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		monitor.Close()
 	}
 	c.directoryMonitors = nil
+
+	if c.Control != nil {
+		if err := c.Control.Close(); err != nil {
+			slog.Error("error closing control server", "error", err)
+		}
+	}
 
 	if c.Store != nil {
 		if err := c.Store.Close(ctx); err != nil {
