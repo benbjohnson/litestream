@@ -408,7 +408,8 @@ func (db *DB) Open() (err error) {
 		db.mu.Unlock()
 		return nil // already open
 	}
-	db.opened = true
+	// Recreate context for fresh start (handles reopen after close)
+	db.ctx, db.cancel = context.WithCancel(context.Background())
 	db.mu.Unlock()
 
 	// Validate fields on database.
@@ -426,6 +427,11 @@ func (db *DB) Open() (err error) {
 		db.wg.Add(1)
 		go func() { defer db.wg.Done(); db.monitor() }()
 	}
+
+	// Mark as opened only after successful initialization
+	db.mu.Lock()
+	db.opened = true
+	db.mu.Unlock()
 
 	return nil
 }

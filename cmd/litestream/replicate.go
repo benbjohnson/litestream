@@ -41,8 +41,8 @@ type ReplicateCommand struct {
 	// MCP server
 	MCP *MCPServer
 
-	// Control server for IPC commands.
-	Control *Server
+	// Server for IPC control commands.
+	Server *litestream.Server
 
 	// Manages the set of databases & compaction levels.
 	Store *litestream.Store
@@ -275,10 +275,13 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
-	// Start control server if socket is configured
-	if c.Config.Socket.Path != "" {
-		c.Control = NewServer(c.Store, c.Config.Socket.Path, c.Config.Socket.Permissions)
-		if err := c.Control.Start(); err != nil {
+	// Start control server if socket is enabled
+	if c.Config.Socket.Enabled {
+		c.Server = litestream.NewServer(c.Store)
+		c.Server.SocketPath = c.Config.Socket.Path
+		c.Server.SocketPerms = c.Config.Socket.Permissions
+		c.Server.PathExpander = expand
+		if err := c.Server.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
 		}
 	}
@@ -413,8 +416,8 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	}
 	c.directoryMonitors = nil
 
-	if c.Control != nil {
-		if err := c.Control.Close(); err != nil {
+	if c.Server != nil {
+		if err := c.Server.Close(); err != nil {
 			slog.Error("error closing control server", "error", err)
 		}
 	}

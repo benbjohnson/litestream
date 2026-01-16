@@ -277,23 +277,6 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 	return nil
 }
 
-// RegisterDB registers a database without opening it.
-// The database can be started later via EnableDB.
-func (s *Store) RegisterDB(db *DB) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	// Check for duplicate path
-	for _, existing := range s.dbs {
-		if existing.Path() == db.Path() {
-			return fmt.Errorf("database already registered: %s", db.Path())
-		}
-	}
-
-	s.dbs = append(s.dbs, db)
-	return nil
-}
-
 // EnableDB starts replication for a registered database.
 func (s *Store) EnableDB(ctx context.Context, path string) error {
 	db := s.FindDB(path)
@@ -405,6 +388,9 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		var notReadyDBs []string
 
 		for _, db := range s.DBs() {
+			if !db.IsOpen() {
+				continue // skip disabled DBs
+			}
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
@@ -464,6 +450,9 @@ LOOP:
 		}
 
 		for _, db := range s.DBs() {
+			if !db.IsOpen() {
+				continue // skip disabled DBs
+			}
 			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					continue
@@ -562,20 +551,25 @@ func (s *Store) sendHeartbeatIfNeeded(ctx context.Context) {
 }
 
 // allDatabasesHealthy returns true if all databases have synced successfully
-// since the given time. Returns false if there are no databases.
+// since the given time. Returns false if there are no databases or no enabled databases.
 func (s *Store) allDatabasesHealthy(since time.Time) bool {
 	dbs := s.DBs()
 	if len(dbs) == 0 {
 		return false
 	}
 
+	enabledCount := 0
 	for _, db := range dbs {
+		if !db.IsOpen() {
+			continue // skip disabled DBs
+		}
+		enabledCount++
 		lastSync := db.LastSuccessfulSyncAt()
 		if lastSync.IsZero() || lastSync.Before(since) {
 			return false
 		}
 	}
-	return true
+	return enabledCount > 0
 }
 
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.

@@ -1,4 +1,4 @@
-package main
+package litestream
 
 import (
 	"context"
@@ -10,15 +10,38 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	"github.com/benbjohnson/litestream"
 )
+
+// SocketConfig configures the Unix socket for control commands.
+type SocketConfig struct {
+	Enabled     bool   `yaml:"enabled"`
+	Path        string `yaml:"path"`
+	Permissions uint32 `yaml:"permissions"`
+}
+
+// DefaultSocketConfig returns the default socket configuration.
+func DefaultSocketConfig() SocketConfig {
+	return SocketConfig{
+		Enabled:     false,
+		Path:        "/var/run/litestream.sock",
+		Permissions: 0600,
+	}
+}
 
 // Server manages runtime control via Unix socket using HTTP.
 type Server struct {
-	store          *litestream.Store
-	socketPath     string
-	socketPerms    uint32
+	store *Store
+
+	// SocketPath is the path to the Unix socket.
+	SocketPath string
+
+	// SocketPerms is the file permissions for the socket.
+	SocketPerms uint32
+
+	// PathExpander optionally expands paths (e.g., ~ expansion).
+	// If nil, paths are used as-is.
+	PathExpander func(string) (string, error)
+
 	socketListener net.Listener
 	httpServer     *http.Server
 
@@ -30,20 +53,19 @@ type Server struct {
 }
 
 // NewServer creates a new Server instance.
-func NewServer(store *litestream.Store, socketPath string, socketPerms uint32) *Server {
+func NewServer(store *Store) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
 		store:       store,
-		socketPath:  socketPath,
-		socketPerms: socketPerms,
+		SocketPerms: 0600,
 		ctx:         ctx,
 		cancel:      cancel,
 		logger:      slog.Default(),
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/start", s.handleStart)
-	mux.HandleFunc("/stop", s.handleStop)
+	mux.HandleFunc("POST /start", s.handleStart)
+	mux.HandleFunc("POST /stop", s.handleStop)
 
 	s.httpServer = &http.Server{Handler: mux}
 
@@ -52,22 +74,35 @@ func NewServer(store *litestream.Store, socketPath string, socketPerms uint32) *
 
 // Start begins listening for control connections.
 func (s *Server) Start() error {
-	if err := os.RemoveAll(s.socketPath); err != nil {
-		return fmt.Errorf("remove existing socket: %w", err)
+	if s.SocketPath == "" {
+		return fmt.Errorf("socket path required")
 	}
 
-	listener, err := net.Listen("unix", s.socketPath)
+	// Check if socket file exists and is actually a socket before removing
+	if info, err := os.Lstat(s.SocketPath); err == nil {
+		if info.Mode()&os.ModeSocket != 0 {
+			if err := os.Remove(s.SocketPath); err != nil {
+				return fmt.Errorf("remove existing socket: %w", err)
+			}
+		} else {
+			return fmt.Errorf("socket path exists but is not a socket: %s", s.SocketPath)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("check socket path: %w", err)
+	}
+
+	listener, err := net.Listen("unix", s.SocketPath)
 	if err != nil {
 		return fmt.Errorf("listen on unix socket: %w", err)
 	}
 	s.socketListener = listener
 
-	if err := os.Chmod(s.socketPath, os.FileMode(s.socketPerms)); err != nil {
+	if err := os.Chmod(s.SocketPath, os.FileMode(s.SocketPerms)); err != nil {
 		listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
-	s.logger.Info("control socket listening", "path", s.socketPath)
+	s.logger.Info("control socket listening", "path", s.SocketPath)
 
 	s.wg.Add(1)
 	go func() {
@@ -96,12 +131,15 @@ func (s *Server) Close() error {
 	return nil
 }
 
-func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
+// expandPath expands the path using PathExpander if set.
+func (s *Server) expandPath(path string) (string, error) {
+	if s.PathExpander != nil {
+		return s.PathExpander(path)
 	}
+	return path, nil
+}
 
+func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	var req StartRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
@@ -113,7 +151,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expandedPath, err := expand(req.Path)
+	expandedPath, err := s.expandPath(req.Path)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
 		return
@@ -138,11 +176,6 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	var req StopRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
@@ -154,7 +187,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	expandedPath, err := expand(req.Path)
+	expandedPath, err := s.expandPath(req.Path)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
 		return
@@ -191,4 +224,34 @@ func writeJSONError(w http.ResponseWriter, status int, message string, details i
 		Error:   message,
 		Details: details,
 	})
+}
+
+// StartRequest is the request body for the /start endpoint.
+type StartRequest struct {
+	Path    string `json:"path"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// StartResponse is the response body for the /start endpoint.
+type StartResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+}
+
+// StopRequest is the request body for the /stop endpoint.
+type StopRequest struct {
+	Path    string `json:"path"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// StopResponse is the response body for the /stop endpoint.
+type StopResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+}
+
+// ErrorResponse is returned when an error occurs.
+type ErrorResponse struct {
+	Error   string      `json:"error"`
+	Details interface{} `json:"details,omitempty"`
 }

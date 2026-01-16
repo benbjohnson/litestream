@@ -9,6 +9,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"time"
+
+	"github.com/benbjohnson/litestream"
 )
 
 // StopCommand represents the command to stop replication for a database.
@@ -18,15 +21,12 @@ type StopCommand struct{}
 func (c *StopCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-stop", flag.ContinueOnError)
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
-	socketPath := fs.String("socket", "", "control socket path (required)")
+	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	if *socketPath == "" {
-		return fmt.Errorf("socket path required; use -socket flag")
-	}
 	if fs.NArg() == 0 {
 		return fmt.Errorf("database path required")
 	}
@@ -36,16 +36,18 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 
 	dbPath := fs.Arg(0)
 
-	// Create HTTP client that connects via Unix socket
+	// Create HTTP client that connects via Unix socket with timeout
+	clientTimeout := time.Duration(*timeout) * time.Second
 	client := &http.Client{
+		Timeout: clientTimeout,
 		Transport: &http.Transport{
 			DialContext: func(_ context.Context, _, _ string) (net.Conn, error) {
-				return net.Dial("unix", *socketPath)
+				return net.DialTimeout("unix", *socketPath, clientTimeout)
 			},
 		},
 	}
 
-	req := StopRequest{
+	req := litestream.StopRequest{
 		Path:    dbPath,
 		Timeout: *timeout,
 	}
@@ -66,19 +68,22 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		var errResp ErrorResponse
+		var errResp litestream.ErrorResponse
 		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != "" {
 			return fmt.Errorf("stop failed: %s", errResp.Error)
 		}
 		return fmt.Errorf("stop failed: %s", string(body))
 	}
 
-	var result StopResponse
+	var result litestream.StopResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, _ := json.MarshalIndent(result, "", "  ")
+	output, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to format response: %w", err)
+	}
 	fmt.Println(string(output))
 
 	return nil
@@ -97,6 +102,6 @@ Options:
       Maximum time to wait in seconds (default: 30).
 
   -socket PATH
-      Path to control socket (required).
+      Path to control socket (default: /var/run/litestream.sock).
 `[1:])
 }

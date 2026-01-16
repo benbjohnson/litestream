@@ -209,12 +209,6 @@ The commands are:
 `[1:])
 }
 
-// SocketConfig configures the Unix socket for control commands.
-type SocketConfig struct {
-	Path        string `yaml:"path"`
-	Permissions uint32 `yaml:"permissions"`
-}
-
 // Config represents a configuration file for the litestream daemon.
 type Config struct {
 	// Global replica settings that serve as defaults for all replicas
@@ -224,7 +218,7 @@ type Config struct {
 	Addr string `yaml:"addr"`
 
 	// Socket configuration for control commands.
-	Socket SocketConfig `yaml:"socket"`
+	Socket litestream.SocketConfig `yaml:"socket"`
 
 	// List of stages in a multi-level compaction.
 	// Only includes L1 through the last non-snapshot level.
@@ -307,10 +301,7 @@ func DefaultConfig() Config {
 			Interval:  &defaultSnapshotInterval,
 			Retention: &defaultSnapshotRetention,
 		},
-		Socket: SocketConfig{
-			Path:        "", // Empty = disabled (opt-in)
-			Permissions: 0600,
-		},
+		Socket:                   litestream.DefaultSocketConfig(),
 		L0Retention:              &defaultL0Retention,
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
 		ShutdownSyncTimeout:      &defaultShutdownSyncTimeout,
