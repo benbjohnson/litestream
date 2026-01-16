@@ -277,6 +277,72 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 	return nil
 }
 
+// RegisterDB registers a database without opening it.
+// The database can be started later via EnableDB.
+func (s *Store) RegisterDB(db *DB) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Check for duplicate path
+	for _, existing := range s.dbs {
+		if existing.Path() == db.Path() {
+			return fmt.Errorf("database already registered: %s", db.Path())
+		}
+	}
+
+	s.dbs = append(s.dbs, db)
+	return nil
+}
+
+// EnableDB starts replication for a registered database.
+func (s *Store) EnableDB(ctx context.Context, path string) error {
+	db := s.FindDB(path)
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if db.IsOpen() {
+		return fmt.Errorf("database already enabled: %s", path)
+	}
+
+	if err := db.Open(); err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	return nil
+}
+
+// DisableDB stops replication for a database.
+func (s *Store) DisableDB(ctx context.Context, path string) error {
+	db := s.FindDB(path)
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if !db.IsOpen() {
+		return fmt.Errorf("database already disabled: %s", path)
+	}
+
+	if err := db.Close(ctx); err != nil {
+		return fmt.Errorf("close database: %w", err)
+	}
+
+	return nil
+}
+
+// FindDB returns the database with the given path.
+func (s *Store) FindDB(path string) *DB {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, db := range s.dbs {
+		if db.Path() == path {
+			return db
+		}
+	}
+	return nil
+}
+
 // SetL0Retention updates the retention window for L0 files and propagates it to
 // all managed databases.
 func (s *Store) SetL0Retention(d time.Duration) {

@@ -159,6 +159,10 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		slog.Info("litestream shut down")
 		return err
 
+	case "start":
+		return (&StartCommand{}).Run(ctx, args)
+	case "stop":
+		return (&StopCommand{}).Run(ctx, args)
 	case "reset":
 		return (&ResetCommand{}).Run(ctx, args)
 	case "restore":
@@ -198,9 +202,17 @@ The commands are:
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
 	restore      recovers database backup from a replica
+	start        start replication for a database
 	status       display replication status for databases
+	stop         stop replication for a database
 	version      prints the binary version
 `[1:])
+}
+
+// SocketConfig configures the Unix socket for control commands.
+type SocketConfig struct {
+	Path        string `yaml:"path"`
+	Permissions uint32 `yaml:"permissions"`
 }
 
 // Config represents a configuration file for the litestream daemon.
@@ -210,6 +222,9 @@ type Config struct {
 
 	// Bind address for serving metrics.
 	Addr string `yaml:"addr"`
+
+	// Socket configuration for control commands.
+	Socket SocketConfig `yaml:"socket"`
 
 	// List of stages in a multi-level compaction.
 	// Only includes L1 through the last non-snapshot level.
@@ -291,6 +306,10 @@ func DefaultConfig() Config {
 		Snapshot: SnapshotConfig{
 			Interval:  &defaultSnapshotInterval,
 			Retention: &defaultSnapshotRetention,
+		},
+		Socket: SocketConfig{
+			Path:        "", // Empty = disabled (opt-in)
+			Permissions: 0600,
 		},
 		L0Retention:              &defaultL0Retention,
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,

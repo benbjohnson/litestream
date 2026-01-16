@@ -71,6 +71,7 @@ type DB struct {
 	pageSize int           // page size, in bytes
 	notify   chan struct{} // closes on WAL change
 	chkMu    sync.RWMutex  // checkpoint lock
+	opened   bool          // true if Open() was called and Close() not yet called
 
 	// syncedSinceCheckpoint tracks whether any data has been synced since
 	// the last checkpoint. Used to prevent time-based checkpoints from
@@ -231,6 +232,13 @@ func (db *DB) SQLDB() *sql.DB {
 // Path returns the path to the database.
 func (db *DB) Path() string {
 	return db.path
+}
+
+// IsOpen returns true if the database has been opened.
+func (db *DB) IsOpen() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.opened
 }
 
 // WALPath returns the path to the database's WAL file.
@@ -395,6 +403,14 @@ func (db *DB) LastSuccessfulSyncAt() time.Time {
 
 // Open initializes the background monitoring goroutine.
 func (db *DB) Open() (err error) {
+	db.mu.Lock()
+	if db.opened {
+		db.mu.Unlock()
+		return nil // already open
+	}
+	db.opened = true
+	db.mu.Unlock()
+
 	// Validate fields on database.
 	if db.MinCheckpointPageN <= 0 {
 		return fmt.Errorf("minimum checkpoint page count required")
@@ -455,6 +471,10 @@ func (db *DB) Close(ctx context.Context) (err error) {
 			err = e
 		}
 	}
+
+	db.mu.Lock()
+	db.opened = false
+	db.mu.Unlock()
 
 	return err
 }
