@@ -278,6 +278,8 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 }
 
 // EnableDB starts replication for a registered database.
+// The context is checked for cancellation before opening.
+// Note: db.Open() itself does not support cancellation.
 func (s *Store) EnableDB(ctx context.Context, path string) error {
 	db := s.FindDB(path)
 	if db == nil {
@@ -286,6 +288,11 @@ func (s *Store) EnableDB(ctx context.Context, path string) error {
 
 	if db.IsOpen() {
 		return fmt.Errorf("database already enabled: %s", path)
+	}
+
+	// Check for cancellation before starting open
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("enable database: %w", err)
 	}
 
 	if err := db.Open(); err != nil {

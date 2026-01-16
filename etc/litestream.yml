@@ -2,6 +2,12 @@
 # access-key-id:     AKIAxxxxxxxxxxxxxxxx
 # secret-access-key: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx/xxxxxxxxx
 
+# Control socket for runtime start/stop commands
+# socket:
+#   enabled: true                          # Enable control socket (default: false)
+#   path: /var/run/litestream.sock         # Socket path (default: /var/run/litestream.sock)
+#   permissions: 0600                      # Socket file permissions (default: 0600)
+
 # dbs:
 #  - path: /path/to/primary/db            # Database to replicate from
 #    replica:

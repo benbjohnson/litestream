@@ -470,16 +470,19 @@ func (db *DB) Close(ctx context.Context) (err error) {
 		if e := db.db.Close(); e != nil && err == nil {
 			err = e
 		}
+		db.db = nil
 	}
 
 	if db.f != nil {
 		if e := db.f.Close(); e != nil && err == nil {
 			err = e
 		}
+		db.f = nil
 	}
 
 	db.mu.Lock()
 	db.opened = false
+	db.rtx = nil
 	db.mu.Unlock()
 
 	return err
