@@ -28,7 +28,7 @@ jobs:
       - uses: pre-commit/action@v3.0.0
 
   vfs-build-test:
-    name: VFS Build Test (macOS)
+    name: VFS Build & Load Test (macOS)
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -43,8 +43,26 @@ jobs:
       - name: Verify shared library created
         run: file dist/litestream-vfs.so
 
+      - name: Test extension loading (no segfault)
+        run: |
+          # Verify extension loads without segfault (will error on missing env var, that's OK)
+          output=$(sqlite3 ':memory:' ".load dist/litestream-vfs.so sqlite3_litestreamvfs_init" 2>&1) || true
+          echo "Output: $output"
+          # Check for segfault
+          if echo "$output" | grep -qi "segmentation fault\|signal.*segv\|bus error"; then
+            echo "ERROR: Extension loading caused a crash!"
+            exit 1
+          fi
+          # Expected: error about missing LITESTREAM_REPLICA_URL
+          if echo "$output" | grep -q "LITESTREAM_REPLICA_URL"; then
+            echo "SUCCESS: Extension loaded correctly (expected env var error)"
+          fi
+
+      - name: Run VFS load integration tests
+        run: go test -v -tags=vfs -run 'TestVFS_Load' ./cmd/litestream-vfs
+
   vfs-build-test-linux:
-    name: VFS Build Test (Linux)
+    name: VFS Build & Load Test (Linux)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +76,66 @@ jobs:
 
       - name: Verify shared library created
         run: file dist/litestream-vfs-linux-amd64.so
+
+      - name: Test extension loading (no segfault)
+        run: |
+          # Verify extension loads without segfault (will error on missing env var, that's OK)
+          output=$(sqlite3 ':memory:' ".load dist/litestream-vfs-linux-amd64.so sqlite3_litestreamvfs_init" 2>&1) || true
+          echo "Output: $output"
+          # Check for segfault
+          if echo "$output" | grep -qi "segmentation fault\|signal.*segv\|bus error"; then
+            echo "ERROR: Extension loading caused a crash!"
+            exit 1
+          fi
+          # Expected: error about missing LITESTREAM_REPLICA_URL
+          if echo "$output" | grep -q "LITESTREAM_REPLICA_URL"; then
+            echo "SUCCESS: Extension loaded correctly (expected env var error)"
+          fi
+
+      - name: Run VFS load integration tests
+        run: go test -v -tags=vfs -run 'TestVFS_Load' ./cmd/litestream-vfs
+
+  vfs-build-test-linux-arm64:
+    name: VFS Build & Load Test (Linux ARM64)
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build VFS Linux ARM64 (native)
+        run: |
+          # On native ARM64 runner, build without cross-compilation
+          mkdir -p dist
+          go build -tags vfs,SQLITE3VFS_LOADABLE_EXT -o dist/litestream-vfs-linux-arm64.a -buildmode=c-archive ./cmd/litestream-vfs
+          cp dist/litestream-vfs-linux-arm64.h src/litestream-vfs.h
+          gcc -DSQLITE3VFS_LOADABLE_EXT -g -fPIC -shared -o dist/litestream-vfs-linux-arm64.so \
+            src/litestream-vfs.c dist/litestream-vfs-linux-arm64.a -lpthread -ldl -lm
+
+      - name: Verify shared library created
+        run: file dist/litestream-vfs-linux-arm64.so
+
+      - name: Test extension loading (no segfault)
+        run: |
+          # This test specifically catches the ARM64 segfault issue caused by
+          # uninitialized sqlite3_api pointers in loadable extensions.
+          output=$(sqlite3 ':memory:' ".load dist/litestream-vfs-linux-arm64.so sqlite3_litestreamvfs_init" 2>&1) || true
+          echo "Output: $output"
+          # Check for segfault - this was the original bug on ARM64
+          if echo "$output" | grep -qi "segmentation fault\|signal.*segv\|bus error"; then
+            echo "ERROR: Extension loading caused a crash on ARM64!"
+            echo "This indicates the sqlite3_api pointer fix may have regressed."
+            exit 1
+          fi
+          # Expected: error about missing LITESTREAM_REPLICA_URL
+          if echo "$output" | grep -q "LITESTREAM_REPLICA_URL"; then
+            echo "SUCCESS: Extension loaded correctly on ARM64 (expected env var error)"
+          fi
+
+      - name: Run VFS load integration tests
+        run: go test -v -tags=vfs -run 'TestVFS_Load' ./cmd/litestream-vfs
 
   build-windows:
     name: Build Windows

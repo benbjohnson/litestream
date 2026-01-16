@@ -5,8 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-/* sqlite3vfs already called SQLITE_EXTENSION_INIT1 */
-extern const sqlite3_api_routines *sqlite3_api;
+/* Define sqlite3_api here - sqlite3vfs uses extern to reference it */
+SQLITE_EXTENSION_INIT1
 
 /* Go function declarations */
 extern char* LitestreamVFSRegister(void);

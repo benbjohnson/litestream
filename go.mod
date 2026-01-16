@@ -134,3 +134,5 @@ require (
 	google.golang.org/protobuf v1.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/psanford/sqlite3vfs => github.com/benbjohnson/sqlite3vfs v0.0.0-20260116214726-237d70b78790
