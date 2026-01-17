@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestStatusCommand_Run(t *testing.T) {
@@ -97,6 +99,31 @@ func TestStatusCommand_Run(t *testing.T) {
 
 		cmd := &main.StatusCommand{}
 		err := cmd.Run(context.Background(), []string{"-config", configPath, dbPath})
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("SocketModeSuccess", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		cmd := &main.StatusCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, db.Path()})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}

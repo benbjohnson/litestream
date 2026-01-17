@@ -2,10 +2,25 @@ package main_test
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"sync/atomic"
 	"testing"
 
+	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
+
+var testSocketCounter uint64
+
+func testSocketPath(t *testing.T) string {
+	t.Helper()
+	n := atomic.AddUint64(&testSocketCounter, 1)
+	path := fmt.Sprintf("/tmp/ls-cmd-test-%d.sock", n)
+	t.Cleanup(func() { os.Remove(path) })
+	return path
+}
 
 func TestInfoCommand_Run(t *testing.T) {
 	t.Run("TooManyArguments", func(t *testing.T) {
@@ -32,6 +47,32 @@ func TestInfoCommand_Run(t *testing.T) {
 		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "-timeout", "1"})
 		if err == nil {
 			t.Error("expected error for socket connection failure")
+		}
+	})
+
+	t.Run("Success", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		server.Version = "v1.0.0-test"
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		cmd := &main.InfoCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath})
+		if err != nil {
+			t.Errorf("unexpected error: %v", err)
 		}
 	})
 }
