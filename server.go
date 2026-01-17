@@ -335,24 +335,54 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		PageSize: db.PageSize(),
 	}
 
+	// Determine replication status more accurately.
+	// "replicating" means DB is open AND has an active replica monitor.
+	// "open" means DB is open but replication is paused/disabled.
+	// "stopped" means DB is closed.
 	if db.IsOpen() {
-		resp.Status = "replicating"
+		if db.Replica != nil && db.Replica.MonitorEnabled {
+			resp.Status = "replicating"
+		} else {
+			resp.Status = "open"
+		}
 	} else {
 		resp.Status = "stopped"
 	}
 
-	if pos, err := db.Pos(); err == nil && pos.TXID > 0 {
-		resp.Position = &PositionInfo{
-			TXID:              pos.TXID.String(),
-			PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
+	// Get position from Replica if available (cached, faster).
+	// Fall back to db.Pos() which reads from disk.
+	var posErr error
+	if db.Replica != nil {
+		pos := db.Replica.Pos()
+		if pos.TXID > 0 {
+			resp.Position = &PositionInfo{
+				TXID:              pos.TXID.String(),
+				PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
+			}
 		}
+	}
+	// If no position from replica, try reading from disk.
+	if resp.Position == nil {
+		if pos, err := db.Pos(); err != nil {
+			posErr = err
+		} else if pos.TXID > 0 {
+			resp.Position = &PositionInfo{
+				TXID:              pos.TXID.String(),
+				PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
+			}
+		}
+	}
+
+	// Surface any position errors.
+	if posErr != nil {
+		resp.Error = fmt.Sprintf("failed to read position: %v", posErr)
 	}
 
 	if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
 		resp.LastSyncAt = &t
 	}
 
-	if db.Replica != nil {
+	if db.Replica != nil && db.Replica.Client != nil {
 		resp.Replicas = append(resp.Replicas, ReplicaInfo{
 			Name: db.Replica.Client.Type(),
 			Type: db.Replica.Client.Type(),
@@ -369,9 +399,15 @@ func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
 	}
 
 	for _, db := range dbs {
-		status := "stopped"
+		var status string
 		if db.IsOpen() {
-			status = "replicating"
+			if db.Replica != nil && db.Replica.MonitorEnabled {
+				status = "replicating"
+			} else {
+				status = "open"
+			}
+		} else {
+			status = "stopped"
 		}
 		resp.Databases = append(resp.Databases, DatabaseSummary{
 			Path:   db.Path(),
@@ -402,6 +438,7 @@ type StatusResponse struct {
 	PageSize   int           `json:"page_size,omitempty"`
 	LastSyncAt *time.Time    `json:"last_sync_at,omitempty"`
 	Replicas   []ReplicaInfo `json:"replicas,omitempty"`
+	Error      string        `json:"error,omitempty"`
 }
 
 // PositionInfo contains replication position information.
