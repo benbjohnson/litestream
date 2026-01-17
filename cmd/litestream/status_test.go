@@ -18,6 +18,36 @@ func TestStatusCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("SocketModeRequiresPath", func(t *testing.T) {
+		cmd := &main.StatusCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock"})
+		if err == nil {
+			t.Error("expected error for missing database path")
+		}
+		if err.Error() != "database path required when using -socket" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("SocketModeTooManyArgs", func(t *testing.T) {
+		cmd := &main.StatusCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "/db1", "/db2"})
+		if err == nil {
+			t.Error("expected error for too many arguments")
+		}
+		if err.Error() != "too many arguments" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("SocketModeConnectionError", func(t *testing.T) {
+		cmd := &main.StatusCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "/path/to/db"})
+		if err == nil {
+			t.Error("expected error for socket connection failure")
+		}
+	})
+
 	t.Run("WithConfig", func(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "test.db")
