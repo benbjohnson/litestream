@@ -43,6 +43,12 @@ type Server struct {
 	// If nil, paths are used as-is.
 	PathExpander func(string) (string, error)
 
+	// Version is the version string to report in /info.
+	Version string
+
+	// startedAt is set when the server starts.
+	startedAt time.Time
+
 	socketListener net.Listener
 	httpServer     *http.Server
 
@@ -68,6 +74,9 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
+	mux.HandleFunc("GET /status", s.handleStatus)
+	mux.HandleFunc("GET /list", s.handleList)
+	mux.HandleFunc("GET /info", s.handleInfo)
 
 	// pprof endpoints
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -86,6 +95,8 @@ func (s *Server) Start() error {
 	if s.SocketPath == "" {
 		return fmt.Errorf("socket path required")
 	}
+
+	s.startedAt = time.Now()
 
 	// Check if socket file exists and is actually a socket before removing
 	if info, err := os.Lstat(s.SocketPath); err == nil {
@@ -298,4 +309,130 @@ type ErrorResponse struct {
 // TXIDResponse is the response body for the /txid endpoint.
 type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
+}
+
+func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("database not found: %s", expandedPath), nil)
+		return
+	}
+
+	resp := StatusResponse{
+		Path:     db.Path(),
+		PageSize: db.PageSize(),
+	}
+
+	if db.IsOpen() {
+		resp.Status = "replicating"
+	} else {
+		resp.Status = "stopped"
+	}
+
+	if pos, err := db.Pos(); err == nil && pos.TXID > 0 {
+		resp.Position = &PositionInfo{
+			TXID:              pos.TXID.String(),
+			PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
+		}
+	}
+
+	if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
+		resp.LastSyncAt = &t
+	}
+
+	if db.Replica != nil {
+		resp.Replicas = append(resp.Replicas, ReplicaInfo{
+			Name: db.Replica.Client.Type(),
+			Type: db.Replica.Client.Type(),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
+	dbs := s.store.DBs()
+	resp := ListResponse{
+		Databases: make([]DatabaseSummary, 0, len(dbs)),
+	}
+
+	for _, db := range dbs {
+		status := "stopped"
+		if db.IsOpen() {
+			status = "replicating"
+		}
+		resp.Databases = append(resp.Databases, DatabaseSummary{
+			Path:   db.Path(),
+			Status: status,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
+	resp := InfoResponse{
+		Version:       s.Version,
+		PID:           os.Getpid(),
+		StartedAt:     s.startedAt,
+		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
+		DatabaseCount: len(s.store.DBs()),
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// StatusResponse is the response body for the /status endpoint.
+type StatusResponse struct {
+	Path       string        `json:"path"`
+	Status     string        `json:"status"`
+	Position   *PositionInfo `json:"position,omitempty"`
+	PageSize   int           `json:"page_size,omitempty"`
+	LastSyncAt *time.Time    `json:"last_sync_at,omitempty"`
+	Replicas   []ReplicaInfo `json:"replicas,omitempty"`
+}
+
+// PositionInfo contains replication position information.
+type PositionInfo struct {
+	TXID              string `json:"txid"`
+	PostApplyChecksum string `json:"post_apply_checksum"`
+}
+
+// ReplicaInfo contains information about a replica.
+type ReplicaInfo struct {
+	Name       string `json:"name"`
+	Type       string `json:"type"`
+	Generation string `json:"generation,omitempty"`
+}
+
+// ListResponse is the response body for the /list endpoint.
+type ListResponse struct {
+	Databases []DatabaseSummary `json:"databases"`
+}
+
+// DatabaseSummary contains summary information about a database.
+type DatabaseSummary struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+}
+
+// InfoResponse is the response body for the /info endpoint.
+type InfoResponse struct {
+	Version       string    `json:"version"`
+	PID           int       `json:"pid"`
+	UptimeSeconds int64     `json:"uptime_seconds"`
+	StartedAt     time.Time `json:"started_at"`
+	DatabaseCount int       `json:"database_count"`
 }

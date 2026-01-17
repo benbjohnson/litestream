@@ -170,6 +170,10 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "status":
 		return (&StatusCommand{}).Run(ctx, args)
+	case "list":
+		return (&ListCommand{}).Run(ctx, args)
+	case "info":
+		return (&InfoCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	case "ltx":
@@ -199,6 +203,8 @@ Usage:
 The commands are:
 
 	databases    list databases specified in config file
+	info         show daemon information
+	list         list all managed databases
 	ltx          list available LTX files for a database
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
