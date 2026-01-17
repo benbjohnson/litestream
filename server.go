@@ -349,33 +349,16 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		resp.Status = "stopped"
 	}
 
-	// Get position from Replica if available (cached, faster).
-	// Fall back to db.Pos() which reads from disk.
-	var posErr error
-	if db.Replica != nil {
-		pos := db.Replica.Pos()
-		if pos.TXID > 0 {
-			resp.Position = &PositionInfo{
-				TXID:              pos.TXID.String(),
-				PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
-			}
+	// Get position from db.Pos() which reads the full position from disk,
+	// including both TXID and checksum. We don't use Replica.Pos() here
+	// because it only caches TXID, not the checksum.
+	if pos, err := db.Pos(); err != nil {
+		resp.Error = fmt.Sprintf("failed to read position: %v", err)
+	} else if pos.TXID > 0 {
+		resp.Position = &PositionInfo{
+			TXID:              pos.TXID.String(),
+			PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
 		}
-	}
-	// If no position from replica, try reading from disk.
-	if resp.Position == nil {
-		if pos, err := db.Pos(); err != nil {
-			posErr = err
-		} else if pos.TXID > 0 {
-			resp.Position = &PositionInfo{
-				TXID:              pos.TXID.String(),
-				PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
-			}
-		}
-	}
-
-	// Surface any position errors.
-	if posErr != nil {
-		resp.Error = fmt.Sprintf("failed to read position: %v", posErr)
 	}
 
 	if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
