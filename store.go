@@ -277,6 +277,62 @@ func (s *Store) RemoveDB(ctx context.Context, path string) error {
 	return nil
 }
 
+// EnableDB starts replication for a registered database.
+// The context is checked for cancellation before opening.
+// Note: db.Open() itself does not support cancellation.
+func (s *Store) EnableDB(ctx context.Context, path string) error {
+	db := s.FindDB(path)
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if db.IsOpen() {
+		return fmt.Errorf("database already enabled: %s", path)
+	}
+
+	// Check for cancellation before starting open
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("enable database: %w", err)
+	}
+
+	if err := db.Open(); err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+
+	return nil
+}
+
+// DisableDB stops replication for a database.
+func (s *Store) DisableDB(ctx context.Context, path string) error {
+	db := s.FindDB(path)
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if !db.IsOpen() {
+		return fmt.Errorf("database already disabled: %s", path)
+	}
+
+	if err := db.Close(ctx); err != nil {
+		return fmt.Errorf("close database: %w", err)
+	}
+
+	return nil
+}
+
+// FindDB returns the database with the given path.
+func (s *Store) FindDB(path string) *DB {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, db := range s.dbs {
+		if db.Path() == path {
+			return db
+		}
+	}
+	return nil
+}
+
 // SetL0Retention updates the retention window for L0 files and propagates it to
 // all managed databases.
 func (s *Store) SetL0Retention(d time.Duration) {
@@ -339,6 +395,9 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		var notReadyDBs []string
 
 		for _, db := range s.DBs() {
+			if !db.IsOpen() {
+				continue // skip disabled DBs
+			}
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
@@ -398,6 +457,9 @@ LOOP:
 		}
 
 		for _, db := range s.DBs() {
+			if !db.IsOpen() {
+				continue // skip disabled DBs
+			}
 			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					continue
@@ -496,20 +558,25 @@ func (s *Store) sendHeartbeatIfNeeded(ctx context.Context) {
 }
 
 // allDatabasesHealthy returns true if all databases have synced successfully
-// since the given time. Returns false if there are no databases.
+// since the given time. Returns false if there are no databases or no enabled databases.
 func (s *Store) allDatabasesHealthy(since time.Time) bool {
 	dbs := s.DBs()
 	if len(dbs) == 0 {
 		return false
 	}
 
+	enabledCount := 0
 	for _, db := range dbs {
+		if !db.IsOpen() {
+			continue // skip disabled DBs
+		}
+		enabledCount++
 		lastSync := db.LastSuccessfulSyncAt()
 		if lastSync.IsZero() || lastSync.Before(since) {
 			return false
 		}
 	}
-	return true
+	return enabledCount > 0
 }
 
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
