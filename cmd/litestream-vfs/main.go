@@ -14,6 +14,7 @@ import "C"
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -64,7 +65,16 @@ func LitestreamVFSRegister() *C.char {
 	default:
 		level = slog.LevelInfo
 	}
-	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	var logOutput io.Writer = os.Stdout
+	if logFile := os.Getenv("LITESTREAM_LOG_FILE"); logFile != "" {
+		f, err := os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+		if err != nil {
+			return C.CString(fmt.Sprintf("failed to open log file: %s", err))
+		}
+		logOutput = f
+	}
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: level}))
 
 	vfs := litestream.NewVFS(client, logger)
 
