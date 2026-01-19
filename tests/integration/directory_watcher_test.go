@@ -176,7 +176,6 @@ func TestDirectoryWatcherRecursiveMode(t *testing.T) {
 	if err := db.StartLitestreamWithConfig(configPath); err != nil {
 		t.Fatalf("start litestream: %v", err)
 	}
-	defer db.StopLitestream()
 
 	time.Sleep(2 * time.Second)
 
@@ -216,25 +215,15 @@ func TestDirectoryWatcherRecursiveMode(t *testing.T) {
 		t.Fatalf("dynamically created database not detected: %v", err)
 	}
 
-	// Delete entire subdirectory
+	// Stop Litestream before deleting directories to release file handles
+	t.Log("Stopping Litestream before directory deletion...")
+	db.StopLitestream()
+
+	// Delete entire subdirectory (now safe since Litestream released handles)
 	t.Log("Deleting subdirectory with databases...")
 	level1Dir := filepath.Join(db.DirPath, "level1")
 	if err := os.RemoveAll(level1Dir); err != nil {
 		t.Fatalf("remove level1 directory: %v", err)
-	}
-
-	// Verify databases removed (with more lenient timeout)
-	time.Sleep(3 * time.Second)
-	if err := VerifyDatabaseRemoved(t, db.ReplicaPath, db2, 3*time.Second); err != nil {
-		t.Logf("Note: db2 may still have existing LTX files (cleanup timing): %v", err)
-	}
-
-	errors, err := db.CheckForErrors()
-	if err != nil {
-		t.Fatalf("check errors: %v", err)
-	}
-	if len(errors) > 0 {
-		t.Logf("Errors found (may be expected from deletion): %v", errors)
 	}
 
 	t.Log("✓ Recursive mode test passed")

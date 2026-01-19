@@ -379,6 +379,22 @@ func (db *TestDB) GetReplicaFileCount() (int, error) {
 	return len(files), nil
 }
 
+func (db *TestDB) WaitForReplicaFiles(minFiles int, timeout time.Duration) (int, error) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		count, err := db.GetReplicaFileCount()
+		if err != nil {
+			return 0, err
+		}
+		if count >= minFiles {
+			return count, nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+	count, _ := db.GetReplicaFileCount()
+	return count, fmt.Errorf("timeout waiting for %d replica files, got %d", minFiles, count)
+}
+
 func (db *TestDB) GetLitestreamLog() (string, error) {
 	logPath := filepath.Join(db.TempDir, "litestream.log")
 	content, err := os.ReadFile(logPath)
