@@ -74,7 +74,6 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
-	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 
@@ -311,70 +310,6 @@ type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
 }
 
-func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
-	path := r.URL.Query().Get("path")
-	if path == "" {
-		writeJSONError(w, http.StatusBadRequest, "path required", nil)
-		return
-	}
-
-	expandedPath, err := s.expandPath(path)
-	if err != nil {
-		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
-		return
-	}
-
-	db := s.store.FindDB(expandedPath)
-	if db == nil {
-		writeJSONError(w, http.StatusNotFound, fmt.Sprintf("database not found: %s", expandedPath), nil)
-		return
-	}
-
-	resp := StatusResponse{
-		Path:     db.Path(),
-		PageSize: db.PageSize(),
-	}
-
-	// Determine replication status more accurately.
-	// "replicating" means DB is open AND has an active replica monitor.
-	// "open" means DB is open but replication is paused/disabled.
-	// "stopped" means DB is closed.
-	if db.IsOpen() {
-		if db.Replica != nil && db.Replica.MonitorEnabled {
-			resp.Status = "replicating"
-		} else {
-			resp.Status = "open"
-		}
-	} else {
-		resp.Status = "stopped"
-	}
-
-	// Get position from db.Pos() which reads the full position from disk,
-	// including both TXID and checksum. We don't use Replica.Pos() here
-	// because it only caches TXID, not the checksum.
-	if pos, err := db.Pos(); err != nil {
-		resp.Error = fmt.Sprintf("failed to read position: %v", err)
-	} else if pos.TXID > 0 {
-		resp.Position = &PositionInfo{
-			TXID:              pos.TXID.String(),
-			PostApplyChecksum: fmt.Sprintf("%016x", pos.PostApplyChecksum),
-		}
-	}
-
-	if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
-		resp.LastSyncAt = &t
-	}
-
-	if db.Replica != nil && db.Replica.Client != nil {
-		resp.Replicas = append(resp.Replicas, ReplicaInfo{
-			Name: db.Replica.Client.Type(),
-			Type: db.Replica.Client.Type(),
-		})
-	}
-
-	writeJSON(w, http.StatusOK, resp)
-}
-
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
 	dbs := s.store.DBs()
 	resp := ListResponse{
@@ -392,10 +327,17 @@ func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
 		} else {
 			status = "stopped"
 		}
-		resp.Databases = append(resp.Databases, DatabaseSummary{
+
+		summary := DatabaseSummary{
 			Path:   db.Path(),
 			Status: status,
-		})
+		}
+
+		if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
+			summary.LastSyncAt = &t
+		}
+
+		resp.Databases = append(resp.Databases, summary)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -413,30 +355,6 @@ func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// StatusResponse is the response body for the /status endpoint.
-type StatusResponse struct {
-	Path       string        `json:"path"`
-	Status     string        `json:"status"`
-	Position   *PositionInfo `json:"position,omitempty"`
-	PageSize   int           `json:"page_size,omitempty"`
-	LastSyncAt *time.Time    `json:"last_sync_at,omitempty"`
-	Replicas   []ReplicaInfo `json:"replicas,omitempty"`
-	Error      string        `json:"error,omitempty"`
-}
-
-// PositionInfo contains replication position information.
-type PositionInfo struct {
-	TXID              string `json:"txid"`
-	PostApplyChecksum string `json:"post_apply_checksum"`
-}
-
-// ReplicaInfo contains information about a replica.
-type ReplicaInfo struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Generation string `json:"generation,omitempty"`
-}
-
 // ListResponse is the response body for the /list endpoint.
 type ListResponse struct {
 	Databases []DatabaseSummary `json:"databases"`
@@ -444,8 +362,9 @@ type ListResponse struct {
 
 // DatabaseSummary contains summary information about a database.
 type DatabaseSummary struct {
-	Path   string `json:"path"`
-	Status string `json:"status"`
+	Path       string     `json:"path"`
+	Status     string     `json:"status"`
+	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
 }
 
 // InfoResponse is the response body for the /info endpoint.

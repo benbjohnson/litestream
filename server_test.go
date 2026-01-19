@@ -7,7 +7,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"sync/atomic"
 	"testing"
@@ -151,56 +150,8 @@ func TestServer_HandleList(t *testing.T) {
 		// Since MonitorEnabled is false, status should be "open" not "replicating".
 		require.Equal(t, "open", result.Databases[0].Status)
 	})
-}
 
-func TestServer_HandleStatus(t *testing.T) {
-	t.Run("MissingPath", func(t *testing.T) {
-		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
-		store.CompactionMonitorEnabled = false
-		require.NoError(t, store.Open(t.Context()))
-		defer store.Close(t.Context())
-
-		server := litestream.NewServer(store)
-		server.SocketPath = testSocketPath(t)
-		require.NoError(t, server.Start())
-		defer server.Close()
-
-		client := newSocketClient(t, server.SocketPath)
-		resp, err := client.Get("http://localhost/status")
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
-
-		var result litestream.ErrorResponse
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "path required", result.Error)
-	})
-
-	t.Run("DatabaseNotFound", func(t *testing.T) {
-		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
-		store.CompactionMonitorEnabled = false
-		require.NoError(t, store.Open(t.Context()))
-		defer store.Close(t.Context())
-
-		server := litestream.NewServer(store)
-		server.SocketPath = testSocketPath(t)
-		require.NoError(t, server.Start())
-		defer server.Close()
-
-		client := newSocketClient(t, server.SocketPath)
-		resp, err := client.Get("http://localhost/status?path=/nonexistent/db")
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		require.Equal(t, http.StatusNotFound, resp.StatusCode)
-
-		var result litestream.ErrorResponse
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Contains(t, result.Error, "database not found")
-	})
-
-	t.Run("DatabaseFound", func(t *testing.T) {
+	t.Run("IncludesLastSyncAt", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
 
@@ -223,112 +174,16 @@ func TestServer_HandleStatus(t *testing.T) {
 		defer server.Close()
 
 		client := newSocketClient(t, server.SocketPath)
-		reqURL := "http://localhost/status?path=" + url.QueryEscape(db.Path())
-		resp, err := client.Get(reqURL)
+		resp, err := client.Get("http://localhost/list")
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var result litestream.StatusResponse
+		var result litestream.ListResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-
-		require.Equal(t, db.Path(), result.Path)
-		// Status should be "open" since MonitorEnabled is false in test helper.
-		require.Equal(t, "open", result.Status)
-		require.Greater(t, result.PageSize, 0)
-		require.NotNil(t, result.Position)
-		require.NotEmpty(t, result.Position.TXID)
-		require.NotNil(t, result.LastSyncAt)
-		require.Len(t, result.Replicas, 1)
-		require.Equal(t, "file", result.Replicas[0].Type)
-	})
-
-	t.Run("ReplicatingStatus", func(t *testing.T) {
-		db, sqldb := testingutil.MustOpenDBs(t)
-		defer testingutil.MustCloseDBs(t, db, sqldb)
-
-		// Enable monitor to get "replicating" status.
-		db.Replica.MonitorEnabled = true
-
-		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
-		store.CompactionMonitorEnabled = false
-		require.NoError(t, store.Open(t.Context()))
-		defer store.Close(t.Context())
-
-		server := litestream.NewServer(store)
-		server.SocketPath = testSocketPath(t)
-		require.NoError(t, server.Start())
-		defer server.Close()
-
-		client := newSocketClient(t, server.SocketPath)
-		reqURL := "http://localhost/status?path=" + url.QueryEscape(db.Path())
-		resp, err := client.Get(reqURL)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		var result litestream.StatusResponse
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "replicating", result.Status)
-	})
-
-	t.Run("StoppedStatus", func(t *testing.T) {
-		db := testingutil.MustOpenDB(t)
-		// Close DB to get "stopped" status.
-		require.NoError(t, db.Close(context.Background()))
-
-		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
-		store.CompactionMonitorEnabled = false
-		// Don't open store - it would try to open the closed DB.
-
-		server := litestream.NewServer(store)
-		server.SocketPath = testSocketPath(t)
-		require.NoError(t, server.Start())
-		defer server.Close()
-
-		client := newSocketClient(t, server.SocketPath)
-		reqURL := "http://localhost/status?path=" + url.QueryEscape(db.Path())
-		resp, err := client.Get(reqURL)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		var result litestream.StatusResponse
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "stopped", result.Status)
-	})
-
-	t.Run("PathExpansion", func(t *testing.T) {
-		db, sqldb := testingutil.MustOpenDBs(t)
-		defer testingutil.MustCloseDBs(t, db, sqldb)
-
-		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
-		store.CompactionMonitorEnabled = false
-		require.NoError(t, store.Open(t.Context()))
-		defer store.Close(t.Context())
-
-		server := litestream.NewServer(store)
-		server.SocketPath = testSocketPath(t)
-		// Set path expander that adds a prefix.
-		server.PathExpander = func(path string) (string, error) {
-			if path == "/alias/db" {
-				return db.Path(), nil
-			}
-			return path, nil
-		}
-		require.NoError(t, server.Start())
-		defer server.Close()
-
-		client := newSocketClient(t, server.SocketPath)
-		reqURL := "http://localhost/status?path=" + url.QueryEscape("/alias/db")
-		resp, err := client.Get(reqURL)
-		require.NoError(t, err)
-		defer resp.Body.Close()
-
-		require.Equal(t, http.StatusOK, resp.StatusCode)
-
-		var result litestream.StatusResponse
-		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, db.Path(), result.Path)
+		require.Len(t, result.Databases, 1)
+		require.NotNil(t, result.Databases[0].LastSyncAt, "LastSyncAt should be set after sync")
 	})
 }
 
