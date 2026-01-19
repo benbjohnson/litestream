@@ -1557,11 +1557,22 @@ func (f *VFSFile) syncToRemote() error {
 		return err
 	}
 
-	// Create LTX file from dirty pages
-	ltxReader := f.createLTXFromDirty()
+	// Create LTX file from dirty pages. The done channel signals when the
+	// goroutine completes - we must wait for it before releasing the lock
+	// to prevent another sync from clearing the buffer while reading.
+	ltxReader, done := f.createLTXFromDirty()
 
 	// Upload LTX file to remote
 	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
+
+	// If WriteLTXFile returned early (error or success), the goroutine may still
+	// be running. Close the pipe reader to unblock it, then wait for completion.
+	// This is safe because WriteLTXFile has already finished reading.
+	if rc, ok := ltxReader.(io.Closer); ok {
+		rc.Close()
+	}
+	<-done // Wait for goroutine to finish before releasing lock
+
 	if err != nil {
 		return fmt.Errorf("upload LTX: %w", err)
 	}
@@ -1640,11 +1651,14 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 }
 
 // createLTXFromDirty creates an LTX file from dirty pages.
-// Returns a streaming reader for the LTX data using io.Pipe to avoid loading
-// all data into memory at once.
+// Returns a streaming reader for the LTX data using io.Pipe, plus a channel
+// that is closed when the goroutine completes. The caller must wait on the
+// done channel before releasing the lock to prevent a race condition where
+// the buffer could be cleared while the goroutine is still reading.
 // Must be called with f.mu held.
-func (f *VFSFile) createLTXFromDirty() io.Reader {
+func (f *VFSFile) createLTXFromDirty() (io.Reader, <-chan struct{}) {
 	pr, pw := io.Pipe()
+	done := make(chan struct{})
 
 	// Sort page numbers (LTX encoder requires ordered pages)
 	pgnos := make([]uint32, 0, len(f.dirty))
@@ -1666,6 +1680,8 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 	bufferFile := f.bufferFile
 
 	go func() {
+		defer close(done) // Signal completion
+
 		var err error
 		defer func() {
 			pw.CloseWithError(err)
@@ -1719,7 +1735,7 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 		}
 	}()
 
-	return pr
+	return pr, done
 }
 
 // initWriteBuffer initializes the write buffer file for durability.

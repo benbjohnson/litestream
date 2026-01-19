@@ -877,3 +877,96 @@ func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
 		t.Errorf("expected size %d after write, got %d", DefaultPageSize, size)
 	}
 }
+
+func TestVFSFile_CreateLTXFromDirty_WaitsForGoroutine(t *testing.T) {
+	// Test that createLTXFromDirty returns a done channel that signals when
+	// the goroutine completes. This ensures we can wait for the goroutine
+	// before clearing the buffer, preventing race conditions.
+	// This verifies the fix for issue #1018 (race condition with buffer EOF).
+	client := newWriteTestReplicaClient()
+
+	// Create initial LTX file
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	// Create VFSFile with write support
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Write data to multiple pages
+	writeData1 := []byte("page 1 data")
+	if _, err := f.WriteAt(writeData1, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	writeData2 := []byte("page 2 data")
+	if _, err := f.WriteAt(writeData2, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	// Lock mutex (simulating what syncToRemote does)
+	f.mu.Lock()
+
+	// Create LTX reader from dirty pages - returns done channel
+	ltxReader, done := f.createLTXFromDirty()
+
+	// Read all data from the pipe (simulating WriteLTXFile)
+	data, err := io.ReadAll(ltxReader)
+	if err != nil {
+		f.mu.Unlock()
+		t.Fatalf("reading LTX data failed: %v", err)
+	}
+
+	// Wait for goroutine to complete before clearing buffer
+	// This is the key fix - we wait for the goroutine to finish
+	// reading from the buffer before we allow it to be cleared
+	<-done
+
+	// NOW it's safe to clear the buffer
+	if err := f.clearWriteBuffer(); err != nil {
+		f.mu.Unlock()
+		t.Fatalf("clearWriteBuffer failed: %v", err)
+	}
+
+	// Clear dirty map to avoid error on Close() trying to sync
+	f.dirty = make(map[uint32]int64)
+
+	f.mu.Unlock()
+
+	// Verify we got valid LTX data (should have header, pages, and trailer)
+	if len(data) < 100 {
+		t.Errorf("LTX data too small: %d bytes", len(data))
+	}
+
+	// Decode the LTX to verify it's valid
+	dec := ltx.NewDecoder(bytes.NewReader(data))
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatalf("failed to decode LTX header: %v", err)
+	}
+	hdr := dec.Header()
+	if hdr.PageSize != pageSize {
+		t.Errorf("expected page size %d, got %d", pageSize, hdr.PageSize)
+	}
+
+	// Count pages in the LTX
+	pageCount := 0
+	var phdr ltx.PageHeader
+	pageBuf := make([]byte, pageSize)
+	for {
+		if err := dec.DecodePage(&phdr, pageBuf); err != nil {
+			if err == io.EOF {
+				break
+			}
+			t.Fatalf("failed to decode page: %v", err)
+		}
+		pageCount++
+	}
+	if pageCount != 2 {
+		t.Errorf("expected 2 pages in LTX, got %d", pageCount)
+	}
+}
