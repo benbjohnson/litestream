@@ -197,6 +197,7 @@ func setupWriteableVFSFile(t *testing.T, client *writeTestReplicaClient) *VFSFil
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 
@@ -235,6 +236,7 @@ func TestVFSFile_WriteEnabled(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -332,8 +334,11 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 	}
 
 	// Check TXID advanced
-	if f.expectedTXID != 2 {
-		t.Errorf("expected TXID 2, got %d", f.expectedTXID)
+	f.writeState.mu.Lock()
+	expectedTXID := f.writeState.expectedTXID
+	f.writeState.mu.Unlock()
+	if expectedTXID != 2 {
+		t.Errorf("expected TXID 2, got %d", expectedTXID)
 	}
 
 	// Check LTX file was written to client
@@ -489,6 +494,7 @@ func TestVFSFile_WriteBuffer(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -547,6 +553,7 @@ func TestVFSFile_WriteBufferDiscardedOnOpen(t *testing.T) {
 	logger := slog.Default()
 	f1 := NewVFSFile(client, "test.db", logger)
 	f1.writeEnabled = true
+	f1.writeState = &vfsWriteState{} // Create shared write state for testing
 	f1.dirty = make(map[uint32]int64)
 	f1.syncInterval = 0
 	f1.bufferPath = bufferPath
@@ -571,6 +578,7 @@ func TestVFSFile_WriteBufferDiscardedOnOpen(t *testing.T) {
 	// Second: create a new VFSFile - buffer should be discarded
 	f2 := NewVFSFile(client, "test.db", logger)
 	f2.writeEnabled = true
+	f2.writeState = &vfsWriteState{} // Create shared write state for testing
 	f2.dirty = make(map[uint32]int64)
 	f2.syncInterval = 0
 	f2.bufferPath = bufferPath
@@ -611,6 +619,7 @@ func TestVFSFile_WriteBufferClearAfterSync(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -653,6 +662,7 @@ func TestVFSFile_OpenFailsWithInvalidBufferPath(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = "/nonexistent/path/that/cannot/be/created/buffer"
@@ -677,6 +687,7 @@ func TestVFSFile_BufferFileAlwaysCreatedWhenWriteEnabled(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "test.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -704,6 +715,7 @@ func TestVFSFile_OpenNewDatabase(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -722,12 +734,17 @@ func TestVFSFile_OpenNewDatabase(t *testing.T) {
 		t.Errorf("expected TXID 0 for new database, got %d", f.pos.TXID)
 	}
 
-	if f.expectedTXID != 0 {
-		t.Errorf("expected expectedTXID 0, got %d", f.expectedTXID)
+	f.writeState.mu.Lock()
+	expectedTXID := f.writeState.expectedTXID
+	pendingTXID := f.writeState.pendingTXID
+	f.writeState.mu.Unlock()
+
+	if expectedTXID != 0 {
+		t.Errorf("expected expectedTXID 0, got %d", expectedTXID)
 	}
 
-	if f.pendingTXID != 1 {
-		t.Errorf("expected pendingTXID 1, got %d", f.pendingTXID)
+	if pendingTXID != 1 {
+		t.Errorf("expected pendingTXID 1, got %d", pendingTXID)
 	}
 
 	if f.commit != 0 {
@@ -745,6 +762,7 @@ func TestVFSFile_NewDatabase_ReadReturnsZeros(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -783,6 +801,7 @@ func TestVFSFile_NewDatabase_WriteAndSync(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -813,11 +832,15 @@ func TestVFSFile_NewDatabase_WriteAndSync(t *testing.T) {
 	}
 
 	// Verify TXID advanced
-	if f.expectedTXID != 1 {
-		t.Errorf("expected expectedTXID 1 after sync, got %d", f.expectedTXID)
+	f.writeState.mu.Lock()
+	expectedTXID := f.writeState.expectedTXID
+	pendingTXID := f.writeState.pendingTXID
+	f.writeState.mu.Unlock()
+	if expectedTXID != 1 {
+		t.Errorf("expected expectedTXID 1 after sync, got %d", expectedTXID)
 	}
-	if f.pendingTXID != 2 {
-		t.Errorf("expected pendingTXID 2 after sync, got %d", f.pendingTXID)
+	if pendingTXID != 2 {
+		t.Errorf("expected pendingTXID 2 after sync, got %d", pendingTXID)
 	}
 
 	// Verify LTX file was written
@@ -844,6 +867,7 @@ func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
 	logger := slog.Default()
 	f := NewVFSFile(client, "new.db", logger)
 	f.writeEnabled = true
+	f.writeState = &vfsWriteState{} // Create shared write state for testing
 	f.dirty = make(map[uint32]int64)
 	f.syncInterval = 0
 	f.bufferPath = bufferPath
@@ -876,4 +900,131 @@ func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
 	if size != int64(DefaultPageSize) {
 		t.Errorf("expected size %d after write, got %d", DefaultPageSize, size)
 	}
+}
+
+// TestVFSFile_SharedWriteStateAcrossInstances verifies the fix for issue 1019:
+// Multiple VFSFile instances for the same database must share expectedTXID state
+// to prevent false conflict detection when multiple connections are open.
+func TestVFSFile_SharedWriteStateAcrossInstances(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	// Create initial LTX file at TXID 1
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	copy(initialPage, []byte("initial data"))
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	// Create a VFS instance to manage shared write state
+	vfs := &VFS{
+		writeStates: make(map[string]*vfsWriteState),
+	}
+
+	dbPath := "test.db"
+	tmpDir := t.TempDir()
+	logger := slog.Default()
+
+	// Acquire shared write state (simulates what VFS.openMainDB does)
+	sharedState := vfs.acquireWriteState(dbPath)
+
+	// Create first VFSFile instance
+	f1 := NewVFSFile(client, dbPath, logger)
+	f1.writeEnabled = true
+	f1.writeState = sharedState
+	f1.dirty = make(map[uint32]int64)
+	f1.syncInterval = 0
+	f1.bufferPath = tmpDir + "/buffer1"
+
+	if err := f1.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		f1.Close()
+		vfs.releaseWriteState(dbPath)
+	}()
+
+	// Verify initial state
+	sharedState.mu.Lock()
+	if sharedState.expectedTXID != 1 {
+		t.Errorf("expected initial expectedTXID 1, got %d", sharedState.expectedTXID)
+	}
+	sharedState.mu.Unlock()
+
+	// Create second VFSFile instance sharing the same state
+	vfs.acquireWriteState(dbPath) // Increment ref count
+	f2 := NewVFSFile(client, dbPath, logger)
+	f2.writeEnabled = true
+	f2.writeState = sharedState // Same shared state as f1
+	f2.dirty = make(map[uint32]int64)
+	f2.syncInterval = 0
+	f2.bufferPath = tmpDir + "/buffer2"
+
+	if err := f2.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		f2.Close()
+		vfs.releaseWriteState(dbPath)
+	}()
+
+	// Write and sync through f1, which updates expectedTXID to 2
+	writeData := []byte("write via f1")
+	if _, err := f1.WriteAt(writeData, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify shared state was updated
+	sharedState.mu.Lock()
+	expectedAfterSync := sharedState.expectedTXID
+	pendingAfterSync := sharedState.pendingTXID
+	sharedState.mu.Unlock()
+
+	if expectedAfterSync != 2 {
+		t.Errorf("expected expectedTXID 2 after f1 sync, got %d", expectedAfterSync)
+	}
+	if pendingAfterSync != 3 {
+		t.Errorf("expected pendingTXID 3 after f1 sync, got %d", pendingAfterSync)
+	}
+
+	// Now f2 should see the updated state since they share the same writeState
+	// This is the critical part of issue 1019 - without shared state,
+	// f2 would still have expectedTXID=1 and would falsely detect a conflict
+	// when trying to sync (seeing remote TXID=2 != expected TXID=1)
+
+	// Write and sync through f2 - should succeed without conflict
+	writeData2 := []byte("write via f2")
+	if _, err := f2.WriteAt(writeData2, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// This sync should succeed because f2 shares the updated expectedTXID=2
+	// Before the fix, f2 would have expectedTXID=1 and fail with conflict detection
+	if err := f2.Sync(0); err != nil {
+		t.Fatalf("f2.Sync failed with error: %v (this would happen without shared state)", err)
+	}
+
+	// Verify state after f2's sync
+	sharedState.mu.Lock()
+	finalExpected := sharedState.expectedTXID
+	finalPending := sharedState.pendingTXID
+	sharedState.mu.Unlock()
+
+	if finalExpected != 3 {
+		t.Errorf("expected expectedTXID 3 after f2 sync, got %d", finalExpected)
+	}
+	if finalPending != 4 {
+		t.Errorf("expected pendingTXID 4 after f2 sync, got %d", finalPending)
+	}
+
+	// Verify reference counting works
+	vfs.writeStatesMu.Lock()
+	state, exists := vfs.writeStates[dbPath]
+	if !exists {
+		t.Error("expected writeState to still exist")
+	} else if state.refCount != 2 {
+		t.Errorf("expected refCount 2, got %d", state.refCount)
+	}
+	vfs.writeStatesMu.Unlock()
 }

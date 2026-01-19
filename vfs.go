@@ -108,6 +108,22 @@ type VFS struct {
 	tempDirErr  error
 	tempFiles   sync.Map // canonical name -> absolute path
 	tempNames   sync.Map // canonical name -> struct{}{}
+
+	// writeStates tracks shared write state for each database path.
+	// Multiple VFSFile instances for the same database share state to prevent
+	// false conflict detection when multiple connections are open.
+	writeStatesMu sync.Mutex
+	writeStates   map[string]*vfsWriteState
+}
+
+// vfsWriteState holds shared write state for a database path.
+// This is shared across all VFSFile instances for the same database to ensure
+// consistent expectedTXID tracking.
+type vfsWriteState struct {
+	mu           sync.Mutex
+	refCount     int      // Number of VFSFiles using this state
+	expectedTXID ltx.TXID // Expected remote TXID (for conflict detection)
+	pendingTXID  ltx.TXID // Next TXID to use for sync
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -116,6 +132,38 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 		logger:       logger.With("vfs", "true"),
 		PollInterval: DefaultPollInterval,
 		CacheSize:    DefaultCacheSize,
+		writeStates:  make(map[string]*vfsWriteState),
+	}
+}
+
+// acquireWriteState gets or creates shared write state for a database path.
+// The caller must call releaseWriteState when the VFSFile is closed.
+func (vfs *VFS) acquireWriteState(path string) *vfsWriteState {
+	vfs.writeStatesMu.Lock()
+	defer vfs.writeStatesMu.Unlock()
+
+	state, ok := vfs.writeStates[path]
+	if !ok {
+		state = &vfsWriteState{}
+		vfs.writeStates[path] = state
+	}
+	state.refCount++
+	return state
+}
+
+// releaseWriteState decrements the reference count for a write state.
+// If the reference count reaches zero, the state is removed.
+func (vfs *VFS) releaseWriteState(path string) {
+	vfs.writeStatesMu.Lock()
+	defer vfs.writeStatesMu.Unlock()
+
+	state, ok := vfs.writeStates[path]
+	if !ok {
+		return
+	}
+	state.refCount--
+	if state.refCount <= 0 {
+		delete(vfs.writeStates, path)
 	}
 }
 
@@ -146,6 +194,11 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 		if f.syncInterval == 0 {
 			f.syncInterval = DefaultSyncInterval
 		}
+
+		// Acquire shared write state for this database path.
+		// This ensures all VFSFile instances for the same database share
+		// expectedTXID and pendingTXID to prevent false conflict detection.
+		f.writeState = vfs.acquireWriteState(name)
 
 		// Set up write buffer path
 		if vfs.WriteBufferPath != "" {
@@ -508,9 +561,8 @@ type VFSFile struct {
 
 	// Write support fields (only used when writeEnabled is true)
 	writeEnabled  bool             // Whether write support is enabled
+	writeState    *vfsWriteState   // Shared write state across VFSFile instances for same database
 	dirty         map[uint32]int64 // Dirty pages: pgno -> offset in buffer file
-	pendingTXID   ltx.TXID         // Next TXID to use for sync
-	expectedTXID  ltx.TXID         // Expected remote TXID (for conflict detection)
 	bufferFile    *os.File         // Temp file for durability
 	bufferPath    string           // Path to buffer file
 	bufferNextOff int64            // Next write offset in buffer file
@@ -929,9 +981,18 @@ func (f *VFSFile) Open() error {
 
 	// Initialize write support TXID tracking
 	if f.writeEnabled {
-		f.expectedTXID = pos.TXID
-		f.pendingTXID = pos.TXID + 1
-		f.logger.Debug("write support enabled", "expectedTXID", f.expectedTXID, "pendingTXID", f.pendingTXID)
+		f.writeState.mu.Lock()
+		// Only initialize if this is the first VFSFile using this shared state.
+		// If another VFSFile has already synced, we use its updated values.
+		if f.writeState.pendingTXID == 0 {
+			f.writeState.expectedTXID = pos.TXID
+			f.writeState.pendingTXID = pos.TXID + 1
+		}
+		f.logger.Debug("write support enabled",
+			"expectedTXID", f.writeState.expectedTXID,
+			"pendingTXID", f.writeState.pendingTXID,
+			"fromRemote", f.writeState.pendingTXID == pos.TXID+1)
+		f.writeState.mu.Unlock()
 
 		// Initialize write buffer file for durability (discards any existing buffer)
 		if err := f.initWriteBuffer(); err != nil {
@@ -998,9 +1059,16 @@ func (f *VFSFile) openNewDatabase() error {
 	f.commit = 0
 
 	// Initialize write support for new database
-	f.expectedTXID = 0
-	f.pendingTXID = 1
-	f.logger.Debug("write support enabled for new database", "expectedTXID", f.expectedTXID, "pendingTXID", f.pendingTXID)
+	f.writeState.mu.Lock()
+	// Only initialize if this is the first VFSFile using this shared state.
+	if f.writeState.pendingTXID == 0 {
+		f.writeState.expectedTXID = 0
+		f.writeState.pendingTXID = 1
+	}
+	f.logger.Debug("write support enabled for new database",
+		"expectedTXID", f.writeState.expectedTXID,
+		"pendingTXID", f.writeState.pendingTXID)
+	f.writeState.mu.Unlock()
 
 	// Initialize write buffer file for durability
 	if err := f.initWriteBuffer(); err != nil {
@@ -1208,7 +1276,7 @@ func (f *VFSFile) applySyncedPagesToHydratedFile() error {
 		}
 	}
 
-	f.hydrator.SetTXID(f.expectedTXID)
+	f.hydrator.SetTXID(f.writeState.expectedTXID)
 	return nil
 }
 
@@ -1246,6 +1314,11 @@ func (f *VFSFile) Close() error {
 		if err := f.hydrator.Close(); err != nil {
 			f.logger.Warn("failed to close hydration file", "error", err)
 		}
+	}
+
+	// Release shared write state if write support was enabled
+	if f.writeEnabled && f.vfs != nil {
+		f.vfs.releaseWriteState(f.name)
 	}
 
 	return nil
@@ -1552,6 +1625,12 @@ func (f *VFSFile) syncToRemote() error {
 
 	ctx := f.ctx
 
+	// Lock shared write state for the duration of the sync.
+	// This ensures multiple VFSFile instances for the same database
+	// don't see stale expectedTXID values after another instance syncs.
+	f.writeState.mu.Lock()
+	defer f.writeState.mu.Unlock()
+
 	// Check for conflicts
 	if err := f.checkForConflict(ctx); err != nil {
 		return err
@@ -1561,7 +1640,7 @@ func (f *VFSFile) syncToRemote() error {
 	ltxReader := f.createLTXFromDirty()
 
 	// Upload LTX file to remote
-	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
+	info, err := f.client.WriteLTXFile(ctx, 0, f.writeState.pendingTXID, f.writeState.pendingTXID, ltxReader)
 	if err != nil {
 		return fmt.Errorf("upload LTX: %w", err)
 	}
@@ -1571,10 +1650,10 @@ func (f *VFSFile) syncToRemote() error {
 		"pages", len(f.dirty),
 		"size", info.Size)
 
-	// Update local state
-	f.expectedTXID = f.pendingTXID
-	f.pendingTXID++
-	f.pos = ltx.Pos{TXID: f.expectedTXID}
+	// Update shared write state
+	f.writeState.expectedTXID = f.writeState.pendingTXID
+	f.writeState.pendingTXID++
+	f.pos = ltx.Pos{TXID: f.writeState.expectedTXID}
 
 	// Update cache with synced pages (index will be populated naturally when pages are fetched)
 	for pgno, bufferOff := range f.dirty {
@@ -1607,10 +1686,10 @@ func (f *VFSFile) syncToRemote() error {
 }
 
 // checkForConflict checks if the remote has newer transactions than expected.
-// Must be called with f.mu held.
+// Must be called with f.mu and f.writeState.mu held.
 func (f *VFSFile) checkForConflict(ctx context.Context) error {
 	// Get latest remote position
-	itr, err := f.client.LTXFiles(ctx, 0, f.expectedTXID, false)
+	itr, err := f.client.LTXFiles(ctx, 0, f.writeState.expectedTXID, false)
 	if err != nil {
 		return fmt.Errorf("check remote position: %w", err)
 	}
@@ -1628,12 +1707,12 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 	}
 
 	// If remote has advanced beyond our expected position, we have a conflict
-	if remoteTXID > f.expectedTXID {
+	if remoteTXID > f.writeState.expectedTXID {
 		f.logger.Warn("conflict detected",
-			"expected", f.expectedTXID,
+			"expected", f.writeState.expectedTXID,
 			"remote", remoteTXID)
 		return fmt.Errorf("%w: expected TXID %d but remote has %d",
-			ErrConflict, f.expectedTXID, remoteTXID)
+			ErrConflict, f.writeState.expectedTXID, remoteTXID)
 	}
 
 	return nil
@@ -1642,7 +1721,7 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 // createLTXFromDirty creates an LTX file from dirty pages.
 // Returns a streaming reader for the LTX data using io.Pipe to avoid loading
 // all data into memory at once.
-// Must be called with f.mu held.
+// Must be called with f.mu and f.writeState.mu held.
 func (f *VFSFile) createLTXFromDirty() io.Reader {
 	pr, pw := io.Pipe()
 
@@ -1662,7 +1741,7 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 	// Capture values for goroutine
 	pageSize := f.pageSize
 	commit := f.commit
-	pendingTXID := f.pendingTXID
+	pendingTXID := f.writeState.pendingTXID
 	bufferFile := f.bufferFile
 
 	go func() {
@@ -1823,7 +1902,10 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	// Track transaction start when acquiring RESERVED lock (write intent)
 	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
 		f.inTransaction = true
-		f.logger.Debug("transaction started", "expectedTXID", f.expectedTXID)
+		f.writeState.mu.Lock()
+		expectedTXID := f.writeState.expectedTXID
+		f.writeState.mu.Unlock()
+		f.logger.Debug("transaction started", "expectedTXID", expectedTXID)
 	}
 
 	f.lockType = elock
