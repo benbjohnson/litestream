@@ -503,7 +503,7 @@ func (itr *ltxFileIterator) Err() error {
 	return itr.err
 }
 
-// Close closes the iterator.
+// Close closes the iterator and returns any error that occurred during iteration.
 func (itr *ltxFileIterator) Close() error {
-	return nil
+	return itr.err
 }

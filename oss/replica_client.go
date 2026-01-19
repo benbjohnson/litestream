@@ -501,11 +501,11 @@ func (itr *fileIterator) initPaginator() {
 	})
 }
 
-// Close stops iteration.
+// Close stops iteration and returns any error that occurred during iteration.
 func (itr *fileIterator) Close() (err error) {
 	itr.closed = true
 	itr.cancel()
-	return nil
+	return itr.err
 }
 
 // Next returns the next file. Returns false when no more files are available.
