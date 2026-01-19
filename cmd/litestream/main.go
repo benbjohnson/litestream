@@ -176,6 +176,10 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&StartCommand{}).Run(ctx, args)
 	case "stop":
 		return (&StopCommand{}).Run(ctx, args)
+	case "add":
+		return (&AddCommand{}).Run(ctx, args)
+	case "remove":
+		return (&RemoveCommand{}).Run(ctx, args)
 	case "reset":
 		return (&ResetCommand{}).Run(ctx, args)
 	case "restore":
@@ -214,10 +218,12 @@ Usage:
 
 The commands are:
 
+	add          add a database for replication
 	databases    list databases specified in config file
 	info         show daemon information
 	list         list all managed databases
 	ltx          list available LTX files for a database
+	remove       remove a database from replication
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
 	restore      recovers database backup from a replica
