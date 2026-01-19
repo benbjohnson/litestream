@@ -74,6 +74,8 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
+	mux.HandleFunc("POST /add", s.handleAdd)
+	mux.HandleFunc("POST /remove", s.handleRemove)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 
@@ -380,4 +382,125 @@ type InfoResponse struct {
 	UptimeSeconds int64     `json:"uptime_seconds"`
 	StartedAt     time.Time `json:"started_at"`
 	DatabaseCount int       `json:"database_count"`
+}
+
+// AddDatabaseRequest is the request body for the /add endpoint.
+type AddDatabaseRequest struct {
+	Path       string `json:"path"`
+	ReplicaURL string `json:"replica_url"`
+}
+
+// AddDatabaseResponse is the response body for the /add endpoint.
+type AddDatabaseResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+}
+
+// RemoveDatabaseRequest is the request body for the /remove endpoint.
+type RemoveDatabaseRequest struct {
+	Path    string `json:"path"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// RemoveDatabaseResponse is the response body for the /remove endpoint.
+type RemoveDatabaseResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+}
+
+func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
+	var req AddDatabaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	if req.ReplicaURL == "" {
+		writeJSONError(w, http.StatusBadRequest, "replica_url required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	// Check if database already exists.
+	if existing := s.store.FindDB(expandedPath); existing != nil {
+		writeJSON(w, http.StatusOK, AddDatabaseResponse{
+			Status: "already_exists",
+			Path:   expandedPath,
+		})
+		return
+	}
+
+	// Create replica client from URL.
+	client, err := NewReplicaClientFromURL(req.ReplicaURL)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid replica url: %v", err), nil)
+		return
+	}
+
+	// Create new database.
+	db := NewDB(expandedPath)
+
+	// Create replica and attach client.
+	replica := NewReplica(db)
+	replica.Client = client
+	db.Replica = replica
+
+	// Register database with store (this also opens the database).
+	if err := s.store.AddDB(db); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to add database: %v", err), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, AddDatabaseResponse{
+		Status: "added",
+		Path:   expandedPath,
+	})
+}
+
+func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
+	var req RemoveDatabaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	// Set up timeout context.
+	timeout := req.Timeout
+	if timeout == 0 {
+		timeout = 30
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	// Remove database from store (this also closes it).
+	if err := s.store.RemoveDB(ctx, expandedPath); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to remove database: %v", err), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, RemoveDatabaseResponse{
+		Status: "removed",
+		Path:   expandedPath,
+	})
 }
