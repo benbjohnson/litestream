@@ -394,7 +394,7 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 func (itr *ltxFileIterator) Close() (err error) {
 	itr.closed = true
 	itr.cancel()
-	return nil
+	return itr.err
 }
 
 func (itr *ltxFileIterator) Next() bool {
