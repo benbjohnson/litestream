@@ -978,10 +978,14 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 		c.logger.Debug("deleting ltx files batch", "count", n)
 
+		start := time.Now()
 		out, err := c.s3.DeleteObjects(ctx, &s3.DeleteObjectsInput{
 			Bucket: aws.String(c.Bucket),
 			Delete: &types.Delete{Objects: objIDs[:n]},
 		})
+		duration := time.Since(start)
+		internal.OperationDurationHistogramVec.WithLabelValues(ReplicaClientType, "DELETE").Observe(duration.Seconds())
+
 		if err != nil {
 			return fmt.Errorf("s3: delete batch of %d objects: %w", n, err)
 		}
@@ -990,8 +994,29 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		if out != nil {
 			deleted = len(out.Deleted)
 		}
-		c.logger.Debug("delete batch completed", "requested", n, "deleted", deleted, "errors", len(out.Errors))
+		c.logger.Debug("delete batch completed",
+			"requested", n,
+			"deleted", deleted,
+			"errors", len(out.Errors),
+			"duration_ms", duration.Milliseconds())
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Add(float64(deleted))
+
+		if len(out.Errors) > 0 {
+			for i, e := range out.Errors {
+				code := aws.ToString(e.Code)
+				internal.OperationErrorCounterVec.WithLabelValues(ReplicaClientType, "DELETE", code).Inc()
+
+				if i < 5 {
+					c.logger.Warn("delete object failed",
+						"key", aws.ToString(e.Key),
+						"code", code,
+						"message", aws.ToString(e.Message))
+				}
+			}
+			if len(out.Errors) > 5 {
+				c.logger.Warn("additional delete errors suppressed", "count", len(out.Errors)-5)
+			}
+		}
 
 		if err := deleteOutputError(out); err != nil {
 			return err
