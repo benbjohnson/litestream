@@ -18,7 +18,7 @@ import (
 
 func TestVFS_RaceStressHarness(t *testing.T) {
 	if os.Getenv("LITESTREAM_ALLOW_RACE") != "1" {
-		t.Skip("set LITESTREAM_ALLOW_RACE=1 to run unstable race harness; modernc.org/sqlite checkptr panics are still unresolved")
+		t.Skip("set LITESTREAM_ALLOW_RACE=1 to run unstable race harness; modernc.org/sqlite checkptr panics are still unresolved (see #1014)")
 	}
 	if !runtime.RaceEnabled() {
 		t.Skip("requires go test -race")
