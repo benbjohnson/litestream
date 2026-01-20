@@ -201,6 +201,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 
 	// Detect S3-compatible provider endpoints for applying appropriate defaults.
+	isHetzner := litestream.IsHetznerEndpoint(endpoint)
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
 	isDigitalOcean := litestream.IsDigitalOceanEndpoint(endpoint)
 	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
@@ -235,7 +236,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			requireMD5, requireMD5Set = false, true
 		}
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
