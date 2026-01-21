@@ -80,6 +80,9 @@ type Store struct {
 	// If true, compaction is run in the background according to compaction levels.
 	CompactionMonitorEnabled bool
 
+	// If true, verify TXID consistency at destination level after each compaction.
+	VerifyCompaction bool
+
 	// Shutdown sync retry settings.
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
@@ -114,6 +117,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		db.L0Retention = s.L0Retention
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 		db.ShutdownSyncInterval = s.ShutdownSyncInterval
+		db.VerifyCompaction = s.VerifyCompaction
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -212,6 +216,7 @@ func (s *Store) AddDB(db *DB) error {
 	db.L0Retention = s.L0Retention
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
+	db.VerifyCompaction = s.VerifyCompaction
 
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.
@@ -363,6 +368,18 @@ func (s *Store) SetShutdownSyncInterval(d time.Duration) {
 	s.ShutdownSyncInterval = d
 	for _, db := range s.dbs {
 		db.ShutdownSyncInterval = d
+	}
+}
+
+// SetVerifyCompaction updates the verify compaction flag and propagates it to
+// all managed databases.
+func (s *Store) SetVerifyCompaction(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.VerifyCompaction = v
+	for _, db := range s.dbs {
+		db.VerifyCompaction = v
+		db.compactor.VerifyCompaction = v
 	}
 }
 

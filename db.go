@@ -148,6 +148,11 @@ type DB struct {
 	// Minimum time to retain L0 files after they have been compacted into L1.
 	L0Retention time.Duration
 
+	// VerifyCompaction enables post-compaction TXID consistency verification.
+	// When enabled, verifies that files at the destination level have
+	// contiguous TXID ranges after each compaction.
+	VerifyCompaction bool
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -209,6 +214,7 @@ func NewDB(path string) *DB {
 	db.compactor = NewCompactor(nil, db.Logger)
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
+	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
 	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -432,6 +438,9 @@ func (db *DB) Open() (err error) {
 	db.mu.Lock()
 	db.opened = true
 	db.mu.Unlock()
+
+	// Apply verify compaction setting to the compactor
+	db.compactor.VerifyCompaction = db.VerifyCompaction
 
 	return nil
 }
@@ -2275,4 +2284,9 @@ var (
 		Name: "litestream_checkpoint_seconds",
 		Help: "Time spent checkpointing WAL, in seconds",
 	}, []string{"db", "mode"})
+
+	compactionVerifyErrorCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_compaction_verify_error_count",
+		Help: "Number of post-compaction verification failures",
+	}, []string{"db"})
 )

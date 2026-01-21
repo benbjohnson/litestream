@@ -321,6 +321,112 @@ func TestCompactor_EnforceSnapshotRetention(t *testing.T) {
 	})
 }
 
+func TestCompactor_VerifyLevelConsistency(t *testing.T) {
+	t.Run("ContiguousFiles", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create contiguous files
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 3, 5)
+		createTestLTXFile(t, client, 1, 6, 10)
+
+		// Should pass verification
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err != nil {
+			t.Errorf("expected nil error for contiguous files, got: %v", err)
+		}
+	})
+
+	t.Run("GapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create files with a gap (missing TXID 3-4)
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 7) // gap: expected MinTXID=3, got 5
+
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err == nil {
+			t.Error("expected error for gap in files, got nil")
+		}
+		if err != nil && !containsString(err.Error(), "gap") {
+			t.Errorf("expected gap error, got: %v", err)
+		}
+	})
+
+	t.Run("OverlapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create overlapping files
+		createTestLTXFile(t, client, 1, 1, 5)
+		createTestLTXFile(t, client, 1, 3, 7) // overlap: expected MinTXID=6, got 3
+
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err == nil {
+			t.Error("expected error for overlapping files, got nil")
+		}
+		if err != nil && !containsString(err.Error(), "overlap") {
+			t.Errorf("expected overlap error, got: %v", err)
+		}
+	})
+
+	t.Run("SingleFile", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create single file - should pass
+		createTestLTXFile(t, client, 1, 1, 5)
+
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err != nil {
+			t.Errorf("expected nil error for single file, got: %v", err)
+		}
+	})
+
+	t.Run("EmptyLevel", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Empty level - should pass
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err != nil {
+			t.Errorf("expected nil error for empty level, got: %v", err)
+		}
+	})
+}
+
+func TestCompactor_CompactWithVerification(t *testing.T) {
+	t.Run("VerificationEnabled", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+		compactor.VerifyCompaction = true
+
+		// Create contiguous L0 files
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
+
+		// Compact to L1 - should succeed with verification
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Level != 1 {
+			t.Errorf("Level=%d, want 1", info.Level)
+		}
+		if info.MinTXID != 1 || info.MaxTXID != 3 {
+			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
+		}
+	})
+}
+
+// containsString checks if s contains substr.
+func containsString(s, substr string) bool {
+	return bytes.Contains([]byte(s), []byte(substr))
+}
+
 // createTestLTXFile creates a minimal LTX file for testing.
 func createTestLTXFile(t testing.TB, client litestream.ReplicaClient, level int, minTXID, maxTXID ltx.TXID) {
 	t.Helper()

@@ -231,6 +231,10 @@ type Config struct {
 	L0Retention              *time.Duration `yaml:"l0-retention"`
 	L0RetentionCheckInterval *time.Duration `yaml:"l0-retention-check-interval"`
 
+	// Verify TXID consistency at destination level after each compaction.
+	// When enabled, logs warnings if gaps or overlaps are detected.
+	VerifyCompaction bool `yaml:"verify-compaction"`
+
 	// Heartbeat settings (global defaults)
 	HeartbeatURL      string         `yaml:"heartbeat-url"`
 	HeartbeatInterval *time.Duration `yaml:"heartbeat-interval"`

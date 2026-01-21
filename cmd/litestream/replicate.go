@@ -250,6 +250,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.ShutdownSyncInterval != nil {
 		c.Store.SetShutdownSyncInterval(*c.Config.ShutdownSyncInterval)
 	}
+	if c.Config.VerifyCompaction {
+		c.Store.SetVerifyCompaction(true)
+	}
 	if c.Config.HeartbeatURL != "" {
 		interval := litestream.DefaultHeartbeatInterval
 		if c.Config.HeartbeatInterval != nil {
