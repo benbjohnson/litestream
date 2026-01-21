@@ -8,6 +8,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/superfly/ltx"
 )
 
@@ -22,6 +23,10 @@ type Compactor struct {
 	// When enabled, verifies that files at the destination level have
 	// contiguous TXID ranges after each compaction. Disabled by default.
 	VerifyCompaction bool
+
+	// CompactionVerifyErrorCounter is incremented when post-compaction
+	// verification fails. Optional; if nil, no metric is recorded.
+	CompactionVerifyErrorCounter prometheus.Counter
 
 	// LocalFileOpener optionally opens a local LTX file for compaction.
 	// If nil or returns os.ErrNotExist, falls back to remote.
@@ -175,6 +180,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			c.logger.Warn("post-compaction verification failed",
 				"level", dstLevel,
 				"error", err)
+			if c.CompactionVerifyErrorCounter != nil {
+				c.CompactionVerifyErrorCounter.Inc()
+			}
 		}
 	}
 

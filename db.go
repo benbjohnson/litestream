@@ -214,6 +214,7 @@ func NewDB(path string) *DB {
 	db.compactor = NewCompactor(nil, db.Logger)
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
+	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
 	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -2283,4 +2284,9 @@ var (
 		Name: "litestream_checkpoint_seconds",
 		Help: "Time spent checkpointing WAL, in seconds",
 	}, []string{"db", "mode"})
+
+	compactionVerifyErrorCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_compaction_verify_error_count",
+		Help: "Number of post-compaction verification failures",
+	}, []string{"db"})
 )
