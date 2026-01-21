@@ -1951,6 +1951,6 @@ func initLog(w io.Writer, level, typ string) {
 		logHandler = slog.NewTextHandler(w, &logOptions)
 	}
 
-	// Set global default logger.
-	slog.SetDefault(slog.New(logHandler))
+	// Set global default logger with PID.
+	slog.SetDefault(slog.New(logHandler).With("pid", os.Getpid()))
 }
