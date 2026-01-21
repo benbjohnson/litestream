@@ -148,6 +148,11 @@ type DB struct {
 	// Minimum time to retain L0 files after they have been compacted into L1.
 	L0Retention time.Duration
 
+	// VerifyCompaction enables post-compaction TXID consistency verification.
+	// When enabled, verifies that files at the destination level have
+	// contiguous TXID ranges after each compaction.
+	VerifyCompaction bool
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -432,6 +437,9 @@ func (db *DB) Open() (err error) {
 	db.mu.Lock()
 	db.opened = true
 	db.mu.Unlock()
+
+	// Apply verify compaction setting to the compactor
+	db.compactor.VerifyCompaction = db.VerifyCompaction
 
 	return nil
 }

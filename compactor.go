@@ -18,6 +18,11 @@ type Compactor struct {
 	client ReplicaClient
 	logger *slog.Logger
 
+	// VerifyCompaction enables post-compaction TXID consistency verification.
+	// When enabled, verifies that files at the destination level have
+	// contiguous TXID ranges after each compaction. Disabled by default.
+	VerifyCompaction bool
+
 	// LocalFileOpener optionally opens a local LTX file for compaction.
 	// If nil or returns os.ErrNotExist, falls back to remote.
 	// This is used by DB to prefer local files over remote for consistency.
@@ -164,7 +169,57 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		c.CacheSetter(dstLevel, info)
 	}
 
+	// Verify level consistency if enabled
+	if c.VerifyCompaction {
+		if err := c.VerifyLevelConsistency(ctx, dstLevel); err != nil {
+			c.logger.Warn("post-compaction verification failed",
+				"level", dstLevel,
+				"error", err)
+		}
+	}
+
 	return info, nil
+}
+
+// VerifyLevelConsistency checks that LTX files at the given level have
+// contiguous TXID ranges (prevMaxTXID + 1 == currMinTXID for consecutive files).
+// Returns an error describing any gaps or overlaps found.
+func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error {
+	itr, err := c.client.LTXFiles(ctx, level, 0, false)
+	if err != nil {
+		return fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var prevInfo *ltx.FileInfo
+	for itr.Next() {
+		info := itr.Item()
+
+		// Skip first file - nothing to compare against
+		if prevInfo == nil {
+			prevInfo = info
+			continue
+		}
+
+		// Check for TXID contiguity: prev.MaxTXID + 1 should equal curr.MinTXID
+		expectedMinTXID := prevInfo.MaxTXID + 1
+		if info.MinTXID != expectedMinTXID {
+			if info.MinTXID > expectedMinTXID {
+				return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
+					prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
+			}
+			return fmt.Errorf("TXID overlap detected: prev.MaxTXID=%s, next.MinTXID=%s",
+				prevInfo.MaxTXID, info.MinTXID)
+		}
+
+		prevInfo = info
+	}
+
+	if err := itr.Close(); err != nil {
+		return fmt.Errorf("close iterator: %w", err)
+	}
+
+	return nil
 }
 
 // EnforceSnapshotRetention enforces retention of snapshot level files by timestamp.
