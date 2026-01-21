@@ -74,7 +74,7 @@ func LitestreamVFSRegister() *C.char {
 		}
 		logOutput = f
 	}
-	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: level}))
+	logger := slog.New(slog.NewTextHandler(logOutput, &slog.HandlerOptions{Level: level})).With("pid", os.Getpid())
 
 	vfs := litestream.NewVFS(client, logger)
 
