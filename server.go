@@ -42,6 +42,12 @@ type Server struct {
 	// If nil, paths are used as-is.
 	PathExpander func(string) (string, error)
 
+	// Version is the version string to report in /info.
+	Version string
+
+	// startedAt is set when the server starts.
+	startedAt time.Time
+
 	socketListener net.Listener
 	httpServer     *http.Server
 
@@ -66,6 +72,8 @@ func NewServer(store *Store) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
+	mux.HandleFunc("GET /list", s.handleList)
+	mux.HandleFunc("GET /info", s.handleInfo)
 
 	s.httpServer = &http.Server{Handler: mux}
 
@@ -77,6 +85,8 @@ func (s *Server) Start() error {
 	if s.SocketPath == "" {
 		return fmt.Errorf("socket path required")
 	}
+
+	s.startedAt = time.Now()
 
 	// Check if socket file exists and is actually a socket before removing
 	if info, err := os.Lstat(s.SocketPath); err == nil {
@@ -254,4 +264,70 @@ type StopResponse struct {
 type ErrorResponse struct {
 	Error   string      `json:"error"`
 	Details interface{} `json:"details,omitempty"`
+}
+
+func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
+	dbs := s.store.DBs()
+	resp := ListResponse{
+		Databases: make([]DatabaseSummary, 0, len(dbs)),
+	}
+
+	for _, db := range dbs {
+		var status string
+		if db.IsOpen() {
+			if db.Replica != nil && db.Replica.MonitorEnabled {
+				status = "replicating"
+			} else {
+				status = "open"
+			}
+		} else {
+			status = "stopped"
+		}
+
+		summary := DatabaseSummary{
+			Path:   db.Path(),
+			Status: status,
+		}
+
+		if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
+			summary.LastSyncAt = &t
+		}
+
+		resp.Databases = append(resp.Databases, summary)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
+	resp := InfoResponse{
+		Version:       s.Version,
+		PID:           os.Getpid(),
+		StartedAt:     s.startedAt,
+		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
+		DatabaseCount: len(s.store.DBs()),
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ListResponse is the response body for the /list endpoint.
+type ListResponse struct {
+	Databases []DatabaseSummary `json:"databases"`
+}
+
+// DatabaseSummary contains summary information about a database.
+type DatabaseSummary struct {
+	Path       string     `json:"path"`
+	Status     string     `json:"status"`
+	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
+}
+
+// InfoResponse is the response body for the /info endpoint.
+type InfoResponse struct {
+	Version       string    `json:"version"`
+	PID           int       `json:"pid"`
+	UptimeSeconds int64     `json:"uptime_seconds"`
+	StartedAt     time.Time `json:"started_at"`
+	DatabaseCount int       `json:"database_count"`
 }
