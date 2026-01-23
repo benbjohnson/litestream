@@ -4,12 +4,14 @@ import (
 	"database/sql"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/superfly/ltx"
 	_ "modernc.org/sqlite"
@@ -186,4 +188,130 @@ func assert(condition bool, message string) {
 	if !condition {
 		panic("assertion failed: " + message)
 	}
+}
+
+// Legacy v0.3.x format types and helpers.
+// These are used for backward compatibility when restoring from v0.3.x backups.
+
+// LegacyPos represents a position in a v0.3.x replica.
+// In v0.3.x, positions were tracked by generation, index, and offset within the WAL.
+type LegacyPos struct {
+	Generation string // 16-character hex string
+	Index      int    // WAL index
+	Offset     int64  // Offset within the WAL segment
+}
+
+// IsZero returns true if the position is empty.
+func (p LegacyPos) IsZero() bool {
+	return p.Generation == "" && p.Index == 0 && p.Offset == 0
+}
+
+// LegacySnapshotInfo represents metadata for a v0.3.x snapshot file.
+type LegacySnapshotInfo struct {
+	Generation string    // Generation ID (16-char hex)
+	Index      int       // Snapshot index
+	Size       int64     // File size in bytes
+	CreatedAt  time.Time // File creation time
+}
+
+// LegacyWALSegmentInfo represents metadata for a v0.3.x WAL segment file.
+type LegacyWALSegmentInfo struct {
+	Generation string    // Generation ID (16-char hex)
+	Index      int       // WAL index
+	Offset     int64     // Offset within this segment
+	Size       int64     // File size in bytes
+	CreatedAt  time.Time // File creation time
+}
+
+// Legacy path constants
+const (
+	LegacyGenerationsDir = "generations"
+	LegacySnapshotsDir   = "snapshots"
+	LegacyWALDir         = "wal"
+)
+
+// LegacyGenerationPath returns the path to a generation directory.
+func LegacyGenerationPath(root, generation string) string {
+	return path.Join(root, LegacyGenerationsDir, generation)
+}
+
+// LegacySnapshotDir returns the path to a generation's snapshot directory.
+func LegacySnapshotDir(root, generation string) string {
+	return path.Join(LegacyGenerationPath(root, generation), LegacySnapshotsDir)
+}
+
+// LegacyWALDir returns the path to a generation's WAL directory.
+func LegacyWALDirPath(root, generation string) string {
+	return path.Join(LegacyGenerationPath(root, generation), LegacyWALDir)
+}
+
+// LegacySnapshotPath returns the path to a specific snapshot file.
+func LegacySnapshotPath(root, generation string, index int) string {
+	return path.Join(LegacySnapshotDir(root, generation), FormatLegacySnapshotFilename(index))
+}
+
+// LegacyWALSegmentPath returns the path to a specific WAL segment file.
+func LegacyWALSegmentPath(root, generation string, index int, offset int64) string {
+	return path.Join(LegacyWALDirPath(root, generation), FormatLegacyWALSegmentFilename(index, offset))
+}
+
+// FormatLegacySnapshotFilename returns the filename for a legacy snapshot.
+// Format: <index>.snapshot.lz4
+func FormatLegacySnapshotFilename(index int) string {
+	return strconv.Itoa(index) + ".snapshot.lz4"
+}
+
+// FormatLegacyWALSegmentFilename returns the filename for a legacy WAL segment.
+// Format: <index>-<offset>.wal.lz4
+func FormatLegacyWALSegmentFilename(index int, offset int64) string {
+	return strconv.Itoa(index) + "-" + strconv.FormatInt(offset, 10) + ".wal.lz4"
+}
+
+// ParseLegacySnapshotFilename parses a legacy snapshot filename.
+// Returns the index or an error if the filename is invalid.
+func ParseLegacySnapshotFilename(name string) (index int, err error) {
+	if !strings.HasSuffix(name, ".snapshot.lz4") {
+		return 0, errors.New("invalid legacy snapshot filename")
+	}
+	name = strings.TrimSuffix(name, ".snapshot.lz4")
+	return strconv.Atoi(name)
+}
+
+// ParseLegacyWALSegmentFilename parses a legacy WAL segment filename.
+// Returns the index and offset or an error if the filename is invalid.
+func ParseLegacyWALSegmentFilename(name string) (index int, offset int64, err error) {
+	if !strings.HasSuffix(name, ".wal.lz4") {
+		return 0, 0, errors.New("invalid legacy WAL segment filename")
+	}
+	name = strings.TrimSuffix(name, ".wal.lz4")
+
+	parts := strings.Split(name, "-")
+	if len(parts) != 2 {
+		return 0, 0, errors.New("invalid legacy WAL segment filename format")
+	}
+
+	index, err = strconv.Atoi(parts[0])
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid index: %w", err)
+	}
+
+	offset, err = strconv.ParseInt(parts[1], 10, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid offset: %w", err)
+	}
+
+	return index, offset, nil
+}
+
+// IsValidGenerationID returns true if s is a valid 16-character hex generation ID.
+func IsValidGenerationID(s string) bool {
+	if len(s) != 16 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return false
+		}
+	}
+	return true
 }

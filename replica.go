@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -505,6 +506,18 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
+	// Check if this is a legacy v0.3.x format backup.
+	if detector, ok := r.Client.(LegacyDetector); ok {
+		isLegacy, err := detector.IsLegacyFormat(ctx)
+		if err != nil {
+			return fmt.Errorf("check legacy format: %w", err)
+		}
+		if isLegacy {
+			r.Logger().Info("detected v0.3.x legacy backup format, using legacy restore")
+			return r.restoreLegacy(ctx, detector, opt)
+		}
+	}
+
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
@@ -669,4 +682,276 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	}
 
 	return infos, nil
+}
+
+// restoreLegacy restores a database from a v0.3.x format backup.
+// This handles the legacy format with generations/, snapshots/, and wal/ directories.
+func (r *Replica) restoreLegacy(ctx context.Context, detector LegacyDetector, opt RestoreOptions) error {
+	// Find the latest generation with snapshots.
+	generations, err := detector.LegacyGenerations(ctx)
+	if err != nil {
+		return fmt.Errorf("list generations: %w", err)
+	}
+	if len(generations) == 0 {
+		return fmt.Errorf("no generations found in legacy backup")
+	}
+
+	// Find the best generation and snapshot to restore from.
+	var bestGen string
+	var bestSnapshot *LegacySnapshotInfo
+
+	for i := len(generations) - 1; i >= 0; i-- {
+		gen := generations[i]
+		snapshots, err := detector.LegacySnapshots(ctx, gen)
+		if err != nil {
+			r.Logger().Warn("failed to list snapshots for generation", "generation", gen, "error", err)
+			continue
+		}
+		if len(snapshots) == 0 {
+			continue
+		}
+
+		// Find the latest snapshot before the target timestamp (if specified).
+		for j := len(snapshots) - 1; j >= 0; j-- {
+			snap := snapshots[j]
+			if !opt.Timestamp.IsZero() && snap.CreatedAt.After(opt.Timestamp) {
+				continue
+			}
+			bestGen = gen
+			bestSnapshot = &snap
+			break
+		}
+
+		if bestSnapshot != nil {
+			break
+		}
+	}
+
+	if bestSnapshot == nil {
+		return fmt.Errorf("no suitable snapshot found for restore")
+	}
+
+	r.Logger().Info("restoring from legacy backup",
+		"generation", bestGen,
+		"snapshot_index", bestSnapshot.Index,
+		"snapshot_time", bestSnapshot.CreatedAt)
+
+	// Create parent directory if it doesn't exist.
+	var dirInfo os.FileInfo
+	if db := r.DB(); db != nil {
+		dirInfo = db.dirInfo
+	}
+	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
+	}
+
+	// Create temp file for the restored database.
+	tmpOutputPath := opt.OutputPath + ".tmp"
+	defer os.Remove(tmpOutputPath)
+
+	// Download and decompress the snapshot.
+	r.Logger().Debug("downloading legacy snapshot", "index", bestSnapshot.Index)
+	if err := r.downloadLegacySnapshot(ctx, detector, bestGen, bestSnapshot.Index, tmpOutputPath); err != nil {
+		return fmt.Errorf("download snapshot: %w", err)
+	}
+
+	// Get WAL segments after the snapshot.
+	walSegments, err := detector.LegacyWALSegments(ctx, bestGen)
+	if err != nil {
+		return fmt.Errorf("list wal segments: %w", err)
+	}
+
+	// Filter WAL segments to only include those after the snapshot.
+	var segmentsToApply []LegacyWALSegmentInfo
+	for _, seg := range walSegments {
+		if seg.Index < bestSnapshot.Index {
+			continue
+		}
+		if !opt.Timestamp.IsZero() && seg.CreatedAt.After(opt.Timestamp) {
+			continue
+		}
+		segmentsToApply = append(segmentsToApply, seg)
+	}
+
+	if len(segmentsToApply) > 0 {
+		r.Logger().Info("applying WAL segments", "count", len(segmentsToApply))
+		if err := r.applyLegacyWALSegments(ctx, detector, bestGen, segmentsToApply, tmpOutputPath, opt.Parallelism); err != nil {
+			return fmt.Errorf("apply wal segments: %w", err)
+		}
+	}
+
+	// Rename temp file to final path.
+	r.Logger().Debug("renaming database from temporary location")
+	return os.Rename(tmpOutputPath, opt.OutputPath)
+}
+
+// downloadLegacySnapshot downloads and decompresses a legacy snapshot to the output path.
+func (r *Replica) downloadLegacySnapshot(ctx context.Context, detector LegacyDetector, generation string, index int, outputPath string) error {
+	rc, err := detector.OpenLegacySnapshot(ctx, generation, index)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	// Create output file.
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Decompress LZ4 and write to file.
+	lz4Reader := internal.NewLZ4Reader(rc)
+	defer lz4Reader.Close()
+
+	if _, err := io.Copy(f, lz4Reader); err != nil {
+		return fmt.Errorf("decompress snapshot: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	return f.Close()
+}
+
+// applyLegacyWALSegments downloads and applies WAL segments to the database.
+func (r *Replica) applyLegacyWALSegments(ctx context.Context, detector LegacyDetector, generation string, segments []LegacyWALSegmentInfo, dbPath string, parallelism int) error {
+	if parallelism <= 0 {
+		parallelism = DefaultRestoreParallelism
+	}
+
+	// Create temp directory for WAL segments.
+	tmpDir, err := os.MkdirTemp("", "litestream-legacy-wal-*")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// Download WAL segments in parallel.
+	type downloadResult struct {
+		index int
+		path  string
+		err   error
+	}
+
+	resultCh := make(chan downloadResult, len(segments))
+	sem := make(chan struct{}, parallelism)
+
+	for i, seg := range segments {
+		seg := seg
+		i := i
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case sem <- struct{}{}:
+		}
+
+		go func() {
+			defer func() { <-sem }()
+
+			walPath := filepath.Join(tmpDir, fmt.Sprintf("%08d-%016x.wal", seg.Index, seg.Offset))
+			err := r.downloadLegacyWALSegment(ctx, detector, generation, seg.Index, seg.Offset, walPath)
+			resultCh <- downloadResult{index: i, path: walPath, err: err}
+		}()
+	}
+
+	// Collect results.
+	walPaths := make([]string, len(segments))
+	for range segments {
+		result := <-resultCh
+		if result.err != nil {
+			return fmt.Errorf("download wal segment %d: %w", result.index, result.err)
+		}
+		walPaths[result.index] = result.path
+	}
+
+	// Apply WAL segments sequentially using SQLite.
+	for i, walPath := range walPaths {
+		if err := r.applyLegacyWAL(ctx, dbPath, walPath); err != nil {
+			return fmt.Errorf("apply wal segment %d: %w", i, err)
+		}
+	}
+
+	return nil
+}
+
+// downloadLegacyWALSegment downloads and decompresses a legacy WAL segment.
+func (r *Replica) downloadLegacyWALSegment(ctx context.Context, detector LegacyDetector, generation string, index int, offset int64, outputPath string) error {
+	rc, err := detector.OpenLegacyWALSegment(ctx, generation, index, offset)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	f, err := os.Create(outputPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Decompress LZ4 and write to file.
+	lz4Reader := internal.NewLZ4Reader(rc)
+	defer lz4Reader.Close()
+
+	if _, err := io.Copy(f, lz4Reader); err != nil {
+		return fmt.Errorf("decompress wal segment: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	return f.Close()
+}
+
+// applyLegacyWAL applies a single WAL file to the database using SQLite's recovery mechanism.
+func (r *Replica) applyLegacyWAL(ctx context.Context, dbPath, walPath string) error {
+	// In v0.3.x, WAL files were applied by:
+	// 1. Copying the WAL file to the database's WAL location
+	// 2. Opening the database which triggers SQLite to replay the WAL
+	// 3. Checkpointing to apply WAL to main database file
+
+	// Copy WAL file to expected location.
+	dbWALPath := dbPath + "-wal"
+	if err := copyFile(walPath, dbWALPath); err != nil {
+		return fmt.Errorf("copy wal file: %w", err)
+	}
+	defer os.Remove(dbWALPath)
+
+	// Open the database which will trigger WAL recovery.
+	db, err := sql.Open("sqlite", dbPath+"?_journal_mode=WAL")
+	if err != nil {
+		return fmt.Errorf("open database: %w", err)
+	}
+	defer db.Close()
+
+	// Force a checkpoint to apply WAL changes to main database.
+	if _, err := db.ExecContext(ctx, "PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+		return fmt.Errorf("checkpoint: %w", err)
+	}
+
+	return nil
+}
+
+// copyFile copies a file from src to dst.
+func copyFile(src, dst string) error {
+	srcFile, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer srcFile.Close()
+
+	dstFile, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer dstFile.Close()
+
+	if _, err := io.Copy(dstFile, srcFile); err != nil {
+		return err
+	}
+
+	return dstFile.Sync()
 }

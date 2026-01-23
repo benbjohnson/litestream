@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1440,4 +1441,226 @@ func parseS3DebugEnv() aws.ClientLogMode {
 		}
 	}
 	return logMode
+}
+
+// Ensure ReplicaClient implements the LegacyDetector interface.
+var _ litestream.LegacyDetector = (*ReplicaClient)(nil)
+
+// IsLegacyFormat returns true if the replica contains v0.3.x format backups.
+func (c *ReplicaClient) IsLegacyFormat(ctx context.Context) (bool, error) {
+	if err := c.Init(ctx); err != nil {
+		return false, err
+	}
+
+	// Check for the presence of the generations/ directory by listing objects
+	prefix := c.Path + "/" + litestream.LegacyGenerationsDir + "/"
+	out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:  aws.String(c.Bucket),
+		Prefix:  aws.String(prefix),
+		MaxKeys: aws.Int32(1),
+	})
+	if err != nil {
+		return false, fmt.Errorf("s3: check legacy format: %w", err)
+	}
+
+	return len(out.Contents) > 0, nil
+}
+
+// LegacyGenerations returns a list of generation IDs found in the replica.
+func (c *ReplicaClient) LegacyGenerations(ctx context.Context) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := c.Path + "/" + litestream.LegacyGenerationsDir + "/"
+
+	// Use CommonPrefixes with delimiter to get generation directories
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(c.Bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	})
+
+	generationSet := make(map[string]struct{})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list generations: %w", err)
+		}
+
+		for _, commonPrefix := range page.CommonPrefixes {
+			p := aws.ToString(commonPrefix.Prefix)
+			// Extract generation ID from prefix like "path/generations/abc123def456/"
+			p = strings.TrimPrefix(p, prefix)
+			p = strings.TrimSuffix(p, "/")
+			if litestream.IsValidGenerationID(p) {
+				generationSet[p] = struct{}{}
+			}
+		}
+	}
+
+	generations := make([]string, 0, len(generationSet))
+	for g := range generationSet {
+		generations = append(generations, g)
+	}
+	sort.Strings(generations)
+	return generations, nil
+}
+
+// LegacySnapshots returns a list of snapshots for a given generation.
+func (c *ReplicaClient) LegacySnapshots(ctx context.Context, generation string) ([]litestream.LegacySnapshotInfo, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := c.Path + "/" + litestream.LegacyGenerationsDir + "/" + generation + "/" + litestream.LegacySnapshotsDir + "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var infos []litestream.LegacySnapshotInfo
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list snapshots: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			filename := path.Base(key)
+
+			index, err := litestream.ParseLegacySnapshotFilename(filename)
+			if err != nil {
+				continue
+			}
+
+			infos = append(infos, litestream.LegacySnapshotInfo{
+				Generation: generation,
+				Index:      index,
+				Size:       aws.ToInt64(obj.Size),
+				CreatedAt:  aws.ToTime(obj.LastModified).UTC(),
+			})
+		}
+	}
+
+	// Sort by index ascending
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].Index < infos[j].Index
+	})
+
+	return infos, nil
+}
+
+// LegacyWALSegments returns a list of WAL segments for a given generation.
+func (c *ReplicaClient) LegacyWALSegments(ctx context.Context, generation string) ([]litestream.LegacyWALSegmentInfo, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := c.Path + "/" + litestream.LegacyGenerationsDir + "/" + generation + "/" + litestream.LegacyWALDir + "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var infos []litestream.LegacyWALSegmentInfo
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list wal segments: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			key := aws.ToString(obj.Key)
+			filename := path.Base(key)
+
+			index, offset, err := litestream.ParseLegacyWALSegmentFilename(filename)
+			if err != nil {
+				continue
+			}
+
+			infos = append(infos, litestream.LegacyWALSegmentInfo{
+				Generation: generation,
+				Index:      index,
+				Offset:     offset,
+				Size:       aws.ToInt64(obj.Size),
+				CreatedAt:  aws.ToTime(obj.LastModified).UTC(),
+			})
+		}
+	}
+
+	// Sort by index and offset ascending
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].Index != infos[j].Index {
+			return infos[i].Index < infos[j].Index
+		}
+		return infos[i].Offset < infos[j].Offset
+	})
+
+	return infos, nil
+}
+
+// OpenLegacySnapshot opens a reader for a legacy snapshot file.
+func (c *ReplicaClient) OpenLegacySnapshot(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	key := c.Path + "/" + litestream.LegacyGenerationsDir + "/" + generation + "/" +
+		litestream.LegacySnapshotsDir + "/" + litestream.FormatLegacySnapshotFilename(index)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("s3: get legacy snapshot %s: %w", key, err)
+	}
+	return out.Body, nil
+}
+
+// OpenLegacyWALSegment opens a reader for a legacy WAL segment file.
+func (c *ReplicaClient) OpenLegacyWALSegment(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	key := c.Path + "/" + litestream.LegacyGenerationsDir + "/" + generation + "/" +
+		litestream.LegacyWALDir + "/" + litestream.FormatLegacyWALSegmentFilename(index, offset)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("s3: get legacy wal segment %s: %w", key, err)
+	}
+	return out.Body, nil
 }

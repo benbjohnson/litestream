@@ -154,3 +154,31 @@ func FetchPage(ctx context.Context, client ReplicaClient, level int, minTXID, ma
 	}
 	return ltx.DecodePageData(b)
 }
+
+// LegacyDetector is an optional interface that ReplicaClient implementations
+// can implement to support restoring from v0.3.x format backups.
+type LegacyDetector interface {
+	// IsLegacyFormat returns true if the replica contains v0.3.x format backups.
+	// This is detected by checking for the presence of a "generations/" directory.
+	IsLegacyFormat(ctx context.Context) (bool, error)
+
+	// LegacyGenerations returns a list of generation IDs (16-char hex strings)
+	// found in the replica. Returns empty slice if no generations exist.
+	LegacyGenerations(ctx context.Context) ([]string, error)
+
+	// LegacySnapshots returns a list of snapshots for a given generation.
+	// Results are sorted by index in ascending order.
+	LegacySnapshots(ctx context.Context, generation string) ([]LegacySnapshotInfo, error)
+
+	// LegacyWALSegments returns a list of WAL segments for a given generation.
+	// Results are sorted by index and offset in ascending order.
+	LegacyWALSegments(ctx context.Context, generation string) ([]LegacyWALSegmentInfo, error)
+
+	// OpenLegacySnapshot opens a reader for a legacy snapshot file.
+	// The returned reader contains LZ4-compressed data.
+	OpenLegacySnapshot(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+
+	// OpenLegacyWALSegment opens a reader for a legacy WAL segment file.
+	// The returned reader contains LZ4-compressed data.
+	OpenLegacyWALSegment(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error)
+}

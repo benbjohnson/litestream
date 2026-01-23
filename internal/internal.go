@@ -6,6 +6,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -59,6 +60,32 @@ func (r *ReadCounter) Read(p []byte) (int, error) {
 
 // N returns the total number of bytes read.
 func (r *ReadCounter) N() int64 { return r.n }
+
+// NewLZ4Reader returns an io.ReadCloser that decompresses LZ4 data from r.
+// The returned reader must be closed after use.
+func NewLZ4Reader(r io.Reader) io.ReadCloser {
+	return &lz4ReadCloser{
+		reader: lz4.NewReader(r),
+		source: r,
+	}
+}
+
+type lz4ReadCloser struct {
+	reader *lz4.Reader
+	source io.Reader
+}
+
+func (r *lz4ReadCloser) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *lz4ReadCloser) Close() error {
+	// Close source if it implements io.Closer
+	if closer, ok := r.source.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
 
 // CreateFile creates the file and matches the mode & uid/gid of fi.
 func CreateFile(filename string, fi os.FileInfo) (*os.File, error) {

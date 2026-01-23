@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -250,4 +251,144 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// Ensure ReplicaClient implements the LegacyDetector interface.
+var _ litestream.LegacyDetector = (*ReplicaClient)(nil)
+
+// IsLegacyFormat returns true if the replica contains v0.3.x format backups.
+func (c *ReplicaClient) IsLegacyFormat(ctx context.Context) (bool, error) {
+	generationsPath := filepath.Join(c.path, litestream.LegacyGenerationsDir)
+	fi, err := os.Stat(generationsPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return fi.IsDir(), nil
+}
+
+// LegacyGenerations returns a list of generation IDs found in the replica.
+func (c *ReplicaClient) LegacyGenerations(ctx context.Context) ([]string, error) {
+	generationsPath := filepath.Join(c.path, litestream.LegacyGenerationsDir)
+	f, err := os.Open(generationsPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fis, err := f.Readdir(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	var generations []string
+	for _, fi := range fis {
+		if !fi.IsDir() {
+			continue
+		}
+		if !litestream.IsValidGenerationID(fi.Name()) {
+			continue
+		}
+		generations = append(generations, fi.Name())
+	}
+
+	sort.Strings(generations)
+	return generations, nil
+}
+
+// LegacySnapshots returns a list of snapshots for a given generation.
+func (c *ReplicaClient) LegacySnapshots(ctx context.Context, generation string) ([]litestream.LegacySnapshotInfo, error) {
+	snapshotDir := filepath.FromSlash(litestream.LegacySnapshotDir(c.path, generation))
+	f, err := os.Open(snapshotDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fis, err := f.Readdir(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	var infos []litestream.LegacySnapshotInfo
+	for _, fi := range fis {
+		index, err := litestream.ParseLegacySnapshotFilename(fi.Name())
+		if err != nil {
+			continue
+		}
+
+		infos = append(infos, litestream.LegacySnapshotInfo{
+			Generation: generation,
+			Index:      index,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		})
+	}
+
+	// Sort by index ascending
+	sort.Slice(infos, func(i, j int) bool {
+		return infos[i].Index < infos[j].Index
+	})
+
+	return infos, nil
+}
+
+// LegacyWALSegments returns a list of WAL segments for a given generation.
+func (c *ReplicaClient) LegacyWALSegments(ctx context.Context, generation string) ([]litestream.LegacyWALSegmentInfo, error) {
+	walDir := filepath.FromSlash(litestream.LegacyWALDirPath(c.path, generation))
+	f, err := os.Open(walDir)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	fis, err := f.Readdir(-1)
+	if err != nil {
+		return nil, err
+	}
+
+	var infos []litestream.LegacyWALSegmentInfo
+	for _, fi := range fis {
+		index, offset, err := litestream.ParseLegacyWALSegmentFilename(fi.Name())
+		if err != nil {
+			continue
+		}
+
+		infos = append(infos, litestream.LegacyWALSegmentInfo{
+			Generation: generation,
+			Index:      index,
+			Offset:     offset,
+			Size:       fi.Size(),
+			CreatedAt:  fi.ModTime().UTC(),
+		})
+	}
+
+	// Sort by index and offset ascending
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].Index != infos[j].Index {
+			return infos[i].Index < infos[j].Index
+		}
+		return infos[i].Offset < infos[j].Offset
+	})
+
+	return infos, nil
+}
+
+// OpenLegacySnapshot opens a reader for a legacy snapshot file.
+func (c *ReplicaClient) OpenLegacySnapshot(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	path := filepath.FromSlash(litestream.LegacySnapshotPath(c.path, generation, index))
+	return os.Open(path)
+}
+
+// OpenLegacyWALSegment opens a reader for a legacy WAL segment file.
+func (c *ReplicaClient) OpenLegacyWALSegment(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error) {
+	path := filepath.FromSlash(litestream.LegacyWALSegmentPath(c.path, generation, index, offset))
+	return os.Open(path)
 }
