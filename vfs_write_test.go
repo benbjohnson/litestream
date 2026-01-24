@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -1079,6 +1080,59 @@ func TestSetWriteEnabled_EnableAfterDisable(t *testing.T) {
 
 	if len(f.dirty) == 0 {
 		t.Error("expected dirty pages after write")
+	}
+}
+
+func TestSetWriteEnabled_DisableWithTimeout(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Start a transaction (acquire RESERVED lock)
+	if err := f.Lock(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write some data
+	if _, err := f.WriteAt([]byte("tx data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Try to disable with a short timeout - should fail
+	err := f.SetWriteEnabledWithTimeout(false, 50*time.Millisecond)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "timeout waiting for transaction") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Write should still be enabled
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to still be true after timeout")
+	}
+
+	// End transaction
+	if err := f.Unlock(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now disable should succeed (with or without timeout)
+	if err := f.SetWriteEnabledWithTimeout(false, 1*time.Second); err != nil {
+		t.Fatalf("SetWriteEnabledWithTimeout failed: %v", err)
+	}
+
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false")
 	}
 }
 

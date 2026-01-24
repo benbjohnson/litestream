@@ -962,8 +962,10 @@ func (f *VFSFile) Open() error {
 	if f.writeEnabled && f.syncInterval > 0 {
 		f.syncTicker = time.NewTicker(f.syncInterval)
 		f.syncStop = make(chan struct{})
+		stopCh := f.syncStop
+		tickerCh := f.syncTicker.C
 		f.wg.Add(1)
-		go func() { defer f.wg.Done(); f.syncLoop() }()
+		go func() { defer f.wg.Done(); f.syncLoop(stopCh, tickerCh) }()
 	}
 
 	// Start compaction monitors if enabled
@@ -1017,8 +1019,10 @@ func (f *VFSFile) openNewDatabase() error {
 	if f.syncInterval > 0 {
 		f.syncTicker = time.NewTicker(f.syncInterval)
 		f.syncStop = make(chan struct{})
+		stopCh := f.syncStop
+		tickerCh := f.syncTicker.C
 		f.wg.Add(1)
-		go func() { defer f.wg.Done(); f.syncLoop() }()
+		go func() { defer f.wg.Done(); f.syncLoop(stopCh, tickerCh) }()
 	}
 
 	// Start compaction monitors if enabled
@@ -1236,11 +1240,13 @@ func (f *VFSFile) Close() error {
 	}
 
 	// Final sync of dirty pages before closing
+	f.mu.Lock()
 	if f.writeEnabled && len(f.dirty) > 0 {
 		if err := f.syncToRemote(); err != nil {
 			f.logger.Error("failed to sync on close", "error", err)
 		}
 	}
+	f.mu.Unlock()
 
 	f.cancel()
 	f.wg.Wait()
@@ -1271,8 +1277,8 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	pageOffset := int(off % int64(pageSize))
 
 	// Check dirty pages first (takes priority over cache and remote)
+	f.mu.Lock()
 	if f.writeEnabled {
-		f.mu.Lock()
 		if bufferOff, ok := f.dirty[pgno]; ok {
 			// Read page from buffer file
 			data := make([]byte, pageSize)
@@ -1292,8 +1298,8 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 
 			return n, nil
 		}
-		f.mu.Unlock()
 	}
+	f.mu.Unlock()
 
 	// If hydration complete, read from local file
 	if f.hydrator != nil && f.hydrator.Complete() {
@@ -1382,11 +1388,6 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	f.logger.Debug("write at", "off", off, "len", len(b))
 
-	// If write support is not enabled, return read-only error
-	if !f.writeEnabled {
-		return 0, fmt.Errorf("litestream is a read only vfs")
-	}
-
 	pageSize, err := f.pageSizeBytes()
 	if err != nil {
 		return 0, err
@@ -1403,6 +1404,11 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	// If write support is not enabled, return read-only error
+	if !f.writeEnabled {
+		return 0, fmt.Errorf("litestream is a read only vfs")
+	}
 
 	// Get page data - either from buffer file (if dirty) or from cache/remote
 	page := make([]byte, pageSize)
@@ -1472,11 +1478,6 @@ func (f *VFSFile) readPageForWrite(pgno uint32, buf []byte) error {
 func (f *VFSFile) Truncate(size int64) error {
 	f.logger.Debug("truncating file", "size", size)
 
-	// If write support is not enabled, return read-only error
-	if !f.writeEnabled {
-		return fmt.Errorf("litestream is a read only vfs")
-	}
-
 	pageSize, err := f.pageSizeBytes()
 	if err != nil {
 		return err
@@ -1486,6 +1487,11 @@ func (f *VFSFile) Truncate(size int64) error {
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	// If write support is not enabled, return read-only error
+	if !f.writeEnabled {
+		return fmt.Errorf("litestream is a read only vfs")
+	}
 
 	// Remove dirty pages beyond new size
 	for pgno := range f.dirty {
@@ -1511,40 +1517,48 @@ func (f *VFSFile) Truncate(size int64) error {
 func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 	f.logger.Debug("syncing file", "flag", flag)
 
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	// If write support is not enabled, no-op
 	if !f.writeEnabled {
 		return nil
 	}
 
-	f.mu.Lock()
 	// Skip sync if no dirty pages
 	if len(f.dirty) == 0 {
-		f.mu.Unlock()
 		return nil
 	}
 	// Skip sync during active transaction
 	if f.inTransaction {
-		f.mu.Unlock()
 		f.logger.Debug("skipping sync during transaction")
 		return nil
 	}
-	f.mu.Unlock()
 
 	return f.syncToRemote()
 }
 
 // SetWriteEnabled enables or disables write support at runtime.
+// This is equivalent to SetWriteEnabledWithTimeout(enabled, 0) which waits indefinitely.
+func (f *VFSFile) SetWriteEnabled(enabled bool) error {
+	return f.SetWriteEnabledWithTimeout(enabled, 0)
+}
+
+// SetWriteEnabledWithTimeout enables or disables write support at runtime with an optional timeout.
 //
 // When disabling (enabled=false):
-//   - If called during an active transaction, waits up to 30 seconds for completion
+//   - If called during an active transaction, waits for completion
+//   - If timeout > 0, returns error after timeout if transaction doesn't complete
+//   - If timeout == 0, waits indefinitely (or until context cancellation)
 //   - Syncs all dirty pages to replica before returning
 //   - Returns error if sync fails (writes remain enabled)
 //   - Stops the sync ticker if running
 //
 // When enabling (enabled=true):
 //   - Initializes buffer file if not already present (cold enable)
+//   - Starts sync ticker using DefaultSyncInterval if not configured
 //   - Starts sync ticker if syncInterval > 0 and not already running
-func (f *VFSFile) SetWriteEnabled(enabled bool) error {
+func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration) error {
 	f.mu.Lock()
 
 	// No-op if already in the requested state
@@ -1556,26 +1570,32 @@ func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 	if !enabled {
 		// DISABLING writes
 
-		// Wait for active transaction to complete (with timeout)
-		const maxWait = 30 * time.Second
-		deadline := time.Now().Add(maxWait)
+		// Wait for active transaction to complete
+		var deadline time.Time
+		if timeout > 0 {
+			deadline = time.Now().Add(timeout)
+		}
 		for f.inTransaction {
-			if time.Now().After(deadline) {
+			// Check timeout if specified
+			if timeout > 0 && time.Now().After(deadline) {
 				f.mu.Unlock()
-				return fmt.Errorf("timeout waiting for transaction to complete (waited %v)", maxWait)
+				return fmt.Errorf("timeout waiting for transaction to complete (waited %v)", timeout)
 			}
 			f.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
+			select {
+			case <-f.ctx.Done():
+				return fmt.Errorf("context cancelled while waiting for transaction to complete: %w", f.ctx.Err())
+			case <-time.After(10 * time.Millisecond):
+			}
 			f.mu.Lock()
 		}
 
 		// Sync dirty pages if any exist
 		if len(f.dirty) > 0 {
-			f.mu.Unlock()
 			if err := f.syncToRemote(); err != nil {
+				f.mu.Unlock()
 				return fmt.Errorf("sync before disable: %w", err)
 			}
-			f.mu.Lock()
 		}
 
 		// Stop sync loop and ticker if running
@@ -1601,9 +1621,13 @@ func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 		f.dirty = make(map[uint32]int64)
 	}
 
-	// Set sync interval from VFS config if not set (preserve 0 = no periodic sync)
+	// Set sync interval from VFS config if not set, falling back to default
+	// This mirrors the startup behavior where WriteSyncInterval==0 uses DefaultSyncInterval
 	if f.syncInterval == 0 && f.vfs != nil {
 		f.syncInterval = f.vfs.WriteSyncInterval
+		if f.syncInterval == 0 {
+			f.syncInterval = DefaultSyncInterval
+		}
 	}
 
 	// Set buffer path if not set
@@ -1626,11 +1650,10 @@ func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 
 	// Initialize buffer file if not present
 	if f.bufferFile == nil {
-		f.mu.Unlock()
 		if err := f.initWriteBuffer(); err != nil {
+			f.mu.Unlock()
 			return fmt.Errorf("init write buffer: %w", err)
 		}
-		f.mu.Lock()
 	}
 
 	// Initialize write tracking state if this is a cold enable
@@ -1644,8 +1667,10 @@ func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 	if f.syncTicker == nil && f.syncInterval > 0 {
 		f.syncTicker = time.NewTicker(f.syncInterval)
 		f.syncStop = make(chan struct{})
+		stopCh := f.syncStop
+		tickerCh := f.syncTicker.C
 		f.wg.Add(1)
-		go func() { defer f.wg.Done(); f.syncLoop() }()
+		go func() { defer f.wg.Done(); f.syncLoop(stopCh, tickerCh) }()
 	}
 
 	f.writeEnabled = true
@@ -1655,15 +1680,10 @@ func (f *VFSFile) SetWriteEnabled(enabled bool) error {
 }
 
 // syncLoop runs periodic sync in the background.
-// It uses a local copy of the stop channel to avoid races with SetWriteEnabled.
-func (f *VFSFile) syncLoop() {
+// The stop channel and ticker channel are passed as parameters to avoid races
+// with SetWriteEnabled potentially nilling them out before this goroutine starts.
+func (f *VFSFile) syncLoop(stopCh <-chan struct{}, tickerCh <-chan time.Time) {
 	f.logger.Debug("starting sync loop", "interval", f.syncInterval)
-
-	// Capture references under mutex to avoid races
-	f.mu.Lock()
-	stopCh := f.syncStop
-	tickerCh := f.syncTicker.C
-	f.mu.Unlock()
 
 	for {
 		select {
@@ -1682,10 +1702,8 @@ func (f *VFSFile) syncLoop() {
 }
 
 // syncToRemote syncs dirty pages to the remote replica.
+// Caller must hold f.mu.
 func (f *VFSFile) syncToRemote() error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
 	// Double-check dirty pages exist
 	if len(f.dirty) == 0 {
 		return nil
@@ -2133,7 +2151,10 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 	case "litestream_write_enabled":
 		if pragmaValue == nil {
 			// READ mode - return current state
-			if f.writeEnabled {
+			f.mu.Lock()
+			enabled := f.writeEnabled
+			f.mu.Unlock()
+			if enabled {
 				result := "1"
 				return &result, nil
 			}
