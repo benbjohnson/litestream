@@ -519,6 +519,7 @@ type VFSFile struct {
 	syncStop      chan struct{}    // Signal to stop sync loop
 	inTransaction bool             // True during active write transaction
 	disabling     bool             // True when write disable is in progress
+	cond          *sync.Cond       // Signals transaction state changes
 
 	hydrator      *Hydrator // Background hydration (nil if disabled)
 	hydrationPath string    // Path for hydration file (set during Open)
@@ -834,6 +835,7 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 		CacheSize:    DefaultCacheSize,
 	}
 	f.ctx, f.cancel = context.WithCancel(context.Background())
+	f.cond = sync.NewCond(&f.mu)
 	return f
 }
 
@@ -1575,34 +1577,56 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 		// Set disabling flag to prevent new transactions from starting
 		f.disabling = true
 
-		// Wait for active transaction to complete
-		var deadline time.Time
+		// Start goroutine to wake us on context cancellation or timeout
+		// This ensures we don't block forever if context is cancelled or timeout expires
+		waitDone := make(chan struct{})
+		var timeoutCh <-chan time.Time
 		if timeout > 0 {
-			deadline = time.Now().Add(timeout)
+			timer := time.NewTimer(timeout)
+			defer timer.Stop()
+			timeoutCh = timer.C
 		}
+		go func() {
+			select {
+			case <-f.ctx.Done():
+				f.cond.Broadcast() // Wake cond.Wait()
+			case <-timeoutCh:
+				f.cond.Broadcast() // Wake cond.Wait() on timeout
+			case <-waitDone:
+				// Normal completion, nothing to do
+			}
+		}()
+
+		// Wait for active transaction to complete
+		deadline := time.Now().Add(timeout)
 		for f.inTransaction {
+			// Check context before waiting
+			select {
+			case <-f.ctx.Done():
+				close(waitDone)
+				f.disabling = false
+				f.cond.Broadcast() // Wake any waiting Lock() calls
+				f.mu.Unlock()
+				return fmt.Errorf("context cancelled while waiting for transaction: %w", f.ctx.Err())
+			default:
+			}
 			// Check timeout if specified
 			if timeout > 0 && time.Now().After(deadline) {
+				close(waitDone)
 				f.disabling = false
+				f.cond.Broadcast() // Wake any waiting Lock() calls
 				f.mu.Unlock()
 				return fmt.Errorf("timeout waiting for transaction to complete (waited %v)", timeout)
 			}
-			f.mu.Unlock()
-			select {
-			case <-f.ctx.Done():
-				f.mu.Lock()
-				f.disabling = false
-				f.mu.Unlock()
-				return fmt.Errorf("context cancelled while waiting for transaction to complete: %w", f.ctx.Err())
-			case <-time.After(10 * time.Millisecond):
-			}
-			f.mu.Lock()
+			f.cond.Wait() // Unlocks mu, waits for signal, relocks mu
 		}
+		close(waitDone) // Stop the watcher goroutine
 
 		// Sync dirty pages if any exist
 		if len(f.dirty) > 0 {
 			if err := f.syncToRemoteWithLock(); err != nil {
 				f.disabling = false
+				f.cond.Broadcast() // Wake any waiting Lock() calls
 				f.mu.Unlock()
 				return fmt.Errorf("sync before disable: %w", err)
 			}
@@ -1620,6 +1644,7 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 
 		f.writeEnabled = false
 		f.disabling = false
+		f.cond.Broadcast() // Wake any Lock() calls waiting for disable to complete
 		f.logger.Info("write support disabled")
 		f.mu.Unlock()
 		return nil
@@ -2007,9 +2032,17 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		return fmt.Errorf("invalid lock downgrade: current=%s target=%s", f.lockType, elock)
 	}
 
+	// Wait for any disable operation to complete before allowing RESERVED lock
+	// This prevents new write transactions from starting during disable
+	if elock >= sqlite3vfs.LockReserved {
+		for f.disabling {
+			f.logger.Debug("waiting for disable to complete before acquiring RESERVED lock")
+			f.cond.Wait()
+		}
+	}
+
 	// Track transaction start when acquiring RESERVED lock (write intent)
-	// Skip if disabling is in progress to prevent starvation during SetWriteEnabled(false)
-	if f.writeEnabled && !f.disabling && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
+	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
 		f.inTransaction = true
 		f.logger.Debug("transaction started", "expectedTXID", f.expectedTXID)
 	}
@@ -2032,6 +2065,7 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	if f.writeEnabled && f.inTransaction && elock < sqlite3vfs.LockReserved {
 		f.inTransaction = false
 		f.logger.Debug("transaction ended", "dirtyPages", len(f.dirty))
+		f.cond.Broadcast() // Wake up SetWriteEnabledWithTimeout if waiting
 	}
 
 	f.lockType = elock
