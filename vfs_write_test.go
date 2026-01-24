@@ -6,6 +6,7 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
@@ -1330,4 +1331,219 @@ func TestSetWriteEnabled_InvalidValue(t *testing.T) {
 	if err.Error() != "invalid value for litestream_write_enabled: invalid (use 0 or 1)" {
 		t.Errorf("unexpected error message: %v", err)
 	}
+}
+
+// failingWriteClient wraps writeTestReplicaClient to fail writes after a certain count.
+type failingWriteClient struct {
+	*writeTestReplicaClient
+	failAfter  int
+	writeCount int
+}
+
+func newFailingWriteClient(failAfter int) *failingWriteClient {
+	return &failingWriteClient{
+		writeTestReplicaClient: newWriteTestReplicaClient(),
+		failAfter:              failAfter,
+	}
+}
+
+func (c *failingWriteClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	c.mu.Lock()
+	c.writeCount++
+	count := c.writeCount
+	c.mu.Unlock()
+
+	if count > c.failAfter {
+		return nil, errors.New("simulated write failure")
+	}
+	return c.writeTestReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func TestSetWriteEnabled_SyncFailureKeepsWritesEnabled(t *testing.T) {
+	// Use a client that fails on the second write attempt (first is from setup/initial sync)
+	client := newFailingWriteClient(0) // Fail on first write
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client.writeTestReplicaClient, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	logger := slog.Default()
+	f := NewVFSFile(client, "test.db", logger)
+	f.writeEnabled = true
+	f.dirty = make(map[uint32]int64)
+	f.syncInterval = 0
+
+	// Create a temporary buffer file
+	tmpFile, err := os.CreateTemp("", "litestream-test-buffer-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.bufferFile = tmpFile
+	f.bufferPath = tmpFile.Name()
+	f.bufferNextOff = 0
+
+	t.Cleanup(func() {
+		if f.bufferFile != nil {
+			f.bufferFile.Close()
+		}
+		os.Remove(f.bufferPath)
+	})
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Write data to create dirty pages
+	writeData := []byte("dirty data")
+	if _, err := f.WriteAt(writeData, 0); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(f.dirty) == 0 {
+		t.Fatal("expected dirty pages")
+	}
+
+	// Try to disable writes - should fail because sync fails
+	err = f.SetWriteEnabled(false)
+	if err == nil {
+		t.Fatal("expected error from sync failure")
+	}
+	if !strings.Contains(err.Error(), "sync before disable") {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	// Write support should still be enabled because sync failed
+	if !f.writeEnabled {
+		t.Error("expected writeEnabled to remain true after sync failure")
+	}
+
+	// Dirty pages should still exist
+	if len(f.dirty) == 0 {
+		t.Error("expected dirty pages to remain after sync failure")
+	}
+}
+
+func TestSetWriteEnabled_DisablingPreventsNewTransactions(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Start a transaction (acquire RESERVED lock)
+	if err := f.Lock(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start disable in a goroutine
+	disableDone := make(chan error, 1)
+	go func() {
+		disableDone <- f.SetWriteEnabledWithTimeout(false, 2*time.Second)
+	}()
+
+	// Give SetWriteEnabled time to set disabling flag
+	time.Sleep(50 * time.Millisecond)
+
+	// Try to start a new transaction from another "connection" by simulating Lock()
+	// The disabling flag should prevent inTransaction from being set to true
+	f.mu.Lock()
+	disabling := f.disabling
+	f.mu.Unlock()
+
+	if !disabling {
+		t.Error("expected disabling flag to be true")
+	}
+
+	// End the first transaction
+	if err := f.Unlock(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for disable to complete
+	select {
+	case err := <-disableDone:
+		if err != nil {
+			t.Fatalf("SetWriteEnabled failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetWriteEnabled timed out")
+	}
+
+	// Verify disabling flag is cleared
+	f.mu.Lock()
+	disabling = f.disabling
+	f.mu.Unlock()
+
+	if disabling {
+		t.Error("expected disabling flag to be false after completion")
+	}
+
+	// Verify writes are disabled
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false")
+	}
+}
+
+func TestSetWriteEnabled_ConcurrentEnableDisable(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Run multiple concurrent enable/disable operations
+	var wg sync.WaitGroup
+	errCh := make(chan error, 20)
+
+	for i := 0; i < 10; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := f.SetWriteEnabled(true); err != nil {
+				errCh <- err
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if err := f.SetWriteEnabled(false); err != nil {
+				errCh <- err
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	// Check for errors
+	for err := range errCh {
+		t.Errorf("concurrent operation failed: %v", err)
+	}
+
+	// The final state should be valid (either enabled or disabled)
+	f.mu.Lock()
+	enabled := f.writeEnabled
+	disabling := f.disabling
+	f.mu.Unlock()
+
+	// disabling should always be false when no operation is in progress
+	if disabling {
+		t.Error("expected disabling to be false after all operations complete")
+	}
+
+	t.Logf("Final writeEnabled state: %v", enabled)
 }

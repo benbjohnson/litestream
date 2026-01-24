@@ -518,6 +518,7 @@ type VFSFile struct {
 	syncInterval  time.Duration    // Interval for periodic sync
 	syncStop      chan struct{}    // Signal to stop sync loop
 	inTransaction bool             // True during active write transaction
+	disabling     bool             // True when write disable is in progress
 
 	hydrator      *Hydrator // Background hydration (nil if disabled)
 	hydrationPath string    // Path for hydration file (set during Open)
@@ -1242,7 +1243,7 @@ func (f *VFSFile) Close() error {
 	// Final sync of dirty pages before closing
 	f.mu.Lock()
 	if f.writeEnabled && len(f.dirty) > 0 {
-		if err := f.syncToRemote(); err != nil {
+		if err := f.syncToRemoteWithLock(); err != nil {
 			f.logger.Error("failed to sync on close", "error", err)
 		}
 	}
@@ -1323,12 +1324,13 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	// Get page index element
 	f.mu.Lock()
 	elem, ok := f.index[pgno]
+	writeEnabled := f.writeEnabled // capture while holding lock to avoid data race
 	f.mu.Unlock()
 
 	if !ok {
 		// For write-enabled VFS with a new database (no existing pages),
 		// return zeros to indicate empty page. SQLite will initialize the database.
-		if f.writeEnabled {
+		if writeEnabled {
 			f.logger.Debug("page not found, returning zeros for new database", "page", pgno)
 			for i := range p {
 				p[i] = 0
@@ -1535,7 +1537,7 @@ func (f *VFSFile) Sync(flag sqlite3vfs.SyncType) error {
 		return nil
 	}
 
-	return f.syncToRemote()
+	return f.syncToRemoteWithLock()
 }
 
 // SetWriteEnabled enables or disables write support at runtime.
@@ -1570,6 +1572,9 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 	if !enabled {
 		// DISABLING writes
 
+		// Set disabling flag to prevent new transactions from starting
+		f.disabling = true
+
 		// Wait for active transaction to complete
 		var deadline time.Time
 		if timeout > 0 {
@@ -1578,12 +1583,16 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 		for f.inTransaction {
 			// Check timeout if specified
 			if timeout > 0 && time.Now().After(deadline) {
+				f.disabling = false
 				f.mu.Unlock()
 				return fmt.Errorf("timeout waiting for transaction to complete (waited %v)", timeout)
 			}
 			f.mu.Unlock()
 			select {
 			case <-f.ctx.Done():
+				f.mu.Lock()
+				f.disabling = false
+				f.mu.Unlock()
 				return fmt.Errorf("context cancelled while waiting for transaction to complete: %w", f.ctx.Err())
 			case <-time.After(10 * time.Millisecond):
 			}
@@ -1592,7 +1601,8 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 
 		// Sync dirty pages if any exist
 		if len(f.dirty) > 0 {
-			if err := f.syncToRemote(); err != nil {
+			if err := f.syncToRemoteWithLock(); err != nil {
+				f.disabling = false
 				f.mu.Unlock()
 				return fmt.Errorf("sync before disable: %w", err)
 			}
@@ -1609,6 +1619,7 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 		}
 
 		f.writeEnabled = false
+		f.disabling = false
 		f.logger.Info("write support disabled")
 		f.mu.Unlock()
 		return nil
@@ -1650,7 +1661,7 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 
 	// Initialize buffer file if not present
 	if f.bufferFile == nil {
-		if err := f.initWriteBuffer(); err != nil {
+		if err := f.initWriteBufferWithLock(); err != nil {
 			f.mu.Unlock()
 			return fmt.Errorf("init write buffer: %w", err)
 		}
@@ -1702,8 +1713,16 @@ func (f *VFSFile) syncLoop(stopCh <-chan struct{}, tickerCh <-chan time.Time) {
 }
 
 // syncToRemote syncs dirty pages to the remote replica.
-// Caller must hold f.mu.
+// This function acquires f.mu internally.
 func (f *VFSFile) syncToRemote() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.syncToRemoteWithLock()
+}
+
+// syncToRemoteWithLock syncs dirty pages to the remote replica.
+// Caller must hold f.mu.
+func (f *VFSFile) syncToRemoteWithLock() error {
 	// Double-check dirty pages exist
 	if len(f.dirty) == 0 {
 		return nil
@@ -1883,8 +1902,17 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 
 // initWriteBuffer initializes the write buffer file for durability.
 // Any existing buffer content is discarded since unsync'd changes are lost on restart.
-// This function is only called when writeEnabled is true, which guarantees bufferPath is set.
+// This function acquires f.mu internally.
 func (f *VFSFile) initWriteBuffer() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.initWriteBufferWithLock()
+}
+
+// initWriteBufferWithLock initializes the write buffer file for durability.
+// Any existing buffer content is discarded since unsync'd changes are lost on restart.
+// Caller must hold f.mu.
+func (f *VFSFile) initWriteBufferWithLock() error {
 	// Ensure parent directory exists
 	if err := os.MkdirAll(filepath.Dir(f.bufferPath), 0755); err != nil {
 		return fmt.Errorf("create buffer directory: %w", err)
@@ -1980,7 +2008,8 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 	}
 
 	// Track transaction start when acquiring RESERVED lock (write intent)
-	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
+	// Skip if disabling is in progress to prevent starvation during SetWriteEnabled(false)
+	if f.writeEnabled && !f.disabling && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
 		f.inTransaction = true
 		f.logger.Debug("transaction started", "expectedTXID", f.expectedTXID)
 	}
