@@ -387,10 +387,6 @@ func CheckForCriticalErrors(t *testing.T, db *TestDB) ([]string, error) {
 	// Filter out known benign errors
 	var criticalErrors []string
 	for _, errLine := range allErrors {
-		// Skip benign compaction errors that can occur during concurrent writes
-		if strings.Contains(errLine, "page size not initialized yet") {
-			continue
-		}
 		// Skip benign database removal errors that occur when closing databases
 		if strings.Contains(errLine, "remove database from store") &&
 			(strings.Contains(errLine, "transaction has already been committed or rolled back") ||

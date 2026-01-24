@@ -437,7 +437,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
 				slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
-				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path())
+				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				slog.Error("compaction failed", "level", lvl.Level, "error", err)
