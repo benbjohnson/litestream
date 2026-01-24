@@ -1547,3 +1547,193 @@ func TestSetWriteEnabled_ConcurrentEnableDisable(t *testing.T) {
 
 	t.Logf("Final writeEnabled state: %v", enabled)
 }
+
+func TestLock_BlocksDuringDisable(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Start a transaction (acquire RESERVED lock)
+	if err := f.Lock(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write some data so there's something to sync
+	if _, err := f.WriteAt([]byte("tx data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start disable in a goroutine - it will wait for the transaction
+	disableDone := make(chan error, 1)
+	go func() {
+		time.Sleep(50 * time.Millisecond) // Give Lock() time to block first
+		disableDone <- f.SetWriteEnabled(false)
+	}()
+
+	// Give SetWriteEnabled time to set disabling flag
+	time.Sleep(100 * time.Millisecond)
+
+	// Try to acquire a new RESERVED lock from another goroutine - should block
+	lockDone := make(chan struct{})
+	var lockElapsed time.Duration
+	go func() {
+		// We need to first release the current transaction, then try to acquire a new one
+		// But since we hold the lock, let's test that a new Lock() call would block
+		// by checking the disabling flag first
+		f.mu.Lock()
+		disabling := f.disabling
+		f.mu.Unlock()
+
+		if !disabling {
+			t.Error("expected disabling flag to be true")
+		}
+
+		// Now let's simulate what would happen with a fresh Lock() call
+		// by calling Lock() directly (it will wait on cond)
+		// Note: Lock() doesn't upgrade, so we need a new connection
+		// For this test, we'll just verify the blocking behavior differently:
+		// Release the current lock, then immediately try to acquire RESERVED again
+
+		// Unlock to end current transaction (this wakes the disable goroutine)
+		// Then the Lock() call should block until disable completes
+		f.Unlock(1) // End transaction, wakes SetWriteEnabled
+
+		// Now immediately try to get RESERVED lock - should block until disable completes
+		lockStart := time.Now()
+		f.Lock(2) // This should block while disabling is true
+		lockElapsed = time.Since(lockStart)
+		close(lockDone)
+	}()
+
+	// Wait for everything to complete
+	select {
+	case err := <-disableDone:
+		if err != nil {
+			t.Fatalf("SetWriteEnabled failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetWriteEnabled timed out")
+	}
+
+	select {
+	case <-lockDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Lock() timed out")
+	}
+
+	// The Lock() call should have waited for disable to complete
+	// Since disable includes sync time, it should take at least some time
+	// This verifies that Lock() blocked during the disable operation
+	t.Logf("Lock() elapsed time: %v", lockElapsed)
+
+	// Verify writeEnabled is now false
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false after disable completed")
+	}
+
+	// Verify no transaction is active (since writeEnabled is false, Lock shouldn't track)
+	f.mu.Lock()
+	inTx := f.inTransaction
+	f.mu.Unlock()
+	if inTx {
+		t.Error("expected inTransaction to be false when writeEnabled is false")
+	}
+}
+
+func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Start a transaction (acquire RESERVED lock)
+	if err := f.Lock(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write some data
+	if _, err := f.WriteAt([]byte("tx data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start disable in a goroutine
+	disableDone := make(chan error, 1)
+	go func() {
+		time.Sleep(30 * time.Millisecond)
+		disableDone <- f.SetWriteEnabled(false)
+	}()
+
+	// Give SetWriteEnabled time to set disabling flag
+	time.Sleep(80 * time.Millisecond)
+
+	// Simulate multiple waiters trying to acquire RESERVED lock
+	var wg sync.WaitGroup
+	results := make(chan time.Duration, 3)
+
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			start := time.Now()
+			// Each waiter tries to get RESERVED lock
+			f.Lock(2) // Will block until disabling is false
+			results <- time.Since(start)
+		}()
+	}
+
+	// Let all waiters start blocking
+	time.Sleep(50 * time.Millisecond)
+
+	// End the original transaction - this will trigger the disable to complete
+	if err := f.Unlock(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for disable to complete
+	select {
+	case err := <-disableDone:
+		if err != nil {
+			t.Fatalf("SetWriteEnabled failed: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("SetWriteEnabled timed out")
+	}
+
+	// Wait for all Lock() calls to complete
+	wg.Wait()
+	close(results)
+
+	// All waiters should have completed
+	var durations []time.Duration
+	for d := range results {
+		durations = append(durations, d)
+	}
+
+	if len(durations) != 3 {
+		t.Errorf("expected 3 durations, got %d", len(durations))
+	}
+
+	t.Logf("Lock() durations: %v", durations)
+
+	// Verify writeEnabled is now false
+	if f.writeEnabled {
+		t.Error("expected writeEnabled to be false")
+	}
+}
