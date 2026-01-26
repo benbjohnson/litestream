@@ -161,9 +161,9 @@ Arguments:
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
-	-index NUM
-	    Restore up to a specific hex-encoded WAL index (inclusive).
-	    Defaults to use the highest available index.
+	-txid TXID
+	    Restore up to a specific hex-encoded transaction ID (inclusive).
+	    Defaults to use the highest available transaction.
 
 	-timestamp TIMESTAMP
 	    Restore to a specific point-in-time.
@@ -195,8 +195,8 @@ Examples:
 	# Restore latest replica for database to new /tmp directory
 	$ litestream restore -o /tmp/db /path/to/db
 
-	# Restore database from S3.
-	$ litestream restore -replica s3 /path/to/db
+	# Restore database from S3 replica URL.
+	$ litestream restore -o /tmp/db s3://mybucket/db
 
 `[1:],
 		DefaultConfigPath(),
