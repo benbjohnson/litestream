@@ -3,20 +3,25 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 func TestReplica_Sync(t *testing.T) {
@@ -578,4 +583,350 @@ func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	}
 
 	// The test passes if context.Canceled errors were properly filtered
+}
+
+func TestReplica_RestoreV3(t *testing.T) {
+	t.Run("SnapshotOnly", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+
+		// Create a v0.3.x backup structure with a snapshot
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(tmpDir, "replica", "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a test SQLite database and compress it as a snapshot
+		testDBPath := filepath.Join(tmpDir, "test.db")
+		testDB, err := sql.Open("sqlite3", testDBPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testDB.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := testDB.Exec(`INSERT INTO test (value) VALUES ('hello')`); err != nil {
+			t.Fatal(err)
+		}
+		if err := testDB.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Compress the database as an LZ4 snapshot
+		dbData, err := os.ReadFile(testDBPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		w := lz4.NewWriter(&buf)
+		if _, err := w.Write(dbData); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		snapshotPath := filepath.Join(snapshotsDir, "00000000.snapshot.lz4")
+		if err := os.WriteFile(snapshotPath, buf.Bytes(), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create file replica client and replica
+		c := file.NewReplicaClient(filepath.Join(tmpDir, "replica"))
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		// Restore from v0.3.x backup
+		outputPath := filepath.Join(tmpDir, "restored.db")
+		if err := r.RestoreV3(ctx, litestream.RestoreOptions{OutputPath: outputPath}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Verify the restored database
+		restoredDB, err := sql.Open("sqlite3", outputPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restoredDB.Close()
+
+		var value string
+		if err := restoredDB.QueryRow(`SELECT value FROM test WHERE id = 1`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "hello" {
+			t.Fatalf("expected 'hello', got %q", value)
+		}
+	})
+
+	t.Run("NoSnapshots", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+
+		// Create empty replica directory
+		c := file.NewReplicaClient(filepath.Join(tmpDir, "replica"))
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := filepath.Join(tmpDir, "restored.db")
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{OutputPath: outputPath})
+		if !errors.Is(err, litestream.ErrNoSnapshots) {
+			t.Fatalf("expected ErrNoSnapshots, got %v", err)
+		}
+	})
+
+	t.Run("EmptyGenerationsDir", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+
+		// Create generations dir but no actual generations
+		genDir := filepath.Join(tmpDir, "replica", "generations")
+		if err := os.MkdirAll(genDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		c := file.NewReplicaClient(filepath.Join(tmpDir, "replica"))
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := filepath.Join(tmpDir, "restored.db")
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{OutputPath: outputPath})
+		if !errors.Is(err, litestream.ErrNoSnapshots) {
+			t.Fatalf("expected ErrNoSnapshots, got %v", err)
+		}
+	})
+
+	t.Run("TimestampRestore", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(tmpDir, "replica", "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create two snapshots with different timestamps
+		baseTime := time.Now().Add(-2 * time.Hour)
+
+		for i, value := range []string{"first", "second"} {
+			testDBPath := filepath.Join(tmpDir, "test.db")
+			testDB, err := sql.Open("sqlite3", testDBPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDB.Exec(`CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDB.Exec(`DELETE FROM test`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDB.Exec(`INSERT INTO test (value) VALUES (?)`, value); err != nil {
+				t.Fatal(err)
+			}
+			if err := testDB.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			dbData, err := os.ReadFile(testDBPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			w := lz4.NewWriter(&buf)
+			if _, err := w.Write(dbData); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			snapshotPath := filepath.Join(snapshotsDir, litestream.FormatSnapshotFilenameV3(i))
+			if err := os.WriteFile(snapshotPath, buf.Bytes(), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Set the file modification time
+			snapshotTime := baseTime.Add(time.Duration(i) * time.Hour)
+			if err := os.Chtimes(snapshotPath, snapshotTime, snapshotTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		c := file.NewReplicaClient(filepath.Join(tmpDir, "replica"))
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		// Restore with timestamp between the two snapshots - should get the first one
+		outputPath := filepath.Join(tmpDir, "restored.db")
+		restoreTime := baseTime.Add(30 * time.Minute)
+		if err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  restoreTime,
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		restoredDB, err := sql.Open("sqlite3", outputPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restoredDB.Close()
+
+		var value string
+		if err := restoredDB.QueryRow(`SELECT value FROM test WHERE id = 1`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "first" {
+			t.Fatalf("expected 'first' for timestamp restore, got %q", value)
+		}
+	})
+
+	t.Run("MultipleGenerations", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+
+		baseTime := time.Now().Add(-2 * time.Hour)
+
+		// Create two generations with different timestamps
+		for genIdx, gen := range []string{"0000000000000001", "0000000000000002"} {
+			snapshotsDir := filepath.Join(tmpDir, "replica", "generations", gen, "snapshots")
+			if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+
+			value := "gen" + gen[:4]
+			testDBPath := filepath.Join(tmpDir, "test.db")
+			testDB, err := sql.Open("sqlite3", testDBPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDB.Exec(`CREATE TABLE IF NOT EXISTS test (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDB.Exec(`DELETE FROM test`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := testDB.Exec(`INSERT INTO test (value) VALUES (?)`, value); err != nil {
+				t.Fatal(err)
+			}
+			if err := testDB.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			dbData, err := os.ReadFile(testDBPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var buf bytes.Buffer
+			w := lz4.NewWriter(&buf)
+			if _, err := w.Write(dbData); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			snapshotPath := filepath.Join(snapshotsDir, "00000000.snapshot.lz4")
+			if err := os.WriteFile(snapshotPath, buf.Bytes(), 0644); err != nil {
+				t.Fatal(err)
+			}
+
+			// Set different timestamps for each generation
+			snapshotTime := baseTime.Add(time.Duration(genIdx) * time.Hour)
+			if err := os.Chtimes(snapshotPath, snapshotTime, snapshotTime); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		c := file.NewReplicaClient(filepath.Join(tmpDir, "replica"))
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		// Restore without timestamp - should get the latest (second generation)
+		outputPath := filepath.Join(tmpDir, "restored.db")
+		if err := r.RestoreV3(ctx, litestream.RestoreOptions{OutputPath: outputPath}); err != nil {
+			t.Fatal(err)
+		}
+
+		restoredDB, err := sql.Open("sqlite3", outputPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restoredDB.Close()
+
+		var value string
+		if err := restoredDB.QueryRow(`SELECT value FROM test WHERE id = 1`).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		if value != "gen0000" {
+			t.Fatalf("expected 'gen0000' (latest generation), got %q", value)
+		}
+	})
+}
+
+func TestReplica_Restore_FallbackToV3(t *testing.T) {
+	ctx := context.Background()
+	tmpDir := t.TempDir()
+
+	// Create a v0.3.x backup structure only (no LTX files)
+	gen := "0123456789abcdef"
+	snapshotsDir := filepath.Join(tmpDir, "replica", "generations", gen, "snapshots")
+	if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a test SQLite database and compress it as a snapshot
+	testDBPath := filepath.Join(tmpDir, "test.db")
+	testDB, err := sql.Open("sqlite3", testDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := testDB.Exec(`INSERT INTO test (value) VALUES ('fallback')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := testDB.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dbData, err := os.ReadFile(testDBPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	w := lz4.NewWriter(&buf)
+	if _, err := w.Write(dbData); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotPath := filepath.Join(snapshotsDir, "00000000.snapshot.lz4")
+	if err := os.WriteFile(snapshotPath, buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create file replica client and replica (no LTX files exist)
+	c := file.NewReplicaClient(filepath.Join(tmpDir, "replica"))
+	r := litestream.NewReplicaWithClient(nil, c)
+
+	// Restore should fall back to v0.3.x when no LTX files exist
+	outputPath := filepath.Join(tmpDir, "restored.db")
+	if err := r.Restore(ctx, litestream.RestoreOptions{OutputPath: outputPath}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify the restored database
+	restoredDB, err := sql.Open("sqlite3", outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restoredDB.Close()
+
+	var value string
+	if err := restoredDB.QueryRow(`SELECT value FROM test WHERE id = 1`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "fallback" {
+		t.Fatalf("expected 'fallback', got %q", value)
+	}
 }

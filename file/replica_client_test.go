@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream/file"
@@ -177,6 +180,459 @@ func createLTXData(minTXID, maxTXID ltx.TXID, data []byte) []byte {
 // createLTXHeader creates minimal LTX header for testing
 func createLTXHeader(minTXID, maxTXID ltx.TXID) []byte {
 	return createLTXData(minTXID, maxTXID, nil)
+}
+
+func TestReplicaClient_GenerationsV3(t *testing.T) {
+	t.Run("NoGenerationsDir", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		gens, err := c.GenerationsV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gens) != 0 {
+			t.Errorf("expected empty slice, got %v", gens)
+		}
+	})
+
+	t.Run("EmptyGenerationsDir", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if err := os.Mkdir(filepath.Join(tmpDir, "generations"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		gens, err := c.GenerationsV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gens) != 0 {
+			t.Errorf("expected empty slice, got %v", gens)
+		}
+	})
+
+	t.Run("InvalidGenerationIDsOnly", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "not-valid"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "also-invalid"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		gens, err := c.GenerationsV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gens) != 0 {
+			t.Errorf("expected empty slice for invalid IDs, got %v", gens)
+		}
+	})
+
+	t.Run("SingleGeneration", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "0123456789abcdef"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		gens, err := c.GenerationsV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gens) != 1 || gens[0] != "0123456789abcdef" {
+			t.Errorf("expected [0123456789abcdef], got %v", gens)
+		}
+	})
+
+	t.Run("MultipleGenerationsSorted", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		// Create in non-sorted order
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "ffffffffffffffff"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "0000000000000000"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "abcdef0123456789"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		gens, err := c.GenerationsV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := []string{"0000000000000000", "abcdef0123456789", "ffffffffffffffff"}
+		if !reflect.DeepEqual(gens, want) {
+			t.Errorf("expected %v, got %v", want, gens)
+		}
+	})
+
+	t.Run("MixedValidInvalid", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "invalid"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", "abcdef0123456789"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		gens, err := c.GenerationsV3(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(gens) != 1 || gens[0] != "abcdef0123456789" {
+			t.Errorf("expected [abcdef0123456789], got %v", gens)
+		}
+	})
+}
+
+func TestReplicaClient_SnapshotsV3(t *testing.T) {
+	t.Run("NoSnapshotsDir", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		snapshots, err := c.SnapshotsV3(context.Background(), "0123456789abcdef")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) != 0 {
+			t.Errorf("expected empty slice, got %v", snapshots)
+		}
+	})
+
+	t.Run("EmptySnapshotsDir", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", gen, "snapshots"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		snapshots, err := c.SnapshotsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) != 0 {
+			t.Errorf("expected empty slice, got %v", snapshots)
+		}
+	})
+
+	t.Run("SingleSnapshot", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(tmpDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshotsDir, "00000001.snapshot.lz4"), []byte("data"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		snapshots, err := c.SnapshotsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) != 1 {
+			t.Fatalf("expected 1 snapshot, got %d", len(snapshots))
+		}
+		if snapshots[0].Generation != gen || snapshots[0].Index != 1 || snapshots[0].Size != 4 {
+			t.Errorf("unexpected snapshot: %+v", snapshots[0])
+		}
+	})
+
+	t.Run("MultipleSnapshotsSorted", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(tmpDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		// Create in non-sorted order
+		if err := os.WriteFile(filepath.Join(snapshotsDir, "00000003.snapshot.lz4"), []byte("c"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshotsDir, "00000001.snapshot.lz4"), []byte("a"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshotsDir, "00000002.snapshot.lz4"), []byte("bb"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		snapshots, err := c.SnapshotsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) != 3 {
+			t.Fatalf("expected 3 snapshots, got %d", len(snapshots))
+		}
+		if snapshots[0].Index != 1 || snapshots[1].Index != 2 || snapshots[2].Index != 3 {
+			t.Errorf("snapshots not sorted by index: %+v", snapshots)
+		}
+	})
+
+	t.Run("SkipsInvalidFilenames", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(tmpDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshotsDir, "00000001.snapshot.lz4"), []byte("a"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(snapshotsDir, "invalid.txt"), []byte("b"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		snapshots, err := c.SnapshotsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(snapshots) != 1 || snapshots[0].Index != 1 {
+			t.Errorf("expected single valid snapshot, got %+v", snapshots)
+		}
+	})
+}
+
+func TestReplicaClient_WALSegmentsV3(t *testing.T) {
+	t.Run("NoWALDir", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		segments, err := c.WALSegmentsV3(context.Background(), "0123456789abcdef")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 0 {
+			t.Errorf("expected empty slice, got %v", segments)
+		}
+	})
+
+	t.Run("EmptyWALDir", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		if err := os.MkdirAll(filepath.Join(tmpDir, "generations", gen, "wal"), 0755); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		segments, err := c.WALSegmentsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 0 {
+			t.Errorf("expected empty slice, got %v", segments)
+		}
+	})
+
+	t.Run("SingleSegment", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
+		if err := os.MkdirAll(walDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(walDir, "00000001-0000000000001000.wal.lz4"), []byte("data"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		segments, err := c.WALSegmentsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 1 {
+			t.Fatalf("expected 1 segment, got %d", len(segments))
+		}
+		if segments[0].Generation != gen || segments[0].Index != 1 || segments[0].Offset != 4096 || segments[0].Size != 4 {
+			t.Errorf("unexpected segment: %+v", segments[0])
+		}
+	})
+
+	t.Run("MultipleSortedByIndexThenOffset", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
+		if err := os.MkdirAll(walDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		// Create in non-sorted order
+		if err := os.WriteFile(filepath.Join(walDir, "00000002-0000000000000000.wal.lz4"), []byte("d"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(walDir, "00000001-0000000000002000.wal.lz4"), []byte("b"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(walDir, "00000001-0000000000001000.wal.lz4"), []byte("a"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(walDir, "00000001-0000000000003000.wal.lz4"), []byte("c"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		segments, err := c.WALSegmentsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 4 {
+			t.Fatalf("expected 4 segments, got %d", len(segments))
+		}
+		// Should be sorted by index, then offset
+		expected := []struct {
+			index  int
+			offset int64
+		}{
+			{1, 0x1000},
+			{1, 0x2000},
+			{1, 0x3000},
+			{2, 0x0000},
+		}
+		for i, exp := range expected {
+			if segments[i].Index != exp.index || segments[i].Offset != exp.offset {
+				t.Errorf("segment %d: expected (index=%d, offset=%x), got (index=%d, offset=%x)",
+					i, exp.index, exp.offset, segments[i].Index, segments[i].Offset)
+			}
+		}
+	})
+
+	t.Run("SkipsInvalidFilenames", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
+		if err := os.MkdirAll(walDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(walDir, "00000001-0000000000001000.wal.lz4"), []byte("a"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(walDir, "invalid.wal"), []byte("b"), 0644); err != nil {
+			t.Fatal(err)
+		}
+		c := file.NewReplicaClient(tmpDir)
+
+		segments, err := c.WALSegmentsV3(context.Background(), gen)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(segments) != 1 || segments[0].Index != 1 {
+			t.Errorf("expected single valid segment, got %+v", segments)
+		}
+	})
+}
+
+func TestReplicaClient_OpenSnapshotV3(t *testing.T) {
+	t.Run("NotFound", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		_, err := c.OpenSnapshotV3(context.Background(), "0123456789abcdef", 0)
+		if !os.IsNotExist(err) {
+			t.Errorf("expected not exist error, got %v", err)
+		}
+	})
+
+	t.Run("ReadDecompressed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(tmpDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LZ4-compressed test data
+		original := []byte("test snapshot data for decompression")
+		var buf bytes.Buffer
+		w := lz4.NewWriter(&buf)
+		if _, err := w.Write(original); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write compressed file
+		path := filepath.Join(snapshotsDir, "00000000.snapshot.lz4")
+		if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		c := file.NewReplicaClient(tmpDir)
+		r, err := c.OpenSnapshotV3(context.Background(), gen, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		data, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, original) {
+			t.Errorf("decompressed data mismatch: got %q, want %q", data, original)
+		}
+	})
+}
+
+func TestReplicaClient_OpenWALSegmentV3(t *testing.T) {
+	t.Run("NotFound", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		_, err := c.OpenWALSegmentV3(context.Background(), "0123456789abcdef", 0, 0)
+		if !os.IsNotExist(err) {
+			t.Errorf("expected not exist error, got %v", err)
+		}
+	})
+
+	t.Run("ReadDecompressed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		gen := "0123456789abcdef"
+		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
+		if err := os.MkdirAll(walDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LZ4-compressed test data
+		original := []byte("test WAL segment data")
+		var buf bytes.Buffer
+		w := lz4.NewWriter(&buf)
+		if _, err := w.Write(original); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write compressed file
+		path := filepath.Join(walDir, "00000001-0000000000001000.wal.lz4")
+		if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		c := file.NewReplicaClient(tmpDir)
+		r, err := c.OpenWALSegmentV3(context.Background(), gen, 1, 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		data, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, original) {
+			t.Errorf("decompressed data mismatch: got %q, want %q", data, original)
+		}
+	})
 }
 
 /*

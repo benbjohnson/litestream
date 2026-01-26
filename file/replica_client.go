@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -25,6 +26,7 @@ func init() {
 const ReplicaClientType = "file"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to disk.
 type ReplicaClient struct {
@@ -250,4 +252,125 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// GenerationsV3 returns a list of v0.3.x generation IDs in the replica.
+// Returns an empty slice if no v0.3.x backups exist.
+func (c *ReplicaClient) GenerationsV3(ctx context.Context) ([]string, error) {
+	genPath := filepath.Join(c.path, litestream.GenerationsDirV3)
+	entries, err := os.ReadDir(genPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var generations []string
+	for _, entry := range entries {
+		if entry.IsDir() && litestream.IsGenerationIDV3(entry.Name()) {
+			generations = append(generations, entry.Name())
+		}
+	}
+	slices.Sort(generations)
+	return generations, nil
+}
+
+// SnapshotsV3 returns snapshots for a generation, sorted by index.
+// Returns an empty slice if no snapshots exist.
+func (c *ReplicaClient) SnapshotsV3(ctx context.Context, generation string) ([]litestream.SnapshotInfoV3, error) {
+	snapshotsPath := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.SnapshotsDirV3)
+	entries, err := os.ReadDir(snapshotsPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var snapshots []litestream.SnapshotInfoV3
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		index, err := litestream.ParseSnapshotFilenameV3(entry.Name())
+		if err != nil {
+			continue // skip invalid filenames
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, litestream.SnapshotInfoV3{
+			Generation: generation,
+			Index:      index,
+			Size:       info.Size(),
+			CreatedAt:  info.ModTime(),
+		})
+	}
+	slices.SortFunc(snapshots, func(a, b litestream.SnapshotInfoV3) int {
+		return a.Index - b.Index
+	})
+	return snapshots, nil
+}
+
+// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
+// Returns an empty slice if no WAL segments exist.
+func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([]litestream.WALSegmentInfoV3, error) {
+	walPath := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.WALDirV3)
+	entries, err := os.ReadDir(walPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var segments []litestream.WALSegmentInfoV3
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		index, offset, err := litestream.ParseWALSegmentFilenameV3(entry.Name())
+		if err != nil {
+			continue // skip invalid filenames
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		segments = append(segments, litestream.WALSegmentInfoV3{
+			Generation: generation,
+			Index:      index,
+			Offset:     offset,
+			Size:       info.Size(),
+			CreatedAt:  info.ModTime(),
+		})
+	}
+	slices.SortFunc(segments, func(a, b litestream.WALSegmentInfoV3) int {
+		if a.Index != b.Index {
+			return a.Index - b.Index
+		}
+		return int(a.Offset - b.Offset)
+	})
+	return segments, nil
+}
+
+// OpenSnapshotV3 opens a v0.3.x snapshot file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	path := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.SnapshotsDirV3, litestream.FormatSnapshotFilenameV3(index))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return litestream.NewLZ4Reader(f), nil
+}
+
+// OpenWALSegmentV3 opens a v0.3.x WAL segment file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error) {
+	path := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.WALDirV3, litestream.FormatWALSegmentFilenameV3(index, offset))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return litestream.NewLZ4Reader(f), nil
 }

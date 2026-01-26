@@ -2,18 +2,22 @@ package litestream
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"time"
 
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream/internal"
+
+	_ "github.com/mattn/go-sqlite3"
 )
 
 // Default replica settings.
@@ -505,8 +509,36 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
+	// When timestamp is specified, compare both formats to find the best snapshot.
+	// A replica may contain both v0.3.x and v0.5.x (LTX) backups.
+	if !opt.Timestamp.IsZero() {
+		if client, ok := r.Client.(ReplicaClientV3); ok {
+			// Get best v0.3.x snapshot for timestamp
+			v3Snapshot := r.findBestV3SnapshotForTimestamp(ctx, client, opt.Timestamp)
+
+			// Get best LTX snapshot for timestamp
+			ltxSnapshot := r.findBestLTXSnapshotForTimestamp(ctx, opt.Timestamp)
+
+			// Compare and choose the better one (closer to but not after timestamp)
+			if v3Snapshot != nil && (ltxSnapshot == nil || v3Snapshot.CreatedAt.After(ltxSnapshot.CreatedAt)) {
+				r.Logger().Debug("using v0.3.x restore (better match for timestamp)",
+					"v3_created_at", v3Snapshot.CreatedAt,
+					"timestamp", opt.Timestamp)
+				return r.RestoreV3(ctx, opt)
+			}
+		}
+	}
+
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
+		// If LTX restore fails, try V3 restore as fallback
+		if client, ok := r.Client.(ReplicaClientV3); ok {
+			generations, genErr := client.GenerationsV3(ctx)
+			if genErr == nil && len(generations) > 0 {
+				r.Logger().Debug("LTX restore failed, attempting v0.3.x restore", "error", err)
+				return r.RestoreV3(ctx, opt)
+			}
+		}
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	}
 
@@ -669,4 +701,246 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	}
 
 	return infos, nil
+}
+
+// RestoreV3 restores from a v0.3.x format backup.
+func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
+	client, ok := r.Client.(ReplicaClientV3)
+	if !ok {
+		return fmt.Errorf("replica client does not support v0.3.x restore")
+	}
+
+	// Find all generations
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return fmt.Errorf("list generations: %w", err)
+	}
+	if len(generations) == 0 {
+		return ErrNoSnapshots
+	}
+
+	// Collect all snapshots across all generations
+	var allSnapshots []SnapshotInfoV3
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return fmt.Errorf("list snapshots for generation %s: %w", gen, err)
+		}
+		allSnapshots = append(allSnapshots, snapshots...)
+	}
+	if len(allSnapshots) == 0 {
+		return ErrNoSnapshots
+	}
+
+	// Sort all snapshots by CreatedAt
+	slices.SortFunc(allSnapshots, func(a, b SnapshotInfoV3) int {
+		return a.CreatedAt.Compare(b.CreatedAt)
+	})
+
+	// Find best snapshot across all generations (latest, or before timestamp if specified)
+	snapshot := r.findBestSnapshotV3(allSnapshots, opt.Timestamp)
+	if snapshot == nil {
+		return ErrNoSnapshots
+	}
+
+	r.Logger().Debug("v0.3.x restore using snapshot",
+		"generation", snapshot.Generation,
+		"index", snapshot.Index,
+		"created_at", snapshot.CreatedAt)
+
+	// Get WAL segments for the snapshot's generation
+	segments, err := client.WALSegmentsV3(ctx, snapshot.Generation)
+	if err != nil {
+		return fmt.Errorf("list WAL segments: %w", err)
+	}
+	segments = r.filterWALSegmentsV3(segments, snapshot.Index, opt.Timestamp)
+
+	r.Logger().Debug("v0.3.x restore found WAL segments", "count", len(segments))
+
+	// Create parent directory if it doesn't exist.
+	var dirInfo os.FileInfo
+	if db := r.DB(); db != nil {
+		dirInfo = db.dirInfo
+	}
+	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
+	}
+
+	// Create temp file for restore
+	tmpPath := opt.OutputPath + ".tmp"
+	defer os.Remove(tmpPath)
+
+	// Download and decompress snapshot
+	if err := r.downloadSnapshotV3(ctx, client, snapshot.Generation, snapshot.Index, tmpPath); err != nil {
+		return fmt.Errorf("download snapshot: %w", err)
+	}
+
+	// Apply WAL segments
+	if err := r.applyWALSegmentsV3(ctx, client, snapshot.Generation, segments, tmpPath); err != nil {
+		return fmt.Errorf("apply WAL segments: %w", err)
+	}
+
+	// Rename to final path
+	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
+		return fmt.Errorf("rename to output path: %w", err)
+	}
+
+	return nil
+}
+
+// findBestSnapshotV3 finds the best snapshot for restore.
+// If timestamp is zero, returns the latest snapshot.
+// Otherwise, returns the latest snapshot created before the timestamp.
+func (r *Replica) findBestSnapshotV3(snapshots []SnapshotInfoV3, timestamp time.Time) *SnapshotInfoV3 {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	if timestamp.IsZero() {
+		return &snapshots[len(snapshots)-1]
+	}
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		if !snapshots[i].CreatedAt.After(timestamp) {
+			return &snapshots[i]
+		}
+	}
+	return nil
+}
+
+// filterWALSegmentsV3 filters WAL segments to those at or after the snapshot index
+// and optionally before the timestamp.
+func (r *Replica) filterWALSegmentsV3(segments []WALSegmentInfoV3, snapshotIndex int, timestamp time.Time) []WALSegmentInfoV3 {
+	var result []WALSegmentInfoV3
+	for _, seg := range segments {
+		if seg.Index < snapshotIndex {
+			continue
+		}
+		if !timestamp.IsZero() && seg.CreatedAt.After(timestamp) {
+			continue
+		}
+		result = append(result, seg)
+	}
+	return result
+}
+
+// downloadSnapshotV3 downloads and decompresses a v0.3.x snapshot to the destination path.
+func (r *Replica) downloadSnapshotV3(ctx context.Context, client ReplicaClientV3, generation string, index int, destPath string) error {
+	rc, err := client.OpenSnapshotV3(ctx, generation, index)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	f, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if _, err := io.Copy(f, rc); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// applyWALSegmentsV3 applies WAL segments to the database file.
+func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3, generation string, segments []WALSegmentInfoV3, dbPath string) error {
+	for _, seg := range segments {
+		if err := r.applyWALSegmentV3(ctx, client, generation, seg, dbPath); err != nil {
+			return fmt.Errorf("apply WAL segment %d/%d: %w", seg.Index, seg.Offset, err)
+		}
+	}
+	return nil
+}
+
+// applyWALSegmentV3 applies a single WAL segment to the database file.
+func (r *Replica) applyWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, dbPath string) error {
+	// Download WAL segment
+	rc, err := client.OpenWALSegmentV3(ctx, generation, seg.Index, seg.Offset)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+
+	// Write to WAL file
+	walPath := dbPath + "-wal"
+	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	// Seek to offset and write
+	if _, err := f.Seek(seg.Offset, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, rc); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+
+	// Checkpoint to apply WAL to database
+	return r.checkpointV3(dbPath)
+}
+
+// checkpointV3 checkpoints the WAL file into the database.
+func (r *Replica) checkpointV3(dbPath string) error {
+	db, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+
+	_, err = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return err
+}
+
+// findBestV3SnapshotForTimestamp returns the best v0.3.x snapshot for the given timestamp.
+// Returns nil if no suitable snapshot exists.
+func (r *Replica) findBestV3SnapshotForTimestamp(ctx context.Context, client ReplicaClientV3, timestamp time.Time) *SnapshotInfoV3 {
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil || len(generations) == 0 {
+		return nil
+	}
+
+	var allSnapshots []SnapshotInfoV3
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			continue
+		}
+		allSnapshots = append(allSnapshots, snapshots...)
+	}
+
+	// Sort by CreatedAt
+	slices.SortFunc(allSnapshots, func(a, b SnapshotInfoV3) int {
+		return a.CreatedAt.Compare(b.CreatedAt)
+	})
+
+	return r.findBestSnapshotV3(allSnapshots, timestamp)
+}
+
+// findBestLTXSnapshotForTimestamp returns the best LTX snapshot for the given timestamp.
+// Returns nil if no suitable snapshot exists.
+func (r *Replica) findBestLTXSnapshotForTimestamp(ctx context.Context, timestamp time.Time) *ltx.FileInfo {
+	// Use accurate timestamp fetching for timestamp-based comparisons
+	itr, err := r.Client.LTXFiles(ctx, SnapshotLevel, 0, true)
+	if err != nil {
+		return nil
+	}
+	defer itr.Close()
+
+	var best *ltx.FileInfo
+	for itr.Next() {
+		info := itr.Item()
+		if info.CreatedAt.After(timestamp) {
+			continue
+		}
+		if best == nil || info.CreatedAt.After(best.CreatedAt) {
+			infoCopy := *info
+			best = &infoCopy
+		}
+	}
+	return best
 }

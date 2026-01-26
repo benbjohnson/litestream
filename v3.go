@@ -1,12 +1,41 @@
 package litestream
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"path"
 	"regexp"
 	"strconv"
 	"time"
+
+	"github.com/pierrec/lz4/v4"
 )
+
+// ReplicaClientV3 reads v0.3.x backup data.
+// ReplicaClient implementations that support v0.3.x restore should implement this interface.
+type ReplicaClientV3 interface {
+	// GenerationsV3 returns a list of generation IDs in the replica.
+	// Returns an empty slice if no v0.3.x backups exist.
+	// Generation IDs are sorted in ascending order.
+	GenerationsV3(ctx context.Context) ([]string, error)
+
+	// SnapshotsV3 returns snapshots for a generation, sorted by index.
+	// Returns an empty slice if no snapshots exist.
+	SnapshotsV3(ctx context.Context, generation string) ([]SnapshotInfoV3, error)
+
+	// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
+	// Returns an empty slice if no WAL segments exist.
+	WALSegmentsV3(ctx context.Context, generation string) ([]WALSegmentInfoV3, error)
+
+	// OpenSnapshotV3 opens a v0.3.x snapshot for reading.
+	// The returned reader provides LZ4-decompressed data.
+	OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+
+	// OpenWALSegmentV3 opens a v0.3.x WAL segment for reading.
+	// The returned reader provides LZ4-decompressed data.
+	OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error)
+}
 
 // PosV3 represents a position in a v0.3.x backup.
 type PosV3 struct {
@@ -136,4 +165,23 @@ func ParseWALSegmentFilenameV3(filename string) (index int, offset int64, err er
 // IsGenerationIDV3 returns true if s is a valid v0.3.x generation ID (16 hex chars).
 func IsGenerationIDV3(s string) bool {
 	return generationRegexV3.MatchString(s)
+}
+
+// lz4ReadCloser wraps an LZ4 reader with the underlying source for proper closing.
+type lz4ReadCloser struct {
+	*lz4.Reader
+	underlying io.Closer
+}
+
+func (r *lz4ReadCloser) Close() error {
+	return r.underlying.Close()
+}
+
+// NewLZ4Reader creates an LZ4 decompressing reader that wraps the source.
+// Closing the returned reader also closes the underlying source.
+func NewLZ4Reader(r io.ReadCloser) io.ReadCloser {
+	return &lz4ReadCloser{
+		Reader:     lz4.NewReader(r),
+		underlying: r,
+	}
 }
