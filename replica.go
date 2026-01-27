@@ -66,6 +66,11 @@ type Replica struct {
 	// the position file and removing local LTX files, forcing a fresh sync.
 	// Disabled by default to prevent silent data loss scenarios.
 	AutoRecoverEnabled bool
+
+	// OnSync is called after LTX files are uploaded to the replica.
+	// Only fires when actual replication occurs (TXID advances).
+	// May be nil.
+	OnSync func(pos ltx.Pos)
 }
 
 func NewReplica(db *DB) *Replica {
@@ -225,6 +230,11 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		r.SetPos(ltx.Pos{TXID: txID})
 		result.synced = true
 		syncedFileN++
+
+		// Notify listeners of actual replication
+		if r.OnSync != nil {
+			r.OnSync(r.Pos())
+		}
 	}
 
 	// Record successful sync for heartbeat monitoring.
