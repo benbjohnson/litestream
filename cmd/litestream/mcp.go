@@ -74,6 +74,12 @@ func (s *MCPServer) Close() error {
 	return s.httpServer.Shutdown(ctx)
 }
 
+// isReplicaURL returns true if the path looks like a replica URL (s3://, gs://, etc.)
+// rather than a local database path. The CLI rejects -config when using replica URLs.
+func isReplicaURL(path string) bool {
+	return strings.Contains(path, "://")
+}
+
 func DatabasesTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_databases",
 		mcp.WithDescription("List databases and their replicas as defined in the Litestream config file. The default path is /etc/litestream.yml but is not required."),
@@ -192,11 +198,22 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if o, err := req.RequireString("o"); err == nil {
 			args = append(args, "-o", o)
 		}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+
+		// Get path first to determine if it's a replica URL
+		path, _ := req.RequireString("path")
+
+		// Only add -config for database paths, not replica URLs
+		// The CLI rejects -config when restoring from a replica URL
+		if !isReplicaURL(path) {
+			config := configPath
+			if configVal, err := req.RequireString("config"); err == nil {
+				config = configVal
+			}
+			if config != "" {
+				args = append(args, "-config", config)
+			}
 		}
-		args = append(args, "-config", config)
+
 		if txid, err := req.RequireString("txid"); err == nil {
 			args = append(args, "-txid", txid)
 		}
@@ -212,7 +229,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if ifReplicaExists, err := req.RequireBool("if_replica_exists"); err == nil {
 			args = append(args, "-if-replica-exists", strconv.FormatBool(ifReplicaExists))
 		}
-		if path, err := req.RequireString("path"); err == nil {
+		if path != "" {
 			args = append(args, path)
 		}
 		cmd := exec.CommandContext(ctx, "litestream", args...)
@@ -241,19 +258,30 @@ func VersionTool() (mcp.Tool, server.ToolHandlerFunc) {
 
 func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_ltx",
-		mcp.WithDescription("List all LTX files for a database."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Database path.")),
-		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
+		mcp.WithDescription("List all LTX files for a database or replica URL."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
+		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional, ignored for replica URLs.")),
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := []string{"ltx"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+
+		// Get path first to determine if it's a replica URL
+		path, _ := req.RequireString("path")
+
+		// Only add -config for database paths, not replica URLs
+		// The CLI rejects -config when using a replica URL
+		if !isReplicaURL(path) {
+			config := configPath
+			if configVal, err := req.RequireString("config"); err == nil {
+				config = configVal
+			}
+			if config != "" {
+				args = append(args, "-config", config)
+			}
 		}
-		args = append(args, "-config", config)
-		if path, err := req.RequireString("path"); err == nil {
+
+		if path != "" {
 			args = append(args, path)
 		}
 		cmd := exec.CommandContext(ctx, "litestream", args...)
