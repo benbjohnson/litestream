@@ -40,6 +40,9 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcpServer.AddTool(DatabasesTool(configPath))
 	mcpServer.AddTool(RestoreTool(configPath))
 	mcpServer.AddTool(LTXTool(configPath))
+	mcpServer.AddTool(VersionTool())
+	mcpServer.AddTool(StatusTool(configPath))
+	mcpServer.AddTool(ResetTool(configPath))
 
 	s.mux = http.NewServeMux()
 	s.mux.Handle("/", httplog.Logger(server.NewStreamableHTTPServer(mcpServer)))
@@ -177,9 +180,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
 		mcp.WithString("o", mcp.Description("Output path for the restored database. Optional.")),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
-		mcp.WithString("replica", mcp.Description("Replica name to restore from. Optional.")),
-		mcp.WithString("generation", mcp.Description("Generation name to restore from. Optional.")),
-		mcp.WithString("index", mcp.Description("Restore up to a specific WAL index. Optional.")),
+		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
 		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
 		mcp.WithString("parallelism", mcp.Description("Number of WAL files to download in parallel. Optional.")),
 		mcp.WithBoolean("if_db_not_exists", mcp.Description("Return 0 if the database already exists. Optional.")),
@@ -196,14 +197,8 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 			config = configVal
 		}
 		args = append(args, "-config", config)
-		if replica, err := req.RequireString("replica"); err == nil {
-			args = append(args, "-replica", replica)
-		}
-		if generation, err := req.RequireString("generation"); err == nil {
-			args = append(args, "-generation", generation)
-		}
-		if index, err := req.RequireString("index"); err == nil {
-			args = append(args, "-index", index)
+		if txid, err := req.RequireString("txid"); err == nil {
+			args = append(args, "-txid", txid)
 		}
 		if timestamp, err := req.RequireString("timestamp"); err == nil {
 			args = append(args, "-timestamp", timestamp)
@@ -246,11 +241,9 @@ func VersionTool() (mcp.Tool, server.ToolHandlerFunc) {
 
 func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_ltx",
-		mcp.WithDescription("List all LTX files for a database or replica."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
+		mcp.WithDescription("List all LTX files for a database."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Database path.")),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
-		mcp.WithString("replica", mcp.Description("Replica name to filter by. Optional.")),
-		mcp.WithString("generation", mcp.Description("Generation name to filter by. Optional.")),
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -260,12 +253,58 @@ func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 			config = configVal
 		}
 		args = append(args, "-config", config)
-		if replica, err := req.RequireString("replica"); err == nil {
-			args = append(args, "-replica", replica)
+		if path, err := req.RequireString("path"); err == nil {
+			args = append(args, path)
 		}
-		if generation, err := req.RequireString("generation"); err == nil {
-			args = append(args, "-generation", generation)
+		cmd := exec.CommandContext(ctx, "litestream", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
 		}
+		return mcp.NewToolResultText(string(output)), nil
+	}
+}
+
+func StatusTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
+	tool := mcp.NewTool("litestream_status",
+		mcp.WithDescription("Display replication status including database path, status, local transaction ID, and WAL size."),
+		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
+		mcp.WithString("path", mcp.Description("Filter to a specific database path. Optional.")),
+	)
+
+	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := []string{"status"}
+		config := configPath
+		if configVal, err := req.RequireString("config"); err == nil {
+			config = configVal
+		}
+		args = append(args, "-config", config)
+		if path, err := req.RequireString("path"); err == nil {
+			args = append(args, path)
+		}
+		cmd := exec.CommandContext(ctx, "litestream", args...)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
+		}
+		return mcp.NewToolResultText(string(output)), nil
+	}
+}
+
+func ResetTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
+	tool := mcp.NewTool("litestream_reset",
+		mcp.WithDescription("Clear local Litestream state for a database. Removes local LTX files, forcing fresh snapshot on next sync. Database file is not modified."),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Database path to reset.")),
+		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
+	)
+
+	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		args := []string{"reset"}
+		config := configPath
+		if configVal, err := req.RequireString("config"); err == nil {
+			config = configVal
+		}
+		args = append(args, "-config", config)
 		if path, err := req.RequireString("path"); err == nil {
 			args = append(args, path)
 		}
