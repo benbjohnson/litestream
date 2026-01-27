@@ -38,9 +38,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	// Add the tools to the server
 	mcpServer.AddTool(InfoTool(configPath))
 	mcpServer.AddTool(DatabasesTool(configPath))
-	mcpServer.AddTool(GenerationsTool(configPath))
 	mcpServer.AddTool(RestoreTool(configPath))
-	mcpServer.AddTool(SnapshotsTool(configPath))
 	mcpServer.AddTool(LTXTool(configPath))
 
 	s.mux = http.NewServeMux()
@@ -95,39 +93,9 @@ func DatabasesTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	}
 }
 
-func GenerationsTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
-	tool := mcp.NewTool("litestream_generations",
-		mcp.WithDescription("List all generations for a database or replica."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
-		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
-		mcp.WithString("replica", mcp.Description("Replica name to filter by. Optional.")),
-	)
-
-	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"generations"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
-		}
-		args = append(args, "-config", config)
-		if replica, err := req.RequireString("replica"); err == nil {
-			args = append(args, "-replica", replica)
-		}
-		if path, err := req.RequireString("path"); err == nil {
-			args = append(args, path)
-		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
-		}
-		return mcp.NewToolResultText(string(output)), nil
-	}
-}
-
 func InfoTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_info",
-		mcp.WithDescription("Get a comprehensive summary of Litestream's current status including databases, generations, snapshots, and version information."),
+		mcp.WithDescription("Get a comprehensive summary of Litestream's current status including databases, LTX files, and version information."),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 	)
 
@@ -179,43 +147,23 @@ func InfoTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 			}
 		}
 
-		// Get generations info for each database
-		summary.WriteString("Generations:\n")
+		// Get LTX files info for each database
+		summary.WriteString("LTX Files:\n")
 		for _, dbPath := range dbPaths {
-			genArgs := []string{"generations"}
+			ltxArgs := []string{"ltx"}
 			if config != "" {
-				genArgs = append(genArgs, "-config", config)
+				ltxArgs = append(ltxArgs, "-config", config)
 			}
-			genArgs = append(genArgs, dbPath)
-			genCmd := exec.CommandContext(ctx, "litestream", genArgs...)
-			genOutput, err := genCmd.CombinedOutput()
+			ltxArgs = append(ltxArgs, dbPath)
+			ltxCmd := exec.CommandContext(ctx, "litestream", ltxArgs...)
+			ltxOutput, err := ltxCmd.CombinedOutput()
 			if err != nil {
-				summary.WriteString("Failed to get generations for " + dbPath + ": " + err.Error() + "\n")
-				summary.WriteString(string(genOutput))
+				summary.WriteString("Failed to get LTX files for " + dbPath + ": " + err.Error() + "\n")
+				summary.WriteString(string(ltxOutput))
 				continue
 			}
 			summary.WriteString("Database: " + dbPath + "\n")
-			summary.WriteString(string(genOutput))
-			summary.WriteString("\n")
-		}
-
-		// Get snapshots info for each database
-		summary.WriteString("Snapshots:\n")
-		for _, dbPath := range dbPaths {
-			snapArgs := []string{"snapshots"}
-			if config != "" {
-				snapArgs = append(snapArgs, "-config", config)
-			}
-			snapArgs = append(snapArgs, dbPath)
-			snapCmd := exec.CommandContext(ctx, "litestream", snapArgs...)
-			snapOutput, err := snapCmd.CombinedOutput()
-			if err != nil {
-				summary.WriteString("Failed to get snapshots for " + dbPath + ": " + err.Error() + "\n")
-				summary.WriteString(string(snapOutput))
-				continue
-			}
-			summary.WriteString("Database: " + dbPath + "\n")
-			summary.WriteString(string(snapOutput))
+			summary.WriteString(string(ltxOutput))
 			summary.WriteString("\n")
 		}
 
@@ -268,36 +216,6 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		}
 		if ifReplicaExists, err := req.RequireBool("if_replica_exists"); err == nil {
 			args = append(args, "-if-replica-exists", strconv.FormatBool(ifReplicaExists))
-		}
-		if path, err := req.RequireString("path"); err == nil {
-			args = append(args, path)
-		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
-		}
-		return mcp.NewToolResultText(string(output)), nil
-	}
-}
-
-func SnapshotsTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
-	tool := mcp.NewTool("litestream_snapshots",
-		mcp.WithDescription("List all snapshots for a database or replica."),
-		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
-		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
-		mcp.WithString("replica", mcp.Description("Replica name to filter by. Optional.")),
-	)
-
-	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"snapshots"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
-		}
-		args = append(args, "-config", config)
-		if replica, err := req.RequireString("replica"); err == nil {
-			args = append(args, "-replica", replica)
 		}
 		if path, err := req.RequireString("path"); err == nil {
 			args = append(args, path)
