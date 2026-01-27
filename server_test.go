@@ -96,7 +96,7 @@ func TestServer_HandleMonitor(t *testing.T) {
 			t.Errorf("expected Content-Type 'application/x-ndjson', got %q", contentType)
 		}
 
-		// Read initial full status event
+		// Read initial full status event (one event per database)
 		scanner := bufio.NewScanner(resp.Body)
 		if !scanner.Scan() {
 			t.Fatal("expected to read first event")
@@ -110,11 +110,11 @@ func TestServer_HandleMonitor(t *testing.T) {
 		if event.Type != "full" {
 			t.Errorf("expected event type 'full', got %q", event.Type)
 		}
-		if len(event.Databases) != 1 {
-			t.Errorf("expected 1 database in full status, got %d", len(event.Databases))
+		if event.Database == nil {
+			t.Fatal("expected non-nil database in full event")
 		}
-		if event.Databases[0].Path != db.Path() {
-			t.Errorf("expected path %q, got %q", db.Path(), event.Databases[0].Path)
+		if event.Database.Path != db.Path() {
+			t.Errorf("expected path %q, got %q", db.Path(), event.Database.Path)
 		}
 	})
 
@@ -141,8 +141,8 @@ func TestServer_HandleMonitor(t *testing.T) {
 		}
 		defer server.Close()
 
-		// Wire up OnSync callback
-		db.Replica.OnSync = func(pos ltx.Pos) {
+		// Wire up AfterSync callback
+		db.Replica.AfterSync = func(pos ltx.Pos) {
 			server.StatusMonitor.NotifySync(db, pos)
 		}
 

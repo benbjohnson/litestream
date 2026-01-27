@@ -289,11 +289,11 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			slog.Warn("failed to start control server", "error", err)
 		}
 
-		// Wire up OnSync callbacks for status monitoring
+		// Wire up AfterSync callbacks for status monitoring
 		for _, db := range c.Store.DBs() {
 			if db.Replica != nil {
 				db := db // capture for closure
-				db.Replica.OnSync = func(pos ltx.Pos) {
+				db.Replica.AfterSync = func(pos ltx.Pos) {
 					c.Server.StatusMonitor.NotifySync(db, pos)
 				}
 			}

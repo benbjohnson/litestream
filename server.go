@@ -227,20 +227,23 @@ func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
 
-	// Send initial full status
-	event := &StatusEvent{
-		Type:      "full",
-		Timestamp: time.Now(),
-		Databases: s.StatusMonitor.GetFullStatus(),
-	}
-	if err := json.NewEncoder(w).Encode(event); err != nil {
-		return
+	// Subscribe before getting full status to avoid missing events
+	sub := s.StatusMonitor.Subscribe()
+	defer s.StatusMonitor.Unsubscribe(sub)
+
+	// Send initial full status - one event per database
+	statuses := s.StatusMonitor.GetFullStatus()
+	for i := range statuses {
+		event := &StatusEvent{
+			Type:      "full",
+			Timestamp: time.Now(),
+			Database:  &statuses[i],
+		}
+		if err := json.NewEncoder(w).Encode(event); err != nil {
+			return
+		}
 	}
 	flusher.Flush()
-
-	// Subscribe to updates
-	ch := s.StatusMonitor.Subscribe()
-	defer s.StatusMonitor.Unsubscribe(ch)
 
 	// Stream events until client disconnects
 	ctx := r.Context()
@@ -248,7 +251,7 @@ func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
 		select {
 		case <-ctx.Done():
 			return
-		case event, ok := <-ch:
+		case event, ok := <-sub.C:
 			if !ok {
 				return
 			}
