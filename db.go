@@ -10,6 +10,7 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
@@ -2108,6 +2109,21 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
 func (db *DB) monitor() {
+	// Add random jitter (0 to 3x MonitorInterval) before the first tick.
+	// This prevents all databases from syncing simultaneously at startup
+	// when many databases are discovered at once (thundering herd prevention).
+	// The 3x multiplier spreads initial syncs over 3 seconds with default 1s interval,
+	// significantly reducing peak CPU while still allowing short-running tests to work.
+	if db.MonitorInterval > 0 {
+		jitterWindow := 3 * db.MonitorInterval
+		jitter := time.Duration(rand.Int63n(int64(jitterWindow)))
+		select {
+		case <-db.ctx.Done():
+			return
+		case <-time.After(jitter):
+		}
+	}
+
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
 

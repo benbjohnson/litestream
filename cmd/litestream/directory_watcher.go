@@ -8,10 +8,23 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/fsnotify/fsnotify"
 
 	"github.com/benbjohnson/litestream"
+)
+
+const (
+	// debounceInterval is the time to wait after an event before processing it.
+	// This allows multiple rapid events for the same file to be coalesced.
+	// Increased from 100ms to reduce event processing overhead at scale.
+	debounceInterval = 250 * time.Millisecond
+
+	// maxConcurrentInits limits the number of databases being initialized
+	// concurrently to prevent thundering herd at startup.
+	// Reduced from 10 to 3 to lower peak CPU during mass discovery.
+	maxConcurrentInits = 3
 )
 
 // DirectoryMonitor watches a directory tree for SQLite databases and dynamically
@@ -32,6 +45,15 @@ type DirectoryMonitor struct {
 	mu          sync.Mutex
 	dbs         map[string]*litestream.DB
 	watchedDirs map[string]struct{}
+
+	// Event debouncing: coalesce rapid events for the same file
+	debounceMu      sync.Mutex
+	pendingEvents   map[string]fsnotify.Op
+	debounceTimer   *time.Timer
+	debounceRunning bool
+
+	// Semaphore for limiting concurrent database initializations
+	initSem chan struct{}
 
 	wg sync.WaitGroup
 }
@@ -61,17 +83,19 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 
 	monitorCtx, cancel := context.WithCancel(ctx)
 	dm := &DirectoryMonitor{
-		store:       store,
-		config:      dbc,
-		dirPath:     dirPath,
-		pattern:     dbc.Pattern,
-		recursive:   dbc.Recursive,
-		watcher:     watcher,
-		ctx:         monitorCtx,
-		cancel:      cancel,
-		logger:      slog.With("dir", dirPath),
-		dbs:         make(map[string]*litestream.DB),
-		watchedDirs: make(map[string]struct{}),
+		store:         store,
+		config:        dbc,
+		dirPath:       dirPath,
+		pattern:       dbc.Pattern,
+		recursive:     dbc.Recursive,
+		watcher:       watcher,
+		ctx:           monitorCtx,
+		cancel:        cancel,
+		logger:        slog.With("dir", dirPath),
+		dbs:           make(map[string]*litestream.DB),
+		watchedDirs:   make(map[string]struct{}),
+		pendingEvents: make(map[string]fsnotify.Op),
+		initSem:       make(chan struct{}, maxConcurrentInits),
 	}
 
 	for _, db := range existing {
@@ -97,6 +121,14 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 func (dm *DirectoryMonitor) Close() {
 	dm.cancel()
 	_ = dm.watcher.Close()
+
+	// Stop debounce timer if running
+	dm.debounceMu.Lock()
+	if dm.debounceTimer != nil {
+		dm.debounceTimer.Stop()
+	}
+	dm.debounceMu.Unlock()
+
 	dm.wg.Wait()
 }
 
@@ -179,8 +211,25 @@ func (dm *DirectoryMonitor) handleEvent(event fsnotify.Event) {
 		return
 	}
 
+	// EARLY FILTER: Skip known non-database suffixes immediately.
+	// This avoids os.Stat() calls for WAL, SHM, and journal files which are
+	// never databases but generate many fsnotify events during normal DB operations.
+	// With 400 databases, this can reduce event processing by 2/3.
+	if dm.shouldSkipPath(path) {
+		return
+	}
+
 	info, statErr := os.Stat(path)
 	isDir := statErr == nil && info.IsDir()
+
+	// For non-directory create/write/rename events, check pattern match early.
+	// This avoids further processing for files that don't match the pattern.
+	// We must check isDir first because directories don't need to match the pattern.
+	if !isDir && event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
+		if !dm.matchesPattern(path) {
+			return
+		}
+	}
 
 	// Check if this path was previously a watched directory (needed for removal detection)
 	dm.mu.Lock()
@@ -226,7 +275,47 @@ func (dm *DirectoryMonitor) handleEvent(event fsnotify.Event) {
 		return
 	}
 
+	// For create/write events, use debouncing to coalesce rapid events.
+	// This reduces redundant processing when multiple events fire for the
+	// same file in quick succession (e.g., during database creation).
 	if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
+		dm.queuePotentialDatabase(path, event.Op)
+	}
+}
+
+// queuePotentialDatabase adds a file to the pending events queue and schedules
+// processing after the debounce interval. Multiple events for the same file
+// within the interval are coalesced.
+func (dm *DirectoryMonitor) queuePotentialDatabase(path string, op fsnotify.Op) {
+	dm.debounceMu.Lock()
+	defer dm.debounceMu.Unlock()
+
+	// Merge operations for the same path
+	dm.pendingEvents[path] |= op
+
+	// Schedule flush if not already running
+	if !dm.debounceRunning {
+		dm.debounceRunning = true
+		dm.debounceTimer = time.AfterFunc(debounceInterval, dm.flushPendingEvents)
+	}
+}
+
+// flushPendingEvents processes all queued potential database events.
+func (dm *DirectoryMonitor) flushPendingEvents() {
+	dm.debounceMu.Lock()
+	events := dm.pendingEvents
+	dm.pendingEvents = make(map[string]fsnotify.Op)
+	dm.debounceRunning = false
+	dm.debounceMu.Unlock()
+
+	for path := range events {
+		// Check context before processing each path
+		select {
+		case <-dm.ctx.Done():
+			return
+		default:
+		}
+
 		dm.handlePotentialDatabase(path)
 	}
 }
@@ -258,6 +347,15 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 	}()
 
 	if !IsSQLiteDatabase(path) {
+		return
+	}
+
+	// Acquire semaphore slot to limit concurrent initializations.
+	// This prevents thundering herd when many databases are discovered at once.
+	select {
+	case dm.initSem <- struct{}{}:
+		defer func() { <-dm.initSem }()
+	case <-dm.ctx.Done():
 		return
 	}
 
@@ -344,6 +442,31 @@ func (dm *DirectoryMonitor) matchesPattern(path string) bool {
 		return false
 	}
 	return matched
+}
+
+// shouldSkipPath returns true for files that should be skipped entirely.
+// This includes SQLite auxiliary files (WAL, SHM, journal) that are never
+// databases themselves but generate many fsnotify events during normal
+// database operations.
+func (dm *DirectoryMonitor) shouldSkipPath(path string) bool {
+	base := filepath.Base(path)
+
+	// Skip SQLite WAL (Write-Ahead Log) files
+	if strings.HasSuffix(base, "-wal") {
+		return true
+	}
+
+	// Skip SQLite SHM (Shared Memory) files
+	if strings.HasSuffix(base, "-shm") {
+		return true
+	}
+
+	// Skip SQLite journal files (rollback journal)
+	if strings.HasSuffix(base, "-journal") {
+		return true
+	}
+
+	return false
 }
 
 // scanDirectory walks a directory to discover pre-existing databases.

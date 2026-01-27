@@ -73,6 +73,10 @@ const (
 	// DefaultDBInitTimeout is the maximum time to wait for a database to be
 	// initialized (page size known) before logging a warning.
 	DefaultDBInitTimeout = 30 * time.Second
+
+	// maxConcurrentDBOpens limits concurrent db.Open() calls during store startup
+	// to prevent thundering herd when many databases are configured.
+	maxConcurrentDBOpens = 10
 )
 
 // Store represents the top-level container for databases.
@@ -153,10 +157,10 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
-	for _, db := range s.dbs {
-		if err := db.Open(); err != nil {
-			return err
-		}
+	// Open databases concurrently with rate limiting to prevent thundering herd.
+	// This spreads out the initial monitor goroutine starts.
+	if err := s.openDatabasesConcurrently(ctx); err != nil {
+		return err
 	}
 
 	// Start monitors for compactions & snapshots.
@@ -204,6 +208,62 @@ func (s *Store) Open(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// openDatabasesConcurrently opens all databases with rate limiting to prevent
+// thundering herd at startup. Uses a semaphore to limit concurrent opens.
+func (s *Store) openDatabasesConcurrently(ctx context.Context) error {
+	if len(s.dbs) == 0 {
+		return nil
+	}
+
+	// For small numbers of databases, open sequentially to avoid goroutine overhead.
+	if len(s.dbs) <= maxConcurrentDBOpens {
+		for _, db := range s.dbs {
+			if err := db.Open(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	// For larger numbers, use concurrent opening with rate limiting.
+	sem := make(chan struct{}, maxConcurrentDBOpens)
+	errCh := make(chan error, 1)
+	var wg sync.WaitGroup
+
+	for _, db := range s.dbs {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-errCh:
+			return err
+		case sem <- struct{}{}:
+		}
+
+		wg.Add(1)
+		go func(db *DB) {
+			defer wg.Done()
+			defer func() { <-sem }()
+
+			if err := db.Open(); err != nil {
+				select {
+				case errCh <- err:
+				default:
+				}
+			}
+		}(db)
+	}
+
+	wg.Wait()
+
+	// Check for any error that occurred.
+	select {
+	case err := <-errCh:
+		return err
+	default:
+		return nil
+	}
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
