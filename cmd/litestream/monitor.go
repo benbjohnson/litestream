@@ -15,7 +15,9 @@ import (
 )
 
 // MonitorCommand represents the command to monitor replication status.
-type MonitorCommand struct{}
+type MonitorCommand struct {
+	seenFull bool // tracks if we've printed the connection header
+}
 
 // Run executes the monitor command.
 func (c *MonitorCommand) Run(ctx context.Context, args []string) error {
@@ -85,15 +87,18 @@ func (c *MonitorCommand) Run(ctx context.Context, args []string) error {
 func (c *MonitorCommand) printEvent(event *litestream.StatusEvent, dbFilter string) {
 	switch event.Type {
 	case "full":
-		fmt.Printf("[%s] Connected - monitoring %d database(s)\n",
-			event.Timestamp.Format(time.RFC3339),
-			len(event.Databases))
-		for _, db := range event.Databases {
-			if dbFilter != "" && db.Path != dbFilter {
-				continue
-			}
-			c.printDatabaseStatus(&db)
+		if event.Database == nil {
+			return
 		}
+		if dbFilter != "" && event.Database.Path != dbFilter {
+			return
+		}
+		// Print header on first full event
+		if !c.seenFull {
+			fmt.Printf("[%s] Connected\n", event.Timestamp.Format(time.RFC3339))
+			c.seenFull = true
+		}
+		c.printDatabaseStatus(event.Database)
 
 	case "sync":
 		if event.Database == nil {

@@ -16,16 +16,16 @@ func TestStatusMonitor_Subscribe(t *testing.T) {
 		store := litestream.NewStore(nil, levels)
 		monitor := litestream.NewStatusMonitor(store)
 
-		ch := monitor.Subscribe()
-		if ch == nil {
-			t.Fatal("expected non-nil channel")
+		sub := monitor.Subscribe()
+		if sub == nil {
+			t.Fatal("expected non-nil subscriber")
 		}
 
 		// Unsubscribe should close the channel
-		monitor.Unsubscribe(ch)
+		monitor.Unsubscribe(sub)
 
 		// Reading from closed channel should return ok=false
-		_, ok := <-ch
+		_, ok := <-sub.C
 		if ok {
 			t.Error("expected channel to be closed after Unsubscribe")
 		}
@@ -36,17 +36,17 @@ func TestStatusMonitor_Subscribe(t *testing.T) {
 		store := litestream.NewStore(nil, levels)
 		monitor := litestream.NewStatusMonitor(store)
 
-		ch1 := monitor.Subscribe()
-		ch2 := monitor.Subscribe()
-		ch3 := monitor.Subscribe()
+		sub1 := monitor.Subscribe()
+		sub2 := monitor.Subscribe()
+		sub3 := monitor.Subscribe()
 
-		if ch1 == ch2 || ch2 == ch3 || ch1 == ch3 {
-			t.Error("expected different channels for different subscribers")
+		if sub1 == sub2 || sub2 == sub3 || sub1 == sub3 {
+			t.Error("expected different subscribers")
 		}
 
-		monitor.Unsubscribe(ch1)
-		monitor.Unsubscribe(ch2)
-		monitor.Unsubscribe(ch3)
+		monitor.Unsubscribe(sub1)
+		monitor.Unsubscribe(sub2)
+		monitor.Unsubscribe(sub3)
 	})
 }
 
@@ -66,10 +66,10 @@ func TestStatusMonitor_NotifySync(t *testing.T) {
 
 		monitor := litestream.NewStatusMonitor(store)
 
-		ch1 := monitor.Subscribe()
-		ch2 := monitor.Subscribe()
-		defer monitor.Unsubscribe(ch1)
-		defer monitor.Unsubscribe(ch2)
+		sub1 := monitor.Subscribe()
+		sub2 := monitor.Subscribe()
+		defer monitor.Unsubscribe(sub1)
+		defer monitor.Unsubscribe(sub2)
 
 		// Notify sync
 		pos := ltx.Pos{TXID: 42}
@@ -77,7 +77,7 @@ func TestStatusMonitor_NotifySync(t *testing.T) {
 
 		// Both subscribers should receive the event
 		select {
-		case event := <-ch1:
+		case event := <-sub1.C:
 			if event.Type != "sync" {
 				t.Errorf("expected type 'sync', got %q", event.Type)
 			}
@@ -88,20 +88,20 @@ func TestStatusMonitor_NotifySync(t *testing.T) {
 				t.Errorf("expected replica_txid '000000000000002a', got %q", event.Database.ReplicaTXID)
 			}
 		case <-time.After(time.Second):
-			t.Fatal("timeout waiting for event on ch1")
+			t.Fatal("timeout waiting for event on sub1")
 		}
 
 		select {
-		case event := <-ch2:
+		case event := <-sub2.C:
 			if event.Type != "sync" {
 				t.Errorf("expected type 'sync', got %q", event.Type)
 			}
 		case <-time.After(time.Second):
-			t.Fatal("timeout waiting for event on ch2")
+			t.Fatal("timeout waiting for event on sub2")
 		}
 	})
 
-	t.Run("DropsEventsForSlowSubscribers", func(t *testing.T) {
+	t.Run("ClosesSlowSubscribers", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
 
@@ -117,16 +117,37 @@ func TestStatusMonitor_NotifySync(t *testing.T) {
 		monitor := litestream.NewStatusMonitor(store)
 
 		// Subscribe but don't read
-		ch := monitor.Subscribe()
-		defer monitor.Unsubscribe(ch)
+		sub := monitor.Subscribe()
 
 		// Send more events than the buffer size (64)
 		for i := 0; i < 100; i++ {
 			monitor.NotifySync(db, ltx.Pos{TXID: ltx.TXID(i)})
 		}
 
-		// Should not block - events should be dropped for slow subscriber
-		// This test passes if it doesn't hang
+		// Should not block - slow subscriber should be closed
+		// Verify channel is closed
+		select {
+		case _, ok := <-sub.C:
+			// Either we get events or channel is closed, both are fine
+			if !ok {
+				// Channel was closed as expected for slow subscriber
+				return
+			}
+		default:
+			// Channel is empty or closed
+		}
+
+		// Drain any remaining events
+		for {
+			select {
+			case _, ok := <-sub.C:
+				if !ok {
+					return // Channel closed
+				}
+			default:
+				return // No more events
+			}
+		}
 	})
 }
 
@@ -240,9 +261,9 @@ func TestStatusMonitor_ConcurrentAccess(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ch := monitor.Subscribe()
+			sub := monitor.Subscribe()
 			time.Sleep(10 * time.Millisecond)
-			monitor.Unsubscribe(ch)
+			monitor.Unsubscribe(sub)
 		}()
 	}
 

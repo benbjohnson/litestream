@@ -12,34 +12,43 @@ import (
 type StatusMonitor struct {
 	store *Store
 
-	mu          sync.RWMutex
-	subscribers map[chan *StatusEvent]struct{}
+	mu          sync.Mutex
+	subscribers map[*StatusSubscriber]struct{}
 }
 
 // NewStatusMonitor creates a new status monitor.
 func NewStatusMonitor(store *Store) *StatusMonitor {
 	return &StatusMonitor{
 		store:       store,
-		subscribers: make(map[chan *StatusEvent]struct{}),
+		subscribers: make(map[*StatusSubscriber]struct{}),
 	}
 }
 
-// Subscribe returns a channel for receiving status events.
+// Subscribe returns a subscriber for receiving status events.
 // The caller must call Unsubscribe when done to avoid resource leaks.
-func (m *StatusMonitor) Subscribe() chan *StatusEvent {
-	ch := make(chan *StatusEvent, 64)
+func (m *StatusMonitor) Subscribe() *StatusSubscriber {
+	sub := &StatusSubscriber{
+		C: make(chan *StatusEvent, 64),
+	}
 	m.mu.Lock()
-	m.subscribers[ch] = struct{}{}
+	m.subscribers[sub] = struct{}{}
 	m.mu.Unlock()
-	return ch
+	return sub
 }
 
-// Unsubscribe removes a subscriber channel and closes it.
-func (m *StatusMonitor) Unsubscribe(ch chan *StatusEvent) {
+// Unsubscribe removes a subscriber and closes its channel.
+func (m *StatusMonitor) Unsubscribe(sub *StatusSubscriber) {
 	m.mu.Lock()
-	delete(m.subscribers, ch)
-	m.mu.Unlock()
-	close(ch)
+	defer m.mu.Unlock()
+	m.closeSubscriber(sub)
+}
+
+// closeSubscriber removes and closes a subscriber. Must be called with mu held.
+func (m *StatusMonitor) closeSubscriber(sub *StatusSubscriber) {
+	if _, ok := m.subscribers[sub]; ok {
+		delete(m.subscribers, sub)
+		close(sub.C)
+	}
 }
 
 // GetFullStatus returns a snapshot of all database statuses.
@@ -53,7 +62,7 @@ func (m *StatusMonitor) GetFullStatus() []DatabaseStatus {
 }
 
 // NotifySync broadcasts a sync event to all subscribers.
-// Called by Replica.OnSync when LTX files are uploaded.
+// Called by Replica.AfterSync when LTX files are uploaded.
 func (m *StatusMonitor) NotifySync(db *DB, pos ltx.Pos) {
 	event := &StatusEvent{
 		Type:      "sync",
@@ -68,16 +77,17 @@ func (m *StatusMonitor) NotifySync(db *DB, pos ltx.Pos) {
 }
 
 // broadcast sends an event to all subscribers.
-// Events are dropped for slow subscribers to avoid blocking.
+// Slow subscribers are closed and removed to avoid blocking.
 func (m *StatusMonitor) broadcast(event *StatusEvent) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
 
-	for ch := range m.subscribers {
+	for sub := range m.subscribers {
 		select {
-		case ch <- event:
+		case sub.C <- event:
 		default:
-			// Drop if subscriber is slow
+			// Subscriber is slow, close and remove it
+			m.closeSubscriber(sub)
 		}
 	}
 }
@@ -134,12 +144,17 @@ func getDatabaseStatus(db *DB) DatabaseStatus {
 	return status
 }
 
+// StatusSubscriber represents a client subscribed to status events.
+type StatusSubscriber struct {
+	// C is the channel for receiving status events.
+	C chan *StatusEvent
+}
+
 // StatusEvent represents a single NDJSON event sent to monitoring clients.
 type StatusEvent struct {
-	Type      string           `json:"type"` // "full" or "sync"
-	Timestamp time.Time        `json:"timestamp"`
-	Database  *DatabaseStatus  `json:"database,omitempty"`  // for "sync" events
-	Databases []DatabaseStatus `json:"databases,omitempty"` // for "full" events
+	Type      string          `json:"type"` // "full" or "sync"
+	Timestamp time.Time       `json:"timestamp"`
+	Database  *DatabaseStatus `json:"database,omitempty"`
 }
 
 // DatabaseStatus represents the replication status of a single database.
