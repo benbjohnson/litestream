@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"context"
 	"fmt"
 	"path"
 	"regexp"
@@ -136,4 +137,21 @@ func ParseWALSegmentFilenameV3(filename string) (index int, offset int64, err er
 // IsGenerationIDV3 returns true if s is a valid v0.3.x generation ID (16 hex chars).
 func IsGenerationIDV3(s string) bool {
 	return generationRegexV3.MatchString(s)
+}
+
+// ReplicaClientV3 reads v0.3.x backup data.
+// ReplicaClient implementations that support v0.3.x restore should implement this interface.
+type ReplicaClientV3 interface {
+	// GenerationsV3 returns a list of generation IDs in the replica.
+	// Returns an empty slice if no v0.3.x backups exist.
+	// Generation IDs are sorted in ascending order.
+	GenerationsV3(ctx context.Context) ([]string, error)
+
+	// SnapshotsV3 returns snapshots for a generation, sorted by index.
+	// Returns an empty slice if no snapshots exist.
+	SnapshotsV3(ctx context.Context, generation string) ([]SnapshotInfoV3, error)
+
+	// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
+	// Returns an empty slice if no WAL segments exist.
+	WALSegmentsV3(ctx context.Context, generation string) ([]WALSegmentInfoV3, error)
 }

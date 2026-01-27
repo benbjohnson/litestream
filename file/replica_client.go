@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -25,6 +26,7 @@ func init() {
 const ReplicaClientType = "file"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to disk.
 type ReplicaClient struct {
@@ -250,4 +252,100 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 	return nil
+}
+
+// GenerationsV3 returns a list of v0.3.x generation IDs in the replica.
+func (c *ReplicaClient) GenerationsV3(ctx context.Context) ([]string, error) {
+	genPath := filepath.Join(c.path, litestream.GenerationsDirV3)
+	entries, err := os.ReadDir(genPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var generations []string
+	for _, entry := range entries {
+		if entry.IsDir() && litestream.IsGenerationIDV3(entry.Name()) {
+			generations = append(generations, entry.Name())
+		}
+	}
+	slices.Sort(generations)
+	return generations, nil
+}
+
+// SnapshotsV3 returns snapshots for a generation, sorted by index.
+func (c *ReplicaClient) SnapshotsV3(ctx context.Context, generation string) ([]litestream.SnapshotInfoV3, error) {
+	snapshotsPath := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.SnapshotsDirV3)
+	entries, err := os.ReadDir(snapshotsPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var snapshots []litestream.SnapshotInfoV3
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		index, err := litestream.ParseSnapshotFilenameV3(entry.Name())
+		if err != nil {
+			continue // skip invalid filenames
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		snapshots = append(snapshots, litestream.SnapshotInfoV3{
+			Generation: generation,
+			Index:      index,
+			Size:       info.Size(),
+			CreatedAt:  info.ModTime(),
+		})
+	}
+	slices.SortFunc(snapshots, func(a, b litestream.SnapshotInfoV3) int {
+		return a.Index - b.Index
+	})
+	return snapshots, nil
+}
+
+// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
+func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([]litestream.WALSegmentInfoV3, error) {
+	walPath := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.WALDirV3)
+	entries, err := os.ReadDir(walPath)
+	if os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var segments []litestream.WALSegmentInfoV3
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		index, offset, err := litestream.ParseWALSegmentFilenameV3(entry.Name())
+		if err != nil {
+			continue // skip invalid filenames
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return nil, err
+		}
+		segments = append(segments, litestream.WALSegmentInfoV3{
+			Generation: generation,
+			Index:      index,
+			Offset:     offset,
+			Size:       info.Size(),
+			CreatedAt:  info.ModTime(),
+		})
+	}
+	slices.SortFunc(segments, func(a, b litestream.WALSegmentInfoV3) int {
+		if a.Index != b.Index {
+			return a.Index - b.Index
+		}
+		return int(a.Offset - b.Offset)
+	})
+	return segments, nil
 }
