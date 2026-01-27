@@ -32,6 +32,9 @@ func DefaultSocketConfig() SocketConfig {
 type Server struct {
 	store *Store
 
+	// StatusMonitor handles replication status streaming.
+	StatusMonitor *StatusMonitor
+
 	// SocketPath is the path to the Unix socket.
 	SocketPath string
 
@@ -56,16 +59,18 @@ type Server struct {
 func NewServer(store *Store) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		store:       store,
-		SocketPerms: 0600,
-		ctx:         ctx,
-		cancel:      cancel,
-		logger:      slog.Default(),
+		store:         store,
+		StatusMonitor: NewStatusMonitor(store),
+		SocketPerms:   0600,
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        slog.Default(),
 	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
+	mux.HandleFunc("GET /monitor", s.handleMonitor)
 
 	s.httpServer = &http.Server{Handler: mux}
 
@@ -209,6 +214,50 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		Status: "stopped",
 		Path:   expandedPath,
 	})
+}
+
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported", nil)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Send initial full status
+	event := &StatusEvent{
+		Type:      "full",
+		Timestamp: time.Now(),
+		Databases: s.StatusMonitor.GetFullStatus(),
+	}
+	if err := json.NewEncoder(w).Encode(event); err != nil {
+		return
+	}
+	flusher.Flush()
+
+	// Subscribe to updates
+	ch := s.StatusMonitor.Subscribe()
+	defer s.StatusMonitor.Unsubscribe(ch)
+
+	// Stream events until client disconnects
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-ch:
+			if !ok {
+				return
+			}
+			if err := json.NewEncoder(w).Encode(event); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {

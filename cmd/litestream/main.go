@@ -159,6 +159,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		slog.Info("litestream shut down")
 		return err
 
+	case "monitor":
+		return (&MonitorCommand{}).Run(ctx, args)
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
 	case "stop":
@@ -199,6 +201,7 @@ The commands are:
 
 	databases    list databases specified in config file
 	ltx          list available LTX files for a database
+	monitor      stream replication status in real-time
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
 	restore      recovers database backup from a replica
