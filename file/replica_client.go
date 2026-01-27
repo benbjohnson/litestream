@@ -349,3 +349,25 @@ func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([
 	})
 	return segments, nil
 }
+
+// OpenSnapshotV3 opens a v0.3.x snapshot file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	path := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.SnapshotsDirV3, litestream.FormatSnapshotFilenameV3(index))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return internal.NewLZ4Reader(f), nil
+}
+
+// OpenWALSegmentV3 opens a v0.3.x WAL segment file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error) {
+	path := filepath.Join(c.path, litestream.GenerationsDirV3, generation, litestream.WALDirV3, litestream.FormatWALSegmentFilenameV3(index, offset))
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	return internal.NewLZ4Reader(f), nil
+}

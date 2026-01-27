@@ -6,6 +6,7 @@ import (
 	"os"
 	"syscall"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
@@ -37,6 +38,25 @@ func (r *ReadCloser) Close() error {
 		}
 	}
 	return r.c.Close()
+}
+
+// LZ4ReadCloser wraps an LZ4 reader with the underlying source for proper closing.
+type LZ4ReadCloser struct {
+	*lz4.Reader
+	underlying io.Closer
+}
+
+func (r *LZ4ReadCloser) Close() error {
+	return r.underlying.Close()
+}
+
+// NewLZ4Reader creates an LZ4 decompressing reader that wraps the source.
+// Closing the returned reader also closes the underlying source.
+func NewLZ4Reader(r io.ReadCloser) io.ReadCloser {
+	return &LZ4ReadCloser{
+		Reader:     lz4.NewReader(r),
+		underlying: r,
+	}
 }
 
 // ReadCounter wraps an io.Reader and counts the total number of bytes read.
