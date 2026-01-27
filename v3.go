@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"fmt"
+	"io"
 	"path"
 	"regexp"
 	"strconv"
@@ -154,4 +155,12 @@ type ReplicaClientV3 interface {
 	// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
 	// Returns an empty slice if no WAL segments exist.
 	WALSegmentsV3(ctx context.Context, generation string) ([]WALSegmentInfoV3, error)
+
+	// OpenSnapshotV3 opens a v0.3.x snapshot for reading.
+	// The returned reader provides LZ4-decompressed data.
+	OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+
+	// OpenWALSegmentV3 opens a v0.3.x WAL segment for reading.
+	// The returned reader provides LZ4-decompressed data.
+	OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error)
 }

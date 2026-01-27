@@ -4,12 +4,14 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream/file"
@@ -559,6 +561,114 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 		}
 		if len(result) != 2 {
 			t.Fatalf("expected 2 valid segments, got %d", len(result))
+		}
+	})
+}
+
+func TestReplicaClient_OpenSnapshotV3(t *testing.T) {
+	gen := "0123456789abcdef"
+
+	t.Run("NotFound", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		_, err := c.OpenSnapshotV3(context.Background(), gen, 0)
+		if !os.IsNotExist(err) {
+			t.Errorf("expected not exist error, got %v", err)
+		}
+	})
+
+	t.Run("ReadDecompressed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		snapshotsDir := filepath.Join(tmpDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LZ4-compressed test data
+		original := []byte("test snapshot data for decompression")
+		var buf bytes.Buffer
+		w := lz4.NewWriter(&buf)
+		if _, err := w.Write(original); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write compressed file
+		path := filepath.Join(snapshotsDir, "00000000.snapshot.lz4")
+		if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		c := file.NewReplicaClient(tmpDir)
+		r, err := c.OpenSnapshotV3(context.Background(), gen, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		data, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, original) {
+			t.Errorf("decompressed data mismatch: got %q, want %q", data, original)
+		}
+	})
+}
+
+func TestReplicaClient_OpenWALSegmentV3(t *testing.T) {
+	gen := "0123456789abcdef"
+
+	t.Run("NotFound", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		c := file.NewReplicaClient(tmpDir)
+
+		_, err := c.OpenWALSegmentV3(context.Background(), gen, 0, 0)
+		if !os.IsNotExist(err) {
+			t.Errorf("expected not exist error, got %v", err)
+		}
+	})
+
+	t.Run("ReadDecompressed", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
+		if err := os.MkdirAll(walDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LZ4-compressed test data
+		original := []byte("test WAL segment data")
+		var buf bytes.Buffer
+		w := lz4.NewWriter(&buf)
+		if _, err := w.Write(original); err != nil {
+			t.Fatal(err)
+		}
+		if err := w.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write compressed file
+		path := filepath.Join(walDir, "00000001-0000000000001000.wal.lz4")
+		if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		c := file.NewReplicaClient(tmpDir)
+		r, err := c.OpenWALSegmentV3(context.Background(), gen, 1, 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer r.Close()
+
+		data, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(data, original) {
+			t.Errorf("decompressed data mismatch: got %q, want %q", data, original)
 		}
 	})
 }
