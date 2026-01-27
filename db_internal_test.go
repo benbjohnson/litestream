@@ -897,6 +897,7 @@ func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
 	// Set up litestream DB with short monitor interval.
 	db := NewDB(dbPath)
 	db.MonitorInterval = 50 * time.Millisecond
+	db.MonitorDelayDisabled = true // Disable startup jitter for precise timing in tests.
 	db.Replica = NewReplica(db)
 	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
 	db.Replica.MonitorEnabled = false // disable replica monitor to avoid hangs
