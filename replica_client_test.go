@@ -126,6 +126,63 @@ func TestReplicaClient_LTX(t *testing.T) {
 			t.Fatal("expected no wal files")
 		}
 	})
+
+	// Regression test: LTXFiles should return files that span across the seek TXID.
+	// A file with minTXID < seek but maxTXID >= seek should be included because
+	// it contains TXIDs that are >= seek. This bug caused compaction gaps when
+	// a compacted file at level N spanned a range that started before the seek
+	// point but contained newer TXIDs that level N+1 needed.
+	RunWithReplicaClient(t, "SeekWithSpanningFile", func(t *testing.T, c litestream.ReplicaClient) {
+		t.Helper()
+		t.Parallel()
+
+		// Write a file that spans a large range (simulates a compacted file)
+		// minTXID=100, maxTXID=200
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(100), ltx.TXID(200), bytes.NewReader(createLTXData(100, 200, []byte(`spanning`)))); err != nil {
+			t.Fatal(err)
+		}
+
+		// Write a file after the spanning file
+		// minTXID=201, maxTXID=210
+		if _, err := c.WriteLTXFile(context.Background(), 0, ltx.TXID(201), ltx.TXID(210), bytes.NewReader(createLTXData(201, 210, []byte(`after`)))); err != nil {
+			t.Fatal(err)
+		}
+
+		// Seek to TXID 150, which is in the middle of the spanning file.
+		// The spanning file (100-200) should be returned because it contains
+		// TXIDs >= 150 (specifically 150-200).
+		itr, err := c.LTXFiles(context.Background(), 0, ltx.TXID(150), false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+
+		a, err := ltx.SliceFileIterator(itr)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Should return 2 files: the spanning file (100-200) and the file after (201-210)
+		if got, want := len(a), 2; got != want {
+			t.Fatalf("len=%v, want %v; spanning file should be included when seek is within its range", got, want)
+		}
+
+		// First file should be the spanning file
+		if got, want := a[0].MinTXID, ltx.TXID(100); got != want {
+			t.Fatalf("a[0].MinTXID=%v, want %v", got, want)
+		}
+		if got, want := a[0].MaxTXID, ltx.TXID(200); got != want {
+			t.Fatalf("a[0].MaxTXID=%v, want %v", got, want)
+		}
+
+		// Second file should be the one after
+		if got, want := a[1].MinTXID, ltx.TXID(201); got != want {
+			t.Fatalf("a[1].MinTXID=%v, want %v", got, want)
+		}
+		if got, want := a[1].MaxTXID, ltx.TXID(210); got != want {
+			t.Fatalf("a[1].MaxTXID=%v, want %v", got, want)
+		}
+	})
 }
 
 func TestReplicaClient_WriteLTXFile(t *testing.T) {

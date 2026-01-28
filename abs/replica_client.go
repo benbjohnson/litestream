@@ -453,8 +453,10 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 			Size:    *item.Properties.ContentLength,
 		}
 
-		// Skip if below seek TXID
-		if info.MinTXID < itr.seek {
+		// Skip if file ends before the seek TXID.
+		// Files that span across the seek point (minTXID < seek <= maxTXID)
+		// must be included because they contain TXIDs >= seek.
+		if info.MaxTXID < itr.seek {
 			continue
 		}
 

@@ -110,7 +110,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 		minTXID, maxTXID, err := ltx.ParseFilename(fi.Name())
 		if err != nil {
 			continue
-		} else if minTXID < seek {
+		} else if maxTXID < seek {
 			continue
 		}
 

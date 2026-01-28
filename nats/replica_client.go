@@ -306,8 +306,10 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 			continue
 		}
 
-		// Apply seek filter
-		if minTXID < seek {
+		// Skip if file ends before the seek TXID.
+		// Files that span across the seek point (minTXID < seek <= maxTXID)
+		// must be included because they contain TXIDs >= seek.
+		if maxTXID < seek {
 			continue
 		}
 

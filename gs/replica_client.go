@@ -126,11 +126,8 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 
 	dir := litestream.LTXLevelDir(c.Path, level)
 	prefix := dir + "/"
-	if seek != 0 {
-		prefix += seek.String()
-	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level, seek), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -236,15 +233,17 @@ type ltxFileIterator struct {
 	it     *storage.ObjectIterator
 	client *ReplicaClient
 	level  int
+	seek   ltx.TXID
 	info   *ltx.FileInfo
 	err    error
 }
 
-func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int) *ltxFileIterator {
+func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
 	return &ltxFileIterator{
 		it:     it,
 		client: client,
 		level:  level,
+		seek:   seek,
 	}
 }
 
@@ -271,6 +270,13 @@ func (itr *ltxFileIterator) Next() bool {
 		// Parse index & offset, otherwise skip to the next object.
 		minTXID, maxTXID, err := ltx.ParseFilename(path.Base(attrs.Name))
 		if err != nil {
+			continue
+		}
+
+		// Skip if file ends before the seek TXID.
+		// Files that span across the seek point (minTXID < seek <= maxTXID)
+		// must be included because they contain TXIDs >= seek.
+		if maxTXID < itr.seek {
 			continue
 		}
 
