@@ -228,13 +228,7 @@ func TestOvernightS3Soak(t *testing.T) {
 
 	// Check for errors
 	errors, _ := db.CheckForErrors()
-	criticalErrors := 0
-	for _, errLine := range errors {
-		if !containsAny(errLine, []string{"page size not initialized"}) {
-			criticalErrors++
-		}
-	}
-	t.Logf("  Critical errors: %d", criticalErrors)
+	t.Logf("  Critical errors: %d", len(errors))
 	t.Log("")
 
 	// Test restoration from S3

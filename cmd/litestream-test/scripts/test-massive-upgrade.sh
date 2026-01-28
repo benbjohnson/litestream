@@ -199,13 +199,11 @@ sleep 10
 FLAG_ERRORS=$(grep -c "no flags allowed" /tmp/massive-v5.log 2>/dev/null || echo "0")
 VERIFICATION_ERRORS=$(grep -c "ltx verification failed" /tmp/massive-v5.log 2>/dev/null || echo "0")
 SYNC_ERRORS=$(grep -c "sync error" /tmp/massive-v5.log 2>/dev/null || echo "0")
-PAGE_SIZE_ERRORS=$(grep -c "page size not initialized" /tmp/massive-v5.log 2>/dev/null || echo "0")
 
 echo "  #754 Error Analysis (Massive Database):"
 echo "    'no flags allowed' errors: $FLAG_ERRORS"
 echo "    'ltx verification failed' errors: $VERIFICATION_ERRORS"
 echo "    'sync error' count: $SYNC_ERRORS"
-echo "    'page size not initialized' errors: $PAGE_SIZE_ERRORS"
 
 if [ "$FLAG_ERRORS" -gt "0" ] || [ "$VERIFICATION_ERRORS" -gt "0" ]; then
     echo ""
