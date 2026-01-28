@@ -57,7 +57,10 @@ require (
 	github.com/markusmobius/go-dateparser v1.2.4
 )
 
-require github.com/stretchr/testify v1.11.1
+require (
+	github.com/pierrec/lz4/v4 v4.1.22
+	github.com/stretchr/testify v1.11.1
+)
 
 require (
 	cloud.google.com/go v0.111.0 // indirect
@@ -106,7 +109,6 @@ require (
 	github.com/matttproud/golang_protobuf_extensions/v2 v2.0.0 // indirect
 	github.com/nats-io/nkeys v0.4.11 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
-	github.com/pierrec/lz4/v4 v4.1.22 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/prometheus/client_model v0.5.0 // indirect
