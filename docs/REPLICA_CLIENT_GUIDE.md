@@ -760,4 +760,4 @@ Before submitting a new replica client:
 2. Check test files for expected behavior
 3. Run integration tests against your backend
 4. Use the mock client for rapid development
-5. Ask in GitHub discussions for design feedback
+5. Open a GitHub issue for design feedback
