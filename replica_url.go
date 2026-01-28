@@ -204,6 +204,15 @@ func BoolQueryValue(query url.Values, keys ...string) (value bool, ok bool) {
 	return false, false
 }
 
+// IsHetznerEndpoint returns true if the endpoint is Hetzner object storage service.
+func IsHetznerEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	return strings.HasSuffix(host, ".your-objectstorage.com")
+}
+
 // IsTigrisEndpoint returns true if the endpoint is the Tigris object storage service.
 func IsTigrisEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)
