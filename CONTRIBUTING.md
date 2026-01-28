@@ -146,7 +146,6 @@ We expect all contributors to:
 
 - **Documentation**: [litestream.io](https://litestream.io)
 - **Issues**: [GitHub Issues](https://github.com/benbjohnson/litestream/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/benbjohnson/litestream/discussions)
 
 ## License
 
