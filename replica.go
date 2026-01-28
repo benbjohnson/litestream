@@ -445,25 +445,28 @@ func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 }
 
 // TimeBounds returns the creation time & last updated time.
-// Returns zero time if LTX files exist.
+// Returns zero time if no LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
-	// Normal operation - use fast timestamps
-	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
-	if err != nil {
-		return createdAt, updatedAt, err
-	}
-	defer itr.Close()
+	for level := SnapshotLevel; level >= 0; level-- {
+		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+		if err != nil {
+			return createdAt, updatedAt, err
+		}
 
-	for itr.Next() {
-		info := itr.Item()
-		if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
-			createdAt = info.CreatedAt
+		for itr.Next() {
+			info := itr.Item()
+			if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
+				createdAt = info.CreatedAt
+			}
+			if updatedAt.IsZero() || info.CreatedAt.After(updatedAt) {
+				updatedAt = info.CreatedAt
+			}
 		}
-		if updatedAt.IsZero() || info.CreatedAt.After(updatedAt) {
-			updatedAt = info.CreatedAt
+		if err := itr.Close(); err != nil {
+			return createdAt, updatedAt, err
 		}
 	}
-	return createdAt, updatedAt, itr.Close()
+	return createdAt, updatedAt, nil
 }
 
 // CalcRestoreTarget returns a target time restore from.

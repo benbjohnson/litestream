@@ -434,6 +434,270 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 	})
 }
 
+func TestReplica_TimeBounds(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	t.Run("Level0Only", func(t *testing.T) {
+		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 0 {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1, CreatedAt: now},
+					{Level: 0, MinTXID: 2, MaxTXID: 2, CreatedAt: now.Add(time.Hour)},
+					{Level: 0, MinTXID: 3, MaxTXID: 3, CreatedAt: now.Add(2 * time.Hour)},
+				}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(now) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, now)
+		}
+		if want := now.Add(2 * time.Hour); !updatedAt.Equal(want) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, want)
+		}
+	})
+
+	t.Run("SnapshotOnly", func(t *testing.T) {
+		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == litestream.SnapshotLevel {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: now},
+				}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(now) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, now)
+		}
+		if !updatedAt.Equal(now) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, now)
+		}
+	})
+
+	t.Run("SnapshotAndLevel0", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		l0Time := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 11, MaxTXID: 11, CreatedAt: l0Time},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(snapshotTime) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, snapshotTime)
+		}
+		if !updatedAt.Equal(l0Time) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, l0Time)
+		}
+	})
+
+	t.Run("MultipleCompactionLevels", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		l2Time := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+		l0Time := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5, CreatedAt: snapshotTime},
+				}), nil
+			case 2:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 2, MinTXID: 6, MaxTXID: 8, CreatedAt: l2Time},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 9, MaxTXID: 9, CreatedAt: l0Time},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(snapshotTime) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, snapshotTime)
+		}
+		if !updatedAt.Equal(l0Time) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, l0Time)
+		}
+	})
+
+	t.Run("NoFiles", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.IsZero() {
+			t.Fatalf("createdAt=%v, want zero", createdAt)
+		}
+		if !updatedAt.IsZero() {
+			t.Fatalf("updatedAt=%v, want zero", updatedAt)
+		}
+	})
+
+	t.Run("ErrorOnLevel", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		errTest := errors.New("test error")
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 3 {
+				return nil, errTest
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		_, _, err := r.TimeBounds(context.Background())
+		if !errors.Is(err, errTest) {
+			t.Fatalf("expected test error, got %v", err)
+		}
+	})
+}
+
+func TestReplica_CalcRestoreTarget(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	t.Run("TimestampInSnapshotRange", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		l0Time := time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 11, MaxTXID: 11, CreatedAt: l0Time},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		ts := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
+		updatedAt, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{Timestamp: ts})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !updatedAt.Equal(l0Time) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, l0Time)
+		}
+	})
+
+	t.Run("TimestampBeforeAllFiles", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		_, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{Timestamp: ts})
+		if err == nil || err.Error() != "timestamp does not exist" {
+			t.Fatalf("expected 'timestamp does not exist', got %v", err)
+		}
+	})
+
+	t.Run("TimestampAfterAllFiles", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		ts := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)
+		_, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{Timestamp: ts})
+		if err == nil || err.Error() != "timestamp does not exist" {
+			t.Fatalf("expected 'timestamp does not exist', got %v", err)
+		}
+	})
+
+	t.Run("NoTimestamp", func(t *testing.T) {
+		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 0 {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1, CreatedAt: now},
+					{Level: 0, MinTXID: 2, MaxTXID: 2, CreatedAt: now.Add(time.Hour)},
+				}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		updatedAt, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := now.Add(time.Hour); !updatedAt.Equal(want) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, want)
+		}
+	})
+}
+
 func TestReplica_Restore_InvalidFileSize(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
