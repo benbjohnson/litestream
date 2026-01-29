@@ -67,6 +67,7 @@ func NewServer(store *Store) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
+	mux.HandleFunc("GET /txid", s.handleTXID)
 
 	// pprof endpoints
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -219,6 +220,36 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleTXID(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusNotFound, "database not found", nil)
+		return
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, TXIDResponse{
+		TXID: uint64(pos.TXID),
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -262,4 +293,9 @@ type StopResponse struct {
 type ErrorResponse struct {
 	Error   string      `json:"error"`
 	Details interface{} `json:"details,omitempty"`
+}
+
+// TXIDResponse is the response body for the /txid endpoint.
+type TXIDResponse struct {
+	TXID uint64 `json:"txid"`
 }
