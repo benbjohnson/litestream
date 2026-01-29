@@ -1161,3 +1161,95 @@ func TestIsSQLiteBusyError(t *testing.T) {
 		})
 	}
 }
+
+// TestDB_IdleCheckpointSnapshotLoop tests for the feedback loop described in issue #997.
+// After bulk inserts trigger a checkpoint, litestream should NOT enter a self-perpetuating
+// loop where checkpoint triggers cause repeated LTX file creation on an idle database.
+//
+// The bug occurred because:
+// 1. PASSIVE checkpoint completes but doesn't truncate WAL file
+// 2. WAL salt changes, new _litestream_seq write goes to offset 32 with new salt
+// 3. Old WAL frames (with old salt) make file size exceed checkpoint threshold
+// 4. checkpointIfNeeded() uses file size, triggering another checkpoint
+// 5. Loop repeats, creating LTX files every sync cycle
+//
+// The fix uses logical WAL offset (from LTX) instead of file size for checkpoint decisions.
+func TestDB_IdleCheckpointSnapshotLoop(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 10 // Low threshold to trigger checkpoint easily
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Initial sync
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk inserts WITHOUT transaction (as in the bug report)
+	// This creates many WAL frames that will trigger a checkpoint
+	for i := 0; i < 100; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO test VALUES (?, ?)`, i, "test data padding"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync and trigger checkpoint via size threshold
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a checkpoint that will reset WAL salt
+	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+	afterCheckpointPos, _ := db.Pos()
+
+	// Now the database is IDLE - no more application writes
+	// Simulate multiple sync cycles (as would happen with MonitorInterval)
+	for cycle := 0; cycle < 5; cycle++ {
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	finalPos, _ := db.Pos()
+
+	// The key assertion: TXID should not be incrementing every cycle.
+	// With the bug, TXID would increment 5 times (one per cycle).
+	// The fix ensures checkpoint decisions use logical WAL size,
+	// preventing spurious checkpoints when WAL file contains stale frames.
+	txidGrowth := int(finalPos.TXID - afterCheckpointPos.TXID)
+	if txidGrowth > 1 {
+		t.Errorf("TXID grew by %d during idle cycles (expected <= 1). "+
+			"This is issue #997: checkpoint triggers infinite LTX creation loop.", txidGrowth)
+	}
+}
