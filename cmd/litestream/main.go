@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -511,7 +512,12 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 
 	// Expand environment variables, if enabled.
 	if expandEnv {
-		buf = []byte(os.ExpandEnv(string(buf)))
+		buf = []byte(os.Expand(string(buf), func(key string) string {
+			if key == "PID" {
+				return strconv.Itoa(os.Getpid())
+			}
+			return os.Getenv(key)
+		}))
 	}
 
 	// Save defaults before unmarshaling
