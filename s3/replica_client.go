@@ -779,6 +779,29 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			stack.Finalize.Remove("addInputChecksumTrailer")
 		}
 
+		// Add debug logging middleware at the end of Finalize phase
+		// so all headers (including X-Tigris-Consistent) are set
+		if err := stack.Finalize.Add(
+			middleware.FinalizeMiddlewareFunc(
+				"LitestreamDebugLogging",
+				func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+					out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
+				) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok {
+						c.logger.Debug("s3 request",
+							"method", req.Method,
+							"url", req.URL.String(),
+							"x-tigris-consistent", req.Header.Get("X-Tigris-Consistent"),
+						)
+					}
+					return next.HandleFinalize(ctx, in)
+				},
+			),
+			middleware.After,
+		); err != nil {
+			return err
+		}
+
 		if !c.RequireContentMD5 {
 			return nil
 		}
