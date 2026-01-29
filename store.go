@@ -677,3 +677,39 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 
 	return nil
 }
+
+// ValidationResult holds the result of validating a replica's LTX files.
+type ValidationResult struct {
+	Valid  bool              // true if no errors found
+	Errors []ValidationError // all errors found
+}
+
+// Validate checks LTX file consistency across all databases and levels.
+// SnapshotLevel (9) is excluded since snapshots are not contiguous.
+func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
+	result := &ValidationResult{Valid: true}
+
+	s.mu.Lock()
+	dbs := s.dbs
+	levels := s.levels
+	s.mu.Unlock()
+
+	for _, db := range dbs {
+		if db.Replica == nil {
+			continue
+		}
+
+		for _, lvl := range levels {
+			errs, err := db.Replica.ValidateLevel(ctx, lvl.Level)
+			if err != nil {
+				return nil, fmt.Errorf("validate level %d for %s: %w", lvl.Level, db.Path(), err)
+			}
+			if len(errs) > 0 {
+				result.Valid = false
+				result.Errors = append(result.Errors, errs...)
+			}
+		}
+	}
+
+	return result, nil
+}

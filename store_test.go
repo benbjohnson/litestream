@@ -276,3 +276,118 @@ func TestStore_SnapshotInterval_Default(t *testing.T) {
 			store.SnapshotInterval)
 	}
 }
+
+func TestStore_Validate(t *testing.T) {
+	t.Run("AllLevelsValid", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+
+		db := &litestream.DB{}
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+		// Create contiguous files at L0
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		// Create contiguous files at L1
+		createTestLTXFile(t, client, 1, 1, 2)
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Valid {
+			t.Errorf("expected valid result, got errors: %v", result.Errors)
+		}
+	})
+
+	t.Run("ErrorAtMultipleLevels", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+
+		db := &litestream.DB{}
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+		// Create files with gap at L0
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 5, 5) // gap at 2-4
+
+		// Create files with overlap at L1
+		createTestLTXFile(t, client, 1, 1, 5)
+		createTestLTXFile(t, client, 1, 3, 7) // overlap
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Valid {
+			t.Error("expected invalid result")
+		}
+		if len(result.Errors) != 2 {
+			t.Errorf("expected 2 errors, got %d", len(result.Errors))
+		}
+	})
+
+	t.Run("NilReplica", func(t *testing.T) {
+		// DB with nil replica should be skipped
+		db := &litestream.DB{}
+		// db.Replica is nil
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Valid {
+			t.Errorf("expected valid result for nil replica, got errors: %v", result.Errors)
+		}
+	})
+
+	t.Run("MultipleDBs", func(t *testing.T) {
+		client1 := file.NewReplicaClient(t.TempDir())
+		client2 := file.NewReplicaClient(t.TempDir())
+
+		db1 := &litestream.DB{}
+		db1.Replica = litestream.NewReplicaWithClient(db1, client1)
+
+		db2 := &litestream.DB{}
+		db2.Replica = litestream.NewReplicaWithClient(db2, client2)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+		}
+		store := litestream.NewStore([]*litestream.DB{db1, db2}, levels)
+
+		// db1: valid
+		createTestLTXFile(t, client1, 0, 1, 1)
+		createTestLTXFile(t, client1, 0, 2, 2)
+
+		// db2: gap error
+		createTestLTXFile(t, client2, 0, 1, 1)
+		createTestLTXFile(t, client2, 0, 5, 5)
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Valid {
+			t.Error("expected invalid result")
+		}
+		if len(result.Errors) != 1 {
+			t.Errorf("expected 1 error from db2, got %d", len(result.Errors))
+		}
+	})
+}
