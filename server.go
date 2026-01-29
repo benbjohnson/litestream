@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"sync"
 	"time"
@@ -66,6 +67,13 @@ func NewServer(store *Store) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
+
+	// pprof endpoints
+	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
+	mux.HandleFunc("GET /debug/pprof/cmdline", pprof.Cmdline)
+	mux.HandleFunc("GET /debug/pprof/profile", pprof.Profile)
+	mux.HandleFunc("GET /debug/pprof/symbol", pprof.Symbol)
+	mux.HandleFunc("GET /debug/pprof/trace", pprof.Trace)
 
 	s.httpServer = &http.Server{Handler: mux}
 
