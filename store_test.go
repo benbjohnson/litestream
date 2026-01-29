@@ -276,3 +276,165 @@ func TestStore_SnapshotInterval_Default(t *testing.T) {
 			store.SnapshotInterval)
 	}
 }
+
+func TestStore_Validate(t *testing.T) {
+	t.Run("AllLevelsValid", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+
+		db := &litestream.DB{}
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+		// Create contiguous files at L0
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		// Create contiguous files at L1
+		createTestLTXFile(t, client, 1, 1, 2)
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Valid {
+			t.Errorf("expected valid result, got errors: %v", result.Errors)
+		}
+	})
+
+	t.Run("ErrorAtMultipleLevels", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+
+		db := &litestream.DB{}
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+		// Create files with gap at L0
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 5, 5) // gap at 2-4
+
+		// Create files with overlap at L1
+		createTestLTXFile(t, client, 1, 1, 5)
+		createTestLTXFile(t, client, 1, 3, 7) // overlap
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Valid {
+			t.Error("expected invalid result")
+		}
+		if len(result.Errors) != 2 {
+			t.Errorf("expected 2 errors, got %d", len(result.Errors))
+		}
+	})
+
+	t.Run("NilReplica", func(t *testing.T) {
+		// DB with nil replica should be skipped
+		db := &litestream.DB{}
+		// db.Replica is nil
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.Valid {
+			t.Errorf("expected valid result for nil replica, got errors: %v", result.Errors)
+		}
+	})
+
+	t.Run("MultipleDBs", func(t *testing.T) {
+		client1 := file.NewReplicaClient(t.TempDir())
+		client2 := file.NewReplicaClient(t.TempDir())
+
+		db1 := &litestream.DB{}
+		db1.Replica = litestream.NewReplicaWithClient(db1, client1)
+
+		db2 := &litestream.DB{}
+		db2.Replica = litestream.NewReplicaWithClient(db2, client2)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+		}
+		store := litestream.NewStore([]*litestream.DB{db1, db2}, levels)
+
+		// db1: valid
+		createTestLTXFile(t, client1, 0, 1, 1)
+		createTestLTXFile(t, client1, 0, 2, 2)
+
+		// db2: gap error
+		createTestLTXFile(t, client2, 0, 1, 1)
+		createTestLTXFile(t, client2, 0, 5, 5)
+
+		result, err := store.Validate(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if result.Valid {
+			t.Error("expected invalid result")
+		}
+		if len(result.Errors) != 1 {
+			t.Errorf("expected 1 error from db2, got %d", len(result.Errors))
+		}
+	})
+}
+
+func TestStore_ValidationMonitor(t *testing.T) {
+	t.Run("RunsPeriodically", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: time.Hour},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+		store.CompactionMonitorEnabled = false
+		store.ValidationInterval = 50 * time.Millisecond
+
+		if err := store.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait for at least one validation cycle
+		time.Sleep(100 * time.Millisecond)
+
+		if err := store.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("DisabledByDefault", func(t *testing.T) {
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+		}
+		store := litestream.NewStore(nil, levels)
+		store.CompactionMonitorEnabled = false
+
+		// ValidationInterval should be zero by default
+		if store.ValidationInterval != 0 {
+			t.Errorf("expected ValidationInterval=0, got %v", store.ValidationInterval)
+		}
+
+		// Open should succeed without starting validation monitor
+		if err := store.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+}

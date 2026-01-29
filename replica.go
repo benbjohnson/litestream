@@ -670,3 +670,78 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 	return infos, nil
 }
+
+// ValidationError represents a single validation issue.
+type ValidationError struct {
+	Level    int           // compaction level
+	Type     string        // "gap", "overlap", or "unsorted"
+	Message  string        // human-readable description
+	PrevFile *ltx.FileInfo // previous file
+	CurrFile *ltx.FileInfo // current file that caused error
+}
+
+// ValidateLevel checks LTX files at the given level are sorted and contiguous.
+// Returns a slice of validation errors (empty if valid).
+func (r *Replica) ValidateLevel(ctx context.Context, level int) ([]ValidationError, error) {
+	itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+	if err != nil {
+		return nil, fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var errors []ValidationError
+	var prevInfo *ltx.FileInfo
+
+	for itr.Next() {
+		info := itr.Item()
+
+		// Skip first file - nothing to compare against
+		if prevInfo == nil {
+			prevInfo = info
+			continue
+		}
+
+		// Check for sort order: curr.MinTXID should be >= prev.MinTXID
+		if info.MinTXID < prevInfo.MinTXID {
+			errors = append(errors, ValidationError{
+				Level:    level,
+				Type:     "unsorted",
+				Message:  fmt.Sprintf("files out of order: curr.MinTXID=%s < prev.MinTXID=%s", info.MinTXID, prevInfo.MinTXID),
+				PrevFile: prevInfo,
+				CurrFile: info,
+			})
+			prevInfo = info
+			continue
+		}
+
+		// Check for TXID contiguity: prev.MaxTXID + 1 should equal curr.MinTXID
+		expectedMinTXID := prevInfo.MaxTXID + 1
+		if info.MinTXID != expectedMinTXID {
+			if info.MinTXID > expectedMinTXID {
+				errors = append(errors, ValidationError{
+					Level:    level,
+					Type:     "gap",
+					Message:  fmt.Sprintf("TXID gap: prev.MaxTXID=%s, curr.MinTXID=%s (expected %s)", prevInfo.MaxTXID, info.MinTXID, expectedMinTXID),
+					PrevFile: prevInfo,
+					CurrFile: info,
+				})
+			} else {
+				errors = append(errors, ValidationError{
+					Level:    level,
+					Type:     "overlap",
+					Message:  fmt.Sprintf("TXID overlap: prev.MaxTXID=%s, curr.MinTXID=%s", prevInfo.MaxTXID, info.MinTXID),
+					PrevFile: prevInfo,
+					CurrFile: info,
+				})
+			}
+		}
+
+		prevInfo = info
+	}
+
+	if err := itr.Close(); err != nil {
+		return nil, fmt.Errorf("close iterator: %w", err)
+	}
+
+	return errors, nil
+}

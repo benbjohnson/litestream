@@ -536,6 +536,42 @@ snapshot:
 	})
 }
 
+func TestConfig_Validate_ValidationInterval(t *testing.T) {
+	t.Run("ValidInterval", func(t *testing.T) {
+		yaml := `
+validation:
+  interval: 5m
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.Validation.Interval == nil {
+			t.Fatal("expected validation interval to be set")
+		}
+		if *config.Validation.Interval != 5*time.Minute {
+			t.Errorf("expected validation interval of 5m, got %v", *config.Validation.Interval)
+		}
+	})
+
+	t.Run("NotSpecified", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// When validation section is not specified, interval should be nil (disabled)
+		if config.Validation.Interval != nil {
+			t.Errorf("expected validation interval to be nil, got %v", *config.Validation.Interval)
+		}
+	})
+}
+
 func TestParseReplicaURL_AccessPoint(t *testing.T) {
 	t.Run("WithPrefix", func(t *testing.T) {
 		scheme, host, urlPath, err := litestream.ParseReplicaURL("s3://arn:aws:s3:us-east-1:123456789012:accesspoint/db-access/backups/prod")

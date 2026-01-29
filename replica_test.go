@@ -579,3 +579,118 @@ func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 
 	// The test passes if context.Canceled errors were properly filtered
 }
+
+func TestReplica_ValidateLevel(t *testing.T) {
+	t.Run("ValidContiguousFiles", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create contiguous files: 1-2, 3-5, 6-10
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 3, 5)
+		createTestLTXFile(t, client, 1, 6, 10)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 0 {
+			t.Errorf("expected no errors for contiguous files, got %d: %v", len(errs), errs)
+		}
+	})
+
+	t.Run("EmptyLevel", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 0 {
+			t.Errorf("expected no errors for empty level, got %d", len(errs))
+		}
+	})
+
+	t.Run("SingleFile", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		createTestLTXFile(t, client, 1, 1, 5)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 0 {
+			t.Errorf("expected no errors for single file, got %d", len(errs))
+		}
+	})
+
+	t.Run("GapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create files with a gap (missing TXID 3-4)
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 7)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 1 {
+			t.Fatalf("expected 1 error, got %d", len(errs))
+		}
+		if errs[0].Type != "gap" {
+			t.Errorf("expected gap error, got %q", errs[0].Type)
+		}
+		if errs[0].Level != 1 {
+			t.Errorf("expected level 1, got %d", errs[0].Level)
+		}
+	})
+
+	t.Run("OverlapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create overlapping files
+		createTestLTXFile(t, client, 1, 1, 5)
+		createTestLTXFile(t, client, 1, 3, 7)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 1 {
+			t.Fatalf("expected 1 error, got %d", len(errs))
+		}
+		if errs[0].Type != "overlap" {
+			t.Errorf("expected overlap error, got %q", errs[0].Type)
+		}
+	})
+
+	t.Run("MultipleErrors", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create files with multiple issues: gap then overlap
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 10) // gap at 3-4
+		createTestLTXFile(t, client, 1, 8, 12) // overlap at 8-10
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 2 {
+			t.Fatalf("expected 2 errors, got %d", len(errs))
+		}
+		if errs[0].Type != "gap" {
+			t.Errorf("expected first error to be gap, got %q", errs[0].Type)
+		}
+		if errs[1].Type != "overlap" {
+			t.Errorf("expected second error to be overlap, got %q", errs[1].Type)
+		}
+	})
+}

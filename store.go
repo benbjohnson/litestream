@@ -96,6 +96,9 @@ type Store struct {
 
 	// heartbeatMonitorRunning tracks whether the heartbeat monitor goroutine is running.
 	heartbeatMonitorRunning bool
+
+	// How often to run validation checks. Zero disables periodic validation.
+	ValidationInterval time.Duration
 }
 
 func NewStore(dbs []*DB, levels CompactionLevels) *Store {
@@ -168,6 +171,15 @@ func (s *Store) Open(ctx context.Context) error {
 
 	// Start heartbeat monitor if any database has heartbeat configured.
 	s.startHeartbeatMonitorIfNeeded()
+
+	// Start validation monitor if configured.
+	if s.ValidationInterval > 0 {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.monitorValidation(s.ctx)
+		}()
+	}
 
 	return nil
 }
@@ -676,4 +688,76 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 	}
 
 	return nil
+}
+
+// ValidationResult holds the result of validating a replica's LTX files.
+type ValidationResult struct {
+	Valid  bool              // true if no errors found
+	Errors []ValidationError // all errors found
+}
+
+// Validate checks LTX file consistency across all databases and levels.
+// SnapshotLevel (9) is excluded since snapshots are not contiguous.
+func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
+	result := &ValidationResult{Valid: true}
+
+	s.mu.Lock()
+	dbs := s.dbs
+	levels := s.levels
+	s.mu.Unlock()
+
+	for _, db := range dbs {
+		if db.Replica == nil {
+			continue
+		}
+
+		for _, lvl := range levels {
+			errs, err := db.Replica.ValidateLevel(ctx, lvl.Level)
+			if err != nil {
+				return nil, fmt.Errorf("validate level %d for %s: %w", lvl.Level, db.Path(), err)
+			}
+			if len(errs) > 0 {
+				result.Valid = false
+				result.Errors = append(result.Errors, errs...)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// monitorValidation periodically runs validation checks on all databases.
+func (s *Store) monitorValidation(ctx context.Context) {
+	slog.Info("starting validation monitor", "interval", s.ValidationInterval)
+
+	ticker := time.NewTicker(s.ValidationInterval)
+	defer ticker.Stop()
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-ticker.C:
+		}
+
+		result, err := s.Validate(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			slog.Error("validation check failed", "error", err)
+			continue
+		}
+
+		if !result.Valid {
+			for _, verr := range result.Errors {
+				slog.Warn("validation error detected",
+					"level", verr.Level,
+					"type", verr.Type,
+					"message", verr.Message,
+				)
+			}
+		}
+	}
 }
