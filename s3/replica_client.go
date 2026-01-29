@@ -1105,6 +1105,7 @@ type fileIterator struct {
 	client *ReplicaClient
 	level  int
 	seek   ltx.TXID
+	prefix string
 
 	useMetadata   bool                 // When true, fetch accurate timestamps from metadata
 	metadataCache map[string]time.Time // key -> timestamp cache for batch fetches
@@ -1121,18 +1122,19 @@ type fileIterator struct {
 func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
+	prefix := client.Path + "/" + fmt.Sprintf("%04x/", level)
 	itr := &fileIterator{
 		ctx:           ctx,
 		cancel:        cancel,
 		client:        client,
 		level:         level,
 		seek:          seek,
+		prefix:        prefix,
 		useMetadata:   useMetadata,
 		metadataCache: make(map[string]time.Time),
 	}
 
 	// Create paginator for listing objects with level prefix
-	prefix := client.Path + "/" + fmt.Sprintf("%04x/", level)
 	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, &s3.ListObjectsV2Input{
 		Bucket: aws.String(client.Bucket),
 		Prefix: aws.String(prefix),
@@ -1242,6 +1244,15 @@ func (itr *fileIterator) Next() bool {
 				return false
 			}
 			itr.pageIndex = 0
+
+			// Log page contents for debugging.
+			if len(itr.page.Contents) > 0 {
+				keys := make([]string, 0, len(itr.page.Contents))
+				for _, obj := range itr.page.Contents {
+					keys = append(keys, path.Base(aws.ToString(obj.Key)))
+				}
+				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "keys", keys)
+			}
 
 			// Batch fetch metadata for the entire page when useMetadata is true.
 			// This uses parallel HeadObject calls controlled by MetadataConcurrency
