@@ -227,6 +227,9 @@ type Config struct {
 	// Snapshot configuration
 	Snapshot SnapshotConfig `yaml:"snapshot"`
 
+	// Validation configuration
+	Validation ValidationConfig `yaml:"validation"`
+
 	// L0 retention settings
 	L0Retention              *time.Duration `yaml:"l0-retention"`
 	L0RetentionCheckInterval *time.Duration `yaml:"l0-retention-check-interval"`
@@ -265,6 +268,11 @@ type Config struct {
 type SnapshotConfig struct {
 	Interval  *time.Duration `yaml:"interval"`
 	Retention *time.Duration `yaml:"retention"`
+}
+
+// ValidationConfig configures periodic validation checks.
+type ValidationConfig struct {
+	Interval *time.Duration `yaml:"interval"`
 }
 
 // LoggingConfig configures logging.

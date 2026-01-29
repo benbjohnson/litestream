@@ -253,6 +253,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.VerifyCompaction {
 		c.Store.SetVerifyCompaction(true)
 	}
+	if c.Config.Validation.Interval != nil {
+		c.Store.ValidationInterval = *c.Config.Validation.Interval
+	}
 	if c.Config.HeartbeatURL != "" {
 		interval := litestream.DefaultHeartbeatInterval
 		if c.Config.HeartbeatInterval != nil {
