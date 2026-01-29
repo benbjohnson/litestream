@@ -391,3 +391,50 @@ func TestStore_Validate(t *testing.T) {
 		}
 	})
 }
+
+func TestStore_ValidationMonitor(t *testing.T) {
+	t.Run("RunsPeriodically", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: time.Hour},
+		}
+		store := litestream.NewStore([]*litestream.DB{db}, levels)
+		store.CompactionMonitorEnabled = false
+		store.ValidationInterval = 50 * time.Millisecond
+
+		if err := store.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait for at least one validation cycle
+		time.Sleep(100 * time.Millisecond)
+
+		if err := store.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("DisabledByDefault", func(t *testing.T) {
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+		}
+		store := litestream.NewStore(nil, levels)
+		store.CompactionMonitorEnabled = false
+
+		// ValidationInterval should be zero by default
+		if store.ValidationInterval != 0 {
+			t.Errorf("expected ValidationInterval=0, got %v", store.ValidationInterval)
+		}
+
+		// Open should succeed without starting validation monitor
+		if err := store.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	})
+}

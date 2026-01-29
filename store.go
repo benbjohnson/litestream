@@ -96,6 +96,9 @@ type Store struct {
 
 	// heartbeatMonitorRunning tracks whether the heartbeat monitor goroutine is running.
 	heartbeatMonitorRunning bool
+
+	// How often to run validation checks. Zero disables periodic validation.
+	ValidationInterval time.Duration
 }
 
 func NewStore(dbs []*DB, levels CompactionLevels) *Store {
@@ -168,6 +171,15 @@ func (s *Store) Open(ctx context.Context) error {
 
 	// Start heartbeat monitor if any database has heartbeat configured.
 	s.startHeartbeatMonitorIfNeeded()
+
+	// Start validation monitor if configured.
+	if s.ValidationInterval > 0 {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.monitorValidation(s.ctx)
+		}()
+	}
 
 	return nil
 }
@@ -712,4 +724,40 @@ func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
 	}
 
 	return result, nil
+}
+
+// monitorValidation periodically runs validation checks on all databases.
+func (s *Store) monitorValidation(ctx context.Context) {
+	slog.Info("starting validation monitor", "interval", s.ValidationInterval)
+
+	ticker := time.NewTicker(s.ValidationInterval)
+	defer ticker.Stop()
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-ticker.C:
+		}
+
+		result, err := s.Validate(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			slog.Error("validation check failed", "error", err)
+			continue
+		}
+
+		if !result.Valid {
+			for _, verr := range result.Errors {
+				slog.Warn("validation error detected",
+					"level", verr.Level,
+					"type", verr.Type,
+					"message", verr.Message,
+				)
+			}
+		}
+	}
 }
