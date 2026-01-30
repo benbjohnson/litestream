@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -1916,6 +1917,38 @@ func (v *txidVar) Set(s string) error {
 		return fmt.Errorf("invalid txid format")
 	}
 	*v = txidVar(txID)
+	return nil
+}
+
+// levelAll is a sentinel value indicating all compaction levels should be shown.
+const levelAll = -1
+
+// levelVar allows the flag package to parse compaction level flags.
+// Accepts integers 0-9 or "all" for all levels.
+type levelVar int
+
+var _ flag.Value = (*levelVar)(nil)
+
+func (v *levelVar) String() string {
+	if *v == levelAll {
+		return "all"
+	}
+	return strconv.Itoa(int(*v))
+}
+
+func (v *levelVar) Set(s string) error {
+	if s == "all" {
+		*v = levelAll
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("invalid level: must be 0-%d or \"all\"", litestream.SnapshotLevel)
+	}
+	if n < 0 || n > litestream.SnapshotLevel {
+		return fmt.Errorf("level must be between 0 and %d", litestream.SnapshotLevel)
+	}
+	*v = levelVar(n)
 	return nil
 }
 
