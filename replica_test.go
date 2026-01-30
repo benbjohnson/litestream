@@ -1203,6 +1203,309 @@ func TestReplica_RestoreV3(t *testing.T) {
 	})
 }
 
+func TestReplica_Restore_BothFormats(t *testing.T) {
+	t.Run("V3OnlyWithTimestamp", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup only
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+		// Set snapshot time to 1 hour ago
+		snapshotTime := time.Now().Add(-1 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), snapshotTime, snapshotTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create replica and restore with timestamp
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(), // Any time after snapshot
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("V3OnlyWithoutTimestamp", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup only (no LTX files)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+
+		// Create replica and restore WITHOUT timestamp - should still use v0.3.x
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			// No timestamp specified
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("LTXOnlyWithTimestamp", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		replicaDir := t.TempDir()
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(db, c)
+
+		// Sync to create LTX files
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a snapshot
+		if _, err := db.Snapshot(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait a bit to ensure distinct timestamps
+		time.Sleep(10 * time.Millisecond)
+
+		// Restore with timestamp
+		outputPath := t.TempDir() + "/restored.db"
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("BothFormats_V3Better", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create v0.3.x snapshot at time T-30min (closer to restore time)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+		v3Time := time.Now().Add(-30 * time.Minute)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), v3Time, v3Time); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LTX snapshot at time T-2h (older)
+		ltxDir := filepath.Join(replicaDir, "ltx", "9") // Snapshot level
+		if err := os.MkdirAll(ltxDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		ltxData := createTestLTXSnapshot(t)
+		ltxPath := filepath.Join(ltxDir, "0000000000000001-0000000000000001.ltx")
+		if err := os.WriteFile(ltxPath, ltxData, 0644); err != nil {
+			t.Fatal(err)
+		}
+		ltxTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(ltxPath, ltxTime, ltxTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Restore with timestamp - should use V3 (more recent)
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("BothFormats_LTXBetter", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		replicaDir := t.TempDir()
+
+		// Create v0.3.x snapshot at time T-2h (older)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		v3Data := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, v3Data)
+		v3Time := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), v3Time, v3Time); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LTX backup (more recent)
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(db, c)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a snapshot
+		if _, err := db.Snapshot(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait a bit
+		time.Sleep(10 * time.Millisecond)
+
+		// Restore with timestamp - should use LTX (more recent)
+		outputPath := t.TempDir() + "/restored.db"
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("NoTimestamp_UsesLTX", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		replicaDir := t.TempDir()
+
+		// Create v0.3.x snapshot
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		v3Data := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, v3Data)
+
+		// Create LTX backup
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(db, c)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Restore without timestamp - should use LTX (default behavior)
+		outputPath := t.TempDir() + "/restored.db"
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+}
+
+// createTestLTXSnapshot creates a minimal LTX snapshot for testing.
+func createTestLTXSnapshot(t *testing.T) []byte {
+	t.Helper()
+
+	// Create a temporary database and generate a real LTX snapshot
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	replicaDir := filepath.Join(tmpDir, "replica")
+
+	db := testingutil.NewDB(t, dbPath)
+
+	// Set up a replica client so we can create snapshots
+	c := file.NewReplicaClient(replicaDir)
+	db.Replica = litestream.NewReplicaWithClient(db, c)
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create some data
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	testingutil.MustCloseSQLDB(t, sqldb)
+
+	// Sync to create LTX file
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create snapshot
+	if _, err := db.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the snapshot file from replica directory
+	ltxPath := filepath.Join(replicaDir, "ltx", fmt.Sprintf("%d", litestream.SnapshotLevel), "0000000000000001-0000000000000001.ltx")
+	data, err := os.ReadFile(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
 // v3SnapshotData holds test data for creating v0.3.x snapshots.
 type v3SnapshotData struct {
 	index int

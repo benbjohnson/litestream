@@ -472,14 +472,32 @@ func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Tim
 
 // CalcRestoreTarget returns a target time restore from.
 func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (updatedAt time.Time, err error) {
-	// Determine the replicated time bounds.
+	// Determine the replicated time bounds from LTX files.
 	createdAt, updatedAt, err := r.TimeBounds(ctx)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("created at: %w", err)
 	}
 
+	// Also check v0.3.x time bounds if client supports it.
+	if client, ok := r.Client.(ReplicaClientV3); ok {
+		v3CreatedAt, v3UpdatedAt, err := r.TimeBoundsV3(ctx, client)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("v0.3.x time bounds: %w", err)
+		}
+		// Extend time bounds to include v0.3.x backups.
+		if !v3CreatedAt.IsZero() && (createdAt.IsZero() || v3CreatedAt.Before(createdAt)) {
+			createdAt = v3CreatedAt
+		}
+		if !v3UpdatedAt.IsZero() && (updatedAt.IsZero() || v3UpdatedAt.After(updatedAt)) {
+			updatedAt = v3UpdatedAt
+		}
+	}
+
 	// Skip if it does not contain timestamp.
 	if !opt.Timestamp.IsZero() {
+		if createdAt.IsZero() && updatedAt.IsZero() {
+			return time.Time{}, fmt.Errorf("no backups found")
+		}
 		if opt.Timestamp.Before(createdAt) || opt.Timestamp.After(updatedAt) {
 			return time.Time{}, fmt.Errorf("timestamp does not exist")
 		}
@@ -494,6 +512,11 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 // replica or it will automatically choose the best one. Finally,
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
+//
+// When the replica contains both v0.3.x and LTX format backups, this method
+// compares snapshots from both formats and uses whichever has the better backup:
+// - With timestamp: uses the format with the most recent snapshot before timestamp
+// - Without timestamp: uses the format with the most recent backup overall
 func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
@@ -507,6 +530,19 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
 	} else if !os.IsNotExist(err) {
 		return err
+	}
+
+	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is specified).
+	if opt.TXID == 0 {
+		if client, ok := r.Client.(ReplicaClientV3); ok {
+			useV3, err := r.shouldUseV3Restore(ctx, client, opt.Timestamp)
+			if err != nil {
+				return err
+			}
+			if useV3 {
+				return r.RestoreV3(ctx, opt)
+			}
+		}
 	}
 
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
@@ -807,6 +843,151 @@ func checkpointV3(dbPath string) error {
 
 	_, err = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
+}
+
+// findBestV3SnapshotForTimestamp returns the best v0.3.x snapshot for the given timestamp.
+// Returns nil if no suitable snapshot exists.
+func (r *Replica) findBestV3SnapshotForTimestamp(ctx context.Context, client ReplicaClientV3, timestamp time.Time) (*SnapshotInfoV3, error) {
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list v0.3.x generations: %w", err)
+	}
+	if len(generations) == 0 {
+		return nil, nil
+	}
+
+	var allSnapshots []SnapshotInfoV3
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return nil, fmt.Errorf("list v0.3.x snapshots for generation %s: %w", gen, err)
+		}
+		allSnapshots = append(allSnapshots, snapshots...)
+	}
+
+	if len(allSnapshots) == 0 {
+		return nil, nil
+	}
+
+	// Sort by CreatedAt for timestamp-based selection.
+	sortSnapshotsV3ByCreatedAt(allSnapshots)
+
+	return findBestSnapshotV3(allSnapshots, timestamp), nil
+}
+
+// shouldUseV3Restore determines whether to use v0.3.x restore instead of LTX.
+// Returns true if v0.3.x has a better backup for the given options.
+func (r *Replica) shouldUseV3Restore(ctx context.Context, client ReplicaClientV3, timestamp time.Time) (bool, error) {
+	// Get v0.3.x time bounds.
+	_, v3UpdatedAt, err := r.TimeBoundsV3(ctx, client)
+	if err != nil {
+		return false, fmt.Errorf("get v0.3.x time bounds: %w", err)
+	}
+
+	// Get LTX time bounds.
+	_, ltxUpdatedAt, err := r.TimeBounds(ctx)
+	if err != nil {
+		return false, fmt.Errorf("get LTX time bounds: %w", err)
+	}
+
+	// If no v0.3.x backups exist, use LTX.
+	if v3UpdatedAt.IsZero() {
+		return false, nil
+	}
+
+	// If no LTX backups exist, use v0.3.x.
+	if ltxUpdatedAt.IsZero() {
+		r.Logger().Debug("using v0.3.x restore (no LTX backups)")
+		return true, nil
+	}
+
+	// Both formats have backups - compare based on timestamp or latest.
+	if !timestamp.IsZero() {
+		// With timestamp: use format with best snapshot before timestamp.
+		v3Snapshot, err := r.findBestV3SnapshotForTimestamp(ctx, client, timestamp)
+		if err != nil {
+			return false, fmt.Errorf("find v0.3.x snapshot: %w", err)
+		}
+
+		ltxSnapshot, err := r.findBestLTXSnapshotForTimestamp(ctx, timestamp)
+		if err != nil {
+			return false, fmt.Errorf("find LTX snapshot: %w", err)
+		}
+
+		if v3Snapshot != nil && (ltxSnapshot == nil || v3Snapshot.CreatedAt.After(ltxSnapshot.CreatedAt)) {
+			r.Logger().Debug("using v0.3.x restore (better snapshot for timestamp)",
+				"v3_snapshot", v3Snapshot.CreatedAt,
+				"ltx_snapshot", ltxSnapshot)
+			return true, nil
+		}
+	} else {
+		// Without timestamp: use format with most recent backup.
+		if v3UpdatedAt.After(ltxUpdatedAt) {
+			r.Logger().Debug("using v0.3.x restore (more recent backup)",
+				"v3_updated_at", v3UpdatedAt,
+				"ltx_updated_at", ltxUpdatedAt)
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// TimeBoundsV3 returns the time bounds of v0.3.x backups.
+// Returns zero times if no v0.3.x backups exist.
+func (r *Replica) TimeBoundsV3(ctx context.Context, client ReplicaClientV3) (createdAt, updatedAt time.Time, err error) {
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		for _, snap := range snapshots {
+			if createdAt.IsZero() || snap.CreatedAt.Before(createdAt) {
+				createdAt = snap.CreatedAt
+			}
+			if updatedAt.IsZero() || snap.CreatedAt.After(updatedAt) {
+				updatedAt = snap.CreatedAt
+			}
+		}
+
+		segments, err := client.WALSegmentsV3(ctx, gen)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		for _, seg := range segments {
+			if createdAt.IsZero() || seg.CreatedAt.Before(createdAt) {
+				createdAt = seg.CreatedAt
+			}
+			if updatedAt.IsZero() || seg.CreatedAt.After(updatedAt) {
+				updatedAt = seg.CreatedAt
+			}
+		}
+	}
+
+	return createdAt, updatedAt, nil
+}
+
+// findBestLTXSnapshotForTimestamp returns the best LTX snapshot for the given timestamp.
+// Returns nil if no suitable snapshot exists.
+func (r *Replica) findBestLTXSnapshotForTimestamp(ctx context.Context, timestamp time.Time) (*ltx.FileInfo, error) {
+	// Find snapshots at the snapshot level that are before the timestamp.
+	snapshots, err := FindLTXFiles(ctx, r.Client, SnapshotLevel, true, func(info *ltx.FileInfo) (bool, error) {
+		return info.CreatedAt.Before(timestamp), nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("find LTX snapshots: %w", err)
+	}
+	if len(snapshots) == 0 {
+		return nil, nil
+	}
+
+	// Return the latest snapshot before the timestamp (last in the sorted list).
+	return snapshots[len(snapshots)-1], nil
 }
 
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
