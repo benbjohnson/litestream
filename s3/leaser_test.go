@@ -32,13 +32,13 @@ func TestLeaser_AcquireLease_NewLease(t *testing.T) {
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
-			var lf lockFile
-			if err := json.Unmarshal(body, &lf); err != nil {
+			var lease litestream.Lease
+			if err := json.Unmarshal(body, &lease); err != nil {
 				t.Errorf("failed to unmarshal lock file: %v", err)
 			}
 
-			if lf.Generation != 1 {
-				t.Errorf("expected generation=1, got %d", lf.Generation)
+			if lease.Generation != 1 {
+				t.Errorf("expected generation=1, got %d", lease.Generation)
 			}
 
 			w.Header().Set("ETag", currentETag)
@@ -86,12 +86,12 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 	newETag := `"new-etag"`
 	var receivedIfMatch string
 
-	expiredLock := lockFile{
+	expiredLease := litestream.Lease{
 		Generation: 5,
-		ExpiresAt:  timeToUnix(time.Now().Add(-1 * time.Hour)),
+		ExpiresAt:  time.Now().Add(-1 * time.Hour),
 		Owner:      "previous-owner",
 	}
-	expiredData, _ := json.Marshal(expiredLock)
+	expiredData, _ := json.Marshal(expiredLease)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -134,12 +134,12 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 }
 
 func TestLeaser_AcquireLease_ActiveLease(t *testing.T) {
-	activeLock := lockFile{
+	activeLease := litestream.Lease{
 		Generation: 3,
-		ExpiresAt:  timeToUnix(time.Now().Add(5 * time.Minute)),
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
 		Owner:      "active-owner",
 	}
-	activeData, _ := json.Marshal(activeLock)
+	activeData, _ := json.Marshal(activeLease)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
@@ -212,13 +212,13 @@ func TestLeaser_RenewLease(t *testing.T) {
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
 
-			var lf lockFile
-			if err := json.Unmarshal(body, &lf); err != nil {
+			var lease litestream.Lease
+			if err := json.Unmarshal(body, &lease); err != nil {
 				t.Errorf("failed to unmarshal: %v", err)
 			}
 
-			if lf.Generation != 5 {
-				t.Errorf("expected generation=5, got %d", lf.Generation)
+			if lease.Generation != 5 {
+				t.Errorf("expected generation=5, got %d", lease.Generation)
 			}
 
 			w.Header().Set("ETag", newETag)
@@ -452,12 +452,12 @@ func TestLeaser_ConcurrentAcquisition(t *testing.T) {
 			if leaseHolder == "" {
 				w.WriteHeader(http.StatusNotFound)
 			} else {
-				lf := lockFile{
+				lease := litestream.Lease{
 					Generation: 1,
-					ExpiresAt:  timeToUnix(time.Now().Add(30 * time.Second)),
+					ExpiresAt:  time.Now().Add(30 * time.Second),
 					Owner:      leaseHolder,
 				}
-				data, _ := json.Marshal(lf)
+				data, _ := json.Marshal(lease)
 				w.Header().Set("ETag", currentETag)
 				w.WriteHeader(http.StatusOK)
 				w.Write(data)
@@ -477,10 +477,10 @@ func TestLeaser_ConcurrentAcquisition(t *testing.T) {
 
 			body, _ := io.ReadAll(r.Body)
 			r.Body.Close()
-			var lf lockFile
-			json.Unmarshal(body, &lf)
+			var lease litestream.Lease
+			json.Unmarshal(body, &lease)
 
-			leaseHolder = lf.Owner
+			leaseHolder = lease.Owner
 			etagCounter++
 			currentETag = `"etag-` + string(rune('0'+etagCounter)) + `"`
 
@@ -572,38 +572,6 @@ func TestLeaser_Type(t *testing.T) {
 
 	if got := leaser.Type(); got != "s3" {
 		t.Errorf("Type() = %q, want %q", got, "s3")
-	}
-}
-
-func TestTimeConversions(t *testing.T) {
-	tests := []struct {
-		name string
-		t    time.Time
-	}{
-		{
-			name: "Now",
-			t:    time.Now().UTC().Truncate(time.Microsecond),
-		},
-		{
-			name: "Future",
-			t:    time.Now().Add(30 * time.Second).UTC().Truncate(time.Microsecond),
-		},
-		{
-			name: "Past",
-			t:    time.Now().Add(-1 * time.Hour).UTC().Truncate(time.Microsecond),
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			unix := timeToUnix(tt.t)
-			back := unixToTime(unix)
-
-			diff := tt.t.Sub(back).Abs()
-			if diff > time.Microsecond {
-				t.Errorf("round-trip failed: %v -> %v (diff: %v)", tt.t, back, diff)
-			}
-		})
 	}
 }
 

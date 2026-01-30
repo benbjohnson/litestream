@@ -156,6 +156,9 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 	})
 	if err != nil {
 		if isNotExists(err) || isNotFoundError(err) {
+			l.logger.Warn("lease already deleted unexpectedly",
+				"generation", lease.Generation,
+				"owner", lease.Owner)
 			return nil
 		}
 		if isPreconditionFailed(err) {
@@ -169,12 +172,6 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 		"owner", lease.Owner)
 
 	return nil
-}
-
-type lockFile struct {
-	Generation int64   `json:"generation"`
-	ExpiresAt  float64 `json:"expires_at"`
-	Owner      string  `json:"owner,omitempty"`
 }
 
 func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, error) {
@@ -197,8 +194,8 @@ func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, erro
 		return nil, "", fmt.Errorf("read lock file: %w", err)
 	}
 
-	var lf lockFile
-	if err := json.Unmarshal(data, &lf); err != nil {
+	var lease litestream.Lease
+	if err := json.Unmarshal(data, &lease); err != nil {
 		return nil, "", fmt.Errorf("unmarshal lock file: %w", err)
 	}
 
@@ -206,27 +203,15 @@ func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, erro
 	if out.ETag != nil {
 		etag = *out.ETag
 	}
+	lease.ETag = etag
 
-	lease := &litestream.Lease{
-		Generation: lf.Generation,
-		ExpiresAt:  unixToTime(lf.ExpiresAt),
-		Owner:      lf.Owner,
-		ETag:       etag,
-	}
-
-	return lease, etag, nil
+	return &lease, etag, nil
 }
 
 func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag string) (string, error) {
 	key := l.lockKey()
 
-	lf := lockFile{
-		Generation: lease.Generation,
-		ExpiresAt:  timeToUnix(lease.ExpiresAt),
-		Owner:      lease.Owner,
-	}
-
-	data, err := json.Marshal(lf)
+	data, err := json.Marshal(lease)
 	if err != nil {
 		return "", fmt.Errorf("marshal lock file: %w", err)
 	}
@@ -258,16 +243,6 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 	}
 
 	return newETag, nil
-}
-
-func timeToUnix(t time.Time) float64 {
-	return float64(t.UnixNano()) / float64(time.Second)
-}
-
-func unixToTime(f float64) time.Time {
-	sec := int64(f)
-	nsec := int64((f - float64(sec)) * float64(time.Second))
-	return time.Unix(sec, nsec).UTC()
 }
 
 func isPreconditionFailed(err error) bool {
