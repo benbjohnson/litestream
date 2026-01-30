@@ -150,12 +150,16 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 
 	key := l.lockKey()
 	_, err := l.client.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(l.client.Bucket),
-		Key:    aws.String(key),
+		Bucket:  aws.String(l.client.Bucket),
+		Key:     aws.String(key),
+		IfMatch: aws.String(lease.ETag),
 	})
 	if err != nil {
 		if isNotExists(err) || isNotFoundError(err) {
 			return nil
+		}
+		if isPreconditionFailed(err) {
+			return litestream.ErrLeaseNotHeld
 		}
 		return fmt.Errorf("delete lease: %w", err)
 	}
@@ -243,10 +247,7 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 	out, err := l.client.s3.PutObject(ctx, input)
 	if err != nil {
 		if isPreconditionFailed(err) {
-			return "", &litestream.LeaseExistsError{
-				Owner:     lease.Owner,
-				ExpiresAt: lease.ExpiresAt,
-			}
+			return "", &litestream.LeaseExistsError{}
 		}
 		return "", fmt.Errorf("put lock file: %w", err)
 	}

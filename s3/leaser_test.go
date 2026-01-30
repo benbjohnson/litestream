@@ -316,10 +316,12 @@ func TestLeaser_RenewLease_NilLease(t *testing.T) {
 
 func TestLeaser_ReleaseLease(t *testing.T) {
 	var deleteCalled atomic.Bool
+	var receivedIfMatch string
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
 			deleteCalled.Store(true)
+			receivedIfMatch = r.Header.Get("If-Match")
 			w.WriteHeader(http.StatusNoContent)
 		}
 	}))
@@ -348,6 +350,39 @@ func TestLeaser_ReleaseLease(t *testing.T) {
 
 	if !deleteCalled.Load() {
 		t.Error("expected DELETE to be called")
+	}
+	if receivedIfMatch != `"my-etag"` {
+		t.Errorf("expected If-Match=%q, got %q", `"my-etag"`, receivedIfMatch)
+	}
+}
+
+func TestLeaser_ReleaseLease_StaleETag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			w.WriteHeader(http.StatusPreconditionFailed)
+		}
+	}))
+	defer server.Close()
+
+	client := newTestClient(server.URL)
+	leaser := NewLeaser(client)
+	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	lease := &litestream.Lease{
+		Token:     5,
+		ExpiresAt: time.Now().Add(5 * time.Minute),
+		Owner:     "me",
+		ETag:      `"stale-etag"`,
+	}
+
+	err := leaser.ReleaseLease(ctx, lease)
+	if err != litestream.ErrLeaseNotHeld {
+		t.Errorf("expected ErrLeaseNotHeld for stale ETag, got %v", err)
 	}
 }
 
