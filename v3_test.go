@@ -112,9 +112,9 @@ func TestFormatWALSegmentFilenameV3(t *testing.T) {
 		offset int64
 		want   string
 	}{
-		{0, 0, "00000000-0000000000000000.wal.lz4"},
-		{1, 4096, "00000001-0000000000001000.wal.lz4"},
-		{255, 0x123456789abcdef0, "000000ff-123456789abcdef0.wal.lz4"},
+		{0, 0, "00000000_00000000.wal.lz4"},
+		{1, 4096, "00000001_00001000.wal.lz4"},
+		{255, 0x12345678, "000000ff_12345678.wal.lz4"},
 	}
 	for _, tt := range tests {
 		if got := litestream.FormatWALSegmentFilenameV3(tt.index, tt.offset); got != tt.want {
@@ -130,9 +130,9 @@ func TestParseWALSegmentFilenameV3(t *testing.T) {
 			wantIndex  int
 			wantOffset int64
 		}{
-			{"00000000-0000000000000000.wal.lz4", 0, 0},
-			{"00000001-0000000000001000.wal.lz4", 1, 4096},
-			{"000000ff-123456789abcdef0.wal.lz4", 255, 0x123456789abcdef0},
+			{"00000000_00000000.wal.lz4", 0, 0},
+			{"00000001_00001000.wal.lz4", 1, 4096},
+			{"000000ff_12345678.wal.lz4", 255, 0x12345678},
 		}
 		for _, tt := range tests {
 			index, offset, err := litestream.ParseWALSegmentFilenameV3(tt.filename)
@@ -151,10 +151,10 @@ func TestParseWALSegmentFilenameV3(t *testing.T) {
 		invalids := []string{
 			"",
 			"invalid.wal",
-			"00000001.wal.lz4",                 // missing offset
-			"00000001-0000000000001000.wal",    // missing .lz4
-			"0000001-0000000000001000.wal.lz4", // 7 chars index
-			"00000001-000000000001000.wal.lz4", // 15 chars offset
+			"00000001.wal.lz4",         // missing offset
+			"00000001_00001000.wal",    // missing .lz4
+			"0000001_00001000.wal.lz4", // 7 chars index
+			"00000001_0001000.wal.lz4", // 7 chars offset
 		}
 		for _, filename := range invalids {
 			_, _, err := litestream.ParseWALSegmentFilenameV3(filename)
@@ -235,7 +235,7 @@ func TestPathsV3(t *testing.T) {
 
 	t.Run("WALSegmentPath", func(t *testing.T) {
 		got := litestream.WALSegmentPathV3(root, gen, 1, 4096)
-		want := "/data/replica/generations/0123456789abcdef/wal/00000001-0000000000001000.wal.lz4"
+		want := "/data/replica/generations/0123456789abcdef/wal/00000001_00001000.wal.lz4"
 		if got != want {
 			t.Errorf("WALSegmentPathV3(%q, %q, 1, 4096) = %q, want %q", root, gen, got, want)
 		}
@@ -265,7 +265,7 @@ func TestFormatParseRoundtrip(t *testing.T) {
 		}{
 			{0, 0},
 			{1, 4096},
-			{255, 0x123456789abcdef0},
+			{255, 0x12345678},
 		}
 		for _, tc := range cases {
 			filename := litestream.FormatWALSegmentFilenameV3(tc.index, tc.offset)

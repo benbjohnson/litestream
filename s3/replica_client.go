@@ -16,6 +16,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -66,6 +67,7 @@ const DefaultMetadataConcurrency = 50
 type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
@@ -1096,6 +1098,195 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+// GenerationsV3 returns a list of v0.3.x generation IDs in the replica.
+func (c *ReplicaClient) GenerationsV3(ctx context.Context) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := litestream.GenerationsPathV3(c.Path) + "/"
+
+	// Use CommonPrefixes with delimiter to list "directories"
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(c.Bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	})
+
+	var generations []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list generations: %w", err)
+		}
+
+		for _, cp := range page.CommonPrefixes {
+			// Extract generation ID from prefix (e.g., "path/generations/abc123def456/" -> "abc123def456")
+			p := aws.ToString(cp.Prefix)
+			p = strings.TrimPrefix(p, prefix)
+			p = strings.TrimSuffix(p, "/")
+			if litestream.IsGenerationIDV3(p) {
+				generations = append(generations, p)
+			}
+		}
+	}
+
+	slices.Sort(generations)
+	return generations, nil
+}
+
+// SnapshotsV3 returns snapshots for a generation, sorted by index.
+func (c *ReplicaClient) SnapshotsV3(ctx context.Context, generation string) ([]litestream.SnapshotInfoV3, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := litestream.SnapshotsPathV3(c.Path, generation) + "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var snapshots []litestream.SnapshotInfoV3
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list snapshots: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			key := path.Base(aws.ToString(obj.Key))
+			index, err := litestream.ParseSnapshotFilenameV3(key)
+			if err != nil {
+				continue // skip invalid filenames
+			}
+
+			snapshots = append(snapshots, litestream.SnapshotInfoV3{
+				Generation: generation,
+				Index:      index,
+				Size:       aws.ToInt64(obj.Size),
+				CreatedAt:  aws.ToTime(obj.LastModified).UTC(),
+			})
+		}
+	}
+
+	slices.SortFunc(snapshots, func(a, b litestream.SnapshotInfoV3) int {
+		return a.Index - b.Index
+	})
+	return snapshots, nil
+}
+
+// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
+func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([]litestream.WALSegmentInfoV3, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := litestream.WALPathV3(c.Path, generation) + "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var segments []litestream.WALSegmentInfoV3
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list wal segments: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			key := path.Base(aws.ToString(obj.Key))
+			index, offset, err := litestream.ParseWALSegmentFilenameV3(key)
+			if err != nil {
+				continue // skip invalid filenames
+			}
+
+			segments = append(segments, litestream.WALSegmentInfoV3{
+				Generation: generation,
+				Index:      index,
+				Offset:     offset,
+				Size:       aws.ToInt64(obj.Size),
+				CreatedAt:  aws.ToTime(obj.LastModified).UTC(),
+			})
+		}
+	}
+
+	slices.SortFunc(segments, func(a, b litestream.WALSegmentInfoV3) int {
+		if a.Index != b.Index {
+			return a.Index - b.Index
+		}
+		return int(a.Offset - b.Offset)
+	})
+	return segments, nil
+}
+
+// OpenSnapshotV3 opens a v0.3.x snapshot file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	key := litestream.SnapshotPathV3(c.Path, generation, index)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("s3: get snapshot %s: %w", key, err)
+	}
+
+	return internal.NewLZ4Reader(out.Body), nil
+}
+
+// OpenWALSegmentV3 opens a v0.3.x WAL segment file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	key := litestream.WALSegmentPathV3(c.Path, generation, index, offset)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("s3: get wal segment %s: %w", key, err)
+	}
+
+	return internal.NewLZ4Reader(out.Body), nil
 }
 
 // fileIterator represents an iterator over LTX files in S3.

@@ -458,7 +458,7 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 			t.Fatal(err)
 		}
 		// Create WAL segment file
-		path := filepath.Join(walDir, "00000001-0000000000001000.wal.lz4")
+		path := filepath.Join(walDir, "00000001_00001000.wal.lz4")
 		if err := os.WriteFile(path, []byte("wal data"), 0644); err != nil {
 			t.Fatal(err)
 		}
@@ -502,7 +502,7 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 			{2, 0x0000},
 		}
 		for _, s := range segments {
-			filename := fmt.Sprintf("%08x-%016x.wal.lz4", s.index, s.offset)
+			filename := fmt.Sprintf("%08x_%08x.wal.lz4", s.index, s.offset)
 			if err := os.WriteFile(filepath.Join(walDir, filename), []byte("x"), 0644); err != nil {
 				t.Fatal(err)
 			}
@@ -542,11 +542,11 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 		}
 		// Create mix of valid and invalid
 		files := []string{
-			"00000001-0000000000000000.wal.lz4", // valid
-			"invalid.wal.lz4",                   // invalid
-			"00000002.wal.lz4",                  // missing offset
-			"00000003-0000000000001000.wal",     // missing .lz4
-			"00000004-0000000000002000.wal.lz4", // valid
+			"00000001_00000000.wal.lz4", // valid
+			"invalid.wal.lz4",           // invalid
+			"00000002.wal.lz4",          // missing offset
+			"00000003_00001000.wal",     // missing .lz4
+			"00000004_00002000.wal.lz4", // valid
 		}
 		for _, name := range files {
 			if err := os.WriteFile(filepath.Join(walDir, name), []byte("x"), 0644); err != nil {
@@ -651,7 +651,7 @@ func TestReplicaClient_OpenWALSegmentV3(t *testing.T) {
 		}
 
 		// Write compressed file
-		path := filepath.Join(walDir, "00000001-0000000000001000.wal.lz4")
+		path := filepath.Join(walDir, "00000001_00001000.wal.lz4")
 		if err := os.WriteFile(path, buf.Bytes(), 0644); err != nil {
 			t.Fatal(err)
 		}
