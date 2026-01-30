@@ -92,6 +92,15 @@ func (l *Leaser) AcquireLease(ctx context.Context) (*litestream.Lease, error) {
 
 	newETag, err := l.writeLease(ctx, newLease, etag)
 	if err != nil {
+		var leaseErr *litestream.LeaseExistsError
+		if errors.As(err, &leaseErr) {
+			if current, _, readErr := l.readLease(ctx); readErr == nil && current != nil {
+				return nil, &litestream.LeaseExistsError{
+					Owner:     current.Owner,
+					ExpiresAt: current.ExpiresAt,
+				}
+			}
+		}
 		return nil, err
 	}
 

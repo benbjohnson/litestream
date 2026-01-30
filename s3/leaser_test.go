@@ -3,11 +3,11 @@ package s3
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -168,17 +168,40 @@ func TestLeaser_AcquireLease_ActiveLease(t *testing.T) {
 	}
 
 	var leaseErr *litestream.LeaseExistsError
-	if !strings.Contains(err.Error(), "active-owner") {
-		t.Errorf("expected error to mention owner, got: %v", err)
+	if !errors.As(err, &leaseErr) {
+		t.Fatalf("expected *LeaseExistsError, got %T: %v", err, err)
 	}
-	_ = leaseErr
+	if leaseErr.Owner != "active-owner" {
+		t.Errorf("expected Owner=%q, got %q", "active-owner", leaseErr.Owner)
+	}
+	if leaseErr.ExpiresAt.IsZero() {
+		t.Error("expected non-zero ExpiresAt")
+	}
+	if leaseErr.ExpiresAt.Before(time.Now()) {
+		t.Errorf("expected future ExpiresAt, got %v", leaseErr.ExpiresAt)
+	}
 }
 
 func TestLeaser_AcquireLease_RaceCondition412(t *testing.T) {
+	var getCalls atomic.Int32
+	winnerLease := litestream.Lease{
+		Generation: 1,
+		ExpiresAt:  time.Now().Add(30 * time.Second),
+		Owner:      "race-winner",
+	}
+	winnerData, _ := json.Marshal(winnerLease)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodGet:
-			w.WriteHeader(http.StatusNotFound)
+			calls := getCalls.Add(1)
+			if calls == 1 {
+				w.WriteHeader(http.StatusNotFound)
+			} else {
+				w.Header().Set("ETag", `"winner-etag"`)
+				w.WriteHeader(http.StatusOK)
+				w.Write(winnerData)
+			}
 		case http.MethodPut:
 			w.WriteHeader(http.StatusPreconditionFailed)
 		}
@@ -197,6 +220,17 @@ func TestLeaser_AcquireLease_RaceCondition412(t *testing.T) {
 	_, err := leaser.AcquireLease(ctx)
 	if err == nil {
 		t.Fatal("expected error for 412 response")
+	}
+
+	var leaseErr *litestream.LeaseExistsError
+	if !errors.As(err, &leaseErr) {
+		t.Fatalf("expected *LeaseExistsError, got %T: %v", err, err)
+	}
+	if leaseErr.Owner != "race-winner" {
+		t.Errorf("expected Owner=%q, got %q", "race-winner", leaseErr.Owner)
+	}
+	if leaseErr.ExpiresAt.IsZero() {
+		t.Error("expected non-zero ExpiresAt after re-read")
 	}
 }
 
