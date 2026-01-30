@@ -101,14 +101,14 @@ func FormatSnapshotFilenameV3(index int) string {
 }
 
 // FormatWALSegmentFilenameV3 returns the filename for a v0.3.x WAL segment.
-// Format: {index:08x}-{offset:016x}.wal.lz4
+// Format: {index:08x}_{offset:08x}.wal.lz4
 func FormatWALSegmentFilenameV3(index int, offset int64) string {
-	return fmt.Sprintf("%08x-%016x.wal.lz4", index, offset)
+	return fmt.Sprintf("%08x_%08x.wal.lz4", index, offset)
 }
 
 var (
 	snapshotRegexV3   = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot\.lz4$`)
-	walSegmentRegexV3 = regexp.MustCompile(`^([0-9a-f]{8})-([0-9a-f]{16})\.wal\.lz4$`)
+	walSegmentRegexV3 = regexp.MustCompile(`^([0-9a-f]{8})_([0-9a-f]{8})\.wal\.lz4$`)
 	generationRegexV3 = regexp.MustCompile(`^[0-9a-f]{16}$`)
 )
 
