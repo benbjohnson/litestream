@@ -29,10 +29,10 @@ type Leaser interface {
 }
 
 type Lease struct {
-	Token     int64     `json:"token"`
-	ExpiresAt time.Time `json:"expires_at"`
-	Owner     string    `json:"owner,omitempty"`
-	ETag      string    `json:"-"`
+	Generation int64     `json:"generation"`
+	ExpiresAt  time.Time `json:"expires_at"`
+	Owner      string    `json:"owner,omitempty"`
+	ETag       string    `json:"-"`
 }
 
 func (l *Lease) IsExpired() bool {

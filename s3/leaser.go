@@ -79,15 +79,15 @@ func (l *Leaser) AcquireLease(ctx context.Context) (*litestream.Lease, error) {
 		}
 	}
 
-	var token int64 = 1
+	var generation int64 = 1
 	if existing != nil {
-		token = existing.Token + 1
+		generation = existing.Generation + 1
 	}
 
 	newLease := &litestream.Lease{
-		Token:     token,
-		ExpiresAt: time.Now().Add(l.TTL),
-		Owner:     l.Owner,
+		Generation: generation,
+		ExpiresAt:  time.Now().Add(l.TTL),
+		Owner:      l.Owner,
 	}
 
 	newETag, err := l.writeLease(ctx, newLease, etag)
@@ -97,7 +97,7 @@ func (l *Leaser) AcquireLease(ctx context.Context) (*litestream.Lease, error) {
 
 	newLease.ETag = newETag
 	l.logger.Debug("lease acquired",
-		"token", newLease.Token,
+		"generation", newLease.Generation,
 		"owner", newLease.Owner,
 		"expires_at", newLease.ExpiresAt,
 		"etag", newLease.ETag)
@@ -115,9 +115,9 @@ func (l *Leaser) RenewLease(ctx context.Context, lease *litestream.Lease) (*lite
 	}
 
 	newLease := &litestream.Lease{
-		Token:     lease.Token,
-		ExpiresAt: time.Now().Add(l.TTL),
-		Owner:     l.Owner,
+		Generation: lease.Generation,
+		ExpiresAt:  time.Now().Add(l.TTL),
+		Owner:      l.Owner,
 	}
 
 	newETag, err := l.writeLease(ctx, newLease, lease.ETag)
@@ -131,7 +131,7 @@ func (l *Leaser) RenewLease(ctx context.Context, lease *litestream.Lease) (*lite
 
 	newLease.ETag = newETag
 	l.logger.Debug("lease renewed",
-		"token", newLease.Token,
+		"generation", newLease.Generation,
 		"owner", newLease.Owner,
 		"expires_at", newLease.ExpiresAt,
 		"etag", newLease.ETag)
@@ -165,16 +165,16 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 	}
 
 	l.logger.Debug("lease released",
-		"token", lease.Token,
+		"generation", lease.Generation,
 		"owner", lease.Owner)
 
 	return nil
 }
 
 type lockFile struct {
-	Token     int64   `json:"token"`
-	ExpiresAt float64 `json:"expires_at"`
-	Owner     string  `json:"owner,omitempty"`
+	Generation int64   `json:"generation"`
+	ExpiresAt  float64 `json:"expires_at"`
+	Owner      string  `json:"owner,omitempty"`
 }
 
 func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, error) {
@@ -208,10 +208,10 @@ func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, erro
 	}
 
 	lease := &litestream.Lease{
-		Token:     lf.Token,
-		ExpiresAt: unixToTime(lf.ExpiresAt),
-		Owner:     lf.Owner,
-		ETag:      etag,
+		Generation: lf.Generation,
+		ExpiresAt:  unixToTime(lf.ExpiresAt),
+		Owner:      lf.Owner,
+		ETag:       etag,
 	}
 
 	return lease, etag, nil
@@ -221,9 +221,9 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 	key := l.lockKey()
 
 	lf := lockFile{
-		Token:     lease.Token,
-		ExpiresAt: timeToUnix(lease.ExpiresAt),
-		Owner:     lease.Owner,
+		Generation: lease.Generation,
+		ExpiresAt:  timeToUnix(lease.ExpiresAt),
+		Owner:      lease.Owner,
 	}
 
 	data, err := json.Marshal(lf)

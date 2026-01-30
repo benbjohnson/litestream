@@ -37,8 +37,8 @@ func TestLeaser_AcquireLease_NewLease(t *testing.T) {
 				t.Errorf("failed to unmarshal lock file: %v", err)
 			}
 
-			if lf.Token != 1 {
-				t.Errorf("expected token=1, got %d", lf.Token)
+			if lf.Generation != 1 {
+				t.Errorf("expected generation=1, got %d", lf.Generation)
 			}
 
 			w.Header().Set("ETag", currentETag)
@@ -70,8 +70,8 @@ func TestLeaser_AcquireLease_NewLease(t *testing.T) {
 	if receivedIfNoneMatch != "*" {
 		t.Errorf("expected If-None-Match: *, got %q", receivedIfNoneMatch)
 	}
-	if lease.Token != 1 {
-		t.Errorf("expected token=1, got %d", lease.Token)
+	if lease.Generation != 1 {
+		t.Errorf("expected generation=1, got %d", lease.Generation)
 	}
 	if lease.ETag != currentETag {
 		t.Errorf("expected ETag=%q, got %q", currentETag, lease.ETag)
@@ -87,9 +87,9 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 	var receivedIfMatch string
 
 	expiredLock := lockFile{
-		Token:     5,
-		ExpiresAt: timeToUnix(time.Now().Add(-1 * time.Hour)),
-		Owner:     "previous-owner",
+		Generation: 5,
+		ExpiresAt:  timeToUnix(time.Now().Add(-1 * time.Hour)),
+		Owner:      "previous-owner",
 	}
 	expiredData, _ := json.Marshal(expiredLock)
 
@@ -125,8 +125,8 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 	if receivedIfMatch != oldETag {
 		t.Errorf("expected If-Match=%q, got %q", oldETag, receivedIfMatch)
 	}
-	if lease.Token != 6 {
-		t.Errorf("expected token=6 (previous+1), got %d", lease.Token)
+	if lease.Generation != 6 {
+		t.Errorf("expected generation=6 (previous+1), got %d", lease.Generation)
 	}
 	if lease.ETag != newETag {
 		t.Errorf("expected ETag=%q, got %q", newETag, lease.ETag)
@@ -135,9 +135,9 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 
 func TestLeaser_AcquireLease_ActiveLease(t *testing.T) {
 	activeLock := lockFile{
-		Token:     3,
-		ExpiresAt: timeToUnix(time.Now().Add(5 * time.Minute)),
-		Owner:     "active-owner",
+		Generation: 3,
+		ExpiresAt:  timeToUnix(time.Now().Add(5 * time.Minute)),
+		Owner:      "active-owner",
 	}
 	activeData, _ := json.Marshal(activeLock)
 
@@ -217,8 +217,8 @@ func TestLeaser_RenewLease(t *testing.T) {
 				t.Errorf("failed to unmarshal: %v", err)
 			}
 
-			if lf.Token != 5 {
-				t.Errorf("expected token=5, got %d", lf.Token)
+			if lf.Generation != 5 {
+				t.Errorf("expected generation=5, got %d", lf.Generation)
 			}
 
 			w.Header().Set("ETag", newETag)
@@ -238,10 +238,10 @@ func TestLeaser_RenewLease(t *testing.T) {
 	}
 
 	oldLease := &litestream.Lease{
-		Token:     5,
-		ExpiresAt: time.Now().Add(5 * time.Second),
-		Owner:     "me",
-		ETag:      oldETag,
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Second),
+		Owner:      "me",
+		ETag:       oldETag,
 	}
 
 	newLease, err := leaser.RenewLease(ctx, oldLease)
@@ -252,8 +252,8 @@ func TestLeaser_RenewLease(t *testing.T) {
 	if receivedIfMatch != oldETag {
 		t.Errorf("expected If-Match=%q, got %q", oldETag, receivedIfMatch)
 	}
-	if newLease.Token != 5 {
-		t.Errorf("expected token=5, got %d", newLease.Token)
+	if newLease.Generation != 5 {
+		t.Errorf("expected generation=5, got %d", newLease.Generation)
 	}
 	if newLease.ETag != newETag {
 		t.Errorf("expected ETag=%q, got %q", newETag, newLease.ETag)
@@ -281,10 +281,10 @@ func TestLeaser_RenewLease_LostLease(t *testing.T) {
 	}
 
 	oldLease := &litestream.Lease{
-		Token:     5,
-		ExpiresAt: time.Now().Add(5 * time.Second),
-		Owner:     "me",
-		ETag:      `"stale-etag"`,
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Second),
+		Owner:      "me",
+		ETag:       `"stale-etag"`,
 	}
 
 	_, err := leaser.RenewLease(ctx, oldLease)
@@ -337,10 +337,10 @@ func TestLeaser_ReleaseLease(t *testing.T) {
 	}
 
 	lease := &litestream.Lease{
-		Token:     5,
-		ExpiresAt: time.Now().Add(5 * time.Minute),
-		Owner:     "me",
-		ETag:      `"my-etag"`,
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       `"my-etag"`,
 	}
 
 	err := leaser.ReleaseLease(ctx, lease)
@@ -374,10 +374,10 @@ func TestLeaser_ReleaseLease_StaleETag(t *testing.T) {
 	}
 
 	lease := &litestream.Lease{
-		Token:     5,
-		ExpiresAt: time.Now().Add(5 * time.Minute),
-		Owner:     "me",
-		ETag:      `"stale-etag"`,
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       `"stale-etag"`,
 	}
 
 	err := leaser.ReleaseLease(ctx, lease)
@@ -404,10 +404,10 @@ func TestLeaser_ReleaseLease_AlreadyDeleted(t *testing.T) {
 	}
 
 	lease := &litestream.Lease{
-		Token:     5,
-		ExpiresAt: time.Now().Add(5 * time.Minute),
-		Owner:     "me",
-		ETag:      `"my-etag"`,
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       `"my-etag"`,
 	}
 
 	err := leaser.ReleaseLease(ctx, lease)
@@ -453,9 +453,9 @@ func TestLeaser_ConcurrentAcquisition(t *testing.T) {
 				w.WriteHeader(http.StatusNotFound)
 			} else {
 				lf := lockFile{
-					Token:     1,
-					ExpiresAt: timeToUnix(time.Now().Add(30 * time.Second)),
-					Owner:     leaseHolder,
+					Generation: 1,
+					ExpiresAt:  timeToUnix(time.Now().Add(30 * time.Second)),
+					Owner:      leaseHolder,
 				}
 				data, _ := json.Marshal(lf)
 				w.Header().Set("ETag", currentETag)
