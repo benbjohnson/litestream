@@ -579,13 +579,7 @@ func performGracefulShutdown(t *testing.T, testInfo *TestInfo) {
 
 	// Check for errors
 	errors, _ := testInfo.DB.CheckForErrors()
-	criticalErrors := 0
-	for _, errLine := range errors {
-		if !strings.Contains(errLine, "page size not initialized") {
-			criticalErrors++
-		}
-	}
-	t.Logf("  Critical errors: %d", criticalErrors)
+	t.Logf("  Critical errors: %d", len(errors))
 
 	// Show where data is preserved
 	t.Log("")
@@ -614,9 +608,6 @@ func getErrorStats(db *TestDB) ErrorStats {
 
 	for _, errLine := range errors {
 		switch {
-		case strings.Contains(errLine, "page size not initialized"):
-			stats.BenignCount++
-			stats.ErrorsByType["page size not initialized"]++
 		case strings.Contains(errLine, "connection refused"):
 			stats.BenignCount++
 			stats.ErrorsByType["connection refused"]++
@@ -711,7 +702,7 @@ func printErrorDetails(t *testing.T, errorStats ErrorStats) {
 	if errorStats.CriticalCount > 0 {
 		t.Log("  Critical errors:")
 		for errorType, count := range errorStats.ErrorsByType {
-			if errorType != "page size not initialized" && count > 0 {
+			if count > 0 {
 				t.Logf("    • %q (%d)", errorType, count)
 			}
 		}
@@ -736,7 +727,7 @@ func printErrorDetails(t *testing.T, errorStats ErrorStats) {
 	// Show benign errors if present
 	if errorStats.BenignCount > 0 {
 		t.Log("")
-		t.Logf("  Benign: %q (%d)", "page size not initialized", errorStats.BenignCount)
+		t.Logf("  Benign errors: %d", errorStats.BenignCount)
 	}
 }
 
@@ -904,20 +895,12 @@ func LogSoakMetrics(t *testing.T, db *TestDB, testName string) {
 		t.Logf("  Replica LTX files: %d", fileCount)
 	}
 
-	// Error check - filter out known benign errors
+	// Error check
 	if errors, err := db.CheckForErrors(); err == nil && len(errors) > 0 {
-		criticalErrors := []string{}
-		for _, errLine := range errors {
-			if !strings.Contains(errLine, "page size not initialized") {
-				criticalErrors = append(criticalErrors, errLine)
-			}
-		}
-		if len(criticalErrors) > 0 {
-			t.Logf("  ⚠ Critical errors detected: %d", len(criticalErrors))
-			if len(criticalErrors) <= 2 {
-				for _, errLine := range criticalErrors {
-					t.Logf("    %s", errLine)
-				}
+		t.Logf("  ⚠ Critical errors detected: %d", len(errors))
+		if len(errors) <= 2 {
+			for _, errLine := range errors {
+				t.Logf("    %s", errLine)
 			}
 		}
 	}

@@ -24,10 +24,27 @@ var (
 	// ErrTxNotAvailable is returned when a transaction does not exist.
 	ErrTxNotAvailable = errors.New("transaction not available")
 
-	// ErrDBNotReady is returned when compaction is attempted before the
-	// database has been initialized (e.g., page size not yet known).
-	ErrDBNotReady = errors.New("db not ready")
+	// ErrDBNotReady is a sentinel for errors.Is() compatibility.
+	ErrDBNotReady = &DBNotReadyError{}
 )
+
+// DBNotReadyError is returned when an operation is attempted before the
+// database has been initialized (e.g., page size not yet known).
+type DBNotReadyError struct {
+	Reason string
+}
+
+func (e *DBNotReadyError) Error() string {
+	if e.Reason != "" {
+		return "db not ready: " + e.Reason
+	}
+	return "db not ready"
+}
+
+func (e *DBNotReadyError) Is(target error) bool {
+	_, ok := target.(*DBNotReadyError)
+	return ok
+}
 
 // Store defaults
 const (
@@ -432,7 +449,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
 				slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
-				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path())
+				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				slog.Error("compaction failed", "level", lvl.Level, "error", err)
@@ -613,7 +630,7 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
-		return nil, ErrDBNotReady
+		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 
 	dstLevel := lvl.Level
