@@ -472,14 +472,32 @@ func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Tim
 
 // CalcRestoreTarget returns a target time restore from.
 func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (updatedAt time.Time, err error) {
-	// Determine the replicated time bounds.
+	// Determine the replicated time bounds from LTX files.
 	createdAt, updatedAt, err := r.TimeBounds(ctx)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("created at: %w", err)
 	}
 
+	// Also check v0.3.x time bounds if client supports it.
+	if client, ok := r.Client.(ReplicaClientV3); ok {
+		v3CreatedAt, v3UpdatedAt, err := r.TimeBoundsV3(ctx, client)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("v0.3.x time bounds: %w", err)
+		}
+		// Extend time bounds to include v0.3.x backups.
+		if !v3CreatedAt.IsZero() && (createdAt.IsZero() || v3CreatedAt.Before(createdAt)) {
+			createdAt = v3CreatedAt
+		}
+		if !v3UpdatedAt.IsZero() && (updatedAt.IsZero() || v3UpdatedAt.After(updatedAt)) {
+			updatedAt = v3UpdatedAt
+		}
+	}
+
 	// Skip if it does not contain timestamp.
 	if !opt.Timestamp.IsZero() {
+		if createdAt.IsZero() && updatedAt.IsZero() {
+			return time.Time{}, fmt.Errorf("no backups found")
+		}
 		if opt.Timestamp.Before(createdAt) || opt.Timestamp.After(updatedAt) {
 			return time.Time{}, fmt.Errorf("timestamp does not exist")
 		}
@@ -866,6 +884,45 @@ func (r *Replica) findBestV3SnapshotForTimestamp(ctx context.Context, client Rep
 	sortSnapshotsV3ByCreatedAt(allSnapshots)
 
 	return findBestSnapshotV3(allSnapshots, timestamp), nil
+}
+
+// TimeBoundsV3 returns the time bounds of v0.3.x backups.
+// Returns zero times if no v0.3.x backups exist.
+func (r *Replica) TimeBoundsV3(ctx context.Context, client ReplicaClientV3) (createdAt, updatedAt time.Time, err error) {
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		for _, snap := range snapshots {
+			if createdAt.IsZero() || snap.CreatedAt.Before(createdAt) {
+				createdAt = snap.CreatedAt
+			}
+			if updatedAt.IsZero() || snap.CreatedAt.After(updatedAt) {
+				updatedAt = snap.CreatedAt
+			}
+		}
+
+		segments, err := client.WALSegmentsV3(ctx, gen)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		for _, seg := range segments {
+			if createdAt.IsZero() || seg.CreatedAt.Before(createdAt) {
+				createdAt = seg.CreatedAt
+			}
+			if updatedAt.IsZero() || seg.CreatedAt.After(updatedAt) {
+				updatedAt = seg.CreatedAt
+			}
+		}
+	}
+
+	return createdAt, updatedAt, nil
 }
 
 // findBestLTXSnapshotForTimestamp returns the best LTX snapshot for the given timestamp.
