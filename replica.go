@@ -513,9 +513,10 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
 //
-// When a timestamp is specified and the replica contains both v0.3.x and LTX
-// format backups, this method compares snapshots from both formats and uses
-// whichever has the better (most recent before timestamp) snapshot.
+// When the replica contains both v0.3.x and LTX format backups, this method
+// compares snapshots from both formats and uses whichever has the better backup:
+// - With timestamp: uses the format with the most recent snapshot before timestamp
+// - Without timestamp: uses the format with the most recent backup overall
 func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
@@ -531,26 +532,14 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
-	// When timestamp is specified, compare both v0.3.x and LTX formats to find the best snapshot.
-	if !opt.Timestamp.IsZero() && opt.TXID == 0 {
+	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is specified).
+	if opt.TXID == 0 {
 		if client, ok := r.Client.(ReplicaClientV3); ok {
-			// Get best v0.3.x snapshot for timestamp.
-			v3Snapshot, err := r.findBestV3SnapshotForTimestamp(ctx, client, opt.Timestamp)
+			useV3, err := r.shouldUseV3Restore(ctx, client, opt.Timestamp)
 			if err != nil {
-				return fmt.Errorf("find v0.3.x snapshot: %w", err)
+				return err
 			}
-
-			// Get best LTX snapshot for timestamp.
-			ltxSnapshot, err := r.findBestLTXSnapshotForTimestamp(ctx, opt.Timestamp)
-			if err != nil {
-				return fmt.Errorf("find LTX snapshot: %w", err)
-			}
-
-			// If v0.3.x has a better snapshot (more recent but still before timestamp), use it.
-			if v3Snapshot != nil && (ltxSnapshot == nil || v3Snapshot.CreatedAt.After(ltxSnapshot.CreatedAt)) {
-				r.Logger().Debug("using v0.3.x restore (better snapshot for timestamp)",
-					"v3_snapshot", v3Snapshot.CreatedAt,
-					"ltx_snapshot", ltxSnapshot)
+			if useV3 {
 				return r.RestoreV3(ctx, opt)
 			}
 		}
@@ -884,6 +873,64 @@ func (r *Replica) findBestV3SnapshotForTimestamp(ctx context.Context, client Rep
 	sortSnapshotsV3ByCreatedAt(allSnapshots)
 
 	return findBestSnapshotV3(allSnapshots, timestamp), nil
+}
+
+// shouldUseV3Restore determines whether to use v0.3.x restore instead of LTX.
+// Returns true if v0.3.x has a better backup for the given options.
+func (r *Replica) shouldUseV3Restore(ctx context.Context, client ReplicaClientV3, timestamp time.Time) (bool, error) {
+	// Get v0.3.x time bounds.
+	_, v3UpdatedAt, err := r.TimeBoundsV3(ctx, client)
+	if err != nil {
+		return false, fmt.Errorf("get v0.3.x time bounds: %w", err)
+	}
+
+	// Get LTX time bounds.
+	_, ltxUpdatedAt, err := r.TimeBounds(ctx)
+	if err != nil {
+		return false, fmt.Errorf("get LTX time bounds: %w", err)
+	}
+
+	// If no v0.3.x backups exist, use LTX.
+	if v3UpdatedAt.IsZero() {
+		return false, nil
+	}
+
+	// If no LTX backups exist, use v0.3.x.
+	if ltxUpdatedAt.IsZero() {
+		r.Logger().Debug("using v0.3.x restore (no LTX backups)")
+		return true, nil
+	}
+
+	// Both formats have backups - compare based on timestamp or latest.
+	if !timestamp.IsZero() {
+		// With timestamp: use format with best snapshot before timestamp.
+		v3Snapshot, err := r.findBestV3SnapshotForTimestamp(ctx, client, timestamp)
+		if err != nil {
+			return false, fmt.Errorf("find v0.3.x snapshot: %w", err)
+		}
+
+		ltxSnapshot, err := r.findBestLTXSnapshotForTimestamp(ctx, timestamp)
+		if err != nil {
+			return false, fmt.Errorf("find LTX snapshot: %w", err)
+		}
+
+		if v3Snapshot != nil && (ltxSnapshot == nil || v3Snapshot.CreatedAt.After(ltxSnapshot.CreatedAt)) {
+			r.Logger().Debug("using v0.3.x restore (better snapshot for timestamp)",
+				"v3_snapshot", v3Snapshot.CreatedAt,
+				"ltx_snapshot", ltxSnapshot)
+			return true, nil
+		}
+	} else {
+		// Without timestamp: use format with most recent backup.
+		if v3UpdatedAt.After(ltxUpdatedAt) {
+			r.Logger().Debug("using v0.3.x restore (more recent backup)",
+				"v3_updated_at", v3UpdatedAt,
+				"ltx_updated_at", ltxUpdatedAt)
+			return true, nil
+		}
+	}
+
+	return false, nil
 }
 
 // TimeBoundsV3 returns the time bounds of v0.3.x backups.

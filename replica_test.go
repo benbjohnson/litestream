@@ -1240,6 +1240,37 @@ func TestReplica_Restore_BothFormats(t *testing.T) {
 		verifyRestoredDB(t, outputPath)
 	})
 
+	t.Run("V3OnlyWithoutTimestamp", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup only (no LTX files)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+
+		// Create replica and restore WITHOUT timestamp - should still use v0.3.x
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			// No timestamp specified
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
 	t.Run("LTXOnlyWithTimestamp", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
