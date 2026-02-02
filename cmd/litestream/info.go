@@ -21,6 +21,7 @@ func (c *InfoCommand) Run(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-info", flag.ContinueOnError)
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	timeout := fs.Int("timeout", 10, "timeout in seconds")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -64,11 +65,20 @@ func (c *InfoCommand) Run(_ context.Context, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	if *jsonOutput {
+		output, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+	} else {
+		uptime := time.Duration(result.UptimeSeconds) * time.Second
+		fmt.Printf("Litestream %s\n", result.Version)
+		fmt.Printf("  PID:        %d\n", result.PID)
+		fmt.Printf("  Uptime:     %s\n", uptime)
+		fmt.Printf("  Started at: %s\n", result.StartedAt.Format(time.RFC3339))
+		fmt.Printf("  Databases:  %d\n", result.DatabaseCount)
 	}
-	fmt.Println(string(output))
 
 	return nil
 }
@@ -81,6 +91,9 @@ usage: litestream info [OPTIONS]
 Show daemon information from a running Litestream instance.
 
 Options:
+  -json
+      Output raw JSON instead of human-readable text.
+
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 

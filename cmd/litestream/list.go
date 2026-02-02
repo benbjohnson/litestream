@@ -21,6 +21,7 @@ func (c *ListCommand) Run(_ context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-list", flag.ContinueOnError)
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	timeout := fs.Int("timeout", 10, "timeout in seconds")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -64,11 +65,25 @@ func (c *ListCommand) Run(_ context.Context, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	if *jsonOutput {
+		output, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+	} else {
+		if len(result.Databases) == 0 {
+			fmt.Println("No databases configured")
+		} else {
+			for _, db := range result.Databases {
+				syncInfo := "never"
+				if db.LastSyncAt != nil {
+					syncInfo = db.LastSyncAt.Format(time.RFC3339)
+				}
+				fmt.Printf("%s [%s] (last sync: %s)\n", db.Path, db.Status, syncInfo)
+			}
+		}
 	}
-	fmt.Println(string(output))
 
 	return nil
 }
@@ -81,6 +96,9 @@ usage: litestream list [OPTIONS]
 List all managed databases from a running daemon.
 
 Options:
+  -json
+      Output raw JSON instead of human-readable text.
+
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 
