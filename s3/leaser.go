@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"os"
 	"time"
@@ -25,17 +24,31 @@ const (
 	LeaserType       = "s3"
 )
 
-var _ litestream.Leaser = (*Leaser)(nil)
+var (
+	_ litestream.Leaser = (*Leaser)(nil)
 
-type Leaser struct {
-	client *ReplicaClient
-	logger *slog.Logger
+	ErrLeaseRequired     = errors.New("lease required")
+	ErrLeaseETagRequired = errors.New("lease etag required")
+)
 
-	TTL   time.Duration
-	Owner string
+// S3API is the interface for S3 operations needed by Leaser.
+type S3API interface {
+	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	DeleteObject(ctx context.Context, params *s3.DeleteObjectInput, optFns ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
-func NewLeaser(client *ReplicaClient) *Leaser {
+type Leaser struct {
+	s3     S3API
+	logger *slog.Logger
+
+	Bucket string
+	Path   string
+	TTL    time.Duration
+	Owner  string
+}
+
+func NewLeaser() *Leaser {
 	owner, _ := os.Hostname()
 	if owner == "" {
 		owner = fmt.Sprintf("pid-%d", os.Getpid())
@@ -44,11 +57,18 @@ func NewLeaser(client *ReplicaClient) *Leaser {
 	}
 
 	return &Leaser{
-		client: client,
 		logger: slog.Default().WithGroup("s3-leaser"),
 		TTL:    DefaultLeaseTTL,
 		Owner:  owner,
 	}
+}
+
+func (l *Leaser) Client() S3API {
+	return l.s3
+}
+
+func (l *Leaser) SetClient(client S3API) {
+	l.s3 = client
 }
 
 func (l *Leaser) Type() string {
@@ -56,17 +76,13 @@ func (l *Leaser) Type() string {
 }
 
 func (l *Leaser) lockKey() string {
-	if l.client.Path == "" {
+	if l.Path == "" {
 		return DefaultLeasePath
 	}
-	return l.client.Path + "/" + DefaultLeasePath
+	return l.Path + "/" + DefaultLeasePath
 }
 
 func (l *Leaser) AcquireLease(ctx context.Context) (*litestream.Lease, error) {
-	if err := l.client.Init(ctx); err != nil {
-		return nil, fmt.Errorf("init s3 client: %w", err)
-	}
-
 	existing, etag, err := l.readLease(ctx)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("read existing lease: %w", err)
@@ -115,12 +131,11 @@ func (l *Leaser) AcquireLease(ctx context.Context) (*litestream.Lease, error) {
 }
 
 func (l *Leaser) RenewLease(ctx context.Context, lease *litestream.Lease) (*litestream.Lease, error) {
-	if err := l.client.Init(ctx); err != nil {
-		return nil, fmt.Errorf("init s3 client: %w", err)
+	if lease == nil {
+		return nil, ErrLeaseRequired
 	}
-
-	if lease == nil || lease.ETag == "" {
-		return nil, litestream.ErrLeaseNotHeld
+	if lease.ETag == "" {
+		return nil, ErrLeaseETagRequired
 	}
 
 	newLease := &litestream.Lease{
@@ -149,17 +164,16 @@ func (l *Leaser) RenewLease(ctx context.Context, lease *litestream.Lease) (*lite
 }
 
 func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) error {
-	if err := l.client.Init(ctx); err != nil {
-		return fmt.Errorf("init s3 client: %w", err)
+	if lease == nil {
+		return ErrLeaseRequired
 	}
-
-	if lease == nil || lease.ETag == "" {
-		return litestream.ErrLeaseNotHeld
+	if lease.ETag == "" {
+		return ErrLeaseETagRequired
 	}
 
 	key := l.lockKey()
-	_, err := l.client.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket:  aws.String(l.client.Bucket),
+	_, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket:  aws.String(l.Bucket),
 		Key:     aws.String(key),
 		IfMatch: aws.String(lease.ETag),
 	})
@@ -186,8 +200,8 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, error) {
 	key := l.lockKey()
 
-	out, err := l.client.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: aws.String(l.client.Bucket),
+	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
+		Bucket: aws.String(l.Bucket),
 		Key:    aws.String(key),
 	})
 	if err != nil {
@@ -198,14 +212,9 @@ func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, erro
 	}
 	defer out.Body.Close()
 
-	data, err := io.ReadAll(out.Body)
-	if err != nil {
-		return nil, "", fmt.Errorf("read lock file: %w", err)
-	}
-
 	var lease litestream.Lease
-	if err := json.Unmarshal(data, &lease); err != nil {
-		return nil, "", fmt.Errorf("unmarshal lock file: %w", err)
+	if err := json.NewDecoder(out.Body).Decode(&lease); err != nil {
+		return nil, "", fmt.Errorf("decode lock file: %w", err)
 	}
 
 	etag := ""
@@ -226,7 +235,7 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 	}
 
 	input := &s3.PutObjectInput{
-		Bucket:      aws.String(l.client.Bucket),
+		Bucket:      aws.String(l.Bucket),
 		Key:         aws.String(key),
 		Body:        bytes.NewReader(data),
 		ContentType: aws.String("application/json"),
@@ -238,7 +247,7 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 		input.IfMatch = aws.String(etag)
 	}
 
-	out, err := l.client.s3.PutObject(ctx, input)
+	out, err := l.s3.PutObject(ctx, input)
 	if err != nil {
 		if isPreconditionFailed(err) {
 			return "", &litestream.LeaseExistsError{}

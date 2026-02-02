@@ -49,16 +49,10 @@ func TestLeaser_AcquireLease_NewLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
+	leaser := newTestLeaser(t, server.URL)
 	leaser.TTL = 10 * time.Second
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	lease, err := leaser.AcquireLease(ctx)
 	if err != nil {
 		t.Fatalf("AcquireLease() error: %v", err)
@@ -107,16 +101,10 @@ func TestLeaser_AcquireLease_ExpiredLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
+	leaser := newTestLeaser(t, server.URL)
 	leaser.TTL = 30 * time.Second
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	lease, err := leaser.AcquireLease(ctx)
 	if err != nil {
 		t.Fatalf("AcquireLease() error: %v", err)
@@ -153,15 +141,9 @@ func TestLeaser_AcquireLease_ActiveLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	_, err := leaser.AcquireLease(ctx)
 	if err == nil {
 		t.Fatal("expected error for active lease")
@@ -208,15 +190,9 @@ func TestLeaser_AcquireLease_RaceCondition412(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	_, err := leaser.AcquireLease(ctx)
 	if err == nil {
 		t.Fatal("expected error for 412 response")
@@ -261,16 +237,10 @@ func TestLeaser_RenewLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
+	leaser := newTestLeaser(t, server.URL)
 	leaser.TTL = 30 * time.Second
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	oldLease := &litestream.Lease{
 		Generation: 5,
 		ExpiresAt:  time.Now().Add(5 * time.Second),
@@ -305,15 +275,9 @@ func TestLeaser_RenewLease_LostLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	oldLease := &litestream.Lease{
 		Generation: 5,
 		ExpiresAt:  time.Now().Add(5 * time.Second),
@@ -333,18 +297,33 @@ func TestLeaser_RenewLease_NilLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	_, err := leaser.RenewLease(ctx, nil)
-	if err != litestream.ErrLeaseNotHeld {
-		t.Errorf("expected ErrLeaseNotHeld for nil lease, got %v", err)
+	if !errors.Is(err, ErrLeaseRequired) {
+		t.Errorf("expected ErrLeaseRequired for nil lease, got %v", err)
+	}
+}
+
+func TestLeaser_RenewLease_EmptyETag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no request should be made for empty ETag")
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+
+	ctx := context.Background()
+	lease := &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Second),
+		Owner:      "me",
+		ETag:       "",
+	}
+	_, err := leaser.RenewLease(ctx, lease)
+	if !errors.Is(err, ErrLeaseETagRequired) {
+		t.Errorf("expected ErrLeaseETagRequired for empty ETag, got %v", err)
 	}
 }
 
@@ -361,15 +340,9 @@ func TestLeaser_ReleaseLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	lease := &litestream.Lease{
 		Generation: 5,
 		ExpiresAt:  time.Now().Add(5 * time.Minute),
@@ -398,15 +371,9 @@ func TestLeaser_ReleaseLease_StaleETag(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	lease := &litestream.Lease{
 		Generation: 5,
 		ExpiresAt:  time.Now().Add(5 * time.Minute),
@@ -428,15 +395,9 @@ func TestLeaser_ReleaseLease_AlreadyDeleted(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	lease := &litestream.Lease{
 		Generation: 5,
 		ExpiresAt:  time.Now().Add(5 * time.Minute),
@@ -456,18 +417,33 @@ func TestLeaser_ReleaseLease_NilLease(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := newTestClient(server.URL)
-	leaser := NewLeaser(client)
-	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	leaser := newTestLeaser(t, server.URL)
 
 	ctx := context.Background()
-	if err := client.Init(ctx); err != nil {
-		t.Fatalf("Init() error: %v", err)
-	}
-
 	err := leaser.ReleaseLease(ctx, nil)
-	if err != litestream.ErrLeaseNotHeld {
-		t.Errorf("expected ErrLeaseNotHeld for nil lease, got %v", err)
+	if !errors.Is(err, ErrLeaseRequired) {
+		t.Errorf("expected ErrLeaseRequired for nil lease, got %v", err)
+	}
+}
+
+func TestLeaser_ReleaseLease_EmptyETag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Error("no request should be made for empty ETag")
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+
+	ctx := context.Background()
+	lease := &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       "",
+	}
+	err := leaser.ReleaseLease(ctx, lease)
+	if !errors.Is(err, ErrLeaseETagRequired) {
+		t.Errorf("expected ErrLeaseETagRequired for empty ETag, got %v", err)
 	}
 }
 
@@ -534,17 +510,10 @@ func TestLeaser_ConcurrentAcquisition(t *testing.T) {
 		go func(id int) {
 			defer wg.Done()
 
-			client := newTestClient(server.URL)
-			leaser := NewLeaser(client)
+			leaser := newTestLeaser(t, server.URL)
 			leaser.Owner = string(rune('A' + id))
-			leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 
 			ctx := context.Background()
-			if err := client.Init(ctx); err != nil {
-				t.Errorf("client %d Init() error: %v", id, err)
-				return
-			}
-
 			_, err := leaser.AcquireLease(ctx)
 			if err == nil {
 				successCount.Add(1)
@@ -589,10 +558,9 @@ func TestLeaser_LockKey(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			client := NewReplicaClient()
-			client.Path = tt.path
+			leaser := NewLeaser()
+			leaser.Path = tt.path
 
-			leaser := NewLeaser(client)
 			if got := leaser.lockKey(); got != tt.wantKey {
 				t.Errorf("lockKey() = %q, want %q", got, tt.wantKey)
 			}
@@ -601,15 +569,16 @@ func TestLeaser_LockKey(t *testing.T) {
 }
 
 func TestLeaser_Type(t *testing.T) {
-	client := NewReplicaClient()
-	leaser := NewLeaser(client)
+	leaser := NewLeaser()
 
 	if got := leaser.Type(); got != "s3" {
 		t.Errorf("Type() = %q, want %q", got, "s3")
 	}
 }
 
-func newTestClient(serverURL string) *ReplicaClient {
+func newTestLeaser(t *testing.T, serverURL string) *Leaser {
+	t.Helper()
+
 	client := NewReplicaClient()
 	client.Bucket = "test-bucket"
 	client.Path = "test-path"
@@ -618,5 +587,17 @@ func newTestClient(serverURL string) *ReplicaClient {
 	client.ForcePathStyle = true
 	client.AccessKeyID = "test-access-key"
 	client.SecretAccessKey = "test-secret-key"
-	return client
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	leaser := NewLeaser()
+	leaser.Bucket = client.Bucket
+	leaser.Path = client.Path
+	leaser.SetClient(client.s3)
+	leaser.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	return leaser
 }
