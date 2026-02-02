@@ -406,8 +406,8 @@ func TestLeaser_ReleaseLease_AlreadyDeleted(t *testing.T) {
 	}
 
 	err := leaser.ReleaseLease(ctx, lease)
-	if err != nil {
-		t.Fatalf("ReleaseLease() should not error for already-deleted lock: %v", err)
+	if !errors.Is(err, ErrLeaseAlreadyReleased) {
+		t.Fatalf("expected ErrLeaseAlreadyReleased, got %v", err)
 	}
 }
 

@@ -27,8 +27,9 @@ const (
 var (
 	_ litestream.Leaser = (*Leaser)(nil)
 
-	ErrLeaseRequired     = errors.New("lease required")
-	ErrLeaseETagRequired = errors.New("lease etag required")
+	ErrLeaseRequired        = errors.New("lease required")
+	ErrLeaseETagRequired    = errors.New("lease etag required")
+	ErrLeaseAlreadyReleased = errors.New("lease already released")
 )
 
 // S3API is the interface for S3 operations needed by Leaser.
@@ -179,10 +180,7 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 	})
 	if err != nil {
 		if isNotExists(err) || isNotFoundError(err) {
-			l.logger.Warn("lease already deleted unexpectedly",
-				"generation", lease.Generation,
-				"owner", lease.Owner)
-			return nil
+			return ErrLeaseAlreadyReleased
 		}
 		if isPreconditionFailed(err) {
 			return litestream.ErrLeaseNotHeld
