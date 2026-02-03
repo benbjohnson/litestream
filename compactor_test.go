@@ -35,6 +35,40 @@ func TestCompactor_Compact(t *testing.T) {
 		}
 	})
 
+	t.Run("PreservesCreatedAt", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		oldest := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		newest := oldest.Add(2 * time.Hour)
+
+		createTestLTXFileWithTimestamp(t, client, 0, 1, 1, oldest)
+		createTestLTXFileWithTimestamp(t, client, 0, 2, 2, newest)
+
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.CreatedAt.Equal(oldest) {
+			t.Errorf("CreatedAt=%v, want %v", info.CreatedAt, oldest)
+		}
+
+		itr, err := client.LTXFiles(context.Background(), 1, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer itr.Close()
+		if !itr.Next() {
+			t.Fatal("expected compacted file")
+		}
+		if got := itr.Item().CreatedAt; !got.Equal(oldest) {
+			t.Errorf("LTXFiles CreatedAt=%v, want %v", got, oldest)
+		}
+		if err := itr.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+
 	t.Run("NoFiles", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())

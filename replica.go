@@ -449,7 +449,7 @@ func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 // Returns zero time if no LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
 	for level := SnapshotLevel; level >= 0; level-- {
-		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+		itr, err := r.Client.LTXFiles(ctx, level, 0, true)
 		if err != nil {
 			return createdAt, updatedAt, err
 		}

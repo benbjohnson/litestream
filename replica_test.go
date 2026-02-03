@@ -441,6 +441,22 @@ func TestReplica_TimeBounds(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
+	t.Run("UsesMetadata", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if !useMetadata {
+				return nil, fmt.Errorf("expected metadata")
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		_, _, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
 	t.Run("Level0Only", func(t *testing.T) {
 		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 		var c mock.ReplicaClient

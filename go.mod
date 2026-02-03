@@ -62,6 +62,8 @@ require (
 	github.com/stretchr/testify v1.11.1
 )
 
+replace github.com/superfly/ltx => ./third_party/ltx
+
 require (
 	cloud.google.com/go v0.111.0 // indirect
 	cloud.google.com/go/compute/metadata v0.3.0 // indirect

@@ -125,6 +125,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}()
 
 	var minTXID, maxTXID ltx.TXID
+	var oldestCreatedAt time.Time
 	for itr.Next() {
 		info := itr.Item()
 
@@ -133,6 +134,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		}
 		if maxTXID == 0 || info.MaxTXID > maxTXID {
 			maxTXID = info.MaxTXID
+		}
+		if !info.CreatedAt.IsZero() && (oldestCreatedAt.IsZero() || info.CreatedAt.Before(oldestCreatedAt)) {
+			oldestCreatedAt = info.CreatedAt
 		}
 
 		if c.LocalFileOpener != nil {
@@ -162,6 +166,10 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
+		if !oldestCreatedAt.IsZero() {
+			timestamp := oldestCreatedAt.UTC().UnixMilli()
+			comp.HeaderTimestamp = &timestamp
+		}
 		_ = pw.CloseWithError(comp.Compact(ctx))
 	}()
 
