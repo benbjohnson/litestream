@@ -28,6 +28,9 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
+	retryDelay := fs.Duration("retry-delay", time.Second, "")
+	retryMaxDelay := fs.Duration("retry-max-delay", 30*time.Second, "")
+	retryMaxRetries := fs.Int("retry-max-retries", 5, "")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -68,6 +71,15 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		} else if err != nil {
 			return err
 		}
+	}
+
+	// Wrap client with retry logic if retries are enabled.
+	if *retryMaxRetries != 0 {
+		r.Client = litestream.NewRetryReplicaClient(r.Client, litestream.RetryConfig{
+			InitialDelay: *retryDelay,
+			MaxDelay:     *retryMaxDelay,
+			MaxRetries:   *retryMaxRetries,
+		})
 	}
 
 	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
@@ -182,6 +194,19 @@ Arguments:
 	-parallelism NUM
 	    Determines the number of WAL files downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
+
+	-retry-delay DURATION
+	    Initial delay between retries on transient errors.
+	    Defaults to 1s.
+
+	-retry-max-delay DURATION
+	    Maximum delay between retries (exponential backoff cap).
+	    Defaults to 30s.
+
+	-retry-max-retries NUM
+	    Maximum number of retry attempts for transient errors.
+	    Set to 0 to disable retries.
+	    Defaults to 5.
 
 
 Examples:
