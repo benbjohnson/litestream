@@ -967,6 +967,71 @@ func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
 	}
 }
 
+// TestDB_Monitor_DetectsWALModTimeChange verifies that the monitor loop
+// detects WAL mtime changes even when size & header are unchanged.
+func TestDB_Monitor_DetectsWALModTimeChange(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 50 * time.Millisecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (x INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for initial sync to complete.
+	time.Sleep(150 * time.Millisecond)
+
+	syncMetric := syncNCounterVec.WithLabelValues(db.Path())
+	baselineSyncCount := testutil.ToFloat64(syncMetric)
+	t.Logf("baseline sync count: %v", baselineSyncCount)
+
+	// Touch the WAL mtime without changing its contents.
+	walPath := db.WALPath()
+	fi, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatalf("failed to stat WAL file: %v", err)
+	}
+	newTime := fi.ModTime().Add(2 * time.Second)
+	if err := os.Chtimes(walPath, newTime, newTime); err != nil {
+		t.Fatalf("failed to update WAL mtime: %v", err)
+	}
+
+	// Wait for the monitor to observe the mtime change and sync.
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if testutil.ToFloat64(syncMetric) > baselineSyncCount {
+			return
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	finalSyncCount := testutil.ToFloat64(syncMetric)
+	t.Fatalf("sync count did not increase after WAL mtime change: baseline=%v, final=%v",
+		baselineSyncCount, finalSyncCount)
+}
+
 // TestDB_Monitor_DetectsSaltChangeAfterRestart verifies that the monitor loop
 // detects WAL header salt changes after a RESTART checkpoint followed by new
 // writes. SQLite generates new salt values when the first write happens after

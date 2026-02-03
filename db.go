@@ -2066,6 +2066,7 @@ func (db *DB) monitor() {
 
 	// Track last known WAL state for cheap change detection.
 	var lastWALSize int64
+	var lastWALModTime time.Time
 	var lastWALHeader []byte
 
 	// Backoff state for error handling.
@@ -2115,14 +2116,16 @@ func (db *DB) monitor() {
 			continue
 		}
 
-		// Skip sync if WAL size and header are unchanged.
+		// Skip sync if WAL size, mtime, and header are unchanged.
 		walSize := fi.Size()
-		if walSize == lastWALSize && bytes.Equal(walHeader, lastWALHeader) {
+		walModTime := fi.ModTime()
+		if walSize == lastWALSize && walModTime.Equal(lastWALModTime) && bytes.Equal(walHeader, lastWALHeader) {
 			continue
 		}
 
 		// WAL changed - update cached state and sync.
 		lastWALSize = walSize
+		lastWALModTime = walModTime
 		lastWALHeader = walHeader
 
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
