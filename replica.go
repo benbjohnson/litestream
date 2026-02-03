@@ -1071,6 +1071,11 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 			break
 		}
 
+		if next.candidate.MaxTXID <= currentMax {
+			next.candidate = nil
+			continue
+		}
+
 		logger.Debug("matching LTX file for restore",
 			"filename", ltx.FormatFilename(next.candidate.MinTXID, next.candidate.MaxTXID),
 			"level", next.candidate.Level)

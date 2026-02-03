@@ -419,6 +419,40 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 	})
 
+	t.Run("SkipsDuplicateRangesAcrossLevels", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			case 1:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 1, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 1, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 1; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
+		}
+	})
+
 	// Issue #847: When a level has overlapping files where a larger compacted file
 	// covers a smaller file's entire range, the smaller file should be skipped
 	// rather than causing a non-contiguous error.
