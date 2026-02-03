@@ -1102,13 +1102,19 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 }
 
 type restoreLevelCursor struct {
-	itr       ltx.FileIterator
-	current   *ltx.FileInfo
+	// itr streams LTX file infos for a single level in filename order.
+	itr ltx.FileIterator
+	// current holds the last item read from itr but not yet evaluated.
+	current *ltx.FileInfo
+	// candidate is the best eligible file at this level for the currentMax.
 	candidate *ltx.FileInfo
-	done      bool
+	// done indicates the iterator has been exhausted or errored.
+	done bool
 }
 
 func (c *restoreLevelCursor) refresh(currentMax, txID ltx.TXID, timestamp time.Time) error {
+	// Advance the iterator until we've evaluated all files that could be
+	// contiguous with currentMax. Keep the best eligible candidate.
 	if c.done {
 		return nil
 	}
@@ -1147,6 +1153,7 @@ func (c *restoreLevelCursor) refresh(currentMax, txID ltx.TXID, timestamp time.T
 }
 
 func (c *restoreLevelCursor) ensureCurrent() error {
+	// Ensure current is populated with the next iterator item, or mark done.
 	if c.done || c.current != nil {
 		return nil
 	}
