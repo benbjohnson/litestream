@@ -1001,64 +1001,90 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 	// Start with latest snapshot before target TXID or timestamp.
 	// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
-	if a, err := FindLTXFiles(ctx, client, SnapshotLevel, !timestamp.IsZero(), func(info *ltx.FileInfo) (bool, error) {
-		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
-		if txID != 0 {
-			return info.MaxTXID <= txID, nil
-		} else if !timestamp.IsZero() {
-			return info.CreatedAt.Before(timestamp), nil
-		}
-		return true, nil
-	}); err != nil {
+	var snapshot *ltx.FileInfo
+	snapshotItr, err := client.LTXFiles(ctx, SnapshotLevel, 0, !timestamp.IsZero())
+	if err != nil {
 		return nil, err
-	} else if len(a) > 0 {
-		logger.Debug("found snapshot before target TXID or timestamp", "snapshot", a[len(a)-1].MaxTXID)
-		infos = append(infos, a[len(a)-1])
+	}
+	for snapshotItr.Next() {
+		info := snapshotItr.Item()
+		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
+		if txID != 0 && info.MaxTXID > txID {
+			continue
+		}
+		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
+			continue
+		}
+		snapshot = info
+	}
+	if err := snapshotItr.Close(); err != nil {
+		return nil, err
+	}
+	if snapshot != nil {
+		logger.Debug("found snapshot before target TXID or timestamp", "snapshot", snapshot.MaxTXID)
+		infos = append(infos, snapshot)
 	}
 
-	// Starting from the highest compaction level, collect all paths after the
-	// latest TXID for each level. Compactions are based on the previous level's
-	// TXID granularity so the TXIDs should align between compaction levels.
+	// Collect candidates across all compaction levels and pick the next file
+	// from any level that extends the longest contiguous TXID range.
 	const maxLevel = SnapshotLevel - 1
+	startTXID := infos.MaxTXID()
+	currentMax := startTXID
+	if txID != 0 && currentMax >= txID {
+		return infos, nil
+	}
+
+	cursors := make([]*restoreLevelCursor, 0, maxLevel+1)
 	for level := maxLevel; level >= 0; level-- {
 		logger.Debug("finding ltx files for level", "level", level)
-
-		// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
-		a, err := FindLTXFiles(ctx, client, level, !timestamp.IsZero(), func(info *ltx.FileInfo) (bool, error) {
-			if info.MaxTXID <= infos.MaxTXID() { // skip if already included in previous levels
-				return false, nil
-			}
-
-			// Filter by TXID or timestamp, if specified.
-			if txID != 0 {
-				return info.MaxTXID <= txID, nil
-			} else if !timestamp.IsZero() {
-				return info.CreatedAt.Before(timestamp), nil
-			}
-			return true, nil
-		})
+		itr, err := client.LTXFiles(ctx, level, 0, !timestamp.IsZero())
 		if err != nil {
 			return nil, err
 		}
+		cursors = append(cursors, &restoreLevelCursor{
+			itr: itr,
+		})
+	}
+	defer func() {
+		for _, cursor := range cursors {
+			if cursor != nil {
+				_ = cursor.itr.Close()
+			}
+		}
+	}()
 
-		// Append each storage path to the list
-		for _, info := range a {
-			// Skip if this file's range is already covered by previously added files.
-			// This can happen when a larger compacted file at the same level covers
-			// a smaller file's entire range (see issue #847).
-			if info.MaxTXID <= infos.MaxTXID() {
+	for {
+		var next *restoreLevelCursor
+		for _, cursor := range cursors {
+			if err := cursor.refresh(currentMax, txID, timestamp); err != nil {
+				return nil, err
+			}
+			if cursor.candidate == nil {
 				continue
 			}
-
-			// Ensure TXIDs are contiguous between each paths.
-			if !ltx.IsContiguous(infos.MaxTXID(), info.MinTXID, info.MaxTXID) {
-				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",
-					infos.MaxTXID().String(), ltx.FormatFilename(info.MinTXID, info.MaxTXID))
+			if next == nil || restoreCandidateBetter(next.candidate, cursor.candidate) {
+				next = cursor
 			}
+		}
 
-			logger.Debug("matching LTX file for restore",
-				"filename", ltx.FormatFilename(info.MinTXID, info.MaxTXID))
-			infos = append(infos, info)
+		if next == nil || next.candidate == nil {
+			break
+		}
+
+		if next.candidate.MaxTXID <= currentMax {
+			next.candidate = nil
+			continue
+		}
+
+		logger.Debug("matching LTX file for restore",
+			"filename", ltx.FormatFilename(next.candidate.MinTXID, next.candidate.MaxTXID),
+			"level", next.candidate.Level)
+		infos = append(infos, next.candidate)
+		currentMax = next.candidate.MaxTXID
+		next.candidate = nil
+
+		if txID != 0 && currentMax >= txID {
+			break
 		}
 	}
 
@@ -1068,8 +1094,91 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	if len(infos) == 0 {
 		return nil, ErrTxNotAvailable
 	}
+	if txID != 0 && infos.MaxTXID() < txID {
+		return nil, ErrTxNotAvailable
+	}
 
 	return infos, nil
+}
+
+type restoreLevelCursor struct {
+	// itr streams LTX file infos for a single level in filename order.
+	itr ltx.FileIterator
+	// current holds the last item read from itr but not yet evaluated.
+	current *ltx.FileInfo
+	// candidate is the best eligible file at this level for the currentMax.
+	candidate *ltx.FileInfo
+	// done indicates the iterator has been exhausted or errored.
+	done bool
+}
+
+func (c *restoreLevelCursor) refresh(currentMax, txID ltx.TXID, timestamp time.Time) error {
+	// Advance the iterator until we've evaluated all files that could be
+	// contiguous with currentMax. Keep the best eligible candidate.
+	if c.done {
+		return nil
+	}
+	if c.candidate != nil && c.candidate.MaxTXID <= currentMax {
+		c.candidate = nil
+	}
+
+	for {
+		if err := c.ensureCurrent(); err != nil {
+			return err
+		}
+		if c.done {
+			return nil
+		}
+
+		info := c.current
+		if info.MinTXID > currentMax+1 {
+			return nil
+		}
+		c.current = nil
+
+		if info.MaxTXID <= currentMax {
+			continue
+		}
+		if txID != 0 && info.MaxTXID > txID {
+			continue
+		}
+		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
+			continue
+		}
+
+		if c.candidate == nil || restoreCandidateBetter(c.candidate, info) {
+			c.candidate = info
+		}
+	}
+}
+
+func (c *restoreLevelCursor) ensureCurrent() error {
+	// Ensure current is populated with the next iterator item, or mark done.
+	if c.done || c.current != nil {
+		return nil
+	}
+	if !c.itr.Next() {
+		if err := c.itr.Err(); err != nil {
+			return err
+		}
+		c.done = true
+		return nil
+	}
+	c.current = c.itr.Item()
+	return nil
+}
+
+func restoreCandidateBetter(curr, next *ltx.FileInfo) bool {
+	if next.MaxTXID != curr.MaxTXID {
+		return next.MaxTXID > curr.MaxTXID
+	}
+	if next.MinTXID != curr.MinTXID {
+		return next.MinTXID < curr.MinTXID
+	}
+	if next.Level != curr.Level {
+		return next.Level > curr.Level
+	}
+	return next.CreatedAt.Before(curr.CreatedAt)
 }
 
 // ValidationError represents a single validation issue.

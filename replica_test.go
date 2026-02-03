@@ -336,7 +336,44 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNonContiguousFiles", func(t *testing.T) {
+	t.Run("SelectLongestAcrossLevels", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5},
+				}), nil
+			case 2:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 2, MinTXID: 6, MaxTXID: 12},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 6, MaxTXID: 20},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 20, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 2; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[1], (ltx.FileInfo{Level: 0, MinTXID: 6, MaxTXID: 20}); got != want {
+			t.Fatalf("plan[1]=%#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("GapInLevelResolvedByLowerLevel", func(t *testing.T) {
 		var c mock.ReplicaClient
 		r := litestream.NewReplicaWithClient(db, &c)
 		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -347,16 +384,72 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 				}), nil
 			case 1:
 				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
-					{Level: 1, MinTXID: 8, MaxTXID: 9},
+					{Level: 1, MinTXID: 6, MaxTXID: 7},
+					{Level: 1, MinTXID: 9, MaxTXID: 10},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 8, MaxTXID: 8},
+					{Level: 0, MinTXID: 9, MaxTXID: 9},
+					{Level: 0, MinTXID: 10, MaxTXID: 10},
 				}), nil
 			default:
 				return ltx.NewFileInfoSliceIterator(nil), nil
 			}
 		}
 
-		_, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
-		if err == nil || err.Error() != `non-contiguous transaction files: prev=0000000000000005 filename=0000000000000008-0000000000000009.ltx` {
-			t.Fatalf("unexpected error: %q", err)
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 4; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[1], (ltx.FileInfo{Level: 1, MinTXID: 6, MaxTXID: 7}); got != want {
+			t.Fatalf("plan[1]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[2], (ltx.FileInfo{Level: 0, MinTXID: 8, MaxTXID: 8}); got != want {
+			t.Fatalf("plan[2]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[3], (ltx.FileInfo{Level: 1, MinTXID: 9, MaxTXID: 10}); got != want {
+			t.Fatalf("plan[3]=%#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("SkipsDuplicateRangesAcrossLevels", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			case 1:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 1, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 1, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 1; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
 		}
 	})
 
