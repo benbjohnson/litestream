@@ -37,6 +37,28 @@ func TestListCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("InvalidTimeoutZero", func(t *testing.T) {
+		cmd := &main.ListCommand{}
+		err := cmd.Run(context.Background(), []string{"-timeout", "0"})
+		if err == nil {
+			t.Error("expected error for zero timeout")
+		}
+		if err.Error() != "timeout must be greater than 0" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("InvalidTimeoutNegative", func(t *testing.T) {
+		cmd := &main.ListCommand{}
+		err := cmd.Run(context.Background(), []string{"-timeout", "-1"})
+		if err == nil {
+			t.Error("expected error for negative timeout")
+		}
+		if err.Error() != "timeout must be greater than 0" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
 	t.Run("Success", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)

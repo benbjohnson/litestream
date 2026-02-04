@@ -95,8 +95,6 @@ func (s *Server) Start() error {
 		return fmt.Errorf("socket path required")
 	}
 
-	s.startedAt = time.Now()
-
 	// Check if socket file exists and is actually a socket before removing
 	if info, err := os.Lstat(s.SocketPath); err == nil {
 		if info.Mode()&os.ModeSocket != 0 {
@@ -120,6 +118,10 @@ func (s *Server) Start() error {
 		listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
+
+	// Set startedAt after successful socket setup to ensure uptime reflects
+	// the actual time the server became available.
+	s.startedAt = time.Now()
 
 	s.logger.Info("control socket listening", "path", s.SocketPath)
 
@@ -362,8 +364,12 @@ type ListResponse struct {
 
 // DatabaseSummary contains summary information about a database.
 type DatabaseSummary struct {
-	Path       string     `json:"path"`
-	Status     string     `json:"status"`
+	Path   string `json:"path"`
+	Status string `json:"status"`
+
+	// LastSyncAt is the timestamp of the last successful replica sync.
+	// This reflects when data was last successfully uploaded to the replica
+	// storage backend, not just when the local WAL was processed.
 	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
 }
 

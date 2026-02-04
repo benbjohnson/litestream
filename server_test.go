@@ -121,7 +121,7 @@ func TestServer_HandleList(t *testing.T) {
 		require.Contains(t, paths, db2.Path())
 	})
 
-	t.Run("StatusReflectsMonitorState", func(t *testing.T) {
+	t.Run("StatusOpenWhenMonitorDisabled", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
 
@@ -149,6 +149,36 @@ func TestServer_HandleList(t *testing.T) {
 
 		// Since MonitorEnabled is false, status should be "open" not "replicating".
 		require.Equal(t, "open", result.Databases[0].Status)
+	})
+
+	t.Run("StatusReplicatingWhenMonitorEnabled", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		// Enable the monitor to simulate active replication.
+		db.Replica.MonitorEnabled = true
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		resp, err := client.Get("http://localhost/list")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		var result litestream.ListResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Len(t, result.Databases, 1)
+
+		// Since MonitorEnabled is true, status should be "replicating".
+		require.Equal(t, "replicating", result.Databases[0].Status)
 	})
 
 	t.Run("IncludesLastSyncAt", func(t *testing.T) {

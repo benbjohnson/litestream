@@ -31,6 +31,10 @@ func (c *ListCommand) Run(_ context.Context, args []string) error {
 		return fmt.Errorf("too many arguments")
 	}
 
+	if *timeout <= 0 {
+		return fmt.Errorf("timeout must be greater than 0")
+	}
+
 	clientTimeout := time.Duration(*timeout) * time.Second
 	client := &http.Client{
 		Timeout: clientTimeout,
