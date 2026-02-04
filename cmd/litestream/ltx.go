@@ -72,47 +72,36 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
 	defer w.Flush()
 
-	showAllLevels := int(level) == levelAll
+	fmt.Fprintln(w, "level\tmin_txid\tmax_txid\tsize\tcreated")
 
-	if showAllLevels {
-		fmt.Fprintln(w, "level\tmin_txid\tmax_txid\tsize\tcreated")
+	// Determine which levels to iterate.
+	var levels []int
+	if int(level) == levelAll {
 		for lvl := 0; lvl <= litestream.SnapshotLevel; lvl++ {
-			itr, err := r.Client.LTXFiles(ctx, lvl, 0, false)
-			if err != nil {
-				return err
-			}
-			for itr.Next() {
-				info := itr.Item()
-				fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%s\n",
-					lvl,
-					info.MinTXID,
-					info.MaxTXID,
-					info.Size,
-					info.CreatedAt.Format(time.RFC3339),
-				)
-			}
-			if err := itr.Close(); err != nil {
-				return err
-			}
+			levels = append(levels, lvl)
 		}
 	} else {
-		fmt.Fprintln(w, "min_txid\tmax_txid\tsize\tcreated")
-		itr, err := r.Client.LTXFiles(ctx, int(level), 0, false)
+		levels = []int{int(level)}
+	}
+
+	for _, lvl := range levels {
+		itr, err := r.Client.LTXFiles(ctx, lvl, 0, false)
 		if err != nil {
 			return err
 		}
-		defer itr.Close()
-
 		for itr.Next() {
 			info := itr.Item()
-			fmt.Fprintf(w, "%s\t%s\t%d\t%s\n",
+			fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%s\n",
+				lvl,
 				info.MinTXID,
 				info.MaxTXID,
 				info.Size,
 				info.CreatedAt.Format(time.RFC3339),
 			)
 		}
-		return itr.Close()
+		if err := itr.Close(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
