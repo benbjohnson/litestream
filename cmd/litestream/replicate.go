@@ -287,6 +287,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		c.Server.SocketPath = c.Config.Socket.Path
 		c.Server.SocketPerms = c.Config.Socket.Permissions
 		c.Server.PathExpander = expand
+		c.Server.Version = Version
 		if err := c.Server.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
 		}

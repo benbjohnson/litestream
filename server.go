@@ -43,6 +43,12 @@ type Server struct {
 	// If nil, paths are used as-is.
 	PathExpander func(string) (string, error)
 
+	// Version is the version string to report in /info.
+	Version string
+
+	// startedAt is set when the server starts.
+	startedAt time.Time
+
 	socketListener net.Listener
 	httpServer     *http.Server
 
@@ -68,6 +74,8 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
+	mux.HandleFunc("GET /list", s.handleList)
+	mux.HandleFunc("GET /info", s.handleInfo)
 
 	// pprof endpoints
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -110,6 +118,10 @@ func (s *Server) Start() error {
 		listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
+
+	// Set startedAt after successful socket setup to ensure uptime reflects
+	// the actual time the server became available.
+	s.startedAt = time.Now()
 
 	s.logger.Info("control socket listening", "path", s.SocketPath)
 
@@ -298,4 +310,74 @@ type ErrorResponse struct {
 // TXIDResponse is the response body for the /txid endpoint.
 type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
+}
+
+func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
+	dbs := s.store.DBs()
+	resp := ListResponse{
+		Databases: make([]DatabaseSummary, 0, len(dbs)),
+	}
+
+	for _, db := range dbs {
+		var status string
+		if db.IsOpen() {
+			if db.Replica != nil && db.Replica.MonitorEnabled {
+				status = "replicating"
+			} else {
+				status = "open"
+			}
+		} else {
+			status = "stopped"
+		}
+
+		summary := DatabaseSummary{
+			Path:   db.Path(),
+			Status: status,
+		}
+
+		if t := db.LastSuccessfulSyncAt(); !t.IsZero() {
+			summary.LastSyncAt = &t
+		}
+
+		resp.Databases = append(resp.Databases, summary)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleInfo(w http.ResponseWriter, _ *http.Request) {
+	resp := InfoResponse{
+		Version:       s.Version,
+		PID:           os.Getpid(),
+		StartedAt:     s.startedAt,
+		UptimeSeconds: int64(time.Since(s.startedAt).Seconds()),
+		DatabaseCount: len(s.store.DBs()),
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// ListResponse is the response body for the /list endpoint.
+type ListResponse struct {
+	Databases []DatabaseSummary `json:"databases"`
+}
+
+// DatabaseSummary contains summary information about a database.
+type DatabaseSummary struct {
+	Path   string `json:"path"`
+	Status string `json:"status"`
+
+	// LastSyncAt is the timestamp of the last successful replica sync.
+	// This reflects when data was last successfully uploaded to the replica
+	// storage backend, not just when the local WAL was processed.
+	LastSyncAt *time.Time `json:"last_sync_at,omitempty"`
+}
+
+// InfoResponse is the response body for the /info endpoint.
+type InfoResponse struct {
+	Version       string    `json:"version"`
+	PID           int       `json:"pid"`
+	UptimeSeconds int64     `json:"uptime_seconds"`
+	StartedAt     time.Time `json:"started_at"`
+	DatabaseCount int       `json:"database_count"`
 }
