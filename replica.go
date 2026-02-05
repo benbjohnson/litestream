@@ -575,7 +575,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		if err != nil {
 			return fmt.Errorf("open ltx file: %w", err)
 		}
-		rdrs = append(rdrs, f)
+		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
