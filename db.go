@@ -260,6 +260,10 @@ func (db *DB) WALPath() string {
 	return db.path + "-wal"
 }
 
+func (db *DB) shmPath() string {
+	return db.path + "-shm"
+}
+
 // MetaPath returns the path to the database metadata.
 func (db *DB) MetaPath() string {
 	return db.metaPath
@@ -2049,11 +2053,14 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // To reduce CPU usage when idle, we use cheap change detection to avoid
 // unnecessary Sync() calls when the WAL hasn't changed:
 //
-//  1. stat() the WAL file to get its size (changes on any write)
-//  2. Read the 32-byte WAL header which contains salt values that change
-//     when SQLite restarts the WAL (e.g., after checkpoint)
+//  1. Read mxFrame from the first page of the WAL-index (-shm). This changes
+//     on each commit even when SQLite reuses WAL space and the WAL file size
+//     stays constant.
+//  2. stat() the WAL file to get its size.
+//  3. Read the 32-byte WAL header which contains salt values that change
+//     when SQLite restarts the WAL (e.g., after checkpoint).
 //
-// If both size and header are unchanged since last check, we skip Sync().
+// If mxFrame, size, and header are unchanged since last check, we skip Sync().
 // When a change is detected, we call Sync() which performs full verification
 // and replication. The cost per tick is just one stat() call plus a 32-byte
 // read, which is negligible.
@@ -2066,8 +2073,8 @@ func (db *DB) monitor() {
 
 	// Track last known WAL state for cheap change detection.
 	var lastWALSize int64
-	var lastWALModTime time.Time
 	var lastWALHeader []byte
+	var lastSHMMxFrame [4]byte
 
 	// Backoff state for error handling.
 	var backoff time.Duration
@@ -2106,6 +2113,15 @@ func (db *DB) monitor() {
 			continue
 		}
 
+		shmMxFrame, err := readSHMMxFrameKey(db.shmPath())
+		if err != nil {
+			// Can't read SHM header - fall back to sync.
+			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				db.Logger.Error("sync error", "error", err)
+			}
+			continue
+		}
+
 		// Read WAL header (32 bytes) for change detection.
 		walHeader, err := readWALHeader(walPath)
 		if err != nil {
@@ -2116,17 +2132,16 @@ func (db *DB) monitor() {
 			continue
 		}
 
-		// Skip sync if WAL size, mtime, and header are unchanged.
+		// Skip sync if WAL-index mxFrame, WAL size, and WAL header are unchanged.
 		walSize := fi.Size()
-		walModTime := fi.ModTime()
-		if walSize == lastWALSize && walModTime.Equal(lastWALModTime) && bytes.Equal(walHeader, lastWALHeader) {
+		if walSize == lastWALSize && shmMxFrame == lastSHMMxFrame && bytes.Equal(walHeader, lastWALHeader) {
 			continue
 		}
 
 		// WAL changed - update cached state and sync.
 		lastWALSize = walSize
-		lastWALModTime = walModTime
 		lastWALHeader = walHeader
+		lastSHMMxFrame = shmMxFrame
 
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++

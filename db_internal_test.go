@@ -967,9 +967,55 @@ func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
 	}
 }
 
-// TestDB_Monitor_DetectsWALModTimeChange verifies that the monitor loop
-// detects WAL mtime changes even when size & header are unchanged.
-func TestDB_Monitor_DetectsWALModTimeChange(t *testing.T) {
+func TestReadSHMMxFrameKey(t *testing.T) {
+	dir := t.TempDir()
+	shmPath := filepath.Join(dir, "db-shm")
+
+	f, err := os.Create(shmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, 16); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, 64); err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := readSHMMxFrameKey(shmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if key != ([4]byte{1, 2, 3, 4}) {
+		t.Fatalf("unexpected key: %#v", key)
+	}
+}
+
+func TestReadSHMMxFrameKeyMismatch(t *testing.T) {
+	dir := t.TempDir()
+	shmPath := filepath.Join(dir, "db-shm")
+
+	f, err := os.Create(shmPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, 16); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{4, 3, 2, 1}, 64); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := readSHMMxFrameKey(shmPath); err == nil {
+		t.Fatal("expected error")
+	}
+}
+
+func TestDB_Monitor_IgnoresWALModTimeChange(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -1004,8 +1050,8 @@ func TestDB_Monitor_DetectsWALModTimeChange(t *testing.T) {
 	time.Sleep(150 * time.Millisecond)
 
 	syncMetric := syncNCounterVec.WithLabelValues(db.Path())
+	time.Sleep(200 * time.Millisecond)
 	baselineSyncCount := testutil.ToFloat64(syncMetric)
-	t.Logf("baseline sync count: %v", baselineSyncCount)
 
 	// Touch the WAL mtime without changing its contents.
 	walPath := db.WALPath()
@@ -1018,18 +1064,12 @@ func TestDB_Monitor_DetectsWALModTimeChange(t *testing.T) {
 		t.Fatalf("failed to update WAL mtime: %v", err)
 	}
 
-	// Wait for the monitor to observe the mtime change and sync.
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if testutil.ToFloat64(syncMetric) > baselineSyncCount {
-			return
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-
+	time.Sleep(300 * time.Millisecond)
 	finalSyncCount := testutil.ToFloat64(syncMetric)
-	t.Fatalf("sync count did not increase after WAL mtime change: baseline=%v, final=%v",
-		baselineSyncCount, finalSyncCount)
+	if finalSyncCount > baselineSyncCount+1 {
+		t.Fatalf("sync count increased after WAL mtime change: baseline=%v, final=%v",
+			baselineSyncCount, finalSyncCount)
+	}
 }
 
 // TestDB_Monitor_DetectsSaltChangeAfterRestart verifies that the monitor loop
