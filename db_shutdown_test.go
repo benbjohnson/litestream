@@ -269,13 +269,14 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 
 		// Create done channel and close it after short delay
 		done := make(chan struct{})
+		db.Done = done
 		go func() {
 			time.Sleep(200 * time.Millisecond)
 			close(done)
 		}()
 
 		start := time.Now()
-		err := db.CloseWithSignal(context.Background(), done)
+		err := db.Close(context.Background())
 		elapsed := time.Since(start)
 
 		// Should exit quickly (well before 10 second timeout)
@@ -327,12 +328,13 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		db.ShutdownSyncTimeout = 10 * time.Second
 		db.ShutdownSyncInterval = 50 * time.Millisecond
 
-		// Close done before calling CloseWithSignal
+		// Close done before calling Close
 		done := make(chan struct{})
 		close(done)
+		db.Done = done
 
 		start := time.Now()
-		err := db.CloseWithSignal(context.Background(), done)
+		err := db.Close(context.Background())
 		elapsed := time.Since(start)
 
 		// Should exit immediately
@@ -354,7 +356,7 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		}
 	})
 
-	t.Run("NilDoneChannelBehavesLikeClose", func(t *testing.T) {
+	t.Run("NilDoneBehavesLikeClose", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 
 		// Write some data
@@ -385,7 +387,8 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		db.ShutdownSyncTimeout = 5 * time.Second
 		db.ShutdownSyncInterval = 50 * time.Millisecond
 
-		if err := db.CloseWithSignal(context.Background(), nil); err != nil {
+		// Done is nil by default, Close should work normally
+		if err := db.Close(context.Background()); err != nil {
 			t.Fatalf("expected success, got: %v", err)
 		}
 		if got := atomic.LoadInt32(&attempts); got != 1 {

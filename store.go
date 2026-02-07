@@ -83,6 +83,7 @@ type Store struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel func()
+	done   <-chan struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -202,20 +203,12 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	return s.CloseWithSignal(ctx, nil)
-}
-
-// CloseWithSignal is like Close but passes a done channel to each database
-// so that the shutdown sync retry loop can be interrupted. Databases are closed
-// sequentially; when done is closed, each database's retry loop exits after its
-// current sync attempt completes. If done is nil, it behaves identically to Close.
-func (s *Store) CloseWithSignal(ctx context.Context, done <-chan struct{}) (err error) {
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
 
 	for _, db := range dbs {
-		if e := db.CloseWithSignal(ctx, done); e != nil && err == nil {
+		if e := db.Close(ctx); e != nil && err == nil {
 			err = e
 		}
 	}
@@ -254,6 +247,7 @@ func (s *Store) AddDB(db *DB) error {
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	db.VerifyCompaction = s.VerifyCompaction
+	db.Done = s.done
 
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.
@@ -383,6 +377,17 @@ func (s *Store) SetL0Retention(d time.Duration) {
 	s.L0Retention = d
 	for _, db := range s.dbs {
 		db.L0Retention = d
+	}
+}
+
+// SetDone sets the done channel used for interrupt handling during shutdown
+// and propagates it to all managed databases.
+func (s *Store) SetDone(done <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.done = done
+	for _, db := range s.dbs {
+		db.Done = done
 	}
 }
 

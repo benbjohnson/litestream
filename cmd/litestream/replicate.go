@@ -260,6 +260,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.Validation.Interval != nil {
 		c.Store.ValidationInterval = *c.Config.Validation.Interval
 	}
+	if c.done != nil {
+		c.Store.SetDone(c.done)
+	}
 	if c.Config.HeartbeatURL != "" {
 		interval := litestream.DefaultHeartbeatInterval
 		if c.Config.HeartbeatInterval != nil {
@@ -433,7 +436,7 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	if c.Store != nil {
-		if err := c.Store.CloseWithSignal(ctx, c.done); err != nil {
+		if err := c.Store.Close(ctx); err != nil {
 			if strings.Contains(err.Error(), "interrupted") {
 				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
 			} else {

@@ -107,6 +107,7 @@ type DB struct {
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
+	Done   <-chan struct{}
 
 	// Metrics
 	dbSizeGauge                 prometheus.Gauge
@@ -454,16 +455,9 @@ func (db *DB) Open() (err error) {
 }
 
 // Close flushes outstanding WAL writes to replicas, releases the read lock,
-// and closes the database. Takes a context for final sync.
+// and closes the database. If a done channel has been set via SetDone, it can
+// interrupt the shutdown sync retry loop.
 func (db *DB) Close(ctx context.Context) (err error) {
-	return db.CloseWithSignal(ctx, nil)
-}
-
-// CloseWithSignal is like Close but accepts a done channel that can interrupt
-// the shutdown sync retry loop. When the done channel is closed, the retry
-// loop exits after the current sync attempt completes. If done is nil, it
-// behaves identically to Close.
-func (db *DB) CloseWithSignal(ctx context.Context, done <-chan struct{}) (err error) {
 	db.cancel()
 	db.wg.Wait()
 
@@ -477,7 +471,7 @@ func (db *DB) CloseWithSignal(ctx context.Context, done <-chan struct{}) (err er
 	// Ensure replicas perform a final sync and stop replicating.
 	if db.Replica != nil {
 		if db.db != nil {
-			if e := db.syncReplicaWithRetry(ctx, done); e != nil && err == nil {
+			if e := db.syncReplicaWithRetry(ctx); e != nil && err == nil {
 				err = e
 			}
 		}
@@ -514,10 +508,10 @@ func (db *DB) CloseWithSignal(ctx context.Context, done <-chan struct{}) (err er
 }
 
 // syncReplicaWithRetry attempts to sync the replica with retry logic for shutdown.
-// It retries until success, timeout, or context cancellation. If done is non-nil,
+// It retries until success, timeout, or context cancellation. If db.Done is non-nil,
 // closing it cancels any in-flight sync attempt and exits the retry loop.
 // If ShutdownSyncTimeout is 0, it performs a single sync attempt without retries.
-func (db *DB) syncReplicaWithRetry(ctx context.Context, done <-chan struct{}) error {
+func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 	if db.Replica == nil {
 		return nil
 	}
@@ -539,15 +533,15 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context, done <-chan struct{}) er
 	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, timeout)
 	defer deadlineCancel()
 
-	// If done is provided, derive a context that cancels when done is closed
+	// If db.Done is set, derive a context that cancels when done is closed
 	// so that in-flight Replica.Sync calls are interrupted immediately.
 	syncCtx := deadlineCtx
-	if done != nil {
+	if db.Done != nil {
 		var syncCancel context.CancelFunc
 		syncCtx, syncCancel = context.WithCancel(deadlineCtx)
 		go func() {
 			select {
-			case <-done:
+			case <-db.Done:
 				syncCancel()
 			case <-deadlineCtx.Done():
 				syncCancel()
@@ -561,9 +555,9 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context, done <-chan struct{}) er
 
 	for {
 		// Check if done is already closed before attempting sync
-		if done != nil {
+		if db.Done != nil {
 			select {
-			case <-done:
+			case <-db.Done:
 				db.Logger.Warn("shutdown sync skipped, interrupted by signal",
 					"attempts", attempt,
 					"duration", time.Since(startTime))
@@ -594,7 +588,7 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context, done <-chan struct{}) er
 				"duration", time.Since(startTime),
 				"error", lastErr)
 			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
-		case <-done:
+		case <-db.Done:
 			db.Logger.Warn("shutdown sync interrupted by signal",
 				"attempts", attempt,
 				"duration", time.Since(startTime),
@@ -604,7 +598,7 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context, done <-chan struct{}) er
 		}
 
 		// Log retry with hint about second signal if interruptible
-		if done != nil {
+		if db.Done != nil {
 			db.Logger.Warn("shutdown sync failed, retrying (press Ctrl+C again to skip)",
 				"attempts", attempt,
 				"error", lastErr,
@@ -623,7 +617,7 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context, done <-chan struct{}) er
 		case <-time.After(interval):
 		case <-deadlineCtx.Done():
 			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
-		case <-done:
+		case <-db.Done:
 			db.Logger.Warn("shutdown sync interrupted by signal",
 				"attempts", attempt,
 				"duration", time.Since(startTime))
