@@ -455,8 +455,8 @@ func (db *DB) Open() (err error) {
 }
 
 // Close flushes outstanding WAL writes to replicas, releases the read lock,
-// and closes the database. If a done channel has been set via SetDone, it can
-// interrupt the shutdown sync retry loop.
+// and closes the database. If Done is set, closing it interrupts the shutdown
+// sync retry loop and cancels any in-flight sync attempt.
 func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
@@ -561,7 +561,7 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 				db.Logger.Warn("shutdown sync skipped, interrupted by signal",
 					"attempts", attempt,
 					"duration", time.Since(startTime))
-				return fmt.Errorf("shutdown sync interrupted after %d attempts", attempt)
+				return fmt.Errorf("after %d attempts: %w", attempt, ErrShutdownInterrupted)
 			default:
 			}
 		}
@@ -593,7 +593,7 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 				"attempts", attempt,
 				"duration", time.Since(startTime),
 				"error", lastErr)
-			return fmt.Errorf("shutdown sync interrupted after %d attempts: %w", attempt, lastErr)
+			return fmt.Errorf("after %d attempts: %w", attempt, ErrShutdownInterrupted)
 		default:
 		}
 
@@ -621,7 +621,7 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 			db.Logger.Warn("shutdown sync interrupted by signal",
 				"attempts", attempt,
 				"duration", time.Since(startTime))
-			return fmt.Errorf("shutdown sync interrupted after %d attempts: %w", attempt, lastErr)
+			return fmt.Errorf("after %d attempts: %w", attempt, ErrShutdownInterrupted)
 		}
 	}
 }

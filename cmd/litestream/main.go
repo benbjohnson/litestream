@@ -157,13 +157,13 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 					return fmt.Errorf("cannot wait for exec process: %w", err)
 				}
 			}
-		}
 
-		// Listen for a second signal to close done and interrupt retry loops.
-		go func() {
-			<-signalCh
-			close(done)
-		}()
+			// Listen for a second signal to close done and interrupt retry loops.
+			go func() {
+				<-signalCh
+				close(done)
+			}()
+		}
 
 		// Gracefully close.
 		if e := c.Close(ctx); e != nil && err == nil {

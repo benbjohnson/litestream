@@ -288,8 +288,8 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error after done signal")
 		}
-		if !strings.Contains(err.Error(), "interrupted") {
-			t.Fatalf("expected interrupted error, got: %v", err)
+		if !errors.Is(err, litestream.ErrShutdownInterrupted) {
+			t.Fatalf("expected ErrShutdownInterrupted, got: %v", err)
 		}
 
 		// Should have made at least 1 attempt before being interrupted
@@ -346,8 +346,8 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		if err == nil {
 			t.Fatal("expected error with pre-closed done channel")
 		}
-		if !strings.Contains(err.Error(), "interrupted") {
-			t.Fatalf("expected interrupted error, got: %v", err)
+		if !errors.Is(err, litestream.ErrShutdownInterrupted) {
+			t.Fatalf("expected ErrShutdownInterrupted, got: %v", err)
 		}
 
 		// Should not have made any sync attempts

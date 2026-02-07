@@ -51,7 +51,7 @@ type ReplicateCommand struct {
 	directoryMonitors []*DirectoryMonitor
 
 	// Done channel for interrupt handling during shutdown. When closed,
-	// the shutdown sync retry loop exits after the current attempt completes.
+	// the shutdown sync retry loop exits and any in-flight sync is cancelled.
 	done <-chan struct{}
 }
 
@@ -437,7 +437,7 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	}
 	if c.Store != nil {
 		if err := c.Store.Close(ctx); err != nil {
-			if strings.Contains(err.Error(), "interrupted") {
+			if errors.Is(err, litestream.ErrShutdownInterrupted) {
 				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
 			} else {
 				slog.Error("failed to close database", "error", err)

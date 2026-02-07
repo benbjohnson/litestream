@@ -26,6 +26,10 @@ var (
 
 	// ErrDBNotReady is a sentinel for errors.Is() compatibility.
 	ErrDBNotReady = &DBNotReadyError{}
+
+	// ErrShutdownInterrupted is returned when the shutdown sync retry loop
+	// is interrupted by a done channel signal (e.g., second Ctrl+C).
+	ErrShutdownInterrupted = errors.New("shutdown sync interrupted")
 )
 
 // DBNotReadyError is returned when an operation is attempted before the
@@ -208,8 +212,14 @@ func (s *Store) Close(ctx context.Context) (err error) {
 	s.mu.Unlock()
 
 	for _, db := range dbs {
-		if e := db.Close(ctx); e != nil && err == nil {
-			err = e
+		if e := db.Close(ctx); e != nil {
+			if errors.Is(e, ErrShutdownInterrupted) {
+				if err == nil {
+					err = e
+				}
+			} else if err == nil || errors.Is(err, ErrShutdownInterrupted) {
+				err = e
+			}
 		}
 	}
 
