@@ -1755,5 +1755,58 @@ func verifyRestoredDB(t *testing.T, path string) {
 	}
 	if result != "ok" {
 		t.Fatalf("integrity check returned: %s", result)
+// TestReplica_LTXStats verifies that LTXStats returns correct file counts and sizes from replica.
+func TestReplica_LTXStats(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create table and insert data
+	if _, err := sqldb.Exec(`CREATE TABLE t (x TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t (x) VALUES ('test data for replica ltx stats')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create replica with file client
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplicaWithClient(db, c)
+
+	// Initially, replica should have no files
+	stats, err := r.LTXStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.ByLevel) != 0 {
+		t.Fatalf("expected 0 levels in replica initially, got %d", len(stats.ByLevel))
+	}
+
+	// Sync to replica
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Now replica should have files
+	stats, err = r.LTXStats(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(stats.ByLevel) == 0 {
+		t.Fatal("expected at least 1 level with LTX files in replica after sync")
+	}
+
+	// Verify level 0 has files
+	level0Stats, ok := stats.ByLevel[0]
+	if !ok {
+		t.Fatal("expected level 0 stats to exist in replica")
+	}
+	if level0Stats.Files == 0 {
+		t.Fatal("expected at least 1 file in replica level 0")
+	}
+	if level0Stats.Bytes == 0 {
+		t.Fatal("expected non-zero bytes in replica level 0")
 	}
 }

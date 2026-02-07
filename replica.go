@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
@@ -170,6 +171,9 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	// Record successful sync for heartbeat monitoring.
 	r.db.RecordSuccessfulSync()
 
+	// Update replica LTX metrics after successful sync.
+	r.UpdateLTXMetrics(ctx)
+
 	return nil
 }
 
@@ -219,6 +223,61 @@ func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileI
 		}
 	}
 	return info, itr.Close()
+}
+
+// LTXStats returns statistics about LTX files in the replica.
+// Iterates through all compaction levels (0 through SnapshotLevel) and aggregates
+// file counts and sizes using the existing LTXFiles iterator.
+func (r *Replica) LTXStats(ctx context.Context) (LTXStats, error) {
+	stats := LTXStats{ByLevel: make(map[int]LTXLevelStats)}
+
+	// Iterate through all possible levels including snapshot level
+	for level := 0; level <= SnapshotLevel; level++ {
+		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+		if err != nil {
+			// Skip levels that don't exist or have errors
+			continue
+		}
+
+		var levelStats LTXLevelStats
+		for itr.Next() {
+			item := itr.Item()
+			levelStats.Files++
+			levelStats.Bytes += item.Size
+		}
+		if err := itr.Close(); err != nil {
+			r.Logger().Debug("error closing LTX iterator", "level", level, "error", err)
+			continue
+		}
+
+		if levelStats.Files > 0 {
+			stats.ByLevel[level] = levelStats
+		}
+	}
+
+	return stats, nil
+}
+
+// UpdateLTXMetrics updates Prometheus metrics for replica LTX files.
+func (r *Replica) UpdateLTXMetrics(ctx context.Context) {
+	if r.db == nil || r.Client == nil {
+		return
+	}
+
+	stats, err := r.LTXStats(ctx)
+	if err != nil {
+		r.Logger().Debug("failed to collect replica LTX stats", "error", err)
+		return
+	}
+
+	dbPath := r.db.Path()
+	replicaType := r.Client.Type()
+
+	for level, levelStats := range stats.ByLevel {
+		levelStr := strconv.Itoa(level)
+		replicaLTXFilesGaugeVec.WithLabelValues(dbPath, replicaType, levelStr).Set(float64(levelStats.Files))
+		replicaLTXBytesGaugeVec.WithLabelValues(dbPath, replicaType, levelStr).Set(float64(levelStats.Bytes))
+	}
 }
 
 // Pos returns the current replicated position.
