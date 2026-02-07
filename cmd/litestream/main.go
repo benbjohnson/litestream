@@ -122,9 +122,14 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			return err
 		}
 
-		// Setup signal handler and pass to command for interrupt handling.
+		// Setup signal handler.
 		signalCh := signalChan()
-		c.SetSignalChan(signalCh)
+
+		// Create done channel for interrupt during shutdown. It will be
+		// closed when a second signal arrives, allowing each database's
+		// retry loop to observe the interrupt.
+		done := make(chan struct{})
+		c.SetDone(done)
 
 		if err := c.Run(ctx); err != nil {
 			return err
@@ -153,6 +158,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 				}
 			}
 		}
+
+		// Listen for a second signal to close done and interrupt retry loops.
+		go func() {
+			<-signalCh
+			close(done)
+		}()
 
 		// Gracefully close.
 		if e := c.Close(ctx); e != nil && err == nil {

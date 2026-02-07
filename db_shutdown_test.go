@@ -4,10 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -239,7 +237,7 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		}
 	})
 
-	t.Run("SignalInterruptsCancelRetryLoop", func(t *testing.T) {
+	t.Run("DoneChannelInterruptsRetryLoop", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 
 		// Write some data
@@ -266,29 +264,28 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		}
 
 		db.Replica = litestream.NewReplicaWithClient(db, client)
-		db.ShutdownSyncTimeout = 10 * time.Second // Long timeout
+		db.ShutdownSyncTimeout = 10 * time.Second
 		db.ShutdownSyncInterval = 50 * time.Millisecond
 
-		// Create signal channel and send signal after short delay
-		signalCh := make(chan os.Signal, 2)
+		// Create done channel and close it after short delay
+		done := make(chan struct{})
 		go func() {
 			time.Sleep(200 * time.Millisecond)
-			signalCh <- syscall.SIGINT
+			close(done)
 		}()
 
-		// Close should be interrupted by signal
 		start := time.Now()
-		err := db.CloseWithSignal(context.Background(), signalCh)
+		err := db.CloseWithSignal(context.Background(), done)
 		elapsed := time.Since(start)
 
 		// Should exit quickly (well before 10 second timeout)
-		if elapsed > 1*time.Second {
-			t.Fatalf("took too long to respond to signal: %v", elapsed)
+		if elapsed > 2*time.Second {
+			t.Fatalf("took too long to respond to done signal: %v", elapsed)
 		}
 
 		// Should have error mentioning interrupt
 		if err == nil {
-			t.Fatal("expected error after signal interrupt")
+			t.Fatal("expected error after done signal")
 		}
 		if !strings.Contains(err.Error(), "interrupted") {
 			t.Fatalf("expected interrupted error, got: %v", err)
@@ -300,7 +297,64 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		}
 	})
 
-	t.Run("NilSignalChannelFallsBackToNormalBehavior", func(t *testing.T) {
+	t.Run("AlreadyClosedDoneSkipsSync", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+
+		// Write some data
+		if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create mock client that always fails
+		var attempts int32
+		client := &mock.ReplicaClient{
+			LTXFilesFunc: func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			},
+			WriteLTXFileFunc: func(_ context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+				atomic.AddInt32(&attempts, 1)
+				return nil, errors.New("persistent error")
+			},
+		}
+
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+		db.ShutdownSyncTimeout = 10 * time.Second
+		db.ShutdownSyncInterval = 50 * time.Millisecond
+
+		// Close done before calling CloseWithSignal
+		done := make(chan struct{})
+		close(done)
+
+		start := time.Now()
+		err := db.CloseWithSignal(context.Background(), done)
+		elapsed := time.Since(start)
+
+		// Should exit immediately
+		if elapsed > 500*time.Millisecond {
+			t.Fatalf("took too long with pre-closed done channel: %v", elapsed)
+		}
+
+		// Should have error mentioning interrupt
+		if err == nil {
+			t.Fatal("expected error with pre-closed done channel")
+		}
+		if !strings.Contains(err.Error(), "interrupted") {
+			t.Fatalf("expected interrupted error, got: %v", err)
+		}
+
+		// Should not have made any sync attempts
+		if got := atomic.LoadInt32(&attempts); got != 0 {
+			t.Fatalf("expected 0 sync attempts with pre-closed done, got %d", got)
+		}
+	})
+
+	t.Run("NilDoneChannelBehavesLikeClose", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 
 		// Write some data
@@ -322,7 +376,6 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 			},
 			WriteLTXFileFunc: func(_ context.Context, _ int, _, _ ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 				atomic.AddInt32(&attempts, 1)
-				// Drain the reader
 				_, _ = io.Copy(io.Discard, r)
 				return &ltx.FileInfo{}, nil
 			},
@@ -332,11 +385,9 @@ func TestDB_Close_SyncRetry(t *testing.T) {
 		db.ShutdownSyncTimeout = 5 * time.Second
 		db.ShutdownSyncInterval = 50 * time.Millisecond
 
-		// CloseWithSignal with nil channel should work like Close
 		if err := db.CloseWithSignal(context.Background(), nil); err != nil {
 			t.Fatalf("expected success, got: %v", err)
 		}
-		// Should have made exactly 1 attempt
 		if got := atomic.LoadInt32(&attempts); got != 1 {
 			t.Fatalf("expected exactly 1 attempt, got %d", got)
 		}

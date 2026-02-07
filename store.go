@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"slices"
 	"sync"
 	"time"
@@ -203,32 +202,20 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
-	s.mu.Lock()
-	dbs := slices.Clone(s.dbs)
-	s.mu.Unlock()
-
-	for _, db := range dbs {
-		if e := db.Close(ctx); e != nil && err == nil {
-			err = e
-		}
-	}
-
-	// Cancel and wait for background tasks to complete.
-	s.cancel()
-	s.wg.Wait()
-
-	return err
+	return s.CloseWithSignal(ctx, nil)
 }
 
-// CloseWithSignal is like Close but passes the signal channel to each database
-// so that the shutdown sync retry loop can be interrupted by a second signal.
-func (s *Store) CloseWithSignal(ctx context.Context, signalCh <-chan os.Signal) (err error) {
+// CloseWithSignal is like Close but passes a done channel to each database
+// so that the shutdown sync retry loop can be interrupted. Databases are closed
+// sequentially; when done is closed, each database's retry loop exits after its
+// current sync attempt completes. If done is nil, it behaves identically to Close.
+func (s *Store) CloseWithSignal(ctx context.Context, done <-chan struct{}) (err error) {
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
 
 	for _, db := range dbs {
-		if e := db.CloseWithSignal(ctx, signalCh); e != nil && err == nil {
+		if e := db.CloseWithSignal(ctx, done); e != nil && err == nil {
 			err = e
 		}
 	}

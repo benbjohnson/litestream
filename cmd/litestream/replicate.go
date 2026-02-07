@@ -50,9 +50,9 @@ type ReplicateCommand struct {
 	// Directory monitors for dynamic database discovery.
 	directoryMonitors []*DirectoryMonitor
 
-	// Signal channel for interrupt handling during shutdown.
-	// A second signal on this channel will interrupt the shutdown sync retry loop.
-	signalCh <-chan os.Signal
+	// Done channel for interrupt handling during shutdown. When closed,
+	// the shutdown sync retry loop exits after the current attempt completes.
+	done <-chan struct{}
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -433,14 +433,12 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	if c.Store != nil {
-		var err error
-		if c.signalCh != nil {
-			err = c.Store.CloseWithSignal(ctx, c.signalCh)
-		} else {
-			err = c.Store.Close(ctx)
-		}
-		if err != nil {
-			slog.Error("failed to close database", "error", err)
+		if err := c.Store.CloseWithSignal(ctx, c.done); err != nil {
+			if strings.Contains(err.Error(), "interrupted") {
+				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
+			} else {
+				slog.Error("failed to close database", "error", err)
+			}
 		}
 	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
@@ -451,10 +449,10 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	return nil
 }
 
-// SetSignalChan sets the signal channel used for interrupt handling during shutdown.
-// A second signal on this channel will interrupt the shutdown sync retry loop.
-func (c *ReplicateCommand) SetSignalChan(ch <-chan os.Signal) {
-	c.signalCh = ch
+// SetDone sets the done channel used for interrupt handling during shutdown.
+// When the channel is closed, the shutdown sync retry loop exits.
+func (c *ReplicateCommand) SetDone(done <-chan struct{}) {
+	c.done = done
 }
 
 // restoreIfNeeded restores a database from its replica if the database doesn't
