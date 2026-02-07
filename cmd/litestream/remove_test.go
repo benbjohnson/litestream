@@ -32,6 +32,28 @@ func TestRemoveCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("InvalidTimeoutZero", func(t *testing.T) {
+		cmd := &main.RemoveCommand{}
+		err := cmd.Run(context.Background(), []string{"-timeout", "0", "/tmp/test.db"})
+		if err == nil {
+			t.Error("expected error for zero timeout")
+		}
+		if err.Error() != "timeout must be greater than 0" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("InvalidTimeoutNegative", func(t *testing.T) {
+		cmd := &main.RemoveCommand{}
+		err := cmd.Run(context.Background(), []string{"-timeout", "-1", "/tmp/test.db"})
+		if err == nil {
+			t.Error("expected error for negative timeout")
+		}
+		if err.Error() != "timeout must be greater than 0" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
 	t.Run("SocketConnectionError", func(t *testing.T) {
 		cmd := &main.RemoveCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "/tmp/test.db"})

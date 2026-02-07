@@ -22,20 +22,27 @@ func (c *AddCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-add", flag.ContinueOnError)
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
+	replicaFlag := fs.String("replica", "", "replica URL (e.g., s3://bucket/prefix, file:///backup/path)")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	if fs.NArg() < 2 {
-		return fmt.Errorf("database path and replica URL required")
+	if fs.NArg() == 0 {
+		return fmt.Errorf("database path required")
 	}
-	if fs.NArg() > 2 {
+	if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
+	}
+	if *replicaFlag == "" {
+		return fmt.Errorf("replica URL required (use -replica flag)")
+	}
+	if *timeout <= 0 {
+		return fmt.Errorf("timeout must be greater than 0")
 	}
 
 	dbPath := fs.Arg(0)
-	replicaURL := fs.Arg(1)
+	replicaURL := *replicaFlag
 
 	// Create HTTP client that connects via Unix socket with timeout.
 	clientTimeout := time.Duration(*timeout) * time.Second
@@ -93,15 +100,18 @@ func (c *AddCommand) Run(ctx context.Context, args []string) error {
 // Usage prints the help text for the add command.
 func (c *AddCommand) Usage() {
 	fmt.Println(`
-usage: litestream add [OPTIONS] DB_PATH REPLICA_URL
+usage: litestream add [OPTIONS] DB_PATH
 
 Add a database for replication.
 
 Arguments:
   DB_PATH      Path to the SQLite database file.
-  REPLICA_URL  URL of the replica destination (e.g., s3://bucket/prefix, file:///backup/path).
 
 Options:
+  -replica URL
+      Replica destination URL (e.g., s3://bucket/prefix, file:///backup/path).
+      Required.
+
   -timeout SECONDS
       Maximum time to wait in seconds (default: 30).
 

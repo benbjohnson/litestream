@@ -11,31 +11,31 @@ import (
 )
 
 func TestAddCommand_Run(t *testing.T) {
-	t.Run("MissingArguments", func(t *testing.T) {
+	t.Run("MissingDBPath", func(t *testing.T) {
 		cmd := &main.AddCommand{}
-		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock"})
+		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "-replica", "file:///tmp/backup"})
 		if err == nil {
-			t.Error("expected error for missing arguments")
+			t.Error("expected error for missing database path")
 		}
-		if err.Error() != "database path and replica URL required" {
+		if err.Error() != "database path required" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
 
-	t.Run("MissingReplicaURL", func(t *testing.T) {
+	t.Run("MissingReplicaFlag", func(t *testing.T) {
 		cmd := &main.AddCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "/tmp/test.db"})
 		if err == nil {
-			t.Error("expected error for missing replica URL")
+			t.Error("expected error for missing replica flag")
 		}
-		if err.Error() != "database path and replica URL required" {
+		if err.Error() != "replica URL required (use -replica flag)" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
 
 	t.Run("TooManyArguments", func(t *testing.T) {
 		cmd := &main.AddCommand{}
-		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "/tmp/test.db", "file:///tmp/backup", "extra"})
+		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "-replica", "file:///tmp/backup", "/tmp/test.db", "extra"})
 		if err == nil {
 			t.Error("expected error for too many arguments")
 		}
@@ -44,9 +44,20 @@ func TestAddCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("InvalidTimeoutZero", func(t *testing.T) {
+		cmd := &main.AddCommand{}
+		err := cmd.Run(context.Background(), []string{"-timeout", "0", "-replica", "file:///tmp/backup", "/tmp/test.db"})
+		if err == nil {
+			t.Error("expected error for zero timeout")
+		}
+		if err.Error() != "timeout must be greater than 0" {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
 	t.Run("SocketConnectionError", func(t *testing.T) {
 		cmd := &main.AddCommand{}
-		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "/tmp/test.db", "file:///tmp/backup"})
+		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "-replica", "file:///tmp/backup", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for socket connection failure")
 		}
@@ -76,7 +87,7 @@ func TestAddCommand_Run(t *testing.T) {
 		backupDir := filepath.Join(t.TempDir(), "backup")
 
 		cmd := &main.AddCommand{}
-		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, dbPath, "file://" + backupDir})
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, dbPath})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
@@ -109,7 +120,7 @@ func TestAddCommand_Run(t *testing.T) {
 		backupDir := filepath.Join(t.TempDir(), "backup")
 
 		cmd := &main.AddCommand{}
-		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, db.Path(), "file://" + backupDir})
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, db.Path()})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
