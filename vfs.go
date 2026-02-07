@@ -67,7 +67,7 @@ type VFS struct {
 	WriteEnabled bool
 
 	// WriteSyncInterval is how often to sync dirty pages to remote storage.
-	// Default: 1 second. Set to 0 for manual sync only.
+	// If zero, defaults to DefaultSyncInterval (1 second).
 	WriteSyncInterval time.Duration
 
 	// WriteBufferPath is the path for local write buffer persistence.
@@ -185,13 +185,14 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 		return nil, 0, err
 	}
 
-	// Set appropriate flags based on write mode
-	if vfs.WriteEnabled {
-		flags &^= sqlite3vfs.OpenReadOnly
-		flags |= sqlite3vfs.OpenReadWrite
-	} else {
-		flags |= sqlite3vfs.OpenReadOnly
-	}
+	// Always report ReadWrite to SQLite so that cold enable via PRAGMA
+	// litestream_write_enabled works. SQLite permanently marks databases as
+	// read-only based on the output flags from xOpen (pager.c:readOnly,
+	// btree.c:BTS_READ_ONLY), which would prevent write transactions even
+	// after enabling writes at runtime. Read-only enforcement happens at
+	// the VFS layer (WriteAt, Truncate, Lock) when writeEnabled is false.
+	flags &^= sqlite3vfs.OpenReadOnly
+	flags |= sqlite3vfs.OpenReadWrite
 
 	return f, flags, nil
 }
@@ -2032,12 +2033,19 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		return fmt.Errorf("invalid lock downgrade: current=%s target=%s", f.lockType, elock)
 	}
 
-	// Wait for any disable operation to complete before allowing RESERVED lock
-	// This prevents new write transactions from starting during disable
 	if elock >= sqlite3vfs.LockReserved {
+		// Wait for any disable operation to complete before allowing RESERVED lock.
+		// This prevents new write transactions from starting during disable.
 		for f.disabling {
 			f.logger.Debug("waiting for disable to complete before acquiring RESERVED lock")
 			f.cond.Wait()
+		}
+
+		// Reject write-intent locks when writes are disabled. Since we always
+		// report OpenReadWrite to SQLite (to support cold enable), SQLite may
+		// attempt write transactions even when writes are logically disabled.
+		if !f.writeEnabled {
+			return fmt.Errorf("litestream is a read only vfs")
 		}
 	}
 

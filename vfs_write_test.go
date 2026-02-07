@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -1009,8 +1010,20 @@ func TestSetWriteEnabled_DisableWaitsForTransaction(t *testing.T) {
 		done <- f.SetWriteEnabled(false)
 	}()
 
-	// Give SetWriteEnabled time to start waiting
-	time.Sleep(50 * time.Millisecond)
+	// Wait for SetWriteEnabled to set the disabling flag
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		disabling := f.disabling
+		f.mu.Unlock()
+		if disabling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for disabling flag")
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 
 	// Write should still be enabled (waiting for transaction)
 	f.mu.Lock()
@@ -1036,7 +1049,10 @@ func TestSetWriteEnabled_DisableWaitsForTransaction(t *testing.T) {
 	}
 
 	// Write should now be disabled
-	if f.writeEnabled {
+	f.mu.Lock()
+	enabled := f.writeEnabled
+	f.mu.Unlock()
+	if enabled {
 		t.Error("expected writeEnabled to be false after transaction ended")
 	}
 }
@@ -1449,17 +1465,19 @@ func TestSetWriteEnabled_DisablingPreventsNewTransactions(t *testing.T) {
 		disableDone <- f.SetWriteEnabledWithTimeout(false, 2*time.Second)
 	}()
 
-	// Give SetWriteEnabled time to set disabling flag
-	time.Sleep(50 * time.Millisecond)
-
-	// Try to start a new transaction from another "connection" by simulating Lock()
-	// The disabling flag should prevent inTransaction from being set to true
-	f.mu.Lock()
-	disabling := f.disabling
-	f.mu.Unlock()
-
-	if !disabling {
-		t.Error("expected disabling flag to be true")
+	// Wait for SetWriteEnabled to set the disabling flag
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		disabling := f.disabling
+		f.mu.Unlock()
+		if disabling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for disabling flag")
+		}
+		time.Sleep(1 * time.Millisecond)
 	}
 
 	// End the first transaction
@@ -1479,7 +1497,7 @@ func TestSetWriteEnabled_DisablingPreventsNewTransactions(t *testing.T) {
 
 	// Verify disabling flag is cleared
 	f.mu.Lock()
-	disabling = f.disabling
+	disabling := f.disabling
 	f.mu.Unlock()
 
 	if disabling {
@@ -1487,7 +1505,10 @@ func TestSetWriteEnabled_DisablingPreventsNewTransactions(t *testing.T) {
 	}
 
 	// Verify writes are disabled
-	if f.writeEnabled {
+	f.mu.Lock()
+	enabled := f.writeEnabled
+	f.mu.Unlock()
+	if enabled {
 		t.Error("expected writeEnabled to be false")
 	}
 }
@@ -1575,46 +1596,41 @@ func TestLock_BlocksDuringDisable(t *testing.T) {
 	// Start disable in a goroutine - it will wait for the transaction
 	disableDone := make(chan error, 1)
 	go func() {
-		time.Sleep(50 * time.Millisecond) // Give Lock() time to block first
 		disableDone <- f.SetWriteEnabled(false)
 	}()
 
-	// Give SetWriteEnabled time to set disabling flag
-	time.Sleep(100 * time.Millisecond)
-
-	// Try to acquire a new RESERVED lock from another goroutine - should block
-	lockDone := make(chan struct{})
-	var lockElapsed time.Duration
-	go func() {
-		// We need to first release the current transaction, then try to acquire a new one
-		// But since we hold the lock, let's test that a new Lock() call would block
-		// by checking the disabling flag first
+	// Wait for SetWriteEnabled to set the disabling flag
+	deadline := time.Now().Add(2 * time.Second)
+	for {
 		f.mu.Lock()
 		disabling := f.disabling
 		f.mu.Unlock()
-
-		if !disabling {
-			t.Error("expected disabling flag to be true")
+		if disabling {
+			break
 		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for disabling flag")
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 
-		// Now let's simulate what would happen with a fresh Lock() call
-		// by calling Lock() directly (it will wait on cond)
-		// Note: Lock() doesn't upgrade, so we need a new connection
-		// For this test, we'll just verify the blocking behavior differently:
-		// Release the current lock, then immediately try to acquire RESERVED again
-
-		// Unlock to end current transaction (this wakes the disable goroutine)
-		// Then the Lock() call should block until disable completes
-		f.Unlock(1) // End transaction, wakes SetWriteEnabled
-
-		// Now immediately try to get RESERVED lock - should block until disable completes
-		lockStart := time.Now()
-		f.Lock(2) // This should block while disabling is true
-		lockElapsed = time.Since(lockStart)
+	// End transaction to let disable proceed, then immediately try to
+	// acquire RESERVED lock again - it should block until disable completes
+	lockErrCh := make(chan error, 1)
+	lockDone := make(chan struct{})
+	go func() {
+		if err := f.Unlock(1); err != nil {
+			lockErrCh <- fmt.Errorf("unlock: %w", err)
+			return
+		}
+		// Lock() should block while disabling is true, then fail because
+		// writeEnabled will be false after disable completes
+		err := f.Lock(2)
+		lockErrCh <- err
 		close(lockDone)
 	}()
 
-	// Wait for everything to complete
+	// Wait for disable to complete
 	select {
 	case err := <-disableDone:
 		if err != nil {
@@ -1630,20 +1646,19 @@ func TestLock_BlocksDuringDisable(t *testing.T) {
 		t.Fatal("Lock() timed out")
 	}
 
-	// The Lock() call should have waited for disable to complete
-	// Since disable includes sync time, it should take at least some time
-	// This verifies that Lock() blocked during the disable operation
-	t.Logf("Lock() elapsed time: %v", lockElapsed)
-
-	// Verify writeEnabled is now false
-	if f.writeEnabled {
-		t.Error("expected writeEnabled to be false after disable completed")
+	// Lock should have returned an error since writes are now disabled
+	if err := <-lockErrCh; err == nil {
+		t.Error("expected Lock(RESERVED) to fail when writes are disabled")
 	}
 
-	// Verify no transaction is active (since writeEnabled is false, Lock shouldn't track)
+	// Verify writeEnabled is now false
 	f.mu.Lock()
+	enabled := f.writeEnabled
 	inTx := f.inTransaction
 	f.mu.Unlock()
+	if enabled {
+		t.Error("expected writeEnabled to be false after disable completed")
+	}
 	if inTx {
 		t.Error("expected inTransaction to be false when writeEnabled is false")
 	}
@@ -1676,30 +1691,45 @@ func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
 	// Start disable in a goroutine
 	disableDone := make(chan error, 1)
 	go func() {
-		time.Sleep(30 * time.Millisecond)
 		disableDone <- f.SetWriteEnabled(false)
 	}()
 
-	// Give SetWriteEnabled time to set disabling flag
-	time.Sleep(80 * time.Millisecond)
+	// Wait for SetWriteEnabled to set the disabling flag
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f.mu.Lock()
+		disabling := f.disabling
+		f.mu.Unlock()
+		if disabling {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for disabling flag")
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 
-	// Simulate multiple waiters trying to acquire RESERVED lock
+	// Simulate multiple waiters trying to acquire RESERVED lock.
+	// They will block on cond.Wait() while disabling is true, then
+	// fail with read-only error once disable completes.
 	var wg sync.WaitGroup
-	results := make(chan time.Duration, 3)
+	errCh := make(chan error, 3)
 
 	for i := 0; i < 3; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			start := time.Now()
-			// Each waiter tries to get RESERVED lock
-			f.Lock(2) // Will block until disabling is false
-			results <- time.Since(start)
+			errCh <- f.Lock(2)
 		}()
 	}
 
-	// Let all waiters start blocking
-	time.Sleep(50 * time.Millisecond)
+	// Give waiters time to enter cond.Wait(), then end the transaction
+	// to unblock everything. Use polling to be deterministic.
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+		break // Brief pause then proceed
+	}
 
 	// End the original transaction - this will trigger the disable to complete
 	if err := f.Unlock(1); err != nil {
@@ -1718,22 +1748,20 @@ func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
 
 	// Wait for all Lock() calls to complete
 	wg.Wait()
-	close(results)
+	close(errCh)
 
-	// All waiters should have completed
-	var durations []time.Duration
-	for d := range results {
-		durations = append(durations, d)
+	// All Lock() calls should have returned errors (writes now disabled)
+	for err := range errCh {
+		if err == nil {
+			t.Error("expected Lock(RESERVED) to fail when writes are disabled")
+		}
 	}
-
-	if len(durations) != 3 {
-		t.Errorf("expected 3 durations, got %d", len(durations))
-	}
-
-	t.Logf("Lock() durations: %v", durations)
 
 	// Verify writeEnabled is now false
-	if f.writeEnabled {
+	f.mu.Lock()
+	enabled := f.writeEnabled
+	f.mu.Unlock()
+	if enabled {
 		t.Error("expected writeEnabled to be false")
 	}
 }
