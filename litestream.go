@@ -133,6 +133,27 @@ func readWALHeader(filename string) ([]byte, error) {
 	return buf[:n], err
 }
 
+func readSHMMxFrameKey(filename string) ([4]byte, error) {
+	var a, b [4]byte
+
+	f, err := os.Open(filename)
+	if err != nil {
+		return [4]byte{}, err
+	}
+	defer f.Close()
+
+	if _, err := f.ReadAt(a[:], 16); err != nil {
+		return [4]byte{}, err
+	}
+	if _, err := f.ReadAt(b[:], 64); err != nil {
+		return [4]byte{}, err
+	}
+	if a != b {
+		return [4]byte{}, errors.New("shm header mismatch")
+	}
+	return a, nil
+}
+
 // readWALFileAt reads a slice from a file. Do not use this with database files
 // as it causes problems with non-OFD locks.
 func readWALFileAt(filename string, offset, n int64) ([]byte, error) {
