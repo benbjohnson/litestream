@@ -485,9 +485,9 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Set up timeout context.
+	// Set up timeout context. Treat non-positive values as default.
 	timeout := req.Timeout
-	if timeout == 0 {
+	if timeout <= 0 {
 		timeout = 30
 	}
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)

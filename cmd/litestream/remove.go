@@ -33,6 +33,9 @@ func (c *RemoveCommand) Run(ctx context.Context, args []string) error {
 	if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
+	if *timeout <= 0 {
+		return fmt.Errorf("timeout must be greater than 0")
+	}
 
 	dbPath := fs.Arg(0)
 
