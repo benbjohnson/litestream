@@ -49,6 +49,10 @@ type ReplicateCommand struct {
 
 	// Directory monitors for dynamic database discovery.
 	directoryMonitors []*DirectoryMonitor
+
+	// Signal channel for interrupt handling during shutdown.
+	// A second signal on this channel will interrupt the shutdown sync retry loop.
+	signalCh <-chan os.Signal
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -429,7 +433,13 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	if c.Store != nil {
-		if err := c.Store.Close(ctx); err != nil {
+		var err error
+		if c.signalCh != nil {
+			err = c.Store.CloseWithSignal(ctx, c.signalCh)
+		} else {
+			err = c.Store.Close(ctx)
+		}
+		if err != nil {
 			slog.Error("failed to close database", "error", err)
 		}
 	}
@@ -439,6 +449,12 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// SetSignalChan sets the signal channel used for interrupt handling during shutdown.
+// A second signal on this channel will interrupt the shutdown sync retry loop.
+func (c *ReplicateCommand) SetSignalChan(ch <-chan os.Signal) {
+	c.signalCh = ch
 }
 
 // restoreIfNeeded restores a database from its replica if the database doesn't

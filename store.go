@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -208,6 +209,26 @@ func (s *Store) Close(ctx context.Context) (err error) {
 
 	for _, db := range dbs {
 		if e := db.Close(ctx); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	// Cancel and wait for background tasks to complete.
+	s.cancel()
+	s.wg.Wait()
+
+	return err
+}
+
+// CloseWithSignal is like Close but passes the signal channel to each database
+// so that the shutdown sync retry loop can be interrupted by a second signal.
+func (s *Store) CloseWithSignal(ctx context.Context, signalCh <-chan os.Signal) (err error) {
+	s.mu.Lock()
+	dbs := slices.Clone(s.dbs)
+	s.mu.Unlock()
+
+	for _, db := range dbs {
+		if e := db.CloseWithSignal(ctx, signalCh); e != nil && err == nil {
 			err = e
 		}
 	}
