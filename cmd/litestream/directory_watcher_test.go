@@ -80,42 +80,26 @@ func TestDirectoryMonitor_matchesPattern(t *testing.T) {
 	}
 }
 
-func TestDirectoryMonitor_queuePotentialDatabase(t *testing.T) {
-	t.Run("coalesces multiple events", func(t *testing.T) {
+func TestDirectoryMonitor_pendingEvents(t *testing.T) {
+	t.Run("coalesces multiple events for same path", func(t *testing.T) {
 		dm := &DirectoryMonitor{
 			pendingEvents: make(map[string]fsnotify.Op),
 		}
 
-		// Queue multiple events for the same path
-		dm.queuePotentialDatabase("/path/to/test.db", fsnotify.Create)
-		dm.queuePotentialDatabase("/path/to/test.db", fsnotify.Write)
-		dm.queuePotentialDatabase("/path/to/test.db", fsnotify.Write)
+		dm.pendingEvents["/path/to/test.db"] |= fsnotify.Create
+		dm.pendingEvents["/path/to/test.db"] |= fsnotify.Write
+		dm.pendingEvents["/path/to/test.db"] |= fsnotify.Write
 
-		dm.debounceMu.Lock()
-		defer dm.debounceMu.Unlock()
-
-		// Should have only one entry
 		if len(dm.pendingEvents) != 1 {
 			t.Errorf("expected 1 pending event, got %d", len(dm.pendingEvents))
 		}
 
-		// Operations should be merged
 		op := dm.pendingEvents["/path/to/test.db"]
 		if op&fsnotify.Create == 0 {
 			t.Error("expected Create op to be set")
 		}
 		if op&fsnotify.Write == 0 {
 			t.Error("expected Write op to be set")
-		}
-
-		// Debounce timer should be running
-		if !dm.debounceRunning {
-			t.Error("expected debounceRunning to be true")
-		}
-
-		// Clean up timer
-		if dm.debounceTimer != nil {
-			dm.debounceTimer.Stop()
 		}
 	})
 
@@ -124,55 +108,12 @@ func TestDirectoryMonitor_queuePotentialDatabase(t *testing.T) {
 			pendingEvents: make(map[string]fsnotify.Op),
 		}
 
-		dm.queuePotentialDatabase("/path/to/db1.db", fsnotify.Create)
-		dm.queuePotentialDatabase("/path/to/db2.db", fsnotify.Create)
-		dm.queuePotentialDatabase("/path/to/db3.db", fsnotify.Write)
-
-		dm.debounceMu.Lock()
-		defer dm.debounceMu.Unlock()
+		dm.pendingEvents["/path/to/db1.db"] |= fsnotify.Create
+		dm.pendingEvents["/path/to/db2.db"] |= fsnotify.Create
+		dm.pendingEvents["/path/to/db3.db"] |= fsnotify.Write
 
 		if len(dm.pendingEvents) != 3 {
 			t.Errorf("expected 3 pending events, got %d", len(dm.pendingEvents))
 		}
-
-		// Clean up timer
-		if dm.debounceTimer != nil {
-			dm.debounceTimer.Stop()
-		}
-	})
-}
-
-func TestDirectoryMonitor_initSemaphore(t *testing.T) {
-	t.Run("semaphore limits concurrency", func(t *testing.T) {
-		// Create a semaphore with capacity 2
-		initSem := make(chan struct{}, 2)
-
-		// Fill the semaphore
-		initSem <- struct{}{}
-		initSem <- struct{}{}
-
-		// Verify it's full (non-blocking check)
-		select {
-		case initSem <- struct{}{}:
-			t.Error("expected semaphore to be full")
-			<-initSem // drain if unexpectedly successful
-		default:
-			// Expected: semaphore is full
-		}
-
-		// Release one slot
-		<-initSem
-
-		// Now we should be able to acquire
-		select {
-		case initSem <- struct{}{}:
-			// Expected: acquired slot
-		default:
-			t.Error("expected to acquire semaphore slot after release")
-		}
-
-		// Drain
-		<-initSem
-		<-initSem
 	})
 }

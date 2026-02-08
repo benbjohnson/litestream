@@ -15,17 +15,7 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-const (
-	// debounceInterval is the time to wait after an event before processing it.
-	// This allows multiple rapid events for the same file to be coalesced.
-	// Increased from 100ms to reduce event processing overhead at scale.
-	debounceInterval = 250 * time.Millisecond
-
-	// maxConcurrentInits limits the number of databases being initialized
-	// concurrently to prevent thundering herd at startup.
-	// Reduced from 10 to 3 to lower peak CPU during mass discovery.
-	maxConcurrentInits = 3
-)
+const debounceInterval = 250 * time.Millisecond
 
 // DirectoryMonitor watches a directory tree for SQLite databases and dynamically
 // manages database instances within the store as files are created or removed.
@@ -46,14 +36,9 @@ type DirectoryMonitor struct {
 	dbs         map[string]*litestream.DB
 	watchedDirs map[string]struct{}
 
-	// Event debouncing: coalesce rapid events for the same file
-	debounceMu      sync.Mutex
-	pendingEvents   map[string]fsnotify.Op
-	debounceTimer   *time.Timer
-	debounceRunning bool
-
-	// Semaphore for limiting concurrent database initializations
-	initSem chan struct{}
+	// pendingEvents accumulates create/write events for debouncing.
+	// Only accessed from the run() goroutine, so no mutex is needed.
+	pendingEvents map[string]fsnotify.Op
 
 	wg sync.WaitGroup
 }
@@ -95,7 +80,6 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 		dbs:           make(map[string]*litestream.DB),
 		watchedDirs:   make(map[string]struct{}),
 		pendingEvents: make(map[string]fsnotify.Op),
-		initSem:       make(chan struct{}, maxConcurrentInits),
 	}
 
 	for _, db := range existing {
@@ -108,7 +92,6 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 		return nil, err
 	}
 
-	// Scan for existing databases after watches are set up
 	dm.scanDirectory(dm.dirPath)
 
 	dm.wg.Add(1)
@@ -121,19 +104,16 @@ func NewDirectoryMonitor(ctx context.Context, store *litestream.Store, dbc *DBCo
 func (dm *DirectoryMonitor) Close() {
 	dm.cancel()
 	_ = dm.watcher.Close()
-
-	// Stop debounce timer if running
-	dm.debounceMu.Lock()
-	if dm.debounceTimer != nil {
-		dm.debounceTimer.Stop()
-	}
-	dm.debounceMu.Unlock()
-
 	dm.wg.Wait()
 }
 
 func (dm *DirectoryMonitor) run() {
 	defer dm.wg.Done()
+
+	// Debounce timer lives in this goroutine so shutdown via dm.wg.Wait() is clean.
+	debounceTimer := time.NewTimer(debounceInterval)
+	debounceTimer.Stop()
+	defer debounceTimer.Stop()
 
 	for {
 		select {
@@ -143,7 +123,11 @@ func (dm *DirectoryMonitor) run() {
 			if !ok {
 				return
 			}
-			dm.handleEvent(event)
+			if dm.handleEvent(event) {
+				debounceTimer.Reset(debounceInterval)
+			}
+		case <-debounceTimer.C:
+			dm.flushPendingEvents()
 		case err, ok := <-dm.watcher.Errors:
 			if !ok {
 				return
@@ -205,119 +189,81 @@ func (dm *DirectoryMonitor) removeDirectoryWatch(path string) {
 	}
 }
 
-func (dm *DirectoryMonitor) handleEvent(event fsnotify.Event) {
+// handleEvent processes a single fsnotify event. Returns true if pending events
+// were queued and the debounce timer should be reset.
+func (dm *DirectoryMonitor) handleEvent(event fsnotify.Event) bool {
 	path := filepath.Clean(event.Name)
 	if path == "" {
-		return
+		return false
 	}
 
-	// EARLY FILTER: Skip known non-database suffixes immediately.
-	// This avoids os.Stat() calls for WAL, SHM, and journal files which are
-	// never databases but generate many fsnotify events during normal DB operations.
-	// With 400 databases, this can reduce event processing by 2/3.
 	if dm.shouldSkipPath(path) {
-		return
+		return false
 	}
 
 	info, statErr := os.Stat(path)
 	isDir := statErr == nil && info.IsDir()
 
-	// For non-directory create/write/rename events, check pattern match early.
-	// This avoids further processing for files that don't match the pattern.
-	// We must check isDir first because directories don't need to match the pattern.
-	if !isDir && event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
+	// Early pattern check for create/write only. Rename must pass through
+	// to removal handling below, since the old path may be a tracked DB.
+	if !isDir && event.Op&(fsnotify.Create|fsnotify.Write) != 0 {
 		if !dm.matchesPattern(path) {
-			return
+			return false
 		}
 	}
 
-	// Check if this path was previously a watched directory (needed for removal detection)
 	dm.mu.Lock()
 	_, wasWatchedDir := dm.watchedDirs[path]
 	dm.mu.Unlock()
 
-	// Handle directory creation/rename
-	// Note: In non-recursive mode, only the root directory is watched.
-	// Subdirectories are completely ignored, and their databases are not replicated.
-	// In recursive mode, all subdirectories are watched and scanned.
 	if isDir && event.Op&(fsnotify.Create|fsnotify.Rename) != 0 {
-		// Only add watches for: (1) root directory, or (2) subdirectories when recursive=true
 		if dm.recursive {
 			if err := dm.addDirectoryWatch(path); err != nil {
 				dm.logger.Error("add directory watch", "path", path, "error", err)
 			}
-			// Scan to catch files created during watch registration race window
 			dm.scanDirectory(path)
 		}
 	}
 
-	// Handle directory removal/rename
-	// Check both current state (isDir) AND previous state (wasWatchedDir)
-	// because os.Stat fails for deleted directories, leaving watches orphaned
 	if (isDir || wasWatchedDir) && event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		dm.removeDirectoryWatch(path)
 		dm.removeDatabasesUnder(path)
-		return
+		return false
 	}
 
-	// If it's still a directory, don't process as a file
 	if isDir {
-		return
+		return false
 	}
 
 	if statErr != nil && !os.IsNotExist(statErr) {
 		dm.logger.Debug("stat event path", "path", path, "error", statErr)
-		return
+		return false
 	}
 
 	if event.Op&(fsnotify.Remove|fsnotify.Rename) != 0 {
 		dm.removeDatabase(path)
-		return
+		return false
 	}
 
-	// For create/write events, use debouncing to coalesce rapid events.
-	// This reduces redundant processing when multiple events fire for the
-	// same file in quick succession (e.g., during database creation).
 	if event.Op&(fsnotify.Create|fsnotify.Write|fsnotify.Rename) != 0 {
-		dm.queuePotentialDatabase(path, event.Op)
+		dm.pendingEvents[path] |= event.Op
+		return true
 	}
-}
 
-// queuePotentialDatabase adds a file to the pending events queue and schedules
-// processing after the debounce interval. Multiple events for the same file
-// within the interval are coalesced.
-func (dm *DirectoryMonitor) queuePotentialDatabase(path string, op fsnotify.Op) {
-	dm.debounceMu.Lock()
-	defer dm.debounceMu.Unlock()
-
-	// Merge operations for the same path
-	dm.pendingEvents[path] |= op
-
-	// Schedule flush if not already running
-	if !dm.debounceRunning {
-		dm.debounceRunning = true
-		dm.debounceTimer = time.AfterFunc(debounceInterval, dm.flushPendingEvents)
-	}
+	return false
 }
 
 // flushPendingEvents processes all queued potential database events.
 func (dm *DirectoryMonitor) flushPendingEvents() {
-	dm.debounceMu.Lock()
-	events := dm.pendingEvents
-	dm.pendingEvents = make(map[string]fsnotify.Op)
-	dm.debounceRunning = false
-	dm.debounceMu.Unlock()
-
-	for path := range events {
-		// Check context before processing each path
+	for path := range dm.pendingEvents {
 		select {
 		case <-dm.ctx.Done():
 			return
 		default:
 		}
-
 		dm.handlePotentialDatabase(path)
 	}
+	dm.pendingEvents = make(map[string]fsnotify.Op)
 }
 
 func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
@@ -347,15 +293,6 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 	}()
 
 	if !IsSQLiteDatabase(path) {
-		return
-	}
-
-	// Acquire semaphore slot to limit concurrent initializations.
-	// This prevents thundering herd when many databases are discovered at once.
-	select {
-	case dm.initSem <- struct{}{}:
-		defer func() { <-dm.initSem }()
-	case <-dm.ctx.Done():
 		return
 	}
 
@@ -414,10 +351,8 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 	}
 	dm.mu.Unlock()
 
-	// Remove from store first, only delete from local map on success
 	for i, db := range toClose {
 		if db == nil {
-			// Clean up nil entries (in-progress databases) from local map
 			dm.mu.Lock()
 			delete(dm.dbs, toClosePaths[i])
 			dm.mu.Unlock()
@@ -428,7 +363,6 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 			continue
 		}
 
-		// Only remove from local map after successful store removal
 		dm.mu.Lock()
 		delete(dm.dbs, toClosePaths[i])
 		dm.mu.Unlock()
@@ -444,40 +378,19 @@ func (dm *DirectoryMonitor) matchesPattern(path string) bool {
 	return matched
 }
 
-// shouldSkipPath returns true for files that should be skipped entirely.
-// This includes SQLite auxiliary files (WAL, SHM, journal) that are never
-// databases themselves but generate many fsnotify events during normal
-// database operations.
+// shouldSkipPath returns true for SQLite auxiliary files (WAL, SHM, journal)
+// that generate many events but are never databases themselves.
 func (dm *DirectoryMonitor) shouldSkipPath(path string) bool {
 	base := filepath.Base(path)
-
-	// Skip SQLite WAL (Write-Ahead Log) files
-	if strings.HasSuffix(base, "-wal") {
-		return true
-	}
-
-	// Skip SQLite SHM (Shared Memory) files
-	if strings.HasSuffix(base, "-shm") {
-		return true
-	}
-
-	// Skip SQLite journal files (rollback journal)
-	if strings.HasSuffix(base, "-journal") {
-		return true
-	}
-
-	return false
+	return strings.HasSuffix(base, "-wal") ||
+		strings.HasSuffix(base, "-shm") ||
+		strings.HasSuffix(base, "-journal")
 }
 
-// scanDirectory walks a directory to discover pre-existing databases.
-// In non-recursive mode, only scans files directly in the directory (subdirectories are ignored).
-// In recursive mode, walks the entire tree and adds watches for all subdirectories.
-// This is called on startup and when new directories are created to catch files created
-// during the fsnotify watch registration race window.
+// scanDirectory discovers pre-existing databases and is also called when new
+// directories appear to close the race window between watch registration and file creation.
 func (dm *DirectoryMonitor) scanDirectory(dir string) {
 	if !dm.recursive {
-		// Non-recursive mode: Only scan files in the immediate directory.
-		// Subdirectories and their contents are completely ignored.
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			if !os.IsNotExist(err) {
@@ -487,7 +400,6 @@ func (dm *DirectoryMonitor) scanDirectory(dir string) {
 		}
 
 		for _, entry := range entries {
-			// Skip subdirectories - they're not watched in non-recursive mode
 			if entry.IsDir() {
 				continue
 			}
@@ -497,7 +409,6 @@ func (dm *DirectoryMonitor) scanDirectory(dir string) {
 		return
 	}
 
-	// Recursive mode: scan full tree
 	err := filepath.WalkDir(dir, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			if os.IsNotExist(err) {

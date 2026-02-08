@@ -152,10 +152,7 @@ type DB struct {
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
 
-	// MonitorDelayDisabled skips the random startup delay in the monitor loop.
-	// This is useful for tests that need precise timing. Production code should
-	// leave this false to prevent thundering herd when many databases start.
-	MonitorDelayDisabled bool
+	monitorDelayDisabled bool
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
@@ -2114,12 +2111,8 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
 func (db *DB) monitor() {
-	// Add random jitter (0 to 3x MonitorInterval) before the first tick.
-	// This prevents all databases from syncing simultaneously at startup
-	// when many databases are discovered at once (thundering herd prevention).
-	// The 3x multiplier spreads initial syncs over 3 seconds with default 1s interval,
-	// significantly reducing peak CPU while still allowing short-running tests to work.
-	if db.MonitorInterval > 0 && !db.MonitorDelayDisabled {
+	// Jitter the first tick to prevent thundering herd when many databases start simultaneously.
+	if db.MonitorInterval > 0 && !db.monitorDelayDisabled {
 		jitterWindow := 3 * db.MonitorInterval
 		jitter := time.Duration(rand.Int63n(int64(jitterWindow)))
 		select {
