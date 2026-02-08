@@ -163,6 +163,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		c.CacheSetter(dstLevel, info)
 	}
 
+	// Verify level consistency if enabled
 	if c.VerifyCompaction {
 		if err := c.VerifyLevelConsistency(ctx, dstLevel); err != nil {
 			c.logger.Warn("post-compaction verification failed",
@@ -191,11 +192,13 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 	for itr.Next() {
 		info := itr.Item()
 
+		// Skip first file - nothing to compare against
 		if prevInfo == nil {
 			prevInfo = info
 			continue
 		}
 
+		// Check for TXID contiguity: prev.MaxTXID + 1 should equal curr.MinTXID
 		expectedMinTXID := prevInfo.MaxTXID + 1
 		if info.MinTXID != expectedMinTXID {
 			if info.MinTXID > expectedMinTXID {
