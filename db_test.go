@@ -507,8 +507,6 @@ func walPageCountForTest(tb testing.TB, db *litestream.DB) int64 {
 func TestDB_Snapshot(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
-	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 		t.Fatal(err)
@@ -554,8 +552,6 @@ func TestDB_Snapshot(t *testing.T) {
 func TestDB_EnforceRetention(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
-	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 	// Create table and sync initial state
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {

@@ -423,6 +423,9 @@ func (db *DB) Open() (err error) {
 	if db.Replica == nil {
 		return fmt.Errorf("replica required before opening database")
 	}
+	if db.Replica.Client == nil {
+		return fmt.Errorf("replica client required before opening database")
+	}
 	if db.MinCheckpointPageN <= 0 {
 		return fmt.Errorf("minimum checkpoint page count required")
 	}
@@ -432,20 +435,20 @@ func (db *DB) Open() (err error) {
 		return fmt.Errorf("cannot remove tmp files: %w", err)
 	}
 
+	// Set the compactor client once before starting any goroutines.
+	db.compactor.VerifyCompaction = db.VerifyCompaction
+	db.compactor.client = db.Replica.Client
+
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {
 		db.wg.Add(1)
 		go func() { defer db.wg.Done(); db.monitor() }()
 	}
 
-	// Mark as opened only after successful initialization
+	// Mark as opened only after successful initialization.
 	db.mu.Lock()
 	db.opened = true
 	db.mu.Unlock()
-
-	// Apply verify compaction setting and set the client once.
-	db.compactor.VerifyCompaction = db.VerifyCompaction
-	db.compactor.client = db.Replica.Client
 
 	return nil
 }
