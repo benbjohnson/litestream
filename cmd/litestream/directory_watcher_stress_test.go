@@ -16,153 +16,158 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-func TestDirectoryWatcher_StressTest_PreCreated100(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping stress test in short mode")
+var dbCounts = []int{100, 250, 500, 1000, 2500}
+
+func TestDirectoryWatcher_PreCreated(t *testing.T) {
+	for _, count := range dbCounts {
+		count := count
+		t.Run(fmt.Sprintf("%d", count), func(t *testing.T) {
+			dbDir := t.TempDir()
+			replicaDir := t.TempDir()
+
+			t.Logf("Creating %d databases...", count)
+			dbs := createTestDatabases(t, dbDir, count)
+			defer closeTestDatabases(dbs)
+
+			store, monitors := startDirectoryMonitor(t, dbDir, replicaDir)
+			defer stopDirectoryMonitor(store, monitors)
+
+			timeout := 3*time.Minute + time.Duration(count/100)*time.Minute
+			t.Logf("Waiting for detection (timeout: %v)...", timeout)
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			if err := waitForDBCount(ctx, store, count); err != nil {
+				t.Fatalf("Failed to detect all databases: %v (got %d, expected %d)",
+					err, len(store.DBs()), count)
+			}
+
+			t.Logf("All %d databases detected successfully", count)
+		})
 	}
-
-	const dbCount = 100
-	const detectionTimeout = 2 * time.Minute
-
-	dbDir := t.TempDir()
-	replicaDir := t.TempDir()
-
-	t.Logf("Creating %d databases...", dbCount)
-	dbs := createTestDatabases(t, dbDir, dbCount)
-	defer closeTestDatabases(dbs)
-
-	store, monitors := startDirectoryMonitor(t, dbDir, replicaDir)
-	defer stopDirectoryMonitor(store, monitors)
-
-	t.Logf("Waiting for detection (timeout: %v)...", detectionTimeout)
-	ctx, cancel := context.WithTimeout(context.Background(), detectionTimeout)
-	defer cancel()
-
-	if err := waitForDBCount(ctx, store, dbCount); err != nil {
-		t.Fatalf("Failed to detect all databases: %v (got %d, expected %d)",
-			err, len(store.DBs()), dbCount)
-	}
-
-	t.Logf("All %d databases detected successfully", dbCount)
 }
 
-func TestDirectoryWatcher_StressTest_DynamicScaling(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping stress test in short mode")
-	}
+func TestDirectoryWatcher_DynamicScaling(t *testing.T) {
+	for _, finalCount := range dbCounts {
+		finalCount := finalCount
+		t.Run(fmt.Sprintf("%d", finalCount), func(t *testing.T) {
+			batchSize := finalCount / 10
+			if batchSize < 10 {
+				batchSize = 10
+			}
+			batchTimeout := 60*time.Second + time.Duration(batchSize/50)*30*time.Second
 
-	const initialDBs = 10
-	const finalDBs = 100
-	const batchSize = 10
-	const batchDetectionTimeout = 30 * time.Second
+			dbDir := t.TempDir()
+			replicaDir := t.TempDir()
 
-	dbDir := t.TempDir()
-	replicaDir := t.TempDir()
+			initialDBs := batchSize
+			t.Logf("Creating initial %d databases...", initialDBs)
+			dbs := createTestDatabases(t, dbDir, initialDBs)
 
-	t.Logf("Creating initial %d databases...", initialDBs)
-	dbs := createTestDatabases(t, dbDir, initialDBs)
+			store, monitors := startDirectoryMonitor(t, dbDir, replicaDir)
+			defer stopDirectoryMonitor(store, monitors)
 
-	store, monitors := startDirectoryMonitor(t, dbDir, replicaDir)
-	defer stopDirectoryMonitor(store, monitors)
-
-	ctx, cancel := context.WithTimeout(context.Background(), batchDetectionTimeout)
-	if err := waitForDBCount(ctx, store, initialDBs); err != nil {
-		cancel()
-		closeTestDatabases(dbs)
-		t.Fatalf("Failed to detect initial databases: %v", err)
-	}
-	cancel()
-	t.Logf("Initial %d databases detected", initialDBs)
-
-	currentCount := initialDBs
-	for currentCount < finalDBs {
-		batchCount := batchSize
-		if currentCount+batchCount > finalDBs {
-			batchCount = finalDBs - currentCount
-		}
-
-		t.Logf("Adding batch: %d -> %d databases", currentCount, currentCount+batchCount)
-		newDBs := createTestDatabasesBatch(t, dbDir, currentCount, batchCount)
-		dbs = append(dbs, newDBs...)
-
-		ctx, cancel := context.WithTimeout(context.Background(), batchDetectionTimeout)
-		expectedCount := currentCount + batchCount
-		if err := waitForDBCount(ctx, store, expectedCount); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), batchTimeout)
+			if err := waitForDBCount(ctx, store, initialDBs); err != nil {
+				cancel()
+				closeTestDatabases(dbs)
+				t.Fatalf("Failed to detect initial databases: %v", err)
+			}
 			cancel()
+			t.Logf("Initial %d databases detected", initialDBs)
+
+			currentCount := initialDBs
+			for currentCount < finalCount {
+				addCount := batchSize
+				if currentCount+addCount > finalCount {
+					addCount = finalCount - currentCount
+				}
+
+				t.Logf("Adding batch: %d -> %d databases", currentCount, currentCount+addCount)
+				newDBs := createTestDatabasesBatch(t, dbDir, currentCount, addCount)
+				dbs = append(dbs, newDBs...)
+
+				ctx, cancel := context.WithTimeout(context.Background(), batchTimeout)
+				expectedCount := currentCount + addCount
+				if err := waitForDBCount(ctx, store, expectedCount); err != nil {
+					cancel()
+					closeTestDatabases(dbs)
+					t.Fatalf("Failed to detect batch (expected %d, got %d): %v",
+						expectedCount, len(store.DBs()), err)
+				}
+				cancel()
+
+				currentCount += addCount
+				time.Sleep(500 * time.Millisecond)
+			}
+
 			closeTestDatabases(dbs)
-			t.Fatalf("Failed to detect batch (expected %d, got %d): %v",
-				expectedCount, len(store.DBs()), err)
-		}
-		cancel()
-
-		currentCount += batchCount
-		time.Sleep(500 * time.Millisecond)
+			t.Logf("Successfully scaled to %d databases", finalCount)
+		})
 	}
-
-	closeTestDatabases(dbs)
-	t.Logf("Successfully scaled to %d databases", finalDBs)
 }
 
 func TestDirectoryWatcher_ConcurrentWrites(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping stress test in short mode")
-	}
+	for _, count := range dbCounts {
+		count := count
+		t.Run(fmt.Sprintf("%d", count), func(t *testing.T) {
+			const writeDuration = 10 * time.Second
+			const writesPerDBPerSec = 5
 
-	const dbCount = 50
-	const writeDuration = 10 * time.Second
-	const writesPerDBPerSec = 5
+			dbDir := t.TempDir()
+			replicaDir := t.TempDir()
 
-	dbDir := t.TempDir()
-	replicaDir := t.TempDir()
+			t.Logf("Creating %d databases...", count)
+			dbs := createTestDatabases(t, dbDir, count)
+			defer closeTestDatabases(dbs)
 
-	t.Logf("Creating %d databases...", dbCount)
-	dbs := createTestDatabases(t, dbDir, dbCount)
-	defer closeTestDatabases(dbs)
+			store, monitors := startDirectoryMonitor(t, dbDir, replicaDir)
+			defer stopDirectoryMonitor(store, monitors)
 
-	store, monitors := startDirectoryMonitor(t, dbDir, replicaDir)
-	defer stopDirectoryMonitor(store, monitors)
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	if err := waitForDBCount(ctx, store, dbCount); err != nil {
-		cancel()
-		t.Fatalf("Failed to detect databases: %v", err)
-	}
-	cancel()
-
-	t.Logf("Starting concurrent writes for %v...", writeDuration)
-	var totalWrites int64
-	var wg sync.WaitGroup
-
-	writeCtx, writeCancel := context.WithTimeout(context.Background(), writeDuration)
-	defer writeCancel()
-
-	for i, db := range dbs {
-		wg.Add(1)
-		go func(idx int, db *sql.DB) {
-			defer wg.Done()
-			ticker := time.NewTicker(time.Second / time.Duration(writesPerDBPerSec))
-			defer ticker.Stop()
-
-			for {
-				select {
-				case <-writeCtx.Done():
-					return
-				case <-ticker.C:
-					_, err := db.Exec("INSERT INTO data (value) VALUES (?)",
-						fmt.Sprintf("db%d-%d", idx, time.Now().UnixNano()))
-					if err == nil {
-						atomic.AddInt64(&totalWrites, 1)
-					}
-				}
+			timeout := 3*time.Minute + time.Duration(count/100)*time.Minute
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			if err := waitForDBCount(ctx, store, count); err != nil {
+				cancel()
+				t.Fatalf("Failed to detect databases: %v", err)
 			}
-		}(i, db)
-	}
+			cancel()
 
-	wg.Wait()
-	t.Logf("Completed %d total writes across %d databases", totalWrites, dbCount)
+			t.Logf("Starting concurrent writes for %v...", writeDuration)
+			var totalWrites int64
+			var wg sync.WaitGroup
 
-	if totalWrites == 0 {
-		t.Fatal("Expected at least some writes to succeed")
+			writeCtx, writeCancel := context.WithTimeout(context.Background(), writeDuration)
+			defer writeCancel()
+
+			for i, db := range dbs {
+				wg.Add(1)
+				go func(idx int, db *sql.DB) {
+					defer wg.Done()
+					ticker := time.NewTicker(time.Second / time.Duration(writesPerDBPerSec))
+					defer ticker.Stop()
+
+					for {
+						select {
+						case <-writeCtx.Done():
+							return
+						case <-ticker.C:
+							_, err := db.Exec("INSERT INTO data (value) VALUES (?)",
+								fmt.Sprintf("db%d-%d", idx, time.Now().UnixNano()))
+							if err == nil {
+								atomic.AddInt64(&totalWrites, 1)
+							}
+						}
+					}
+				}(i, db)
+			}
+
+			wg.Wait()
+			t.Logf("Completed %d total writes across %d databases", totalWrites, count)
+
+			if totalWrites == 0 {
+				t.Fatal("Expected at least some writes to succeed")
+			}
+		})
 	}
 }
 
