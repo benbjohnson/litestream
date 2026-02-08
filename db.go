@@ -261,6 +261,10 @@ func (db *DB) WALPath() string {
 	return db.path + "-wal"
 }
 
+func (db *DB) shmPath() string {
+	return db.path + "-shm"
+}
+
 // MetaPath returns the path to the database metadata.
 func (db *DB) MetaPath() string {
 	return db.metaPath
@@ -1183,6 +1187,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
+	info.commit = dec.Header().Commit
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
@@ -1369,6 +1374,7 @@ type syncInfo struct {
 	offset       int64 // end of the previous LTX read
 	salt1        uint32
 	salt2        uint32
+	commit       uint32
 	snapshotting bool   // if true, a full snapshot is required
 	reason       string // reason for snapshot
 }
@@ -1515,7 +1521,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 			return false, fmt.Errorf("write ltx from db: %w", err)
 		}
 	} else {
-		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap); err != nil {
+		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap, info.commit); err != nil {
 			return false, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
@@ -1620,28 +1626,43 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
-	// Create an ordered list of page numbers since the LTX encoder requires it.
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64, prevCommit uint32) error {
+	lockPgno := ltx.LockPgno(enc.Header().PageSize)
+
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
 		pgnos = append(pgnos, pgno)
 	}
+
+	if commit := enc.Header().Commit; prevCommit > 0 && commit > prevCommit {
+		for pgno := prevCommit + 1; pgno <= commit; pgno++ {
+			if pgno == lockPgno {
+				continue
+			}
+			if _, ok := pageMap[pgno]; ok {
+				continue
+			}
+			pgnos = append(pgnos, pgno)
+		}
+	}
+
 	slices.Sort(pgnos)
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
-		offset := pageMap[pgno]
+		offset, ok := pageMap[pgno]
+		if !ok {
+			clear(data)
+		} else {
+			db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
 
-		db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
-
-		// Read source page using page map.
-		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
-			return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
-		} else if n != len(data) {
-			return fmt.Errorf("short read page %d @ %d", pgno, offset)
+			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
+				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
+			} else if n != len(data) {
+				return fmt.Errorf("short read page %d @ %d", pgno, offset)
+			}
 		}
 
-		// Write page to LTX encoder.
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 			return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
 		}
@@ -2096,11 +2117,14 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // To reduce CPU usage when idle, we use cheap change detection to avoid
 // unnecessary Sync() calls when the WAL hasn't changed:
 //
-//  1. stat() the WAL file to get its size (changes on any write)
-//  2. Read the 32-byte WAL header which contains salt values that change
-//     when SQLite restarts the WAL (e.g., after checkpoint)
+//  1. Read mxFrame from the first page of the WAL-index (-shm). This changes
+//     on each commit even when SQLite reuses WAL space and the WAL file size
+//     stays constant.
+//  2. stat() the WAL file to get its size.
+//  3. Read the 32-byte WAL header which contains salt values that change
+//     when SQLite restarts the WAL (e.g., after checkpoint).
 //
-// If both size and header are unchanged since last check, we skip Sync().
+// If mxFrame, size, and header are unchanged since last check, we skip Sync().
 // When a change is detected, we call Sync() which performs full verification
 // and replication. The cost per tick is just one stat() call plus a 32-byte
 // read, which is negligible.
@@ -2114,6 +2138,7 @@ func (db *DB) monitor() {
 	// Track last known WAL state for cheap change detection.
 	var lastWALSize int64
 	var lastWALHeader []byte
+	var lastSHMMxFrame [4]byte
 
 	// Backoff state for error handling.
 	var backoff time.Duration
@@ -2152,6 +2177,15 @@ func (db *DB) monitor() {
 			continue
 		}
 
+		shmMxFrame, err := readSHMMxFrameKey(db.shmPath())
+		if err != nil {
+			// Can't read SHM header - fall back to sync.
+			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				db.Logger.Error("sync error", "error", err)
+			}
+			continue
+		}
+
 		// Read WAL header (32 bytes) for change detection.
 		walHeader, err := readWALHeader(walPath)
 		if err != nil {
@@ -2162,15 +2196,16 @@ func (db *DB) monitor() {
 			continue
 		}
 
-		// Skip sync if WAL size and header are unchanged.
+		// Skip sync if WAL-index mxFrame, WAL size, and WAL header are unchanged.
 		walSize := fi.Size()
-		if walSize == lastWALSize && bytes.Equal(walHeader, lastWALHeader) {
+		if walSize == lastWALSize && shmMxFrame == lastSHMMxFrame && bytes.Equal(walHeader, lastWALHeader) {
 			continue
 		}
 
 		// WAL changed - update cached state and sync.
 		lastWALSize = walSize
 		lastWALHeader = walHeader
+		lastSHMMxFrame = shmMxFrame
 
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
