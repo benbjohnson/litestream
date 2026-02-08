@@ -49,6 +49,10 @@ type ReplicateCommand struct {
 
 	// Directory monitors for dynamic database discovery.
 	directoryMonitors []*DirectoryMonitor
+
+	// Done channel for interrupt handling during shutdown. When closed,
+	// the shutdown sync retry loop exits and any in-flight sync is cancelled.
+	done <-chan struct{}
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -256,6 +260,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.Validation.Interval != nil {
 		c.Store.ValidationInterval = *c.Config.Validation.Interval
 	}
+	if c.done != nil {
+		c.Store.SetDone(c.done)
+	}
 	if c.Config.HeartbeatURL != "" {
 		interval := litestream.DefaultHeartbeatInterval
 		if c.Config.HeartbeatInterval != nil {
@@ -430,7 +437,11 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	}
 	if c.Store != nil {
 		if err := c.Store.Close(ctx); err != nil {
-			slog.Error("failed to close database", "error", err)
+			if errors.Is(err, litestream.ErrShutdownInterrupted) {
+				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
+			} else {
+				slog.Error("failed to close database", "error", err)
+			}
 		}
 	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
@@ -439,6 +450,12 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// SetDone sets the done channel used for interrupt handling during shutdown.
+// When the channel is closed, the shutdown sync retry loop exits.
+func (c *ReplicateCommand) SetDone(done <-chan struct{}) {
+	c.done = done
 }
 
 // restoreIfNeeded restores a database from its replica if the database doesn't

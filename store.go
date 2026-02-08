@@ -26,6 +26,10 @@ var (
 
 	// ErrDBNotReady is a sentinel for errors.Is() compatibility.
 	ErrDBNotReady = &DBNotReadyError{}
+
+	// ErrShutdownInterrupted is returned when the shutdown sync retry loop
+	// is interrupted by a done channel signal (e.g., second Ctrl+C).
+	ErrShutdownInterrupted = errors.New("shutdown sync interrupted")
 )
 
 // DBNotReadyError is returned when an operation is attempted before the
@@ -83,6 +87,7 @@ type Store struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel func()
+	done   <-chan struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -207,8 +212,14 @@ func (s *Store) Close(ctx context.Context) (err error) {
 	s.mu.Unlock()
 
 	for _, db := range dbs {
-		if e := db.Close(ctx); e != nil && err == nil {
-			err = e
+		if e := db.Close(ctx); e != nil {
+			if errors.Is(e, ErrShutdownInterrupted) {
+				if err == nil {
+					err = e
+				}
+			} else if err == nil || errors.Is(err, ErrShutdownInterrupted) {
+				err = e
+			}
 		}
 	}
 
@@ -246,6 +257,7 @@ func (s *Store) AddDB(db *DB) error {
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	db.VerifyCompaction = s.VerifyCompaction
+	db.Done = s.done
 
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.
@@ -375,6 +387,17 @@ func (s *Store) SetL0Retention(d time.Duration) {
 	s.L0Retention = d
 	for _, db := range s.dbs {
 		db.L0Retention = d
+	}
+}
+
+// SetDone sets the done channel used for interrupt handling during shutdown
+// and propagates it to all managed databases.
+func (s *Store) SetDone(done <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.done = done
+	for _, db := range s.dbs {
+		db.Done = done
 	}
 }
 

@@ -125,6 +125,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Setup signal handler.
 		signalCh := signalChan()
 
+		// Create done channel for interrupt during shutdown. It will be
+		// closed when a second signal arrives, allowing each database's
+		// retry loop to observe the interrupt.
+		done := make(chan struct{})
+		c.SetDone(done)
+
 		if err := c.Run(ctx); err != nil {
 			return err
 		}
@@ -138,7 +144,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 				slog.Info("replication complete, litestream shutting down")
 			}
 		case sig := <-signalCh:
-			slog.Info("signal received, litestream shutting down")
+			slog.Info("signal received, litestream shutting down", "signal", sig)
 
 			if c.cmd != nil {
 				slog.Info("sending signal to exec process")
@@ -151,6 +157,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 					return fmt.Errorf("cannot wait for exec process: %w", err)
 				}
 			}
+
+			// Listen for a second signal to close done and interrupt retry loops.
+			go func() {
+				<-signalCh
+				close(done)
+			}()
 		}
 
 		// Gracefully close.
