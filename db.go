@@ -420,6 +420,9 @@ func (db *DB) Open() (err error) {
 	db.mu.Unlock()
 
 	// Validate fields on database.
+	if db.Replica == nil {
+		return fmt.Errorf("replica required before opening database")
+	}
 	if db.MinCheckpointPageN <= 0 {
 		return fmt.Errorf("minimum checkpoint page count required")
 	}
@@ -442,9 +445,7 @@ func (db *DB) Open() (err error) {
 
 	// Apply verify compaction setting and set the client once.
 	db.compactor.VerifyCompaction = db.VerifyCompaction
-	if db.Replica != nil {
-		db.compactor.client = db.Replica.Client
-	}
+	db.compactor.client = db.Replica.Client
 
 	return nil
 }
