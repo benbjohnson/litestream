@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -17,7 +16,6 @@ import (
 // It operates solely through the ReplicaClient interface, making it
 // suitable for both DB (with local file caching) and VFS (remote-only).
 type Compactor struct {
-	mu     sync.RWMutex
 	client ReplicaClient
 	logger *slog.Logger
 
@@ -59,31 +57,9 @@ func NewCompactor(client ReplicaClient, logger *slog.Logger) *Compactor {
 	}
 }
 
-// Client returns the underlying ReplicaClient.
-func (c *Compactor) Client() ReplicaClient {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.client
-}
-
-// SetClient updates the ReplicaClient.
-// This is used by DB when the Replica is assigned after construction.
-// It blocks until all in-flight compactor operations complete.
-func (c *Compactor) SetClient(client ReplicaClient) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.client = client
-}
-
 // MaxLTXFileInfo returns metadata for the last LTX file in a level.
 // Uses cache if available, otherwise fetches from remote.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.maxLTXFileInfo(ctx, level)
-}
-
-func (c *Compactor) maxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
 	if c.CacheGetter != nil {
 		if info, ok := c.CacheGetter(level); ok {
 			return *info, nil
@@ -114,12 +90,9 @@ func (c *Compactor) maxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo
 // Compact compacts source level files into the destination level.
 // Returns ErrNoCompaction if there are no files to compact.
 func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	srcLevel := dstLevel - 1
 
-	prevMaxInfo, err := c.maxLTXFileInfo(ctx, dstLevel)
+	prevMaxInfo, err := c.MaxLTXFileInfo(ctx, dstLevel)
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
 	}
@@ -191,7 +164,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}
 
 	if c.VerifyCompaction {
-		if err := c.verifyLevelConsistency(ctx, dstLevel); err != nil {
+		if err := c.VerifyLevelConsistency(ctx, dstLevel); err != nil {
 			c.logger.Warn("post-compaction verification failed",
 				"level", dstLevel,
 				"error", err)
@@ -208,12 +181,6 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 // contiguous TXID ranges (prevMaxTXID + 1 == currMinTXID for consecutive files).
 // Returns an error describing any gaps or overlaps found.
 func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.verifyLevelConsistency(ctx, level)
-}
-
-func (c *Compactor) verifyLevelConsistency(ctx context.Context, level int) error {
 	itr, err := c.client.LTXFiles(ctx, level, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch ltx files: %w", err)
@@ -253,9 +220,6 @@ func (c *Compactor) verifyLevelConsistency(ctx context.Context, level int) error
 // Files older than the retention duration are deleted (except the newest is always kept).
 // Returns the minimum snapshot TXID still retained (useful for cascading retention to lower levels).
 func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time.Duration) (ltx.TXID, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	timestamp := time.Now().Add(-retention)
 	c.logger.Debug("enforcing snapshot retention", "timestamp", timestamp)
 
@@ -309,9 +273,6 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 // EnforceRetentionByTXID deletes files at the given level with maxTXID below the target.
 // Always keeps at least one file.
 func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
 	c.logger.Debug("enforcing retention", "level", level, "txid", txID)
 
 	itr, err := c.client.LTXFiles(ctx, level, 0, false)
@@ -362,9 +323,6 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 	if retention <= 0 {
 		return nil
 	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
 
 	c.logger.Debug("enforcing l0 retention", "retention", retention)
 

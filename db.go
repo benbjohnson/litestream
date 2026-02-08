@@ -166,7 +166,7 @@ type DB struct {
 	Replica *Replica
 
 	// Compactor handles shared compaction logic.
-	// Created in NewDB, client set when Replica is assigned.
+	// Created in NewDB with nil client; client set once in Open() from Replica.Client.
 	compactor *Compactor
 
 	// Shutdown sync retry settings.
@@ -218,7 +218,7 @@ func NewDB(path string) *DB {
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
-	// Initialize compactor with nil client (will be set when Replica is assigned).
+	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger)
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
@@ -324,13 +324,6 @@ func (db *DB) deleteLocalLTXFile(level int, minTXID, maxTXID ltx.TXID) error {
 		return err
 	}
 	return nil
-}
-
-// ensureCompactorClient ensures the compactor has the current replica client.
-func (db *DB) ensureCompactorClient() {
-	if db.Replica != nil && db.compactor.Client() != db.Replica.Client {
-		db.compactor.SetClient(db.Replica.Client)
-	}
 }
 
 // MaxLTX returns the last LTX file written to level 0.
@@ -447,8 +440,11 @@ func (db *DB) Open() (err error) {
 	db.opened = true
 	db.mu.Unlock()
 
-	// Apply verify compaction setting to the compactor
+	// Apply verify compaction setting and set the client once.
 	db.compactor.VerifyCompaction = db.VerifyCompaction
+	if db.Replica != nil {
+		db.compactor.client = db.Replica.Client
+	}
 
 	return nil
 }
@@ -1825,8 +1821,6 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 // Returns metadata for the newly written compaction file. Returns ErrNoCompaction
 // if no new files are available to be compacted.
 func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
-	db.ensureCompactorClient()
-
 	info, err := db.compactor.Compact(ctx, dstLevel)
 	if err != nil {
 		return nil, err
@@ -2039,7 +2033,6 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 // EnforceRetentionByTXID enforces retention so that any LTX files below
 // the target TXID are deleted. Always keep at least one file.
 func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) (err error) {
-	db.ensureCompactorClient()
 	return db.compactor.EnforceRetentionByTXID(ctx, level, txID)
 }
 

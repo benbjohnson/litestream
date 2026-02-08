@@ -386,8 +386,6 @@ func TestDB_Compact(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
-		db.Replica = litestream.NewReplica(db)
-		db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
@@ -710,14 +708,19 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 	ctx := context.Background()
 
-	db, sqldb := testingutil.MustOpenDBs(t)
-	defer testingutil.MustCloseDBs(t, db, sqldb)
-
-	// Set up replica with file backend
-	replicaPath := filepath.Join(t.TempDir(), "replica")
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	replicaPath := filepath.Join(dir, "replica")
 	client := file.NewReplicaClient(replicaPath)
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	// Create some transactions
 	for i := 0; i < 10; i++ {
@@ -819,13 +822,19 @@ func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 	ctx := context.Background()
 
-	db, sqldb := testingutil.MustOpenDBs(t)
-	defer testingutil.MustCloseDBs(t, db, sqldb)
-
-	replicaPath := filepath.Join(t.TempDir(), "replica")
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	replicaPath := filepath.Join(dir, "replica")
 	client := file.NewReplicaClient(replicaPath)
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -908,13 +917,19 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 func TestDB_EnforceL0RetentionByTime(t *testing.T) {
 	ctx := context.Background()
 
-	db, sqldb := testingutil.MustOpenDBs(t)
-	defer testingutil.MustCloseDBs(t, db, sqldb)
-
-	replicaPath := filepath.Join(t.TempDir(), "replica")
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	replicaPath := filepath.Join(dir, "replica")
 	client := file.NewReplicaClient(replicaPath)
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	// Use a long retention initially so compaction does not immediately clean up files.
 	db.L0Retention = 30 * time.Minute
