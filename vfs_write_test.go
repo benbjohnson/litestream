@@ -1619,15 +1619,14 @@ func TestLock_BlocksDuringDisable(t *testing.T) {
 	lockErrCh := make(chan error, 1)
 	lockDone := make(chan struct{})
 	go func() {
+		defer close(lockDone)
 		if err := f.Unlock(1); err != nil {
 			lockErrCh <- fmt.Errorf("unlock: %w", err)
 			return
 		}
 		// Lock() should block while disabling is true, then fail because
 		// writeEnabled will be false after disable completes
-		err := f.Lock(2)
-		lockErrCh <- err
-		close(lockDone)
+		lockErrCh <- f.Lock(2)
 	}()
 
 	// Wait for disable to complete
@@ -1712,23 +1711,28 @@ func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
 	// Simulate multiple waiters trying to acquire RESERVED lock.
 	// They will block on cond.Wait() while disabling is true, then
 	// fail with read-only error once disable completes.
+	const numWaiters = 3
 	var wg sync.WaitGroup
-	errCh := make(chan error, 3)
+	errCh := make(chan error, numWaiters)
+	started := make(chan struct{}, numWaiters)
 
-	for i := 0; i < 3; i++ {
+	for i := 0; i < numWaiters; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			started <- struct{}{}
 			errCh <- f.Lock(2)
 		}()
 	}
 
-	// Give waiters time to enter cond.Wait(), then end the transaction
-	// to unblock everything. Use polling to be deterministic.
-	deadline = time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(5 * time.Millisecond)
-		break // Brief pause then proceed
+	// Wait for all goroutines to start, then verify none have completed yet
+	// (they should be blocked in cond.Wait() while disabling is true).
+	for i := 0; i < numWaiters; i++ {
+		<-started
+	}
+	time.Sleep(10 * time.Millisecond)
+	if len(errCh) > 0 {
+		t.Fatal("expected all Lock() calls to be blocked during disable, but some completed early")
 	}
 
 	// End the original transaction - this will trigger the disable to complete

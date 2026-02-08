@@ -185,14 +185,19 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 		return nil, 0, err
 	}
 
-	// Always report ReadWrite to SQLite so that cold enable via PRAGMA
-	// litestream_write_enabled works. SQLite permanently marks databases as
-	// read-only based on the output flags from xOpen (pager.c:readOnly,
-	// btree.c:BTS_READ_ONLY), which would prevent write transactions even
-	// after enabling writes at runtime. Read-only enforcement happens at
-	// the VFS layer (WriteAt, Truncate, Lock) when writeEnabled is false.
-	flags &^= sqlite3vfs.OpenReadOnly
-	flags |= sqlite3vfs.OpenReadWrite
+	// When SQLite requests read-write access, always report ReadWrite in the
+	// output flags so that cold enable via PRAGMA litestream_write_enabled
+	// works. SQLite permanently marks databases as read-only based on the
+	// output flags from xOpen (pager.c:readOnly, btree.c:BTS_READ_ONLY),
+	// which would prevent write transactions even after enabling writes at
+	// runtime. Read-only enforcement happens at the VFS layer (WriteAt,
+	// Truncate, Lock) when writeEnabled is false.
+	//
+	// If the caller explicitly requested read-only, we respect that intent.
+	if flags&sqlite3vfs.OpenReadOnly == 0 {
+		flags &^= sqlite3vfs.OpenReadOnly
+		flags |= sqlite3vfs.OpenReadWrite
+	}
 
 	return f, flags, nil
 }
@@ -1412,7 +1417,7 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 
 	// If write support is not enabled, return read-only error
 	if !f.writeEnabled {
-		return 0, fmt.Errorf("litestream is a read only vfs")
+		return 0, sqlite3vfs.ReadOnlyError
 	}
 
 	// Get page data - either from buffer file (if dirty) or from cache/remote
@@ -1495,7 +1500,7 @@ func (f *VFSFile) Truncate(size int64) error {
 
 	// If write support is not enabled, return read-only error
 	if !f.writeEnabled {
-		return fmt.Errorf("litestream is a read only vfs")
+		return sqlite3vfs.ReadOnlyError
 	}
 
 	// Remove dirty pages beyond new size
@@ -2045,7 +2050,7 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		// report OpenReadWrite to SQLite (to support cold enable), SQLite may
 		// attempt write transactions even when writes are logically disabled.
 		if !f.writeEnabled {
-			return fmt.Errorf("litestream is a read only vfs")
+			return sqlite3vfs.ReadOnlyError
 		}
 	}
 
