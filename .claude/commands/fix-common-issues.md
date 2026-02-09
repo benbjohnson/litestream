@@ -166,10 +166,10 @@ defer func() {
 **Check**:
 ```bash
 # Look for LTXError messages in logs
-grep -i "ltx.*error\|reset.*local\|auto.recover" /var/log/litestream.log
+rg -i "ltx.*error|reset.*local|auto.recover" /var/log/litestream.log
 
-# Check if meta directory has corrupted state
-ls -la /path/to/database.db-litestream/ltx/
+# Check if meta directory has corrupted state (note dot prefix)
+ls -la /path/to/.database.db-litestream/ltx/
 ```
 
 **Fix - Manual Reset**:
@@ -194,7 +194,8 @@ dbs:
 
 **When to use which**: Use `auto-recover` for unattended deployments where automatic recovery
 is preferred over manual intervention. Use manual `reset` when you want to investigate the
-corruption first. `auto-recover` is disabled by default to prevent silent data loss.
+corruption first. `auto-recover` is disabled by default because resetting discards local LTX
+history, which may reduce point-in-time restore granularity.
 
 **Reference**: `cmd/litestream/reset.go`, `replica.go` (auto-recover logic), `db.go` (`ResetLocalState`)
 

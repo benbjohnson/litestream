@@ -274,7 +274,7 @@ Load reference files on demand based on the task:
 
 ### Corrupted or Missing LTX Files
 
-1. Check logs for `LTXError` messages — they include context (Op, Path, Level, TXID) and recovery hints
+1. Check logs for `LTXError` messages - they include context (Op, Path, Level, TXID) and recovery hints
 2. Common error messages: "nonsequential page numbers", "non-contiguous transaction files", "ltx validation failed"
 3. Manual fix: `litestream reset <db-path>` clears local LTX state and forces fresh snapshot on next sync (database file is not modified)
 4. Automatic fix: set `auto-recover: true` on the replica config to auto-reset on LTX errors (disabled by default)

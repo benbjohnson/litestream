@@ -47,9 +47,11 @@ Next sync creates a fresh snapshot. See `cmd/litestream/reset.go` for implementa
 
 **Automatic recovery** with `auto-recover` config:
 ```yaml
-replicas:
-  - url: s3://bucket/path
-    auto-recover: true
+dbs:
+  - path: /path/to/database.db
+    replicas:
+      - url: s3://bucket/path
+        auto-recover: true
 ```
 When enabled, Litestream automatically resets local state when LTX errors are detected
 during sync. Disabled by default. See `replica.go` (auto-recover logic) for implementation.
