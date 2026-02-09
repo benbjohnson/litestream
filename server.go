@@ -73,6 +73,7 @@ func NewServer(store *Store) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
+	mux.HandleFunc("POST /sync-replicate", s.handleSyncReplicate)
 	mux.HandleFunc("GET /txid", s.handleTXID)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
@@ -262,6 +263,65 @@ func (s *Server) handleTXID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleSyncReplicate(w http.ResponseWriter, r *http.Request) {
+	var req SyncReplicateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	ctx := s.ctx
+	if req.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(req.Timeout)*time.Second)
+		defer cancel()
+	}
+
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusNotFound, "database not found", nil)
+		return
+	}
+
+	if db.Replica == nil {
+		writeJSONError(w, http.StatusBadRequest, "database has no replica configured", nil)
+		return
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("sync failed: %v", err), nil)
+		return
+	}
+
+	if err := db.Replica.Sync(ctx); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("replica sync failed: %v", err), nil)
+		return
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, SyncReplicateResponse{
+		Status: "ok",
+		Path:   expandedPath,
+		TXID:   uint64(pos.TXID),
+	})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -310,6 +370,19 @@ type ErrorResponse struct {
 // TXIDResponse is the response body for the /txid endpoint.
 type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
+}
+
+// SyncReplicateRequest is the request body for the /sync-replicate endpoint.
+type SyncReplicateRequest struct {
+	Path    string `json:"path"`
+	Timeout int    `json:"timeout,omitempty"` // seconds, 0 = no timeout
+}
+
+// SyncReplicateResponse is the response body for the /sync-replicate endpoint.
+type SyncReplicateResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {
