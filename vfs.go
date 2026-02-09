@@ -147,8 +147,9 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 		if vfs.writeFile != nil {
 			vfs.writeFileMu.Unlock()
 			vfs.logger.Warn("write connection already open, rejecting new connection", "name", name)
-			return nil, 0, sqlite3vfs.BusyError
+			return nil, flags, sqlite3vfs.BusyError
 		}
+		vfs.writeFile = f
 		vfs.writeFileMu.Unlock()
 
 		f.writeEnabled = true
@@ -165,6 +166,9 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
+				vfs.writeFileMu.Lock()
+				vfs.writeFile = nil
+				vfs.writeFileMu.Unlock()
 				return nil, 0, fmt.Errorf("create temp dir for write buffer: %w", err)
 			}
 			f.bufferPath = filepath.Join(dir, "write-buffer")
@@ -186,6 +190,11 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
+				if vfs.WriteEnabled {
+					vfs.writeFileMu.Lock()
+					vfs.writeFile = nil
+					vfs.writeFileMu.Unlock()
+				}
 				return nil, 0, fmt.Errorf("create temp dir for hydration: %w", err)
 			}
 			f.hydrationPath = filepath.Join(dir, "hydration.db")
@@ -193,14 +202,12 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	if err := f.Open(); err != nil {
+		if vfs.WriteEnabled {
+			vfs.writeFileMu.Lock()
+			vfs.writeFile = nil
+			vfs.writeFileMu.Unlock()
+		}
 		return nil, 0, err
-	}
-
-	// Register active write connection after successful open
-	if vfs.WriteEnabled {
-		vfs.writeFileMu.Lock()
-		vfs.writeFile = f
-		vfs.writeFileMu.Unlock()
 	}
 
 	// Set appropriate flags based on write mode
@@ -1233,15 +1240,6 @@ func (f *VFSFile) applySyncedPagesToHydratedFile() error {
 func (f *VFSFile) Close() error {
 	f.logger.Debug("closing file")
 
-	// Clear active write connection on parent VFS
-	if f.vfs != nil && f.writeEnabled {
-		f.vfs.writeFileMu.Lock()
-		if f.vfs.writeFile == f {
-			f.vfs.writeFile = nil
-		}
-		f.vfs.writeFileMu.Unlock()
-	}
-
 	// Stop sync ticker if running
 	if f.syncTicker != nil {
 		f.syncTicker.Stop()
@@ -1273,6 +1271,15 @@ func (f *VFSFile) Close() error {
 		if err := f.hydrator.Close(); err != nil {
 			f.logger.Warn("failed to close hydration file", "error", err)
 		}
+	}
+
+	// Clear active write connection on parent VFS after all cleanup is complete
+	if f.vfs != nil && f.writeEnabled {
+		f.vfs.writeFileMu.Lock()
+		if f.vfs.writeFile == f {
+			f.vfs.writeFile = nil
+		}
+		f.vfs.writeFileMu.Unlock()
 	}
 
 	return nil

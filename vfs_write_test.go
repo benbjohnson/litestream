@@ -6,6 +6,7 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -189,6 +190,36 @@ func createTestLTXFile(t *testing.T, client *writeTestReplicaClient, txid ltx.TX
 		Size:      int64(buf.Len()),
 	})
 	client.mu.Unlock()
+}
+
+// slowWriteTestReplicaClient wraps writeTestReplicaClient and blocks WriteLTXFile
+// until writeCh is closed. Used to simulate slow sync during Close().
+type slowWriteTestReplicaClient struct {
+	writeTestReplicaClient
+	writeCh chan struct{}
+}
+
+func (c *slowWriteTestReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	<-c.writeCh
+	return c.writeTestReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+// failOpenTestReplicaClient wraps writeTestReplicaClient. LTXFiles returns
+// an error when failOpen is true, causing VFSFile.Open() to fail.
+type failOpenTestReplicaClient struct {
+	writeTestReplicaClient
+	mu       sync.Mutex
+	failOpen bool
+}
+
+func (c *failOpenTestReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	c.mu.Lock()
+	fail := c.failOpen
+	c.mu.Unlock()
+	if fail {
+		return nil, fmt.Errorf("injected open error")
+	}
+	return c.writeTestReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
 }
 
 // setupWriteableVFSFile creates a VFSFile with write support enabled and a buffer file.
@@ -386,17 +417,17 @@ func TestVFS_RejectSecondWriteConnection(t *testing.T) {
 	initialPage := make([]byte, pageSize)
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	vfs := NewVFS(client, slog.Default())
-	vfs.WriteEnabled = true
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
 
 	// First connection should succeed
-	file1, _, err := vfs.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	file1, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatalf("first open should succeed: %v", err)
 	}
 
 	// Second connection should be rejected with BusyError
-	_, _, err = vfs.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	_, _, err = v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
 	if err != sqlite3vfs.BusyError {
 		t.Fatalf("second open should return BusyError, got: %v", err)
 	}
@@ -407,11 +438,140 @@ func TestVFS_RejectSecondWriteConnection(t *testing.T) {
 	}
 
 	// Third connection should succeed now that the first is closed
-	file3, _, err := vfs.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	file3, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatalf("third open should succeed after close: %v", err)
 	}
 	defer file3.Close()
+}
+
+func TestVFS_ConcurrentOpenOnlyOneSucceeds(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	const goroutines = 10
+	results := make(chan error, goroutines)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+			results <- err
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	var successes, busyErrors int
+	for err := range results {
+		switch err {
+		case nil:
+			successes++
+		case sqlite3vfs.BusyError:
+			busyErrors++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if successes != 1 {
+		t.Fatalf("expected exactly 1 successful open, got %d", successes)
+	}
+	if busyErrors != goroutines-1 {
+		t.Fatalf("expected %d BusyErrors, got %d", goroutines-1, busyErrors)
+	}
+}
+
+func TestVFS_OpenBlockedDuringClose(t *testing.T) {
+	writeCh := make(chan struct{})
+	client := &slowWriteTestReplicaClient{
+		writeTestReplicaClient: *newWriteTestReplicaClient(),
+		writeCh:                writeCh,
+	}
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, &client.writeTestReplicaClient, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+	v.WriteSyncInterval = 0
+
+	file1, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	vf := file1.(*VFSFile)
+	if _, err := vf.WriteAt([]byte("dirty data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- file1.Close()
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		_, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+		if err == sqlite3vfs.BusyError {
+			close(writeCh)
+			if err := <-closeDone; err != nil {
+				t.Fatalf("close error: %v", err)
+			}
+			return
+		}
+		if err == nil {
+			t.Fatal("open should not succeed while close is in progress")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	close(writeCh)
+	<-closeDone
+	t.Fatal("timed out waiting for BusyError during close")
+}
+
+func TestVFS_WriteFileSlotClearedOnOpenError(t *testing.T) {
+	client := &failOpenTestReplicaClient{
+		writeTestReplicaClient: *newWriteTestReplicaClient(),
+		failOpen:               true,
+	}
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, &client.writeTestReplicaClient, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	// First open fails due to injected error
+	_, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err == nil {
+		t.Fatal("expected open to fail")
+	}
+
+	// Disable error injection
+	client.mu.Lock()
+	client.failOpen = false
+	client.mu.Unlock()
+
+	// Second open should succeed — writeFile slot was cleared on first failure
+	file2, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("second open should succeed after first failed: %v", err)
+	}
+	defer file2.Close()
 }
 
 func TestVFSFile_TransactionTracking(t *testing.T) {
