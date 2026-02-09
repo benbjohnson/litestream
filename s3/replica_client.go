@@ -223,6 +223,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			forcePathStyle = true
 		}
 	}
+	if isCloudflareR2 && client.Concurrency == 0 {
+		client.Concurrency = 2
+	}
 
 	// Configure client
 	client.Bucket = bucket

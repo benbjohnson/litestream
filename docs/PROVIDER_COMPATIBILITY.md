@@ -282,7 +282,7 @@ replicas:
 | `endpoint` | Custom S3 endpoint URL | AWS S3 |
 | `region` | AWS region | Auto-detected |
 | `force-path-style` | Use path-style URLs | `false` (auto for custom endpoints) |
-| `sign-payload` | Sign request payloads | `false` |
+| `sign-payload` | Sign request payloads | `true` |
 | `skip-verify` | Skip TLS verification | `false` |
 | `concurrency` | Multipart upload concurrency | `5` (2 for R2) |
 | `part-size` | Multipart upload part size | `5MB` |
@@ -296,13 +296,13 @@ Litestream automatically detects certain providers and applies appropriate defau
 
 | Provider | Detection Pattern | Applied Settings |
 |----------|-------------------|------------------|
-| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `concurrency=2`, checksums disabled |
+| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true`, `concurrency=2`, checksums disabled |
 | Backblaze B2 | `*.backblazeb2.com` | `sign-payload=true`, `force-path-style=true` |
-| DigitalOcean | `*.digitaloceanspaces.com` | `force-path-style=false` |
-| Scaleway | `*.scw.cloud` | `force-path-style=true` |
-| Filebase | `s3.filebase.com` | `force-path-style=true` |
-| Tigris | `*.tigris.dev` | `force-path-style=true` |
-| MinIO | `minio` in hostname | `force-path-style=true` |
+| DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
+| Scaleway | `*.scw.cloud` | `sign-payload=true` |
+| Filebase | `s3.filebase.com` | `sign-payload=true`, `force-path-style=true` |
+| Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false` |
+| MinIO | `minio` in hostname | `sign-payload=true`, `force-path-style=true` |
 
 ## Troubleshooting
 

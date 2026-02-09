@@ -8,11 +8,14 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1678,7 +1681,6 @@ func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
 			name:            "R2_DefaultConcurrency",
 			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
 			wantConcurrency: 2,
-			skipReason:      "pending issue #948 fix",
 		},
 		{
 			name:            "AWS_NoConcurrencyOverride",
@@ -1816,4 +1818,151 @@ func TestReplicaClient_CustomEndpoint_DisablesChecksumFeatures(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestReplicaClient_MultipartUploadThreshold(t *testing.T) {
+	tests := []struct {
+		name            string
+		dataSize        int
+		expectMultipart bool
+	}{
+		{
+			name:            "BelowThreshold_4MB",
+			dataSize:        4 * 1024 * 1024,
+			expectMultipart: false,
+		},
+		{
+			name:            "AtThreshold_5MB",
+			dataSize:        5 * 1024 * 1024,
+			expectMultipart: true,
+		},
+		{
+			name:            "AboveThreshold_6MB",
+			dataSize:        6 * 1024 * 1024,
+			expectMultipart: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var sawMultipart atomic.Bool
+			var sawSinglePut atomic.Bool
+			var sawChunkedEncoding atomic.Bool
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				_, _ = io.Copy(io.Discard, r.Body)
+
+				if strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") ||
+					strings.Contains(r.Header.Get("Transfer-Encoding"), "aws-chunked") {
+					sawChunkedEncoding.Store(true)
+				}
+
+				query, _ := url.ParseQuery(r.URL.RawQuery)
+
+				switch {
+				case r.Method == http.MethodPost && query.Has("uploads"):
+					sawMultipart.Store(true)
+					w.Header().Set("Content-Type", "application/xml")
+					fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
+<InitiateMultipartUploadResult>
+  <Bucket>test-bucket</Bucket>
+  <Key>%s</Key>
+  <UploadId>test-upload-id</UploadId>
+</InitiateMultipartUploadResult>`, r.URL.Path)
+
+				case r.Method == http.MethodPut && query.Get("partNumber") != "":
+					w.Header().Set("ETag", `"part-etag"`)
+					w.WriteHeader(http.StatusOK)
+
+				case r.Method == http.MethodPost && query.Get("uploadId") != "":
+					w.Header().Set("Content-Type", "application/xml")
+					fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<CompleteMultipartUploadResult>
+  <Bucket>test-bucket</Bucket>
+  <ETag>"completed-etag"</ETag>
+</CompleteMultipartUploadResult>`)
+
+				case r.Method == http.MethodPut:
+					sawSinglePut.Store(true)
+					w.Header().Set("ETag", `"single-etag"`)
+					w.WriteHeader(http.StatusOK)
+
+				default:
+					w.WriteHeader(http.StatusOK)
+				}
+			}))
+			defer server.Close()
+
+			client := NewReplicaClient()
+			client.Bucket = "test-bucket"
+			client.Path = "replica"
+			client.Region = "us-east-1"
+			client.Endpoint = server.URL
+			client.ForcePathStyle = true
+			client.AccessKeyID = "test-access-key"
+			client.SecretAccessKey = "test-secret-key"
+
+			ctx := context.Background()
+			if err := client.Init(ctx); err != nil {
+				t.Fatalf("Init() error: %v", err)
+			}
+
+			data := mustLTXWithSize(t, tt.dataSize)
+			if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+				t.Fatalf("WriteLTXFile() error: %v", err)
+			}
+
+			if tt.expectMultipart {
+				if !sawMultipart.Load() {
+					t.Error("expected multipart upload for data above threshold, but saw single PUT")
+				}
+			} else {
+				if !sawSinglePut.Load() {
+					t.Error("expected single PUT for data at/below threshold, but saw multipart upload")
+				}
+				if sawMultipart.Load() {
+					t.Error("unexpected multipart upload for data at/below threshold")
+				}
+			}
+
+			if sawChunkedEncoding.Load() {
+				t.Error("aws-chunked encoding detected; S3-compatible providers do not support this")
+			}
+		})
+	}
+}
+
+func mustLTXWithSize(t *testing.T, size int) []byte {
+	t.Helper()
+
+	buf := new(bytes.Buffer)
+	enc, err := ltx.NewEncoder(buf)
+	if err != nil {
+		t.Fatalf("NewEncoder: %v", err)
+	}
+
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:          ltx.Version,
+		PageSize:         4096,
+		Commit:           0,
+		MinTXID:          2,
+		MaxTXID:          2,
+		Timestamp:        time.Now().UnixMilli(),
+		PreApplyChecksum: ltx.ChecksumFlag | 1,
+	}); err != nil {
+		t.Fatalf("EncodeHeader: %v", err)
+	}
+
+	enc.SetPostApplyChecksum(ltx.ChecksumFlag)
+	if err := enc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	data := buf.Bytes()
+	if len(data) < size {
+		padding := make([]byte, size-len(data))
+		data = append(data, padding...)
+	}
+	return data
 }
