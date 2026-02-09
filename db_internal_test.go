@@ -1253,3 +1253,133 @@ func TestDB_IdleCheckpointSnapshotLoop(t *testing.T) {
 			"This is issue #997: checkpoint triggers infinite LTX creation loop.", txidGrowth)
 	}
 }
+
+// TestDB_Issue994_RunawayDiskUsage reproduces the scenario from issue #994 where
+// the local -litestream directory grows unboundedly. The reporter saw ~10MB/s growth
+// in LTX files. This test verifies that after bulk writes and idle sync cycles,
+// local LTX file count and total size stabilize rather than growing linearly.
+func TestDB_Issue994_RunawayDiskUsage(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 10
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk inserts without a wrapping transaction (matches the #994 scenario).
+	// This builds up WAL frames and will trigger checkpoint thresholds.
+	for i := 0; i < 200; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO test VALUES (?, ?)`, i, "padding data for disk usage test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync to create LTX files from the WAL data.
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a checkpoint (mirrors what happens in production after bulk writes).
+	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	// Measure the baseline LTX directory size after initial sync + checkpoint.
+	baselineSize := dirSize(t, db.LTXDir())
+	baselineFiles := dirFileCount(t, db.LTXDir())
+	t.Logf("baseline: %d bytes, %d files", baselineSize, baselineFiles)
+
+	// Run 20 idle sync cycles (no application writes).
+	// With the #994 bug, each cycle would create a new LTX snapshot file,
+	// causing linear disk growth.
+	for cycle := 0; cycle < 20; cycle++ {
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	finalSize := dirSize(t, db.LTXDir())
+	finalFiles := dirFileCount(t, db.LTXDir())
+	t.Logf("after 20 idle cycles: %d bytes, %d files", finalSize, finalFiles)
+
+	// Allow for at most 1 additional LTX file (the _litestream_seq bookkeeping write).
+	// With the bug, we'd see 20+ new files.
+	newFiles := finalFiles - baselineFiles
+	if newFiles > 2 {
+		t.Errorf("LTX file count grew by %d during 20 idle sync cycles (expected <= 2). "+
+			"This indicates issue #994: runaway LTX file creation.", newFiles)
+	}
+
+	// Size should not grow significantly. Allow 2x as generous margin.
+	if baselineSize > 0 && finalSize > baselineSize*2 {
+		t.Errorf("LTX directory grew from %d to %d bytes during idle cycles (>2x growth). "+
+			"This indicates issue #994: runaway disk usage.", baselineSize, finalSize)
+	}
+}
+
+func dirSize(t *testing.T, path string) int64 {
+	t.Helper()
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return size
+}
+
+func dirFileCount(t *testing.T, path string) int {
+	t.Helper()
+	var count int
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
