@@ -33,3 +33,23 @@ Use the testing harness to reproduce:
 ```bash
 ./bin/litestream-test validate -source-db test.db -replica-url [URL]
 ```
+
+## Recovery Options
+
+When analysis reveals corrupted or missing LTX files, two recovery mechanisms are available:
+
+**Manual recovery** with `litestream reset`:
+```bash
+litestream reset /path/to/database.db
+```
+Clears local LTX state from the metadata directory. The database file is not modified.
+Next sync creates a fresh snapshot. See `cmd/litestream/reset.go` for implementation.
+
+**Automatic recovery** with `auto-recover` config:
+```yaml
+replicas:
+  - url: s3://bucket/path
+    auto-recover: true
+```
+When enabled, Litestream automatically resets local state when LTX errors are detected
+during sync. Disabled by default. See `replica.go` (auto-recover logic) for implementation.

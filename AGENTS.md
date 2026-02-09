@@ -14,6 +14,8 @@ Litestream is a disaster recovery tool for SQLite that runs as a background proc
 - **LTX files are immutable**: Never modify after creation. See [docs/LTX_FORMAT.md](docs/LTX_FORMAT.md)
 - **Single replica per database**: Each DB replicates to exactly one destination
 - **Use `litestream ltx`**: Not `litestream wal` (deprecated)
+- **Use `litestream reset`**: Clears corrupted local LTX state for a database. See `cmd/litestream/reset.go`
+- **`auto-recover` config**: Replica option that automatically resets local state on LTX errors. Disabled by default. See `replica.go`
 
 ## Layer Boundaries
 

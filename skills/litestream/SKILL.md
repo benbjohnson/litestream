@@ -272,6 +272,14 @@ Load reference files on demand based on the task:
 4. Test concurrent operations with `-race` flag
 5. For eventually consistent backends, add retry logic with backoff
 
+### Corrupted or Missing LTX Files
+
+1. Check logs for `LTXError` messages — they include context (Op, Path, Level, TXID) and recovery hints
+2. Common error messages: "nonsequential page numbers", "non-contiguous transaction files", "ltx validation failed"
+3. Manual fix: `litestream reset <db-path>` clears local LTX state and forces fresh snapshot on next sync (database file is not modified)
+4. Automatic fix: set `auto-recover: true` on the replica config to auto-reset on LTX errors (disabled by default)
+5. Reference: `cmd/litestream/reset.go`, `replica.go` (auto-recover logic), `db.go` (`ResetLocalState`)
+
 ## Contribution Guidelines
 
 ### What's Accepted
