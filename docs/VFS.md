@@ -283,12 +283,14 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 2. Dirty pages are tracked in memory
 3. Periodically (or on close), dirty pages are packaged into an LTX file
 4. The LTX file is uploaded to remote storage
-5. If the remote has advanced (e.g., another connection synced first), the VFSFile rebases its TXID tracking and proceeds
+5. If the remote has advanced unexpectedly, `ErrConflict` is returned as a safety check
 
 ### Write Mode Considerations
 
-- **Single writer**: Only one writer should be active at a time
-- **Automatic rebase**: When multiple VFSFile instances exist (e.g., from `database/sql` connection pooling), each instance automatically rebases its expected TXID when it discovers the remote has advanced due to another instance's sync
+- **Single connection**: Only one write connection is allowed at a time. Opening a second
+  connection in write mode returns `SQLITE_BUSY`. When using Go's `database/sql`, set
+  `db.SetMaxOpenConns(1)` to prevent connection pooling from opening multiple connections.
+- **Conflict detection**: If the remote has advanced unexpectedly, `ErrConflict` is returned
 - **Buffer durability**: The local buffer file provides crash recovery for uncommitted writes
 - **Sync interval**: Balance between durability (shorter) and performance (longer)
 - **New databases**: Write mode can create new databases from scratch if no LTX files exist

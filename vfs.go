@@ -103,6 +103,9 @@ type VFS struct {
 	// Set to 0 to delete immediately after compaction.
 	L0Retention time.Duration
 
+	writeFileMu sync.Mutex
+	writeFile   *VFSFile
+
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
@@ -140,6 +143,14 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 	// Initialize write support if enabled
 	if vfs.WriteEnabled {
+		vfs.writeFileMu.Lock()
+		if vfs.writeFile != nil {
+			vfs.writeFileMu.Unlock()
+			vfs.logger.Warn("write connection already open, rejecting new connection", "name", name)
+			return nil, 0, sqlite3vfs.BusyError
+		}
+		vfs.writeFileMu.Unlock()
+
 		f.writeEnabled = true
 		f.dirty = make(map[uint32]int64)
 		f.syncInterval = vfs.WriteSyncInterval
@@ -183,6 +194,13 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 	if err := f.Open(); err != nil {
 		return nil, 0, err
+	}
+
+	// Register active write connection after successful open
+	if vfs.WriteEnabled {
+		vfs.writeFileMu.Lock()
+		vfs.writeFile = f
+		vfs.writeFileMu.Unlock()
 	}
 
 	// Set appropriate flags based on write mode
@@ -1215,6 +1233,15 @@ func (f *VFSFile) applySyncedPagesToHydratedFile() error {
 func (f *VFSFile) Close() error {
 	f.logger.Debug("closing file")
 
+	// Clear active write connection on parent VFS
+	if f.vfs != nil && f.writeEnabled {
+		f.vfs.writeFileMu.Lock()
+		if f.vfs.writeFile == f {
+			f.vfs.writeFile = nil
+		}
+		f.vfs.writeFileMu.Unlock()
+	}
+
 	// Stop sync ticker if running
 	if f.syncTicker != nil {
 		f.syncTicker.Stop()
@@ -1627,17 +1654,13 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 		return fmt.Errorf("iterate remote files: %w", err)
 	}
 
-	// If remote has advanced beyond our expected position, rebase our state.
-	// This happens when another VFSFile instance (e.g., from database/sql
-	// connection pool) synced before us. Since the VFS enforces single-writer
-	// semantics, our dirty pages are sequentially safe to apply after the
-	// remote's latest transaction.
+	// If remote has advanced beyond our expected position, we have a conflict
 	if remoteTXID > f.expectedTXID {
-		f.logger.Info("rebasing on advanced remote",
+		f.logger.Warn("conflict detected",
 			"expected", f.expectedTXID,
 			"remote", remoteTXID)
-		f.expectedTXID = remoteTXID
-		f.pendingTXID = remoteTXID + 1
+		return fmt.Errorf("%w: expected TXID %d but remote has %d",
+			ErrConflict, f.expectedTXID, remoteTXID)
 	}
 
 	return nil
@@ -2166,12 +2189,6 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
-
-	// Keep write state in sync with remote when polling discovers advancement.
-	if f.writeEnabled && f.pos.TXID > f.expectedTXID {
-		f.expectedTXID = f.pos.TXID
-		f.pendingTXID = f.pos.TXID + 1
-	}
 
 	// Apply updates to hydrated file if hydration is complete
 	if f.hydrator != nil && f.hydrator.Complete() && len(combined) > 0 {

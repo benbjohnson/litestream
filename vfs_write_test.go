@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
 )
 
@@ -365,92 +366,52 @@ func TestVFSFile_ConflictDetection(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Simulate remote advancement (e.g., another VFSFile instance synced)
+	// Simulate remote advancement (another writer)
 	createTestLTXFile(t, client, 2, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	// Sync should succeed by rebasing on the advanced remote
-	if err := f.Sync(0); err != nil {
-		t.Fatalf("expected sync to succeed after rebase, got: %v", err)
+	// Try to sync - should fail with conflict
+	err := f.Sync(0)
+	if err == nil {
+		t.Fatal("expected conflict error")
 	}
-
-	// expectedTXID should be rebased past the remote advancement (TXID 2)
-	// and then advanced to our own sync (TXID 3)
-	if f.expectedTXID != 3 {
-		t.Fatalf("expectedTXID: got %d, want 3", f.expectedTXID)
-	}
-	if f.pendingTXID != 4 {
-		t.Fatalf("pendingTXID: got %d, want 4", f.pendingTXID)
+	if err.Error() != "remote has newer transactions than expected: expected TXID 1 but remote has 2" {
+		t.Errorf("unexpected error: %v", err)
 	}
 }
 
-func TestVFSFile_MultiConnectionSync(t *testing.T) {
+func TestVFS_RejectSecondWriteConnection(t *testing.T) {
 	client := newWriteTestReplicaClient()
 
-	// Create initial LTX file (TXID 1)
 	pageSize := uint32(4096)
 	initialPage := make([]byte, pageSize)
-	copy(initialPage, "initial")
 	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
-	// Create two VFSFile instances sharing the same client (simulates database/sql connection pool)
-	fileA := setupWriteableVFSFile(t, client)
-	if err := fileA.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer fileA.Close()
+	vfs := NewVFS(client, slog.Default())
+	vfs.WriteEnabled = true
 
-	fileB := setupWriteableVFSFile(t, client)
-	if err := fileB.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer fileB.Close()
-
-	// Both should start with expectedTXID=1, pendingTXID=2
-	if fileA.expectedTXID != 1 {
-		t.Fatalf("fileA expectedTXID: got %d, want 1", fileA.expectedTXID)
-	}
-	if fileB.expectedTXID != 1 {
-		t.Fatalf("fileB expectedTXID: got %d, want 1", fileB.expectedTXID)
+	// First connection should succeed
+	file1, _, err := vfs.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("first open should succeed: %v", err)
 	}
 
-	// FileA writes and syncs (simulates first connection's transaction)
-	if _, err := fileA.WriteAt([]byte("data from A"), 0); err != nil {
-		t.Fatal(err)
+	// Second connection should be rejected with BusyError
+	_, _, err = vfs.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != sqlite3vfs.BusyError {
+		t.Fatalf("second open should return BusyError, got: %v", err)
 	}
-	if err := fileA.Sync(0); err != nil {
+
+	// Close first connection
+	if err := file1.Close(); err != nil {
 		t.Fatal(err)
 	}
 
-	// FileA should now be at expectedTXID=2
-	if fileA.expectedTXID != 2 {
-		t.Fatalf("fileA expectedTXID after sync: got %d, want 2", fileA.expectedTXID)
+	// Third connection should succeed now that the first is closed
+	file3, _, err := vfs.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("third open should succeed after close: %v", err)
 	}
-
-	// FileB writes (simulates second connection's transaction)
-	if _, err := fileB.WriteAt([]byte("data from B"), 100); err != nil {
-		t.Fatal(err)
-	}
-
-	// FileB syncs — this should succeed by rebasing, not return ErrConflict
-	if err := fileB.Sync(0); err != nil {
-		t.Fatalf("fileB sync should succeed after rebase, got error: %v", err)
-	}
-
-	// FileB should have rebased: expectedTXID=3, pendingTXID=4
-	if fileB.expectedTXID != 3 {
-		t.Fatalf("fileB expectedTXID after rebase sync: got %d, want 3", fileB.expectedTXID)
-	}
-	if fileB.pendingTXID != 4 {
-		t.Fatalf("fileB pendingTXID after rebase sync: got %d, want 4", fileB.pendingTXID)
-	}
-
-	// Remote should have 3 LTX files total (initial + A's sync + B's sync)
-	client.mu.Lock()
-	ltxCount := len(client.ltxFiles[0])
-	client.mu.Unlock()
-	if ltxCount != 3 {
-		t.Fatalf("expected 3 LTX files on remote, got %d", ltxCount)
-	}
+	defer file3.Close()
 }
 
 func TestVFSFile_TransactionTracking(t *testing.T) {
