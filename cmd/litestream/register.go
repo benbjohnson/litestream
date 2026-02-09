@@ -14,12 +14,10 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-// AddCommand represents the command to add a database for replication.
-type AddCommand struct{}
+type RegisterCommand struct{}
 
-// Run executes the add command.
-func (c *AddCommand) Run(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("litestream-add", flag.ContinueOnError)
+func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("litestream-register", flag.ContinueOnError)
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	replicaFlag := fs.String("replica", "", "replica URL (e.g., s3://bucket/prefix, file:///backup/path)")
@@ -55,7 +53,7 @@ func (c *AddCommand) Run(ctx context.Context, args []string) error {
 		},
 	}
 
-	req := litestream.AddDatabaseRequest{
+	req := litestream.RegisterDatabaseRequest{
 		Path:       dbPath,
 		ReplicaURL: replicaURL,
 	}
@@ -64,7 +62,7 @@ func (c *AddCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := client.Post("http://localhost/add", "application/json", bytes.NewReader(reqBody))
+	resp, err := client.Post("http://localhost/register", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control socket: %w", err)
 	}
@@ -78,12 +76,12 @@ func (c *AddCommand) Run(ctx context.Context, args []string) error {
 	if resp.StatusCode != http.StatusOK {
 		var errResp litestream.ErrorResponse
 		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != "" {
-			return fmt.Errorf("add failed: %s", errResp.Error)
+			return fmt.Errorf("register failed: %s", errResp.Error)
 		}
-		return fmt.Errorf("add failed: %s", string(body))
+		return fmt.Errorf("register failed: %s", string(body))
 	}
 
-	var result litestream.AddDatabaseResponse
+	var result litestream.RegisterDatabaseResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -97,12 +95,11 @@ func (c *AddCommand) Run(ctx context.Context, args []string) error {
 	return nil
 }
 
-// Usage prints the help text for the add command.
-func (c *AddCommand) Usage() {
+func (c *RegisterCommand) Usage() {
 	fmt.Println(`
-usage: litestream add [OPTIONS] DB_PATH
+usage: litestream register [OPTIONS] DB_PATH
 
-Add a database for replication.
+Register a database for replication.
 
 Arguments:
   DB_PATH      Path to the SQLite database file.

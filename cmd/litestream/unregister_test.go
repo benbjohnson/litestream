@@ -9,9 +9,9 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-func TestRemoveCommand_Run(t *testing.T) {
+func TestUnregisterCommand_Run(t *testing.T) {
 	t.Run("MissingPath", func(t *testing.T) {
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock"})
 		if err == nil {
 			t.Error("expected error for missing path")
@@ -22,7 +22,7 @@ func TestRemoveCommand_Run(t *testing.T) {
 	})
 
 	t.Run("TooManyArguments", func(t *testing.T) {
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "/tmp/test.db", "extra"})
 		if err == nil {
 			t.Error("expected error for too many arguments")
@@ -33,7 +33,7 @@ func TestRemoveCommand_Run(t *testing.T) {
 	})
 
 	t.Run("InvalidTimeoutZero", func(t *testing.T) {
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-timeout", "0", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for zero timeout")
@@ -44,7 +44,7 @@ func TestRemoveCommand_Run(t *testing.T) {
 	})
 
 	t.Run("InvalidTimeoutNegative", func(t *testing.T) {
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-timeout", "-1", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for negative timeout")
@@ -55,7 +55,7 @@ func TestRemoveCommand_Run(t *testing.T) {
 	})
 
 	t.Run("SocketConnectionError", func(t *testing.T) {
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for socket connection failure")
@@ -77,7 +77,7 @@ func TestRemoveCommand_Run(t *testing.T) {
 		}
 		defer server.Close()
 
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		// Should not error even though database doesn't exist.
 		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "/nonexistent/db"})
 		if err != nil {
@@ -109,13 +109,13 @@ func TestRemoveCommand_Run(t *testing.T) {
 		}
 		defer server.Close()
 
-		cmd := &main.RemoveCommand{}
+		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, dbPath})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 
-		// Verify database was removed from store.
+		// Verify database was unregistered from store.
 		if len(store.DBs()) != 0 {
 			t.Errorf("expected 0 databases in store, got %d", len(store.DBs()))
 		}

@@ -275,7 +275,7 @@ func TestServer_HandleStop(t *testing.T) {
 	})
 }
 
-func TestServer_HandleAdd(t *testing.T) {
+func TestServer_HandleRegister(t *testing.T) {
 	t.Run("MissingPath", func(t *testing.T) {
 		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
 		store.CompactionMonitorEnabled = false
@@ -289,7 +289,7 @@ func TestServer_HandleAdd(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := `{"replica_url": "file:///tmp/backup"}`
-		resp, err := client.Post("http://localhost/add", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -313,7 +313,7 @@ func TestServer_HandleAdd(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := `{"path": "/tmp/test.db"}`
-		resp, err := client.Post("http://localhost/add", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -337,7 +337,7 @@ func TestServer_HandleAdd(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := `{"path": "/tmp/test.db", "replica_url": "invalid://badscheme"}`
-		resp, err := client.Post("http://localhost/add", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -369,18 +369,18 @@ func TestServer_HandleAdd(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s"}`, dbPath, backupDir)
-		resp, err := client.Post("http://localhost/add", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var result litestream.AddDatabaseResponse
+		var result litestream.RegisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "added", result.Status)
+		require.Equal(t, "registered", result.Status)
 		require.Equal(t, dbPath, result.Path)
 
-		// Verify database was added to store.
+		// Verify database was registered with store.
 		require.Len(t, store.DBs(), 1)
 		require.Equal(t, dbPath, store.DBs()[0].Path())
 	})
@@ -399,23 +399,23 @@ func TestServer_HandleAdd(t *testing.T) {
 		require.NoError(t, server.Start())
 		defer server.Close()
 
-		// Try to add the same database again.
+		// Try to register the same database again.
 		backupDir := t.TempDir()
 		client := newSocketClient(t, server.SocketPath)
 		body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s"}`, db.Path(), backupDir)
-		resp, err := client.Post("http://localhost/add", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var result litestream.AddDatabaseResponse
+		var result litestream.RegisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 		require.Equal(t, "already_exists", result.Status)
 	})
 }
 
-func TestServer_HandleRemove(t *testing.T) {
+func TestServer_HandleUnregister(t *testing.T) {
 	t.Run("MissingPath", func(t *testing.T) {
 		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
 		store.CompactionMonitorEnabled = false
@@ -429,7 +429,7 @@ func TestServer_HandleRemove(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := `{}`
-		resp, err := client.Post("http://localhost/remove", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/unregister", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
@@ -453,16 +453,16 @@ func TestServer_HandleRemove(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := `{"path": "/nonexistent/db"}`
-		resp, err := client.Post("http://localhost/remove", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/unregister", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
-		// RemoveDB is idempotent - returns success even if DB not found.
+		// UnregisterDB is idempotent - returns success even if DB not found.
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var result litestream.RemoveDatabaseResponse
+		var result litestream.UnregisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "removed", result.Status)
+		require.Equal(t, "unregistered", result.Status)
 	})
 
 	t.Run("Success", func(t *testing.T) {
@@ -484,18 +484,18 @@ func TestServer_HandleRemove(t *testing.T) {
 
 		client := newSocketClient(t, server.SocketPath)
 		body := fmt.Sprintf(`{"path": %q}`, dbPath)
-		resp, err := client.Post("http://localhost/remove", "application/json", io.NopCloser(stringReader(body)))
+		resp, err := client.Post("http://localhost/unregister", "application/json", io.NopCloser(stringReader(body)))
 		require.NoError(t, err)
 		defer resp.Body.Close()
 
 		require.Equal(t, http.StatusOK, resp.StatusCode)
 
-		var result litestream.RemoveDatabaseResponse
+		var result litestream.UnregisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "removed", result.Status)
+		require.Equal(t, "unregistered", result.Status)
 		require.Equal(t, dbPath, result.Path)
 
-		// Verify database was removed from store.
+		// Verify database was unregistered from store.
 		require.Empty(t, store.DBs())
 	})
 }

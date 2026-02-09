@@ -14,12 +14,10 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
-// RemoveCommand represents the command to remove a database from replication.
-type RemoveCommand struct{}
+type UnregisterCommand struct{}
 
-// Run executes the remove command.
-func (c *RemoveCommand) Run(ctx context.Context, args []string) error {
-	fs := flag.NewFlagSet("litestream-remove", flag.ContinueOnError)
+func (c *UnregisterCommand) Run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("litestream-unregister", flag.ContinueOnError)
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	fs.Usage = c.Usage
@@ -50,7 +48,7 @@ func (c *RemoveCommand) Run(ctx context.Context, args []string) error {
 		},
 	}
 
-	req := litestream.RemoveDatabaseRequest{
+	req := litestream.UnregisterDatabaseRequest{
 		Path:    dbPath,
 		Timeout: *timeout,
 	}
@@ -59,7 +57,7 @@ func (c *RemoveCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
-	resp, err := client.Post("http://localhost/remove", "application/json", bytes.NewReader(reqBody))
+	resp, err := client.Post("http://localhost/unregister", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control socket: %w", err)
 	}
@@ -73,12 +71,12 @@ func (c *RemoveCommand) Run(ctx context.Context, args []string) error {
 	if resp.StatusCode != http.StatusOK {
 		var errResp litestream.ErrorResponse
 		if err := json.Unmarshal(body, &errResp); err == nil && errResp.Error != "" {
-			return fmt.Errorf("remove failed: %s", errResp.Error)
+			return fmt.Errorf("unregister failed: %s", errResp.Error)
 		}
-		return fmt.Errorf("remove failed: %s", string(body))
+		return fmt.Errorf("unregister failed: %s", string(body))
 	}
 
-	var result litestream.RemoveDatabaseResponse
+	var result litestream.UnregisterDatabaseResponse
 	if err := json.Unmarshal(body, &result); err != nil {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
@@ -92,12 +90,11 @@ func (c *RemoveCommand) Run(ctx context.Context, args []string) error {
 	return nil
 }
 
-// Usage prints the help text for the remove command.
-func (c *RemoveCommand) Usage() {
+func (c *UnregisterCommand) Usage() {
 	fmt.Println(`
-usage: litestream remove [OPTIONS] DB_PATH
+usage: litestream unregister [OPTIONS] DB_PATH
 
-Remove a database from replication.
+Unregister a database from replication.
 
 Arguments:
   DB_PATH      Path to the SQLite database file.

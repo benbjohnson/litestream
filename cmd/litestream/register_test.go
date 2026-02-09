@@ -10,9 +10,9 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
-func TestAddCommand_Run(t *testing.T) {
+func TestRegisterCommand_Run(t *testing.T) {
 	t.Run("MissingDBPath", func(t *testing.T) {
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "-replica", "file:///tmp/backup"})
 		if err == nil {
 			t.Error("expected error for missing database path")
@@ -23,7 +23,7 @@ func TestAddCommand_Run(t *testing.T) {
 	})
 
 	t.Run("MissingReplicaFlag", func(t *testing.T) {
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for missing replica flag")
@@ -34,7 +34,7 @@ func TestAddCommand_Run(t *testing.T) {
 	})
 
 	t.Run("TooManyArguments", func(t *testing.T) {
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/tmp/test.sock", "-replica", "file:///tmp/backup", "/tmp/test.db", "extra"})
 		if err == nil {
 			t.Error("expected error for too many arguments")
@@ -45,7 +45,7 @@ func TestAddCommand_Run(t *testing.T) {
 	})
 
 	t.Run("InvalidTimeoutZero", func(t *testing.T) {
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-timeout", "0", "-replica", "file:///tmp/backup", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for zero timeout")
@@ -56,7 +56,7 @@ func TestAddCommand_Run(t *testing.T) {
 	})
 
 	t.Run("SocketConnectionError", func(t *testing.T) {
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "-replica", "file:///tmp/backup", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for socket connection failure")
@@ -86,13 +86,13 @@ func TestAddCommand_Run(t *testing.T) {
 		// Create a temp directory for backup.
 		backupDir := filepath.Join(t.TempDir(), "backup")
 
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, dbPath})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 
-		// Verify database was added to store.
+		// Verify database was registered with store.
 		if len(store.DBs()) != 1 {
 			t.Errorf("expected 1 database in store, got %d", len(store.DBs()))
 		}
@@ -119,13 +119,13 @@ func TestAddCommand_Run(t *testing.T) {
 		// Create a temp directory for backup.
 		backupDir := filepath.Join(t.TempDir(), "backup")
 
-		cmd := &main.AddCommand{}
+		cmd := &main.RegisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, db.Path()})
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
 		}
 
-		// Still only 1 database - didn't add a duplicate.
+		// Still only 1 database - didn't register a duplicate.
 		if len(store.DBs()) != 1 {
 			t.Errorf("expected 1 database in store, got %d", len(store.DBs()))
 		}

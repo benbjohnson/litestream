@@ -74,8 +74,8 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
-	mux.HandleFunc("POST /add", s.handleAdd)
-	mux.HandleFunc("POST /remove", s.handleRemove)
+	mux.HandleFunc("POST /register", s.handleRegister)
+	mux.HandleFunc("POST /unregister", s.handleUnregister)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 
@@ -384,32 +384,32 @@ type InfoResponse struct {
 	DatabaseCount int       `json:"database_count"`
 }
 
-// AddDatabaseRequest is the request body for the /add endpoint.
-type AddDatabaseRequest struct {
+// RegisterDatabaseRequest is the request body for the /register endpoint.
+type RegisterDatabaseRequest struct {
 	Path       string `json:"path"`
 	ReplicaURL string `json:"replica_url"`
 }
 
-// AddDatabaseResponse is the response body for the /add endpoint.
-type AddDatabaseResponse struct {
+// RegisterDatabaseResponse is the response body for the /register endpoint.
+type RegisterDatabaseResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
 }
 
-// RemoveDatabaseRequest is the request body for the /remove endpoint.
-type RemoveDatabaseRequest struct {
+// UnregisterDatabaseRequest is the request body for the /unregister endpoint.
+type UnregisterDatabaseRequest struct {
 	Path    string `json:"path"`
 	Timeout int    `json:"timeout,omitempty"`
 }
 
-// RemoveDatabaseResponse is the response body for the /remove endpoint.
-type RemoveDatabaseResponse struct {
+// UnregisterDatabaseResponse is the response body for the /unregister endpoint.
+type UnregisterDatabaseResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
 }
 
-func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
-	var req AddDatabaseRequest
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req RegisterDatabaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
 		return
@@ -433,7 +433,7 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 
 	// Check if database already exists.
 	if existing := s.store.FindDB(expandedPath); existing != nil {
-		writeJSON(w, http.StatusOK, AddDatabaseResponse{
+		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
 			Status: "already_exists",
 			Path:   expandedPath,
 		})
@@ -461,14 +461,14 @@ func (s *Server) handleAdd(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, AddDatabaseResponse{
-		Status: "added",
+	writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+		Status: "registered",
 		Path:   expandedPath,
 	})
 }
 
-func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
-	var req RemoveDatabaseRequest
+func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
+	var req UnregisterDatabaseRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
 		return
@@ -499,8 +499,8 @@ func (s *Server) handleRemove(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, RemoveDatabaseResponse{
-		Status: "removed",
+	writeJSON(w, http.StatusOK, UnregisterDatabaseResponse{
+		Status: "unregistered",
 		Path:   expandedPath,
 	})
 }
