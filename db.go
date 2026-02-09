@@ -10,7 +10,6 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
-	"math/rand"
 	"os"
 	"path/filepath"
 	"slices"
@@ -151,8 +150,6 @@ type DB struct {
 
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
-
-	monitorDelayDisabled bool
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
@@ -2111,17 +2108,6 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
 func (db *DB) monitor() {
-	// Jitter the first tick to prevent thundering herd when many databases start simultaneously.
-	if db.MonitorInterval > 0 && !db.monitorDelayDisabled {
-		jitterWindow := 3 * db.MonitorInterval
-		jitter := time.Duration(rand.Int63n(int64(jitterWindow)))
-		select {
-		case <-db.ctx.Done():
-			return
-		case <-time.After(jitter):
-		}
-	}
-
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
 

@@ -153,9 +153,18 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
-	for _, db := range s.dbs {
+	// Stagger db.Open() calls to prevent thundering herd when many databases
+	// start their monitor goroutines simultaneously.
+	var openDelay time.Duration
+	if n := len(s.dbs); n > 1 {
+		openDelay = DefaultMonitorInterval / time.Duration(n)
+	}
+	for i, db := range s.dbs {
 		if err := db.Open(); err != nil {
 			return err
+		}
+		if openDelay > 0 && i < len(s.dbs)-1 {
+			time.Sleep(openDelay)
 		}
 	}
 

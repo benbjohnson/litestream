@@ -36,9 +36,9 @@ type DirectoryMonitor struct {
 	dbs         map[string]*litestream.DB
 	watchedDirs map[string]struct{}
 
-	// pendingEvents accumulates create/write events for debouncing.
 	// Only accessed from the run() goroutine, so no mutex is needed.
-	pendingEvents map[string]fsnotify.Op
+	pendingEvents  map[string]fsnotify.Op
+	debounceActive bool
 
 	wg sync.WaitGroup
 }
@@ -123,8 +123,9 @@ func (dm *DirectoryMonitor) run() {
 			if !ok {
 				return
 			}
-			if dm.handleEvent(event) {
+			if dm.handleEvent(event) && !dm.debounceActive {
 				debounceTimer.Reset(debounceInterval)
+				dm.debounceActive = true
 			}
 		case <-debounceTimer.C:
 			dm.flushPendingEvents()
@@ -264,6 +265,7 @@ func (dm *DirectoryMonitor) flushPendingEvents() {
 		dm.handlePotentialDatabase(path)
 	}
 	dm.pendingEvents = make(map[string]fsnotify.Op)
+	dm.debounceActive = false
 }
 
 func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
