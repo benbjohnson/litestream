@@ -57,17 +57,6 @@ func NewCompactor(client ReplicaClient, logger *slog.Logger) *Compactor {
 	}
 }
 
-// Client returns the underlying ReplicaClient.
-func (c *Compactor) Client() ReplicaClient {
-	return c.client
-}
-
-// SetClient updates the ReplicaClient.
-// This is used by DB when the Replica is assigned after construction.
-func (c *Compactor) SetClient(client ReplicaClient) {
-	c.client = client
-}
-
 // MaxLTXFileInfo returns metadata for the last LTX file in a level.
 // Uses cache if available, otherwise fetches from remote.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {

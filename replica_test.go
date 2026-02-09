@@ -1681,14 +1681,7 @@ func writeV3WALSegment(t *testing.T, dir string, index int, offset int64, data [
 func createTestSQLiteDB(t *testing.T) []byte {
 	t.Helper()
 
-	// Create a temporary database
 	tmpPath := t.TempDir() + "/test.db"
-	db := testingutil.NewDB(t, tmpPath)
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-
-	// Create a table via SQL
 	sqldb := testingutil.MustOpenSQLDB(t, tmpPath)
 	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
 		t.Fatal(err)
@@ -1698,11 +1691,6 @@ func createTestSQLiteDB(t *testing.T) []byte {
 	}
 	testingutil.MustCloseSQLDB(t, sqldb)
 
-	if err := db.Close(context.Background()); err != nil {
-		t.Fatal(err)
-	}
-
-	// Read the database file
 	data, err := os.ReadFile(tmpPath)
 	if err != nil {
 		t.Fatal(err)
