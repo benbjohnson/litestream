@@ -105,6 +105,11 @@ type Store struct {
 	// If true, verify TXID consistency at destination level after each compaction.
 	VerifyCompaction bool
 
+	// SkipRemoteDeletion disables remote file deletion during retention
+	// enforcement, allowing cloud provider lifecycle policies to handle
+	// retention instead. Local file cleanup still occurs.
+	SkipRemoteDeletion bool
+
 	// Shutdown sync retry settings.
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
@@ -143,6 +148,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 		db.ShutdownSyncInterval = s.ShutdownSyncInterval
 		db.VerifyCompaction = s.VerifyCompaction
+		db.SkipRemoteDeletion = s.SkipRemoteDeletion
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -257,6 +263,7 @@ func (s *Store) AddDB(db *DB) error {
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	db.VerifyCompaction = s.VerifyCompaction
+	db.SkipRemoteDeletion = s.SkipRemoteDeletion
 	db.Done = s.done
 
 	// Open the database without holding the lock to avoid blocking other operations.
@@ -432,6 +439,16 @@ func (s *Store) SetVerifyCompaction(v bool) {
 	for _, db := range s.dbs {
 		db.VerifyCompaction = v
 		db.compactor.VerifyCompaction = v
+	}
+}
+
+func (s *Store) SetSkipRemoteDeletion(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.SkipRemoteDeletion = v
+	for _, db := range s.dbs {
+		db.SkipRemoteDeletion = v
+		db.compactor.SkipRemoteDeletion = v
 	}
 }
 

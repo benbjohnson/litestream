@@ -438,3 +438,47 @@ func TestStore_ValidationMonitor(t *testing.T) {
 		}
 	})
 }
+
+func TestStore_SetSkipRemoteDeletion(t *testing.T) {
+	db0, sqldb0 := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+	db1, sqldb1 := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db1, sqldb1)
+
+	levels := litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Hour},
+	}
+	store := litestream.NewStore([]*litestream.DB{db0, db1}, levels)
+	store.CompactionMonitorEnabled = false
+
+	// Initially should be false.
+	if store.SkipRemoteDeletion {
+		t.Fatal("expected SkipRemoteDeletion=false initially")
+	}
+
+	// Set to true and verify propagation to all DBs.
+	store.SetSkipRemoteDeletion(true)
+
+	if !store.SkipRemoteDeletion {
+		t.Fatal("expected store.SkipRemoteDeletion=true")
+	}
+	for _, db := range store.DBs() {
+		if !db.SkipRemoteDeletion {
+			t.Fatalf("expected db.SkipRemoteDeletion=true for %s", db.Path())
+		}
+	}
+
+	// Set back to false.
+	store.SetSkipRemoteDeletion(false)
+
+	if store.SkipRemoteDeletion {
+		t.Fatal("expected store.SkipRemoteDeletion=false after reset")
+	}
+	for _, db := range store.DBs() {
+		if db.SkipRemoteDeletion {
+			t.Fatalf("expected db.SkipRemoteDeletion=false for %s after reset", db.Path())
+		}
+	}
+}

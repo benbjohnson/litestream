@@ -162,6 +162,11 @@ type DB struct {
 	// contiguous TXID ranges after each compaction.
 	VerifyCompaction bool
 
+	// SkipRemoteDeletion disables remote file deletion during retention
+	// enforcement, allowing cloud provider lifecycle policies to handle
+	// retention instead. Local file cleanup still occurs.
+	SkipRemoteDeletion bool
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -438,6 +443,7 @@ func (db *DB) Open() (err error) {
 
 	// Set the compactor client once before starting any goroutines.
 	db.compactor.VerifyCompaction = db.VerifyCompaction
+	db.compactor.SkipRemoteDeletion = db.SkipRemoteDeletion
 	db.compactor.client = db.Replica.Client
 
 	// Start monitoring SQLite database in a separate goroutine.
@@ -1946,11 +1952,14 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion from both remote and local storage.
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	// Remove files marked for deletion from remote storage (unless skipped).
+	if db.SkipRemoteDeletion {
+		db.Logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", SnapshotLevel, "count", len(deleted))
+	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
+	// Always clean up local files.
 	for _, info := range deleted {
 		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
 		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
@@ -2067,7 +2076,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if db.SkipRemoteDeletion {
+		db.Logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", 0, "count", len(deleted))
+	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 

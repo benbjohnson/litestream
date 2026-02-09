@@ -257,6 +257,10 @@ type Config struct {
 	// When enabled, logs warnings if gaps or overlaps are detected.
 	VerifyCompaction bool `yaml:"verify-compaction"`
 
+	// SkipRemoteDeletion disables remote file deletion during retention
+	// enforcement, allowing cloud provider lifecycle policies to handle it.
+	SkipRemoteDeletion bool `yaml:"skip-remote-deletion"`
+
 	// Heartbeat settings (global defaults)
 	HeartbeatURL      string         `yaml:"heartbeat-url"`
 	HeartbeatInterval *time.Duration `yaml:"heartbeat-interval"`

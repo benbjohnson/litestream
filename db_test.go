@@ -621,6 +621,134 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 }
 
+func TestDB_EnforceSnapshotRetention_SkipRemoteDeletion(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Enable skip remote deletion.
+	db.SkipRemoteDeletion = true
+
+	// Create table and sync initial state.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create multiple snapshots with delays.
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Snapshot(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Count snapshots before retention.
+	countFiles := func() int {
+		t.Helper()
+		itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		for itr.Next() {
+			n++
+		}
+		itr.Close()
+		return n
+	}
+
+	beforeCount := countFiles()
+	if beforeCount != 3 {
+		t.Fatalf("expected 3 snapshots before retention, got %d", beforeCount)
+	}
+
+	// Enforce retention with skip remote deletion enabled.
+	retentionTime := time.Now().Add(-150 * time.Millisecond)
+	if _, err := db.EnforceSnapshotRetention(t.Context(), retentionTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote files should all still exist.
+	afterCount := countFiles()
+	if afterCount != beforeCount {
+		t.Fatalf("expected %d remote snapshots (no remote deletion), got %d", beforeCount, afterCount)
+	}
+}
+
+func TestDB_EnforceL0RetentionByTime_SkipRemoteDeletion(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Enable skip remote deletion and set a short L0 retention.
+	db.SkipRemoteDeletion = true
+	db.L0Retention = time.Nanosecond
+
+	// Create table and sync to create L0 files.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync replica to upload L0 files to remote storage.
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Count L0 files before.
+	countL0 := func() int {
+		t.Helper()
+		itr, err := db.Replica.Client.LTXFiles(t.Context(), 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		for itr.Next() {
+			n++
+		}
+		itr.Close()
+		return n
+	}
+
+	beforeCount := countL0()
+	if beforeCount < 2 {
+		t.Fatalf("expected at least 2 L0 files, got %d", beforeCount)
+	}
+
+	// Compact L0 to L1 so files become eligible for L0 retention.
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
+	if _, err := store.CompactDB(t.Context(), db, &litestream.CompactionLevel{Level: 1, Interval: time.Nanosecond}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait a moment for files to become old enough.
+	time.Sleep(10 * time.Millisecond)
+
+	// Enforce L0 retention.
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote L0 files should all still exist.
+	afterCount := countL0()
+	if afterCount != beforeCount {
+		t.Fatalf("expected %d remote L0 files (no remote deletion), got %d", beforeCount, afterCount)
+	}
+}
+
 // TestDB_ConcurrentMapWrite tests for race conditions in maxLTXFileInfos map access.
 // This test specifically targets the concurrent map write issue found in db.go
 // where sync() method writes to the map without proper locking.
