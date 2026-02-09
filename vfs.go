@@ -1627,13 +1627,17 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 		return fmt.Errorf("iterate remote files: %w", err)
 	}
 
-	// If remote has advanced beyond our expected position, we have a conflict
+	// If remote has advanced beyond our expected position, rebase our state.
+	// This happens when another VFSFile instance (e.g., from database/sql
+	// connection pool) synced before us. Since the VFS enforces single-writer
+	// semantics, our dirty pages are sequentially safe to apply after the
+	// remote's latest transaction.
 	if remoteTXID > f.expectedTXID {
-		f.logger.Warn("conflict detected",
+		f.logger.Info("rebasing on advanced remote",
 			"expected", f.expectedTXID,
 			"remote", remoteTXID)
-		return fmt.Errorf("%w: expected TXID %d but remote has %d",
-			ErrConflict, f.expectedTXID, remoteTXID)
+		f.expectedTXID = remoteTXID
+		f.pendingTXID = remoteTXID + 1
 	}
 
 	return nil
@@ -2162,6 +2166,12 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
+
+	// Keep write state in sync with remote when polling discovers advancement.
+	if f.writeEnabled && f.pos.TXID > f.expectedTXID {
+		f.expectedTXID = f.pos.TXID
+		f.pendingTXID = f.pos.TXID + 1
+	}
 
 	// Apply updates to hydrated file if hydration is complete
 	if f.hydrator != nil && f.hydrator.Complete() && len(combined) > 0 {
