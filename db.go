@@ -1187,7 +1187,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
-	info.commit = dec.Header().Commit
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
@@ -1374,7 +1373,6 @@ type syncInfo struct {
 	offset       int64 // end of the previous LTX read
 	salt1        uint32
 	salt2        uint32
-	commit       uint32
 	snapshotting bool   // if true, a full snapshot is required
 	reason       string // reason for snapshot
 }
@@ -1521,7 +1519,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 			return false, fmt.Errorf("write ltx from db: %w", err)
 		}
 	} else {
-		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap, info.commit); err != nil {
+		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap); err != nil {
 			return false, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
@@ -1626,43 +1624,28 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64, prevCommit uint32) error {
-	lockPgno := ltx.LockPgno(enc.Header().PageSize)
-
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
+	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
 		pgnos = append(pgnos, pgno)
 	}
-
-	if commit := enc.Header().Commit; prevCommit > 0 && commit > prevCommit {
-		for pgno := prevCommit + 1; pgno <= commit; pgno++ {
-			if pgno == lockPgno {
-				continue
-			}
-			if _, ok := pageMap[pgno]; ok {
-				continue
-			}
-			pgnos = append(pgnos, pgno)
-		}
-	}
-
 	slices.Sort(pgnos)
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
-		offset, ok := pageMap[pgno]
-		if !ok {
-			clear(data)
-		} else {
-			db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
+		offset := pageMap[pgno]
 
-			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
-				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
-			} else if n != len(data) {
-				return fmt.Errorf("short read page %d @ %d", pgno, offset)
-			}
+		db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
+
+		// Read source page using page map.
+		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
+			return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
+		} else if n != len(data) {
+			return fmt.Errorf("short read page %d @ %d", pgno, offset)
 		}
 
+		// Write page to LTX encoder.
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 			return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
 		}
@@ -2180,6 +2163,7 @@ func (db *DB) monitor() {
 		shmMxFrame, err := readSHMMxFrameKey(db.shmPath())
 		if err != nil {
 			// Can't read SHM header - fall back to sync.
+			db.Logger.Debug("failed to read shm mxFrame", "error", err)
 			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 				db.Logger.Error("sync error", "error", err)
 			}

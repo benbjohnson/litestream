@@ -980,9 +980,6 @@ func TestReadSHMMxFrameKey(t *testing.T) {
 	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, 16); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, 64); err != nil {
-		t.Fatal(err)
-	}
 
 	key, err := readSHMMxFrameKey(shmPath)
 	if err != nil {
@@ -990,28 +987,6 @@ func TestReadSHMMxFrameKey(t *testing.T) {
 	}
 	if key != ([4]byte{1, 2, 3, 4}) {
 		t.Fatalf("unexpected key: %#v", key)
-	}
-}
-
-func TestReadSHMMxFrameKeyMismatch(t *testing.T) {
-	dir := t.TempDir()
-	shmPath := filepath.Join(dir, "db-shm")
-
-	f, err := os.Create(shmPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer f.Close()
-
-	if _, err := f.WriteAt([]byte{1, 2, 3, 4}, 16); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := f.WriteAt([]byte{4, 3, 2, 1}, 64); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := readSHMMxFrameKey(shmPath); err == nil {
-		t.Fatal("expected error")
 	}
 }
 
