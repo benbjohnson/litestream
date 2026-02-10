@@ -1667,9 +1667,6 @@ func TestReplicaClient_NoSSE_Headers(t *testing.T) {
 // TestReplicaClient_R2ConcurrencyDefault tests that Cloudflare R2 endpoints get
 // Concurrency=2 by default to avoid their strict concurrent upload limits.
 // This is a regression test for issue #948.
-//
-// NOTE: This test is skipped until issue #948 is fixed. Once the fix is merged,
-// remove the t.Skip() call and the test should pass.
 func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
 	tests := []struct {
 		name            string
