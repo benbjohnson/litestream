@@ -299,6 +299,13 @@ func (s *Server) handleSyncReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	beforeDBPos, err := db.Pos()
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get database position: %v", err), nil)
+		return
+	}
+	beforeReplicaPos := db.Replica.Pos()
+
 	if err := db.Sync(ctx); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("sync failed: %v", err), nil)
 		return
@@ -309,16 +316,26 @@ func (s *Server) handleSyncReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pos, err := db.Pos()
+	afterDBPos, err := db.Pos()
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to get database position after sync: %v", err), nil)
+		return
+	}
+	afterReplicaPos := db.Replica.Pos()
+
+	if afterDBPos.TXID <= beforeDBPos.TXID && afterReplicaPos.TXID <= beforeReplicaPos.TXID {
+		writeJSON(w, http.StatusOK, SyncReplicateResponse{
+			Status: "no_change",
+			Path:   expandedPath,
+			TXID:   uint64(afterDBPos.TXID),
+		})
 		return
 	}
 
 	writeJSON(w, http.StatusOK, SyncReplicateResponse{
 		Status: "ok",
 		Path:   expandedPath,
-		TXID:   uint64(pos.TXID),
+		TXID:   uint64(afterDBPos.TXID),
 	})
 }
 

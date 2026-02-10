@@ -311,6 +311,46 @@ func TestServer_SyncReplicate(t *testing.T) {
 		require.Greater(t, result.TXID, uint64(0))
 	})
 
+	t.Run("NoChange", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		_, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`)
+		require.NoError(t, err)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := fmt.Sprintf(`{"path": %q}`, db.Path())
+
+		resp, err := client.Post("http://localhost/sync-replicate", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result litestream.SyncReplicateResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "ok", result.Status)
+
+		resp2, err := client.Post("http://localhost/sync-replicate", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp2.Body.Close()
+		require.Equal(t, http.StatusOK, resp2.StatusCode)
+
+		var result2 litestream.SyncReplicateResponse
+		require.NoError(t, json.NewDecoder(resp2.Body).Decode(&result2))
+		require.Equal(t, "no_change", result2.Status)
+		require.Equal(t, result.TXID, result2.TXID)
+	})
+
 	t.Run("NotFound", func(t *testing.T) {
 		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
 		store.CompactionMonitorEnabled = false
