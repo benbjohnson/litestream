@@ -16,6 +16,7 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestDB_Path(t *testing.T) {
@@ -1330,6 +1331,27 @@ func TestDB_SyncStatus(t *testing.T) {
 			t.Fatal("expected InSync=false after new writes without replica sync")
 		}
 	})
+
+	t.Run("CancelledContext", func(t *testing.T) {
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+		client := &mock.ReplicaClient{
+			LTXFilesFunc: func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+				return nil, ctx.Err()
+			},
+		}
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := db.SyncStatus(ctx)
+		if err == nil {
+			t.Fatal("expected error with cancelled context")
+		}
+		if !strings.Contains(err.Error(), "remote position") {
+			t.Fatalf("expected remote position error, got: %v", err)
+		}
+	})
 }
 
 func TestDB_SyncAndWait(t *testing.T) {
@@ -1414,6 +1436,27 @@ func TestDB_EnsureExists(t *testing.T) {
 
 		if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
 			t.Fatal("expected database file to not exist when no backup available")
+		}
+	})
+
+	t.Run("MissingParentDir", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "subdir", "nested", "db")
+
+		db := testingutil.NewDB(t, dbPath)
+		client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		if err := db.EnsureExists(context.Background()); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+
+		info, err := os.Stat(filepath.Join(dir, "subdir", "nested"))
+		if err != nil {
+			t.Fatal("expected parent directories to be created")
+		}
+		if !info.IsDir() {
+			t.Fatal("expected parent path to be a directory")
 		}
 	})
 

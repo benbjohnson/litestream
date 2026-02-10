@@ -417,7 +417,8 @@ type SyncStatus struct {
 }
 
 // SyncStatus returns the current replication status of the database, comparing
-// the local transaction position against the remote replica position.
+// the local transaction position against the remote replica position. The remote
+// position is queried from the replica storage, so this method may perform I/O.
 func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 	if db.Replica == nil {
 		return SyncStatus{}, fmt.Errorf("no replica configured")
@@ -428,7 +429,10 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 		return SyncStatus{}, fmt.Errorf("local position: %w", err)
 	}
 
-	remotePos := db.Replica.Pos()
+	remotePos, err := db.Replica.calcPos(ctx)
+	if err != nil {
+		return SyncStatus{}, fmt.Errorf("remote position: %w", err)
+	}
 
 	return SyncStatus{
 		LocalTXID:  localPos.TXID,
@@ -470,12 +474,18 @@ func (db *DB) EnsureExists(ctx context.Context) error {
 		return fmt.Errorf("stat database: %w", err)
 	}
 
+	if dir := filepath.Dir(db.Path()); dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return fmt.Errorf("create parent directory: %w", err)
+		}
+	}
+
 	opt := NewRestoreOptions()
 	opt.OutputPath = db.Path()
 
 	if err := db.Replica.Restore(ctx, opt); err != nil {
 		if errors.Is(err, ErrTxNotAvailable) || errors.Is(err, ErrNoSnapshots) {
-			db.Logger.Info("no backup found, will create fresh database")
+			db.Logger.Debug("no backup found, will create fresh database")
 			return nil
 		}
 		return fmt.Errorf("restore from backup: %w", err)
