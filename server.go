@@ -456,8 +456,8 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	db.Replica = replica
 
 	// Register database with store (this also opens the database).
-	if err := s.store.AddDB(db); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to add database: %v", err), nil)
+	if err := s.store.RegisterDB(db); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register database: %v", err), nil)
 		return
 	}
 
@@ -494,8 +494,8 @@ func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 
 	// Remove database from store (this also closes it).
-	if err := s.store.RemoveDB(ctx, expandedPath); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to remove database: %v", err), nil)
+	if err := s.store.UnregisterDB(ctx, expandedPath); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to unregister database: %v", err), nil)
 		return
 	}
 

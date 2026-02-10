@@ -236,8 +236,8 @@ func (s *Store) DBs() []*DB {
 	return slices.Clone(s.dbs)
 }
 
-// AddDB registers a new database with the store and starts monitoring it.
-func (s *Store) AddDB(db *DB) error {
+// RegisterDB registers a new database with the store and starts monitoring it.
+func (s *Store) RegisterDB(db *DB) error {
 	if db == nil {
 		return fmt.Errorf("db required")
 	}
@@ -290,8 +290,8 @@ func (s *Store) AddDB(db *DB) error {
 	return nil
 }
 
-// RemoveDB stops monitoring the database at the provided path and closes it.
-func (s *Store) RemoveDB(ctx context.Context, path string) error {
+// UnregisterDB stops monitoring the database at the provided path and closes it.
+func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	if path == "" {
 		return fmt.Errorf("db path required")
 	}
