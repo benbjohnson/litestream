@@ -2620,7 +2620,81 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			t.Error("expected manual RequireContentMD5 override to take precedence")
 		}
 	})
+
+	t.Run("ProviderDefaultsParity", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			endpoint string
+		}{
+			{"Tigris", "https://fly.storage.tigris.dev"},
+			{"DigitalOcean", "https://nyc3.digitaloceanspaces.com"},
+			{"Backblaze", "https://s3.us-west-002.backblazeb2.com"},
+			{"Filebase", "https://s3.filebase.com"},
+			{"Scaleway", "https://s3.fr-par.scw.cloud"},
+			{"CloudflareR2", "https://accountid.r2.cloudflarestorage.com"},
+			{"MinIO", "http://localhost:9000"},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				urlClient, err := litestream.NewReplicaClientFromURL(
+					"s3://mybucket/path?endpoint=" + tt.endpoint + "&region=us-east-1",
+				)
+				if err != nil {
+					t.Fatalf("URL factory error: %v", err)
+				}
+				uc := urlClient.(*s3.ReplicaClient)
+
+				cc, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+					Path: "path",
+					ReplicaSettings: main.ReplicaSettings{
+						Bucket:   "mybucket",
+						Endpoint: tt.endpoint,
+						Region:   "us-east-1",
+					},
+				}, nil)
+				if err != nil {
+					t.Fatalf("Config factory error: %v", err)
+				}
+
+				if uc.SignPayload != cc.SignPayload {
+					t.Errorf("SignPayload: URL=%v, Config=%v", uc.SignPayload, cc.SignPayload)
+				}
+				if uc.RequireContentMD5 != cc.RequireContentMD5 {
+					t.Errorf("RequireContentMD5: URL=%v, Config=%v", uc.RequireContentMD5, cc.RequireContentMD5)
+				}
+				if uc.ForcePathStyle != cc.ForcePathStyle {
+					t.Errorf("ForcePathStyle: URL=%v, Config=%v", uc.ForcePathStyle, cc.ForcePathStyle)
+				}
+				if uc.Concurrency != cc.Concurrency {
+					t.Errorf("Concurrency: URL=%v, Config=%v", uc.Concurrency, cc.Concurrency)
+				}
+			})
+		}
+	})
+
+	t.Run("R2ConfigExplicitOverride", func(t *testing.T) {
+		signFalse := false
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:      "mybucket",
+				Endpoint:    "https://accountid.r2.cloudflarestorage.com",
+				SignPayload: &signFalse,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.SignPayload {
+			t.Error("expected explicit SignPayload=false to override R2 default")
+		}
+	})
 }
+
 func TestGlobalDefaults(t *testing.T) {
 	// Test comprehensive global defaults functionality
 	t.Run("GlobalReplicaDefaults", func(t *testing.T) {

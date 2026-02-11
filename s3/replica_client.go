@@ -62,6 +62,10 @@ const DefaultRegion = "us-east-1"
 // S3 can handle 5,500+ HEAD requests per second per prefix.
 const DefaultMetadataConcurrency = 50
 
+// DefaultR2Concurrency is the default number of concurrent multipart upload
+// parts for Cloudflare R2, which has strict concurrent upload limits.
+const DefaultR2Concurrency = 2
+
 // contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
 // through the middleware stack from Serialize to Finalize phase.
 type contentMD5StackKey struct{}
@@ -222,6 +226,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		if isFilebase || isBackblaze || isMinIO {
 			forcePathStyle = true
 		}
+	}
+	if isCloudflareR2 {
+		client.Concurrency = DefaultR2Concurrency
 	}
 
 	// Configure client
