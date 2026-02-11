@@ -17,6 +17,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -138,6 +139,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		signPayloadSet bool
 		requireMD5     bool
 		requireMD5Set  bool
+		concurrency    int
+		concurrencySet bool
+		partSize       int64
 	)
 
 	// Parse host for bucket and region
@@ -154,18 +158,18 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		qEndpoint, _ = litestream.EnsureEndpointScheme(qEndpoint)
 		endpoint = qEndpoint
 		// Default to path style for custom endpoints unless explicitly set to false
-		if query.Get("forcePathStyle") != "false" {
+		if v, ok := litestream.BoolQueryValue(query, "forcePathStyle", "force-path-style"); !ok || v {
 			forcePathStyle = true
 		}
 	}
 	if qRegion := query.Get("region"); qRegion != "" {
 		region = qRegion
 	}
-	if qForcePathStyle := query.Get("forcePathStyle"); qForcePathStyle != "" {
-		forcePathStyle = qForcePathStyle == "true"
+	if v, ok := litestream.BoolQueryValue(query, "forcePathStyle", "force-path-style"); ok {
+		forcePathStyle = v
 	}
-	if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
-		skipVerify = qSkipVerify == "true"
+	if v, ok := litestream.BoolQueryValue(query, "skipVerify", "skip-verify"); ok {
+		skipVerify = v
 	}
 	if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
 		signPayload = v
@@ -174,6 +178,21 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 		requireMD5 = v
 		requireMD5Set = true
+	}
+	if v := query.Get("concurrency"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			concurrency = n
+			concurrencySet = true
+		}
+	}
+	if v := query.Get("partSize"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			partSize = n
+		}
+	} else if v := query.Get("part-size"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			partSize = n
+		}
 	}
 
 	// Ensure bucket is set
@@ -191,7 +210,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set via query parameter.
-	forcePathStyleSet := query.Get("forcePathStyle") != ""
+	forcePathStyleSet := query.Get("forcePathStyle") != "" || query.Get("force-path-style") != ""
 
 	// Read authentication from environment variables
 	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
@@ -244,6 +263,12 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 	if requireMD5Set {
 		client.RequireContentMD5 = requireMD5
+	}
+	if concurrencySet {
+		client.Concurrency = concurrency
+	}
+	if partSize > 0 {
+		client.PartSize = partSize
 	}
 
 	// Parse SSE-C parameters from query string
