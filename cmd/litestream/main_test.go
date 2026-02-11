@@ -3,10 +3,13 @@ package main_test
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -3023,6 +3026,36 @@ dbs:
 			t.Errorf("DBs[0].Path = %q, want %q", got, dbPath)
 		}
 	})
+}
+
+func TestX509FallbackRoots(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("x509 fallback test requires Linux (macOS uses system keychain)")
+	}
+
+	if os.Getenv("GO_X509_FALLBACK_TEST") == "1" {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			t.Fatalf("SystemCertPool() error: %v", err)
+		}
+		if pool.Equal(x509.NewCertPool()) {
+			t.Fatal("SystemCertPool() returned empty pool; x509roots/fallback not providing certificates")
+		}
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestX509FallbackRoots$", "-test.v")
+	cmd.Env = []string{
+		"GO_X509_FALLBACK_TEST=1",
+		"SSL_CERT_FILE=/nonexistent/cert.pem",
+		"SSL_CERT_DIR=/nonexistent/certs",
+		"HOME=" + t.TempDir(),
+	}
+	out, err := cmd.CombinedOutput()
+	t.Logf("subprocess output:\n%s", out)
+	if err != nil {
+		t.Fatalf("x509 fallback roots verification failed: %v", err)
+	}
 }
 
 func hasDBPath(dbs []*litestream.DB, path string) bool {
