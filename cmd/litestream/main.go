@@ -1414,6 +1414,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
 	isScaleway := litestream.IsScalewayEndpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
+	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set by user (config or URL query param).
 	forcePathStyleSet := c.ForcePathStyle != nil
@@ -1425,7 +1426,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}

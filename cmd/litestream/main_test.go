@@ -2620,6 +2620,61 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			t.Error("expected manual RequireContentMD5 override to take precedence")
 		}
 	})
+
+	t.Run("R2ConfigEndpoint", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:   "mybucket",
+				Endpoint: "https://accountid.r2.cloudflarestorage.com",
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !client.SignPayload {
+			t.Error("expected SignPayload to be true for config-based R2 endpoint")
+		}
+	})
+
+	t.Run("R2URLEndpoint", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/db?endpoint=https://accountid.r2.cloudflarestorage.com&region=auto",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if !client.SignPayload {
+			t.Error("expected SignPayload to be true for URL-based R2 endpoint")
+		}
+	})
+
+	t.Run("R2ConfigExplicitOverride", func(t *testing.T) {
+		signFalse := false
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:      "mybucket",
+				Endpoint:    "https://accountid.r2.cloudflarestorage.com",
+				SignPayload: &signFalse,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.SignPayload {
+			t.Error("expected explicit SignPayload=false to override R2 default")
+		}
+	})
 }
 func TestGlobalDefaults(t *testing.T) {
 	// Test comprehensive global defaults functionality
