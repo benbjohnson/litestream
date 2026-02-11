@@ -1426,6 +1426,107 @@ func TestDB_Issue994_RunawayDiskUsage(t *testing.T) {
 	}
 }
 
+// TestDB_Verify_ForceSnapshotAfterCheckpointWALRestart verifies that when
+// forceNextSnapshot is set (simulating a WAL restart during checkpoint),
+// verify() returns snapshotting=true with proper WAL header values.
+//
+// This tests the fix for a race condition where external writes could be
+// auto-checkpointed to the database while execCheckpoint() releases the
+// read lock. Those pages would be missing from the new WAL, so a full
+// snapshot is required.
+func TestDB_Verify_ForceSnapshotAfterCheckpointWALRestart(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Without forceNextSnapshot, verify should return snapshotting=false
+	// (incremental sync from where the last LTX left off).
+	info, err := db.verify(ctx)
+	if err != nil {
+		t.Fatalf("verify without flag: %v", err)
+	}
+	if info.snapshotting {
+		t.Fatal("verify without flag: expected snapshotting=false")
+	}
+
+	// Read current WAL header to get expected salt values.
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatalf("read WAL header: %v", err)
+	}
+	expectedSalt1 := binary.BigEndian.Uint32(walHdr[16:])
+	expectedSalt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	// Set forceNextSnapshot (simulates what checkpoint() does on WAL restart).
+	db.forceNextSnapshot = true
+
+	info, err = db.verify(ctx)
+	if err != nil {
+		t.Fatalf("verify with flag: %v", err)
+	}
+	if !info.snapshotting {
+		t.Fatal("verify with flag: expected snapshotting=true")
+	}
+	if info.offset != WALHeaderSize {
+		t.Fatalf("verify with flag: offset=%d, want %d", info.offset, WALHeaderSize)
+	}
+	if info.salt1 != expectedSalt1 {
+		t.Fatalf("verify with flag: salt1=%d, want %d", info.salt1, expectedSalt1)
+	}
+	if info.salt2 != expectedSalt2 {
+		t.Fatalf("verify with flag: salt2=%d, want %d", info.salt2, expectedSalt2)
+	}
+
+	// Flag should be cleared after use.
+	if db.forceNextSnapshot {
+		t.Fatal("forceNextSnapshot should be cleared after verify")
+	}
+
+	// Next verify should return to normal incremental behavior.
+	info, err = db.verify(ctx)
+	if err != nil {
+		t.Fatalf("verify after cleared flag: %v", err)
+	}
+	if info.snapshotting {
+		t.Fatal("verify after cleared flag: expected snapshotting=false")
+	}
+}
+
 func dirSize(t *testing.T, path string) int64 {
 	t.Helper()
 	var size int64
