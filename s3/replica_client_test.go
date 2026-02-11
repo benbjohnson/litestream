@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -334,6 +335,133 @@ func mustLTX(t *testing.T) []byte {
 	}
 
 	return buf.Bytes()
+}
+
+func mustLTXWithSize(t *testing.T, size int) []byte {
+	t.Helper()
+	header := mustLTX(t)
+	if size <= len(header) {
+		return header[:size]
+	}
+	data := make([]byte, size)
+	copy(data, header)
+	return data
+}
+
+func TestReplicaClient_MultipartUploadThreshold(t *testing.T) {
+	const mb = 1024 * 1024
+
+	tests := []struct {
+		name          string
+		payloadSize   int
+		wantMultipart bool
+	}{
+		{"BelowThreshold_4MB", 4 * mb, false},
+		{"AtThreshold_5MB", 5 * mb, true},
+		{"AboveThreshold_6MB", 6 * mb, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var (
+				gotPut      bool
+				gotInitiate bool
+				gotComplete bool
+				awsChunked  bool
+			)
+
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				_, _ = io.Copy(io.Discard, r.Body)
+
+				if r.Method == http.MethodPut {
+					if strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
+						awsChunked = true
+					}
+					if strings.Contains(r.Header.Get("Transfer-Encoding"), "aws-chunked") {
+						awsChunked = true
+					}
+				}
+
+				query := r.URL.Query()
+
+				if r.Method == http.MethodPost && query.Has("uploads") {
+					gotInitiate = true
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test-key</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
+					return
+				}
+
+				if r.Method == http.MethodPut && query.Get("partNumber") != "" {
+					w.Header().Set("ETag", fmt.Sprintf(`"part-etag-%s"`, query.Get("partNumber")))
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+
+				if r.Method == http.MethodPost && query.Get("uploadId") != "" && !query.Has("uploads") {
+					gotComplete = true
+					w.Header().Set("Content-Type", "application/xml")
+					w.WriteHeader(http.StatusOK)
+					fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Location>http://test-bucket.s3.amazonaws.com/test-key</Location><Bucket>test-bucket</Bucket><Key>test-key</Key><ETag>"complete-etag"</ETag></CompleteMultipartUploadResult>`)
+					return
+				}
+
+				if r.Method == http.MethodPut {
+					gotPut = true
+					w.Header().Set("ETag", `"test-etag"`)
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer server.Close()
+
+			data := mustLTXWithSize(t, tt.payloadSize)
+
+			client := NewReplicaClient()
+			client.Bucket = "test-bucket"
+			client.Path = "replica"
+			client.Region = "us-east-1"
+			client.Endpoint = server.URL
+			client.ForcePathStyle = true
+			client.AccessKeyID = "test-access-key"
+			client.SecretAccessKey = "test-secret-key"
+
+			ctx := context.Background()
+			if err := client.Init(ctx); err != nil {
+				t.Fatalf("Init() error: %v", err)
+			}
+
+			if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+				t.Fatalf("WriteLTXFile() error: %v", err)
+			}
+
+			if tt.wantMultipart {
+				if !gotInitiate {
+					t.Error("expected CreateMultipartUpload but did not receive one")
+				}
+				if !gotComplete {
+					t.Error("expected CompleteMultipartUpload but did not receive one")
+				}
+				if gotPut {
+					t.Error("did not expect single PUT for multipart upload")
+				}
+			} else {
+				if !gotPut {
+					t.Error("expected single PUT upload but did not receive one")
+				}
+				if gotInitiate {
+					t.Error("did not expect CreateMultipartUpload for single-part upload")
+				}
+			}
+
+			if awsChunked {
+				t.Error("aws-chunked encoding detected; this is incompatible with S3-compatible providers")
+			}
+		})
+	}
 }
 
 // TestReplicaClient_Init_BucketValidation tests that Init validates bucket name
@@ -1664,21 +1792,16 @@ func TestReplicaClient_NoSSE_Headers(t *testing.T) {
 // TestReplicaClient_R2ConcurrencyDefault tests that Cloudflare R2 endpoints get
 // Concurrency=2 by default to avoid their strict concurrent upload limits.
 // This is a regression test for issue #948.
-//
-// NOTE: This test is skipped until issue #948 is fixed. Once the fix is merged,
-// remove the t.Skip() call and the test should pass.
 func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
 	tests := []struct {
 		name            string
 		url             string
 		wantConcurrency int
-		skipReason      string
 	}{
 		{
 			name:            "R2_DefaultConcurrency",
 			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
 			wantConcurrency: 2,
-			skipReason:      "pending issue #948 fix",
 		},
 		{
 			name:            "AWS_NoConcurrencyOverride",
@@ -1694,10 +1817,6 @@ func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.skipReason != "" {
-				t.Skip(tt.skipReason)
-			}
-
 			client, err := litestream.NewReplicaClientFromURL(tt.url)
 			if err != nil {
 				t.Fatalf("NewReplicaClientFromURL() error: %v", err)
