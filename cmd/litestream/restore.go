@@ -28,6 +28,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
+	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -38,6 +39,22 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	initLog(os.Stdout, "INFO", "text")
+
+	// When follow mode is enabled, set up signal handling so Ctrl+C stops
+	// the follow loop cleanly.
+	if opt.Follow {
+		ch := signalChan()
+		cancelCtx, cancel := context.WithCancel(ctx)
+		go func() {
+			select {
+			case <-ch:
+				cancel()
+			case <-cancelCtx.Done():
+			}
+		}()
+		ctx = cancelCtx
+		defer cancel()
+	}
 
 	// Parse timestamp, if specified.
 	if *timestampStr != "" {
@@ -179,6 +196,12 @@ Arguments:
 	-if-replica-exists
 	    Returns exit code of 0 if no backups found.
 
+	-f
+	    Follow mode. After restoring, continuously poll for and apply
+	    new changes. Similar to tail -f. The restored database should
+	    only be opened in read-only mode by consumers.
+	    Cannot be used with -txid or -timestamp.
+
 	-parallelism NUM
 	    Determines the number of WAL files downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
@@ -197,6 +220,9 @@ Examples:
 
 	# Restore database from S3 replica URL.
 	$ litestream restore -o /tmp/db s3://mybucket/db
+
+	# Continuously restore (follow) a database from a replica.
+	$ litestream restore -f -o /tmp/read-replica.db s3://mybucket/db
 
 `[1:],
 		DefaultConfigPath(),

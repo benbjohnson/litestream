@@ -523,6 +523,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("output path required")
 	} else if opt.TXID != 0 && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot specify index & timestamp to restore")
+	} else if opt.Follow && opt.TXID != 0 {
+		return fmt.Errorf("cannot use follow mode with -txid")
+	} else if opt.Follow && !opt.Timestamp.IsZero() {
+		return fmt.Errorf("cannot use follow mode with -timestamp")
 	}
 
 	// Ensure output path does not already exist.
@@ -533,7 +537,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is specified).
-	if opt.TXID == 0 {
+	// Skip V3 format when follow mode is enabled (V3 doesn't support incremental following).
+	if opt.TXID == 0 && !opt.Follow {
 		if client, ok := r.Client.(ReplicaClientV3); ok {
 			useV3, err := r.shouldUseV3Restore(ctx, client, opt.Timestamp)
 			if err != nil {
@@ -626,7 +631,213 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Copy file to final location.
 	r.Logger().Debug("renaming database from temporary location")
-	return os.Rename(tmpOutputPath, opt.OutputPath)
+	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
+		return err
+	}
+
+	// Enter follow mode if enabled, continuously applying new LTX files.
+	if opt.Follow {
+		maxTXID := infos[len(infos)-1].MaxTXID
+		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
+	}
+
+	return nil
+}
+
+// follow enters a continuous restore loop, polling for new LTX files and
+// applying them to the restored database. It blocks until the context is
+// cancelled (e.g. Ctrl+C). Returns nil on clean shutdown.
+func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TXID, interval time.Duration) error {
+	f, err := os.OpenFile(outputPath, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("open database for follow: %w", err)
+	}
+	defer func() {
+		_ = f.Sync()
+		_ = f.Close()
+	}()
+
+	// Read page size from SQLite header (offset 16, 2 bytes, big-endian).
+	var buf [2]byte
+	if _, err := f.ReadAt(buf[:], 16); err != nil {
+		return fmt.Errorf("read page size from database header: %w", err)
+	}
+	pageSize := uint32(buf[0])<<8 | uint32(buf[1])
+	if pageSize == 1 {
+		pageSize = 65536
+	}
+
+	if interval <= 0 {
+		interval = DefaultFollowInterval
+	}
+
+	r.Logger().Info("entering follow mode", "output", outputPath, "txid", lastTXID, "interval", interval)
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	var consecutiveErrors int
+	for {
+		select {
+		case <-ctx.Done():
+			r.Logger().Info("follow mode stopped")
+			return nil
+		case <-ticker.C:
+			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
+			if err != nil {
+				if ctx.Err() != nil {
+					r.Logger().Info("follow mode stopped")
+					return nil
+				}
+				consecutiveErrors++
+				r.Logger().Error("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
+				continue
+			}
+			if newTXID > lastTXID {
+				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
+				lastTXID = newTXID
+				consecutiveErrors = 0
+			}
+		}
+	}
+}
+
+// applyNewLTXFiles polls for new LTX files and applies them to the database.
+// It starts from level 0 and falls back to higher levels if there are gaps
+// (e.g., level 0 files were compacted away).
+func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+	currentTXID := afterTXID
+
+	// Poll level 0 for the most recent incremental files.
+	itr, err := r.Client.LTXFiles(ctx, 0, currentTXID+1, false)
+	if err != nil {
+		return currentTXID, fmt.Errorf("list level 0 ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	for itr.Next() {
+		info := itr.Item()
+
+		// If there's a gap, try to fill it from higher compaction levels.
+		if info.MinTXID > currentTXID+1 {
+			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize)
+			if err != nil {
+				return currentTXID, err
+			}
+			currentTXID = bridgedTXID
+
+			// Re-check if this file is still needed after bridging.
+			if info.MaxTXID <= currentTXID {
+				continue
+			}
+			if info.MinTXID > currentTXID+1 {
+				return currentTXID, nil
+			}
+		}
+
+		// Skip if already covered by a higher-level file.
+		if info.MaxTXID <= currentTXID {
+			continue
+		}
+
+		if err := r.applyLTXFile(ctx, f, info, pageSize); err != nil {
+			return currentTXID, fmt.Errorf("apply ltx file (level=%d, min=%s, max=%s): %w",
+				info.Level, info.MinTXID, info.MaxTXID, err)
+		}
+		currentTXID = info.MaxTXID
+	}
+
+	return currentTXID, nil
+}
+
+// applyLTXFile applies a single LTX file's pages to the database file.
+// This follows the same pattern as Hydrator.ApplyLTX (vfs.go:712-747).
+func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileInfo, pageSize uint32) error {
+	rc, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open ltx file: %w", err)
+	}
+	defer rc.Close()
+
+	dec := ltx.NewDecoder(rc)
+	if err := dec.DecodeHeader(); err != nil {
+		return fmt.Errorf("decode header: %w", err)
+	}
+
+	hdr := dec.Header()
+
+	for {
+		var phdr ltx.PageHeader
+		data := make([]byte, pageSize)
+		if err := dec.DecodePage(&phdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode page: %w", err)
+		}
+
+		off := int64(phdr.Pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt(data, off); err != nil {
+			return fmt.Errorf("write page %d: %w", phdr.Pgno, err)
+		}
+	}
+
+	// Truncate database if it shrank (e.g., after VACUUM).
+	if hdr.Commit > 0 {
+		newSize := int64(hdr.Commit) * int64(pageSize)
+		if err := f.Truncate(newSize); err != nil {
+			return fmt.Errorf("truncate: %w", err)
+		}
+	}
+
+	return f.Sync()
+}
+
+// fillFollowGap attempts to bridge a gap in level 0 files by searching
+// higher compaction levels for a file that covers the missing TXID range.
+func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.TXID, gapMinTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+	currentTXID := afterTXID
+
+	for level := 1; level < SnapshotLevel; level++ {
+		itr, err := r.Client.LTXFiles(ctx, level, currentTXID+1, false)
+		if err != nil {
+			return currentTXID, fmt.Errorf("list level %d ltx files: %w", level, err)
+		}
+
+		for itr.Next() {
+			info := itr.Item()
+
+			// Skip if there's a gap at this level too.
+			if info.MinTXID > currentTXID+1 {
+				break
+			}
+
+			// Skip if already covered.
+			if info.MaxTXID <= currentTXID {
+				continue
+			}
+
+			if err := r.applyLTXFile(ctx, f, info, pageSize); err != nil {
+				itr.Close()
+				return currentTXID, fmt.Errorf("apply gap-fill ltx file (level=%d, min=%s, max=%s): %w",
+					info.Level, info.MinTXID, info.MaxTXID, err)
+			}
+			currentTXID = info.MaxTXID
+
+			// If we've bridged past the gap, we're done.
+			if currentTXID+1 >= gapMinTXID {
+				itr.Close()
+				return currentTXID, nil
+			}
+		}
+		itr.Close()
+
+		// If we made progress at this level, restart from level 1.
+		if currentTXID > afterTXID {
+			return currentTXID, nil
+		}
+	}
+
+	return currentTXID, nil
 }
 
 // RestoreV3 restores from a v0.3.x format backup.
