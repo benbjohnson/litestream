@@ -301,7 +301,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 
 | Provider | Detection Pattern | Applied Settings |
 |----------|-------------------|------------------|
-| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true`, `concurrency=2`, checksums disabled |
+| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true` |
 | Backblaze B2 | `*.backblazeb2.com` | `sign-payload=true`, `force-path-style=true` |
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
 | Scaleway | `*.scw.cloud` | `sign-payload=true` |
