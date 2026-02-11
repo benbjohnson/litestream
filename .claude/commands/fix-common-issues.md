@@ -158,6 +158,47 @@ defer func() {
 }()
 ```
 
+## Issue 8: Corrupted or Missing LTX Files
+
+**Symptom**: Sync failures with errors like "ltx validation failed", "nonsequential page numbers",
+"non-contiguous transaction files", or persistent sync retry backoff loops after unclean shutdowns.
+
+**Check**:
+```bash
+# Look for LTXError messages in logs
+rg -i "ltx.*error|reset.*local|auto.recover" /var/log/litestream.log
+
+# Check if meta directory has corrupted state (note dot prefix)
+ls -la /path/to/.database.db-litestream/ltx/
+```
+
+**Fix - Manual Reset**:
+```bash
+# Clears local LTX state, forces fresh snapshot on next sync
+# Database file is NOT modified
+litestream reset /path/to/database.db
+
+# With explicit config file
+litestream reset -config /etc/litestream.yml /path/to/database.db
+```
+
+**Fix - Automatic Recovery**:
+```yaml
+# Add to replica config in litestream.yml
+dbs:
+  - path: /path/to/database.db
+    replicas:
+      - url: s3://bucket/path
+        auto-recover: true  # Automatically resets on LTX errors
+```
+
+**When to use which**: Use `auto-recover` for unattended deployments where automatic recovery
+is preferred over manual intervention. Use manual `reset` when you want to investigate the
+corruption first. `auto-recover` is disabled by default because resetting discards local LTX
+history, which may reduce point-in-time restore granularity.
+
+**Reference**: `cmd/litestream/reset.go`, `replica.go` (auto-recover logic), `db.go` (`ResetLocalState`)
+
 ## Diagnostic Commands
 
 ```bash
@@ -169,6 +210,9 @@ litestream ltx /path/to/db.sqlite
 
 # Check replication status
 litestream databases
+
+# Reset corrupted local state
+litestream reset /path/to/database.db
 
 # Test restoration
 litestream restore -o test.db [replica-url]
