@@ -409,6 +409,92 @@ func (db *DB) LastSuccessfulSyncAt() time.Time {
 	return db.lastSuccessfulSyncAt
 }
 
+// SyncStatus represents the current replication state of the database.
+type SyncStatus struct {
+	LocalTXID  ltx.TXID
+	RemoteTXID ltx.TXID
+	InSync     bool
+}
+
+// SyncStatus returns the current replication status of the database, comparing
+// the local transaction position against the remote replica position. The remote
+// position is queried from the replica storage, so this method may perform I/O.
+func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
+	if db.Replica == nil {
+		return SyncStatus{}, fmt.Errorf("no replica configured")
+	}
+
+	localPos, err := db.Pos()
+	if err != nil {
+		return SyncStatus{}, fmt.Errorf("local position: %w", err)
+	}
+
+	remotePos, err := db.Replica.calcPos(ctx)
+	if err != nil {
+		return SyncStatus{}, fmt.Errorf("remote position: %w", err)
+	}
+
+	return SyncStatus{
+		LocalTXID:  localPos.TXID,
+		RemoteTXID: remotePos.TXID,
+		InSync:     localPos.TXID > 0 && localPos.TXID == remotePos.TXID,
+	}, nil
+}
+
+// SyncAndWait performs a full sync: WAL to LTX files, then LTX files to remote
+// replica. Blocks until both stages complete.
+func (db *DB) SyncAndWait(ctx context.Context) error {
+	if db.Replica == nil {
+		return fmt.Errorf("no replica configured")
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		return fmt.Errorf("db sync: %w", err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		return fmt.Errorf("replica sync: %w", err)
+	}
+	return nil
+}
+
+// EnsureExists restores the database from the configured replica if the local
+// database file does not exist. If no backup is available, it returns nil and
+// a fresh database will be created on Open(). Must be called before Open().
+func (db *DB) EnsureExists(ctx context.Context) error {
+	if db.Replica == nil {
+		return fmt.Errorf("no replica configured")
+	}
+	if db.Replica.Client == nil {
+		return fmt.Errorf("no replica client configured")
+	}
+
+	if _, err := os.Stat(db.Path()); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat database: %w", err)
+	}
+
+	if dir := filepath.Dir(db.Path()); dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return fmt.Errorf("create parent directory: %w", err)
+		}
+	}
+
+	opt := NewRestoreOptions()
+	opt.OutputPath = db.Path()
+
+	if err := db.Replica.Restore(ctx, opt); err != nil {
+		if errors.Is(err, ErrTxNotAvailable) || errors.Is(err, ErrNoSnapshots) {
+			db.Logger.Debug("no backup found, will create fresh database")
+			return nil
+		}
+		return fmt.Errorf("restore from backup: %w", err)
+	}
+
+	db.Logger.Info("database restored from backup", "path", db.Path())
+	return nil
+}
+
 // Open initializes the background monitoring goroutine.
 func (db *DB) Open() (err error) {
 	db.mu.Lock()
