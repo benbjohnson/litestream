@@ -74,6 +74,8 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /start", s.handleStart)
 	mux.HandleFunc("POST /stop", s.handleStop)
 	mux.HandleFunc("GET /txid", s.handleTXID)
+	mux.HandleFunc("POST /register", s.handleRegister)
+	mux.HandleFunc("POST /unregister", s.handleUnregister)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 
@@ -380,4 +382,125 @@ type InfoResponse struct {
 	UptimeSeconds int64     `json:"uptime_seconds"`
 	StartedAt     time.Time `json:"started_at"`
 	DatabaseCount int       `json:"database_count"`
+}
+
+// RegisterDatabaseRequest is the request body for the /register endpoint.
+type RegisterDatabaseRequest struct {
+	Path       string `json:"path"`
+	ReplicaURL string `json:"replica_url"`
+}
+
+// RegisterDatabaseResponse is the response body for the /register endpoint.
+type RegisterDatabaseResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+}
+
+// UnregisterDatabaseRequest is the request body for the /unregister endpoint.
+type UnregisterDatabaseRequest struct {
+	Path    string `json:"path"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// UnregisterDatabaseResponse is the response body for the /unregister endpoint.
+type UnregisterDatabaseResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
+}
+
+func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
+	var req RegisterDatabaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	if req.ReplicaURL == "" {
+		writeJSONError(w, http.StatusBadRequest, "replica_url required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	// Check if database already exists.
+	if existing := s.store.FindDB(expandedPath); existing != nil {
+		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+			Status: "already_exists",
+			Path:   expandedPath,
+		})
+		return
+	}
+
+	// Create replica client from URL.
+	client, err := NewReplicaClientFromURL(req.ReplicaURL)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid replica url: %v", err), nil)
+		return
+	}
+
+	// Create new database.
+	db := NewDB(expandedPath)
+
+	// Create replica and attach client.
+	replica := NewReplica(db)
+	replica.Client = client
+	db.Replica = replica
+
+	// Register database with store (this also opens the database).
+	if err := s.store.RegisterDB(db); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to register database: %v", err), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
+		Status: "registered",
+		Path:   expandedPath,
+	})
+}
+
+func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
+	var req UnregisterDatabaseRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	// Set up timeout context. Treat non-positive values as default.
+	timeout := req.Timeout
+	if timeout <= 0 {
+		timeout = 30
+	}
+	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	// Remove database from store (this also closes it).
+	if err := s.store.UnregisterDB(ctx, expandedPath); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to unregister database: %v", err), nil)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, UnregisterDatabaseResponse{
+		Status: "unregistered",
+		Path:   expandedPath,
+	})
 }

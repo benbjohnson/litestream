@@ -249,7 +249,7 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 	defer func() {
 		if !success {
 			if db != nil {
-				_ = dm.store.RemoveDB(dm.ctx, db.Path())
+				_ = dm.store.UnregisterDB(dm.ctx, db.Path())
 			}
 			dm.mu.Lock()
 			delete(dm.dbs, path)
@@ -268,8 +268,8 @@ func (dm *DirectoryMonitor) handlePotentialDatabase(path string) {
 		return
 	}
 
-	if err := dm.store.AddDB(db); err != nil {
-		dm.logger.Error("add database to store", "path", path, "error", err)
+	if err := dm.store.RegisterDB(db); err != nil {
+		dm.logger.Error("register database with store", "path", path, "error", err)
 		return
 	}
 
@@ -290,8 +290,8 @@ func (dm *DirectoryMonitor) removeDatabase(path string) {
 		return
 	}
 
-	if err := dm.store.RemoveDB(dm.ctx, db.Path()); err != nil {
-		dm.logger.Error("remove database from store", "path", path, "error", err)
+	if err := dm.store.UnregisterDB(dm.ctx, db.Path()); err != nil {
+		dm.logger.Error("unregister database from store", "path", path, "error", err)
 		return
 	}
 
@@ -325,8 +325,8 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 			dm.mu.Unlock()
 			continue
 		}
-		if err := dm.store.RemoveDB(dm.ctx, db.Path()); err != nil {
-			dm.logger.Error("remove database from store", "path", db.Path(), "error", err)
+		if err := dm.store.UnregisterDB(dm.ctx, db.Path()); err != nil {
+			dm.logger.Error("unregister database from store", "path", db.Path(), "error", err)
 			continue
 		}
 

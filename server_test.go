@@ -275,6 +275,231 @@ func TestServer_HandleStop(t *testing.T) {
 	})
 }
 
+func TestServer_HandleRegister(t *testing.T) {
+	t.Run("MissingPath", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := `{"replica_url": "file:///tmp/backup"}`
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var result litestream.ErrorResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "path required", result.Error)
+	})
+
+	t.Run("MissingReplicaURL", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := `{"path": "/tmp/test.db"}`
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var result litestream.ErrorResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "replica_url required", result.Error)
+	})
+
+	t.Run("InvalidReplicaURL", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := `{"path": "/tmp/test.db", "replica_url": "invalid://badscheme"}`
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var result litestream.ErrorResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Contains(t, result.Error, "invalid replica url")
+	})
+
+	t.Run("Success", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		// Create a temporary database file.
+		db, sqldb := testingutil.MustOpenDBs(t)
+		testingutil.MustCloseDBs(t, db, sqldb)
+		dbPath := db.Path()
+
+		// Create a temp directory for backup.
+		backupDir := t.TempDir()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s"}`, dbPath, backupDir)
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result litestream.RegisterDatabaseResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "registered", result.Status)
+		require.Equal(t, dbPath, result.Path)
+
+		// Verify database was registered with store.
+		require.Len(t, store.DBs(), 1)
+		require.Equal(t, dbPath, store.DBs()[0].Path())
+	})
+
+	t.Run("AlreadyExists", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		// Try to register the same database again.
+		backupDir := t.TempDir()
+		client := newSocketClient(t, server.SocketPath)
+		body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s"}`, db.Path(), backupDir)
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result litestream.RegisterDatabaseResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "already_exists", result.Status)
+	})
+}
+
+func TestServer_HandleUnregister(t *testing.T) {
+	t.Run("MissingPath", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := `{}`
+		resp, err := client.Post("http://localhost/unregister", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+		var result litestream.ErrorResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "path required", result.Error)
+	})
+
+	t.Run("NotFoundIsIdempotent", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := `{"path": "/nonexistent/db"}`
+		resp, err := client.Post("http://localhost/unregister", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		// UnregisterDB is idempotent - returns success even if DB not found.
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result litestream.UnregisterDatabaseResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "unregistered", result.Status)
+	})
+
+	t.Run("Success", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+		dbPath := db.Path()
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		require.Len(t, store.DBs(), 1)
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := fmt.Sprintf(`{"path": %q}`, dbPath)
+		resp, err := client.Post("http://localhost/unregister", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result litestream.UnregisterDatabaseResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Equal(t, "unregistered", result.Status)
+		require.Equal(t, dbPath, result.Path)
+
+		// Verify database was unregistered from store.
+		require.Empty(t, store.DBs())
+	})
+}
+
 func newSocketClient(t *testing.T, socketPath string) *http.Client {
 	t.Helper()
 	return &http.Client{
