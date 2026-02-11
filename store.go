@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -153,19 +154,21 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
-	// Stagger db.Open() calls to prevent thundering herd when many databases
-	// start their monitor goroutines simultaneously.
-	var openDelay time.Duration
-	if n := len(s.dbs); n > 1 {
-		openDelay = DefaultMonitorInterval / time.Duration(n)
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(50)
+	for _, db := range s.dbs {
+		db := db
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return db.Open()
+			}
+		})
 	}
-	for i, db := range s.dbs {
-		if err := db.Open(); err != nil {
-			return err
-		}
-		if openDelay > 0 && i < len(s.dbs)-1 {
-			time.Sleep(openDelay)
-		}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	// Start monitors for compactions & snapshots.
