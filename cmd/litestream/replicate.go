@@ -257,7 +257,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.VerifyCompaction {
 		c.Store.SetVerifyCompaction(true)
 	}
-	if c.Config.SkipRemoteDeletion {
+	if c.Config.Retention.Enabled != nil && !*c.Config.Retention.Enabled {
 		c.Store.SetSkipRemoteDeletion(true)
 	}
 	if c.Config.Validation.Interval != nil {
@@ -292,7 +292,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	if c.Store.SkipRemoteDeletion {
-		slog.Warn("remote file deletion disabled; cloud provider lifecycle policies must handle retention",
+		slog.Warn("retention disabled; cloud provider lifecycle policies must handle retention",
 			"hint", "idle databases that stop receiving writes will not generate new snapshots and may lose backup coverage if cloud retention expires")
 	}
 

@@ -260,7 +260,7 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 	}
 
 	if c.SkipRemoteDeletion {
-		c.logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", SnapshotLevel, "count", len(deleted))
+		c.logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
@@ -308,7 +308,7 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 	}
 
 	if c.SkipRemoteDeletion {
-		c.logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", level, "count", len(deleted))
+		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
 	}
@@ -396,7 +396,7 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 	}
 
 	if c.SkipRemoteDeletion {
-		c.logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", 0, "count", len(deleted))
+		c.logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}

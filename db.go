@@ -1954,7 +1954,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 
 	// Remove files marked for deletion from remote storage (unless skipped).
 	if db.SkipRemoteDeletion {
-		db.Logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", SnapshotLevel, "count", len(deleted))
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
@@ -2077,7 +2077,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	}
 
 	if db.SkipRemoteDeletion {
-		db.Logger.Debug("skipping remote deletion (skip-remote-deletion enabled)", "level", 0, "count", len(deleted))
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
