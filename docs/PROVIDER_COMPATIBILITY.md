@@ -277,18 +277,23 @@ replicas:
 
 ### S3 Query Parameters
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `endpoint` | Custom S3 endpoint URL | AWS S3 |
-| `region` | AWS region | Auto-detected |
-| `force-path-style` | Use path-style URLs | `false` (auto for custom endpoints) |
-| `sign-payload` | Sign request payloads | `true` |
-| `skip-verify` | Skip TLS verification | `false` |
-| `concurrency` | Multipart upload concurrency | `5` (2 for R2) |
-| `part-size` | Multipart upload part size | `5MB` |
-| `sse-algorithm` | Server-side encryption | None |
-| `sse-kms-key-id` | KMS key for encryption | None |
-| `sse-customer-key` | Customer-provided encryption key | None |
+Parameters with an alias accept both camelCase and hyphenated forms
+(e.g., `forcePathStyle` or `force-path-style`).
+
+| Parameter | Alias | Description | Default |
+|-----------|-------|-------------|---------|
+| `endpoint` | | Custom S3 endpoint URL | AWS S3 |
+| `region` | | AWS region | Auto-detected |
+| `forcePathStyle` | `force-path-style` | Use path-style URLs | `false` (auto for custom endpoints) |
+| `skipVerify` | `skip-verify` | Skip TLS verification | `false` |
+| `signPayload` | `sign-payload` | Sign request payloads | `true` |
+| `requireContentMD5` | `require-content-md5` | Require Content-MD5 header | `true` |
+| `concurrency` | | Multipart upload concurrency | `5` |
+| `partSize` | `part-size` | Multipart upload part size | `5MB` |
+| `sseCustomerAlgorithm` | `sse-customer-algorithm` | SSE-C encryption algorithm | None |
+| `sseCustomerKey` | `sse-customer-key` | SSE-C encryption key | None |
+| `sseCustomerKeyMD5` | `sse-customer-key-md5` | SSE-C key MD5 checksum | None |
+| `sseKmsKeyId` | `sse-kms-key-id` | KMS key for encryption | None |
 
 ### Provider Detection
 
@@ -296,7 +301,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 
 | Provider | Detection Pattern | Applied Settings |
 |----------|-------------------|------------------|
-| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true`, `concurrency=2`, checksums disabled |
+| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true` |
 | Backblaze B2 | `*.backblazeb2.com` | `sign-payload=true`, `force-path-style=true` |
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
 | Scaleway | `*.scw.cloud` | `sign-payload=true` |

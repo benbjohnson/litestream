@@ -1936,3 +1936,86 @@ func TestReplicaClient_CustomEndpoint_DisablesChecksumFeatures(t *testing.T) {
 		})
 	}
 }
+
+func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
+	tests := []struct {
+		name               string
+		url                string
+		wantForcePathStyle bool
+		wantSkipVerify     bool
+		wantConcurrency    int
+		wantPartSize       int64
+	}{
+		{
+			name:               "forcePathStyle_camelCase",
+			url:                "s3://mybucket/path?forcePathStyle=true",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "force-path-style_hyphenated",
+			url:                "s3://mybucket/path?force-path-style=true",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "force-path-style_false",
+			url:                "s3://mybucket/path?endpoint=http://localhost:9000&force-path-style=false",
+			wantForcePathStyle: false,
+		},
+		{
+			name:           "skipVerify_camelCase",
+			url:            "s3://mybucket/path?skipVerify=true",
+			wantSkipVerify: true,
+		},
+		{
+			name:           "skip-verify_hyphenated",
+			url:            "s3://mybucket/path?skip-verify=true",
+			wantSkipVerify: true,
+		},
+		{
+			name:            "concurrency_url_param",
+			url:             "s3://mybucket/path?concurrency=3",
+			wantConcurrency: 3,
+		},
+		{
+			name:         "part-size_hyphenated",
+			url:          "s3://mybucket/path?part-size=10485760",
+			wantPartSize: 10485760,
+		},
+		{
+			name:         "partSize_camelCase",
+			url:          "s3://mybucket/path?partSize=10485760",
+			wantPartSize: 10485760,
+		},
+		{
+			name:               "all_params_combined",
+			url:                "s3://mybucket/path?force-path-style=true&skip-verify=true&concurrency=4&part-size=8388608",
+			wantForcePathStyle: true,
+			wantSkipVerify:     true,
+			wantConcurrency:    4,
+			wantPartSize:       8388608,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatalf("NewReplicaClientFromURL() error: %v", err)
+			}
+			c := client.(*ReplicaClient)
+
+			if c.ForcePathStyle != tt.wantForcePathStyle {
+				t.Errorf("ForcePathStyle = %v, want %v", c.ForcePathStyle, tt.wantForcePathStyle)
+			}
+			if c.SkipVerify != tt.wantSkipVerify {
+				t.Errorf("SkipVerify = %v, want %v", c.SkipVerify, tt.wantSkipVerify)
+			}
+			if c.Concurrency != tt.wantConcurrency {
+				t.Errorf("Concurrency = %d, want %d", c.Concurrency, tt.wantConcurrency)
+			}
+			if c.PartSize != tt.wantPartSize {
+				t.Errorf("PartSize = %d, want %d", c.PartSize, tt.wantPartSize)
+			}
+		})
+	}
+}
