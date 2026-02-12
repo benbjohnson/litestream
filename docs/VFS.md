@@ -283,12 +283,13 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 2. Dirty pages are tracked in memory
 3. Periodically (or on close), dirty pages are packaged into an LTX file
 4. The LTX file is uploaded to remote storage
-5. Conflict detection prevents overwrites if the remote has newer transactions
+5. If the remote has advanced unexpectedly, `ErrConflict` is returned as a safety check
 
 ### Write Mode Considerations
 
-- **Single writer**: Only one writer should be active at a time
-- **Conflict detection**: If another writer has updated the remote, `ErrConflict` is returned
+- **Connection pooling**: Multiple connections can be opened in write mode (for example, by `database/sql`)
+- **Single writer**: Write contention is enforced at lock acquisition. If another connection already holds write intent, SQLite returns `SQLITE_BUSY`
+- **Conflict detection**: If the remote has advanced unexpectedly, `ErrConflict` is returned
 - **Buffer durability**: The local buffer file provides crash recovery for uncommitted writes
 - **Sync interval**: Balance between durability (shorter) and performance (longer)
 - **New databases**: Write mode can create new databases from scratch if no LTX files exist
