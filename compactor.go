@@ -24,6 +24,11 @@ type Compactor struct {
 	// contiguous TXID ranges after each compaction. Disabled by default.
 	VerifyCompaction bool
 
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
+
 	// CompactionVerifyErrorCounter is incremented when post-compaction
 	// verification fails. Optional; if nil, no metric is recorded.
 	CompactionVerifyErrorCounter prometheus.Counter
@@ -52,8 +57,9 @@ func NewCompactor(client ReplicaClient, logger *slog.Logger) *Compactor {
 		logger = slog.Default()
 	}
 	return &Compactor{
-		client: client,
-		logger: logger,
+		client:           client,
+		logger:           logger,
+		RetentionEnabled: true,
 	}
 }
 
@@ -254,7 +260,9 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if !c.RetentionEnabled {
+		c.logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
+	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -300,7 +308,9 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if !c.RetentionEnabled {
+		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(deleted))
+	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
 	}
 
@@ -386,7 +396,9 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 		return nil
 	}
 
-	if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if !c.RetentionEnabled {
+		c.logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
+	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 

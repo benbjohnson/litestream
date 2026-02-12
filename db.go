@@ -162,6 +162,11 @@ type DB struct {
 	// contiguous TXID ranges after each compaction.
 	VerifyCompaction bool
 
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
@@ -200,6 +205,7 @@ func NewDB(path string) *DB {
 		MonitorInterval:      DefaultMonitorInterval,
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
+		RetentionEnabled:     true,
 		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval: DefaultShutdownSyncInterval,
 		Logger:               slog.With("db", filepath.Base(path)),
@@ -524,6 +530,7 @@ func (db *DB) Open() (err error) {
 
 	// Set the compactor client once before starting any goroutines.
 	db.compactor.VerifyCompaction = db.VerifyCompaction
+	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
 
 	// Start monitoring SQLite database in a separate goroutine.
@@ -2032,11 +2039,14 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion from both remote and local storage.
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	// Remove files marked for deletion from remote storage (unless retention disabled).
+	if !db.RetentionEnabled {
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
+	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
+	// Always clean up local files.
 	for _, info := range deleted {
 		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
 		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
@@ -2153,7 +2163,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if !db.RetentionEnabled {
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
+	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 

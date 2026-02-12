@@ -106,6 +106,11 @@ type Store struct {
 	// If true, verify TXID consistency at destination level after each compaction.
 	VerifyCompaction bool
 
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
+
 	// Shutdown sync retry settings.
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
@@ -134,6 +139,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		L0Retention:              DefaultL0Retention,
 		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
 		CompactionMonitorEnabled: true,
+		RetentionEnabled:         true,
 		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
@@ -144,6 +150,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 		db.ShutdownSyncInterval = s.ShutdownSyncInterval
 		db.VerifyCompaction = s.VerifyCompaction
+		db.RetentionEnabled = s.RetentionEnabled
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -269,6 +276,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
 	db.VerifyCompaction = s.VerifyCompaction
+	db.RetentionEnabled = s.RetentionEnabled
 	db.Done = s.done
 
 	// Open the database without holding the lock to avoid blocking other operations.
@@ -444,6 +452,16 @@ func (s *Store) SetVerifyCompaction(v bool) {
 	for _, db := range s.dbs {
 		db.VerifyCompaction = v
 		db.compactor.VerifyCompaction = v
+	}
+}
+
+func (s *Store) SetRetentionEnabled(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.RetentionEnabled = v
+	for _, db := range s.dbs {
+		db.RetentionEnabled = v
+		db.compactor.RetentionEnabled = v
 	}
 }
 

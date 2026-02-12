@@ -438,3 +438,47 @@ func TestStore_ValidationMonitor(t *testing.T) {
 		}
 	})
 }
+
+func TestStore_SetRetentionEnabled(t *testing.T) {
+	db0, sqldb0 := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+	db1, sqldb1 := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db1, sqldb1)
+
+	levels := litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Hour},
+	}
+	store := litestream.NewStore([]*litestream.DB{db0, db1}, levels)
+	store.CompactionMonitorEnabled = false
+
+	// Initially should be true (retention enabled by default).
+	if !store.RetentionEnabled {
+		t.Fatal("expected RetentionEnabled=true initially")
+	}
+
+	// Set to false and verify propagation to all DBs.
+	store.SetRetentionEnabled(false)
+
+	if store.RetentionEnabled {
+		t.Fatal("expected store.RetentionEnabled=false")
+	}
+	for _, db := range store.DBs() {
+		if db.RetentionEnabled {
+			t.Fatalf("expected db.RetentionEnabled=false for %s", db.Path())
+		}
+	}
+
+	// Set back to true.
+	store.SetRetentionEnabled(true)
+
+	if !store.RetentionEnabled {
+		t.Fatal("expected store.RetentionEnabled=true after reset")
+	}
+	for _, db := range store.DBs() {
+		if !db.RetentionEnabled {
+			t.Fatalf("expected db.RetentionEnabled=true for %s after reset", db.Path())
+		}
+	}
+}
