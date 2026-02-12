@@ -22,7 +22,8 @@ import (
 )
 
 func TestVFSFile_LockStateMachine(t *testing.T) {
-	f := &VFSFile{logger: slog.Default()}
+	f := &VFSFile{logger: slog.Default(), writeEnabled: true}
+	f.cond = sync.NewCond(&f.mu)
 
 	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
 		t.Fatalf("lock shared: %v", err)
