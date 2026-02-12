@@ -43,7 +43,7 @@ jobs:
       - name: Run quick integration tests
         run: |
           go test -v -tags=integration -timeout=30m ./tests/integration/... \
-            -run="TestFreshStart|TestDatabaseIntegrity|TestRapidCheckpoints|TestS3AccessPointLocalStack"
+            -run="TestFreshStart|TestDatabaseIntegrity|TestRapidCheckpoints|TestS3AccessPointLocalStack|TestRestore_|TestBinaryCompatibility|TestCompaction_Compatibility|TestVersionMigration|TestLockPage|TestDirectoryWatcher|TestDatabaseDeletion|TestWALGrowth|TestBusyTimeout|TestConcurrentOperations"
         env:
           CGO_ENABLED: 1
 

@@ -16,6 +16,8 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -61,11 +63,16 @@ const DefaultRegion = "us-east-1"
 // S3 can handle 5,500+ HEAD requests per second per prefix.
 const DefaultMetadataConcurrency = 50
 
+// DefaultR2Concurrency is the default number of concurrent multipart upload
+// parts for Cloudflare R2, which has strict concurrent upload limits.
+const DefaultR2Concurrency = 2
+
 // contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
 // through the middleware stack from Serialize to Finalize phase.
 type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
@@ -132,6 +139,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		signPayloadSet bool
 		requireMD5     bool
 		requireMD5Set  bool
+		concurrency    int
+		concurrencySet bool
+		partSize       int64
 	)
 
 	// Parse host for bucket and region
@@ -148,18 +158,18 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		qEndpoint, _ = litestream.EnsureEndpointScheme(qEndpoint)
 		endpoint = qEndpoint
 		// Default to path style for custom endpoints unless explicitly set to false
-		if query.Get("forcePathStyle") != "false" {
+		if v, ok := litestream.BoolQueryValue(query, "forcePathStyle", "force-path-style"); !ok || v {
 			forcePathStyle = true
 		}
 	}
 	if qRegion := query.Get("region"); qRegion != "" {
 		region = qRegion
 	}
-	if qForcePathStyle := query.Get("forcePathStyle"); qForcePathStyle != "" {
-		forcePathStyle = qForcePathStyle == "true"
+	if v, ok := litestream.BoolQueryValue(query, "forcePathStyle", "force-path-style"); ok {
+		forcePathStyle = v
 	}
-	if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
-		skipVerify = qSkipVerify == "true"
+	if v, ok := litestream.BoolQueryValue(query, "skipVerify", "skip-verify"); ok {
+		skipVerify = v
 	}
 	if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
 		signPayload = v
@@ -168,6 +178,21 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 		requireMD5 = v
 		requireMD5Set = true
+	}
+	if v := query.Get("concurrency"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			concurrency = n
+			concurrencySet = true
+		}
+	}
+	if v := query.Get("partSize"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			partSize = n
+		}
+	} else if v := query.Get("part-size"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			partSize = n
+		}
 	}
 
 	// Ensure bucket is set
@@ -186,7 +211,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set via query parameter.
-	forcePathStyleSet := query.Get("forcePathStyle") != ""
+	forcePathStyleSet := query.Get("forcePathStyle") != "" || query.Get("force-path-style") != ""
 
 	// Read authentication from environment variables
 	if v := os.Getenv("AWS_ACCESS_KEY_ID"); v != "" {
@@ -222,6 +247,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			forcePathStyle = true
 		}
 	}
+	if isCloudflareR2 {
+		client.Concurrency = DefaultR2Concurrency
+	}
 
 	// Configure client
 	client.Bucket = bucket
@@ -236,6 +264,12 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 	if requireMD5Set {
 		client.RequireContentMD5 = requireMD5
+	}
+	if concurrencySet {
+		client.Concurrency = concurrency
+	}
+	if partSize > 0 {
+		client.PartSize = partSize
 	}
 
 	// Parse SSE-C parameters from query string
@@ -780,6 +814,29 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			stack.Finalize.Remove("addInputChecksumTrailer")
 		}
 
+		// Add debug logging middleware at the end of Finalize phase
+		// so all headers (including X-Tigris-Consistent) are set
+		if err := stack.Finalize.Add(
+			middleware.FinalizeMiddlewareFunc(
+				"LitestreamDebugLogging",
+				func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+					out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
+				) {
+					if req, ok := in.Request.(*smithyhttp.Request); ok {
+						c.logger.Debug("s3 request",
+							"method", req.Method,
+							"url", req.URL.String(),
+							"x-tigris-consistent", req.Header.Get("X-Tigris-Consistent"),
+						)
+					}
+					return next.HandleFinalize(ctx, in)
+				},
+			),
+			middleware.After,
+		); err != nil {
+			return err
+		}
+
 		if !c.RequireContentMD5 {
 			return nil
 		}
@@ -1076,6 +1133,195 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	return nil
 }
 
+// GenerationsV3 returns a list of v0.3.x generation IDs in the replica.
+func (c *ReplicaClient) GenerationsV3(ctx context.Context) ([]string, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := litestream.GenerationsPathV3(c.Path) + "/"
+
+	// Use CommonPrefixes with delimiter to list "directories"
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket:    aws.String(c.Bucket),
+		Prefix:    aws.String(prefix),
+		Delimiter: aws.String("/"),
+	})
+
+	var generations []string
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list generations: %w", err)
+		}
+
+		for _, cp := range page.CommonPrefixes {
+			// Extract generation ID from prefix (e.g., "path/generations/abc123def456/" -> "abc123def456")
+			p := aws.ToString(cp.Prefix)
+			p = strings.TrimPrefix(p, prefix)
+			p = strings.TrimSuffix(p, "/")
+			if litestream.IsGenerationIDV3(p) {
+				generations = append(generations, p)
+			}
+		}
+	}
+
+	slices.Sort(generations)
+	return generations, nil
+}
+
+// SnapshotsV3 returns snapshots for a generation, sorted by index.
+func (c *ReplicaClient) SnapshotsV3(ctx context.Context, generation string) ([]litestream.SnapshotInfoV3, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := litestream.SnapshotsPathV3(c.Path, generation) + "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var snapshots []litestream.SnapshotInfoV3
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list snapshots: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			key := path.Base(aws.ToString(obj.Key))
+			index, err := litestream.ParseSnapshotFilenameV3(key)
+			if err != nil {
+				continue // skip invalid filenames
+			}
+
+			snapshots = append(snapshots, litestream.SnapshotInfoV3{
+				Generation: generation,
+				Index:      index,
+				Size:       aws.ToInt64(obj.Size),
+				CreatedAt:  aws.ToTime(obj.LastModified).UTC(),
+			})
+		}
+	}
+
+	slices.SortFunc(snapshots, func(a, b litestream.SnapshotInfoV3) int {
+		return a.Index - b.Index
+	})
+	return snapshots, nil
+}
+
+// WALSegmentsV3 returns WAL segments for a generation, sorted by index then offset.
+func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([]litestream.WALSegmentInfoV3, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	prefix := litestream.WALPathV3(c.Path, generation) + "/"
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	var segments []litestream.WALSegmentInfoV3
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("s3: list wal segments: %w", err)
+		}
+
+		for _, obj := range page.Contents {
+			key := path.Base(aws.ToString(obj.Key))
+			index, offset, err := litestream.ParseWALSegmentFilenameV3(key)
+			if err != nil {
+				continue // skip invalid filenames
+			}
+
+			segments = append(segments, litestream.WALSegmentInfoV3{
+				Generation: generation,
+				Index:      index,
+				Offset:     offset,
+				Size:       aws.ToInt64(obj.Size),
+				CreatedAt:  aws.ToTime(obj.LastModified).UTC(),
+			})
+		}
+	}
+
+	slices.SortFunc(segments, func(a, b litestream.WALSegmentInfoV3) int {
+		if a.Index != b.Index {
+			return a.Index - b.Index
+		}
+		return int(a.Offset - b.Offset)
+	})
+	return segments, nil
+}
+
+// OpenSnapshotV3 opens a v0.3.x snapshot file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	key := litestream.SnapshotPathV3(c.Path, generation, index)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("s3: get snapshot %s: %w", key, err)
+	}
+
+	return internal.NewLZ4Reader(out.Body), nil
+}
+
+// OpenWALSegmentV3 opens a v0.3.x WAL segment file for reading.
+// The returned reader provides LZ4-decompressed data.
+func (c *ReplicaClient) OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	key := litestream.WALSegmentPathV3(c.Path, generation, index, offset)
+
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+
+	// Add SSE-C parameters if configured
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, os.ErrNotExist
+		}
+		return nil, fmt.Errorf("s3: get wal segment %s: %w", key, err)
+	}
+
+	return internal.NewLZ4Reader(out.Body), nil
+}
+
 // fileIterator represents an iterator over LTX files in S3.
 type fileIterator struct {
 	ctx    context.Context
@@ -1083,6 +1329,7 @@ type fileIterator struct {
 	client *ReplicaClient
 	level  int
 	seek   ltx.TXID
+	prefix string
 
 	useMetadata   bool                 // When true, fetch accurate timestamps from metadata
 	metadataCache map[string]time.Time // key -> timestamp cache for batch fetches
@@ -1099,18 +1346,19 @@ type fileIterator struct {
 func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
+	prefix := client.Path + "/" + fmt.Sprintf("%04x/", level)
 	itr := &fileIterator{
 		ctx:           ctx,
 		cancel:        cancel,
 		client:        client,
 		level:         level,
 		seek:          seek,
+		prefix:        prefix,
 		useMetadata:   useMetadata,
 		metadataCache: make(map[string]time.Time),
 	}
 
 	// Create paginator for listing objects with level prefix
-	prefix := client.Path + "/" + fmt.Sprintf("%04x/", level)
 	itr.paginator = s3.NewListObjectsV2Paginator(client.s3, &s3.ListObjectsV2Input{
 		Bucket: aws.String(client.Bucket),
 		Prefix: aws.String(prefix),
@@ -1220,6 +1468,15 @@ func (itr *fileIterator) Next() bool {
 				return false
 			}
 			itr.pageIndex = 0
+
+			// Log page contents for debugging.
+			if len(itr.page.Contents) > 0 {
+				keys := make([]string, 0, len(itr.page.Contents))
+				for _, obj := range itr.page.Contents {
+					keys = append(keys, path.Base(aws.ToString(obj.Key)))
+				}
+				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "keys", keys)
+			}
 
 			// Batch fetch metadata for the entire page when useMetadata is true.
 			// This uses parallel HeadObject calls controlled by MetadataConcurrency

@@ -2235,7 +2235,8 @@ func (f *VFSFile) pageSizeBytes() (uint32, error) {
 	pageSize := f.pageSize
 	f.mu.Unlock()
 	if pageSize == 0 {
-		return 0, fmt.Errorf("page size not initialized")
+		f.logger.Debug("page size not initialized", "pageSize", 0)
+		return 0, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 	return pageSize, nil
 }
@@ -2481,7 +2482,8 @@ func (f *VFSFile) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	f.mu.Unlock()
 
 	if pageSize == 0 {
-		return nil, fmt.Errorf("page size not initialized")
+		f.logger.Debug("snapshot skipped, page size not initialized", "pageSize", 0)
+		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 
 	// Sort page numbers for consistent output
@@ -2580,8 +2582,10 @@ func (f *VFSFile) monitorSnapshots(ctx context.Context) {
 		case <-ticker.C:
 			info, err := f.Snapshot(ctx)
 			if err != nil {
+				// DBNotReadyError is already logged at debug level in Snapshot()
 				if !errors.Is(err, context.Canceled) &&
-					!errors.Is(err, context.DeadlineExceeded) {
+					!errors.Is(err, context.DeadlineExceeded) &&
+					!errors.Is(err, ErrDBNotReady) {
 					f.logger.Error("snapshot failed", "error", err)
 				}
 			} else {

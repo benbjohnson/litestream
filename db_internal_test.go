@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
@@ -899,7 +900,7 @@ func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
 	db.MonitorInterval = 50 * time.Millisecond
 	db.Replica = NewReplica(db)
 	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false // disable replica monitor to avoid hangs
+	db.Replica.MonitorEnabled = false
 
 	// Open litestream database.
 	if err := db.Open(); err != nil {
@@ -1160,4 +1161,529 @@ func TestIsSQLiteBusyError(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDB_IdleCheckpointSnapshotLoop tests for the feedback loop described in issue #997.
+// After bulk inserts trigger a checkpoint, litestream should NOT enter a self-perpetuating
+// loop where checkpoint triggers cause repeated LTX file creation on an idle database.
+//
+// The bug occurred because:
+// 1. PASSIVE checkpoint completes but doesn't truncate WAL file
+// 2. WAL salt changes, new _litestream_seq write goes to offset 32 with new salt
+// 3. Old WAL frames (with old salt) make file size exceed checkpoint threshold
+// 4. checkpointIfNeeded() uses file size, triggering another checkpoint
+// 5. Loop repeats, creating LTX files every sync cycle
+//
+// The fix uses logical WAL offset (from LTX) instead of file size for checkpoint decisions.
+func TestDB_IdleCheckpointSnapshotLoop(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 10 // Low threshold to trigger checkpoint easily
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Initial sync
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk inserts WITHOUT transaction (as in the bug report)
+	// This creates many WAL frames that will trigger a checkpoint
+	for i := 0; i < 100; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO test VALUES (?, ?)`, i, "test data padding"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync and trigger checkpoint via size threshold
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a checkpoint that will reset WAL salt
+	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+	afterCheckpointPos, _ := db.Pos()
+
+	// Now the database is IDLE - no more application writes
+	// Simulate multiple sync cycles (as would happen with MonitorInterval)
+	for cycle := 0; cycle < 5; cycle++ {
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	finalPos, _ := db.Pos()
+
+	// The key assertion: TXID should not be incrementing every cycle.
+	// With the bug, TXID would increment 5 times (one per cycle).
+	// The fix ensures checkpoint decisions use logical WAL size,
+	// preventing spurious checkpoints when WAL file contains stale frames.
+	txidGrowth := int(finalPos.TXID - afterCheckpointPos.TXID)
+	if txidGrowth > 1 {
+		t.Errorf("TXID grew by %d during idle cycles (expected <= 1). "+
+			"This is issue #997: checkpoint triggers infinite LTX creation loop.", txidGrowth)
+	}
+}
+
+// TestDB_Issue994_RunawayDiskUsage reproduces the scenario from issue #994 where
+// the local -litestream directory grows unboundedly. The reporter saw ~10MB/s growth
+// in LTX files. This test verifies that after bulk writes and idle sync cycles,
+// local LTX file count and total size stabilize rather than growing linearly.
+func TestDB_Issue994_RunawayDiskUsage(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "test.db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 10
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bulk inserts without a wrapping transaction (matches the #994 scenario).
+	// This builds up WAL frames and will trigger checkpoint thresholds.
+	for i := 0; i < 200; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO test VALUES (?, ?)`, i, "padding data for disk usage test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync to create LTX files from the WAL data.
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force a checkpoint (mirrors what happens in production after bulk writes).
+	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	// Measure the baseline LTX directory size after initial sync + checkpoint.
+	baselineSize := dirSize(t, db.LTXDir())
+	baselineFiles := dirFileCount(t, db.LTXDir())
+	t.Logf("baseline: %d bytes, %d files", baselineSize, baselineFiles)
+
+	// Run 20 idle sync cycles (no application writes).
+	// With the #994 bug, each cycle would create a new LTX snapshot file,
+	// causing linear disk growth.
+	for cycle := 0; cycle < 20; cycle++ {
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	finalSize := dirSize(t, db.LTXDir())
+	finalFiles := dirFileCount(t, db.LTXDir())
+	t.Logf("after 20 idle cycles: %d bytes, %d files", finalSize, finalFiles)
+
+	// Allow for at most 1 additional LTX file (the _litestream_seq bookkeeping write).
+	// With the bug, we'd see 20+ new files.
+	newFiles := finalFiles - baselineFiles
+	if newFiles > 2 {
+		t.Errorf("LTX file count grew by %d during 20 idle sync cycles (expected <= 2). "+
+			"This indicates issue #994: runaway LTX file creation.", newFiles)
+	}
+
+	// Size should not grow significantly. Allow 2x as generous margin.
+	if baselineSize > 0 && finalSize > baselineSize*2 {
+		t.Errorf("LTX directory grew from %d to %d bytes during idle cycles (>2x growth). "+
+			"This indicates issue #994: runaway disk usage.", baselineSize, finalSize)
+	}
+}
+
+func dirSize(t *testing.T, path string) int64 {
+	t.Helper()
+	var size int64
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			size += info.Size()
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return size
+}
+
+func dirFileCount(t *testing.T, path string) int {
+	t.Helper()
+	var count int
+	err := filepath.Walk(path, func(_ string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if !info.IsDir() {
+			count++
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return count
+}
+
+// TestDB_WALPageCoverage_AllNewPagesPresent verifies that when SQLite grows a
+// database (increases page count), ALL new pages appear as WAL frames. This
+// test exercises SQLite's allocateBtreePage code path which calls
+// sqlite3PagerWrite on every newly allocated page.
+//
+// If this test passes, it confirms that SQLite does not skip WAL writes when
+// growing the database — Ben Bjohnson's skepticism about the zero-fill fix
+// (PR #1087 comment) is well-founded at the SQLite level.
+func TestDB_WALPageCoverage_AllNewPagesPresent(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 100; i++ {
+		blob := make([]byte, 3000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	walFile, err := os.Open(dbPath + "-wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	rd, err := NewWALReader(walFile, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pageMap, _, commit, err := rd.PageMap(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if commit == 0 {
+		t.Fatal("expected non-zero commit from WAL")
+	}
+
+	lockPgno := ltx.LockPgno(4096)
+	var missing []uint32
+	for pgno := uint32(1); pgno <= commit; pgno++ {
+		if pgno == lockPgno {
+			continue
+		}
+		if _, ok := pageMap[pgno]; !ok {
+			missing = append(missing, pgno)
+		}
+	}
+
+	t.Logf("commit=%d, pages_in_wal=%d, missing=%d", commit, len(pageMap), len(missing))
+	if len(missing) > 0 {
+		first := missing[0]
+		last := missing[len(missing)-1]
+		t.Errorf("pages missing from WAL: %d total (first=%d, last=%d, commit=%d)",
+			len(missing), first, last, commit)
+	}
+}
+
+// TestDB_WriteLTXFromWAL_PageGrowthCoverage verifies that an incremental LTX
+// file produced by writeLTXFromWAL contains all new pages when the database
+// grows between syncs. This tests the full Litestream sync path.
+func TestDB_WriteLTXFromWAL_PageGrowthCoverage(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, make([]byte, 100)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos1, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f1, err := os.Open(db.LTXPath(0, pos1.TXID, pos1.TXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec1 := ltx.NewDecoder(f1)
+	if err := dec1.DecodeHeader(); err != nil {
+		f1.Close()
+		t.Fatal(err)
+	}
+	prevCommit := dec1.Header().Commit
+	f1.Close()
+	t.Logf("after sync 1: txid=%d, commit=%d", pos1.TXID, prevCommit)
+
+	for i := 5; i < 150; i++ {
+		blob := make([]byte, 3000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	pos2, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f2, err := os.Open(db.LTXPath(0, pos2.TXID, pos2.TXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+
+	dec2 := ltx.NewDecoder(f2)
+	if err := dec2.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	newCommit := dec2.Header().Commit
+
+	ltx2Pages := make(map[uint32]bool)
+	pageBuf := make([]byte, dec2.Header().PageSize)
+	for {
+		var phdr ltx.PageHeader
+		if err := dec2.DecodePage(&phdr, pageBuf); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		ltx2Pages[phdr.Pgno] = true
+	}
+
+	lockPgno := ltx.LockPgno(dec2.Header().PageSize)
+	var missing []uint32
+	for pgno := prevCommit + 1; pgno <= newCommit; pgno++ {
+		if pgno == lockPgno {
+			continue
+		}
+		if !ltx2Pages[pgno] {
+			missing = append(missing, pgno)
+		}
+	}
+
+	t.Logf("after sync 2: txid=%d, prevCommit=%d, newCommit=%d, pages_in_ltx=%d, missing=%d",
+		pos2.TXID, prevCommit, newCommit, len(ltx2Pages), len(missing))
+	if len(missing) > 0 {
+		first := missing[0]
+		last := missing[len(missing)-1]
+		t.Errorf("pages missing from incremental LTX: %d total (first=%d, last=%d, prevCommit=%d, newCommit=%d)",
+			len(missing), first, last, prevCommit, newCommit)
+	}
+}
+
+// TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint verifies that compaction
+// produces valid snapshots after a cycle of: grow DB, sync, checkpoint, grow
+// more, sync. If the zero-fill bug existed, compaction would fail with
+// "nonsequential page numbers in snapshot transaction".
+func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 50; i++ {
+		blob := make([]byte, 3000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 50; i < 100; i++ {
+		blob := make([]byte, 3000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("final txid=%d", pos.TXID)
+
+	var readers []io.ReadCloser
+	for txid := ltx.TXID(1); txid <= pos.TXID; txid++ {
+		path := db.LTXPath(0, txid, txid)
+		f, err := os.Open(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			t.Fatal(err)
+		}
+		readers = append(readers, f)
+	}
+	defer func() {
+		for _, r := range readers {
+			r.Close()
+		}
+	}()
+
+	if len(readers) < 2 {
+		t.Fatalf("expected at least 2 LTX files, got %d", len(readers))
+	}
+
+	ioReaders := make([]io.Reader, len(readers))
+	for i, r := range readers {
+		ioReaders[i] = r
+	}
+
+	var buf bytes.Buffer
+	c, err := ltx.NewCompactor(&buf, ioReaders)
+	if err != nil {
+		t.Fatalf("new compactor: %v", err)
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	if err := c.Compact(ctx); err != nil {
+		t.Fatalf("compaction failed (this would indicate the zero-fill bug): %v", err)
+	}
+
+	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
 }

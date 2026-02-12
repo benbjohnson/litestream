@@ -157,9 +157,11 @@ func TestLockPageWithDifferentPageSizes(t *testing.T) {
 				t.Fatalf("Failed to start Litestream: %v", err)
 			}
 
-			time.Sleep(20 * time.Second)
-
-			fileCount, _ := db.GetReplicaFileCount()
+			t.Log("[3a] Waiting for replication to produce files...")
+			fileCount, err := db.WaitForReplicaFiles(1, 2*time.Minute)
+			if err != nil {
+				t.Logf("Warning: %v", err)
+			}
 			t.Logf("✓ LTX files: %d", fileCount)
 
 			db.StopLitestream()

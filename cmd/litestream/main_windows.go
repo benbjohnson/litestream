@@ -106,7 +106,7 @@ func (w *eventlogWriter) Write(p []byte) (n int, err error) {
 }
 
 func signalChan() <-chan os.Signal {
-	ch := make(chan os.Signal, 1)
+	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt)
 	return ch
 }

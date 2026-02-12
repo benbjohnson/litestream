@@ -8,7 +8,6 @@ assignees: ''
 ---
 
 <!--- Please provide as much detail as possible to help us reproduce and fix the issue -->
-<!--- For general questions, please use GitHub Discussions instead -->
 
 ## Bug Description
 

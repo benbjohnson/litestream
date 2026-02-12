@@ -321,6 +321,244 @@ func TestCompactor_EnforceSnapshotRetention(t *testing.T) {
 	})
 }
 
+func TestCompactor_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+	compactor.RetentionEnabled = false
+
+	var localDeleted []ltx.TXID
+	compactor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {
+		localDeleted = append(localDeleted, maxTXID)
+		return nil
+	}
+
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-2*time.Hour))
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 10, time.Now().Add(-30*time.Minute))
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 15, time.Now().Add(-5*time.Minute))
+
+	_, err := compactor.EnforceSnapshotRetention(context.Background(), time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote files should all still exist (skip remote deletion).
+	itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+
+	var count int
+	for itr.Next() {
+		count++
+	}
+	if count != 3 {
+		t.Errorf("remote file count=%d, want 3 (no remote deletion)", count)
+	}
+
+	// Local file deleter should still have been called.
+	if len(localDeleted) != 1 {
+		t.Errorf("local deleted count=%d, want 1", len(localDeleted))
+	}
+}
+
+func TestCompactor_EnforceRetentionByTXID_RetentionDisabled(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+	compactor.RetentionEnabled = false
+
+	var localDeleted []ltx.TXID
+	compactor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {
+		localDeleted = append(localDeleted, maxTXID)
+		return nil
+	}
+
+	createTestLTXFile(t, client, 1, 1, 2)
+	createTestLTXFile(t, client, 1, 3, 5)
+	createTestLTXFile(t, client, 1, 6, 10)
+
+	err := compactor.EnforceRetentionByTXID(context.Background(), 1, 5)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote files should all still exist.
+	itr, err := client.LTXFiles(context.Background(), 1, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+
+	var count int
+	for itr.Next() {
+		count++
+	}
+	if count != 3 {
+		t.Errorf("remote file count=%d, want 3 (no remote deletion)", count)
+	}
+
+	// Local file deleter should still have been called for the file below TXID 5.
+	if len(localDeleted) != 1 {
+		t.Errorf("local deleted count=%d, want 1", len(localDeleted))
+	}
+}
+
+func TestCompactor_EnforceL0Retention_RetentionDisabled(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+	compactor.RetentionEnabled = false
+
+	var localDeleted []ltx.TXID
+	compactor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {
+		localDeleted = append(localDeleted, maxTXID)
+		return nil
+	}
+
+	// Create L0 files with old timestamps so they're eligible for deletion.
+	oldTime := time.Now().Add(-1 * time.Hour)
+	createTestLTXFileWithTimestamp(t, client, 0, 1, 1, oldTime)
+	createTestLTXFileWithTimestamp(t, client, 0, 2, 2, oldTime)
+	createTestLTXFileWithTimestamp(t, client, 0, 3, 3, oldTime)
+
+	// Compact to L1 first.
+	_, err := compactor.Compact(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Use a real retention duration so the check doesn't return early.
+	err = compactor.EnforceL0Retention(context.Background(), time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote L0 files should all still exist.
+	itr, err := client.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+
+	var count int
+	for itr.Next() {
+		count++
+	}
+	if count != 3 {
+		t.Errorf("remote file count=%d, want 3 (no remote deletion)", count)
+	}
+
+	// Local file deleter should still have been called for compacted files.
+	if len(localDeleted) < 1 {
+		t.Errorf("local deleted count=%d, want at least 1", len(localDeleted))
+	}
+}
+
+func TestCompactor_VerifyLevelConsistency(t *testing.T) {
+	t.Run("ContiguousFiles", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create contiguous files
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 3, 5)
+		createTestLTXFile(t, client, 1, 6, 10)
+
+		// Should pass verification
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err != nil {
+			t.Errorf("expected nil error for contiguous files, got: %v", err)
+		}
+	})
+
+	t.Run("GapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create files with a gap (missing TXID 3-4)
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 7) // gap: expected MinTXID=3, got 5
+
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err == nil {
+			t.Error("expected error for gap in files, got nil")
+		}
+		if err != nil && !containsString(err.Error(), "gap") {
+			t.Errorf("expected gap error, got: %v", err)
+		}
+	})
+
+	t.Run("OverlapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create overlapping files
+		createTestLTXFile(t, client, 1, 1, 5)
+		createTestLTXFile(t, client, 1, 3, 7) // overlap: expected MinTXID=6, got 3
+
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err == nil {
+			t.Error("expected error for overlapping files, got nil")
+		}
+		if err != nil && !containsString(err.Error(), "overlap") {
+			t.Errorf("expected overlap error, got: %v", err)
+		}
+	})
+
+	t.Run("SingleFile", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Create single file - should pass
+		createTestLTXFile(t, client, 1, 1, 5)
+
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err != nil {
+			t.Errorf("expected nil error for single file, got: %v", err)
+		}
+	})
+
+	t.Run("EmptyLevel", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Empty level - should pass
+		err := compactor.VerifyLevelConsistency(context.Background(), 1)
+		if err != nil {
+			t.Errorf("expected nil error for empty level, got: %v", err)
+		}
+	})
+}
+
+func TestCompactor_CompactWithVerification(t *testing.T) {
+	t.Run("VerificationEnabled", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+		compactor.VerifyCompaction = true
+
+		// Create contiguous L0 files
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
+
+		// Compact to L1 - should succeed with verification
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Level != 1 {
+			t.Errorf("Level=%d, want 1", info.Level)
+		}
+		if info.MinTXID != 1 || info.MaxTXID != 3 {
+			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
+		}
+	})
+}
+
+// containsString checks if s contains substr.
+func containsString(s, substr string) bool {
+	return bytes.Contains([]byte(s), []byte(substr))
+}
+
 // createTestLTXFile creates a minimal LTX file for testing.
 func createTestLTXFile(t testing.TB, client litestream.ReplicaClient, level int, minTXID, maxTXID ltx.TXID) {
 	t.Helper()

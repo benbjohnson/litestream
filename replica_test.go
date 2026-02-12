@@ -4,13 +4,16 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
@@ -333,7 +336,44 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		}
 	})
 
-	t.Run("ErrNonContiguousFiles", func(t *testing.T) {
+	t.Run("SelectLongestAcrossLevels", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5},
+				}), nil
+			case 2:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 2, MinTXID: 6, MaxTXID: 12},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 6, MaxTXID: 20},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 20, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 2; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[1], (ltx.FileInfo{Level: 0, MinTXID: 6, MaxTXID: 20}); got != want {
+			t.Fatalf("plan[1]=%#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("GapInLevelResolvedByLowerLevel", func(t *testing.T) {
 		var c mock.ReplicaClient
 		r := litestream.NewReplicaWithClient(db, &c)
 		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -344,16 +384,72 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 				}), nil
 			case 1:
 				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
-					{Level: 1, MinTXID: 8, MaxTXID: 9},
+					{Level: 1, MinTXID: 6, MaxTXID: 7},
+					{Level: 1, MinTXID: 9, MaxTXID: 10},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 8, MaxTXID: 8},
+					{Level: 0, MinTXID: 9, MaxTXID: 9},
+					{Level: 0, MinTXID: 10, MaxTXID: 10},
 				}), nil
 			default:
 				return ltx.NewFileInfoSliceIterator(nil), nil
 			}
 		}
 
-		_, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
-		if err == nil || err.Error() != `non-contiguous transaction files: prev=0000000000000005 filename=0000000000000008-0000000000000009.ltx` {
-			t.Fatalf("unexpected error: %q", err)
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 10, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 4; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[1], (ltx.FileInfo{Level: 1, MinTXID: 6, MaxTXID: 7}); got != want {
+			t.Fatalf("plan[1]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[2], (ltx.FileInfo{Level: 0, MinTXID: 8, MaxTXID: 8}); got != want {
+			t.Fatalf("plan[2]=%#v, want %#v", got, want)
+		}
+		if got, want := *plan[3], (ltx.FileInfo{Level: 1, MinTXID: 9, MaxTXID: 10}); got != want {
+			t.Fatalf("plan[3]=%#v, want %#v", got, want)
+		}
+	})
+
+	t.Run("SkipsDuplicateRangesAcrossLevels", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			case 1:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 1, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		plan, err := litestream.CalcRestorePlan(context.Background(), r.Client, 1, time.Time{}, r.Logger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got, want := len(plan), 1; got != want {
+			t.Fatalf("n=%v, want %v", got, want)
+		}
+		if got, want := *plan[0], (ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1}); got != want {
+			t.Fatalf("plan[0]=%#v, want %#v", got, want)
 		}
 	})
 
@@ -430,6 +526,270 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 		_, err := litestream.CalcRestorePlan(context.Background(), r.Client, 5, time.Time{}, r.Logger())
 		if !errors.Is(err, litestream.ErrTxNotAvailable) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
+		}
+	})
+}
+
+func TestReplica_TimeBounds(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	t.Run("Level0Only", func(t *testing.T) {
+		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 0 {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1, CreatedAt: now},
+					{Level: 0, MinTXID: 2, MaxTXID: 2, CreatedAt: now.Add(time.Hour)},
+					{Level: 0, MinTXID: 3, MaxTXID: 3, CreatedAt: now.Add(2 * time.Hour)},
+				}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(now) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, now)
+		}
+		if want := now.Add(2 * time.Hour); !updatedAt.Equal(want) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, want)
+		}
+	})
+
+	t.Run("SnapshotOnly", func(t *testing.T) {
+		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == litestream.SnapshotLevel {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: now},
+				}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(now) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, now)
+		}
+		if !updatedAt.Equal(now) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, now)
+		}
+	})
+
+	t.Run("SnapshotAndLevel0", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		l0Time := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 11, MaxTXID: 11, CreatedAt: l0Time},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(snapshotTime) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, snapshotTime)
+		}
+		if !updatedAt.Equal(l0Time) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, l0Time)
+		}
+	})
+
+	t.Run("MultipleCompactionLevels", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		l2Time := time.Date(2024, 1, 2, 0, 0, 0, 0, time.UTC)
+		l0Time := time.Date(2024, 1, 3, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 5, CreatedAt: snapshotTime},
+				}), nil
+			case 2:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 2, MinTXID: 6, MaxTXID: 8, CreatedAt: l2Time},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 9, MaxTXID: 9, CreatedAt: l0Time},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.Equal(snapshotTime) {
+			t.Fatalf("createdAt=%v, want %v", createdAt, snapshotTime)
+		}
+		if !updatedAt.Equal(l0Time) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, l0Time)
+		}
+	})
+
+	t.Run("NoFiles", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		createdAt, updatedAt, err := r.TimeBounds(context.Background())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !createdAt.IsZero() {
+			t.Fatalf("createdAt=%v, want zero", createdAt)
+		}
+		if !updatedAt.IsZero() {
+			t.Fatalf("updatedAt=%v, want zero", updatedAt)
+		}
+	})
+
+	t.Run("ErrorOnLevel", func(t *testing.T) {
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		errTest := errors.New("test error")
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 3 {
+				return nil, errTest
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		_, _, err := r.TimeBounds(context.Background())
+		if !errors.Is(err, errTest) {
+			t.Fatalf("expected test error, got %v", err)
+		}
+	})
+}
+
+func TestReplica_CalcRestoreTarget(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	t.Run("TimestampInSnapshotRange", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		l0Time := time.Date(2024, 1, 10, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			case 0:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 11, MaxTXID: 11, CreatedAt: l0Time},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		ts := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
+		updatedAt, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{Timestamp: ts})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !updatedAt.Equal(l0Time) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, l0Time)
+		}
+	})
+
+	t.Run("TimestampBeforeAllFiles", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 5, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		ts := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		_, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{Timestamp: ts})
+		if err == nil || err.Error() != "timestamp does not exist" {
+			t.Fatalf("expected 'timestamp does not exist', got %v", err)
+		}
+	})
+
+	t.Run("TimestampAfterAllFiles", func(t *testing.T) {
+		snapshotTime := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			switch level {
+			case litestream.SnapshotLevel:
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 10, CreatedAt: snapshotTime},
+				}), nil
+			default:
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+		}
+
+		ts := time.Date(2024, 12, 31, 0, 0, 0, 0, time.UTC)
+		_, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{Timestamp: ts})
+		if err == nil || err.Error() != "timestamp does not exist" {
+			t.Fatalf("expected 'timestamp does not exist', got %v", err)
+		}
+	})
+
+	t.Run("NoTimestamp", func(t *testing.T) {
+		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(db, &c)
+		c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 0 {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+					{Level: 0, MinTXID: 1, MaxTXID: 1, CreatedAt: now},
+					{Level: 0, MinTXID: 2, MaxTXID: 2, CreatedAt: now.Add(time.Hour)},
+				}), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		updatedAt, err := r.CalcRestoreTarget(context.Background(), litestream.RestoreOptions{})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if want := now.Add(time.Hour); !updatedAt.Equal(want) {
+			t.Fatalf("updatedAt=%v, want %v", updatedAt, want)
 		}
 	})
 }
@@ -578,4 +938,810 @@ func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	}
 
 	// The test passes if context.Canceled errors were properly filtered
+}
+
+func TestReplica_ValidateLevel(t *testing.T) {
+	t.Run("ValidContiguousFiles", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create contiguous files: 1-2, 3-5, 6-10
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 3, 5)
+		createTestLTXFile(t, client, 1, 6, 10)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 0 {
+			t.Errorf("expected no errors for contiguous files, got %d: %v", len(errs), errs)
+		}
+	})
+
+	t.Run("EmptyLevel", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 0 {
+			t.Errorf("expected no errors for empty level, got %d", len(errs))
+		}
+	})
+
+	t.Run("SingleFile", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		createTestLTXFile(t, client, 1, 1, 5)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 0 {
+			t.Errorf("expected no errors for single file, got %d", len(errs))
+		}
+	})
+
+	t.Run("GapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create files with a gap (missing TXID 3-4)
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 7)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 1 {
+			t.Fatalf("expected 1 error, got %d", len(errs))
+		}
+		if errs[0].Type != "gap" {
+			t.Errorf("expected gap error, got %q", errs[0].Type)
+		}
+		if errs[0].Level != 1 {
+			t.Errorf("expected level 1, got %d", errs[0].Level)
+		}
+	})
+
+	t.Run("OverlapDetected", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create overlapping files
+		createTestLTXFile(t, client, 1, 1, 5)
+		createTestLTXFile(t, client, 1, 3, 7)
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 1 {
+			t.Fatalf("expected 1 error, got %d", len(errs))
+		}
+		if errs[0].Type != "overlap" {
+			t.Errorf("expected overlap error, got %q", errs[0].Type)
+		}
+	})
+
+	t.Run("MultipleErrors", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		replica := litestream.NewReplicaWithClient(nil, client)
+
+		// Create files with multiple issues: gap then overlap
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 10) // gap at 3-4
+		createTestLTXFile(t, client, 1, 8, 12) // overlap at 8-10
+
+		errs, err := replica.ValidateLevel(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(errs) != 2 {
+			t.Fatalf("expected 2 errors, got %d", len(errs))
+		}
+		if errs[0].Type != "gap" {
+			t.Errorf("expected first error to be gap, got %q", errs[0].Type)
+		}
+		if errs[1].Type != "overlap" {
+			t.Errorf("expected second error to be overlap, got %q", errs[1].Type)
+		}
+	})
+}
+func TestReplica_RestoreV3(t *testing.T) {
+	t.Run("SnapshotOnly", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup structure with a snapshot
+		gen := "0123456789abcdef"
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: createTestSQLiteDB(t)},
+		}, nil)
+
+		// Create replica client and replica
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		// Restore
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("SnapshotWithWAL", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup with snapshot and WAL segments
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALData(t, dbData)
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData},
+		})
+
+		// Create replica and restore
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("TimestampRestore", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup with multiple snapshots at different times
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create first snapshot (older)
+		dbData1 := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData1)
+		// Set older mod time
+		oldTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create second snapshot (newer) - sleep briefly to ensure different times
+		time.Sleep(10 * time.Millisecond)
+		dbData2 := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 1, dbData2)
+		// Set newer mod time
+		newTime := time.Now().Add(-1 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000001.snapshot.lz4"), newTime, newTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create replica and restore to a timestamp between the two snapshots
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		restoreTime := time.Now().Add(-90 * time.Minute) // Between old and new
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  restoreTime,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		// Verify restored database (should be the older one)
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("NoSnapshots", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create empty generations directory
+		gen := "0123456789abcdef"
+		if err := os.MkdirAll(filepath.Join(replicaDir, "generations", gen), 0755); err != nil {
+			t.Fatal(err)
+		}
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if !errors.Is(err, litestream.ErrNoSnapshots) {
+			t.Fatalf("expected ErrNoSnapshots, got %v", err)
+		}
+	})
+
+	t.Run("NoGenerations", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Empty replica directory
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if !errors.Is(err, litestream.ErrNoSnapshots) {
+			t.Fatalf("expected ErrNoSnapshots, got %v", err)
+		}
+	})
+
+	t.Run("OutputPathExists", func(t *testing.T) {
+		ctx := context.Background()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup
+		gen := "0123456789abcdef"
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: createTestSQLiteDB(t)},
+		}, nil)
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		// Create output file that already exists
+		outputPath := t.TempDir() + "/existing.db"
+		if err := os.WriteFile(outputPath, []byte("existing"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "already exists") {
+			t.Fatalf("expected 'already exists' error, got %v", err)
+		}
+	})
+
+	t.Run("ClientDoesNotSupportV3", func(t *testing.T) {
+		ctx := context.Background()
+
+		// Use mock client that doesn't implement ReplicaClientV3
+		var c mock.ReplicaClient
+		r := litestream.NewReplicaWithClient(nil, &c)
+
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: t.TempDir() + "/restored.db",
+		})
+		if err == nil || !strings.Contains(err.Error(), "does not support v0.3.x") {
+			t.Fatalf("expected 'does not support v0.3.x' error, got %v", err)
+		}
+	})
+
+	t.Run("MultipleGenerations", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create snapshots in two different generations
+		gen1 := "0000000000000001"
+		gen2 := "0000000000000002"
+
+		// Older snapshot in gen1
+		snapshotsDir1 := filepath.Join(replicaDir, "generations", gen1, "snapshots")
+		if err := os.MkdirAll(snapshotsDir1, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData1 := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir1, 0, dbData1)
+		oldTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir1, "00000000.snapshot.lz4"), oldTime, oldTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Newer snapshot in gen2
+		snapshotsDir2 := filepath.Join(replicaDir, "generations", gen2, "snapshots")
+		if err := os.MkdirAll(snapshotsDir2, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData2 := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir2, 0, dbData2)
+		newTime := time.Now().Add(-1 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir2, "00000000.snapshot.lz4"), newTime, newTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Restore without timestamp should pick the newest
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+}
+
+func TestReplica_Restore_BothFormats(t *testing.T) {
+	t.Run("V3OnlyWithTimestamp", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup only
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+		// Set snapshot time to 1 hour ago
+		snapshotTime := time.Now().Add(-1 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), snapshotTime, snapshotTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create replica and restore with timestamp
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(), // Any time after snapshot
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("V3OnlyWithoutTimestamp", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create a v0.3.x backup only (no LTX files)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+
+		// Create replica and restore WITHOUT timestamp - should still use v0.3.x
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			// No timestamp specified
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("LTXOnlyWithTimestamp", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		replicaDir := t.TempDir()
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(db, c)
+
+		// Sync to create LTX files
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a snapshot
+		if _, err := db.Snapshot(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait a bit to ensure distinct timestamps
+		time.Sleep(10 * time.Millisecond)
+
+		// Restore with timestamp
+		outputPath := t.TempDir() + "/restored.db"
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("BothFormats_V3Better", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		// Create v0.3.x snapshot at time T-30min (closer to restore time)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		dbData := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, dbData)
+		v3Time := time.Now().Add(-30 * time.Minute)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), v3Time, v3Time); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LTX snapshot at time T-2h (older)
+		ltxDir := filepath.Join(replicaDir, "ltx", "9") // Snapshot level
+		if err := os.MkdirAll(ltxDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		ltxData := createTestLTXSnapshot(t)
+		ltxPath := filepath.Join(ltxDir, "0000000000000001-0000000000000001.ltx")
+		if err := os.WriteFile(ltxPath, ltxData, 0644); err != nil {
+			t.Fatal(err)
+		}
+		ltxTime := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(ltxPath, ltxTime, ltxTime); err != nil {
+			t.Fatal(err)
+		}
+
+		// Restore with timestamp - should use V3 (more recent)
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.Restore(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("BothFormats_LTXBetter", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		replicaDir := t.TempDir()
+
+		// Create v0.3.x snapshot at time T-2h (older)
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		v3Data := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, v3Data)
+		v3Time := time.Now().Add(-2 * time.Hour)
+		if err := os.Chtimes(filepath.Join(snapshotsDir, "00000000.snapshot.lz4"), v3Time, v3Time); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create LTX backup (more recent)
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(db, c)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Create a snapshot
+		if _, err := db.Snapshot(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Wait a bit
+		time.Sleep(10 * time.Millisecond)
+
+		// Restore with timestamp - should use LTX (more recent)
+		outputPath := t.TempDir() + "/restored.db"
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+			Timestamp:  time.Now(),
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("NoTimestamp_UsesLTX", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		replicaDir := t.TempDir()
+
+		// Create v0.3.x snapshot
+		gen := "0123456789abcdef"
+		snapshotsDir := filepath.Join(replicaDir, "generations", gen, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		v3Data := createTestSQLiteDB(t)
+		writeV3Snapshot(t, snapshotsDir, 0, v3Data)
+
+		// Create LTX backup
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(db, c)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Restore without timestamp - should use LTX (default behavior)
+		outputPath := t.TempDir() + "/restored.db"
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("Restore failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+}
+
+// createTestLTXSnapshot creates a minimal LTX snapshot for testing.
+func createTestLTXSnapshot(t *testing.T) []byte {
+	t.Helper()
+
+	// Create a temporary database and generate a real LTX snapshot
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "test.db")
+	replicaDir := filepath.Join(tmpDir, "replica")
+
+	db := testingutil.NewDB(t, dbPath)
+
+	// Set up a replica client so we can create snapshots
+	c := file.NewReplicaClient(replicaDir)
+	db.Replica = litestream.NewReplicaWithClient(db, c)
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create some data
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	testingutil.MustCloseSQLDB(t, sqldb)
+
+	// Sync to create LTX file
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create snapshot
+	if _, err := db.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read the snapshot file from replica directory
+	ltxPath := filepath.Join(replicaDir, "ltx", fmt.Sprintf("%d", litestream.SnapshotLevel), "0000000000000001-0000000000000001.ltx")
+	data, err := os.ReadFile(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// v3SnapshotData holds test data for creating v0.3.x snapshots.
+type v3SnapshotData struct {
+	index int
+	data  []byte
+}
+
+// v3WALSegmentData holds test data for creating v0.3.x WAL segments.
+type v3WALSegmentData struct {
+	index  int
+	offset int64
+	data   []byte
+}
+
+// createV3Backup creates a v0.3.x backup structure for testing.
+func createV3Backup(t *testing.T, replicaDir, generation string, snapshots []v3SnapshotData, walSegments []v3WALSegmentData) {
+	t.Helper()
+
+	// Create snapshots directory and files
+	if len(snapshots) > 0 {
+		snapshotsDir := filepath.Join(replicaDir, "generations", generation, "snapshots")
+		if err := os.MkdirAll(snapshotsDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for _, s := range snapshots {
+			writeV3Snapshot(t, snapshotsDir, s.index, s.data)
+		}
+	}
+
+	// Create WAL directory and files
+	if len(walSegments) > 0 {
+		walDir := filepath.Join(replicaDir, "generations", generation, "wal")
+		if err := os.MkdirAll(walDir, 0755); err != nil {
+			t.Fatal(err)
+		}
+		for _, w := range walSegments {
+			writeV3WALSegment(t, walDir, w.index, w.offset, w.data)
+		}
+	}
+}
+
+// writeV3Snapshot writes an LZ4-compressed snapshot file.
+func writeV3Snapshot(t *testing.T, dir string, index int, data []byte) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w := lz4.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	filename := fmt.Sprintf("%08x.snapshot.lz4", index)
+	if err := os.WriteFile(filepath.Join(dir, filename), buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// writeV3WALSegment writes an LZ4-compressed WAL segment file.
+func writeV3WALSegment(t *testing.T, dir string, index int, offset int64, data []byte) {
+	t.Helper()
+
+	var buf bytes.Buffer
+	w := lz4.NewWriter(&buf)
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	filename := fmt.Sprintf("%08x-%016x.wal.lz4", index, offset)
+	if err := os.WriteFile(filepath.Join(dir, filename), buf.Bytes(), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// createTestSQLiteDB creates a minimal valid SQLite database for testing.
+func createTestSQLiteDB(t *testing.T) []byte {
+	t.Helper()
+
+	tmpPath := t.TempDir() + "/test.db"
+	sqldb := testingutil.MustOpenSQLDB(t, tmpPath)
+	if _, err := sqldb.Exec(`CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO test (value) VALUES ('hello')`); err != nil {
+		t.Fatal(err)
+	}
+	testingutil.MustCloseSQLDB(t, sqldb)
+
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return data
+}
+
+// createTestWALData creates minimal valid WAL data for testing.
+// For simplicity, returns an empty WAL header (32 bytes) which is valid.
+func createTestWALData(t *testing.T, dbData []byte) []byte {
+	t.Helper()
+
+	// Create a minimal WAL header
+	// WAL header is 32 bytes:
+	// - magic number (4 bytes): 0x377f0683 (big-endian) or 0x377f0682 (little-endian)
+	// - file format version (4 bytes): 3007000
+	// - page size (4 bytes)
+	// - checkpoint sequence (4 bytes)
+	// - salt-1 (4 bytes)
+	// - salt-2 (4 bytes)
+	// - checksum-1 (4 bytes)
+	// - checksum-2 (4 bytes)
+
+	// For testing, we'll create an empty WAL that doesn't need frames applied
+	// This is sufficient for testing the restore mechanism
+	return make([]byte, 32) // Empty WAL header placeholder
+}
+
+// verifyRestoredDB verifies that the restored database is valid.
+func verifyRestoredDB(t *testing.T, path string) {
+	t.Helper()
+
+	// Check file exists
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("restored file not found: %v", err)
+	}
+	if info.Size() == 0 {
+		t.Fatal("restored file is empty")
+	}
+
+	// Try to open with SQLite to verify it's valid
+	sqldb := testingutil.MustOpenSQLDB(t, path)
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+
+	// Run integrity check
+	var result string
+	if err := sqldb.QueryRow("PRAGMA integrity_check").Scan(&result); err != nil {
+		t.Fatalf("integrity check failed: %v", err)
+	}
+	if result != "ok" {
+		t.Fatalf("integrity check returned: %s", result)
+	}
 }

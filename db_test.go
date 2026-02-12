@@ -16,6 +16,7 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestDB_Path(t *testing.T) {
@@ -386,8 +387,6 @@ func TestDB_Compact(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)
 		defer testingutil.MustCloseDBs(t, db, sqldb)
-		db.Replica = litestream.NewReplica(db)
-		db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
@@ -509,8 +508,6 @@ func walPageCountForTest(tb testing.TB, db *litestream.DB) int64 {
 func TestDB_Snapshot(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
-	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 		t.Fatal(err)
@@ -556,8 +553,6 @@ func TestDB_Snapshot(t *testing.T) {
 func TestDB_EnforceRetention(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
-	db.Replica = litestream.NewReplica(db)
-	db.Replica.Client = testingutil.NewFileReplicaClient(t)
 
 	// Create table and sync initial state
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
@@ -624,6 +619,134 @@ func TestDB_EnforceRetention(t *testing.T) {
 	// Should have fewer snapshots than before
 	if afterCount >= beforeCount {
 		t.Fatalf("expected fewer snapshots after retention, before=%d after=%d", beforeCount, afterCount)
+	}
+}
+
+func TestDB_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Disable retention (let cloud provider handle it).
+	db.RetentionEnabled = false
+
+	// Create table and sync initial state.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create multiple snapshots with delays.
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Snapshot(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Count snapshots before retention.
+	countFiles := func() int {
+		t.Helper()
+		itr, err := db.Replica.Client.LTXFiles(t.Context(), litestream.SnapshotLevel, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		for itr.Next() {
+			n++
+		}
+		itr.Close()
+		return n
+	}
+
+	beforeCount := countFiles()
+	if beforeCount != 3 {
+		t.Fatalf("expected 3 snapshots before retention, got %d", beforeCount)
+	}
+
+	// Enforce retention with skip remote deletion enabled.
+	retentionTime := time.Now().Add(-150 * time.Millisecond)
+	if _, err := db.EnforceSnapshotRetention(t.Context(), retentionTime); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote files should all still exist.
+	afterCount := countFiles()
+	if afterCount != beforeCount {
+		t.Fatalf("expected %d remote snapshots (no remote deletion), got %d", beforeCount, afterCount)
+	}
+}
+
+func TestDB_EnforceL0RetentionByTime_RetentionDisabled(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Disable retention and set a short L0 retention.
+	db.RetentionEnabled = false
+	db.L0Retention = time.Nanosecond
+
+	// Create table and sync to create L0 files.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		} else if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync replica to upload L0 files to remote storage.
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Count L0 files before.
+	countL0 := func() int {
+		t.Helper()
+		itr, err := db.Replica.Client.LTXFiles(t.Context(), 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var n int
+		for itr.Next() {
+			n++
+		}
+		itr.Close()
+		return n
+	}
+
+	beforeCount := countL0()
+	if beforeCount < 2 {
+		t.Fatalf("expected at least 2 L0 files, got %d", beforeCount)
+	}
+
+	// Compact L0 to L1 so files become eligible for L0 retention.
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
+	if _, err := store.CompactDB(t.Context(), db, &litestream.CompactionLevel{Level: 1, Interval: time.Nanosecond}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait a moment for files to become old enough.
+	time.Sleep(10 * time.Millisecond)
+
+	// Enforce L0 retention.
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Remote L0 files should all still exist.
+	afterCount := countL0()
+	if afterCount != beforeCount {
+		t.Fatalf("expected %d remote L0 files (no remote deletion), got %d", beforeCount, afterCount)
 	}
 }
 
@@ -710,14 +833,19 @@ func TestDB_ConcurrentMapWrite(t *testing.T) {
 func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 	ctx := context.Background()
 
-	db, sqldb := testingutil.MustOpenDBs(t)
-	defer testingutil.MustCloseDBs(t, db, sqldb)
-
-	// Set up replica with file backend
-	replicaPath := filepath.Join(t.TempDir(), "replica")
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	replicaPath := filepath.Join(dir, "replica")
 	client := file.NewReplicaClient(replicaPath)
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	// Create some transactions
 	for i := 0; i < 10; i++ {
@@ -819,13 +947,19 @@ func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 	ctx := context.Background()
 
-	db, sqldb := testingutil.MustOpenDBs(t)
-	defer testingutil.MustCloseDBs(t, db, sqldb)
-
-	replicaPath := filepath.Join(t.TempDir(), "replica")
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	replicaPath := filepath.Join(dir, "replica")
 	client := file.NewReplicaClient(replicaPath)
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
 		t.Fatalf("create table: %v", err)
@@ -908,13 +1042,19 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 func TestDB_EnforceL0RetentionByTime(t *testing.T) {
 	ctx := context.Background()
 
-	db, sqldb := testingutil.MustOpenDBs(t)
-	defer testingutil.MustCloseDBs(t, db, sqldb)
-
-	replicaPath := filepath.Join(t.TempDir(), "replica")
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	replicaPath := filepath.Join(dir, "replica")
 	client := file.NewReplicaClient(replicaPath)
 	db.Replica = litestream.NewReplicaWithClient(db, client)
 	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
 
 	// Use a long retention initially so compaction does not immediately clean up files.
 	db.L0Retention = 30 * time.Minute
@@ -1208,6 +1348,312 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 		t.Fatalf("expected TXID to advance after delayed checkpoint (syncedSinceCheckpoint should persist), got insert=%d delayed=%d",
 			posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
 	}
+}
+
+func TestDB_SyncStatus(t *testing.T) {
+	t.Run("NoReplica", func(t *testing.T) {
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+		db.Replica = nil
+		if _, err := db.SyncStatus(context.Background()); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("BeforeSync", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		status, err := db.SyncStatus(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.LocalTXID != 0 {
+			t.Fatalf("expected LocalTXID=0, got %d", status.LocalTXID)
+		}
+		if status.RemoteTXID != 0 {
+			t.Fatalf("expected RemoteTXID=0, got %d", status.RemoteTXID)
+		}
+		if status.InSync {
+			t.Fatal("expected InSync=false before any sync")
+		}
+	})
+
+	t.Run("AfterDBSyncOnly", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		status, err := db.SyncStatus(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.LocalTXID == 0 {
+			t.Fatal("expected non-zero LocalTXID after db sync")
+		}
+		if status.RemoteTXID != 0 {
+			t.Fatalf("expected RemoteTXID=0, got %d", status.RemoteTXID)
+		}
+		if status.InSync {
+			t.Fatal("expected InSync=false when remote has not synced")
+		}
+	})
+
+	t.Run("AfterFullSync", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		status, err := db.SyncStatus(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.LocalTXID == 0 {
+			t.Fatal("expected non-zero LocalTXID")
+		}
+		if status.LocalTXID != status.RemoteTXID {
+			t.Fatalf("expected LocalTXID=%d == RemoteTXID=%d", status.LocalTXID, status.RemoteTXID)
+		}
+		if !status.InSync {
+			t.Fatal("expected InSync=true after full sync")
+		}
+	})
+
+	t.Run("AfterNewWrites", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1)`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		status, err := db.SyncStatus(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if status.LocalTXID <= status.RemoteTXID {
+			t.Fatalf("expected LocalTXID=%d > RemoteTXID=%d", status.LocalTXID, status.RemoteTXID)
+		}
+		if status.InSync {
+			t.Fatal("expected InSync=false after new writes without replica sync")
+		}
+	})
+
+	t.Run("CancelledContext", func(t *testing.T) {
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+		client := &mock.ReplicaClient{
+			LTXFilesFunc: func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+				return nil, ctx.Err()
+			},
+		}
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		_, err := db.SyncStatus(ctx)
+		if err == nil {
+			t.Fatal("expected error with cancelled context")
+		}
+		if !strings.Contains(err.Error(), "remote position") {
+			t.Fatalf("expected remote position error, got: %v", err)
+		}
+	})
+}
+
+func TestDB_SyncAndWait(t *testing.T) {
+	t.Run("NoReplica", func(t *testing.T) {
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+		db.Replica = nil
+		if err := db.SyncAndWait(context.Background()); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("OK", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1)`); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.SyncAndWait(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		status, err := db.SyncStatus(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !status.InSync {
+			t.Fatalf("expected InSync=true after SyncAndWait, LocalTXID=%d RemoteTXID=%d", status.LocalTXID, status.RemoteTXID)
+		}
+	})
+}
+
+func TestDB_EnsureExists(t *testing.T) {
+	t.Run("NoReplica", func(t *testing.T) {
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+		db.Replica = nil
+		if err := db.EnsureExists(context.Background()); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
+	t.Run("DBAlreadyExists", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "db")
+
+		if err := os.WriteFile(dbPath, []byte("dummy"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		db := litestream.NewDB(dbPath)
+		client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		if err := db.EnsureExists(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		data, err := os.ReadFile(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != "dummy" {
+			t.Fatal("expected file to remain unchanged")
+		}
+	})
+
+	t.Run("NoBackup", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "db")
+
+		db := testingutil.NewDB(t, dbPath)
+		client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		if err := db.EnsureExists(context.Background()); err != nil {
+			t.Fatalf("expected nil error for no backup, got %v", err)
+		}
+
+		if _, err := os.Stat(dbPath); !os.IsNotExist(err) {
+			t.Fatal("expected database file to not exist when no backup available")
+		}
+	})
+
+	t.Run("MissingParentDir", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "subdir", "nested", "db")
+
+		db := testingutil.NewDB(t, dbPath)
+		client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+		db.Replica = litestream.NewReplicaWithClient(db, client)
+
+		if err := db.EnsureExists(context.Background()); err != nil {
+			t.Fatalf("expected nil error, got %v", err)
+		}
+
+		info, err := os.Stat(filepath.Join(dir, "subdir", "nested"))
+		if err != nil {
+			t.Fatal("expected parent directories to be created")
+		}
+		if !info.IsDir() {
+			t.Fatal("expected parent path to be a directory")
+		}
+	})
+
+	t.Run("RestoreFromBackup", func(t *testing.T) {
+		ctx := context.Background()
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "db")
+		replicaPath := filepath.Join(dir, "replica")
+
+		db := testingutil.NewDB(t, dbPath)
+		db.MonitorInterval = 0
+		db.ShutdownSyncTimeout = 0
+		client := file.NewReplicaClient(replicaPath)
+		replica := litestream.NewReplicaWithClient(db, client)
+		replica.MonitorEnabled = false
+		db.Replica = replica
+
+		if err := db.Open(); err != nil {
+			t.Fatal(err)
+		}
+
+		sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+		if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INT, value TEXT)`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (id, value) VALUES (1, 'hello')`); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := db.SyncAndWait(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := os.Remove(dbPath); err != nil {
+			t.Fatal(err)
+		}
+		walPath := dbPath + "-wal"
+		os.Remove(walPath)
+
+		db2 := testingutil.NewDB(t, dbPath)
+		client2 := file.NewReplicaClient(replicaPath)
+		db2.Replica = litestream.NewReplicaWithClient(db2, client2)
+
+		if err := db2.EnsureExists(ctx); err != nil {
+			t.Fatalf("EnsureExists: %v", err)
+		}
+
+		if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+			t.Fatal("expected database file to be restored")
+		}
+
+		sqldb2 := testingutil.MustOpenSQLDB(t, dbPath)
+		defer sqldb2.Close()
+
+		var value string
+		if err := sqldb2.QueryRowContext(ctx, `SELECT value FROM t WHERE id = 1`).Scan(&value); err != nil {
+			t.Fatalf("query restored db: %v", err)
+		}
+		if value != "hello" {
+			t.Fatalf("expected 'hello', got %q", value)
+		}
+	})
 }
 
 // TestDB_ResetLocalState verifies that ResetLocalState clears the LTX directory.

@@ -87,6 +87,14 @@ type DB struct {
 	// the new (truncated) WAL size.
 	syncedToWALEnd bool
 
+	// lastSyncedWALOffset tracks the logical end of the WAL content after
+	// the last successful sync. This is the WALOffset + WALSize from the
+	// last LTX file. Used for checkpoint threshold decisions instead of
+	// file size, which may include stale frames with old salt values after
+	// a checkpoint. This prevents issue #997 where PASSIVE checkpoints
+	// trigger a feedback loop because stale file size exceeds threshold.
+	lastSyncedWALOffset int64
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -99,6 +107,7 @@ type DB struct {
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
+	Done   <-chan struct{}
 
 	// Metrics
 	dbSizeGauge                 prometheus.Gauge
@@ -148,12 +157,22 @@ type DB struct {
 	// Minimum time to retain L0 files after they have been compacted into L1.
 	L0Retention time.Duration
 
+	// VerifyCompaction enables post-compaction TXID consistency verification.
+	// When enabled, verifies that files at the destination level have
+	// contiguous TXID ranges after each compaction.
+	VerifyCompaction bool
+
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
+
 	// Remote replica for the database.
 	// Must be set before calling Open().
 	Replica *Replica
 
 	// Compactor handles shared compaction logic.
-	// Created in NewDB, client set when Replica is assigned.
+	// Created in NewDB with nil client; client set once in Open() from Replica.Client.
 	compactor *Compactor
 
 	// Shutdown sync retry settings.
@@ -186,6 +205,7 @@ func NewDB(path string) *DB {
 		MonitorInterval:      DefaultMonitorInterval,
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
+		RetentionEnabled:     true,
 		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval: DefaultShutdownSyncInterval,
 		Logger:               slog.With("db", filepath.Base(path)),
@@ -205,10 +225,11 @@ func NewDB(path string) *DB {
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
-	// Initialize compactor with nil client (will be set when Replica is assigned).
+	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger)
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
+	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
 	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -312,13 +333,6 @@ func (db *DB) deleteLocalLTXFile(level int, minTXID, maxTXID ltx.TXID) error {
 	return nil
 }
 
-// ensureCompactorClient ensures the compactor has the current replica client.
-func (db *DB) ensureCompactorClient() {
-	if db.Replica != nil && db.compactor.Client() != db.Replica.Client {
-		db.compactor.SetClient(db.Replica.Client)
-	}
-}
-
 // MaxLTX returns the last LTX file written to level 0.
 func (db *DB) MaxLTX() (minTXID, maxTXID ltx.TXID, err error) {
 	ents, err := os.ReadDir(db.LTXLevelDir(0))
@@ -401,6 +415,92 @@ func (db *DB) LastSuccessfulSyncAt() time.Time {
 	return db.lastSuccessfulSyncAt
 }
 
+// SyncStatus represents the current replication state of the database.
+type SyncStatus struct {
+	LocalTXID  ltx.TXID
+	RemoteTXID ltx.TXID
+	InSync     bool
+}
+
+// SyncStatus returns the current replication status of the database, comparing
+// the local transaction position against the remote replica position. The remote
+// position is queried from the replica storage, so this method may perform I/O.
+func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
+	if db.Replica == nil {
+		return SyncStatus{}, fmt.Errorf("no replica configured")
+	}
+
+	localPos, err := db.Pos()
+	if err != nil {
+		return SyncStatus{}, fmt.Errorf("local position: %w", err)
+	}
+
+	remotePos, err := db.Replica.calcPos(ctx)
+	if err != nil {
+		return SyncStatus{}, fmt.Errorf("remote position: %w", err)
+	}
+
+	return SyncStatus{
+		LocalTXID:  localPos.TXID,
+		RemoteTXID: remotePos.TXID,
+		InSync:     localPos.TXID > 0 && localPos.TXID == remotePos.TXID,
+	}, nil
+}
+
+// SyncAndWait performs a full sync: WAL to LTX files, then LTX files to remote
+// replica. Blocks until both stages complete.
+func (db *DB) SyncAndWait(ctx context.Context) error {
+	if db.Replica == nil {
+		return fmt.Errorf("no replica configured")
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		return fmt.Errorf("db sync: %w", err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		return fmt.Errorf("replica sync: %w", err)
+	}
+	return nil
+}
+
+// EnsureExists restores the database from the configured replica if the local
+// database file does not exist. If no backup is available, it returns nil and
+// a fresh database will be created on Open(). Must be called before Open().
+func (db *DB) EnsureExists(ctx context.Context) error {
+	if db.Replica == nil {
+		return fmt.Errorf("no replica configured")
+	}
+	if db.Replica.Client == nil {
+		return fmt.Errorf("no replica client configured")
+	}
+
+	if _, err := os.Stat(db.Path()); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("stat database: %w", err)
+	}
+
+	if dir := filepath.Dir(db.Path()); dir != "." {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			return fmt.Errorf("create parent directory: %w", err)
+		}
+	}
+
+	opt := NewRestoreOptions()
+	opt.OutputPath = db.Path()
+
+	if err := db.Replica.Restore(ctx, opt); err != nil {
+		if errors.Is(err, ErrTxNotAvailable) || errors.Is(err, ErrNoSnapshots) {
+			db.Logger.Debug("no backup found, will create fresh database")
+			return nil
+		}
+		return fmt.Errorf("restore from backup: %w", err)
+	}
+
+	db.Logger.Info("database restored from backup", "path", db.Path())
+	return nil
+}
+
 // Open initializes the background monitoring goroutine.
 func (db *DB) Open() (err error) {
 	db.mu.Lock()
@@ -413,6 +513,12 @@ func (db *DB) Open() (err error) {
 	db.mu.Unlock()
 
 	// Validate fields on database.
+	if db.Replica == nil {
+		return fmt.Errorf("replica required before opening database")
+	}
+	if db.Replica.Client == nil {
+		return fmt.Errorf("replica client required before opening database")
+	}
 	if db.MinCheckpointPageN <= 0 {
 		return fmt.Errorf("minimum checkpoint page count required")
 	}
@@ -422,13 +528,18 @@ func (db *DB) Open() (err error) {
 		return fmt.Errorf("cannot remove tmp files: %w", err)
 	}
 
+	// Set the compactor client once before starting any goroutines.
+	db.compactor.VerifyCompaction = db.VerifyCompaction
+	db.compactor.RetentionEnabled = db.RetentionEnabled
+	db.compactor.client = db.Replica.Client
+
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {
 		db.wg.Add(1)
 		go func() { defer db.wg.Done(); db.monitor() }()
 	}
 
-	// Mark as opened only after successful initialization
+	// Mark as opened only after successful initialization.
 	db.mu.Lock()
 	db.opened = true
 	db.mu.Unlock()
@@ -437,7 +548,8 @@ func (db *DB) Open() (err error) {
 }
 
 // Close flushes outstanding WAL writes to replicas, releases the read lock,
-// and closes the database. Takes a context for final sync.
+// and closes the database. If Done is set, closing it interrupts the shutdown
+// sync retry loop and cancels any in-flight sync attempt.
 func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
@@ -489,7 +601,8 @@ func (db *DB) Close(ctx context.Context) (err error) {
 }
 
 // syncReplicaWithRetry attempts to sync the replica with retry logic for shutdown.
-// It retries until success, timeout, or context cancellation.
+// It retries until success, timeout, or context cancellation. If db.Done is non-nil,
+// closing it cancels any in-flight sync attempt and exits the retry loop.
 // If ShutdownSyncTimeout is 0, it performs a single sync attempt without retries.
 func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 	if db.Replica == nil {
@@ -509,19 +622,47 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 		interval = DefaultShutdownSyncInterval
 	}
 
-	// Create deadline context for total retry duration
-	deadlineCtx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
+	// Create deadline context for total retry duration.
+	deadlineCtx, deadlineCancel := context.WithTimeout(ctx, timeout)
+	defer deadlineCancel()
+
+	// If db.Done is set, derive a context that cancels when done is closed
+	// so that in-flight Replica.Sync calls are interrupted immediately.
+	syncCtx := deadlineCtx
+	if db.Done != nil {
+		var syncCancel context.CancelFunc
+		syncCtx, syncCancel = context.WithCancel(deadlineCtx)
+		go func() {
+			select {
+			case <-db.Done:
+				syncCancel()
+			case <-deadlineCtx.Done():
+				syncCancel()
+			}
+		}()
+	}
 
 	var lastErr error
 	attempt := 0
 	startTime := time.Now()
 
 	for {
+		// Check if done is already closed before attempting sync
+		if db.Done != nil {
+			select {
+			case <-db.Done:
+				db.Logger.Warn("shutdown sync skipped, interrupted by signal",
+					"attempts", attempt,
+					"duration", time.Since(startTime))
+				return fmt.Errorf("after %d attempts: %w", attempt, ErrShutdownInterrupted)
+			default:
+			}
+		}
+
 		attempt++
 
 		// Try sync
-		if err := db.Replica.Sync(deadlineCtx); err == nil {
+		if err := db.Replica.Sync(syncCtx); err == nil {
 			if attempt > 1 {
 				db.Logger.Info("shutdown sync succeeded after retry",
 					"attempts", attempt,
@@ -532,29 +673,48 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 			lastErr = err
 		}
 
-		// Check if we should stop retrying
+		// Check if we should stop retrying (done signal or timeout)
 		select {
 		case <-deadlineCtx.Done():
 			db.Logger.Error("shutdown sync failed after timeout",
 				"attempts", attempt,
 				"duration", time.Since(startTime),
-				"lastError", lastErr)
+				"error", lastErr)
 			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
+		case <-db.Done:
+			db.Logger.Warn("shutdown sync interrupted by signal",
+				"attempts", attempt,
+				"duration", time.Since(startTime),
+				"error", lastErr)
+			return fmt.Errorf("after %d attempts: %w", attempt, ErrShutdownInterrupted)
 		default:
 		}
 
-		// Log retry
-		db.Logger.Warn("shutdown sync failed, retrying",
-			"attempt", attempt,
-			"error", lastErr,
-			"elapsed", time.Since(startTime),
-			"remaining", time.Until(startTime.Add(timeout)))
+		// Log retry with hint about second signal if interruptible
+		if db.Done != nil {
+			db.Logger.Warn("shutdown sync failed, retrying (press Ctrl+C again to skip)",
+				"attempts", attempt,
+				"error", lastErr,
+				"elapsed", time.Since(startTime),
+				"remaining", time.Until(startTime.Add(timeout)))
+		} else {
+			db.Logger.Warn("shutdown sync failed, retrying",
+				"attempts", attempt,
+				"error", lastErr,
+				"elapsed", time.Since(startTime),
+				"remaining", time.Until(startTime.Add(timeout)))
+		}
 
-		// Wait before retry
+		// Wait before retry, but also listen for done signal
 		select {
 		case <-time.After(interval):
 		case <-deadlineCtx.Done():
 			return fmt.Errorf("shutdown sync timeout after %d attempts: %w", attempt, lastErr)
+		case <-db.Done:
+			db.Logger.Warn("shutdown sync interrupted by signal",
+				"attempts", attempt,
+				"duration", time.Since(startTime))
+			return fmt.Errorf("after %d attempts: %w", attempt, ErrShutdownInterrupted)
 		}
 	}
 }
@@ -847,10 +1007,16 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 }
 
 func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSize, newWALSize int64, synced bool, err error) {
-	// Capture WAL size before sync for checkpoint threshold checks.
-	origWALSize, err = db.walFileSize()
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("stat wal before sync: %w", err)
+	// Use the last synced WAL offset as the logical size for checkpoint decisions.
+	// This avoids using file size which may include stale frames with old salt
+	// values after a checkpoint. See issue #997.
+	origWALSize = db.lastSyncedWALOffset
+	if origWALSize == 0 {
+		// First sync - use file size as fallback
+		origWALSize, err = db.walFileSize()
+		if err != nil {
+			return 0, 0, false, fmt.Errorf("stat wal before sync: %w", err)
+		}
 	}
 
 	// Verify our last sync matches the current state of the WAL.
@@ -866,11 +1032,10 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSiz
 		return 0, 0, false, fmt.Errorf("sync: %w", err)
 	}
 
-	// Capture WAL size after sync for checkpoint threshold checks.
-	newWALSize, err = db.walFileSize()
-	if err != nil {
-		return 0, 0, false, fmt.Errorf("stat wal after sync: %w", err)
-	}
+	// Use the logical WAL offset (from LTX) for checkpoint decisions.
+	// After sync, db.lastSyncedWALOffset is updated to reflect the actual
+	// content position, not the file size.
+	newWALSize = db.lastSyncedWALOffset
 
 	return origWALSize, newWALSize, synced, nil
 }
@@ -1480,11 +1645,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	}
 	db.maxLTXFileInfos.Unlock()
 
+	// Track the logical end of WAL content for checkpoint decisions.
+	// This is the WALOffset + WALSize from the LTX we just created.
+	// Using this instead of file size prevents issue #997 where stale
+	// frames with old salt values cause perpetual checkpoint triggering.
+	finalOffset := info.offset + sz
+	db.lastSyncedWALOffset = finalOffset
+
 	// Track if we synced to the exact end of the WAL file.
 	// This is used by verify() to distinguish expected checkpoint truncation
 	// from unexpected external WAL modifications. See issue #927.
 	if walSize, err := db.walFileSize(); err == nil {
-		finalOffset := info.offset + sz
 		db.syncedToWALEnd = finalOffset == walSize
 	} else {
 		db.syncedToWALEnd = false
@@ -1694,7 +1865,8 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 	if db.PageSize() == 0 {
-		return ltx.Pos{}, nil, fmt.Errorf("page size not initialized yet")
+		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
+		return ltx.Pos{}, nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 
 	pos, err := db.Pos()
@@ -1796,8 +1968,6 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 // Returns metadata for the newly written compaction file. Returns ErrNoCompaction
 // if no new files are available to be compacted.
 func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
-	db.ensureCompactorClient()
-
 	info, err := db.compactor.Compact(ctx, dstLevel)
 	if err != nil {
 		return nil, err
@@ -1869,11 +2039,14 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove all files marked for deletion from both remote and local storage.
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	// Remove files marked for deletion from remote storage (unless retention disabled).
+	if !db.RetentionEnabled {
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
+	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
 
+	// Always clean up local files.
 	for _, info := range deleted {
 		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
 		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
@@ -1990,7 +2163,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
+	if !db.RetentionEnabled {
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
+	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
@@ -2010,7 +2185,6 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 // EnforceRetentionByTXID enforces retention so that any LTX files below
 // the target TXID are deleted. Always keep at least one file.
 func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) (err error) {
-	db.ensureCompactorClient()
 	return db.compactor.EnforceRetentionByTXID(ctx, level, txID)
 }
 
@@ -2275,4 +2449,9 @@ var (
 		Name: "litestream_checkpoint_seconds",
 		Help: "Time spent checkpointing WAL, in seconds",
 	}, []string{"db", "mode"})
+
+	compactionVerifyErrorCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_compaction_verify_error_count",
+		Help: "Number of post-compaction verification failures",
+	}, []string{"db"})
 )

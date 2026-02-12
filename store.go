@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -24,10 +25,31 @@ var (
 	// ErrTxNotAvailable is returned when a transaction does not exist.
 	ErrTxNotAvailable = errors.New("transaction not available")
 
-	// ErrDBNotReady is returned when compaction is attempted before the
-	// database has been initialized (e.g., page size not yet known).
-	ErrDBNotReady = errors.New("db not ready")
+	// ErrDBNotReady is a sentinel for errors.Is() compatibility.
+	ErrDBNotReady = &DBNotReadyError{}
+
+	// ErrShutdownInterrupted is returned when the shutdown sync retry loop
+	// is interrupted by a done channel signal (e.g., second Ctrl+C).
+	ErrShutdownInterrupted = errors.New("shutdown sync interrupted")
 )
+
+// DBNotReadyError is returned when an operation is attempted before the
+// database has been initialized (e.g., page size not yet known).
+type DBNotReadyError struct {
+	Reason string
+}
+
+func (e *DBNotReadyError) Error() string {
+	if e.Reason != "" {
+		return "db not ready: " + e.Reason
+	}
+	return "db not ready"
+}
+
+func (e *DBNotReadyError) Is(target error) bool {
+	_, ok := target.(*DBNotReadyError)
+	return ok
+}
 
 // Store defaults
 const (
@@ -66,6 +88,7 @@ type Store struct {
 	wg     sync.WaitGroup
 	ctx    context.Context
 	cancel func()
+	done   <-chan struct{}
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
@@ -80,6 +103,14 @@ type Store struct {
 	// If true, compaction is run in the background according to compaction levels.
 	CompactionMonitorEnabled bool
 
+	// If true, verify TXID consistency at destination level after each compaction.
+	VerifyCompaction bool
+
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
+
 	// Shutdown sync retry settings.
 	ShutdownSyncTimeout  time.Duration
 	ShutdownSyncInterval time.Duration
@@ -93,6 +124,9 @@ type Store struct {
 
 	// heartbeatMonitorRunning tracks whether the heartbeat monitor goroutine is running.
 	heartbeatMonitorRunning bool
+
+	// How often to run validation checks. Zero disables periodic validation.
+	ValidationInterval time.Duration
 }
 
 func NewStore(dbs []*DB, levels CompactionLevels) *Store {
@@ -105,6 +139,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		L0Retention:              DefaultL0Retention,
 		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
 		CompactionMonitorEnabled: true,
+		RetentionEnabled:         true,
 		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
@@ -114,6 +149,8 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		db.L0Retention = s.L0Retention
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 		db.ShutdownSyncInterval = s.ShutdownSyncInterval
+		db.VerifyCompaction = s.VerifyCompaction
+		db.RetentionEnabled = s.RetentionEnabled
 	}
 	s.ctx, s.cancel = context.WithCancel(context.Background())
 	return s
@@ -124,10 +161,21 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(50)
 	for _, db := range s.dbs {
-		if err := db.Open(); err != nil {
-			return err
-		}
+		db := db
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return db.Open()
+			}
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	// Start monitors for compactions & snapshots.
@@ -165,6 +213,15 @@ func (s *Store) Open(ctx context.Context) error {
 	// Start heartbeat monitor if any database has heartbeat configured.
 	s.startHeartbeatMonitorIfNeeded()
 
+	// Start validation monitor if configured.
+	if s.ValidationInterval > 0 {
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.monitorValidation(s.ctx)
+		}()
+	}
+
 	return nil
 }
 
@@ -174,8 +231,14 @@ func (s *Store) Close(ctx context.Context) (err error) {
 	s.mu.Unlock()
 
 	for _, db := range dbs {
-		if e := db.Close(ctx); e != nil && err == nil {
-			err = e
+		if e := db.Close(ctx); e != nil {
+			if errors.Is(e, ErrShutdownInterrupted) {
+				if err == nil {
+					err = e
+				}
+			} else if err == nil || errors.Is(err, ErrShutdownInterrupted) {
+				err = e
+			}
 		}
 	}
 
@@ -192,8 +255,8 @@ func (s *Store) DBs() []*DB {
 	return slices.Clone(s.dbs)
 }
 
-// AddDB registers a new database with the store and starts monitoring it.
-func (s *Store) AddDB(db *DB) error {
+// RegisterDB registers a new database with the store and starts monitoring it.
+func (s *Store) RegisterDB(db *DB) error {
 	if db == nil {
 		return fmt.Errorf("db required")
 	}
@@ -212,6 +275,9 @@ func (s *Store) AddDB(db *DB) error {
 	db.L0Retention = s.L0Retention
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
+	db.VerifyCompaction = s.VerifyCompaction
+	db.RetentionEnabled = s.RetentionEnabled
+	db.Done = s.done
 
 	// Open the database without holding the lock to avoid blocking other operations.
 	// The double-check pattern below handles the race condition.
@@ -244,8 +310,8 @@ func (s *Store) AddDB(db *DB) error {
 	return nil
 }
 
-// RemoveDB stops monitoring the database at the provided path and closes it.
-func (s *Store) RemoveDB(ctx context.Context, path string) error {
+// UnregisterDB stops monitoring the database at the provided path and closes it.
+func (s *Store) UnregisterDB(ctx context.Context, path string) error {
 	if path == "" {
 		return fmt.Errorf("db path required")
 	}
@@ -344,6 +410,17 @@ func (s *Store) SetL0Retention(d time.Duration) {
 	}
 }
 
+// SetDone sets the done channel used for interrupt handling during shutdown
+// and propagates it to all managed databases.
+func (s *Store) SetDone(done <-chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.done = done
+	for _, db := range s.dbs {
+		db.Done = done
+	}
+}
+
 // SetShutdownSyncTimeout updates the shutdown sync timeout and propagates it to
 // all managed databases.
 func (s *Store) SetShutdownSyncTimeout(d time.Duration) {
@@ -363,6 +440,28 @@ func (s *Store) SetShutdownSyncInterval(d time.Duration) {
 	s.ShutdownSyncInterval = d
 	for _, db := range s.dbs {
 		db.ShutdownSyncInterval = d
+	}
+}
+
+// SetVerifyCompaction updates the verify compaction flag and propagates it to
+// all managed databases.
+func (s *Store) SetVerifyCompaction(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.VerifyCompaction = v
+	for _, db := range s.dbs {
+		db.VerifyCompaction = v
+		db.compactor.VerifyCompaction = v
+	}
+}
+
+func (s *Store) SetRetentionEnabled(v bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.RetentionEnabled = v
+	for _, db := range s.dbs {
+		db.RetentionEnabled = v
+		db.compactor.RetentionEnabled = v
 	}
 }
 
@@ -403,7 +502,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
 				slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
-				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path())
+				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				slog.Error("compaction failed", "level", lvl.Level, "error", err)
@@ -584,7 +683,7 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
-		return nil, ErrDBNotReady
+		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 
 	dstLevel := lvl.Level
@@ -659,4 +758,76 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 	}
 
 	return nil
+}
+
+// ValidationResult holds the result of validating a replica's LTX files.
+type ValidationResult struct {
+	Valid  bool              // true if no errors found
+	Errors []ValidationError // all errors found
+}
+
+// Validate checks LTX file consistency across all databases and levels.
+// SnapshotLevel (9) is excluded since snapshots are not contiguous.
+func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
+	result := &ValidationResult{Valid: true}
+
+	s.mu.Lock()
+	dbs := s.dbs
+	levels := s.levels
+	s.mu.Unlock()
+
+	for _, db := range dbs {
+		if db.Replica == nil {
+			continue
+		}
+
+		for _, lvl := range levels {
+			errs, err := db.Replica.ValidateLevel(ctx, lvl.Level)
+			if err != nil {
+				return nil, fmt.Errorf("validate level %d for %s: %w", lvl.Level, db.Path(), err)
+			}
+			if len(errs) > 0 {
+				result.Valid = false
+				result.Errors = append(result.Errors, errs...)
+			}
+		}
+	}
+
+	return result, nil
+}
+
+// monitorValidation periodically runs validation checks on all databases.
+func (s *Store) monitorValidation(ctx context.Context) {
+	slog.Info("starting validation monitor", "interval", s.ValidationInterval)
+
+	ticker := time.NewTicker(s.ValidationInterval)
+	defer ticker.Stop()
+
+LOOP:
+	for {
+		select {
+		case <-ctx.Done():
+			break LOOP
+		case <-ticker.C:
+		}
+
+		result, err := s.Validate(ctx)
+		if err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				continue
+			}
+			slog.Error("validation check failed", "error", err)
+			continue
+		}
+
+		if !result.Valid {
+			for _, verr := range result.Errors {
+				slog.Warn("validation error detected",
+					"level", verr.Level,
+					"type", verr.Type,
+					"message", verr.Message,
+				)
+			}
+		}
+	}
 }

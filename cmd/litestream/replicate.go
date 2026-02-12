@@ -49,6 +49,10 @@ type ReplicateCommand struct {
 
 	// Directory monitors for dynamic database discovery.
 	directoryMonitors []*DirectoryMonitor
+
+	// Done channel for interrupt handling during shutdown. When closed,
+	// the shutdown sync retry loop exits and any in-flight sync is cancelled.
+	done <-chan struct{}
 }
 
 func NewReplicateCommand() *ReplicateCommand {
@@ -250,6 +254,18 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if c.Config.ShutdownSyncInterval != nil {
 		c.Store.SetShutdownSyncInterval(*c.Config.ShutdownSyncInterval)
 	}
+	if c.Config.VerifyCompaction {
+		c.Store.SetVerifyCompaction(true)
+	}
+	if c.Config.Retention.Enabled != nil && !*c.Config.Retention.Enabled {
+		c.Store.SetRetentionEnabled(false)
+	}
+	if c.Config.Validation.Interval != nil {
+		c.Store.ValidationInterval = *c.Config.Validation.Interval
+	}
+	if c.done != nil {
+		c.Store.SetDone(c.done)
+	}
 	if c.Config.HeartbeatURL != "" {
 		interval := litestream.DefaultHeartbeatInterval
 		if c.Config.HeartbeatInterval != nil {
@@ -275,12 +291,18 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
+	if !c.Store.RetentionEnabled {
+		slog.Warn("retention disabled; cloud provider lifecycle policies must handle retention",
+			"hint", "idle databases that stop receiving writes will not generate new snapshots and may lose backup coverage if cloud retention expires")
+	}
+
 	// Start control server if socket is enabled
 	if c.Config.Socket.Enabled {
 		c.Server = litestream.NewServer(c.Store)
 		c.Server.SocketPath = c.Config.Socket.Path
 		c.Server.SocketPerms = c.Config.Socket.Permissions
 		c.Server.PathExpander = expand
+		c.Server.Version = Version
 		if err := c.Server.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
 		}
@@ -423,7 +445,11 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	}
 	if c.Store != nil {
 		if err := c.Store.Close(ctx); err != nil {
-			slog.Error("failed to close database", "error", err)
+			if errors.Is(err, litestream.ErrShutdownInterrupted) {
+				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
+			} else {
+				slog.Error("failed to close database", "error", err)
+			}
 		}
 	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
@@ -432,6 +458,12 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// SetDone sets the done channel used for interrupt handling during shutdown.
+// When the channel is closed, the shutdown sync retry loop exits.
+func (c *ReplicateCommand) SetDone(done <-chan struct{}) {
+	c.done = done
 }
 
 // restoreIfNeeded restores a database from its replica if the database doesn't

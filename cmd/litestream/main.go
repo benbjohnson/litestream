@@ -13,11 +13,13 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
+	_ "golang.org/x/crypto/x509roots/fallback"
 	"gopkg.in/yaml.v2"
 	_ "modernc.org/sqlite"
 
@@ -124,6 +126,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		// Setup signal handler.
 		signalCh := signalChan()
 
+		// Create done channel for interrupt during shutdown. It will be
+		// closed when a second signal arrives, allowing each database's
+		// retry loop to observe the interrupt.
+		done := make(chan struct{})
+		c.SetDone(done)
+
 		if err := c.Run(ctx); err != nil {
 			return err
 		}
@@ -137,7 +145,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 				slog.Info("replication complete, litestream shutting down")
 			}
 		case sig := <-signalCh:
-			slog.Info("signal received, litestream shutting down")
+			slog.Info("signal received, litestream shutting down", "signal", sig)
 
 			if c.cmd != nil {
 				slog.Info("sending signal to exec process")
@@ -150,6 +158,12 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 					return fmt.Errorf("cannot wait for exec process: %w", err)
 				}
 			}
+
+			// Listen for a second signal to close done and interrupt retry loops.
+			go func() {
+				<-signalCh
+				close(done)
+			}()
 		}
 
 		// Gracefully close.
@@ -163,12 +177,20 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&StartCommand{}).Run(ctx, args)
 	case "stop":
 		return (&StopCommand{}).Run(ctx, args)
+	case "register":
+		return (&RegisterCommand{}).Run(ctx, args)
+	case "unregister":
+		return (&UnregisterCommand{}).Run(ctx, args)
 	case "reset":
 		return (&ResetCommand{}).Run(ctx, args)
 	case "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "status":
 		return (&StatusCommand{}).Run(ctx, args)
+	case "list":
+		return (&ListCommand{}).Run(ctx, args)
+	case "info":
+		return (&InfoCommand{}).Run(ctx, args)
 	case "version":
 		return (&VersionCommand{}).Run(ctx, args)
 	case "ltx":
@@ -198,13 +220,17 @@ Usage:
 The commands are:
 
 	databases    list databases specified in config file
+	info         show daemon information
+	list         list all managed databases
 	ltx          list available LTX files for a database
+	register     register a database for replication
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
 	restore      recovers database backup from a replica
 	start        start replication for a database
 	status       display replication status for databases
 	stop         stop replication for a database
+	unregister   unregister a database from replication
 	version      prints the binary version
 `[1:])
 }
@@ -227,9 +253,19 @@ type Config struct {
 	// Snapshot configuration
 	Snapshot SnapshotConfig `yaml:"snapshot"`
 
+	// Validation configuration
+	Validation ValidationConfig `yaml:"validation"`
+
 	// L0 retention settings
 	L0Retention              *time.Duration `yaml:"l0-retention"`
 	L0RetentionCheckInterval *time.Duration `yaml:"l0-retention-check-interval"`
+
+	// Verify TXID consistency at destination level after each compaction.
+	// When enabled, logs warnings if gaps or overlaps are detected.
+	VerifyCompaction bool `yaml:"verify-compaction"`
+
+	// Retention configuration
+	Retention RetentionConfig `yaml:"retention"`
 
 	// Heartbeat settings (global defaults)
 	HeartbeatURL      string         `yaml:"heartbeat-url"`
@@ -261,6 +297,16 @@ type Config struct {
 type SnapshotConfig struct {
 	Interval  *time.Duration `yaml:"interval"`
 	Retention *time.Duration `yaml:"retention"`
+}
+
+// RetentionConfig configures retention enforcement behavior.
+type RetentionConfig struct {
+	Enabled *bool `yaml:"enabled"`
+}
+
+// ValidationConfig configures periodic validation checks.
+type ValidationConfig struct {
+	Interval *time.Duration `yaml:"interval"`
 }
 
 // LoggingConfig configures logging.
@@ -499,7 +545,12 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 
 	// Expand environment variables, if enabled.
 	if expandEnv {
-		buf = []byte(os.ExpandEnv(string(buf)))
+		buf = []byte(os.Expand(string(buf), func(key string) string {
+			if key == "PID" {
+				return strconv.Itoa(os.Getpid())
+			}
+			return os.Getenv(key)
+		}))
 	}
 
 	// Save defaults before unmarshaling
@@ -1378,6 +1429,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
 	isScaleway := litestream.IsScalewayEndpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
+	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set by user (config or URL query param).
 	forcePathStyleSet := c.ForcePathStyle != nil
@@ -1389,7 +1441,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isMinIO {
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
@@ -1413,6 +1465,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	client.SignPayload = signSetting.value
 	client.RequireContentMD5 = requireSetting.value
+
+	if isCloudflareR2 {
+		client.Concurrency = s3.DefaultR2Concurrency
+	}
 
 	// Apply upload configuration if specified.
 	if c.PartSize != nil {
@@ -1912,6 +1968,38 @@ func (v *txidVar) Set(s string) error {
 		return fmt.Errorf("invalid txid format")
 	}
 	*v = txidVar(txID)
+	return nil
+}
+
+// levelAll is a sentinel value indicating all compaction levels should be shown.
+const levelAll = -1
+
+// levelVar allows the flag package to parse compaction level flags.
+// Accepts integers 0-9 or "all" for all levels.
+type levelVar int
+
+var _ flag.Value = (*levelVar)(nil)
+
+func (v *levelVar) String() string {
+	if *v == levelAll {
+		return "all"
+	}
+	return strconv.Itoa(int(*v))
+}
+
+func (v *levelVar) Set(s string) error {
+	if s == "all" {
+		*v = levelAll
+		return nil
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return fmt.Errorf("invalid level: must be 0-%d or \"all\"", litestream.SnapshotLevel)
+	}
+	if n < 0 || n > litestream.SnapshotLevel {
+		return fmt.Errorf("level must be between 0 and %d", litestream.SnapshotLevel)
+	}
+	*v = levelVar(n)
 	return nil
 }
 

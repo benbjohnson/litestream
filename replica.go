@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -445,37 +446,58 @@ func (r *Replica) CreatedAt(ctx context.Context) (time.Time, error) {
 }
 
 // TimeBounds returns the creation time & last updated time.
-// Returns zero time if LTX files exist.
+// Returns zero time if no LTX files exist.
 func (r *Replica) TimeBounds(ctx context.Context) (createdAt, updatedAt time.Time, err error) {
-	// Normal operation - use fast timestamps
-	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
-	if err != nil {
-		return createdAt, updatedAt, err
-	}
-	defer itr.Close()
+	for level := SnapshotLevel; level >= 0; level-- {
+		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+		if err != nil {
+			return createdAt, updatedAt, err
+		}
 
-	for itr.Next() {
-		info := itr.Item()
-		if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
-			createdAt = info.CreatedAt
+		for itr.Next() {
+			info := itr.Item()
+			if createdAt.IsZero() || info.CreatedAt.Before(createdAt) {
+				createdAt = info.CreatedAt
+			}
+			if updatedAt.IsZero() || info.CreatedAt.After(updatedAt) {
+				updatedAt = info.CreatedAt
+			}
 		}
-		if updatedAt.IsZero() || info.CreatedAt.After(updatedAt) {
-			updatedAt = info.CreatedAt
+		if err := itr.Close(); err != nil {
+			return createdAt, updatedAt, err
 		}
 	}
-	return createdAt, updatedAt, itr.Close()
+	return createdAt, updatedAt, nil
 }
 
 // CalcRestoreTarget returns a target time restore from.
 func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (updatedAt time.Time, err error) {
-	// Determine the replicated time bounds.
+	// Determine the replicated time bounds from LTX files.
 	createdAt, updatedAt, err := r.TimeBounds(ctx)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("created at: %w", err)
 	}
 
+	// Also check v0.3.x time bounds if client supports it.
+	if client, ok := r.Client.(ReplicaClientV3); ok {
+		v3CreatedAt, v3UpdatedAt, err := r.TimeBoundsV3(ctx, client)
+		if err != nil {
+			return time.Time{}, fmt.Errorf("v0.3.x time bounds: %w", err)
+		}
+		// Extend time bounds to include v0.3.x backups.
+		if !v3CreatedAt.IsZero() && (createdAt.IsZero() || v3CreatedAt.Before(createdAt)) {
+			createdAt = v3CreatedAt
+		}
+		if !v3UpdatedAt.IsZero() && (updatedAt.IsZero() || v3UpdatedAt.After(updatedAt)) {
+			updatedAt = v3UpdatedAt
+		}
+	}
+
 	// Skip if it does not contain timestamp.
 	if !opt.Timestamp.IsZero() {
+		if createdAt.IsZero() && updatedAt.IsZero() {
+			return time.Time{}, fmt.Errorf("no backups found")
+		}
 		if opt.Timestamp.Before(createdAt) || opt.Timestamp.After(updatedAt) {
 			return time.Time{}, fmt.Errorf("timestamp does not exist")
 		}
@@ -490,6 +512,11 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 // replica or it will automatically choose the best one. Finally,
 // a timestamp can be specified to restore the database to a specific
 // point-in-time.
+//
+// When the replica contains both v0.3.x and LTX format backups, this method
+// compares snapshots from both formats and uses whichever has the better backup:
+// - With timestamp: uses the format with the most recent snapshot before timestamp
+// - Without timestamp: uses the format with the most recent backup overall
 func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
@@ -503,6 +530,19 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
 	} else if !os.IsNotExist(err) {
 		return err
+	}
+
+	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is specified).
+	if opt.TXID == 0 {
+		if client, ok := r.Client.(ReplicaClientV3); ok {
+			useV3, err := r.shouldUseV3Restore(ctx, client, opt.Timestamp)
+			if err != nil {
+				return err
+			}
+			if useV3 {
+				return r.RestoreV3(ctx, opt)
+			}
+		}
 	}
 
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
@@ -535,7 +575,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		if err != nil {
 			return fmt.Errorf("open ltx file: %w", err)
 		}
-		rdrs = append(rdrs, f)
+		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
@@ -589,6 +629,367 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	return os.Rename(tmpOutputPath, opt.OutputPath)
 }
 
+// RestoreV3 restores from a v0.3.x format backup.
+func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
+	client, ok := r.Client.(ReplicaClientV3)
+	if !ok {
+		return fmt.Errorf("replica client does not support v0.3.x restore")
+	}
+
+	// Validate options.
+	if opt.OutputPath == "" {
+		return fmt.Errorf("output path required")
+	}
+
+	// Ensure output path does not already exist.
+	if _, err := os.Stat(opt.OutputPath); err == nil {
+		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	// Find all generations.
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return fmt.Errorf("list generations: %w", err)
+	}
+	if len(generations) == 0 {
+		return ErrNoSnapshots
+	}
+
+	// Collect all snapshots across all generations.
+	var allSnapshots []SnapshotInfoV3
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return fmt.Errorf("list snapshots for generation %s: %w", gen, err)
+		}
+		allSnapshots = append(allSnapshots, snapshots...)
+	}
+	if len(allSnapshots) == 0 {
+		return ErrNoSnapshots
+	}
+
+	// Sort all snapshots by CreatedAt for timestamp-based selection.
+	sortSnapshotsV3ByCreatedAt(allSnapshots)
+
+	// Find best snapshot across all generations (latest, or before timestamp if specified).
+	snapshot := findBestSnapshotV3(allSnapshots, opt.Timestamp)
+	if snapshot == nil {
+		return ErrNoSnapshots
+	}
+
+	r.Logger().Debug("selected v0.3.x snapshot",
+		"generation", snapshot.Generation,
+		"index", snapshot.Index,
+		"created_at", snapshot.CreatedAt)
+
+	// Get WAL segments for the snapshot's generation.
+	segments, err := client.WALSegmentsV3(ctx, snapshot.Generation)
+	if err != nil {
+		return fmt.Errorf("list WAL segments: %w", err)
+	}
+	segments = filterWALSegmentsV3(segments, snapshot.Index, opt.Timestamp)
+
+	r.Logger().Debug("found v0.3.x WAL segments", "n", len(segments))
+
+	// Create parent directory if it doesn't exist.
+	var dirInfo os.FileInfo
+	if db := r.DB(); db != nil {
+		dirInfo = db.DirInfo()
+	}
+	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
+		return fmt.Errorf("create parent directory: %w", err)
+	}
+
+	// Create temp file for restore.
+	tmpPath := opt.OutputPath + ".tmp"
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	// Download and decompress snapshot.
+	if err := r.downloadSnapshotV3(ctx, client, snapshot.Generation, snapshot.Index, tmpPath); err != nil {
+		return fmt.Errorf("download snapshot: %w", err)
+	}
+
+	// Apply WAL segments.
+	if err := r.applyWALSegmentsV3(ctx, client, snapshot.Generation, segments, tmpPath); err != nil {
+		return fmt.Errorf("apply WAL segments: %w", err)
+	}
+
+	// Rename to final path.
+	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
+		return fmt.Errorf("rename to output path: %w", err)
+	}
+
+	return nil
+}
+
+// sortSnapshotsV3ByCreatedAt sorts snapshots by creation time in ascending order.
+func sortSnapshotsV3ByCreatedAt(snapshots []SnapshotInfoV3) {
+	for i := 0; i < len(snapshots)-1; i++ {
+		for j := i + 1; j < len(snapshots); j++ {
+			if snapshots[i].CreatedAt.After(snapshots[j].CreatedAt) {
+				snapshots[i], snapshots[j] = snapshots[j], snapshots[i]
+			}
+		}
+	}
+}
+
+// findBestSnapshotV3 finds the best snapshot for restore.
+// If timestamp is zero, returns the latest snapshot.
+// Otherwise, returns the latest snapshot created before or at the timestamp.
+func findBestSnapshotV3(snapshots []SnapshotInfoV3, timestamp time.Time) *SnapshotInfoV3 {
+	if len(snapshots) == 0 {
+		return nil
+	}
+	if timestamp.IsZero() {
+		return &snapshots[len(snapshots)-1]
+	}
+	for i := len(snapshots) - 1; i >= 0; i-- {
+		if !snapshots[i].CreatedAt.After(timestamp) {
+			return &snapshots[i]
+		}
+	}
+	return nil
+}
+
+// filterWALSegmentsV3 filters WAL segments to those at or after the snapshot index
+// and optionally before the timestamp.
+func filterWALSegmentsV3(segments []WALSegmentInfoV3, snapshotIndex int, timestamp time.Time) []WALSegmentInfoV3 {
+	var result []WALSegmentInfoV3
+	for _, seg := range segments {
+		if seg.Index < snapshotIndex {
+			continue
+		}
+		if !timestamp.IsZero() && seg.CreatedAt.After(timestamp) {
+			continue
+		}
+		result = append(result, seg)
+	}
+	return result
+}
+
+// downloadSnapshotV3 downloads and decompresses a v0.3.x snapshot to the destination path.
+func (r *Replica) downloadSnapshotV3(ctx context.Context, client ReplicaClientV3, generation string, index int, destPath string) error {
+	rc, err := client.OpenSnapshotV3(ctx, generation, index)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rc.Close() }()
+
+	f, err := os.Create(destPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	if _, err := io.Copy(f, rc); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// applyWALSegmentsV3 applies WAL segments to the database file.
+func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3, generation string, segments []WALSegmentInfoV3, dbPath string) error {
+	if len(segments) == 0 {
+		return nil
+	}
+
+	// Write all WAL segments to the WAL file.
+	walPath := dbPath + "-wal"
+	for _, seg := range segments {
+		if err := r.writeWALSegmentV3(ctx, client, generation, seg, walPath); err != nil {
+			return fmt.Errorf("write WAL segment %d/%d: %w", seg.Index, seg.Offset, err)
+		}
+	}
+
+	// Checkpoint to apply WAL to database.
+	return checkpointV3(dbPath)
+}
+
+// writeWALSegmentV3 writes a single WAL segment to the WAL file.
+func (r *Replica) writeWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, walPath string) error {
+	// Download WAL segment.
+	rc, err := client.OpenWALSegmentV3(ctx, generation, seg.Index, seg.Offset)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rc.Close() }()
+
+	// Open WAL file for writing.
+	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = f.Close() }()
+
+	// Seek to offset and write.
+	if _, err := f.Seek(seg.Offset, io.SeekStart); err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, rc); err != nil {
+		return err
+	}
+	return f.Sync()
+}
+
+// checkpointV3 checkpoints the WAL file into the database.
+func checkpointV3(dbPath string) error {
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	_, err = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+	return err
+}
+
+// findBestV3SnapshotForTimestamp returns the best v0.3.x snapshot for the given timestamp.
+// Returns nil if no suitable snapshot exists.
+func (r *Replica) findBestV3SnapshotForTimestamp(ctx context.Context, client ReplicaClientV3, timestamp time.Time) (*SnapshotInfoV3, error) {
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list v0.3.x generations: %w", err)
+	}
+	if len(generations) == 0 {
+		return nil, nil
+	}
+
+	var allSnapshots []SnapshotInfoV3
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return nil, fmt.Errorf("list v0.3.x snapshots for generation %s: %w", gen, err)
+		}
+		allSnapshots = append(allSnapshots, snapshots...)
+	}
+
+	if len(allSnapshots) == 0 {
+		return nil, nil
+	}
+
+	// Sort by CreatedAt for timestamp-based selection.
+	sortSnapshotsV3ByCreatedAt(allSnapshots)
+
+	return findBestSnapshotV3(allSnapshots, timestamp), nil
+}
+
+// shouldUseV3Restore determines whether to use v0.3.x restore instead of LTX.
+// Returns true if v0.3.x has a better backup for the given options.
+func (r *Replica) shouldUseV3Restore(ctx context.Context, client ReplicaClientV3, timestamp time.Time) (bool, error) {
+	// Get v0.3.x time bounds.
+	_, v3UpdatedAt, err := r.TimeBoundsV3(ctx, client)
+	if err != nil {
+		return false, fmt.Errorf("get v0.3.x time bounds: %w", err)
+	}
+
+	// Get LTX time bounds.
+	_, ltxUpdatedAt, err := r.TimeBounds(ctx)
+	if err != nil {
+		return false, fmt.Errorf("get LTX time bounds: %w", err)
+	}
+
+	// If no v0.3.x backups exist, use LTX.
+	if v3UpdatedAt.IsZero() {
+		return false, nil
+	}
+
+	// If no LTX backups exist, use v0.3.x.
+	if ltxUpdatedAt.IsZero() {
+		r.Logger().Debug("using v0.3.x restore (no LTX backups)")
+		return true, nil
+	}
+
+	// Both formats have backups - compare based on timestamp or latest.
+	if !timestamp.IsZero() {
+		// With timestamp: use format with best snapshot before timestamp.
+		v3Snapshot, err := r.findBestV3SnapshotForTimestamp(ctx, client, timestamp)
+		if err != nil {
+			return false, fmt.Errorf("find v0.3.x snapshot: %w", err)
+		}
+
+		ltxSnapshot, err := r.findBestLTXSnapshotForTimestamp(ctx, timestamp)
+		if err != nil {
+			return false, fmt.Errorf("find LTX snapshot: %w", err)
+		}
+
+		if v3Snapshot != nil && (ltxSnapshot == nil || v3Snapshot.CreatedAt.After(ltxSnapshot.CreatedAt)) {
+			r.Logger().Debug("using v0.3.x restore (better snapshot for timestamp)",
+				"v3_snapshot", v3Snapshot.CreatedAt,
+				"ltx_snapshot", ltxSnapshot)
+			return true, nil
+		}
+	} else {
+		// Without timestamp: use format with most recent backup.
+		if v3UpdatedAt.After(ltxUpdatedAt) {
+			r.Logger().Debug("using v0.3.x restore (more recent backup)",
+				"v3_updated_at", v3UpdatedAt,
+				"ltx_updated_at", ltxUpdatedAt)
+			return true, nil
+		}
+	}
+
+	return false, nil
+}
+
+// TimeBoundsV3 returns the time bounds of v0.3.x backups.
+// Returns zero times if no v0.3.x backups exist.
+func (r *Replica) TimeBoundsV3(ctx context.Context, client ReplicaClientV3) (createdAt, updatedAt time.Time, err error) {
+	generations, err := client.GenerationsV3(ctx)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+
+	for _, gen := range generations {
+		snapshots, err := client.SnapshotsV3(ctx, gen)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		for _, snap := range snapshots {
+			if createdAt.IsZero() || snap.CreatedAt.Before(createdAt) {
+				createdAt = snap.CreatedAt
+			}
+			if updatedAt.IsZero() || snap.CreatedAt.After(updatedAt) {
+				updatedAt = snap.CreatedAt
+			}
+		}
+
+		segments, err := client.WALSegmentsV3(ctx, gen)
+		if err != nil {
+			return time.Time{}, time.Time{}, err
+		}
+		for _, seg := range segments {
+			if createdAt.IsZero() || seg.CreatedAt.Before(createdAt) {
+				createdAt = seg.CreatedAt
+			}
+			if updatedAt.IsZero() || seg.CreatedAt.After(updatedAt) {
+				updatedAt = seg.CreatedAt
+			}
+		}
+	}
+
+	return createdAt, updatedAt, nil
+}
+
+// findBestLTXSnapshotForTimestamp returns the best LTX snapshot for the given timestamp.
+// Returns nil if no suitable snapshot exists.
+func (r *Replica) findBestLTXSnapshotForTimestamp(ctx context.Context, timestamp time.Time) (*ltx.FileInfo, error) {
+	// Find snapshots at the snapshot level that are before the timestamp.
+	snapshots, err := FindLTXFiles(ctx, r.Client, SnapshotLevel, true, func(info *ltx.FileInfo) (bool, error) {
+		return info.CreatedAt.Before(timestamp), nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("find LTX snapshots: %w", err)
+	}
+	if len(snapshots) == 0 {
+		return nil, nil
+	}
+
+	// Return the latest snapshot before the timestamp (last in the sorted list).
+	return snapshots[len(snapshots)-1], nil
+}
+
 // CalcRestorePlan returns a list of storage paths to restore a snapshot at the given TXID.
 func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, timestamp time.Time, logger *slog.Logger) ([]*ltx.FileInfo, error) {
 	if txID != 0 && !timestamp.IsZero() {
@@ -600,64 +1001,90 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 	// Start with latest snapshot before target TXID or timestamp.
 	// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
-	if a, err := FindLTXFiles(ctx, client, SnapshotLevel, !timestamp.IsZero(), func(info *ltx.FileInfo) (bool, error) {
-		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
-		if txID != 0 {
-			return info.MaxTXID <= txID, nil
-		} else if !timestamp.IsZero() {
-			return info.CreatedAt.Before(timestamp), nil
-		}
-		return true, nil
-	}); err != nil {
+	var snapshot *ltx.FileInfo
+	snapshotItr, err := client.LTXFiles(ctx, SnapshotLevel, 0, !timestamp.IsZero())
+	if err != nil {
 		return nil, err
-	} else if len(a) > 0 {
-		logger.Debug("found snapshot before target TXID or timestamp", "snapshot", a[len(a)-1].MaxTXID)
-		infos = append(infos, a[len(a)-1])
+	}
+	for snapshotItr.Next() {
+		info := snapshotItr.Item()
+		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
+		if txID != 0 && info.MaxTXID > txID {
+			continue
+		}
+		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
+			continue
+		}
+		snapshot = info
+	}
+	if err := snapshotItr.Close(); err != nil {
+		return nil, err
+	}
+	if snapshot != nil {
+		logger.Debug("found snapshot before target TXID or timestamp", "snapshot", snapshot.MaxTXID)
+		infos = append(infos, snapshot)
 	}
 
-	// Starting from the highest compaction level, collect all paths after the
-	// latest TXID for each level. Compactions are based on the previous level's
-	// TXID granularity so the TXIDs should align between compaction levels.
+	// Collect candidates across all compaction levels and pick the next file
+	// from any level that extends the longest contiguous TXID range.
 	const maxLevel = SnapshotLevel - 1
+	startTXID := infos.MaxTXID()
+	currentMax := startTXID
+	if txID != 0 && currentMax >= txID {
+		return infos, nil
+	}
+
+	cursors := make([]*restoreLevelCursor, 0, maxLevel+1)
 	for level := maxLevel; level >= 0; level-- {
 		logger.Debug("finding ltx files for level", "level", level)
-
-		// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
-		a, err := FindLTXFiles(ctx, client, level, !timestamp.IsZero(), func(info *ltx.FileInfo) (bool, error) {
-			if info.MaxTXID <= infos.MaxTXID() { // skip if already included in previous levels
-				return false, nil
-			}
-
-			// Filter by TXID or timestamp, if specified.
-			if txID != 0 {
-				return info.MaxTXID <= txID, nil
-			} else if !timestamp.IsZero() {
-				return info.CreatedAt.Before(timestamp), nil
-			}
-			return true, nil
-		})
+		itr, err := client.LTXFiles(ctx, level, 0, !timestamp.IsZero())
 		if err != nil {
 			return nil, err
 		}
+		cursors = append(cursors, &restoreLevelCursor{
+			itr: itr,
+		})
+	}
+	defer func() {
+		for _, cursor := range cursors {
+			if cursor != nil {
+				_ = cursor.itr.Close()
+			}
+		}
+	}()
 
-		// Append each storage path to the list
-		for _, info := range a {
-			// Skip if this file's range is already covered by previously added files.
-			// This can happen when a larger compacted file at the same level covers
-			// a smaller file's entire range (see issue #847).
-			if info.MaxTXID <= infos.MaxTXID() {
+	for {
+		var next *restoreLevelCursor
+		for _, cursor := range cursors {
+			if err := cursor.refresh(currentMax, txID, timestamp); err != nil {
+				return nil, err
+			}
+			if cursor.candidate == nil {
 				continue
 			}
-
-			// Ensure TXIDs are contiguous between each paths.
-			if !ltx.IsContiguous(infos.MaxTXID(), info.MinTXID, info.MaxTXID) {
-				return nil, fmt.Errorf("non-contiguous transaction files: prev=%s filename=%s",
-					infos.MaxTXID().String(), ltx.FormatFilename(info.MinTXID, info.MaxTXID))
+			if next == nil || restoreCandidateBetter(next.candidate, cursor.candidate) {
+				next = cursor
 			}
+		}
 
-			logger.Debug("matching LTX file for restore",
-				"filename", ltx.FormatFilename(info.MinTXID, info.MaxTXID))
-			infos = append(infos, info)
+		if next == nil || next.candidate == nil {
+			break
+		}
+
+		if next.candidate.MaxTXID <= currentMax {
+			next.candidate = nil
+			continue
+		}
+
+		logger.Debug("matching LTX file for restore",
+			"filename", ltx.FormatFilename(next.candidate.MinTXID, next.candidate.MaxTXID),
+			"level", next.candidate.Level)
+		infos = append(infos, next.candidate)
+		currentMax = next.candidate.MaxTXID
+		next.candidate = nil
+
+		if txID != 0 && currentMax >= txID {
+			break
 		}
 	}
 
@@ -667,6 +1094,164 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	if len(infos) == 0 {
 		return nil, ErrTxNotAvailable
 	}
+	if txID != 0 && infos.MaxTXID() < txID {
+		return nil, ErrTxNotAvailable
+	}
 
 	return infos, nil
+}
+
+type restoreLevelCursor struct {
+	// itr streams LTX file infos for a single level in filename order.
+	itr ltx.FileIterator
+	// current holds the last item read from itr but not yet evaluated.
+	current *ltx.FileInfo
+	// candidate is the best eligible file at this level for the currentMax.
+	candidate *ltx.FileInfo
+	// done indicates the iterator has been exhausted or errored.
+	done bool
+}
+
+func (c *restoreLevelCursor) refresh(currentMax, txID ltx.TXID, timestamp time.Time) error {
+	// Advance the iterator until we've evaluated all files that could be
+	// contiguous with currentMax. Keep the best eligible candidate.
+	if c.done {
+		return nil
+	}
+	if c.candidate != nil && c.candidate.MaxTXID <= currentMax {
+		c.candidate = nil
+	}
+
+	for {
+		if err := c.ensureCurrent(); err != nil {
+			return err
+		}
+		if c.done {
+			return nil
+		}
+
+		info := c.current
+		if info.MinTXID > currentMax+1 {
+			return nil
+		}
+		c.current = nil
+
+		if info.MaxTXID <= currentMax {
+			continue
+		}
+		if txID != 0 && info.MaxTXID > txID {
+			continue
+		}
+		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
+			continue
+		}
+
+		if c.candidate == nil || restoreCandidateBetter(c.candidate, info) {
+			c.candidate = info
+		}
+	}
+}
+
+func (c *restoreLevelCursor) ensureCurrent() error {
+	// Ensure current is populated with the next iterator item, or mark done.
+	if c.done || c.current != nil {
+		return nil
+	}
+	if !c.itr.Next() {
+		if err := c.itr.Err(); err != nil {
+			return err
+		}
+		c.done = true
+		return nil
+	}
+	c.current = c.itr.Item()
+	return nil
+}
+
+func restoreCandidateBetter(curr, next *ltx.FileInfo) bool {
+	if next.MaxTXID != curr.MaxTXID {
+		return next.MaxTXID > curr.MaxTXID
+	}
+	if next.MinTXID != curr.MinTXID {
+		return next.MinTXID < curr.MinTXID
+	}
+	if next.Level != curr.Level {
+		return next.Level > curr.Level
+	}
+	return next.CreatedAt.Before(curr.CreatedAt)
+}
+
+// ValidationError represents a single validation issue.
+type ValidationError struct {
+	Level    int           // compaction level
+	Type     string        // "gap", "overlap", or "unsorted"
+	Message  string        // human-readable description
+	PrevFile *ltx.FileInfo // previous file
+	CurrFile *ltx.FileInfo // current file that caused error
+}
+
+// ValidateLevel checks LTX files at the given level are sorted and contiguous.
+// Returns a slice of validation errors (empty if valid).
+func (r *Replica) ValidateLevel(ctx context.Context, level int) ([]ValidationError, error) {
+	itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+	if err != nil {
+		return nil, fmt.Errorf("fetch ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var errors []ValidationError
+	var prevInfo *ltx.FileInfo
+
+	for itr.Next() {
+		info := itr.Item()
+
+		// Skip first file - nothing to compare against
+		if prevInfo == nil {
+			prevInfo = info
+			continue
+		}
+
+		// Check for sort order: curr.MinTXID should be >= prev.MinTXID
+		if info.MinTXID < prevInfo.MinTXID {
+			errors = append(errors, ValidationError{
+				Level:    level,
+				Type:     "unsorted",
+				Message:  fmt.Sprintf("files out of order: curr.MinTXID=%s < prev.MinTXID=%s", info.MinTXID, prevInfo.MinTXID),
+				PrevFile: prevInfo,
+				CurrFile: info,
+			})
+			prevInfo = info
+			continue
+		}
+
+		// Check for TXID contiguity: prev.MaxTXID + 1 should equal curr.MinTXID
+		expectedMinTXID := prevInfo.MaxTXID + 1
+		if info.MinTXID != expectedMinTXID {
+			if info.MinTXID > expectedMinTXID {
+				errors = append(errors, ValidationError{
+					Level:    level,
+					Type:     "gap",
+					Message:  fmt.Sprintf("TXID gap: prev.MaxTXID=%s, curr.MinTXID=%s (expected %s)", prevInfo.MaxTXID, info.MinTXID, expectedMinTXID),
+					PrevFile: prevInfo,
+					CurrFile: info,
+				})
+			} else {
+				errors = append(errors, ValidationError{
+					Level:    level,
+					Type:     "overlap",
+					Message:  fmt.Sprintf("TXID overlap: prev.MaxTXID=%s, curr.MinTXID=%s", prevInfo.MaxTXID, info.MinTXID),
+					PrevFile: prevInfo,
+					CurrFile: info,
+				})
+			}
+		}
+
+		prevInfo = info
+	}
+
+	if err := itr.Close(); err != nil {
+		return nil, fmt.Errorf("close iterator: %w", err)
+	}
+
+	return errors, nil
 }

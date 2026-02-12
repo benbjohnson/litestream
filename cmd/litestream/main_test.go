@@ -3,10 +3,13 @@ package main_test
 import (
 	"bytes"
 	"context"
+	"crypto/x509"
 	"errors"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -532,6 +535,42 @@ snapshot:
 		}
 		if *config.Snapshot.Retention != 24*time.Hour {
 			t.Errorf("expected default snapshot retention of 24h, got %v", *config.Snapshot.Retention)
+		}
+	})
+}
+
+func TestConfig_Validate_ValidationInterval(t *testing.T) {
+	t.Run("ValidInterval", func(t *testing.T) {
+		yaml := `
+validation:
+  interval: 5m
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.Validation.Interval == nil {
+			t.Fatal("expected validation interval to be set")
+		}
+		if *config.Validation.Interval != 5*time.Minute {
+			t.Errorf("expected validation interval of 5m, got %v", *config.Validation.Interval)
+		}
+	})
+
+	t.Run("NotSpecified", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		// When validation section is not specified, interval should be nil (disabled)
+		if config.Validation.Interval != nil {
+			t.Errorf("expected validation interval to be nil, got %v", *config.Validation.Interval)
 		}
 	})
 }
@@ -2584,7 +2623,81 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			t.Error("expected manual RequireContentMD5 override to take precedence")
 		}
 	})
+
+	t.Run("ProviderDefaultsParity", func(t *testing.T) {
+		tests := []struct {
+			name     string
+			endpoint string
+		}{
+			{"Tigris", "https://fly.storage.tigris.dev"},
+			{"DigitalOcean", "https://nyc3.digitaloceanspaces.com"},
+			{"Backblaze", "https://s3.us-west-002.backblazeb2.com"},
+			{"Filebase", "https://s3.filebase.com"},
+			{"Scaleway", "https://s3.fr-par.scw.cloud"},
+			{"CloudflareR2", "https://accountid.r2.cloudflarestorage.com"},
+			{"MinIO", "http://localhost:9000"},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				urlClient, err := litestream.NewReplicaClientFromURL(
+					"s3://mybucket/path?endpoint=" + tt.endpoint + "&region=us-east-1",
+				)
+				if err != nil {
+					t.Fatalf("URL factory error: %v", err)
+				}
+				uc := urlClient.(*s3.ReplicaClient)
+
+				cc, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+					Path: "path",
+					ReplicaSettings: main.ReplicaSettings{
+						Bucket:   "mybucket",
+						Endpoint: tt.endpoint,
+						Region:   "us-east-1",
+					},
+				}, nil)
+				if err != nil {
+					t.Fatalf("Config factory error: %v", err)
+				}
+
+				if uc.SignPayload != cc.SignPayload {
+					t.Errorf("SignPayload: URL=%v, Config=%v", uc.SignPayload, cc.SignPayload)
+				}
+				if uc.RequireContentMD5 != cc.RequireContentMD5 {
+					t.Errorf("RequireContentMD5: URL=%v, Config=%v", uc.RequireContentMD5, cc.RequireContentMD5)
+				}
+				if uc.ForcePathStyle != cc.ForcePathStyle {
+					t.Errorf("ForcePathStyle: URL=%v, Config=%v", uc.ForcePathStyle, cc.ForcePathStyle)
+				}
+				if uc.Concurrency != cc.Concurrency {
+					t.Errorf("Concurrency: URL=%v, Config=%v", uc.Concurrency, cc.Concurrency)
+				}
+			})
+		}
+	})
+
+	t.Run("R2ConfigExplicitOverride", func(t *testing.T) {
+		signFalse := false
+		config := &main.ReplicaConfig{
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:      "mybucket",
+				Endpoint:    "https://accountid.r2.cloudflarestorage.com",
+				SignPayload: &signFalse,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.SignPayload {
+			t.Error("expected explicit SignPayload=false to override R2 default")
+		}
+	})
 }
+
 func TestGlobalDefaults(t *testing.T) {
 	// Test comprehensive global defaults functionality
 	t.Run("GlobalReplicaDefaults", func(t *testing.T) {
@@ -2913,6 +3026,36 @@ dbs:
 			t.Errorf("DBs[0].Path = %q, want %q", got, dbPath)
 		}
 	})
+}
+
+func TestX509FallbackRoots(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("x509 fallback test requires Linux (macOS uses system keychain)")
+	}
+
+	if os.Getenv("GO_X509_FALLBACK_TEST") == "1" {
+		pool, err := x509.SystemCertPool()
+		if err != nil {
+			t.Fatalf("SystemCertPool() error: %v", err)
+		}
+		if pool.Equal(x509.NewCertPool()) {
+			t.Fatal("SystemCertPool() returned empty pool; x509roots/fallback not providing certificates")
+		}
+		return
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestX509FallbackRoots$", "-test.v")
+	cmd.Env = []string{
+		"GO_X509_FALLBACK_TEST=1",
+		"SSL_CERT_FILE=/nonexistent/cert.pem",
+		"SSL_CERT_DIR=/nonexistent/certs",
+		"HOME=" + t.TempDir(),
+	}
+	out, err := cmd.CombinedOutput()
+	t.Logf("subprocess output:\n%s", out)
+	if err != nil {
+		t.Fatalf("x509 fallback roots verification failed: %v", err)
+	}
 }
 
 func hasDBPath(dbs []*litestream.DB, path string) bool {
