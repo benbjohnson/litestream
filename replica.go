@@ -713,16 +713,27 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 	if err != nil {
 		return currentTXID, fmt.Errorf("list level 0 ltx files: %w", err)
 	}
-	defer itr.Close()
+	closeLevel0 := func(retErr error) (ltx.TXID, error) {
+		if closeErr := itr.Close(); closeErr != nil {
+			closeErr = fmt.Errorf("close level 0 ltx iterator: %w", closeErr)
+			if retErr != nil {
+				return currentTXID, errors.Join(retErr, closeErr)
+			}
+			return currentTXID, closeErr
+		}
+		return currentTXID, retErr
+	}
 
+	var sawLevel0 bool
 	for itr.Next() {
+		sawLevel0 = true
 		info := itr.Item()
 
 		// If there's a gap, try to fill it from higher compaction levels.
 		if info.MinTXID > currentTXID+1 {
 			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize)
 			if err != nil {
-				return currentTXID, err
+				return closeLevel0(err)
 			}
 			currentTXID = bridgedTXID
 
@@ -731,7 +742,7 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 				continue
 			}
 			if info.MinTXID > currentTXID+1 {
-				return currentTXID, nil
+				return closeLevel0(nil)
 			}
 		}
 
@@ -741,10 +752,27 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 		}
 
 		if err := r.applyLTXFile(ctx, f, info, pageSize); err != nil {
-			return currentTXID, fmt.Errorf("apply ltx file (level=%d, min=%s, max=%s): %w",
-				info.Level, info.MinTXID, info.MaxTXID, err)
+			return closeLevel0(fmt.Errorf(
+				"apply ltx file (level=%d, min=%s, max=%s): %w",
+				info.Level, info.MinTXID, info.MaxTXID, err,
+			))
 		}
 		currentTXID = info.MaxTXID
+	}
+
+	if iterErr := itr.Err(); iterErr != nil {
+		return closeLevel0(fmt.Errorf("iterate level 0 ltx files: %w", iterErr))
+	}
+	if _, err := closeLevel0(nil); err != nil {
+		return currentTXID, err
+	}
+
+	if !sawLevel0 {
+		bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, currentTXID+1, pageSize)
+		if err != nil {
+			return currentTXID, err
+		}
+		currentTXID = bridgedTXID
 	}
 
 	return currentTXID, nil
@@ -789,6 +817,10 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 		}
 	}
 
+	if err := dec.Close(); err != nil {
+		return fmt.Errorf("close decoder: %w", err)
+	}
+
 	return f.Sync()
 }
 
@@ -798,9 +830,19 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 	currentTXID := afterTXID
 
 	for level := 1; level < SnapshotLevel; level++ {
-		itr, err := r.Client.LTXFiles(ctx, level, currentTXID+1, false)
+		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
 		if err != nil {
 			return currentTXID, fmt.Errorf("list level %d ltx files: %w", level, err)
+		}
+		closeLevel := func(retErr error) (ltx.TXID, error) {
+			if closeErr := itr.Close(); closeErr != nil {
+				closeErr = fmt.Errorf("close level %d ltx iterator: %w", level, closeErr)
+				if retErr != nil {
+					return currentTXID, errors.Join(retErr, closeErr)
+				}
+				return currentTXID, closeErr
+			}
+			return currentTXID, retErr
 		}
 
 		for itr.Next() {
@@ -817,19 +859,25 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 			}
 
 			if err := r.applyLTXFile(ctx, f, info, pageSize); err != nil {
-				itr.Close()
-				return currentTXID, fmt.Errorf("apply gap-fill ltx file (level=%d, min=%s, max=%s): %w",
-					info.Level, info.MinTXID, info.MaxTXID, err)
+				return closeLevel(fmt.Errorf(
+					"apply gap-fill ltx file (level=%d, min=%s, max=%s): %w",
+					info.Level, info.MinTXID, info.MaxTXID, err,
+				))
 			}
 			currentTXID = info.MaxTXID
 
 			// If we've bridged past the gap, we're done.
 			if currentTXID+1 >= gapMinTXID {
-				itr.Close()
-				return currentTXID, nil
+				return closeLevel(nil)
 			}
 		}
-		itr.Close()
+
+		if iterErr := itr.Err(); iterErr != nil {
+			return closeLevel(fmt.Errorf("iterate level %d ltx files: %w", level, iterErr))
+		}
+		if _, err := closeLevel(nil); err != nil {
+			return currentTXID, err
+		}
 
 		// If we made progress at this level, restart from level 1.
 		if currentTXID > afterTXID {
