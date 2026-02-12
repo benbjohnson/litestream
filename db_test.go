@@ -621,12 +621,12 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 }
 
-func TestDB_EnforceSnapshotRetention_SkipRemoteDeletion(t *testing.T) {
+func TestDB_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
-	// Enable skip remote deletion.
-	db.SkipRemoteDeletion = true
+	// Disable retention (let cloud provider handle it).
+	db.RetentionEnabled = false
 
 	// Create table and sync initial state.
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
@@ -681,12 +681,12 @@ func TestDB_EnforceSnapshotRetention_SkipRemoteDeletion(t *testing.T) {
 	}
 }
 
-func TestDB_EnforceL0RetentionByTime_SkipRemoteDeletion(t *testing.T) {
+func TestDB_EnforceL0RetentionByTime_RetentionDisabled(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
-	// Enable skip remote deletion and set a short L0 retention.
-	db.SkipRemoteDeletion = true
+	// Disable retention and set a short L0 retention.
+	db.RetentionEnabled = false
 	db.L0Retention = time.Nanosecond
 
 	// Create table and sync to create L0 files.

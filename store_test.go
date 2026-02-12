@@ -439,7 +439,7 @@ func TestStore_ValidationMonitor(t *testing.T) {
 	})
 }
 
-func TestStore_SetSkipRemoteDeletion(t *testing.T) {
+func TestStore_SetRetentionEnabled(t *testing.T) {
 	db0, sqldb0 := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db0, sqldb0)
 
@@ -453,32 +453,32 @@ func TestStore_SetSkipRemoteDeletion(t *testing.T) {
 	store := litestream.NewStore([]*litestream.DB{db0, db1}, levels)
 	store.CompactionMonitorEnabled = false
 
-	// Initially should be false.
-	if store.SkipRemoteDeletion {
-		t.Fatal("expected SkipRemoteDeletion=false initially")
+	// Initially should be true (retention enabled by default).
+	if !store.RetentionEnabled {
+		t.Fatal("expected RetentionEnabled=true initially")
 	}
 
-	// Set to true and verify propagation to all DBs.
-	store.SetSkipRemoteDeletion(true)
+	// Set to false and verify propagation to all DBs.
+	store.SetRetentionEnabled(false)
 
-	if !store.SkipRemoteDeletion {
-		t.Fatal("expected store.SkipRemoteDeletion=true")
+	if store.RetentionEnabled {
+		t.Fatal("expected store.RetentionEnabled=false")
 	}
 	for _, db := range store.DBs() {
-		if !db.SkipRemoteDeletion {
-			t.Fatalf("expected db.SkipRemoteDeletion=true for %s", db.Path())
+		if db.RetentionEnabled {
+			t.Fatalf("expected db.RetentionEnabled=false for %s", db.Path())
 		}
 	}
 
-	// Set back to false.
-	store.SetSkipRemoteDeletion(false)
+	// Set back to true.
+	store.SetRetentionEnabled(true)
 
-	if store.SkipRemoteDeletion {
-		t.Fatal("expected store.SkipRemoteDeletion=false after reset")
+	if !store.RetentionEnabled {
+		t.Fatal("expected store.RetentionEnabled=true after reset")
 	}
 	for _, db := range store.DBs() {
-		if db.SkipRemoteDeletion {
-			t.Fatalf("expected db.SkipRemoteDeletion=false for %s after reset", db.Path())
+		if !db.RetentionEnabled {
+			t.Fatalf("expected db.RetentionEnabled=true for %s after reset", db.Path())
 		}
 	}
 }

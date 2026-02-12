@@ -24,10 +24,10 @@ type Compactor struct {
 	// contiguous TXID ranges after each compaction. Disabled by default.
 	VerifyCompaction bool
 
-	// SkipRemoteDeletion disables remote file deletion during retention
-	// enforcement, allowing cloud provider lifecycle policies to handle
-	// retention instead. Local file cleanup still occurs.
-	SkipRemoteDeletion bool
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
 
 	// CompactionVerifyErrorCounter is incremented when post-compaction
 	// verification fails. Optional; if nil, no metric is recorded.
@@ -259,7 +259,7 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	if c.SkipRemoteDeletion {
+	if !c.RetentionEnabled {
 		c.logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
@@ -307,7 +307,7 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	if c.SkipRemoteDeletion {
+	if !c.RetentionEnabled {
 		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
@@ -395,7 +395,7 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 		return nil
 	}
 
-	if c.SkipRemoteDeletion {
+	if !c.RetentionEnabled {
 		c.logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)

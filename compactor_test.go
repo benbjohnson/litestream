@@ -321,10 +321,10 @@ func TestCompactor_EnforceSnapshotRetention(t *testing.T) {
 	})
 }
 
-func TestCompactor_EnforceSnapshotRetention_SkipRemoteDeletion(t *testing.T) {
+func TestCompactor_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	compactor := litestream.NewCompactor(client, slog.Default())
-	compactor.SkipRemoteDeletion = true
+	compactor.RetentionEnabled = false
 
 	var localDeleted []ltx.TXID
 	compactor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {
@@ -362,10 +362,10 @@ func TestCompactor_EnforceSnapshotRetention_SkipRemoteDeletion(t *testing.T) {
 	}
 }
 
-func TestCompactor_EnforceRetentionByTXID_SkipRemoteDeletion(t *testing.T) {
+func TestCompactor_EnforceRetentionByTXID_RetentionDisabled(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	compactor := litestream.NewCompactor(client, slog.Default())
-	compactor.SkipRemoteDeletion = true
+	compactor.RetentionEnabled = false
 
 	var localDeleted []ltx.TXID
 	compactor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {
@@ -403,10 +403,10 @@ func TestCompactor_EnforceRetentionByTXID_SkipRemoteDeletion(t *testing.T) {
 	}
 }
 
-func TestCompactor_EnforceL0Retention_SkipRemoteDeletion(t *testing.T) {
+func TestCompactor_EnforceL0Retention_RetentionDisabled(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	compactor := litestream.NewCompactor(client, slog.Default())
-	compactor.SkipRemoteDeletion = true
+	compactor.RetentionEnabled = false
 
 	var localDeleted []ltx.TXID
 	compactor.LocalFileDeleter = func(level int, minTXID, maxTXID ltx.TXID) error {

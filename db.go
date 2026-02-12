@@ -162,10 +162,10 @@ type DB struct {
 	// contiguous TXID ranges after each compaction.
 	VerifyCompaction bool
 
-	// SkipRemoteDeletion disables remote file deletion during retention
-	// enforcement, allowing cloud provider lifecycle policies to handle
-	// retention instead. Local file cleanup still occurs.
-	SkipRemoteDeletion bool
+	// RetentionEnabled controls whether Litestream actively deletes old files
+	// during retention enforcement. When false, cloud provider lifecycle
+	// policies handle retention instead. Local file cleanup still occurs.
+	RetentionEnabled bool
 
 	// Remote replica for the database.
 	// Must be set before calling Open().
@@ -443,7 +443,7 @@ func (db *DB) Open() (err error) {
 
 	// Set the compactor client once before starting any goroutines.
 	db.compactor.VerifyCompaction = db.VerifyCompaction
-	db.compactor.SkipRemoteDeletion = db.SkipRemoteDeletion
+	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
 
 	// Start monitoring SQLite database in a separate goroutine.
@@ -1952,8 +1952,8 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
-	// Remove files marked for deletion from remote storage (unless skipped).
-	if db.SkipRemoteDeletion {
+	// Remove files marked for deletion from remote storage (unless retention disabled).
+	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
@@ -2076,7 +2076,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	if db.SkipRemoteDeletion {
+	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)

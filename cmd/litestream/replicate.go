@@ -258,7 +258,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		c.Store.SetVerifyCompaction(true)
 	}
 	if c.Config.Retention.Enabled != nil && !*c.Config.Retention.Enabled {
-		c.Store.SetSkipRemoteDeletion(true)
+		c.Store.SetRetentionEnabled(false)
 	}
 	if c.Config.Validation.Interval != nil {
 		c.Store.ValidationInterval = *c.Config.Validation.Interval
@@ -291,7 +291,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
-	if c.Store.SkipRemoteDeletion {
+	if !c.Store.RetentionEnabled {
 		slog.Warn("retention disabled; cloud provider lifecycle policies must handle retention",
 			"hint", "idle databases that stop receiving writes will not generate new snapshots and may lose backup coverage if cloud retention expires")
 	}
