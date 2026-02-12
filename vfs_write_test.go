@@ -410,7 +410,7 @@ func TestVFSFile_ConflictDetection(t *testing.T) {
 	}
 }
 
-func TestVFS_RejectSecondWriteConnection(t *testing.T) {
+func TestVFS_OpenAllowsMultipleConnectionsWhenWriteEnabled(t *testing.T) {
 	client := newWriteTestReplicaClient()
 
 	pageSize := uint32(4096)
@@ -426,11 +426,11 @@ func TestVFS_RejectSecondWriteConnection(t *testing.T) {
 		t.Fatalf("first open should succeed: %v", err)
 	}
 
-	// Second connection should be rejected with BusyError
-	_, _, err = v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
-	if err != sqlite3vfs.BusyError {
-		t.Fatalf("second open should return BusyError, got: %v", err)
+	file2, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("second open should succeed: %v", err)
 	}
+	defer file2.Close()
 
 	// Close first connection
 	if err := file1.Close(); err != nil {
@@ -445,7 +445,7 @@ func TestVFS_RejectSecondWriteConnection(t *testing.T) {
 	defer file3.Close()
 }
 
-func TestVFS_ConcurrentOpenOnlyOneSucceeds(t *testing.T) {
+func TestVFS_ConcurrentOpenAllSucceed(t *testing.T) {
 	client := newWriteTestReplicaClient()
 
 	pageSize := uint32(4096)
@@ -472,74 +472,67 @@ func TestVFS_ConcurrentOpenOnlyOneSucceeds(t *testing.T) {
 	wg.Wait()
 	close(results)
 
-	var successes, busyErrors int
+	var successes int
 	for err := range results {
 		switch err {
 		case nil:
 			successes++
-		case sqlite3vfs.BusyError:
-			busyErrors++
 		default:
 			t.Fatalf("unexpected error: %v", err)
 		}
 	}
 
-	if successes != 1 {
-		t.Fatalf("expected exactly 1 successful open, got %d", successes)
-	}
-	if busyErrors != goroutines-1 {
-		t.Fatalf("expected %d BusyErrors, got %d", goroutines-1, busyErrors)
+	if successes != goroutines {
+		t.Fatalf("expected %d successful opens, got %d", goroutines, successes)
 	}
 }
 
-func TestVFS_OpenBlockedDuringClose(t *testing.T) {
-	writeCh := make(chan struct{})
-	client := &slowWriteTestReplicaClient{
-		writeTestReplicaClient: *newWriteTestReplicaClient(),
-		writeCh:                writeCh,
-	}
+func TestVFS_WriteLockBlocksConcurrentWriters(t *testing.T) {
+	client := newWriteTestReplicaClient()
 
 	pageSize := uint32(4096)
 	initialPage := make([]byte, pageSize)
-	createTestLTXFile(t, &client.writeTestReplicaClient, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
 
 	v := NewVFS(client, slog.Default())
 	v.WriteEnabled = true
-	v.WriteSyncInterval = 0
 
 	file1, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer file1.Close()
 
-	vf := file1.(*VFSFile)
-	if _, err := vf.WriteAt([]byte("dirty data"), 0); err != nil {
+	file2, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
 		t.Fatal(err)
 	}
+	defer file2.Close()
 
-	closeDone := make(chan error, 1)
-	go func() {
-		closeDone <- file1.Close()
-	}()
+	vf1 := file1.(*VFSFile)
+	vf2 := file2.(*VFSFile)
 
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		_, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
-		if err == sqlite3vfs.BusyError {
-			close(writeCh)
-			if err := <-closeDone; err != nil {
-				t.Fatalf("close error: %v", err)
-			}
-			return
-		}
-		if err == nil {
-			t.Fatal("open should not succeed while close is in progress")
-		}
-		time.Sleep(time.Millisecond)
+	if err := vf2.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("reader lock should succeed: %v", err)
 	}
-	close(writeCh)
-	<-closeDone
-	t.Fatal("timed out waiting for BusyError during close")
+	defer vf2.Unlock(sqlite3vfs.LockNone)
+
+	if err := vf1.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("first writer lock should succeed: %v", err)
+	}
+	defer vf1.Unlock(sqlite3vfs.LockNone)
+
+	if err := vf2.Lock(sqlite3vfs.LockReserved); err != sqlite3vfs.BusyError {
+		t.Fatalf("second writer lock should return BusyError, got %v", err)
+	}
+
+	if err := vf1.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("first writer unlock should succeed: %v", err)
+	}
+
+	if err := vf2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("second writer lock should succeed after first unlock: %v", err)
+	}
 }
 
 func TestVFS_WriteFileSlotClearedOnOpenError(t *testing.T) {
