@@ -52,6 +52,27 @@ type ReplicaClient interface {
    - Return `os.ErrNotExist` for missing files
    - Wrap errors with context: `fmt.Errorf("operation: %w", err)`
 
+4. **ResumableReader Support**:
+   - `OpenLTXFile` MUST support the `offset` parameter for range requests
+   - `internal/resumable_reader.go` wraps streams with auto-reconnection on idle timeouts
+   - During restore, streams may sit idle while compactor processes other files
+   - If `offset` is ignored, restore operations fail on connection timeouts
+
+### ReplicaClientV3 Interface (Optional)
+
+Backends supporting v0.3.x backward-compatible restore should implement:
+```go
+type ReplicaClientV3 interface {
+    GenerationsV3(ctx context.Context) ([]string, error)
+    SnapshotsV3(ctx context.Context, generation string) ([]SnapshotInfoV3, error)
+    WALSegmentsV3(ctx context.Context, generation string) ([]WALSegmentInfoV3, error)
+    OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+    OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error)
+}
+```
+
+See `v3.go` for type definitions and `s3/replica_client.go` for reference implementation.
+
 ## Implementation Checklist
 
 ### New Backend Requirements
@@ -88,6 +109,7 @@ go test -race -v ./[backend]/...
 - `file/replica_client.go` - Local filesystem (simplest)
 - `sftp/replica_client.go` - SSH File Transfer
 - `nats/replica_client.go` - NATS JetStream (newest)
+- `oss/replica_client.go` - Alibaba Cloud OSS
 
 ## Common Pitfalls
 
@@ -97,6 +119,7 @@ go test -race -v ./[backend]/...
 4. Not preserving timestamps
 5. Forgetting partial read support
 6. No retry logic for transient failures
+7. Not supporting `offset` parameter in `OpenLTXFile` — breaks `ResumableReader` during restore
 
 ## Configuration Pattern
 
@@ -111,4 +134,6 @@ replica:
 
 - docs/REPLICA_CLIENT_GUIDE.md - Complete implementation guide
 - replica_client.go - Interface definition
+- v3.go - ReplicaClientV3 interface and v0.3.x types
+- internal/resumable_reader.go - ResumableReader for restore resilience
 - replica_client_test.go - Test suite
