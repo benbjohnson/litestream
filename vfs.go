@@ -103,6 +103,10 @@ type VFS struct {
 	// Set to 0 to delete immediately after compaction.
 	L0Retention time.Duration
 
+	writeFileMu sync.Mutex
+	writeFile   *VFSFile
+	writeSeq    uint64
+
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
@@ -195,37 +199,34 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 			f.syncInterval = DefaultSyncInterval
 		}
 
-		// Acquire shared write state for this database path.
-		// This ensures all VFSFile instances for the same database share
-		// expectedTXID and pendingTXID to prevent false conflict detection.
+		// Acquire shared write state for this database path so all
+		// connections coordinate expected/pending TXIDs.
 		f.writeState = vfs.acquireWriteState(name)
 
-		// Set up write buffer path
+		writeSeq := atomic.AddUint64(&vfs.writeSeq, 1)
 		if vfs.WriteBufferPath != "" {
-			f.bufferPath = vfs.WriteBufferPath
+			if writeSeq == 1 {
+				f.bufferPath = vfs.WriteBufferPath
+			} else {
+				f.bufferPath = vfs.WriteBufferPath + "." + strconv.FormatUint(writeSeq, 10)
+			}
 		} else {
-			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
 				return nil, 0, fmt.Errorf("create temp dir for write buffer: %w", err)
 			}
-			f.bufferPath = filepath.Join(dir, "write-buffer")
+			f.bufferPath = filepath.Join(dir, "write-buffer-"+strconv.FormatUint(writeSeq, 10))
 		}
 
-		// Initialize compaction if enabled
 		if vfs.CompactionEnabled {
 			f.compactor = NewCompactor(vfs.client, f.logger)
-			// VFS has no local files, so leave LocalFileOpener/LocalFileDeleter nil
 		}
 	}
 
-	// Initialize hydration support if enabled
 	if vfs.HydrationEnabled {
 		if vfs.HydrationPath != "" {
-			// Use provided path directly
 			f.hydrationPath = vfs.HydrationPath
 		} else {
-			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
 				return nil, 0, fmt.Errorf("create temp dir for hydration: %w", err)
@@ -1899,8 +1900,16 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		return fmt.Errorf("invalid lock downgrade: current=%s target=%s", f.lockType, elock)
 	}
 
-	// Track transaction start when acquiring RESERVED lock (write intent)
 	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
+		if f.vfs != nil {
+			f.vfs.writeFileMu.Lock()
+			if f.vfs.writeFile != nil && f.vfs.writeFile != f {
+				f.vfs.writeFileMu.Unlock()
+				return sqlite3vfs.BusyError
+			}
+			f.vfs.writeFile = f
+			f.vfs.writeFileMu.Unlock()
+		}
 		f.inTransaction = true
 		f.writeState.mu.Lock()
 		expectedTXID := f.writeState.expectedTXID
@@ -1922,9 +1931,15 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 		return fmt.Errorf("invalid unlock target: %s", elock)
 	}
 
-	// Detect transaction end when dropping below RESERVED
 	if f.writeEnabled && f.inTransaction && elock < sqlite3vfs.LockReserved {
 		f.inTransaction = false
+		if f.vfs != nil {
+			f.vfs.writeFileMu.Lock()
+			if f.vfs.writeFile == f {
+				f.vfs.writeFile = nil
+			}
+			f.vfs.writeFileMu.Unlock()
+		}
 		f.logger.Debug("transaction ended", "dirtyPages", len(f.dirty))
 	}
 

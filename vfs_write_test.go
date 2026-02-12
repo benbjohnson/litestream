@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
 )
 
@@ -380,6 +381,131 @@ func TestVFSFile_ConflictDetection(t *testing.T) {
 	}
 	if err.Error() != "remote has newer transactions than expected: expected TXID 1 but remote has 2" {
 		t.Errorf("unexpected error: %v", err)
+	}
+}
+
+func TestVFS_OpenAllowsMultipleConnectionsWhenWriteEnabled(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	// First connection should succeed
+	file1, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("first open should succeed: %v", err)
+	}
+
+	file2, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("second open should succeed: %v", err)
+	}
+	defer file2.Close()
+
+	// Close first connection
+	if err := file1.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Third connection should succeed now that the first is closed
+	file3, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatalf("third open should succeed after close: %v", err)
+	}
+	defer file3.Close()
+}
+
+func TestVFS_ConcurrentOpenAllSucceed(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	const goroutines = 10
+	results := make(chan error, goroutines)
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			_, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+			results <- err
+		}()
+	}
+
+	wg.Wait()
+	close(results)
+
+	var successes int
+	for err := range results {
+		switch err {
+		case nil:
+			successes++
+		default:
+			t.Fatalf("unexpected error: %v", err)
+		}
+	}
+
+	if successes != goroutines {
+		t.Fatalf("expected %d successful opens, got %d", goroutines, successes)
+	}
+}
+
+func TestVFS_WriteLockBlocksConcurrentWriters(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	file1, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file1.Close()
+
+	file2, _, err := v.Open("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenCreate|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file2.Close()
+
+	vf1 := file1.(*VFSFile)
+	vf2 := file2.(*VFSFile)
+
+	if err := vf2.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("reader lock should succeed: %v", err)
+	}
+	defer vf2.Unlock(sqlite3vfs.LockNone)
+
+	if err := vf1.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("first writer lock should succeed: %v", err)
+	}
+	defer vf1.Unlock(sqlite3vfs.LockNone)
+
+	if err := vf2.Lock(sqlite3vfs.LockReserved); err != sqlite3vfs.BusyError {
+		t.Fatalf("second writer lock should return BusyError, got %v", err)
+	}
+
+	if err := vf1.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("first writer unlock should succeed: %v", err)
+	}
+
+	if err := vf2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("second writer lock should succeed after first unlock: %v", err)
 	}
 }
 
