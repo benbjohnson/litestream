@@ -900,7 +900,7 @@ func TestDB_Monitor_CheapChangeDetection(t *testing.T) {
 	db.MonitorInterval = 50 * time.Millisecond
 	db.Replica = NewReplica(db)
 	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false // disable replica monitor to avoid hangs
+	db.Replica.MonitorEnabled = false
 
 	// Open litestream database.
 	if err := db.Open(); err != nil {

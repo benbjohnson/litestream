@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 )
 
 var (
@@ -153,10 +154,21 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(50)
 	for _, db := range s.dbs {
-		if err := db.Open(); err != nil {
-			return err
-		}
+		db := db
+		g.Go(func() error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
+				return db.Open()
+			}
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	// Start monitors for compactions & snapshots.
