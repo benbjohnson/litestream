@@ -287,8 +287,9 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 
 ### Write Mode Considerations
 
-- **Single writer**: Only one writer should be active at a time
-- **Conflict detection**: If another writer has updated the remote, `ErrConflict` is returned
+- **Connection pooling**: Multiple connections can be opened in write mode (for example, by `database/sql`)
+- **Single writer**: Write contention is enforced at lock acquisition. If another connection already holds write intent, SQLite returns `SQLITE_BUSY`
+- **Conflict detection**: If the remote has advanced unexpectedly, `ErrConflict` is returned
 - **Buffer durability**: The local buffer file provides crash recovery for uncommitted writes
 - **Sync interval**: Balance between durability (shorter) and performance (longer)
 - **New databases**: Write mode can create new databases from scratch if no LTX files exist

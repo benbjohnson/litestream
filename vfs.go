@@ -103,6 +103,11 @@ type VFS struct {
 	// Set to 0 to delete immediately after compaction.
 	L0Retention time.Duration
 
+	writeMu        sync.Mutex
+	writeFile      *VFSFile // current RESERVED lock holder (nil if none)
+	lastSyncedTXID ltx.TXID // highest TXID synced by any local connection
+	writeSeq       uint64   // atomic counter for unique buffer paths
+
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
@@ -147,16 +152,19 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 			f.syncInterval = DefaultSyncInterval
 		}
 
-		// Set up write buffer path
+		writeSeq := atomic.AddUint64(&vfs.writeSeq, 1)
 		if vfs.WriteBufferPath != "" {
-			f.bufferPath = vfs.WriteBufferPath
+			if writeSeq == 1 {
+				f.bufferPath = vfs.WriteBufferPath
+			} else {
+				f.bufferPath = vfs.WriteBufferPath + "." + strconv.FormatUint(writeSeq, 10)
+			}
 		} else {
-			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
 				return nil, 0, fmt.Errorf("create temp dir for write buffer: %w", err)
 			}
-			f.bufferPath = filepath.Join(dir, "write-buffer")
+			f.bufferPath = filepath.Join(dir, "write-buffer-"+strconv.FormatUint(writeSeq, 10))
 		}
 
 		// Initialize compaction if enabled
@@ -183,6 +191,14 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 	if err := f.Open(); err != nil {
 		return nil, 0, err
+	}
+
+	if vfs.WriteEnabled {
+		vfs.writeMu.Lock()
+		if f.expectedTXID > vfs.lastSyncedTXID {
+			vfs.lastSyncedTXID = f.expectedTXID
+		}
+		vfs.writeMu.Unlock()
 	}
 
 	// When SQLite requests read-write access, always report ReadWrite in the
@@ -1391,6 +1407,14 @@ func (f *VFSFile) Close() error {
 		}
 	}
 
+	if f.writeEnabled && f.vfs != nil {
+		f.vfs.writeMu.Lock()
+		if f.vfs.writeFile == f {
+			f.vfs.writeFile = nil
+		}
+		f.vfs.writeMu.Unlock()
+	}
+
 	return nil
 }
 
@@ -1899,10 +1923,17 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		"pages", len(f.dirty),
 		"size", info.Size)
 
-	// Update local state
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
+
+	if f.vfs != nil {
+		f.vfs.writeMu.Lock()
+		if f.expectedTXID > f.vfs.lastSyncedTXID {
+			f.vfs.lastSyncedTXID = f.expectedTXID
+		}
+		f.vfs.writeMu.Unlock()
+	}
 
 	// Update cache with synced pages (index will be populated naturally when pages are fetched)
 	for pgno, bufferOff := range f.dirty {
@@ -2173,8 +2204,21 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		}
 	}
 
-	// Track transaction start when acquiring RESERVED lock (write intent)
 	if f.writeEnabled && elock >= sqlite3vfs.LockReserved && !f.inTransaction {
+		if f.vfs != nil {
+			f.vfs.writeMu.Lock()
+			if f.vfs.writeFile != nil && f.vfs.writeFile != f {
+				f.vfs.writeMu.Unlock()
+				return sqlite3vfs.BusyError
+			}
+			f.vfs.writeFile = f
+			if f.vfs.lastSyncedTXID > f.expectedTXID {
+				f.expectedTXID = f.vfs.lastSyncedTXID
+				f.pendingTXID = f.vfs.lastSyncedTXID + 1
+				f.pos = ltx.Pos{TXID: f.expectedTXID}
+			}
+			f.vfs.writeMu.Unlock()
+		}
 		f.inTransaction = true
 		f.logger.Debug("transaction started", "expectedTXID", f.expectedTXID)
 	}
@@ -2193,9 +2237,15 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 		return fmt.Errorf("invalid unlock target: %s", elock)
 	}
 
-	// Detect transaction end when dropping below RESERVED
 	if f.writeEnabled && f.inTransaction && elock < sqlite3vfs.LockReserved {
 		f.inTransaction = false
+		if f.vfs != nil {
+			f.vfs.writeMu.Lock()
+			if f.vfs.writeFile == f {
+				f.vfs.writeFile = nil
+			}
+			f.vfs.writeMu.Unlock()
+		}
 		f.logger.Debug("transaction ended", "dirtyPages", len(f.dirty))
 		f.cond.Broadcast() // Wake up SetWriteEnabledWithTimeout if waiting
 	}
@@ -2229,7 +2279,16 @@ func (f *VFSFile) CheckReservedLock() (bool, error) {
 	f.logger.Debug("checking reserved lock")
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.lockType >= sqlite3vfs.LockReserved, nil
+	if f.lockType >= sqlite3vfs.LockReserved {
+		return true, nil
+	}
+	if f.vfs != nil {
+		f.vfs.writeMu.Lock()
+		held := f.vfs.writeFile != nil
+		f.vfs.writeMu.Unlock()
+		return held, nil
+	}
+	return false, nil
 }
 
 func (f *VFSFile) SectorSize() int64 {
