@@ -205,6 +205,7 @@ func NewDB(path string) *DB {
 		MonitorInterval:      DefaultMonitorInterval,
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
+		RetentionEnabled:     true,
 		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval: DefaultShutdownSyncInterval,
 		Logger:               slog.With("db", filepath.Base(path)),
