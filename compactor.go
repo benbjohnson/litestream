@@ -57,8 +57,9 @@ func NewCompactor(client ReplicaClient, logger *slog.Logger) *Compactor {
 		logger = slog.Default()
 	}
 	return &Compactor{
-		client: client,
-		logger: logger,
+		client:           client,
+		logger:           logger,
+		RetentionEnabled: true,
 	}
 }
 
