@@ -9,6 +9,9 @@ This document contains detailed code patterns, examples, and anti-patterns for w
 - [Error Handling](#error-handling)
 - [Locking Patterns](#locking-patterns)
 - [Compaction and Eventual Consistency](#compaction-and-eventual-consistency)
+- [Resumable Reader Pattern](#resumable-reader-pattern)
+- [Retention Bypass Pattern](#retention-bypass-pattern)
+- [Conditional Write Pattern (Distributed Locking)](#conditional-write-pattern-distributed-locking)
 - [Timestamp Preservation](#timestamp-preservation)
 - [Common Pitfalls](#common-pitfalls)
 - [Component Reference](#component-reference)
@@ -235,6 +238,107 @@ return replica.Client.OpenLTXFile(...)
 f, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
 ```
 
+## Resumable Reader Pattern
+
+During restore, LTX file streams from S3/Tigris may sit idle while the compactor processes lower-numbered pages from the snapshot. Storage providers close these idle connections, causing "unexpected EOF" errors.
+
+The `ResumableReader` (`internal/resumable_reader.go`) wraps `io.ReadCloser` with automatic reconnection:
+
+### Interface
+
+```go
+type LTXFileOpener interface {
+    OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
+}
+```
+
+### Two Failure Modes
+
+1. **Non-EOF errors** (connection reset, timeout) — stream broke mid-transfer
+2. **Premature EOF** — server closed cleanly, but `offset < size` (known file size)
+
+### Key Behaviors
+
+- Max 3 retries (`resumableReaderMaxRetries = 3`)
+- Tracks current byte `offset` for range-request resume
+- Returns partial reads without error so callers like `io.ReadFull` naturally retry
+- Reopens from current offset using `OpenLTXFile(ctx, level, min, max, offset, 0)`
+
+### DO: Use ResumableReader for restore streams
+
+```go
+rc, _ := client.OpenLTXFile(ctx, level, min, max, 0, fileInfo.Size)
+rr := internal.NewResumableReader(ctx, client, level, min, max, fileInfo.Size, rc, logger)
+defer rr.Close()
+```
+
+### DON'T: Use raw OpenLTXFile during long restore operations
+
+```go
+rc, _ := client.OpenLTXFile(ctx, level, min, max, 0, 0)
+// Risk: connection may drop during idle periods in multi-file restore
+io.ReadFull(rc, buf) // unexpected EOF!
+```
+
+## Retention Bypass Pattern
+
+When using cloud provider lifecycle policies (S3 lifecycle rules, R2 auto-cleanup), Litestream's active file deletion can be disabled:
+
+```yaml
+retention:
+  enabled: false
+```
+
+### Propagation Chain
+
+1. `RetentionConfig{Enabled *bool}` in YAML config (`cmd/litestream/main.go`)
+2. `Store.SetRetentionEnabled(bool)` propagates to all DBs and their compactors (`store.go`)
+3. `Compactor.RetentionEnabled` guards 3 deletion points in `compactor.go`
+
+### DO: Disable retention when cloud lifecycle handles cleanup
+
+```go
+store.SetRetentionEnabled(false) // Delegates deletion to cloud lifecycle policies
+```
+
+### DON'T: Disable retention without cloud lifecycle policies
+
+Disabling retention without cloud lifecycle policies causes unbounded storage growth. Litestream logs a warning: "retention disabled; cloud provider lifecycle policies must handle retention".
+
+## Conditional Write Pattern (Distributed Locking)
+
+The S3 leaser (`s3/leaser.go`) uses S3 conditional writes (`If-Match`/`If-None-Match`) for distributed locking without an external coordination service.
+
+### Acquire Pattern
+
+```go
+input := &s3.PutObjectInput{
+    Bucket: aws.String(l.Bucket),
+    Key:    aws.String(key),
+    Body:   bytes.NewReader(data),
+}
+if etag == "" {
+    input.IfNoneMatch = aws.String("*") // First acquire: only if key doesn't exist
+} else {
+    input.IfMatch = aws.String(etag)     // Expired takeover: only if ETag matches
+}
+```
+
+### Release Pattern
+
+```go
+_, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+    Bucket:  aws.String(l.Bucket),
+    Key:     aws.String(key),
+    IfMatch: aws.String(lease.ETag), // Only delete if we still hold the lease
+})
+```
+
+### Error Handling
+
+- **HTTP 412 (PreconditionFailed)**: Another instance acquired/renewed the lease
+- **HTTP 404 (NoSuchKey)**: Lease already released
+
 ## Timestamp Preservation
 
 During compaction, preserve the earliest CreatedAt timestamp from source files to maintain temporal granularity for point-in-time restoration.
@@ -381,6 +485,32 @@ type ReplicaClient interface {
 
 - `useMetadata=true`: Fetch accurate timestamps from backend metadata (required for point-in-time restores)
 - `useMetadata=false`: Use fast timestamps for normal operations
+
+### Compactor Component (compactor.go)
+
+**Responsibilities:**
+
+- Compaction and retention for LTX files
+- Operates solely through `ReplicaClient` interface
+- Suitable for both DB (with local file caching) and VFS (remote-only)
+
+**Key Fields:**
+
+```go
+type Compactor struct {
+    client           ReplicaClient
+    VerifyCompaction bool  // Post-compaction TXID consistency check
+    RetentionEnabled bool  // Default: true. Controls active file deletion
+
+    // Local file optimization (set by DB layer)
+    LocalFileOpener  func(level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error)
+    LocalFileDeleter func(level int, minTXID, maxTXID ltx.TXID) error
+
+    // Level max-file-info caching
+    CacheGetter func(level int) (*ltx.FileInfo, bool)
+    CacheSetter func(level int, info *ltx.FileInfo)
+}
+```
 
 ### Store Component (store.go)
 
