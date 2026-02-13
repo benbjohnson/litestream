@@ -105,7 +105,7 @@ Options:
       Block until sync completes including remote replication (default: false).
 
   -timeout SECONDS
-      Maximum time to wait in seconds (default: 30).
+      Maximum time to wait in seconds, best-effort (default: 30).
 
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).

@@ -572,7 +572,7 @@ func TestServer_HandleSync(t *testing.T) {
 
 		var result litestream.SyncResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "sync_triggered", result.Status)
+		require.Equal(t, "synced_local", result.Status)
 		require.Equal(t, db.Path(), result.Path)
 	})
 

@@ -348,7 +348,7 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	status := "sync_triggered"
+	status := "synced_local"
 	if req.Wait {
 		status = "synced"
 	}
