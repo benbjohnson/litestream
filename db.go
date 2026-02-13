@@ -859,7 +859,6 @@ func (db *DB) Sync(ctx context.Context) error {
 	close(db.notify)
 	db.notify = make(chan struct{})
 	// }
-	//
 
 	success = true
 	return nil
