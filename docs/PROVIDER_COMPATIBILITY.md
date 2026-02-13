@@ -301,7 +301,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 
 | Provider | Detection Pattern | Applied Settings |
 |----------|-------------------|------------------|
-| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true` |
+| Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true`, `concurrency=2` |
 | Backblaze B2 | `*.backblazeb2.com` | `sign-payload=true`, `force-path-style=true` |
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
 | Scaleway | `*.scw.cloud` | `sign-payload=true` |
@@ -372,9 +372,20 @@ litestream restore -o /tmp/test.db s3://bucket/path?endpoint=...
 
 - **Litestream v0.5.x**: AWS SDK v2, improved provider compatibility
 - **Litestream v0.4.x**: AWS SDK v1, different authentication handling
-- **Litestream v0.3.x**: Legacy format, not compatible with v0.5.x restores
+- **Litestream v0.3.x**: Legacy format — v0.5.x can restore from v0.3.x backups via `ReplicaClientV3` interface
 
-When upgrading from v0.3.x, be aware that v0.5.x uses a different backup format
+When upgrading from v0.3.x, v0.5.x can automatically restore from v0.3.x backups if no v0.4.x+ backup exists. The S3 backend implements `ReplicaClientV3` to read the v0.3.x `generations/{id}/snapshots/` and `generations/{id}/wal/` directory structure. See [REPLICA_CLIENT_GUIDE.md](REPLICA_CLIENT_GUIDE.md#replicaclientv3-interface-v03x-restore) for details.
+
+### Validation Interval
+
+Litestream supports periodic validation of replica integrity:
+
+```yaml
+validation:
+  interval: "5m"  # How often to validate; 0 disables
+```
+
+This runs `Store.Validate()` on a ticker, comparing local and remote positions. Can also be set per-replica via the `validation-interval` replica config key.
 and cannot restore backups created by v0.3.x. See the upgrade guide for migration
 instructions.
 
