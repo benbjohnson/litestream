@@ -3,6 +3,9 @@
 ## Table of Contents
 - [System Layers](#system-layers)
 - [Core Components](#core-components)
+- [IPC Server & Control Socket](#ipc-server--control-socket)
+- [Distributed Leasing](#distributed-leasing)
+- [Library Convenience Methods](#library-convenience-methods)
 - [LTX File Format](#ltx-file-format)
 - [WAL Monitoring Mechanism](#wal-monitoring-mechanism)
 - [Compaction Process](#compaction-process)
@@ -82,6 +85,10 @@ graph TB
 
 #### 4. Storage Implementations
 - Backend-specific logic (authentication, retries, optimizations)
+
+#### 5. IPC Layer
+- **Server**: Unix socket HTTP server for runtime control (`server.go`)
+- **Leaser**: Distributed lease interface for coordination (`leaser.go`, `s3/leaser.go`)
 
 ## Core Components
 
@@ -201,6 +208,111 @@ type Store struct {
     wg     sync.WaitGroup
 }
 ```
+
+## IPC Server & Control Socket
+
+Litestream exposes a Unix socket HTTP server for runtime control (`server.go`).
+
+### Socket Configuration
+
+```go
+type SocketConfig struct {
+    Enabled     bool   `yaml:"enabled"`     // Default: false
+    Path        string `yaml:"path"`        // Default: "/var/run/litestream.sock"
+    Permissions uint32 `yaml:"permissions"` // Default: 0600
+}
+```
+
+### HTTP Endpoints
+
+All endpoints are served over the Unix socket via Go's `net/http` mux:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `POST` | `/register` | Add a database at runtime |
+| `POST` | `/unregister` | Remove a database at runtime |
+| `GET` | `/txid?path=` | Get current transaction ID for a database |
+| `GET` | `/list` | List all managed databases |
+| `GET` | `/info` | Server info (version, PID, uptime, database count) |
+| `POST` | `/start` | Start replication for a database |
+| `POST` | `/stop` | Stop replication for a database |
+| `GET` | `/debug/pprof/*` | Standard Go pprof endpoints |
+
+### Request/Response Types
+
+```go
+type RegisterDatabaseRequest struct {
+    Path       string `json:"path"`
+    ReplicaURL string `json:"replica_url"`
+}
+
+type UnregisterDatabaseRequest struct {
+    Path    string `json:"path"`
+    Timeout int    `json:"timeout,omitempty"` // Seconds
+}
+
+type TXIDResponse struct {
+    TXID uint64 `json:"txid"`
+}
+```
+
+## Distributed Leasing
+
+The `Leaser` interface (`leaser.go`) enables distributed coordination so multiple Litestream instances can safely share a replica destination.
+
+### Interface
+
+```go
+type Leaser interface {
+    Type() string
+    AcquireLease(ctx context.Context) (*Lease, error)
+    RenewLease(ctx context.Context, lease *Lease) (*Lease, error)
+    ReleaseLease(ctx context.Context, lease *Lease) error
+}
+
+type Lease struct {
+    Generation int64     `json:"generation"`
+    ExpiresAt  time.Time `json:"expires_at"`
+    Owner      string    `json:"owner,omitempty"`
+    ETag       string    `json:"-"`
+}
+```
+
+### S3 Implementation (`s3/leaser.go`)
+
+- **Defaults**: `DefaultLeaseTTL = 30s`, `DefaultLeasePath = "lock.json"`
+- **Owner format**: `hostname:pid` (falls back to `pid-N` if hostname unavailable)
+- **Conditional writes**: Uses `If-Match`/`If-None-Match` on S3 PutObject to prevent races
+- **Release**: Uses `DeleteObject` with `If-Match` to ensure only the holder can release
+- **Error types**: `ErrLeaseNotHeld`, `ErrLeaseAlreadyReleased`, `LeaseExistsError{Owner, ExpiresAt}`
+
+### Acquisition Flow
+
+1. Read existing lease from S3 (`lock.json`)
+2. If lease exists and is not expired, return `LeaseExistsError`
+3. Write new lease with `If-None-Match: *` (first acquire) or `If-Match: <etag>` (expired takeover)
+4. If `PreconditionFailed` (412), another instance acquired first
+5. Return lease with ETag for subsequent renewal
+
+## Library Convenience Methods
+
+These methods on `DB` (`db.go`) simplify common operations when Litestream is used as a library:
+
+```go
+type SyncStatus struct {
+    LocalTXID  ltx.TXID // Local transaction ID
+    RemoteTXID ltx.TXID // Remote transaction ID
+    InSync     bool     // true if LocalTXID > 0 and equal to RemoteTXID
+}
+
+func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error)
+func (db *DB) SyncAndWait(ctx context.Context) error
+func (db *DB) EnsureExists(ctx context.Context) error
+```
+
+- **SyncStatus**: Compares local TXID against remote replica position (performs I/O to query remote)
+- **SyncAndWait**: Runs `db.Sync()` (WAL to LTX) then `db.Replica.Sync()` (LTX to remote), blocking until both complete
+- **EnsureExists**: Restores database from replica if local file doesn't exist; no-op if file exists or no backup available. Must be called before `Open()`
 
 ## LTX File Format
 
@@ -447,6 +559,21 @@ type Store struct {
     mu sync.Mutex       // Protects database list
 }
 ```
+
+### Thundering Herd Prevention
+
+`Store.Open()` (`store.go`) limits concurrent database opens at startup:
+
+```go
+g, ctx := errgroup.WithContext(ctx)
+g.SetLimit(50) // Max 50 concurrent DB opens
+for _, db := range s.dbs {
+    db := db
+    g.Go(func() error { return db.Open() })
+}
+```
+
+This prevents OS resource exhaustion (file descriptors, memory) when hundreds of databases are configured.
 
 ### Lock Ordering (Prevent Deadlocks)
 
