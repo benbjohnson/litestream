@@ -199,6 +199,74 @@ history, which may reduce point-in-time restore granularity.
 
 **Reference**: `cmd/litestream/reset.go`, `replica.go` (auto-recover logic), `db.go` (`ResetLocalState`)
 
+## Issue 9: IPC Socket Connection Failures
+
+**Symptom**: `connection refused` or `no such file or directory` when using the control socket
+
+**Check**:
+```bash
+# Verify socket exists and has correct permissions
+ls -la /var/run/litestream.sock
+
+# Verify socket is enabled in config
+rg -A3 'socket:' /etc/litestream.yml
+
+# Check if litestream process is running
+pgrep -a litestream
+```
+
+**Fix**:
+```yaml
+# Enable socket in litestream.yml
+socket:
+  enabled: true
+  path: /var/run/litestream.sock
+  permissions: 0600
+```
+
+**Stale socket**: If litestream crashed, the socket file may still exist. The process creates a new socket on startup and will fail if the stale file exists. Remove it manually:
+```bash
+rm /var/run/litestream.sock
+```
+
+**Reference**: `server.go` (`SocketConfig`, `Server.Start`)
+
+## Issue 10: Backup Files Accumulating (Retention Disabled)
+
+**Symptom**: Storage usage growing unbounded, old LTX files never deleted
+
+**Check**:
+```bash
+# Look for retention warning in logs
+rg "retention disabled" /var/log/litestream.log
+```
+
+**Fix**:
+```yaml
+# Option 1: Re-enable Litestream retention (default)
+retention:
+  enabled: true
+
+# Option 2: Keep disabled, but configure cloud lifecycle policies
+# Example: S3 lifecycle rule to expire objects in ltx/ prefix after 30 days
+```
+
+**Reference**: `store.go` (`SetRetentionEnabled`), `compactor.go` (`RetentionEnabled`), `cmd/litestream/replicate.go:295`
+
+## Issue 11: v0.3.x Restore Not Finding Backups
+
+**Symptom**: Restore fails with "no snapshots available" but v0.3.x backups exist in storage
+
+**Check**:
+```bash
+# Verify v0.3.x backup structure exists
+aws s3 ls s3://bucket/path/generations/ --recursive | head -20
+```
+
+**Fix**: Ensure the backend implements `ReplicaClientV3`. The S3 backend supports this automatically. The restore process checks for v0.3.x backups when no v0.4.x+ backup is found.
+
+**Reference**: `v3.go` (`ReplicaClientV3` interface), `s3/replica_client.go`
+
 ## Diagnostic Commands
 
 ```bash
@@ -216,6 +284,11 @@ litestream reset /path/to/database.db
 
 # Test restoration
 litestream restore -o test.db [replica-url]
+
+# IPC socket diagnostics (requires socket.enabled: true)
+curl --unix-socket /var/run/litestream.sock http://localhost/info
+curl --unix-socket /var/run/litestream.sock http://localhost/list
+curl --unix-socket /var/run/litestream.sock "http://localhost/txid?path=/path/to/db"
 ```
 
 ## Prevention Checklist
