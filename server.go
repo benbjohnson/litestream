@@ -76,6 +76,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("GET /txid", s.handleTXID)
 	mux.HandleFunc("POST /register", s.handleRegister)
 	mux.HandleFunc("POST /unregister", s.handleUnregister)
+	mux.HandleFunc("POST /sync", s.handleSync)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
 
@@ -312,6 +313,63 @@ type ErrorResponse struct {
 // TXIDResponse is the response body for the /txid endpoint.
 type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
+}
+
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	var req SyncRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid request body", err.Error())
+		return
+	}
+
+	if req.Path == "" {
+		writeJSONError(w, http.StatusBadRequest, "path required", nil)
+		return
+	}
+
+	expandedPath, err := s.expandPath(req.Path)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+		return
+	}
+
+	ctx := s.ctx
+	if req.Wait && req.Timeout == 0 {
+		req.Timeout = 30
+	}
+	if req.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(req.Timeout)*time.Second)
+		defer cancel()
+	}
+
+	if err := s.store.SyncDB(ctx, expandedPath, req.Wait); err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
+
+	status := "sync_triggered"
+	if req.Wait {
+		status = "synced"
+	}
+
+	writeJSON(w, http.StatusOK, SyncResponse{
+		Status: status,
+		Path:   expandedPath,
+	})
+}
+
+// SyncRequest is the request body for the /sync endpoint.
+type SyncRequest struct {
+	Path    string `json:"path"`
+	Wait    bool   `json:"wait,omitempty"`
+	Timeout int    `json:"timeout,omitempty"`
+}
+
+// SyncResponse is the response body for the /sync endpoint.
+type SyncResponse struct {
+	Status string `json:"status"`
+	Path   string `json:"path"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {

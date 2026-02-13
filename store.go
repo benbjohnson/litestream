@@ -386,6 +386,32 @@ func (s *Store) DisableDB(ctx context.Context, path string) error {
 	return nil
 }
 
+// SyncDB forces an immediate sync for a database. If wait is true, blocks
+// until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
+// only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
+func (s *Store) SyncDB(ctx context.Context, path string, wait bool) error {
+	db := s.FindDB(path)
+	if db == nil {
+		return fmt.Errorf("database not found: %s", path)
+	}
+
+	if !db.IsOpen() {
+		return fmt.Errorf("database not open: %s", path)
+	}
+
+	if wait {
+		if err := db.SyncAndWait(ctx); err != nil {
+			return fmt.Errorf("sync database: %w", err)
+		}
+	} else {
+		if err := db.Sync(ctx); err != nil {
+			return fmt.Errorf("sync database: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // FindDB returns the database with the given path.
 func (s *Store) FindDB(path string) *DB {
 	s.mu.Lock()
