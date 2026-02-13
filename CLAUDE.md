@@ -9,6 +9,7 @@ With Claude's large context window, load documentation as needed:
 - Start with [AGENTS.md](AGENTS.md) for overview and checklist
 - Load [docs/PATTERNS.md](docs/PATTERNS.md) when writing code
 - Load [docs/SQLITE_INTERNALS.md](docs/SQLITE_INTERNALS.md) for WAL/page work
+- Load [docs/PROVIDER_COMPATIBILITY.md](docs/PROVIDER_COMPATIBILITY.md) for storage backend configs
 
 ## Claude-Specific Resources
 
@@ -23,6 +24,7 @@ With Claude's large context window, load documentation as needed:
 ### Commands (.claude/commands/)
 
 - `/analyze-ltx` - Analyze LTX file structure
+- `/debug-ipc` - Debug IPC Unix socket issues
 - `/debug-wal` - Debug WAL replication issues
 - `/test-compaction` - Test compaction scenarios
 - `/trace-replication` - Trace replication flow
