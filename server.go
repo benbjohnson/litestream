@@ -343,19 +343,25 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
-	if err := s.store.SyncDB(ctx, expandedPath, req.Wait); err != nil {
+	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait)
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		return
 	}
 
-	status := "synced_local"
-	if req.Wait {
+	var status string
+	if !result.Changed {
+		status = "no_change"
+	} else if req.Wait {
 		status = "synced"
+	} else {
+		status = "synced_local"
 	}
 
 	writeJSON(w, http.StatusOK, SyncResponse{
 		Status: status,
 		Path:   expandedPath,
+		TXID:   result.TXID,
 	})
 }
 
@@ -370,6 +376,7 @@ type SyncRequest struct {
 type SyncResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {

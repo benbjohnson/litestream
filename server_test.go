@@ -574,6 +574,7 @@ func TestServer_HandleSync(t *testing.T) {
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 		require.Equal(t, "synced_local", result.Status)
 		require.Equal(t, db.Path(), result.Path)
+		require.Greater(t, result.TXID, uint64(0))
 	})
 
 	t.Run("SuccessWithWait", func(t *testing.T) {
@@ -607,6 +608,50 @@ func TestServer_HandleSync(t *testing.T) {
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
 		require.Equal(t, "synced", result.Status)
 		require.Equal(t, db.Path(), result.Path)
+		require.Greater(t, result.TXID, uint64(0))
+	})
+
+	t.Run("NoChange", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		_, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`)
+		require.NoError(t, err)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		body := fmt.Sprintf(`{"path": %q}`, db.Path())
+
+		// First sync should pick up the CREATE TABLE.
+		resp1, err := client.Post("http://localhost/sync", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp1.Body.Close()
+		require.Equal(t, http.StatusOK, resp1.StatusCode)
+
+		var result1 litestream.SyncResponse
+		require.NoError(t, json.NewDecoder(resp1.Body).Decode(&result1))
+		require.Equal(t, "synced_local", result1.Status)
+		require.Greater(t, result1.TXID, uint64(0))
+
+		// Second sync with no new writes should return no_change.
+		resp2, err := client.Post("http://localhost/sync", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp2.Body.Close()
+		require.Equal(t, http.StatusOK, resp2.StatusCode)
+
+		var result2 litestream.SyncResponse
+		require.NoError(t, json.NewDecoder(resp2.Body).Decode(&result2))
+		require.Equal(t, "no_change", result2.Status)
+		require.Equal(t, result1.TXID, result2.TXID)
 	})
 }
 
