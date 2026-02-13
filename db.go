@@ -1676,18 +1676,18 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	return nil
 }
 
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) error {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
 		return nil
 	}
 
 	// Track checkpoint metrics.
-	t := time.Now()
+	t, success := time.Now(), false
 	defer func() {
 		labels := prometheus.Labels{"mode": mode}
 		db.checkpointNCounterVec.With(labels).Inc()
-		if err != nil {
+		if !success {
 			db.checkpointErrorNCounterVec.With(labels).Inc()
 		}
 		db.checkpointSecondsCounterVec.With(labels).Add(float64(time.Since(t).Seconds()))
@@ -1719,6 +1719,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 		return fmt.Errorf("reacquire read lock: %w", err)
 	}
 
+	success = true
 	return nil
 }
 
