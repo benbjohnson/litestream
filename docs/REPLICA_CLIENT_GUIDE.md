@@ -9,6 +9,7 @@ This guide provides comprehensive instructions for implementing new storage back
 - [Eventual Consistency Handling](#eventual-consistency-handling)
 - [Error Handling](#error-handling)
 - [Testing Requirements](#testing-requirements)
+- [ReplicaClientV3 Interface (v0.3.x Restore)](#replicaclientv3-interface-v03x-restore)
 - [Common Implementation Mistakes](#common-implementation-mistakes)
 - [Reference Implementations](#reference-implementations)
 
@@ -441,6 +442,71 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
     return info, nil
 }
 ```
+
+## ReplicaClientV3 Interface (v0.3.x Restore)
+
+Backends that need backward-compatible restore from v0.3.x Litestream backups should implement the optional `ReplicaClientV3` interface (`v3.go`). This enables restoring databases from pre-v0.4 backup formats.
+
+### Interface
+
+```go
+type ReplicaClientV3 interface {
+    GenerationsV3(ctx context.Context) ([]string, error)
+    SnapshotsV3(ctx context.Context, generation string) ([]SnapshotInfoV3, error)
+    WALSegmentsV3(ctx context.Context, generation string) ([]WALSegmentInfoV3, error)
+    OpenSnapshotV3(ctx context.Context, generation string, index int) (io.ReadCloser, error)
+    OpenWALSegmentV3(ctx context.Context, generation string, index int, offset int64) (io.ReadCloser, error)
+}
+```
+
+### Supporting Types
+
+```go
+type PosV3 struct {
+    Generation string // 16-char hex string
+    Index      int    // WAL index
+    Offset     int64  // Offset within WAL segment
+}
+
+type SnapshotInfoV3 struct {
+    Generation string
+    Index      int
+    Size       int64
+    CreatedAt  time.Time
+}
+
+type WALSegmentInfoV3 struct {
+    Generation string
+    Index      int
+    Offset     int64
+    Size       int64
+    CreatedAt  time.Time
+}
+```
+
+### v0.3.x Path Structure
+
+```text
+generations/
+  {generation-id}/         # 16-char hex (validated by IsGenerationIDV3)
+    snapshots/
+      {index:08x}.snapshot.lz4
+    wal/
+      {index:08x}_{offset:08x}.wal.lz4
+```
+
+### Implementation Notes
+
+- Generation IDs are 16 hex characters, validated by `IsGenerationIDV3()` (`generationRegexV3`)
+- All returned readers provide LZ4-decompressed data
+- `GenerationsV3` returns IDs sorted ascending
+- `SnapshotsV3` returns sorted by index
+- `WALSegmentsV3` returns sorted by index, then offset
+- S3 backend implements this: `var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)`
+
+### ResumableReader Integration
+
+`OpenLTXFile` must support the `offset` parameter for range requests. The `ResumableReader` (`internal/resumable_reader.go`) reopens streams from the last successful byte offset on connection failures during restore. If your backend ignores `offset`, restore operations will fail on idle connection timeouts.
 
 ## Common Implementation Mistakes
 
