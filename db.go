@@ -800,7 +800,7 @@ func (db *DB) releaseReadLock() error {
 }
 
 // Sync copies pending data from the WAL to the shadow WAL.
-func (db *DB) Sync(ctx context.Context) (err error) {
+func (db *DB) Sync(ctx context.Context) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
@@ -813,10 +813,10 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}
 
 	// Track total sync metrics.
-	t := time.Now()
+	t, success := time.Now(), false
 	defer func() {
 		db.syncNCounter.Inc()
-		if err != nil {
+		if !success {
 			db.syncErrorNCounter.Inc()
 		}
 		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
@@ -859,6 +859,9 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	close(db.notify)
 	db.notify = make(chan struct{})
 	// }
+	//
+
+	success = true
 
 	return nil
 }
