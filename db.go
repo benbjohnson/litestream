@@ -862,7 +862,6 @@ func (db *DB) Sync(ctx context.Context) error {
 	//
 
 	success = true
-
 	return nil
 }
 
