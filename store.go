@@ -31,6 +31,9 @@ var (
 	// ErrShutdownInterrupted is returned when the shutdown sync retry loop
 	// is interrupted by a done channel signal (e.g., second Ctrl+C).
 	ErrShutdownInterrupted = errors.New("shutdown sync interrupted")
+
+	ErrDatabaseNotFound = errors.New("database not found")
+	ErrDatabaseNotOpen  = errors.New("database not open")
 )
 
 // DBNotReadyError is returned when an operation is attempted before the
@@ -384,6 +387,52 @@ func (s *Store) DisableDB(ctx context.Context, path string) error {
 	}
 
 	return nil
+}
+
+// SyncDBResult holds the result of a sync operation.
+type SyncDBResult struct {
+	TXID    uint64
+	Changed bool
+}
+
+// SyncDB forces an immediate sync for a database. If wait is true, blocks
+// until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
+// only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
+// The timeout is best-effort as internal lock acquisition is not context-aware.
+func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
+	db := s.FindDB(path)
+	if db == nil {
+		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
+	}
+
+	if !db.IsOpen() {
+		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotOpen, path)
+	}
+
+	_, beforeTXID, err := db.MaxLTX()
+	if err != nil {
+		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
+	}
+
+	if wait {
+		if err := db.SyncAndWait(ctx); err != nil {
+			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
+		}
+	} else {
+		if err := db.Sync(ctx); err != nil {
+			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
+		}
+	}
+
+	_, afterTXID, err := db.MaxLTX()
+	if err != nil {
+		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
+	}
+
+	return SyncDBResult{
+		TXID:    uint64(afterTXID),
+		Changed: afterTXID > beforeTXID,
+	}, nil
 }
 
 // FindDB returns the database with the given path.
