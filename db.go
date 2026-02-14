@@ -95,6 +95,14 @@ type DB struct {
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
 
+	// forceNextSnapshot forces the next verify() call to return
+	// snapshotting=true. Set by checkpoint() when the WAL restarts during
+	// checkpointing, which indicates external writes may have been
+	// auto-checkpointed to the DB while the read lock was released.
+	// Those pages would not be in the new WAL or any LTX file, so a full
+	// snapshot is needed to ensure complete coverage.
+	forceNextSnapshot bool
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -265,6 +273,10 @@ func (db *DB) IsOpen() bool {
 // WALPath returns the path to the database's WAL file.
 func (db *DB) WALPath() string {
 	return db.path + "-wal"
+}
+
+func (db *DB) shmPath() string {
+	return db.path + "-shm"
 }
 
 // MetaPath returns the path to the database metadata.
@@ -1256,6 +1268,19 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		return info, nil // first sync
 	}
 
+	if db.forceNextSnapshot {
+		db.forceNextSnapshot = false
+		hdr, err := readWALHeader(db.WALPath())
+		if err != nil {
+			return info, fmt.Errorf("read wal header for forced snapshot: %w", err)
+		}
+		info.offset = WALHeaderSize
+		info.salt1 = binary.BigEndian.Uint32(hdr[16:])
+		info.salt2 = binary.BigEndian.Uint32(hdr[20:])
+		info.reason = "WAL restarted during checkpoint"
+		return info, nil
+	}
+
 	// Determine last WAL offset we save from.
 	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
 	ltxFile, err := os.Open(ltxPath)
@@ -1281,32 +1306,22 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	if fi, err := os.Stat(db.WALPath()); err != nil {
 		return info, fmt.Errorf("open wal file: %w", err)
 	} else if info.offset > fi.Size() {
-		// If we previously synced to the exact end of the WAL, this truncation
-		// is expected (normal checkpoint behavior). Reset position and continue
-		// incrementally rather than triggering a full snapshot. See issue #927.
-		if db.syncedToWALEnd {
-			db.syncedToWALEnd = false // Clear flag
+		db.syncedToWALEnd = false
 
-			// Read new WAL header to get current salt values
-			hdr, err := readWALHeader(db.WALPath())
-			if err != nil {
-				return info, fmt.Errorf("read wal header after expected truncation: %w", err)
-			}
-
-			info.offset = WALHeaderSize
-			info.salt1 = binary.BigEndian.Uint32(hdr[16:])
-			info.salt2 = binary.BigEndian.Uint32(hdr[20:])
-			info.snapshotting = false
-			info.reason = ""
-
-			db.Logger.Log(ctx, internal.LevelTrace, "wal truncated after sync to end (expected checkpoint)",
-				"new_salt1", info.salt1,
-				"new_salt2", info.salt2)
-
-			return info, nil
+		hdr, err := readWALHeader(db.WALPath())
+		if err != nil {
+			return info, fmt.Errorf("read wal header after wal truncation: %w", err)
 		}
 
-		info.reason = "wal truncated by another process"
+		info.offset = WALHeaderSize
+		info.salt1 = binary.BigEndian.Uint32(hdr[16:])
+		info.salt2 = binary.BigEndian.Uint32(hdr[20:])
+		info.reason = "wal truncated, snapshotting for complete page coverage"
+
+		db.Logger.Log(ctx, internal.LevelTrace, "wal truncated, forcing snapshot",
+			"new_salt1", info.salt1,
+			"new_salt2", info.salt2)
+
 		return info, nil
 	}
 
@@ -1361,8 +1376,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	slog.Debug("verify.2", "lastPageMatch", lastPageMatch)
 
-	// Salt has changed which could indicate a FULL checkpoint.
-	// If we have a last page match, then we can assume that the WAL has not been overwritten.
 	if !saltMatch {
 		db.Logger.Log(ctx, internal.LevelTrace, "wal restarted",
 			"salt1", salt1,
@@ -1370,14 +1383,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
-
-		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {dec.Header().WALSalt1, dec.Header().WALSalt2}}); err != nil {
-			return info, fmt.Errorf("detect full checkpoint: %w", err)
-		} else if detected {
-			info.reason = "full or restart checkpoint detected, snapshotting"
-		} else {
-			info.snapshotting = false
-		}
+		info.reason = "wal restarted, snapshotting for complete page coverage"
 
 		return info, nil
 	}
@@ -1424,38 +1430,6 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 		}
 		return true, nil // Page matches
 	}
-}
-
-// detectFullCheckpoint attempts to detect checks if a FULL or RESTART checkpoint
-// has occurred and we may have missed some frames.
-func (db *DB) detectFullCheckpoint(ctx context.Context, knownSalts [][2]uint32) (bool, error) {
-	walFile, err := os.Open(db.WALPath())
-	if err != nil {
-		return false, fmt.Errorf("open wal file: %w", err)
-	}
-	defer walFile.Close()
-
-	var lastKnownSalt [2]uint32
-	if len(knownSalts) > 0 {
-		lastKnownSalt = knownSalts[len(knownSalts)-1]
-	}
-
-	rd, err := NewWALReader(walFile, db.Logger)
-	if err != nil {
-		return false, fmt.Errorf("new wal reader: %w", err)
-	}
-	m, err := rd.FrameSaltsUntil(ctx, lastKnownSalt)
-	if err != nil {
-		return false, fmt.Errorf("frame salts until: %w", err)
-	}
-
-	// Remove known salts from the map.
-	for _, salt := range knownSalts {
-		delete(m, salt)
-	}
-
-	// If we have more than one unknown salt, then we have a FULL or RESTART checkpoint.
-	return len(m) >= 1, nil
 }
 
 type syncInfo struct {
@@ -1784,6 +1758,8 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		db.syncedSinceCheckpoint = false
 		return nil
 	}
+
+	db.forceNextSnapshot = true
 
 	// Start a transaction. This will be promoted immediately after.
 	tx, err := db.db.BeginTx(ctx, nil)
@@ -2194,11 +2170,14 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // To reduce CPU usage when idle, we use cheap change detection to avoid
 // unnecessary Sync() calls when the WAL hasn't changed:
 //
-//  1. stat() the WAL file to get its size (changes on any write)
-//  2. Read the 32-byte WAL header which contains salt values that change
-//     when SQLite restarts the WAL (e.g., after checkpoint)
+//  1. Read mxFrame from the first page of the WAL-index (-shm). This changes
+//     on each commit even when SQLite reuses WAL space and the WAL file size
+//     stays constant.
+//  2. stat() the WAL file to get its size.
+//  3. Read the 32-byte WAL header which contains salt values that change
+//     when SQLite restarts the WAL (e.g., after checkpoint).
 //
-// If both size and header are unchanged since last check, we skip Sync().
+// If mxFrame, size, and header are unchanged since last check, we skip Sync().
 // When a change is detected, we call Sync() which performs full verification
 // and replication. The cost per tick is just one stat() call plus a 32-byte
 // read, which is negligible.
@@ -2212,6 +2191,7 @@ func (db *DB) monitor() {
 	// Track last known WAL state for cheap change detection.
 	var lastWALSize int64
 	var lastWALHeader []byte
+	var lastSHMMxFrame [4]byte
 
 	// Backoff state for error handling.
 	var backoff time.Duration
@@ -2250,6 +2230,16 @@ func (db *DB) monitor() {
 			continue
 		}
 
+		shmMxFrame, err := readSHMMxFrameKey(db.shmPath())
+		if err != nil {
+			// Can't read SHM header - fall back to sync.
+			db.Logger.Debug("failed to read shm mxFrame", "error", err)
+			if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+				db.Logger.Error("sync error", "error", err)
+			}
+			continue
+		}
+
 		// Read WAL header (32 bytes) for change detection.
 		walHeader, err := readWALHeader(walPath)
 		if err != nil {
@@ -2260,15 +2250,16 @@ func (db *DB) monitor() {
 			continue
 		}
 
-		// Skip sync if WAL size and header are unchanged.
+		// Skip sync if WAL-index mxFrame, WAL size, and WAL header are unchanged.
 		walSize := fi.Size()
-		if walSize == lastWALSize && bytes.Equal(walHeader, lastWALHeader) {
+		if walSize == lastWALSize && shmMxFrame == lastSHMMxFrame && bytes.Equal(walHeader, lastWALHeader) {
 			continue
 		}
 
 		// WAL changed - update cached state and sync.
 		lastWALSize = walSize
 		lastWALHeader = walHeader
+		lastSHMMxFrame = shmMxFrame
 
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++

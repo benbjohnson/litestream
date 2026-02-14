@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -264,8 +265,11 @@ func (db *TestDB) StopLitestream() error {
 		return nil
 	}
 
-	if err := db.LitestreamCmd.Process.Kill(); err != nil {
-		return fmt.Errorf("kill litestream: %w", err)
+	// Send SIGINT for graceful shutdown so litestream can flush pending syncs
+	// and uploads. SIGKILL would interrupt S3 uploads, causing incomplete LTX
+	// coverage during restore.
+	if err := db.LitestreamCmd.Process.Signal(syscall.SIGINT); err != nil {
+		return fmt.Errorf("signal litestream: %w", err)
 	}
 
 	db.LitestreamCmd.Wait()
