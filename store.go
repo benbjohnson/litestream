@@ -31,6 +31,9 @@ var (
 	// ErrShutdownInterrupted is returned when the shutdown sync retry loop
 	// is interrupted by a done channel signal (e.g., second Ctrl+C).
 	ErrShutdownInterrupted = errors.New("shutdown sync interrupted")
+
+	ErrDatabaseNotFound = errors.New("database not found")
+	ErrDatabaseNotOpen  = errors.New("database not open")
 )
 
 // DBNotReadyError is returned when an operation is attempted before the
@@ -399,14 +402,14 @@ type SyncDBResult struct {
 func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
 	db := s.FindDB(path)
 	if db == nil {
-		return SyncDBResult{}, fmt.Errorf("database not found: %s", path)
+		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotFound, path)
 	}
 
 	if !db.IsOpen() {
-		return SyncDBResult{}, fmt.Errorf("database not open: %s", path)
+		return SyncDBResult{}, fmt.Errorf("%w: %s", ErrDatabaseNotOpen, path)
 	}
 
-	beforePos, err := db.Pos()
+	_, beforeTXID, err := db.MaxLTX()
 	if err != nil {
 		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
 	}
@@ -421,14 +424,14 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 		}
 	}
 
-	afterPos, err := db.Pos()
+	_, afterTXID, err := db.MaxLTX()
 	if err != nil {
 		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
 	}
 
 	return SyncDBResult{
-		TXID:    uint64(afterPos.TXID),
-		Changed: afterPos.TXID > beforePos.TXID,
+		TXID:    uint64(afterTXID),
+		Changed: afterTXID > beforeTXID,
 	}, nil
 }
 

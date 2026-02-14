@@ -3,6 +3,7 @@ package litestream
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -345,7 +346,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 
 	result, err := s.store.SyncDB(ctx, expandedPath, req.Wait)
 	if err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		switch {
+		case errors.Is(err, ErrDatabaseNotFound):
+			writeJSONError(w, http.StatusNotFound, err.Error(), nil)
+		case errors.Is(err, ErrDatabaseNotOpen):
+			writeJSONError(w, http.StatusConflict, err.Error(), nil)
+		default:
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		}
 		return
 	}
 
