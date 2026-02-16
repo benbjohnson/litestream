@@ -60,38 +60,6 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
-// errorReplicaClient is a replica client that returns errors for testing.
-type errorReplicaClient struct {
-	writeErr error
-}
-
-func (c *errorReplicaClient) Init(_ context.Context) error { return nil }
-
-func (c *errorReplicaClient) Type() string { return "error" }
-
-func (c *errorReplicaClient) LTXFiles(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
-	return ltx.NewFileInfoSliceIterator(nil), nil
-}
-
-func (c *errorReplicaClient) OpenLTXFile(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
-	return nil, os.ErrNotExist
-}
-
-func (c *errorReplicaClient) WriteLTXFile(_ context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
-	if c.writeErr != nil {
-		return nil, c.writeErr
-	}
-	return nil, nil
-}
-
-func (c *errorReplicaClient) DeleteLTXFiles(_ context.Context, _ []*ltx.FileInfo) error {
-	return nil
-}
-
-func (c *errorReplicaClient) DeleteAll(_ context.Context) error {
-	return nil
-}
-
 // TestCalcWALSize ensures calcWALSize doesn't overflow with large page sizes.
 // Regression test for uint32 overflow bug where large page sizes (>=16KB)
 // caused incorrect WAL size calculations, triggering checkpoints too early.
@@ -328,32 +296,23 @@ func TestDB_Sync_ErrorMetrics(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
-	errorClient := &errorReplicaClient{writeErr: errors.New("simulated write error")}
 	workingClient := &testReplicaClient{dir: t.TempDir()}
 
 	db := NewDB(dbPath)
 	db.MonitorInterval = 0
 	db.Replica = NewReplica(db)
-	db.Replica.Client = workingClient // Start with working client
+	db.Replica.Client = workingClient
 	db.Replica.MonitorEnabled = false
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		// Switch back to working client for clean close
-		db.Replica.Client = workingClient
-		_ = db.Close(context.Background())
-	}()
+	defer func() { _ = db.Close(context.Background()) }()
 
 	sqldb, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
 
 	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
 		t.Fatal(err)
@@ -362,31 +321,25 @@ func TestDB_Sync_ErrorMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// First sync with working client to initialize
 	if err := db.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	// Insert more data
 	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'more data')`); err != nil {
 		t.Fatal(err)
 	}
 
-	// Get baseline error count
 	baselineErrors := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
 
-	// Switch to error client
-	db.Replica.Client = errorClient
-
-	// Sync should fail due to error replica client
-	err = db.Sync(context.Background())
-	if err == nil {
-		t.Skip("sync did not return error, skipping error metric test")
+	if err := os.Remove(db.WALPath()); err != nil {
+		t.Fatal(err)
 	}
 
-	// Verify sync_error_count was incremented
-	syncErrorMetric := syncErrorNCounterVec.WithLabelValues(db.Path())
-	syncErrorValue := testutil.ToFloat64(syncErrorMetric)
+	if err := db.Sync(context.Background()); err == nil {
+		t.Fatal("expected error from sync with missing WAL")
+	}
+
+	syncErrorValue := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
 	if syncErrorValue <= baselineErrors {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v", syncErrorValue, baselineErrors)
 	}
