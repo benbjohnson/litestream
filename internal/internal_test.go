@@ -49,3 +49,23 @@ func TestReplicaOperationMetrics(t *testing.T) {
 		}
 	}
 }
+
+// TestReplicaOperationErrorMetrics verifies that replica operation error metrics
+// are properly incremented when errors occur.
+func TestReplicaOperationErrorMetrics(t *testing.T) {
+	testType := "test-error-metrics"
+
+	codes := []string{"AccessDenied", "InternalError", "NoSuchKey"}
+	for _, code := range codes {
+		baseline := testutil.ToFloat64(
+			OperationErrorCounterVec.WithLabelValues(testType, "DELETE", code))
+
+		OperationErrorCounterVec.WithLabelValues(testType, "DELETE", code).Inc()
+
+		after := testutil.ToFloat64(
+			OperationErrorCounterVec.WithLabelValues(testType, "DELETE", code))
+		if after != baseline+1 {
+			t.Fatalf("litestream_replica_operation_errors_total[%s]=%v, want %v", code, after, baseline+1)
+		}
+	}
+}

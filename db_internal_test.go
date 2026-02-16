@@ -17,6 +17,8 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
 	_ "modernc.org/sqlite"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // testReplicaClient is a minimal mock for testing that doesn't cause import cycles.
@@ -28,12 +30,42 @@ func (c *testReplicaClient) Init(_ context.Context) error { return nil }
 
 func (c *testReplicaClient) Type() string { return "test" }
 
-func (c *testReplicaClient) LTXFiles(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
-	return ltx.NewFileInfoSliceIterator(nil), nil
+func (c *testReplicaClient) LTXFiles(_ context.Context, level int, afterTXID ltx.TXID, _ bool) (ltx.FileIterator, error) {
+	levelDir := filepath.Join(c.dir, fmt.Sprintf("l%d", level))
+	entries, err := os.ReadDir(levelDir)
+	if os.IsNotExist(err) {
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var infos []*ltx.FileInfo
+	for _, entry := range entries {
+		minTXID, maxTXID, err := ltx.ParseFilename(entry.Name())
+		if err != nil {
+			continue
+		}
+		if maxTXID <= afterTXID {
+			continue
+		}
+		fi, _ := entry.Info()
+		var size int64
+		if fi != nil {
+			size = fi.Size()
+		}
+		infos = append(infos, &ltx.FileInfo{
+			Level:   level,
+			MinTXID: minTXID,
+			MaxTXID: maxTXID,
+			Size:    size,
+		})
+	}
+	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
-func (c *testReplicaClient) OpenLTXFile(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
-	return nil, os.ErrNotExist
+func (c *testReplicaClient) OpenLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+	path := filepath.Join(c.dir, fmt.Sprintf("l%d", level), ltx.FormatFilename(minTXID, maxTXID))
+	return os.Open(path)
 }
 
 func (c *testReplicaClient) WriteLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
@@ -342,6 +374,112 @@ func TestDB_Sync_ErrorMetrics(t *testing.T) {
 	syncErrorValue := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
 	if syncErrorValue <= baselineErrors {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v", syncErrorValue, baselineErrors)
+	}
+}
+
+// TestDB_Checkpoint_ErrorMetrics verifies that checkpoint error counter is incremented on failure.
+func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'test data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	baselineErrors := testutil.ToFloat64(checkpointErrorNCounterVec.WithLabelValues(db.Path(), "PASSIVE"))
+
+	db.db.Close()
+
+	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+		t.Fatal("expected error from checkpoint with closed db")
+	}
+
+	checkpointErrorValue := testutil.ToFloat64(checkpointErrorNCounterVec.WithLabelValues(db.Path(), "PASSIVE"))
+	if checkpointErrorValue <= baselineErrors {
+		t.Fatalf("litestream_checkpoint_error_count=%v, want > %v", checkpointErrorValue, baselineErrors)
+	}
+}
+
+// TestDB_L0RetentionMetrics verifies that L0 retention gauges are set during enforcement.
+func TestDB_L0RetentionMetrics(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	client := &testReplicaClient{dir: t.TempDir()}
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.L0Retention = 1 * time.Nanosecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = client
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := range 3 {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, 'data')`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	compactor := NewCompactor(client, slog.Default())
+	if _, err := compactor.Compact(context.Background(), 1); err != nil {
+		t.Fatal(err)
+	}
+
+	dbName := filepath.Base(db.Path())
+	if err := db.EnforceL0RetentionByTime(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	eligible := testutil.ToFloat64(internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible"))
+	notCompacted := testutil.ToFloat64(internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted"))
+	tooRecent := testutil.ToFloat64(internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent"))
+
+	if eligible+notCompacted+tooRecent == 0 {
+		t.Fatalf("expected at least one L0 retention gauge > 0, got eligible=%v not_compacted=%v too_recent=%v",
+			eligible, notCompacted, tooRecent)
 	}
 }
 
