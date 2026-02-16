@@ -1216,3 +1216,113 @@ func TestVFSFile_Hydration_IncrementalUpdates(t *testing.T) {
 		}
 	}
 }
+
+func TestHydrator_Close_Persistent(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hydration.db")
+	client := newMockReplicaClient()
+
+	h := NewHydrator(path, true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	h.SetTXID(5)
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("hydration file should be preserved: %v", err)
+	}
+
+	metaPath := path + ".meta"
+	data, err := os.ReadFile(metaPath)
+	if err != nil {
+		t.Fatalf("meta file should exist: %v", err)
+	}
+	if got := strings.TrimSpace(string(data)); got != "5" {
+		t.Fatalf("expected meta TXID=5, got %q", got)
+	}
+}
+
+func TestHydrator_Init_Resume(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hydration.db")
+	client := newMockReplicaClient()
+
+	if err := os.WriteFile(path, []byte("existing-db-data"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path+".meta", []byte("42\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHydrator(path, true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer h.Close()
+
+	if got := h.TXID(); got != 42 {
+		t.Fatalf("expected TXID=42, got %d", got)
+	}
+
+	data := make([]byte, 16)
+	n, err := h.file.ReadAt(data, 0)
+	if err != nil && err != io.EOF {
+		t.Fatalf("read: %v", err)
+	}
+	if string(data[:n]) != "existing-db-data" {
+		t.Fatalf("file contents should be preserved, got %q", string(data[:n]))
+	}
+}
+
+func TestHydrator_Close_TempFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hydration.db")
+	client := newMockReplicaClient()
+
+	h := NewHydrator(path, false, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+
+	h.SetTXID(10)
+
+	if err := h.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("temp hydration file should be deleted")
+	}
+	if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+		t.Fatalf("meta file should not exist for temp hydrator")
+	}
+}
+
+func TestHydrator_Init_StaleMeta(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "hydration.db")
+	client := newMockReplicaClient()
+
+	if err := os.WriteFile(path+".meta", []byte("99\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewHydrator(path, true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	defer h.Close()
+
+	if got := h.TXID(); got != 0 {
+		t.Fatalf("expected TXID=0 for stale meta, got %d", got)
+	}
+
+	if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+		t.Fatalf("stale meta file should be removed")
+	}
+}
