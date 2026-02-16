@@ -30,10 +30,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 # --- Hardened image (Scratch) ---
 FROM alpine:3.21 AS certs
-RUN apk --update add ca-certificates
+RUN apk --update add ca-certificates && \
+	echo "root:x:0:0:root:/root:/sbin/nologin" > /etc/minimal-passwd && \
+	echo "root:x:0:" > /etc/minimal-group
 
 FROM scratch AS hardened
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=certs /etc/minimal-passwd /etc/passwd
+COPY --from=certs /etc/minimal-group /etc/group
 COPY --from=builder /usr/local/bin/litestream /usr/local/bin/litestream
 ENTRYPOINT ["/usr/local/bin/litestream"]
 CMD []
