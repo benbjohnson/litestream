@@ -28,7 +28,18 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 	dist/litestream-vfs.a \
 	-lpthread -ldl -lm
 
-FROM debian:bookworm-slim
+# --- Hardened image (Scratch) ---
+FROM alpine:3.21 AS certs
+RUN apk --update add ca-certificates
+
+FROM scratch AS hardened
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+COPY --from=builder /usr/local/bin/litestream /usr/local/bin/litestream
+ENTRYPOINT ["/usr/local/bin/litestream"]
+CMD []
+
+# --- Default image (Debian) ---
+FROM debian:bookworm-slim AS default
 
 RUN apt-get update && \
 	apt-get install -y ca-certificates sqlite3 && \
