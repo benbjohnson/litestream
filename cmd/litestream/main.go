@@ -187,6 +187,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return (&RestoreCommand{}).Run(ctx, args)
 	case "status":
 		return (&StatusCommand{}).Run(ctx, args)
+	case "sync":
+		return (&SyncCommand{}).Run(ctx, args)
 	case "list":
 		return (&ListCommand{}).Run(ctx, args)
 	case "info":
@@ -230,6 +232,7 @@ The commands are:
 	start        start replication for a database
 	status       display replication status for databases
 	stop         stop replication for a database
+	sync         force an immediate sync for a database
 	unregister   unregister a database from replication
 	version      prints the binary version
 `[1:])
