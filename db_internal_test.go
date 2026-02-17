@@ -1687,3 +1687,41 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 
 	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
 }
+
+// TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
+// when db.init() fails. Regression test for issue #1128.
+func TestDB_Sync_InitErrorMetrics(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	// Create a directory at the DB path so init() will fail when trying to
+	// open it as a SQLite database.
+	if err := os.Mkdir(dbPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	baselineErrors := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
+
+	err := db.Sync(context.Background())
+	if err == nil {
+		t.Fatal("expected Sync to return error when init fails, got nil")
+	}
+
+	syncErrorValue := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
+	if syncErrorValue <= baselineErrors {
+		t.Fatalf("litestream_sync_error_count=%v, want > %v (init error should be counted)", syncErrorValue, baselineErrors)
+	}
+}

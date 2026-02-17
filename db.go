@@ -947,14 +947,6 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	// Initialize database, if necessary. Exit if no DB exists.
-	if err := db.init(ctx); err != nil {
-		return err
-	} else if db.db == nil {
-		db.Logger.Debug("sync: no database found")
-		return nil
-	}
-
 	// Track total sync metrics.
 	t := time.Now()
 	defer func() {
@@ -964,6 +956,14 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		}
 		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
 	}()
+
+	// Initialize database, if necessary. Exit if no DB exists.
+	if err := db.init(ctx); err != nil {
+		return err
+	} else if db.db == nil {
+		db.Logger.Debug("sync: no database found")
+		return nil
+	}
 
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(ctx); err != nil {
