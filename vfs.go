@@ -830,6 +830,9 @@ func (h *Hydrator) Close() error {
 	}
 
 	if h.persistent && h.txid > 0 {
+		if err := h.file.Sync(); err != nil {
+			h.logger.Warn("failed to sync hydration file", "error", err)
+		}
 		if err := h.saveMeta(); err != nil {
 			h.logger.Warn("failed to save hydration meta", "error", err)
 		}
@@ -885,6 +888,15 @@ func (h *Hydrator) saveMeta() error {
 			h.logger.Warn("failed to remove temp meta file during cleanup", "error", removeErr)
 		}
 		return fmt.Errorf("write hydration meta: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		if closeErr := tmp.Close(); closeErr != nil {
+			h.logger.Warn("failed to close temp meta file during cleanup", "error", closeErr)
+		}
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			h.logger.Warn("failed to remove temp meta file during cleanup", "error", removeErr)
+		}
+		return fmt.Errorf("sync temp meta file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
 		if removeErr := os.Remove(tmpPath); removeErr != nil {
@@ -1259,6 +1271,11 @@ func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
 			f.logger.Warn("remote TXID regressed, discarding persistent hydration",
 				"hydration_txid", hydrationTXID.String(),
 				"current_txid", currentTXID.String())
+			if err := f.hydrator.Truncate(0); err != nil {
+				f.hydrator.SetErr(err)
+				f.logger.Error("hydration truncate failed", "error", err)
+				return
+			}
 		}
 		if err := f.hydrator.Restore(f.ctx, infos); err != nil {
 			f.hydrator.SetErr(err)
