@@ -31,10 +31,8 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 # --- Hardened image (Scratch) ---
 FROM alpine:3.21 AS certs
 RUN apk --update add ca-certificates && \
-	echo "root:x:0:0:root:/root:/sbin/nologin" > /etc/minimal-passwd && \
-	echo "nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin" >> /etc/minimal-passwd && \
-	echo "root:x:0:" > /etc/minimal-group && \
-	echo "nonroot:x:65532:" >> /etc/minimal-group
+	echo "nonroot:x:65532:65532:nonroot:/home/nonroot:/sbin/nologin" > /etc/minimal-passwd && \
+	echo "nonroot:x:65532:" > /etc/minimal-group
 
 FROM scratch AS hardened
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
