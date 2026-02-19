@@ -154,7 +154,7 @@ func TestReplica_ApplyLTXFile_VerifiesChecksumOnClose(t *testing.T) {
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	err := r.applyLTXFile(context.Background(), f, info, pageSize)
+	_, err := r.applyLTXFile(context.Background(), f, info, pageSize)
 	if err == nil {
 		t.Fatal("expected checksum validation error")
 	}

@@ -638,6 +638,13 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
+		for _, rd := range rdrs {
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+		rdrs = nil
+
 		maxTXID := infos[len(infos)-1].MaxTXID
 		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
 	}
@@ -752,12 +759,14 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 			continue
 		}
 
-		if err := r.applyLTXFile(ctx, f, info, pageSize); err != nil {
+		newPageSize, err := r.applyLTXFile(ctx, f, info, pageSize)
+		if err != nil {
 			return closeLevel0(fmt.Errorf(
 				"apply ltx file (level=%d, min=%s, max=%s): %w",
 				info.Level, info.MinTXID, info.MaxTXID, err,
 			))
 		}
+		pageSize = newPageSize
 		currentTXID = info.MaxTXID
 	}
 
@@ -787,32 +796,37 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 // (bytes 18-19) to indicate DELETE journal mode instead of WAL mode, and
 // randomize the schema change counter (bytes 24-27) to invalidate cached
 // schemas in other connections.
-func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileInfo, pageSize uint32) error {
+func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileInfo, pageSize uint32) (uint32, error) {
 	rc, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 	if err != nil {
-		return fmt.Errorf("open ltx file: %w", err)
+		return pageSize, fmt.Errorf("open ltx file: %w", err)
 	}
 	defer rc.Close()
 
 	dec := ltx.NewDecoder(rc)
 	if err := dec.DecodeHeader(); err != nil {
-		return fmt.Errorf("decode header: %w", err)
+		return pageSize, fmt.Errorf("decode header: %w", err)
 	}
 
 	hdr := dec.Header()
 
+	ps := pageSize
+	if hdr.PageSize > 0 {
+		ps = hdr.PageSize
+	}
+
 	if err := internal.LockFileExclusive(f); err != nil {
-		return fmt.Errorf("acquire exclusive lock: %w", err)
+		return pageSize, fmt.Errorf("acquire exclusive lock: %w", err)
 	}
 	defer internal.UnlockFile(f)
 
 	for {
 		var phdr ltx.PageHeader
-		data := make([]byte, pageSize)
+		data := make([]byte, ps)
 		if err := dec.DecodePage(&phdr, data); err == io.EOF {
 			break
 		} else if err != nil {
-			return fmt.Errorf("decode page: %w", err)
+			return pageSize, fmt.Errorf("decode page: %w", err)
 		}
 
 		if phdr.Pgno == 1 && len(data) >= 28 {
@@ -820,25 +834,24 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 			_, _ = rand.Read(data[24:28])
 		}
 
-		off := int64(phdr.Pgno-1) * int64(pageSize)
+		off := int64(phdr.Pgno-1) * int64(ps)
 		if _, err := f.WriteAt(data, off); err != nil {
-			return fmt.Errorf("write page %d: %w", phdr.Pgno, err)
+			return pageSize, fmt.Errorf("write page %d: %w", phdr.Pgno, err)
 		}
 	}
 
-	// Truncate database if it shrank (e.g., after VACUUM).
 	if hdr.Commit > 0 {
-		newSize := int64(hdr.Commit) * int64(pageSize)
+		newSize := int64(hdr.Commit) * int64(ps)
 		if err := f.Truncate(newSize); err != nil {
-			return fmt.Errorf("truncate: %w", err)
+			return pageSize, fmt.Errorf("truncate: %w", err)
 		}
 	}
 
 	if err := dec.Close(); err != nil {
-		return fmt.Errorf("close decoder: %w", err)
+		return pageSize, fmt.Errorf("close decoder: %w", err)
 	}
 
-	return f.Sync()
+	return ps, f.Sync()
 }
 
 // fillFollowGap attempts to bridge a gap in level 0 files by searching
@@ -875,12 +888,14 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 				continue
 			}
 
-			if err := r.applyLTXFile(ctx, f, info, pageSize); err != nil {
+			newPageSize, err := r.applyLTXFile(ctx, f, info, pageSize)
+			if err != nil {
 				return closeLevel(fmt.Errorf(
 					"apply gap-fill ltx file (level=%d, min=%s, max=%s): %w",
 					info.Level, info.MinTXID, info.MaxTXID, err,
 				))
 			}
+			pageSize = newPageSize
 			currentTXID = info.MaxTXID
 
 			// If we've bridged past the gap, we're done.
