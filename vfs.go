@@ -910,7 +910,19 @@ func (h *Hydrator) saveMeta() error {
 		}
 		return fmt.Errorf("rename hydration meta: %w", err)
 	}
+	if err := syncDir(filepath.Dir(h.metaPath())); err != nil {
+		return fmt.Errorf("sync hydration meta directory: %w", err)
+	}
 	return nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile {

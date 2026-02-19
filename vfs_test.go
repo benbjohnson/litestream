@@ -1326,3 +1326,75 @@ func TestHydrator_Init_StaleMeta(t *testing.T) {
 		t.Fatalf("stale meta file should be removed")
 	}
 }
+
+func TestVFSFile_Hydration_PersistentResumeOnReopen(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'g'))
+
+	hydrationDir := t.TempDir()
+	hydrationPath := filepath.Join(hydrationDir, "persistent-hydration.db")
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationPath = hydrationPath
+	f.hydrationPersistent = true
+	f.PollInterval = 50 * time.Millisecond
+
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file (first): %v", err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for f.hydrator == nil || !f.hydrator.Complete() {
+		if time.Now().After(deadline) {
+			t.Fatalf("first hydration did not complete in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := f.Close(); err != nil {
+		t.Fatalf("close vfs file (first): %v", err)
+	}
+
+	if _, err := os.Stat(hydrationPath); err != nil {
+		t.Fatalf("persistent hydration file should exist after close: %v", err)
+	}
+	if _, err := os.Stat(hydrationPath + ".meta"); err != nil {
+		t.Fatalf("persistent hydration meta should exist after close: %v", err)
+	}
+	initialInfo, err := os.Stat(hydrationPath)
+	if err != nil {
+		t.Fatalf("stat hydration file after first close: %v", err)
+	}
+
+	f2 := NewVFSFile(client, "test.db", slog.Default())
+	f2.hydrationPath = hydrationPath
+	f2.hydrationPersistent = true
+	f2.PollInterval = 50 * time.Millisecond
+
+	if err := f2.Open(); err != nil {
+		t.Fatalf("open vfs file (second): %v", err)
+	}
+
+	deadline = time.Now().Add(5 * time.Second)
+	for f2.hydrator == nil || !f2.hydrator.Complete() {
+		if time.Now().After(deadline) {
+			t.Fatalf("second hydration did not complete in time")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if got := f2.hydrator.TXID(); got != 1 {
+		t.Fatalf("expected resumed hydration txid=1, got %d", got)
+	}
+	if err := f2.Close(); err != nil {
+		t.Fatalf("close vfs file (second): %v", err)
+	}
+
+	reopenedInfo, err := os.Stat(hydrationPath)
+	if err != nil {
+		t.Fatalf("stat hydration file after second close: %v", err)
+	}
+	if !reopenedInfo.ModTime().Equal(initialInfo.ModTime()) {
+		t.Fatalf("expected hydration file modtime unchanged on reopen resume")
+	}
+}
