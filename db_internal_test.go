@@ -31,6 +31,8 @@ func (c *testReplicaClient) Init(_ context.Context) error { return nil }
 func (c *testReplicaClient) Type() string { return "test" }
 
 func (c *testReplicaClient) LTXFiles(_ context.Context, level int, afterTXID ltx.TXID, _ bool) (ltx.FileIterator, error) {
+	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "LIST").Inc()
+
 	levelDir := filepath.Join(c.dir, fmt.Sprintf("l%d", level))
 	entries, err := os.ReadDir(levelDir)
 	if os.IsNotExist(err) {
@@ -64,6 +66,8 @@ func (c *testReplicaClient) LTXFiles(_ context.Context, level int, afterTXID ltx
 }
 
 func (c *testReplicaClient) OpenLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "GET").Inc()
+
 	path := filepath.Join(c.dir, fmt.Sprintf("l%d", level), ltx.FormatFilename(minTXID, maxTXID))
 	return os.Open(path)
 }
@@ -81,10 +85,15 @@ func (c *testReplicaClient) WriteLTXFile(_ context.Context, level int, minTXID, 
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return nil, err
 	}
+
+	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(c.Type(), "PUT").Add(float64(len(data)))
+
 	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID, Size: int64(len(data))}, nil
 }
 
-func (c *testReplicaClient) DeleteLTXFiles(_ context.Context, _ []*ltx.FileInfo) error {
+func (c *testReplicaClient) DeleteLTXFiles(_ context.Context, infos []*ltx.FileInfo) error {
+	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "DELETE").Add(float64(len(infos)))
 	return nil
 }
 
@@ -320,6 +329,68 @@ func TestDB_Checkpoint_UpdatesMetrics(t *testing.T) {
 	checkpointSecondsValue := testutil.ToFloat64(checkpointSecondsMetric)
 	if checkpointSecondsValue <= baselineSeconds {
 		t.Fatalf("litestream_checkpoint_seconds=%v, want > %v", checkpointSecondsValue, baselineSeconds)
+	}
+}
+
+// TestDB_ReplicaSync_OperationMetrics verifies that replica operation metrics
+// (PUT total and bytes) are incremented when Replica.Sync() uploads LTX files.
+func TestDB_ReplicaSync_OperationMetrics(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'test data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	baselinePutTotal := testutil.ToFloat64(
+		internal.OperationTotalCounterVec.WithLabelValues("test", "PUT"))
+	baselinePutBytes := testutil.ToFloat64(
+		internal.OperationBytesCounterVec.WithLabelValues("test", "PUT"))
+
+	if err := db.Replica.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	putTotal := testutil.ToFloat64(
+		internal.OperationTotalCounterVec.WithLabelValues("test", "PUT"))
+	putBytes := testutil.ToFloat64(
+		internal.OperationBytesCounterVec.WithLabelValues("test", "PUT"))
+
+	if putTotal <= baselinePutTotal {
+		t.Fatalf("litestream_replica_operation_total[test,PUT]=%v, want > %v", putTotal, baselinePutTotal)
+	}
+	if putBytes <= baselinePutBytes {
+		t.Fatalf("litestream_replica_operation_bytes[test,PUT]=%v, want > %v", putBytes, baselinePutBytes)
 	}
 }
 
