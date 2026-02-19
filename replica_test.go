@@ -1719,6 +1719,197 @@ func createTestWALData(t *testing.T, dbData []byte) []byte {
 	return make([]byte, 32) // Empty WAL header placeholder
 }
 
+func TestReplica_Restore_Follow_IncompatibleFlags(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplicaWithClient(db, c)
+
+	t.Run("FollowWithTXID", func(t *testing.T) {
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: t.TempDir() + "/db",
+			Follow:     true,
+			TXID:       1,
+		})
+		if err == nil || err.Error() != "cannot use follow mode with -txid" {
+			t.Fatalf("expected 'cannot use follow mode with -txid' error, got: %v", err)
+		}
+	})
+
+	t.Run("FollowWithTimestamp", func(t *testing.T) {
+		err := r.Restore(context.Background(), litestream.RestoreOptions{
+			OutputPath: t.TempDir() + "/db",
+			Follow:     true,
+			Timestamp:  time.Now(),
+		})
+		if err == nil || err.Error() != "cannot use follow mode with -timestamp" {
+			t.Fatalf("expected 'cannot use follow mode with -timestamp' error, got: %v", err)
+		}
+	})
+}
+
+func TestReplica_Restore_Follow(t *testing.T) {
+	ctx := context.Background()
+
+	// Create source database with initial data.
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync and replicate to file replica.
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a snapshot so restore has something to work with.
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Start follow mode in a goroutine.
+	outputPath := t.TempDir() + "/follower.db"
+	followCtx, followCancel := context.WithCancel(ctx)
+	defer followCancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.Restore(followCtx, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	// Wait for initial restore to complete (file should appear).
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outputPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("restored file not found after waiting: %v", err)
+	}
+
+	// Insert more data into source and replicate.
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (2, 'follow-update')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for follow mode to apply the new data.
+	deadline = time.Now().Add(5 * time.Second)
+	var found bool
+	for time.Now().Before(deadline) {
+		// Open the follower database read-only and check for new data.
+		followerDB := testingutil.MustOpenSQLDB(t, outputPath)
+		var count int
+		if err := followerDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM test WHERE value = 'follow-update'`).Scan(&count); err == nil && count > 0 {
+			found = true
+			followerDB.Close()
+			break
+		}
+		followerDB.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("follow mode did not apply new data within timeout")
+	}
+
+	// Cancel follow and verify clean shutdown.
+	followCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("follow returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not shut down within timeout")
+	}
+}
+
+func TestReplica_Restore_Follow_ContextCancellation(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create initial data and replicate.
+	if _, err := sqldb.ExecContext(context.Background(), `CREATE TABLE test(id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := t.TempDir() + "/follower.db"
+	followCtx, followCancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.Restore(followCtx, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	// Wait for restore to complete.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outputPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Cancel immediately and verify clean return (nil error).
+	followCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("expected nil error on context cancellation, got: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not shut down within timeout")
+	}
+}
+
 // verifyRestoredDB verifies that the restored database is valid.
 func verifyRestoredDB(t *testing.T, path string) {
 	t.Helper()
