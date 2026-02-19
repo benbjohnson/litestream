@@ -119,6 +119,14 @@ jobs:
             echo "FAIL: Expected user 'nonroot:nonroot', got '$user'"
             exit 1
           fi
+          docker create --name uid-check litestream:hardened version
+          uid=$(docker export uid-check | tar -xf - --to-stdout etc/passwd | grep '^nonroot:' | cut -d: -f3)
+          docker rm uid-check
+          echo "nonroot UID: $uid"
+          if [ "$uid" != "65532" ]; then
+            echo "FAIL: Expected UID 65532, got '$uid'"
+            exit 1
+          fi
 
       - name: "Hardened: verify no shell exists"
         run: |
