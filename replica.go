@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -780,6 +781,12 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 
 // applyLTXFile applies a single LTX file's pages to the database file.
 // This follows the same pattern as Hydrator.ApplyLTX (vfs.go:712-747).
+//
+// To prevent concurrent SQLite readers from seeing partial updates, we acquire
+// an exclusive file lock before writing. We also rewrite the SQLite header
+// (bytes 18-19) to indicate DELETE journal mode instead of WAL mode, and
+// randomize the schema change counter (bytes 24-27) to invalidate cached
+// schemas in other connections.
 func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileInfo, pageSize uint32) error {
 	rc, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 	if err != nil {
@@ -794,6 +801,11 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 
 	hdr := dec.Header()
 
+	if err := internal.LockFileExclusive(f); err != nil {
+		return fmt.Errorf("acquire exclusive lock: %w", err)
+	}
+	defer internal.UnlockFile(f)
+
 	for {
 		var phdr ltx.PageHeader
 		data := make([]byte, pageSize)
@@ -801,6 +813,11 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 			break
 		} else if err != nil {
 			return fmt.Errorf("decode page: %w", err)
+		}
+
+		if phdr.Pgno == 1 && len(data) >= 28 {
+			data[18], data[19] = 0x01, 0x01
+			_, _ = rand.Read(data[24:28])
 		}
 
 		off := int64(phdr.Pgno-1) * int64(pageSize)
