@@ -169,8 +169,8 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	// Initialize hydration support if enabled
 	if vfs.HydrationEnabled {
 		if vfs.HydrationPath != "" {
-			// Use provided path directly
 			f.hydrationPath = vfs.HydrationPath
+			f.hydrationPersistent = true
 		} else {
 			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
@@ -518,8 +518,9 @@ type VFSFile struct {
 	syncInterval  time.Duration    // Interval for periodic sync
 	inTransaction bool             // True during active write transaction
 
-	hydrator      *Hydrator // Background hydration (nil if disabled)
-	hydrationPath string    // Path for hydration file (set during Open)
+	hydrator            *Hydrator // Background hydration (nil if disabled)
+	hydrationPath       string    // Path for hydration file (set during Open)
+	hydrationPersistent bool      // True when using user-specified persistent path
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -540,36 +541,53 @@ type VFSFile struct {
 
 // Hydrator handles background hydration of the database to a local file.
 type Hydrator struct {
-	path      string         // Full path to hydration file
-	file      *os.File       // Local database file
-	complete  atomic.Bool    // True when restore completes
-	txid      ltx.TXID       // TXID the hydrated file is at
-	mu        sync.Mutex     // Protects hydration file writes
-	err       error          // Stores fatal hydration error
-	compactor *ltx.Compactor // Tracks compaction progress during restore
-	pageSize  uint32         // Page size of the database
-	client    ReplicaClient
-	logger    *slog.Logger
+	path       string         // Full path to hydration file
+	persistent bool           // True when file should survive across restarts
+	file       *os.File       // Local database file
+	complete   atomic.Bool    // True when restore completes
+	txid       ltx.TXID       // TXID the hydrated file is at
+	mu         sync.Mutex     // Protects hydration file writes
+	err        error          // Stores fatal hydration error
+	compactor  *ltx.Compactor // Tracks compaction progress during restore
+	pageSize   uint32         // Page size of the database
+	client     ReplicaClient
+	logger     *slog.Logger
 }
 
 // NewHydrator creates a new Hydrator instance.
-func NewHydrator(path string, pageSize uint32, client ReplicaClient, logger *slog.Logger) *Hydrator {
+func NewHydrator(path string, persistent bool, pageSize uint32, client ReplicaClient, logger *slog.Logger) *Hydrator {
 	return &Hydrator{
-		path:     path,
-		pageSize: pageSize,
-		client:   client,
-		logger:   logger,
+		path:       path,
+		persistent: persistent,
+		pageSize:   pageSize,
+		client:     client,
+		logger:     logger,
 	}
 }
 
 // Init opens or creates the hydration file.
 func (h *Hydrator) Init() error {
-	// Create parent directory if needed
 	if err := os.MkdirAll(filepath.Dir(h.path), 0755); err != nil {
 		return fmt.Errorf("create hydration directory: %w", err)
 	}
 
-	// Create/truncate local database file
+	if h.persistent {
+		if txid, err := h.loadMeta(); err == nil {
+			if _, statErr := os.Stat(h.path); statErr == nil {
+				file, err := os.OpenFile(h.path, os.O_RDWR, 0600)
+				if err != nil {
+					return fmt.Errorf("open persistent hydration file: %w", err)
+				}
+				h.file = file
+				h.txid = txid
+				return nil
+			}
+		}
+		if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove stale hydration meta: %w", err)
+		}
+	}
+
 	file, err := os.OpenFile(h.path, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return fmt.Errorf("create hydration file: %w", err)
@@ -804,10 +822,21 @@ func (h *Hydrator) Truncate(size int64) error {
 	return h.file.Truncate(size)
 }
 
-// Close closes and removes the hydration file.
+// Close closes the hydration file. For persistent hydrators, the file and a
+// companion .meta file are preserved so hydration can resume on the next open.
 func (h *Hydrator) Close() error {
 	if h.file == nil {
 		return nil
+	}
+
+	if h.persistent && h.txid > 0 {
+		if err := h.file.Sync(); err != nil {
+			h.logger.Warn("failed to sync hydration file", "error", err)
+		}
+		if err := h.saveMeta(); err != nil {
+			h.logger.Warn("failed to save hydration meta", "error", err)
+		}
+		return h.file.Close()
 	}
 
 	if err := h.file.Close(); err != nil {
@@ -817,8 +846,83 @@ func (h *Hydrator) Close() error {
 	if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
-
+	if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	return nil
+}
+
+func (h *Hydrator) metaPath() string {
+	return h.path + ".meta"
+}
+
+func (h *Hydrator) loadMeta() (ltx.TXID, error) {
+	data, err := os.ReadFile(h.metaPath())
+	if err != nil {
+		return 0, err
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse hydration meta: %w", err)
+	}
+	return ltx.TXID(v), nil
+}
+
+func (h *Hydrator) saveMeta() error {
+	h.mu.Lock()
+	txid := h.txid
+	h.mu.Unlock()
+
+	dir := filepath.Dir(h.metaPath())
+	tmp, err := os.CreateTemp(dir, ".hydration-meta-*")
+	if err != nil {
+		return fmt.Errorf("create temp meta file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := fmt.Fprintf(tmp, "%d\n", txid); err != nil {
+		if closeErr := tmp.Close(); closeErr != nil {
+			h.logger.Warn("failed to close temp meta file during cleanup", "error", closeErr)
+		}
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			h.logger.Warn("failed to remove temp meta file during cleanup", "error", removeErr)
+		}
+		return fmt.Errorf("write hydration meta: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		if closeErr := tmp.Close(); closeErr != nil {
+			h.logger.Warn("failed to close temp meta file during cleanup", "error", closeErr)
+		}
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			h.logger.Warn("failed to remove temp meta file during cleanup", "error", removeErr)
+		}
+		return fmt.Errorf("sync temp meta file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			h.logger.Warn("failed to remove temp meta file during cleanup", "error", removeErr)
+		}
+		return fmt.Errorf("close temp meta file: %w", err)
+	}
+	if err := os.Rename(tmpPath, h.metaPath()); err != nil {
+		if removeErr := os.Remove(tmpPath); removeErr != nil {
+			h.logger.Warn("failed to remove temp meta file during cleanup", "error", removeErr)
+		}
+		return fmt.Errorf("rename hydration meta: %w", err)
+	}
+	if err := syncDir(filepath.Dir(h.metaPath())); err != nil {
+		return fmt.Errorf("sync hydration meta directory: %w", err)
+	}
+	return nil
+}
+
+func syncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	return dir.Sync()
 }
 
 func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile {
@@ -1150,7 +1254,7 @@ func (f *VFSFile) buildIndex(ctx context.Context, infos []*ltx.FileInfo) error {
 
 // initHydration starts the background hydration process.
 func (f *VFSFile) initHydration(infos []*ltx.FileInfo) error {
-	f.hydrator = NewHydrator(f.hydrationPath, f.pageSize, f.client, f.logger)
+	f.hydrator = NewHydrator(f.hydrationPath, f.hydrationPersistent, f.pageSize, f.client, f.logger)
 	if err := f.hydrator.Init(); err != nil {
 		return err
 	}
@@ -1166,18 +1270,33 @@ func (f *VFSFile) initHydration(infos []*ltx.FileInfo) error {
 func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
 	defer f.wg.Done()
 
-	if err := f.hydrator.Restore(f.ctx, infos); err != nil {
-		f.hydrator.SetErr(err)
-		f.logger.Error("hydration failed", "error", err)
-		return
-	}
+	hydrationTXID := f.hydrator.TXID()
 
-	// Check if we need to catch up with polling
 	f.mu.Lock()
 	currentTXID := f.pos.TXID
 	f.mu.Unlock()
 
-	hydrationTXID := f.hydrator.TXID()
+	if hydrationTXID > 0 && currentTXID >= hydrationTXID {
+		f.logger.Debug("resuming hydration from persistent file", "txid", hydrationTXID.String())
+	} else {
+		if hydrationTXID > 0 {
+			f.logger.Warn("remote TXID regressed, discarding persistent hydration",
+				"hydration_txid", hydrationTXID.String(),
+				"current_txid", currentTXID.String())
+			if err := f.hydrator.Truncate(0); err != nil {
+				f.hydrator.SetErr(err)
+				f.logger.Error("hydration truncate failed", "error", err)
+				return
+			}
+		}
+		if err := f.hydrator.Restore(f.ctx, infos); err != nil {
+			f.hydrator.SetErr(err)
+			f.logger.Error("hydration failed", "error", err)
+			return
+		}
+		hydrationTXID = f.hydrator.TXID()
+	}
+
 	if currentTXID > hydrationTXID {
 		if err := f.hydrator.CatchUp(f.ctx, hydrationTXID, currentTXID); err != nil {
 			f.hydrator.SetErr(err)
