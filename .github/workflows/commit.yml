@@ -80,18 +80,68 @@ jobs:
           GOARCH: amd64
           CC: x86_64-w64-mingw32-gcc
 
-  docker-build-test:
-    name: Docker Build Test
+  docker-smoke-test:
+    name: Docker Smoke Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - uses: docker/build-push-action@v6
+
+      - name: Build default image
+        uses: docker/build-push-action@v6
         with:
           context: .
+          target: default
           push: false
           load: true
-          tags: litestream:test
+          tags: litestream:default
+
+      - name: Build hardened image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: hardened
+          push: false
+          load: true
+          tags: litestream:hardened
+
+      - name: "Default: verify version command"
+        run: docker run --rm litestream:default version
+
+      - name: "Hardened: verify version command"
+        run: docker run --rm litestream:hardened version
+
+      - name: "Hardened: verify non-root user (UID 65532)"
+        run: |
+          user=$(docker inspect --format='{{.Config.User}}' litestream:hardened)
+          echo "Container user: $user"
+          if [ "$user" != "nonroot:nonroot" ]; then
+            echo "FAIL: Expected user 'nonroot:nonroot', got '$user'"
+            exit 1
+          fi
+          docker create --name uid-check litestream:hardened version
+          uid=$(docker export uid-check | tar -xf - --to-stdout etc/passwd | grep '^nonroot:' | cut -d: -f3)
+          docker rm uid-check
+          echo "nonroot UID: $uid"
+          if [ "$uid" != "65532" ]; then
+            echo "FAIL: Expected UID 65532, got '$uid'"
+            exit 1
+          fi
+
+      - name: "Hardened: verify no shell exists"
+        run: |
+          if docker run --rm --entrypoint /bin/sh litestream:hardened -c "echo hello" 2>/dev/null; then
+            echo "FAIL: Shell should not exist in scratch image"
+            exit 1
+          fi
+          echo "PASS: No shell in scratch image"
+
+      - name: "Hardened: verify CA certificates present"
+        run: |
+          docker create --name cert-check litestream:hardened version
+          docker export cert-check | tar -tf - | grep -q "etc/ssl/certs/ca-certificates.crt"
+          echo "PASS: CA certificates found"
+          docker rm cert-check
 
   build:
     name: Build & Unit Test
