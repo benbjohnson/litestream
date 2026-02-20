@@ -1433,6 +1433,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	isScaleway := litestream.IsScalewayEndpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
+	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set by user (config or URL query param).
 	forcePathStyleSet := c.ForcePathStyle != nil
@@ -1444,13 +1445,13 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO {
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
 	if !forcePathStyleSet {
-		// Filebase, Backblaze B2, and MinIO require path-style URLs
-		if isFilebase || isBackblaze || isMinIO {
+		// Filebase, Backblaze B2, MinIO, and Supabase require path-style URLs
+		if isFilebase || isBackblaze || isMinIO || isSupabase {
 			forcePathStyle = true
 		}
 	}

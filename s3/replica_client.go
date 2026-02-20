@@ -208,6 +208,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	isScaleway := litestream.IsScalewayEndpoint(endpoint)
 	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
+	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
 
 	// Track if forcePathStyle was explicitly set via query parameter.
 	forcePathStyleSet := query.Get("forcePathStyle") != "" || query.Get("force-path-style") != ""
@@ -234,15 +235,15 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			requireMD5, requireMD5Set = false, true
 		}
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO {
+	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
 	}
 	if !forcePathStyleSet {
-		// Filebase, Backblaze B2, and MinIO require path-style URLs
-		if isFilebase || isBackblaze || isMinIO {
+		// Filebase, Backblaze B2, MinIO, and Supabase require path-style URLs
+		if isFilebase || isBackblaze || isMinIO || isSupabase {
 			forcePathStyle = true
 		}
 	}
