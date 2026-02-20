@@ -1,0 +1,81 @@
+services:
+  db:
+    image: postgres:15
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: postgres
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: supa-storage
+      MINIO_ROOT_PASSWORD: secret1234
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  minio-createbucket:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set supabase http://minio:9000 supa-storage secret1234;
+      mc mb --ignore-existing supabase/supa-storage-bucket;
+      exit 0;
+      "
+
+  storage:
+    image: supabase/storage-api:latest
+    depends_on:
+      db:
+        condition: service_healthy
+      minio-createbucket:
+        condition: service_completed_successfully
+    ports:
+      - "5555:5000"
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@db:5432/postgres
+      DB_INSTALL_ROLES: "true"
+      STORAGE_BACKEND: s3
+      STORAGE_S3_BUCKET: supa-storage-bucket
+      STORAGE_S3_ENDPOINT: http://minio:9000
+      STORAGE_S3_FORCE_PATH_STYLE: "true"
+      STORAGE_S3_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: supa-storage
+      AWS_SECRET_ACCESS_KEY: secret1234
+      AUTH_JWT_SECRET: super-secret-jwt-token-with-at-least-32-characters
+      AUTH_JWT_ALGORITHM: HS256
+      S3_PROTOCOL_ACCESS_KEY_ID: supabase-s3-access-key
+      S3_PROTOCOL_ACCESS_KEY_SECRET: supabase-s3-secret-key-that-is-long-enough
+      ANON_KEY: eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAic3VwYWJhc2UiLCAicm9sZSI6ICJhbm9uIn0.y78PwHBHnrLnHZODMOjJfZZPlfKk0W3DucVCxvI6uF8
+      SERVICE_KEY: eyJhbGciOiAiSFMyNTYiLCAidHlwIjogIkpXVCJ9.eyJpc3MiOiAic3VwYWJhc2UiLCAicm9sZSI6ICJzZXJ2aWNlX3JvbGUifQ.lRaC0LUy-3mILAj_17hVWOBnaft3QPpK-pqAs8h2MRI
+      IS_MULTITENANT: "false"
+      POSTGREST_URL: http://localhost:3000
+      REGION: us-east-1
+      TENANT_ID: stub
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:5000/status"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 10s
+
+volumes:
+  pg_data:
+  minio_data:

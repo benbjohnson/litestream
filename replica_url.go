@@ -255,6 +255,15 @@ func IsCloudflareR2Endpoint(endpoint string) bool {
 	return strings.HasSuffix(host, ".r2.cloudflarestorage.com")
 }
 
+// IsSupabaseEndpoint returns true if the endpoint is Supabase Storage S3.
+func IsSupabaseEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if host == "" {
+		return false
+	}
+	return strings.HasSuffix(host, ".supabase.co")
+}
+
 // IsMinIOEndpoint returns true if the endpoint appears to be MinIO or similar
 // (a custom endpoint with a port number that is not a known cloud provider).
 func IsMinIOEndpoint(endpoint string) bool {
@@ -275,7 +284,8 @@ func IsMinIOEndpoint(endpoint string) bool {
 		strings.Contains(host, ".scw.cloud") ||
 		strings.Contains(host, ".r2.cloudflarestorage.com") ||
 		strings.Contains(host, "tigris.dev") ||
-		strings.Contains(host, "t3.storage.dev") {
+		strings.Contains(host, "t3.storage.dev") ||
+		strings.Contains(host, ".supabase.co") {
 		return false
 	}
 	return true

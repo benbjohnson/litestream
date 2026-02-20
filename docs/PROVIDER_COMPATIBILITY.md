@@ -193,6 +193,36 @@ replicas:
     secret-access-key: your-secret-key
 ```
 
+### Supabase Storage (S3-Compatible API)
+
+**Status**: Supported (auto-detected)
+
+**Known Limitations**:
+
+- Requires path-style URLs (`force-path-style=true`)
+- No S3 versioning support
+
+**Configuration**:
+
+```yaml
+replicas:
+  - url: s3://bucket-name/path?endpoint=https://PROJECT_REF.supabase.co/storage/v1/s3
+    access-key-id: your-s3-access-key
+    secret-access-key: your-s3-secret-key
+```
+
+**Automatic Defaults** (applied when Supabase endpoint detected):
+
+- `sign-payload=true` - Signed payloads required
+- `force-path-style=true` - Path-style URLs required
+
+**Notes**:
+
+- S3 access keys are generated in the Supabase dashboard under Storage > S3 Access Keys
+- Endpoint format: `https://<PROJECT_REF>.supabase.co/storage/v1/s3`
+
+Related issues: #1133
+
 ### Wasabi
 
 **Status**: Supported
@@ -308,6 +338,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | Filebase | `s3.filebase.com` | `sign-payload=true`, `force-path-style=true` |
 | Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
+| Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
 
 ## Troubleshooting
 

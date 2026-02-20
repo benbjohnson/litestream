@@ -2636,6 +2636,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			{"Scaleway", "https://s3.fr-par.scw.cloud"},
 			{"CloudflareR2", "https://accountid.r2.cloudflarestorage.com"},
 			{"MinIO", "http://localhost:9000"},
+			{"Supabase", "https://myproject.supabase.co/storage/v1/s3"},
 		}
 
 		for _, tt := range tests {

@@ -872,6 +872,28 @@ func TestIsCloudflareR2Endpoint(t *testing.T) {
 	}
 }
 
+func TestIsSupabaseEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://myproject.supabase.co/storage/v1/s3", true},
+		{"https://abcdefghij.supabase.co", true},
+		{"myproject.supabase.co", true},
+		{"https://s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsSupabaseEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsSupabaseEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsMinIOEndpoint(t *testing.T) {
 	tests := []struct {
 		endpoint string
