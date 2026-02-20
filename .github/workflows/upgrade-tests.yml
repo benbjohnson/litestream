@@ -1,0 +1,51 @@
+name: Upgrade Tests
+
+on:
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'tests/integration/**'
+      - '.github/workflows/upgrade-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  upgrade-test:
+    name: v0.3.x to v0.5.x Upgrade Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Download Litestream v0.3.13
+        run: |
+          mkdir -p /tmp/litestream-v3
+          gh release download v0.3.13 --repo benbjohnson/litestream --pattern 'litestream-v0.3.13-linux-amd64.tar.gz' --dir /tmp
+          tar -xzf /tmp/litestream-v0.3.13-linux-amd64.tar.gz -C /tmp/litestream-v3
+          chmod +x /tmp/litestream-v3/litestream
+          /tmp/litestream-v3/litestream version
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Build current binaries
+        run: go build -o bin/litestream ./cmd/litestream && go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run upgrade integration tests
+        run: go test -v -tags=integration -timeout=10m ./tests/integration/... -run=TestUpgrade
+        env:
+          CGO_ENABLED: "1"
+          LITESTREAM_V3_BIN: /tmp/litestream-v3/litestream
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upgrade-test-logs
+          path: /tmp/litestream-*/*.log
