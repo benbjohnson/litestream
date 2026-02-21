@@ -26,4 +26,8 @@ def loadable_path():
 def load(conn):
     """Load the Litestream VFS extension into a sqlite3 connection."""
     path = loadable_path()
-    conn.load_extension(os.path.splitext(path)[0])
+    conn.enable_load_extension(True)
+    try:
+        conn.load_extension(os.path.splitext(path)[0])
+    finally:
+        conn.enable_load_extension(False)

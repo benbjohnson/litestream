@@ -21,6 +21,8 @@ module LitestreamVfs
   end
 
   def self.load(db)
+    db.enable_load_extension(true)
     db.load_extension(loadable_path.delete_suffix(File.extname(loadable_path)))
+    db.enable_load_extension(false)
   end
 end
