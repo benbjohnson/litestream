@@ -1395,9 +1395,10 @@ func (f *VFSFile) Close() error {
 	f.cancel()
 	f.wg.Wait()
 
-	// Close buffer file if open
+	// Close and remove buffer file if open
 	if f.bufferFile != nil {
 		f.bufferFile.Close()
+		os.Remove(f.bufferPath)
 	}
 
 	// Close and remove hydration file
@@ -2212,7 +2213,7 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 				return sqlite3vfs.BusyError
 			}
 			f.vfs.writeFile = f
-			if f.vfs.lastSyncedTXID > f.expectedTXID {
+			if f.vfs.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
 				f.expectedTXID = f.vfs.lastSyncedTXID
 				f.pendingTXID = f.vfs.lastSyncedTXID + 1
 				f.pos = ltx.Pos{TXID: f.expectedTXID}
