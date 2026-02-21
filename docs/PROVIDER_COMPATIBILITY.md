@@ -153,6 +153,7 @@ Related issues: #912
 
 - `InvalidArgument` errors with default AWS SDK settings
 - Does not support `aws-chunked` content encoding
+- Requires signed payloads for all requests
 
 **Configuration**:
 
@@ -331,6 +332,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 
 | Provider | Detection Pattern | Applied Settings |
 |----------|-------------------|------------------|
+| Hetzner | `*.your-objectstorage.com` | `sign-payload=true` |
 | Cloudflare R2 | `*.r2.cloudflarestorage.com` | `sign-payload=true`, `concurrency=2` |
 | Backblaze B2 | `*.backblazeb2.com` | `sign-payload=true`, `force-path-style=true` |
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |

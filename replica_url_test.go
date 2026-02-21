@@ -894,6 +894,30 @@ func TestIsSupabaseEndpoint(t *testing.T) {
 	}
 }
 
+func TestIsHetznerEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"fsn1.your-objectstorage.com", true},
+		{"nbg1.your-objectstorage.com", true},
+		{"https://fsn1.your-objectstorage.com", true},
+		{"http://nbg1.your-objectstorage.com", true},
+		{"s3.amazonaws.com", false},
+		{"https://s3.filebase.com", false},
+		{"", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsHetznerEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsHetznerEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsMinIOEndpoint(t *testing.T) {
 	tests := []struct {
 		endpoint string
@@ -1029,6 +1053,13 @@ func TestS3ProviderDefaults(t *testing.T) {
 		{
 			name:               "MinIO_SignPayloadAndPathStyle",
 			url:                "s3://mybucket/path?endpoint=http://localhost:9000",
+			wantSignPayload:    true,
+			wantForcePathStyle: true,
+			wantRequireMD5:     true,
+		},
+		{
+			name:               "Hetzner_SignPayload",
+			url:                "s3://mybucket/path?endpoint=https://fsn1.your-objectstorage.com",
 			wantSignPayload:    true,
 			wantForcePathStyle: true,
 			wantRequireMD5:     true,
