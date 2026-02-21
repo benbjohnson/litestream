@@ -319,12 +319,13 @@ jobs:
       - name: Create NATS Object Store Bucket
         run: |
           # Install NATS CLI - get latest version using jq for JSON parsing
-          NATS_VERSION=$(curl -fsSL https://api.github.com/repos/nats-io/natscli/releases/latest \
+          NATS_VERSION=$(curl -fsSL -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            https://api.github.com/repos/nats-io/natscli/releases/latest \
             | jq -r '.tag_name' \
             | sed 's/^v//')
           if [ -z "$NATS_VERSION" ] || [ "$NATS_VERSION" = "null" ]; then
-            echo "Failed to determine latest NATS CLI version"
-            exit 1
+            NATS_VERSION="0.3.1"
+            echo "Warning: Failed to fetch latest NATS CLI version, using fallback v${NATS_VERSION}"
           fi
           wget "https://github.com/nats-io/natscli/releases/download/v${NATS_VERSION}/nats-${NATS_VERSION}-linux-amd64.zip" -O nats.zip
           unzip nats.zip
