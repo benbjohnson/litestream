@@ -332,6 +332,41 @@ func (c *Config) propagateGlobalSettings() {
 	}
 }
 
+func (c *Config) applyBucketInfo() error {
+	for _, dbc := range c.DBs {
+		if dbc.Replica != nil {
+			if err := applyBucketInfoToReplica(dbc.Replica); err != nil {
+				return err
+			}
+		}
+		for _, rc := range dbc.Replicas {
+			if err := applyBucketInfoToReplica(rc); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func applyBucketInfoToReplica(rc *ReplicaConfig) error {
+	if rc.BucketInfoPath == "" {
+		return nil
+	}
+
+	info, err := ReadBucketInfo(rc.BucketInfoPath)
+	if err != nil {
+		return fmt.Errorf("replica %q: %w", rc.Path, err)
+	}
+
+	rc.ApplyBucketInfo(info)
+
+	if rc.Type == "" && rc.URL == "" {
+		rc.Type = "s3"
+	}
+
+	return nil
+}
+
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
 	defaultSnapshotInterval := 24 * time.Hour
@@ -592,6 +627,11 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 
 	// Propagate settings from global config to individual configs.
 	config.propagateGlobalSettings()
+
+	// Apply COSI BucketInfo settings to replicas that specify a bucket-info path.
+	if err := config.applyBucketInfo(); err != nil {
+		return config, err
+	}
 
 	// Validate configuration
 	if err := config.Validate(); err != nil {
@@ -994,6 +1034,9 @@ type ReplicaSettings struct {
 	// Disabled by default to prevent silent data loss scenarios.
 	AutoRecover *bool `yaml:"auto-recover"`
 
+	// COSI BucketInfo JSON file path for Kubernetes COSI integration
+	BucketInfoPath string `yaml:"bucket-info"`
+
 	// S3 settings
 	AccessKeyID       string    `yaml:"access-key-id"`
 	SecretAccessKey   string    `yaml:"secret-access-key"`
@@ -1073,6 +1116,11 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	// Recovery settings
 	if rs.AutoRecover == nil && src.AutoRecover != nil {
 		rs.AutoRecover = src.AutoRecover
+	}
+
+	// COSI BucketInfo path
+	if rs.BucketInfoPath == "" {
+		rs.BucketInfoPath = src.BucketInfoPath
 	}
 
 	// S3 settings
