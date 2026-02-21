@@ -218,7 +218,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	if endpoint == "" {
 		if v := os.Getenv("LITESTREAM_S3_ENDPOINT"); v != "" {
 			endpoint, _ = litestream.EnsureEndpointScheme(v)
-			forcePathStyle = true
+			if !forcePathStyleSet {
+				forcePathStyle = true
+			}
 		}
 	}
 

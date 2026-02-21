@@ -2050,6 +2050,13 @@ func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 			wantForcePathStyle: true,
 		},
 		{
+			name:               "env_var_respects_force_path_style_false",
+			url:                "s3://mybucket/path?force-path-style=false",
+			envEndpoint:        "http://localhost:9000",
+			wantEndpoint:       "http://localhost:9000",
+			wantForcePathStyle: false,
+		},
+		{
 			name:               "no_env_var_no_endpoint",
 			url:                "s3://mybucket/path",
 			envEndpoint:        "",
@@ -2060,9 +2067,7 @@ func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if tt.envEndpoint != "" {
-				t.Setenv("LITESTREAM_S3_ENDPOINT", tt.envEndpoint)
-			}
+			t.Setenv("LITESTREAM_S3_ENDPOINT", tt.envEndpoint)
 
 			client, err := litestream.NewReplicaClientFromURL(tt.url)
 			if err != nil {
