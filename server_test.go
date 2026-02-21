@@ -609,6 +609,7 @@ func TestServer_HandleSync(t *testing.T) {
 		require.Equal(t, "synced", result.Status)
 		require.Equal(t, db.Path(), result.Path)
 		require.Greater(t, result.TXID, uint64(0))
+		require.Greater(t, result.ReplicatedTXID, uint64(0))
 	})
 
 	t.Run("NoChange", func(t *testing.T) {
