@@ -29,6 +29,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
+	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -201,6 +202,10 @@ Arguments:
 	    new changes. Similar to tail -f. The restored database should
 	    only be opened in read-only mode by consumers.
 	    Cannot be used with -txid or -timestamp.
+
+	-follow-interval DURATION
+	    Polling interval for follow mode.
+	    Defaults to 1s.
 
 	-parallelism NUM
 	    Determines the number of WAL files downloaded in parallel.
