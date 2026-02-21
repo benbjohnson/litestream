@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1514,7 +1513,7 @@ func WriteTXIDFile(outputPath string, txid ltx.TXID) error {
 		return fmt.Errorf("create txid temp file: %w", err)
 	}
 
-	if _, err := fmt.Fprintf(f, "%016x\n", uint64(txid)); err != nil {
+	if _, err := fmt.Fprintln(f, txid); err != nil {
 		_ = f.Close()
 		_ = os.Remove(tmpPath)
 		return fmt.Errorf("write txid: %w", err)
@@ -1551,17 +1550,12 @@ func ReadTXIDFile(outputPath string) (ltx.TXID, error) {
 		return 0, fmt.Errorf("read txid file: %w", err)
 	}
 
-	s := strings.TrimSpace(string(data))
-	if s == "" {
-		return 0, fmt.Errorf("txid file is empty")
-	}
-
-	v, err := strconv.ParseUint(s, 16, 64)
+	txid, err := ltx.ParseTXID(strings.TrimSpace(string(data)))
 	if err != nil {
 		return 0, fmt.Errorf("parse txid file: %w", err)
 	}
 
-	return ltx.TXID(v), nil
+	return txid, nil
 }
 
 // ValidationError represents a single validation issue.
