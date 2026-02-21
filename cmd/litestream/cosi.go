@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 )
 
 type COSIBucketInfo struct {
@@ -11,10 +12,10 @@ type COSIBucketInfo struct {
 }
 
 type COSIBucketInfoSpec struct {
-	BucketName         string        `json:"bucketName"`
-	AuthenticationType string        `json:"authenticationType"`
-	Protocols          COSIProtocols `json:"protocols"`
-	SecretS3           *COSIS3Secret `json:"secretS3"`
+	BucketName         string          `json:"bucketName"`
+	AuthenticationType string          `json:"authenticationType"`
+	Protocols          json.RawMessage `json:"protocols"`
+	SecretS3           *COSIS3Secret   `json:"secretS3"`
 }
 
 type COSIProtocols struct {
@@ -34,6 +35,41 @@ type COSIS3Secret struct {
 	AccessSecretKey string `json:"accessSecretKey"`
 }
 
+func (spec *COSIBucketInfoSpec) ParseProtocols() (*COSIProtocols, error) {
+	if len(spec.Protocols) == 0 {
+		return &COSIProtocols{}, nil
+	}
+
+	// Try object form: {"s3": {...}}
+	var obj COSIProtocols
+	if err := json.Unmarshal(spec.Protocols, &obj); err == nil && obj.S3 != nil {
+		return &obj, nil
+	}
+
+	// Try array form: ["S3"]
+	var arr []string
+	if err := json.Unmarshal(spec.Protocols, &arr); err == nil {
+		for _, p := range arr {
+			if strings.EqualFold(p, "s3") {
+				return &COSIProtocols{}, nil
+			}
+		}
+	}
+
+	return &COSIProtocols{}, nil
+}
+
+func (spec *COSIBucketInfoSpec) HasS3() bool {
+	if spec.SecretS3 != nil {
+		return true
+	}
+	protocols, err := spec.ParseProtocols()
+	if err != nil {
+		return false
+	}
+	return protocols.S3 != nil
+}
+
 func ReadBucketInfo(path string) (*COSIBucketInfo, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -45,14 +81,14 @@ func ReadBucketInfo(path string) (*COSIBucketInfo, error) {
 		return nil, fmt.Errorf("parse bucket info JSON: %w", err)
 	}
 
-	if info.Spec.Protocols.S3 == nil && info.Spec.SecretS3 == nil {
+	if !info.Spec.HasS3() {
 		return nil, fmt.Errorf("bucket info contains no S3 protocol configuration")
 	}
 
 	return &info, nil
 }
 
-func (rs *ReplicaSettings) ApplyBucketInfo(info *COSIBucketInfo) {
+func (rs *ReplicaSettings) ApplyBucketInfo(info *COSIBucketInfo, hasURL bool) {
 	if info == nil {
 		return
 	}
@@ -72,16 +108,17 @@ func (rs *ReplicaSettings) ApplyBucketInfo(info *COSIBucketInfo) {
 		}
 	}
 
-	if p := info.Spec.Protocols.S3; p != nil {
-		if rs.Endpoint == "" && p.Endpoint != "" {
-			rs.Endpoint = p.Endpoint
+	protocols, _ := info.Spec.ParseProtocols()
+	if protocols != nil && protocols.S3 != nil {
+		if rs.Endpoint == "" && protocols.S3.Endpoint != "" {
+			rs.Endpoint = protocols.S3.Endpoint
 		}
-		if rs.Region == "" && p.Region != "" {
-			rs.Region = p.Region
+		if rs.Region == "" && protocols.S3.Region != "" {
+			rs.Region = protocols.S3.Region
 		}
 	}
 
-	if rs.Bucket == "" && info.Spec.BucketName != "" {
+	if !hasURL && rs.Bucket == "" && info.Spec.BucketName != "" {
 		rs.Bucket = info.Spec.BucketName
 	}
 }

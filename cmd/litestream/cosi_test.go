@@ -28,6 +28,23 @@ const testBucketInfoJSON = `{
   }
 }`
 
+const testBucketInfoArrayProtocolJSON = `{
+  "spec": {
+    "bucketName": "objectstorage",
+    "authenticationType": "Key",
+    "secretS3": {
+      "endpoint": "us-mia-1.linodeobjects.com",
+      "region": "us-mia",
+      "accessKeyID": "LINODE-KEY",
+      "accessSecretKey": "LINODE-SECRET"
+    },
+    "secretAzure": null,
+    "protocols": [
+      "S3"
+    ]
+  }
+}`
+
 func writeBucketInfo(t *testing.T, dir, content string) string {
 	t.Helper()
 	path := filepath.Join(dir, "BucketInfo")
@@ -51,8 +68,30 @@ func TestReadBucketInfo(t *testing.T) {
 		if info.Spec.SecretS3.AccessKeyID != "AKIAIOSFODNN7EXAMPLE" {
 			t.Fatalf("unexpected access key: %s", info.Spec.SecretS3.AccessKeyID)
 		}
-		if info.Spec.Protocols.S3.Region != "us-west-2" {
-			t.Fatalf("unexpected region: %s", info.Spec.Protocols.S3.Region)
+		protocols, err := info.Spec.ParseProtocols()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if protocols.S3 == nil {
+			t.Fatal("expected S3 protocol to be parsed")
+		}
+		if protocols.S3.Region != "us-west-2" {
+			t.Fatalf("unexpected region: %s", protocols.S3.Region)
+		}
+	})
+
+	t.Run("ArrayProtocols", func(t *testing.T) {
+		path := writeBucketInfo(t, t.TempDir(), testBucketInfoArrayProtocolJSON)
+
+		info, err := main.ReadBucketInfo(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Spec.BucketName != "objectstorage" {
+			t.Fatalf("unexpected bucket name: %s", info.Spec.BucketName)
+		}
+		if info.Spec.SecretS3.AccessKeyID != "LINODE-KEY" {
+			t.Fatalf("unexpected access key: %s", info.Spec.SecretS3.AccessKeyID)
 		}
 	})
 
@@ -101,7 +140,7 @@ func TestApplyBucketInfo(t *testing.T) {
 		}
 
 		var rs main.ReplicaSettings
-		rs.ApplyBucketInfo(info)
+		rs.ApplyBucketInfo(info, false)
 
 		if rs.AccessKeyID != "AKIAIOSFODNN7EXAMPLE" {
 			t.Fatalf("expected access key to be applied, got: %s", rs.AccessKeyID)
@@ -134,7 +173,7 @@ func TestApplyBucketInfo(t *testing.T) {
 			Bucket:          "my-bucket",
 			Endpoint:        "https://custom.endpoint.com",
 		}
-		rs.ApplyBucketInfo(info)
+		rs.ApplyBucketInfo(info, false)
 
 		if rs.AccessKeyID != "MY-KEY" {
 			t.Fatalf("access key should be preserved, got: %s", rs.AccessKeyID)
@@ -155,9 +194,51 @@ func TestApplyBucketInfo(t *testing.T) {
 
 	t.Run("NilInfo", func(t *testing.T) {
 		var rs main.ReplicaSettings
-		rs.ApplyBucketInfo(nil)
+		rs.ApplyBucketInfo(nil, false)
 		if rs.AccessKeyID != "" {
 			t.Fatal("expected no changes for nil info")
+		}
+	})
+
+	t.Run("SkipBucketWhenURLPresent", func(t *testing.T) {
+		path := writeBucketInfo(t, t.TempDir(), testBucketInfoJSON)
+		info, err := main.ReadBucketInfo(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var rs main.ReplicaSettings
+		rs.ApplyBucketInfo(info, true)
+
+		if rs.Bucket != "" {
+			t.Fatalf("bucket should not be set when URL is present, got: %s", rs.Bucket)
+		}
+		if rs.AccessKeyID != "AKIAIOSFODNN7EXAMPLE" {
+			t.Fatalf("access key should still be applied, got: %s", rs.AccessKeyID)
+		}
+	})
+
+	t.Run("ArrayProtocols", func(t *testing.T) {
+		path := writeBucketInfo(t, t.TempDir(), testBucketInfoArrayProtocolJSON)
+		info, err := main.ReadBucketInfo(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		var rs main.ReplicaSettings
+		rs.ApplyBucketInfo(info, false)
+
+		if rs.AccessKeyID != "LINODE-KEY" {
+			t.Fatalf("expected access key from secretS3, got: %s", rs.AccessKeyID)
+		}
+		if rs.Endpoint != "us-mia-1.linodeobjects.com" {
+			t.Fatalf("expected endpoint from secretS3, got: %s", rs.Endpoint)
+		}
+		if rs.Region != "us-mia" {
+			t.Fatalf("expected region from secretS3, got: %s", rs.Region)
+		}
+		if rs.Bucket != "objectstorage" {
+			t.Fatalf("expected bucket from bucketName, got: %s", rs.Bucket)
 		}
 	})
 }
@@ -260,5 +341,38 @@ dbs:
 	rc := config.DBs[0].Replicas[0]
 	if rc.Type != "s3" {
 		t.Fatalf("expected auto-detected type 's3', got: %s", rc.Type)
+	}
+}
+
+func TestParseConfig_BucketInfoArrayProtocols(t *testing.T) {
+	dir := t.TempDir()
+	bucketInfoPath := writeBucketInfo(t, dir, testBucketInfoArrayProtocolJSON)
+
+	configYAML := `
+dbs:
+  - path: /tmp/test.db
+    replicas:
+      - bucket-info: ` + bucketInfoPath + `
+        path: my-prefix
+`
+	configPath := filepath.Join(dir, "litestream.yml")
+	if err := os.WriteFile(configPath, []byte(configYAML), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	config, err := main.ReadConfigFile(configPath, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	rc := config.DBs[0].Replicas[0]
+	if rc.AccessKeyID != "LINODE-KEY" {
+		t.Fatalf("expected access key, got: %s", rc.AccessKeyID)
+	}
+	if rc.Bucket != "objectstorage" {
+		t.Fatalf("expected bucket, got: %s", rc.Bucket)
+	}
+	if rc.Type != "s3" {
+		t.Fatalf("expected type 's3', got: %s", rc.Type)
 	}
 }

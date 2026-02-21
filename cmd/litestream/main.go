@@ -353,12 +353,17 @@ func applyBucketInfoToReplica(rc *ReplicaConfig) error {
 		return nil
 	}
 
-	info, err := ReadBucketInfo(rc.BucketInfoPath)
+	path, err := expand(rc.BucketInfoPath)
+	if err != nil {
+		return fmt.Errorf("replica %q: expand bucket-info path: %w", rc.Path, err)
+	}
+
+	info, err := ReadBucketInfo(path)
 	if err != nil {
 		return fmt.Errorf("replica %q: %w", rc.Path, err)
 	}
 
-	rc.ApplyBucketInfo(info)
+	rc.ApplyBucketInfo(info, rc.URL != "")
 
 	if rc.Type == "" && rc.URL == "" {
 		rc.Type = "s3"
