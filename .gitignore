@@ -20,3 +20,4 @@ bin/
 # Cached binaries for integration tests
 .cache/
 .claude/*.loop.local.md
+.claude/worktrees/
