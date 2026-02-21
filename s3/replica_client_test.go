@@ -2019,3 +2019,63 @@ func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
 		})
 	}
 }
+
+func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
+	tests := []struct {
+		name               string
+		url                string
+		envEndpoint        string
+		wantEndpoint       string
+		wantForcePathStyle bool
+	}{
+		{
+			name:               "env_var_sets_endpoint",
+			url:                "s3://mybucket/path",
+			envEndpoint:        "http://localhost:9000",
+			wantEndpoint:       "http://localhost:9000",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "env_var_adds_https_scheme",
+			url:                "s3://mybucket/path",
+			envEndpoint:        "s3.example.com",
+			wantEndpoint:       "https://s3.example.com",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "query_param_overrides_env_var",
+			url:                "s3://mybucket/path?endpoint=http://other:9000",
+			envEndpoint:        "http://localhost:9000",
+			wantEndpoint:       "http://other:9000",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "no_env_var_no_endpoint",
+			url:                "s3://mybucket/path",
+			envEndpoint:        "",
+			wantEndpoint:       "",
+			wantForcePathStyle: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.envEndpoint != "" {
+				t.Setenv("LITESTREAM_S3_ENDPOINT", tt.envEndpoint)
+			}
+
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatalf("NewReplicaClientFromURL() error: %v", err)
+			}
+			c := client.(*ReplicaClient)
+
+			if c.Endpoint != tt.wantEndpoint {
+				t.Errorf("Endpoint = %q, want %q", c.Endpoint, tt.wantEndpoint)
+			}
+			if c.ForcePathStyle != tt.wantForcePathStyle {
+				t.Errorf("ForcePathStyle = %v, want %v", c.ForcePathStyle, tt.wantForcePathStyle)
+			}
+		})
+	}
+}
