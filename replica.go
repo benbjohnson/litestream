@@ -543,6 +543,21 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			if txid == 0 {
 				return fmt.Errorf("cannot resume follow mode: database exists at %s but no .txid file found; delete the database to re-restore", opt.OutputPath)
 			}
+			// Validate saved TXID is still reachable. If the earliest snapshot
+			// starts after our saved TXID, retention has pruned the history
+			// and we can't catch up incrementally.
+			snapshotItr, itrErr := r.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
+			if itrErr == nil {
+				if snapshotItr.Next() {
+					info := snapshotItr.Item()
+					if info.MinTXID > txid {
+						_ = snapshotItr.Close()
+						return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned — delete %s and %s.txid to re-restore", txid, info.MinTXID, opt.OutputPath, opt.OutputPath)
+					}
+				}
+				_ = snapshotItr.Close()
+			}
+
 			r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
 			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
 		}
@@ -724,7 +739,8 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 			}
 			if newTXID > lastTXID {
 				if err := WriteTXIDFile(outputPath, newTXID); err != nil {
-					r.Logger().Error("follow: failed to write txid file", "err", err)
+					r.Logger().Error("follow: failed to write txid file, not advancing checkpoint", "err", err)
+					continue
 				}
 				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
 				lastTXID = newTXID

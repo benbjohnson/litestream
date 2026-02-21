@@ -2279,6 +2279,78 @@ func TestReplica_Restore_Follow_NoTXIDFile(t *testing.T) {
 	}
 }
 
+func TestReplica_Restore_Follow_StaleTXID(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+
+	// Create a fake database and a TXID file with a low TXID (1).
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate retention pruning: remove all level 0 files and replace the
+	// snapshot with one whose MinTXID is far ahead of our saved TXID.
+	level0Dir := c.LTXLevelDir(0)
+	if entries, err := os.ReadDir(level0Dir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(level0Dir, e.Name()))
+		}
+	}
+	snapshotDir := c.LTXLevelDir(9)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+	// Create a dummy snapshot file with MinTXID=10000 (far ahead of saved TXID=1).
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dummySnapshotPath := filepath.Join(snapshotDir, "0000000000002710-0000000000002710.ltx")
+	if err := os.WriteFile(dummySnapshotPath, []byte("dummy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for stale TXID")
+	}
+	if !strings.Contains(err.Error(), "replica history has been pruned") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // verifyRestoredDB verifies that the restored database is valid.
 func verifyRestoredDB(t *testing.T, path string) {
 	t.Helper()
