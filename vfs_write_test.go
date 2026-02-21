@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
 )
 
@@ -1767,5 +1768,222 @@ func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
 	f.mu.Unlock()
 	if enabled {
 		t.Error("expected writeEnabled to be false")
+	}
+}
+
+func openWriteVFSFile(t *testing.T, vfs *VFS) *VFSFile {
+	t.Helper()
+	file, _, err := vfs.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := file.(*VFSFile)
+	t.Cleanup(func() { f.Close() })
+	return f
+}
+
+func TestVFS_MultipleConnections_NoFalseConflict(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+	v.WriteSyncInterval = 0
+
+	f1 := openWriteVFSFile(t, v)
+	f2 := openWriteVFSFile(t, v)
+
+	// Connection 1: acquire RESERVED, write, sync
+	if err := f1.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f1.WriteAt([]byte("data1"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Sync(0); err != nil {
+		t.Fatalf("connection 1 sync failed: %v", err)
+	}
+	if f1.expectedTXID != 2 {
+		t.Fatalf("expected f1.expectedTXID=2, got %d", f1.expectedTXID)
+	}
+
+	// Connection 2: acquire RESERVED (should refresh TXID), write, sync
+	if err := f2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	if f2.expectedTXID != 2 {
+		t.Fatalf("expected f2.expectedTXID=2 after RESERVED lock refresh, got %d", f2.expectedTXID)
+	}
+	if _, err := f2.WriteAt([]byte("data2"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+	if err := f2.Sync(0); err != nil {
+		t.Fatalf("connection 2 sync failed (false conflict): %v", err)
+	}
+	if f2.expectedTXID != 3 {
+		t.Fatalf("expected f2.expectedTXID=3, got %d", f2.expectedTXID)
+	}
+}
+
+func TestVFS_WriteLockBlocksConcurrentWriters(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	f1 := openWriteVFSFile(t, v)
+	f2 := openWriteVFSFile(t, v)
+
+	// f1 acquires RESERVED
+	if err := f1.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+
+	// f2 attempts RESERVED - should get BusyError
+	err := f2.Lock(sqlite3vfs.LockReserved)
+	if !errors.Is(err, sqlite3vfs.BusyError) {
+		t.Fatalf("expected BusyError, got %v", err)
+	}
+
+	// f1 releases
+	if err := f1.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+
+	// f2 should now succeed
+	if err := f2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("expected f2 to acquire RESERVED after f1 released, got %v", err)
+	}
+	if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestVFS_ConcurrentOpenAllSucceed(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	const n = 10
+	var wg sync.WaitGroup
+	errs := make([]error, n)
+	files := make([]sqlite3vfs.File, n)
+
+	for i := range n {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			f, _, err := v.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+			errs[idx] = err
+			files[idx] = f
+		}(i)
+	}
+	wg.Wait()
+
+	var opened int
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("connection %d failed to open: %v", i, err)
+		} else {
+			opened++
+			files[i].(io.Closer).Close()
+		}
+	}
+	if opened != n {
+		t.Errorf("expected all %d connections to open, got %d", n, opened)
+	}
+}
+
+func TestVFS_UniqueBufferPaths(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	f1 := openWriteVFSFile(t, v)
+	f2 := openWriteVFSFile(t, v)
+
+	if f1.bufferPath == f2.bufferPath {
+		t.Errorf("buffer paths should be unique: both are %q", f1.bufferPath)
+	}
+}
+
+func TestVFS_RealConflict_StillDetected(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+	v.WriteSyncInterval = 0
+
+	f1 := openWriteVFSFile(t, v)
+
+	// Write dirty data
+	if _, err := f1.WriteAt([]byte("data"), 0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate external writer advancing remote
+	createTestLTXFile(t, client, 2, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	// Sync should fail with real conflict
+	err := f1.Sync(0)
+	if err == nil {
+		t.Fatal("expected conflict error from external writer")
+	}
+	if !errors.Is(err, ErrConflict) {
+		t.Fatalf("expected ErrConflict, got: %v", err)
+	}
+}
+
+func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	v := NewVFS(client, slog.Default())
+	v.WriteEnabled = true
+
+	// Open and acquire RESERVED
+	file1, _, err := v.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f1 := file1.(*VFSFile)
+	if err := f1.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+
+	// Close f1 (should release write slot)
+	f1.Close()
+
+	// New connection should be able to acquire RESERVED
+	f2 := openWriteVFSFile(t, v)
+	if err := f2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatalf("expected f2 to acquire RESERVED after f1 closed, got %v", err)
+	}
+	if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
 	}
 }
