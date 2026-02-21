@@ -21,3 +21,4 @@ bin/
 .cache/
 .claude/*.loop.local.md
 .claude/worktrees/
+CLAUDE.local.md
