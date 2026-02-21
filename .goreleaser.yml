@@ -163,6 +163,13 @@ release:
     | macOS Intel | `litestream-vfs-v{{.Version}}-darwin-amd64.tar.gz` |
     | macOS Apple Silicon | `litestream-vfs-v{{.Version}}-darwin-arm64.tar.gz` |
 
+    Install via package managers:
+    ```bash
+    pip install litestream-vfs    # Python
+    npm install litestream-vfs    # Node.js
+    gem install litestream-vfs    # Ruby
+    ```
+
   # Signing configuration
   # signs:
   #   - id: macos

@@ -22,3 +22,8 @@ bin/
 .claude/*.loop.local.md
 .claude/worktrees/
 CLAUDE.local.md
+
+# Package manager build artifacts
+packages/python/dist/
+packages/python/build/
+packages/python/*.egg-info/

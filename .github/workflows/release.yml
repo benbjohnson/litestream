@@ -134,6 +134,12 @@ jobs:
             dist/litestream-vfs-${{ steps.version.outputs.version }}-linux-${{ matrix.arch }}.tar.gz.sha256 \
             --clobber
 
+      - name: Upload artifact for packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: vfs-linux-${{ matrix.arch }}
+          path: dist/litestream-vfs-linux-${{ matrix.arch }}.so
+
   vfs-build-darwin:
     name: Build VFS (macOS ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -198,6 +204,12 @@ jobs:
             dist/litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz \
             dist/litestream-vfs-${{ steps.version.outputs.version }}-darwin-${{ matrix.arch }}.tar.gz.sha256 \
             --clobber
+
+      - name: Upload artifact for packaging
+        uses: actions/upload-artifact@v4
+        with:
+          name: vfs-darwin-${{ matrix.arch }}
+          path: dist/litestream-vfs-darwin-${{ matrix.arch }}.dylib
 
   # macos-sign:
   #   runs-on: macos-latest
@@ -277,3 +289,229 @@ jobs:
   #         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
   #       run: |
   #         gh release upload ${{ github.ref_name }} dist\litestream-*-windows-${{ matrix.arch }}.zip
+
+  publish-pypi:
+    name: Publish to PyPI (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [vfs-build-linux, vfs-build-darwin]
+    environment: release
+    permissions:
+      id-token: write
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: so
+            src_name: litestream-vfs-linux-amd64.so
+            dest_name: litestream-vfs.so
+            platform_tag: manylinux_2_35_x86_64
+          - os: linux
+            arch: arm64
+            ext: so
+            src_name: litestream-vfs-linux-arm64.so
+            dest_name: litestream-vfs.so
+            platform_tag: manylinux_2_35_aarch64
+          - os: darwin
+            arch: amd64
+            ext: dylib
+            src_name: litestream-vfs-darwin-amd64.dylib
+            dest_name: litestream-vfs.dylib
+            platform_tag: macosx_11_0_x86_64
+          - os: darwin
+            arch: arm64
+            ext: dylib
+            src_name: litestream-vfs-darwin-arm64.dylib
+            dest_name: litestream-vfs.dylib
+            platform_tag: macosx_11_0_arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download VFS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vfs-${{ matrix.os }}-${{ matrix.arch }}
+          path: packages/python/litestream_vfs/
+
+      - name: Rename binary
+        run: |
+          mv packages/python/litestream_vfs/${{ matrix.src_name }} \
+             packages/python/litestream_vfs/${{ matrix.dest_name }}
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Build wheel
+        run: |
+          cd packages/python
+          pip install setuptools wheel
+          LITESTREAM_VERSION=${{ steps.version.outputs.version }} python setup.py bdist_wheel
+
+      - name: Rename wheel with platform tag
+        run: |
+          cd packages/python
+          python scripts/rename_wheel.py dist ${{ matrix.platform_tag }}
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: packages/python/dist/
+
+  publish-npm:
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    needs: [vfs-build-linux, vfs-build-darwin]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all VFS artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Copy binaries to platform packages
+        run: |
+          cp artifacts/vfs-linux-amd64/litestream-vfs-linux-amd64.so \
+             packages/npm/litestream-vfs-linux-amd64/litestream-vfs.so
+          cp artifacts/vfs-linux-arm64/litestream-vfs-linux-arm64.so \
+             packages/npm/litestream-vfs-linux-arm64/litestream-vfs.so
+          cp artifacts/vfs-darwin-amd64/litestream-vfs-darwin-amd64.dylib \
+             packages/npm/litestream-vfs-darwin-amd64/litestream-vfs.dylib
+          cp artifacts/vfs-darwin-arm64/litestream-vfs-darwin-arm64.dylib \
+             packages/npm/litestream-vfs-darwin-arm64/litestream-vfs.dylib
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Set versions
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          for dir in packages/npm/litestream-vfs-*/; do
+            jq --arg v "$VERSION" '.version = $v' "$dir/package.json" > tmp.json && mv tmp.json "$dir/package.json"
+          done
+          jq --arg v "$VERSION" '
+            .version = $v |
+            .optionalDependencies = (.optionalDependencies | to_entries | map(.value = $v) | from_entries)
+          ' packages/npm/litestream-vfs/package.json > tmp.json && mv tmp.json packages/npm/litestream-vfs/package.json
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in packages/npm/litestream-vfs-*/; do
+            cd "$dir"
+            npm publish --access public
+            cd -
+          done
+
+      - name: Wait for registry propagation
+        run: sleep 30
+
+      - name: Publish main package
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          cd packages/npm/litestream-vfs
+          npm publish --access public
+
+  publish-gem:
+    name: Publish to RubyGems (${{ matrix.os }}-${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    needs: [vfs-build-linux, vfs-build-darwin]
+    strategy:
+      matrix:
+        include:
+          - os: linux
+            arch: amd64
+            ext: so
+            src_name: litestream-vfs-linux-amd64.so
+            dest_name: litestream-vfs.so
+            platform: x86_64-linux
+          - os: linux
+            arch: arm64
+            ext: so
+            src_name: litestream-vfs-linux-arm64.so
+            dest_name: litestream-vfs.so
+            platform: aarch64-linux
+          - os: darwin
+            arch: amd64
+            ext: dylib
+            src_name: litestream-vfs-darwin-amd64.dylib
+            dest_name: litestream-vfs.dylib
+            platform: x86_64-darwin
+          - os: darwin
+            arch: arm64
+            ext: dylib
+            src_name: litestream-vfs-darwin-arm64.dylib
+            dest_name: litestream-vfs.dylib
+            platform: arm64-darwin
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+
+      - name: Download VFS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vfs-${{ matrix.os }}-${{ matrix.arch }}
+          path: packages/ruby/lib/
+
+      - name: Rename binary
+        run: |
+          mv packages/ruby/lib/${{ matrix.src_name }} \
+             packages/ruby/lib/${{ matrix.dest_name }}
+
+      - name: Get version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            VERSION="${{ inputs.tag }}"
+          else
+            VERSION="${GITHUB_REF#refs/tags/}"
+          fi
+          echo "version=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Build gem
+        run: |
+          cd packages/ruby
+          LITESTREAM_VERSION=${{ steps.version.outputs.version }} \
+          PLATFORM=${{ matrix.platform }} \
+          gem build litestream-vfs.gemspec
+
+      - name: Publish to RubyGems
+        env:
+          GEM_HOST_API_KEY: ${{ secrets.RUBYGEMS_API_KEY }}
+        run: |
+          cd packages/ruby
+          gem push litestream-vfs-*.gem
