@@ -367,9 +367,10 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, SyncResponse{
-		Status: status,
-		Path:   expandedPath,
-		TXID:   result.TXID,
+		Status:         status,
+		Path:           expandedPath,
+		TXID:           result.TXID,
+		ReplicatedTXID: result.ReplicatedTXID,
 	})
 }
 
@@ -382,9 +383,10 @@ type SyncRequest struct {
 
 // SyncResponse is the response body for the /sync endpoint.
 type SyncResponse struct {
-	Status string `json:"status"`
-	Path   string `json:"path"`
-	TXID   uint64 `json:"txid"`
+	Status         string `json:"status"`
+	Path           string `json:"path"`
+	TXID           uint64 `json:"txid"`
+	ReplicatedTXID uint64 `json:"replicated_txid"`
 }
 
 func (s *Server) handleList(w http.ResponseWriter, _ *http.Request) {

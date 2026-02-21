@@ -391,8 +391,9 @@ func (s *Store) DisableDB(ctx context.Context, path string) error {
 
 // SyncDBResult holds the result of a sync operation.
 type SyncDBResult struct {
-	TXID    uint64
-	Changed bool
+	TXID           uint64
+	ReplicatedTXID uint64
+	Changed        bool
 }
 
 // SyncDB forces an immediate sync for a database. If wait is true, blocks
@@ -429,9 +430,15 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
 	}
 
+	var replicatedTXID uint64
+	if db.Replica != nil {
+		replicatedTXID = uint64(db.Replica.Pos().TXID)
+	}
+
 	return SyncDBResult{
-		TXID:    uint64(afterTXID),
-		Changed: afterTXID > beforeTXID,
+		TXID:           uint64(afterTXID),
+		ReplicatedTXID: replicatedTXID,
+		Changed:        afterTXID > beforeTXID,
 	}, nil
 }
 
