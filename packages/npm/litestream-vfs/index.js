@@ -23,8 +23,18 @@ function getLoadablePath() {
   }
 
   const ext = EXT_MAP[os.platform()];
+  const searchPaths = [
+    path.join(process.cwd(), "node_modules"),
+    ...module.paths,
+  ];
+  if (require.main) {
+    searchPaths.push(...require.main.paths);
+  }
   try {
-    return path.join(path.dirname(require.resolve(`${pkg}/package.json`)), ext);
+    const resolved = require.resolve(`${pkg}/package.json`, {
+      paths: searchPaths,
+    });
+    return path.join(path.dirname(resolved), ext);
   } catch {
     throw new Error(
       `Platform package ${pkg} is not installed. ` +
