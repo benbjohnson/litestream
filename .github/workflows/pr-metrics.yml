@@ -146,11 +146,14 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
 
-      - name: Post PR comment
+      - name: Post PR comment and manage labels
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.issue.number;
 
             const baseSize = parseInt(fs.readFileSync('base-size/base-size.txt', 'utf8').trim());
             const prSize = parseInt(fs.readFileSync('pr-size/pr-size.txt', 'utf8').trim());
@@ -166,9 +169,10 @@ jobs:
               vulncheck = vulncheck.substring(0, MAX_VULNCHECK_LEN) + '\n... (truncated, see workflow run for full output)';
             }
 
+            // --- Compute metrics ---
             const diff = prSize - baseSize;
+            const absPct = baseSize > 0 ? Math.abs((diff / baseSize) * 100) : 0;
             const pct = baseSize > 0 ? ((diff / baseSize) * 100).toFixed(2) : 'N/A';
-            const arrow = diff > 0 ? '📈' : diff < 0 ? '📉' : '➡️';
             const sign = diff > 0 ? '+' : '';
             const fmt = (bytes) => (bytes / 1024 / 1024).toFixed(2) + ' MB';
 
@@ -176,44 +180,69 @@ jobs:
             const removedSection = depsDiff.split('## Removed')[1]?.trim() || '';
             const addedDeps = addedSection ? addedSection.split('\n').filter(l => l.trim()) : [];
             const removedDeps = removedSection ? removedSection.split('\n').filter(l => l.trim()) : [];
-
-            let depsTable = '';
-            if (addedDeps.length > 0 || removedDeps.length > 0) {
-              depsTable = '### Dependency Changes\n\n';
-              if (addedDeps.length > 0) {
-                depsTable += '**Added:**\n' + addedDeps.map(d => `- \`${d}\``).join('\n') + '\n\n';
-              }
-              if (removedDeps.length > 0) {
-                depsTable += '**Removed:**\n' + removedDeps.map(d => `- \`${d}\``).join('\n') + '\n\n';
-              }
-            } else {
-              depsTable = '### Dependency Changes\n\nNo dependency changes.\n\n';
-            }
+            const depsChanged = addedDeps.length + removedDeps.length;
 
             const graphDiff = parseInt(prGraphSize) - parseInt(baseGraphSize);
             const graphSign = graphDiff > 0 ? '+' : '';
 
+            const hasVulns = vulncheck.includes('Vulnerability #') || vulncheck.includes('GO-');
+
+            // --- Determine status ---
+            const flags = [];
+            let sizeIcon = '✅';
+            if (diff > 0 && absPct >= 10) { sizeIcon = '🚨'; flags.push('binary size >10%'); }
+            else if (diff > 0 && absPct >= 5) { sizeIcon = '⚠️'; flags.push('binary size >5%'); }
+            else if (diff < 0) { sizeIcon = '📉'; }
+
+            const vulnIcon = hasVulns ? '⚠️' : '✅';
+            if (hasVulns) flags.push('vulnerabilities found');
+
+            const depsIcon = depsChanged > 0 ? 'ℹ️' : '✅';
+
+            const overallIcon = flags.length > 0 ? '⚠️' : '✅';
+            const overallText = flags.length > 0
+              ? `**Attention needed** — ${flags.join(', ')}`
+              : '**All clear** — no issues detected';
+
+            // --- Build compact comment ---
+            let depsDetail = 'No dependency changes.';
+            if (depsChanged > 0) {
+              const parts = [];
+              if (addedDeps.length > 0) parts.push('**Added:**\n' + addedDeps.map(d => `- \`${d}\``).join('\n'));
+              if (removedDeps.length > 0) parts.push('**Removed:**\n' + removedDeps.map(d => `- \`${d}\``).join('\n'));
+              depsDetail = parts.join('\n\n');
+            }
+
             const body = `## PR Build Metrics
 
-            ### Binary Size (linux/amd64)
+            ${overallIcon} ${overallText}
+
+            | Check | Status | Summary |
+            |:------|:------:|:--------|
+            | Binary size | ${sizeIcon} | ${fmt(prSize)} (${sign}${(diff / 1024).toFixed(1)} KB / ${sign}${pct}%) |
+            | Dependencies | ${depsIcon} | ${depsChanged > 0 ? `${addedDeps.length} added, ${removedDeps.length} removed` : 'No changes'} |
+            | Vulnerabilities | ${vulnIcon} | ${hasVulns ? 'Issues found — expand details below' : 'None detected'} |
+            | Module graph | ✅ | ${prGraphSize} edges (${graphSign}${graphDiff}) |
+
+            <details>
+            <summary>Binary size details</summary>
 
             | | Size | Change |
             |---|---:|---:|
             | Base (\`${context.payload.pull_request.base.sha.substring(0, 7)}\`) | ${fmt(baseSize)} | |
-            | PR (\`${context.sha.substring(0, 7)}\`) | ${fmt(prSize)} | ${arrow} ${sign}${(diff / 1024).toFixed(1)} KB (${sign}${pct}%) |
+            | PR (\`${context.sha.substring(0, 7)}\`) | ${fmt(prSize)} | ${sign}${(diff / 1024).toFixed(1)} KB (${sign}${pct}%) |
 
-            ${depsTable}
-            ### Module Graph
-
-            | | Edges |
-            |---|---:|
-            | Base | ${baseGraphSize} |
-            | PR | ${prGraphSize} (${graphSign}${graphDiff}) |
-
-            ### Vulnerability Check
+            </details>
 
             <details>
-            <summary>govulncheck results</summary>
+            <summary>Dependency changes</summary>
+
+            ${depsDetail}
+
+            </details>
+
+            <details>
+            <summary>govulncheck output</summary>
 
             \`\`\`
             ${vulncheck}
@@ -221,7 +250,8 @@ jobs:
 
             </details>
 
-            ### Build Info
+            <details>
+            <summary>Build info</summary>
 
             | Metric | Value |
             |---|---|
@@ -229,31 +259,113 @@ jobs:
             | Go version | \`${goVersion}\` |
             | Commit | \`${context.sha.substring(0, 7)}\` |
 
-            ---
-            <sub>🤖 This comment is automatically updated on each push.</sub>`.replace(/^            /gm, '');
+            </details>
 
+            <!-- history -->
+            ---
+            <sub>🤖 Updated on each push.</sub>`.replace(/^            /gm, '');
+
+            // --- Post or update comment (with history) ---
             const marker = '## PR Build Metrics';
+            const historyMarker = '<!-- history -->';
             let existing = null;
             for await (const response of github.paginate.iterator(
               github.rest.issues.listComments,
-              { owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, per_page: 100 }
+              { owner, repo, issue_number, per_page: 100 }
             )) {
               existing = response.data.find(c => c.body?.startsWith(marker));
               if (existing) break;
             }
 
             if (existing) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
-              });
+              // Extract previous summary line and history from existing comment
+              const prevBody = existing.body;
+              const prevStatusMatch = prevBody.match(/\| Binary size \|[^\n]+/);
+              const prevCommitMatch = prevBody.match(/\| Commit \| `([^`]+)` \|/);
+              const prevSummary = prevStatusMatch ? prevStatusMatch[0] : null;
+              const prevCommit = prevCommitMatch ? prevCommitMatch[1] : '?';
+
+              // Extract existing history entries
+              let historyEntries = '';
+              const historyIdx = prevBody.indexOf(historyMarker);
+              if (historyIdx !== -1) {
+                const afterMarker = prevBody.substring(historyIdx + historyMarker.length);
+                const detailsMatch = afterMarker.match(/<details>[\s\S]*?<\/details>/);
+                if (detailsMatch) {
+                  const innerMatch = detailsMatch[0].match(/<summary>[^<]*<\/summary>([\s\S]*?)<\/details>/);
+                  if (innerMatch) historyEntries = innerMatch[1].trim();
+                }
+              }
+
+              // Build new history (most recent first, cap at 10)
+              const now = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+              const newEntry = prevSummary
+                ? `| \`${prevCommit}\` | ${now} | ${prevSummary.replace(/\| Binary size \|/, '').trim().replace(/^\||\|$/g, '').trim()} |`
+                : null;
+
+              let historyRows = '';
+              if (newEntry || historyEntries) {
+                const existingRows = historyEntries
+                  .split('\n')
+                  .filter(l => l.startsWith('|') && !l.startsWith('| Commit') && !l.startsWith('|:'))
+                  .slice(0, 9);
+                const allRows = newEntry ? [newEntry, ...existingRows] : existingRows;
+                if (allRows.length > 0) {
+                  historyRows = `\n<details>\n<summary>History (${allRows.length} previous)</summary>\n\n| Commit | Updated | Status | Summary |\n|:-------|:--------|:------:|:--------|\n${allRows.join('\n')}\n\n</details>`;
+                }
+              }
+
+              // Insert history into body
+              const finalBody = body.replace(historyMarker, historyMarker + historyRows);
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: finalBody });
             } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
-              });
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+            // --- Manage labels ---
+            const LABELS = {
+              SIZE_WARNING: 'metrics: size-warning',
+              SIZE_ALERT: 'metrics: size-alert',
+              VULNS: 'metrics: vulns-found',
+            };
+
+            const ensureLabel = async (name, color, description) => {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch {
+                await github.rest.issues.createLabel({ owner, repo, name, color, description });
+              }
+            };
+
+            const addLabel = async (name) => {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [name] });
+            };
+
+            const removeLabel = async (name) => {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+              } catch { /* label not present, ignore */ }
+            };
+
+            // Size labels
+            await ensureLabel(LABELS.SIZE_WARNING, 'fbca04', 'Binary size increased 5-10%');
+            await ensureLabel(LABELS.SIZE_ALERT, 'e11d48', 'Binary size increased >10%');
+            await ensureLabel(LABELS.VULNS, 'e11d48', 'govulncheck found vulnerabilities');
+
+            if (diff > 0 && absPct >= 10) {
+              await addLabel(LABELS.SIZE_ALERT);
+              await removeLabel(LABELS.SIZE_WARNING);
+            } else if (diff > 0 && absPct >= 5) {
+              await addLabel(LABELS.SIZE_WARNING);
+              await removeLabel(LABELS.SIZE_ALERT);
+            } else {
+              await removeLabel(LABELS.SIZE_WARNING);
+              await removeLabel(LABELS.SIZE_ALERT);
+            }
+
+            // Vuln label
+            if (hasVulns) {
+              await addLabel(LABELS.VULNS);
+            } else {
+              await removeLabel(LABELS.VULNS);
             }
