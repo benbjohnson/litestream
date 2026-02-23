@@ -547,27 +547,30 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			// and we can't catch up incrementally.
 			snapshotItr, itrErr := r.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
 			if itrErr != nil {
-				// Can't validate saved TXID; delete DB and txid file, then do full restore.
-				r.Logger().Warn("cannot validate saved TXID, performing full restore", "err", itrErr)
-				if err := os.Remove(opt.OutputPath); err != nil {
-					return fmt.Errorf("remove database for re-restore: %w", err)
-				}
-				if err := os.Remove(TXIDPath(opt.OutputPath)); err != nil && !os.IsNotExist(err) {
-					return fmt.Errorf("remove txid file for re-restore: %w", err)
-				}
-			} else {
-				if snapshotItr.Next() {
-					info := snapshotItr.Item()
-					if info.MinTXID > txid {
-						_ = snapshotItr.Close()
-						return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned — delete %s and %s-txid to re-restore", txid, info.MinTXID, opt.OutputPath, opt.OutputPath)
-					}
-				}
-				_ = snapshotItr.Close()
-
-				r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
-				return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
+				return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", itrErr)
 			}
+
+			var latestSnapshot *ltx.FileInfo
+			for snapshotItr.Next() {
+				latestSnapshot = snapshotItr.Item()
+			}
+			if err := snapshotItr.Err(); err != nil {
+				_ = snapshotItr.Close()
+				return fmt.Errorf("iterate snapshots for crash recovery validation: %w", err)
+			}
+			_ = snapshotItr.Close()
+
+			if latestSnapshot != nil {
+				if latestSnapshot.MinTXID > txid {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
+				}
+				if txid > latestSnapshot.MaxTXID {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
+				}
+			}
+
+			r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
+			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
 		}
 	}
 
@@ -1545,7 +1548,15 @@ func WriteTXIDFile(outputPath string, txid ltx.TXID) error {
 		return fmt.Errorf("rename txid file: %w", err)
 	}
 
-	return nil
+	dir, err := os.Open(filepath.Dir(txidPath))
+	if err != nil {
+		return fmt.Errorf("open txid dir for sync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("sync txid dir: %w", err)
+	}
+	return dir.Close()
 }
 
 // ReadTXIDFile reads the TXID from a sidecar file at <outputPath>-txid.
