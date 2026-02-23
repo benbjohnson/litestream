@@ -20,6 +20,7 @@ Litestream is a disaster recovery tool for SQLite that runs as a background proc
 - **IPC socket disabled by default**: Control socket is off by default. Enable with `socket.enabled: true` in config. See `server.go`
 - **`$PID` config expansion**: Config files support `$PID` to expand to the current process ID, plus standard `$ENV_VAR` expansion. See `cmd/litestream/main.go`
 - **`litestream ltx -level`**: Use `-level 0`–`9` or `-level all` to inspect specific compaction levels. See `cmd/litestream/ltx.go`
+- **Return errors, don't log them**: Always return errors to callers. Never `log.Printf(err)` and continue — this silently hides failures in a disaster recovery tool. Only use DEBUG log for best-effort operations where failure doesn't affect correctness and a valid fallback exists (e.g., reading SHM mxFrame optimization hint). See [docs/PATTERNS.md](docs/PATTERNS.md#error-handling)
 
 ## Layer Boundaries
 

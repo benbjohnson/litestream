@@ -10,6 +10,7 @@ Before submitting a PR:
 - [ ] **Define scope clearly** - State what this PR does AND does not do
 - [ ] **Include runnable test commands** - Not just descriptions, actual `go test` commands
 - [ ] **Reference related issues/PRs** - Show awareness of related work
+- [ ] **Error handling**: Does the code return errors to callers? Watch for `log.Printf(err)` followed by `continue` or `return nil` — this silently swallows failures.
 
 ## What Makes PRs Succeed
 
