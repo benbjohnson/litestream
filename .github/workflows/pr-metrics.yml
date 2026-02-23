@@ -136,8 +136,8 @@ jobs:
           fi
           MINOR=$(echo "$CURRENT" | grep -oE '^[0-9]+\.[0-9]+')
 
-          LATEST=$(curl -sf 'https://go.dev/dl/?mode=json' | \
-            python3 -c "import sys,json; releases=json.load(sys.stdin); print(next(r['version'] for r in releases if r['stable'] and r['version'].startswith('go${MINOR}')))" 2>/dev/null | sed 's/^go//')
+          LATEST=$(curl -sf 'https://go.dev/dl/?mode=json&include=all' | \
+            python3 -c "import sys,json; releases=json.load(sys.stdin); print(next(r['version'] for r in releases if r['stable'] and r['version'].startswith('go${MINOR}.')))" 2>/dev/null | sed 's/^go//')
 
           if [ -z "$LATEST" ]; then
             echo "current=${CURRENT}" > go-toolchain.txt
