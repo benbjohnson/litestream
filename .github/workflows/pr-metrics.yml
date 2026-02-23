@@ -4,6 +4,10 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
 
+concurrency:
+  group: pr-metrics-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write
@@ -18,6 +22,7 @@ jobs:
           ref: ${{ github.event.pull_request.base.sha }}
 
       - name: Set up Go
+        id: setup-go
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -27,7 +32,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: litestream-base
-          key: pr-metrics-base-${{ github.event.pull_request.base.sha }}
+          key: pr-metrics-base-${{ github.event.pull_request.base.sha }}-${{ steps.setup-go.outputs.go-version }}
 
       - name: Build base binary
         if: steps.cache-base.outputs.cache-hit != 'true'
@@ -98,17 +103,19 @@ jobs:
 
       - name: Diff go.mod dependencies
         run: |
-          diff_deps() {
+          extract_require_deps() {
             local gomod="$1"
-            grep -E '^\t' "$gomod" | sed 's/^\t//' | sort
+            awk '/^require \(/{found=1; next} found && /^\)/{found=0} found && /^\t/' "$gomod" | sed 's/^\t//' | sort
           }
-          diff_deps base/go.mod > /tmp/base-deps.txt
-          diff_deps pr/go.mod > /tmp/pr-deps.txt
+          extract_require_deps base/go.mod > /tmp/base-deps.txt
+          extract_require_deps pr/go.mod > /tmp/pr-deps.txt
 
-          echo "## Added" > deps-diff.txt
-          comm -13 /tmp/base-deps.txt /tmp/pr-deps.txt >> deps-diff.txt
-          echo "## Removed" >> deps-diff.txt
-          comm -23 /tmp/base-deps.txt /tmp/pr-deps.txt >> deps-diff.txt
+          {
+            echo "## Added"
+            comm -13 /tmp/base-deps.txt /tmp/pr-deps.txt
+            echo "## Removed"
+            comm -23 /tmp/base-deps.txt /tmp/pr-deps.txt
+          } > deps-diff.txt
 
       - name: Module graph size
         run: |
@@ -132,6 +139,7 @@ jobs:
             vulncheck-results.txt
 
   post-comment:
+    if: github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
     needs: [build-base, build-pr, analyze-deps]
     steps:
@@ -151,7 +159,12 @@ jobs:
             const depsDiff = fs.readFileSync('dep-analysis/deps-diff.txt', 'utf8').trim();
             const baseGraphSize = fs.readFileSync('dep-analysis/base-graph-size.txt', 'utf8').trim();
             const prGraphSize = fs.readFileSync('dep-analysis/pr-graph-size.txt', 'utf8').trim();
-            const vulncheck = fs.readFileSync('dep-analysis/vulncheck-results.txt', 'utf8').trim();
+            let vulncheck = fs.readFileSync('dep-analysis/vulncheck-results.txt', 'utf8').trim();
+
+            const MAX_VULNCHECK_LEN = 10000;
+            if (vulncheck.length > MAX_VULNCHECK_LEN) {
+              vulncheck = vulncheck.substring(0, MAX_VULNCHECK_LEN) + '\n... (truncated, see workflow run for full output)';
+            }
 
             const diff = prSize - baseSize;
             const pct = baseSize > 0 ? ((diff / baseSize) * 100).toFixed(2) : 'N/A';
@@ -159,7 +172,6 @@ jobs:
             const sign = diff > 0 ? '+' : '';
             const fmt = (bytes) => (bytes / 1024 / 1024).toFixed(2) + ' MB';
 
-            const addedLines = depsDiff.split('\n').filter(l => l && !l.startsWith('##'));
             const addedSection = depsDiff.split('## Removed')[0].replace('## Added', '').trim();
             const removedSection = depsDiff.split('## Removed')[1]?.trim() || '';
             const addedDeps = addedSection ? addedSection.split('\n').filter(l => l.trim()) : [];
@@ -220,14 +232,15 @@ jobs:
             ---
             <sub>🤖 This comment is automatically updated on each push.</sub>`.replace(/^            /gm, '');
 
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-
             const marker = '## PR Build Metrics';
-            const existing = comments.find(c => c.body?.startsWith(marker));
+            let existing = null;
+            for await (const response of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, per_page: 100 }
+            )) {
+              existing = response.data.find(c => c.body?.startsWith(marker));
+              if (existing) break;
+            }
 
             if (existing) {
               await github.rest.issues.updateComment({
