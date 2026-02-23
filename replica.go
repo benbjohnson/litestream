@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -530,6 +531,49 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot use follow mode with -timestamp")
 	}
 
+	// In follow mode, if the database already exists, attempt crash recovery
+	// by reading the last applied TXID from the sidecar file.
+	if opt.Follow {
+		if _, statErr := os.Stat(opt.OutputPath); statErr == nil {
+			txid, readErr := ReadTXIDFile(opt.OutputPath)
+			if readErr != nil {
+				return fmt.Errorf("read txid file for crash recovery: %w", readErr)
+			}
+			if txid == 0 {
+				return fmt.Errorf("cannot resume follow mode: database exists but no -txid file found; delete the database to re-restore: %s", opt.OutputPath)
+			}
+			// Validate saved TXID is still reachable. If the earliest snapshot
+			// starts after our saved TXID, retention has pruned the history
+			// and we can't catch up incrementally.
+			snapshotItr, itrErr := r.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
+			if itrErr != nil {
+				return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", itrErr)
+			}
+
+			var latestSnapshot *ltx.FileInfo
+			for snapshotItr.Next() {
+				latestSnapshot = snapshotItr.Item()
+			}
+			if err := snapshotItr.Err(); err != nil {
+				_ = snapshotItr.Close()
+				return fmt.Errorf("iterate snapshots for crash recovery validation: %w", err)
+			}
+			_ = snapshotItr.Close()
+
+			if latestSnapshot != nil {
+				if latestSnapshot.MinTXID > txid {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
+				}
+				if txid > latestSnapshot.MaxTXID {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
+				}
+			}
+
+			r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
+			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
+		}
+	}
+
 	// Ensure output path does not already exist.
 	if _, err := os.Stat(opt.OutputPath); err == nil {
 		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
@@ -646,6 +690,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		rdrs = nil
 
 		maxTXID := infos[len(infos)-1].MaxTXID
+		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
+			return fmt.Errorf("write initial txid file: %w", err)
+		}
 		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
 	}
 
@@ -702,6 +749,9 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 				continue
 			}
 			if newTXID > lastTXID {
+				if err := WriteTXIDFile(outputPath, newTXID); err != nil {
+					return fmt.Errorf("write txid file: %w", err)
+				}
 				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
 				lastTXID = newTXID
 				consecutiveErrors = 0
@@ -1461,6 +1511,72 @@ func restoreCandidateBetter(curr, next *ltx.FileInfo) bool {
 		return next.Level > curr.Level
 	}
 	return next.CreatedAt.Before(curr.CreatedAt)
+}
+
+// TXIDPath returns the path to the TXID sidecar file for the given database path.
+// Uses -txid suffix to match SQLite's naming convention for associated files (-wal, -shm).
+func TXIDPath(outputPath string) string {
+	return outputPath + "-txid"
+}
+
+// WriteTXIDFile atomically writes a TXID to a sidecar file at <outputPath>-txid.
+// Uses temp-file + fsync + rename for crash safety.
+func WriteTXIDFile(outputPath string, txid ltx.TXID) error {
+	txidPath := TXIDPath(outputPath)
+	tmpPath := txidPath + ".tmp"
+
+	f, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("create txid temp file: %w", err)
+	}
+	defer f.Close()
+	defer os.Remove(tmpPath)
+
+	if _, err := fmt.Fprintln(f, txid); err != nil {
+		return fmt.Errorf("write txid: %w", err)
+	}
+
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("sync txid file: %w", err)
+	}
+
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("close txid file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, txidPath); err != nil {
+		return fmt.Errorf("rename txid file: %w", err)
+	}
+
+	dir, err := os.Open(filepath.Dir(txidPath))
+	if err != nil {
+		return fmt.Errorf("open txid dir for sync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return fmt.Errorf("sync txid dir: %w", err)
+	}
+	return dir.Close()
+}
+
+// ReadTXIDFile reads the TXID from a sidecar file at <outputPath>-txid.
+// Returns 0, nil if the file does not exist (first run).
+func ReadTXIDFile(outputPath string) (ltx.TXID, error) {
+	txidPath := TXIDPath(outputPath)
+
+	data, err := os.ReadFile(txidPath)
+	if os.IsNotExist(err) {
+		return 0, nil
+	} else if err != nil {
+		return 0, fmt.Errorf("read txid file: %w", err)
+	}
+
+	txid, err := ltx.ParseTXID(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parse txid file: %w", err)
+	}
+
+	return txid, nil
 }
 
 // ValidationError represents a single validation issue.

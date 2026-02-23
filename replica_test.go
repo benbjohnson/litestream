@@ -1719,6 +1719,108 @@ func createTestWALData(t *testing.T, dbData []byte) []byte {
 	return make([]byte, 32) // Empty WAL header placeholder
 }
 
+func TestWriteTXIDFile(t *testing.T) {
+	t.Run("WritesCorrectFormat", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+		if err := os.WriteFile(dbPath, []byte("db"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if err := litestream.WriteTXIDFile(dbPath, 42); err != nil {
+			t.Fatal(err)
+		}
+
+		data, err := os.ReadFile(dbPath + "-txid")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := strings.TrimSpace(string(data)), "000000000000002a"; got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+
+	t.Run("AtomicOverwrite", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+
+		if err := litestream.WriteTXIDFile(dbPath, 10); err != nil {
+			t.Fatal(err)
+		}
+		if err := litestream.WriteTXIDFile(dbPath, 20); err != nil {
+			t.Fatal(err)
+		}
+
+		txid, err := litestream.ReadTXIDFile(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if txid != 20 {
+			t.Fatalf("got %d, want 20", txid)
+		}
+	})
+}
+
+func TestReadTXIDFile(t *testing.T) {
+	t.Run("MissingFile", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "nonexistent.db")
+
+		txid, err := litestream.ReadTXIDFile(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if txid != 0 {
+			t.Fatalf("got %d, want 0", txid)
+		}
+	})
+
+	t.Run("ValidFile", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+
+		if err := os.WriteFile(dbPath+"-txid", []byte("00000000000000ff\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		txid, err := litestream.ReadTXIDFile(dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if txid != 255 {
+			t.Fatalf("got %d, want 255", txid)
+		}
+	})
+
+	t.Run("MalformedFile", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+
+		if err := os.WriteFile(dbPath+"-txid", []byte("not-a-hex-value\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := litestream.ReadTXIDFile(dbPath)
+		if err == nil {
+			t.Fatal("expected error for malformed file")
+		}
+	})
+
+	t.Run("EmptyFile", func(t *testing.T) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "test.db")
+
+		if err := os.WriteFile(dbPath+"-txid", []byte(""), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		_, err := litestream.ReadTXIDFile(dbPath)
+		if err == nil {
+			t.Fatal("expected error for empty file")
+		}
+	})
+}
+
 func TestReplica_Restore_Follow_IncompatibleFlags(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -1907,6 +2009,345 @@ func TestReplica_Restore_Follow_ContextCancellation(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("follow did not shut down within timeout")
+	}
+}
+
+func TestReplica_Restore_Follow_WriteTXIDFile(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := t.TempDir() + "/follower.db"
+	followCtx, followCancel := context.WithCancel(ctx)
+	defer followCancel()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.Restore(followCtx, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	// Wait for initial restore.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outputPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Verify -txid file was created after initial restore.
+	txidPath := outputPath + "-txid"
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(txidPath); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, err := os.Stat(txidPath); err != nil {
+		t.Fatalf("txid file not created after initial restore: %v", err)
+	}
+
+	initialTXID, err := litestream.ReadTXIDFile(outputPath)
+	if err != nil {
+		t.Fatalf("failed to read initial txid: %v", err)
+	}
+	if initialTXID == 0 {
+		t.Fatal("initial txid should be non-zero")
+	}
+
+	// Insert more data and sync.
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (2, 'update')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Wait for follow to apply and update the TXID file.
+	deadline = time.Now().Add(5 * time.Second)
+	var updatedTXID ltx.TXID
+	for time.Now().Before(deadline) {
+		txid, err := litestream.ReadTXIDFile(outputPath)
+		if err == nil && txid > initialTXID {
+			updatedTXID = txid
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if updatedTXID <= initialTXID {
+		t.Fatalf("txid file not updated after follow apply: initial=%d, current=%d", initialTXID, updatedTXID)
+	}
+
+	followCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("follow returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not shut down within timeout")
+	}
+}
+
+func TestReplica_Restore_Follow_CrashRecovery(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := t.TempDir() + "/follower.db"
+	followCtx, followCancel := context.WithCancel(ctx)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.Restore(followCtx, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	// Wait for initial restore and -txid file.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outputPath + "-txid"); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	savedTXID, err := litestream.ReadTXIDFile(outputPath)
+	if err != nil {
+		t.Fatalf("failed to read txid file: %v", err)
+	}
+	if savedTXID == 0 {
+		t.Fatal("saved txid should be non-zero")
+	}
+
+	// Simulate crash by cancelling follow mode.
+	followCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("follow returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not shut down within timeout")
+	}
+
+	// Verify DB and -txid file still exist.
+	if _, err := os.Stat(outputPath); err != nil {
+		t.Fatalf("database file missing after crash: %v", err)
+	}
+	if _, err := os.Stat(outputPath + "-txid"); err != nil {
+		t.Fatalf("txid file missing after crash: %v", err)
+	}
+
+	// Add more data to source while follow was down.
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (2, 'post-crash')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart follow mode — should resume from saved TXID (crash recovery).
+	followCtx2, followCancel2 := context.WithCancel(ctx)
+	defer followCancel2()
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		errCh2 <- r.Restore(followCtx2, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	// Wait for follow mode to pick up new data.
+	deadline = time.Now().Add(5 * time.Second)
+	var found bool
+	for time.Now().Before(deadline) {
+		followerDB := testingutil.MustOpenSQLDB(t, outputPath)
+		var count int
+		if err := followerDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM test WHERE value = 'post-crash'`).Scan(&count); err == nil && count > 0 {
+			found = true
+			followerDB.Close()
+			break
+		}
+		followerDB.Close()
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !found {
+		t.Fatal("crash recovery did not apply new data within timeout")
+	}
+
+	followCancel2()
+	select {
+	case err := <-errCh2:
+		if err != nil {
+			t.Fatalf("follow returned error after recovery: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("follow did not shut down within timeout after recovery")
+	}
+}
+
+func TestReplica_Restore_Follow_NoTXIDFile(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplicaWithClient(db, c)
+
+	// Create a database file but no -txid sidecar.
+	outputPath := t.TempDir() + "/existing.db"
+	if err := os.WriteFile(outputPath, []byte("fake-db"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Restore(context.Background(), litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error when DB exists but no -txid file")
+	}
+	if !strings.Contains(err.Error(), "no -txid file found") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplica_Restore_Follow_StaleTXID(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+
+	// Create a fake database and a TXID file with a low TXID (1).
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate retention pruning: remove all level 0 files and replace the
+	// snapshot with one whose MinTXID is far ahead of our saved TXID.
+	level0Dir := c.LTXLevelDir(0)
+	if entries, err := os.ReadDir(level0Dir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(level0Dir, e.Name()))
+		}
+	}
+	snapshotDir := c.LTXLevelDir(9)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+	// Create a dummy snapshot file with MinTXID=10000 (far ahead of saved TXID=1).
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dummySnapshotPath := filepath.Join(snapshotDir, "0000000000002710-0000000000002710.ltx")
+	if err := os.WriteFile(dummySnapshotPath, []byte("dummy"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for stale TXID")
+	}
+	if !strings.Contains(err.Error(), "replica history has been pruned") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
