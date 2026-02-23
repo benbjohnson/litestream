@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 	"unsafe"
@@ -41,21 +42,18 @@ func main() {}
 //export LitestreamVFSRegister
 func LitestreamVFSRegister() *C.char {
 	var client litestream.ReplicaClient
-	var err error
 
 	replicaURL := os.Getenv("LITESTREAM_REPLICA_URL")
-	if replicaURL == "" {
-		return C.CString("LITESTREAM_REPLICA_URL environment variable required")
-	}
+	if replicaURL != "" {
+		var err error
+		client, err = litestream.NewReplicaClientFromURL(replicaURL)
+		if err != nil {
+			return C.CString(fmt.Sprintf("failed to create replica client: %s", err))
+		}
 
-	client, err = litestream.NewReplicaClientFromURL(replicaURL)
-	if err != nil {
-		return C.CString(fmt.Sprintf("failed to create replica client: %s", err))
-	}
-
-	// Initialize the client.
-	if err := client.Init(context.Background()); err != nil {
-		return C.CString(fmt.Sprintf("failed to initialize replica client: %s", err))
+		if err := client.Init(context.Background()); err != nil {
+			return C.CString(fmt.Sprintf("failed to initialize replica client: %s", err))
+		}
 	}
 
 	var level slog.Level
@@ -108,6 +106,58 @@ func LitestreamVFSRegister() *C.char {
 		return C.CString(fmt.Sprintf("failed to register VFS: %s", err))
 	}
 
+	return nil
+}
+
+//export GoLitestreamConfigure
+func GoLitestreamConfigure(dbName *C.char, key *C.char, value *C.char) *C.char {
+	name := C.GoString(dbName)
+	k := C.GoString(key)
+	v := C.GoString(value)
+
+	cfg := litestream.GetVFSConfig(name)
+	if cfg == nil {
+		cfg = &litestream.VFSConfig{}
+	}
+
+	switch k {
+	case "replica_url":
+		cfg.ReplicaURL = v
+	case "write_enabled":
+		b := strings.ToLower(v) == "true" || v == "1"
+		cfg.WriteEnabled = &b
+	case "sync_interval":
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return C.CString(fmt.Sprintf("invalid sync_interval: %s", err))
+		}
+		cfg.SyncInterval = &d
+	case "buffer_path":
+		cfg.BufferPath = v
+	case "hydration_enabled":
+		b := strings.ToLower(v) == "true" || v == "1"
+		cfg.HydrationEnabled = &b
+	case "hydration_path":
+		cfg.HydrationPath = v
+	case "poll_interval":
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			return C.CString(fmt.Sprintf("invalid poll_interval: %s", err))
+		}
+		cfg.PollInterval = &d
+	case "cache_size":
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return C.CString(fmt.Sprintf("invalid cache_size: %s", err))
+		}
+		cfg.CacheSize = &n
+	case "log_level":
+		cfg.LogLevel = v
+	default:
+		return C.CString(fmt.Sprintf("unknown config key: %s", k))
+	}
+
+	litestream.SetVFSConfig(name, cfg)
 	return nil
 }
 
