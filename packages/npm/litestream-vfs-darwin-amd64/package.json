@@ -1,0 +1,12 @@
+{
+  "name": "litestream-vfs-darwin-amd64",
+  "version": "0.0.0",
+  "description": "Litestream VFS extension for macOS x64",
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benbjohnson/litestream"
+  },
+  "license": "Apache-2.0"
+}

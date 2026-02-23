@@ -1,0 +1,13 @@
+{
+  "name": "litestream-vfs-linux-arm64",
+  "version": "0.0.0",
+  "description": "Litestream VFS extension for Linux ARM64",
+  "os": ["linux"],
+  "cpu": ["arm64"],
+  "libc": ["glibc"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benbjohnson/litestream"
+  },
+  "license": "Apache-2.0"
+}

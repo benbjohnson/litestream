@@ -1,0 +1,12 @@
+{
+  "name": "litestream-vfs-darwin-arm64",
+  "version": "0.0.0",
+  "description": "Litestream VFS extension for macOS ARM64",
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/benbjohnson/litestream"
+  },
+  "license": "Apache-2.0"
+}
