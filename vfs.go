@@ -133,25 +133,75 @@ func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, s
 }
 
 func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
+	cfg := GetVFSConfig(name)
+
+	client := vfs.client
+	var perConnClient bool
+	if cfg != nil && cfg.ReplicaURL != "" {
+		var err error
+		client, err = NewReplicaClientFromURL(cfg.ReplicaURL)
+		if err != nil {
+			return nil, 0, fmt.Errorf("create per-connection replica client: %w", err)
+		}
+		if err := client.Init(context.Background()); err != nil {
+			return nil, 0, fmt.Errorf("init per-connection replica client: %w", err)
+		}
+		perConnClient = true
+	}
+
+	f := NewVFSFile(client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
-	f.vfs = vfs // Store reference to parent VFS for config access
+	f.vfs = vfs
+	f.perConnClient = perConnClient
+
+	if cfg != nil {
+		if cfg.PollInterval != nil {
+			f.PollInterval = *cfg.PollInterval
+		}
+		if cfg.CacheSize != nil {
+			f.CacheSize = *cfg.CacheSize
+		}
+	}
+
+	writeEnabled := vfs.WriteEnabled
+	if cfg != nil && cfg.WriteEnabled != nil {
+		writeEnabled = *cfg.WriteEnabled
+	}
+
+	syncInterval := vfs.WriteSyncInterval
+	if cfg != nil && cfg.SyncInterval != nil {
+		syncInterval = *cfg.SyncInterval
+	}
+
+	bufferPath := vfs.WriteBufferPath
+	if cfg != nil && cfg.BufferPath != "" {
+		bufferPath = cfg.BufferPath
+	}
+
+	hydrationEnabled := vfs.HydrationEnabled
+	if cfg != nil && cfg.HydrationEnabled != nil {
+		hydrationEnabled = *cfg.HydrationEnabled
+	}
+
+	hydrationPath := vfs.HydrationPath
+	if cfg != nil && cfg.HydrationPath != "" {
+		hydrationPath = cfg.HydrationPath
+	}
 
 	// Initialize write support if enabled
-	if vfs.WriteEnabled {
+	if writeEnabled {
 		f.writeEnabled = true
 		f.dirty = make(map[uint32]int64)
-		f.syncInterval = vfs.WriteSyncInterval
+		f.syncInterval = syncInterval
 		if f.syncInterval == 0 {
 			f.syncInterval = DefaultSyncInterval
 		}
 
 		// Set up write buffer path
-		if vfs.WriteBufferPath != "" {
-			f.bufferPath = vfs.WriteBufferPath
+		if bufferPath != "" {
+			f.bufferPath = bufferPath
 		} else {
-			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
 				return nil, 0, fmt.Errorf("create temp dir for write buffer: %w", err)
@@ -161,18 +211,16 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 		// Initialize compaction if enabled
 		if vfs.CompactionEnabled {
-			f.compactor = NewCompactor(vfs.client, f.logger)
-			// VFS has no local files, so leave LocalFileOpener/LocalFileDeleter nil
+			f.compactor = NewCompactor(client, f.logger)
 		}
 	}
 
 	// Initialize hydration support if enabled
-	if vfs.HydrationEnabled {
-		if vfs.HydrationPath != "" {
-			f.hydrationPath = vfs.HydrationPath
+	if hydrationEnabled {
+		if hydrationPath != "" {
+			f.hydrationPath = hydrationPath
 			f.hydrationPersistent = true
 		} else {
-			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
 				return nil, 0, fmt.Errorf("create temp dir for hydration: %w", err)
@@ -526,6 +574,8 @@ type VFSFile struct {
 	inTransaction bool             // True during active write transaction
 	disabling     bool             // True when write disable is in progress
 	cond          *sync.Cond       // Signals transaction state changes
+
+	perConnClient bool // True when client was created from config registry (close on file close)
 
 	hydrator            *Hydrator // Background hydration (nil if disabled)
 	hydrationPath       string    // Path for hydration file (set during Open)
@@ -1388,6 +1438,14 @@ func (f *VFSFile) Close() error {
 	if f.hydrator != nil {
 		if err := f.hydrator.Close(); err != nil {
 			f.logger.Warn("failed to close hydration file", "error", err)
+		}
+	}
+
+	if f.perConnClient {
+		if closer, ok := f.client.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				f.logger.Warn("failed to close per-connection client", "error", err)
+			}
 		}
 	}
 
@@ -2372,6 +2430,80 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, fmt.Errorf("invalid value for litestream_write_enabled: %s (use 0 or 1)", *pragmaValue)
 		}
 
+	case "litestream_poll_interval":
+		f.mu.Lock()
+		if pragmaValue == nil {
+			result := f.PollInterval.String()
+			f.mu.Unlock()
+			return &result, nil
+		}
+		d, err := time.ParseDuration(*pragmaValue)
+		if err != nil {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("invalid poll_interval: %w", err)
+		}
+		f.PollInterval = d
+		f.mu.Unlock()
+		return nil, nil
+
+	case "litestream_cache_size":
+		f.mu.Lock()
+		if pragmaValue == nil {
+			result := strconv.Itoa(f.CacheSize)
+			f.mu.Unlock()
+			return &result, nil
+		}
+		n, err := strconv.Atoi(*pragmaValue)
+		if err != nil {
+			f.mu.Unlock()
+			return nil, fmt.Errorf("invalid cache_size: %w", err)
+		}
+		f.CacheSize = n
+		f.mu.Unlock()
+		return nil, nil
+
+	case "litestream_hydration_enabled":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_hydration_enabled is read-only")
+		}
+		if f.hydrator != nil {
+			result := "1"
+			return &result, nil
+		}
+		result := "0"
+		return &result, nil
+
+	case "litestream_log_level":
+		if pragmaValue == nil {
+			if f.logger.Enabled(context.Background(), slog.LevelDebug) {
+				result := "debug"
+				return &result, nil
+			}
+			result := "info"
+			return &result, nil
+		}
+		switch strings.ToLower(*pragmaValue) {
+		case "debug":
+			f.logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})).With("name", f.name)
+		case "info":
+			f.logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("name", f.name)
+		default:
+			return nil, fmt.Errorf("invalid log_level: %s (use \"debug\" or \"info\")", *pragmaValue)
+		}
+		return nil, nil
+
+	case "litestream_replica_url":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_replica_url is read-only")
+		}
+		cfg := GetVFSConfig(f.name)
+		if cfg != nil && cfg.ReplicaURL != "" {
+			result := cfg.ReplicaURL
+			return &result, nil
+		}
+		result := ""
+		return &result, nil
+
 	default:
 		return nil, sqlite3vfs.NotFoundError
 	}
@@ -2409,7 +2541,10 @@ func isRetryablePageError(err error) bool {
 }
 
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
-	ticker := time.NewTicker(f.PollInterval)
+	f.mu.Lock()
+	pollInterval := f.PollInterval
+	f.mu.Unlock()
+	ticker := time.NewTicker(pollInterval)
 	defer ticker.Stop()
 
 	for {
