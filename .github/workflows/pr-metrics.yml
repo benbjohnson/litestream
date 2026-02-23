@@ -128,6 +128,31 @@ jobs:
           cd pr
           govulncheck ./... > ../vulncheck-results.txt 2>&1 || true
 
+      - name: Check Go toolchain freshness
+        run: |
+          CURRENT=$(grep '^toolchain ' pr/go.mod | awk '{print $2}' | sed 's/^go//')
+          if [ -z "$CURRENT" ]; then
+            CURRENT=$(grep '^go ' pr/go.mod | awk '{print $2}')
+          fi
+          MINOR=$(echo "$CURRENT" | grep -oE '^[0-9]+\.[0-9]+')
+
+          LATEST=$(curl -sf 'https://go.dev/dl/?mode=json' | \
+            python3 -c "import sys,json; releases=json.load(sys.stdin); print(next(r['version'] for r in releases if r['stable'] and r['version'].startswith('go${MINOR}')))" 2>/dev/null | sed 's/^go//')
+
+          if [ -z "$LATEST" ]; then
+            echo "current=${CURRENT}" > go-toolchain.txt
+            echo "latest=unknown" >> go-toolchain.txt
+            echo "stale=false" >> go-toolchain.txt
+          elif [ "$CURRENT" = "$LATEST" ]; then
+            echo "current=${CURRENT}" > go-toolchain.txt
+            echo "latest=${LATEST}" >> go-toolchain.txt
+            echo "stale=false" >> go-toolchain.txt
+          else
+            echo "current=${CURRENT}" > go-toolchain.txt
+            echo "latest=${LATEST}" >> go-toolchain.txt
+            echo "stale=true" >> go-toolchain.txt
+          fi
+
       - name: Upload dependency analysis
         uses: actions/upload-artifact@v4
         with:
@@ -137,6 +162,7 @@ jobs:
             base-graph-size.txt
             pr-graph-size.txt
             vulncheck-results.txt
+            go-toolchain.txt
 
   post-comment:
     if: github.event.pull_request.head.repo.full_name == github.repository
@@ -163,11 +189,18 @@ jobs:
             const baseGraphSize = fs.readFileSync('dep-analysis/base-graph-size.txt', 'utf8').trim();
             const prGraphSize = fs.readFileSync('dep-analysis/pr-graph-size.txt', 'utf8').trim();
             let vulncheck = fs.readFileSync('dep-analysis/vulncheck-results.txt', 'utf8').trim();
+            const toolchainData = fs.readFileSync('dep-analysis/go-toolchain.txt', 'utf8').trim();
 
             const MAX_VULNCHECK_LEN = 10000;
             if (vulncheck.length > MAX_VULNCHECK_LEN) {
               vulncheck = vulncheck.substring(0, MAX_VULNCHECK_LEN) + '\n... (truncated, see workflow run for full output)';
             }
+
+            // --- Parse Go toolchain freshness ---
+            const tcLines = Object.fromEntries(toolchainData.split('\n').map(l => l.split('=')));
+            const goCurrent = tcLines.current || 'unknown';
+            const goLatest = tcLines.latest || 'unknown';
+            const goStale = tcLines.stale === 'true';
 
             // --- Compute metrics ---
             const diff = prSize - baseSize;
@@ -197,6 +230,9 @@ jobs:
             const vulnIcon = hasVulns ? '⚠️' : '✅';
             if (hasVulns) flags.push('vulnerabilities found');
 
+            const goIcon = goStale ? '⚠️' : '✅';
+            if (goStale) flags.push(`Go toolchain outdated (${goCurrent} → ${goLatest})`);
+
             const depsIcon = depsChanged > 0 ? 'ℹ️' : '✅';
 
             const overallIcon = flags.length > 0 ? '⚠️' : '✅';
@@ -222,6 +258,7 @@ jobs:
             | Binary size | ${sizeIcon} | ${fmt(prSize)} (${sign}${(diff / 1024).toFixed(1)} KB / ${sign}${pct}%) |
             | Dependencies | ${depsIcon} | ${depsChanged > 0 ? `${addedDeps.length} added, ${removedDeps.length} removed` : 'No changes'} |
             | Vulnerabilities | ${vulnIcon} | ${hasVulns ? 'Issues found — expand details below' : 'None detected'} |
+            | Go toolchain | ${goIcon} | ${goCurrent}${goStale ? ` → ${goLatest} available` : ' (latest)'} |
             | Module graph | ✅ | ${prGraphSize} edges (${graphSign}${graphDiff}) |
 
             <details>
@@ -327,6 +364,7 @@ jobs:
               SIZE_WARNING: 'metrics: size-warning',
               SIZE_ALERT: 'metrics: size-alert',
               VULNS: 'metrics: vulns-found',
+              GO_UPDATE: 'metrics: go-update',
             };
 
             const ensureLabel = async (name, color, description) => {
@@ -351,6 +389,7 @@ jobs:
             await ensureLabel(LABELS.SIZE_WARNING, 'fbca04', 'Binary size increased 5-10%');
             await ensureLabel(LABELS.SIZE_ALERT, 'e11d48', 'Binary size increased >10%');
             await ensureLabel(LABELS.VULNS, 'e11d48', 'govulncheck found vulnerabilities');
+            await ensureLabel(LABELS.GO_UPDATE, 'fbca04', 'Go toolchain has a newer patch release');
 
             if (diff > 0 && absPct >= 10) {
               await addLabel(LABELS.SIZE_ALERT);
@@ -368,4 +407,11 @@ jobs:
               await addLabel(LABELS.VULNS);
             } else {
               await removeLabel(LABELS.VULNS);
+            }
+
+            // Go toolchain label
+            if (goStale) {
+              await addLabel(LABELS.GO_UPDATE);
+            } else {
+              await removeLabel(LABELS.GO_UPDATE);
             }
