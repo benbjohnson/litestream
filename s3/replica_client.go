@@ -200,17 +200,6 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		return nil, fmt.Errorf("bucket required for s3 replica URL")
 	}
 
-	// Detect S3-compatible provider endpoints for applying appropriate defaults.
-	isHetzner := litestream.IsHetznerEndpoint(endpoint)
-	isTigris := litestream.IsTigrisEndpoint(endpoint)
-	isDigitalOcean := litestream.IsDigitalOceanEndpoint(endpoint)
-	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
-	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
-	isScaleway := litestream.IsScalewayEndpoint(endpoint)
-	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
-	isMinIO := litestream.IsMinIOEndpoint(endpoint)
-	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
-
 	// Track if forcePathStyle was explicitly set via query parameter.
 	forcePathStyleSet := query.Get("forcePathStyle") != "" || query.Get("force-path-style") != ""
 
@@ -225,6 +214,26 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	} else if v := os.Getenv("LITESTREAM_SECRET_ACCESS_KEY"); v != "" {
 		client.SecretAccessKey = v
 	}
+
+	if endpoint == "" {
+		if v := os.Getenv("LITESTREAM_S3_ENDPOINT"); v != "" {
+			endpoint, _ = litestream.EnsureEndpointScheme(v)
+			if !forcePathStyleSet {
+				forcePathStyle = true
+			}
+		}
+	}
+
+	// Detect S3-compatible provider endpoints for applying appropriate defaults.
+	isHetzner := litestream.IsHetznerEndpoint(endpoint)
+	isTigris := litestream.IsTigrisEndpoint(endpoint)
+	isDigitalOcean := litestream.IsDigitalOceanEndpoint(endpoint)
+	isBackblaze := litestream.IsBackblazeEndpoint(endpoint)
+	isFilebase := litestream.IsFilebaseEndpoint(endpoint)
+	isScaleway := litestream.IsScalewayEndpoint(endpoint)
+	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
+	isMinIO := litestream.IsMinIOEndpoint(endpoint)
+	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
 
 	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
