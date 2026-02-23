@@ -1731,7 +1731,7 @@ func TestWriteTXIDFile(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		data, err := os.ReadFile(dbPath + ".txid")
+		data, err := os.ReadFile(dbPath + "-txid")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1779,7 +1779,7 @@ func TestReadTXIDFile(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "test.db")
 
-		if err := os.WriteFile(dbPath+".txid", []byte("00000000000000ff\n"), 0644); err != nil {
+		if err := os.WriteFile(dbPath+"-txid", []byte("00000000000000ff\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1796,7 +1796,7 @@ func TestReadTXIDFile(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "test.db")
 
-		if err := os.WriteFile(dbPath+".txid", []byte("not-a-hex-value\n"), 0644); err != nil {
+		if err := os.WriteFile(dbPath+"-txid", []byte("not-a-hex-value\n"), 0644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -1810,7 +1810,7 @@ func TestReadTXIDFile(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "test.db")
 
-		if err := os.WriteFile(dbPath+".txid", []byte(""), 0644); err != nil {
+		if err := os.WriteFile(dbPath+"-txid", []byte(""), 0644); err != nil {
 			t.Fatal(err)
 		}
 
@@ -2064,8 +2064,8 @@ func TestReplica_Restore_Follow_WriteTXIDFile(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Verify .txid file was created after initial restore.
-	txidPath := outputPath + ".txid"
+	// Verify -txid file was created after initial restore.
+	txidPath := outputPath + "-txid"
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(txidPath); err == nil {
@@ -2164,10 +2164,10 @@ func TestReplica_Restore_Follow_CrashRecovery(t *testing.T) {
 		})
 	}()
 
-	// Wait for initial restore and .txid file.
+	// Wait for initial restore and -txid file.
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if _, err := os.Stat(outputPath + ".txid"); err == nil {
+		if _, err := os.Stat(outputPath + "-txid"); err == nil {
 			break
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -2192,11 +2192,11 @@ func TestReplica_Restore_Follow_CrashRecovery(t *testing.T) {
 		t.Fatal("follow did not shut down within timeout")
 	}
 
-	// Verify DB and .txid file still exist.
+	// Verify DB and -txid file still exist.
 	if _, err := os.Stat(outputPath); err != nil {
 		t.Fatalf("database file missing after crash: %v", err)
 	}
-	if _, err := os.Stat(outputPath + ".txid"); err != nil {
+	if _, err := os.Stat(outputPath + "-txid"); err != nil {
 		t.Fatalf("txid file missing after crash: %v", err)
 	}
 
@@ -2260,7 +2260,7 @@ func TestReplica_Restore_Follow_NoTXIDFile(t *testing.T) {
 	c := file.NewReplicaClient(t.TempDir())
 	r := litestream.NewReplicaWithClient(db, c)
 
-	// Create a database file but no .txid sidecar.
+	// Create a database file but no -txid sidecar.
 	outputPath := t.TempDir() + "/existing.db"
 	if err := os.WriteFile(outputPath, []byte("fake-db"), 0644); err != nil {
 		t.Fatal(err)
@@ -2272,9 +2272,9 @@ func TestReplica_Restore_Follow_NoTXIDFile(t *testing.T) {
 		FollowInterval: 50 * time.Millisecond,
 	})
 	if err == nil {
-		t.Fatal("expected error when DB exists but no .txid file")
+		t.Fatal("expected error when DB exists but no -txid file")
 	}
-	if !strings.Contains(err.Error(), "no .txid file found") {
+	if !strings.Contains(err.Error(), "no -txid file found") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
