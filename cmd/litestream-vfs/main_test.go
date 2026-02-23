@@ -1820,6 +1820,133 @@ func TestVFS_PollIntervalEdgeCases(t *testing.T) {
 	}
 }
 
+func TestVFS_PooledWriteNoFalseConflict(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE seed (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatalf("create seed table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO seed (id) VALUES (1)"); err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+
+	require.Eventually(t, func() bool {
+		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
+		if err != nil {
+			return false
+		}
+		defer itr.Close()
+		return itr.Next()
+	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	forceReplicaSync(t, db)
+
+	vfs := newVFS(t, client)
+	vfs.WriteEnabled = true
+	vfs.WriteSyncInterval = 0
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+
+	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(t.TempDir(), "pooled-write.db")), vfsName)
+	sqldb, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open write db: %v", err)
+	}
+	defer sqldb.Close()
+	sqldb.SetMaxOpenConns(2)
+	sqldb.SetMaxIdleConns(2)
+
+	if _, err := sqldb.Exec("PRAGMA busy_timeout = 5000"); err != nil {
+		t.Fatalf("set busy timeout: %v", err)
+	}
+	if _, err := sqldb.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	const totalWrites = 20
+	for i := 1; i <= totalWrites; i++ {
+		if _, err := sqldb.Exec("INSERT INTO t (id, value) VALUES (?, ?)", i, fmt.Sprintf("row-%d", i)); err != nil {
+			if strings.Contains(err.Error(), "conflict") || errors.Is(err, litestream.ErrConflict) {
+				t.Fatalf("false ErrConflict on write %d: %v", i, err)
+			}
+			t.Fatalf("write %d failed: %v", i, err)
+		}
+	}
+
+	var count int
+	if err := sqldb.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != totalWrites {
+		t.Fatalf("expected %d rows, got %d", totalWrites, count)
+	}
+}
+
+func TestVFS_PooledWriteStress(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+
+	db, primary := openReplicatedPrimary(t, client, 25*time.Millisecond, 25*time.Millisecond)
+	defer testingutil.MustCloseSQLDB(t, primary)
+
+	if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT)"); err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+	if _, err := primary.Exec("INSERT INTO t (value) VALUES ('seed')"); err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
+
+	require.Eventually(t, func() bool {
+		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
+		if err != nil {
+			return false
+		}
+		defer itr.Close()
+		return itr.Next()
+	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	forceReplicaSync(t, db)
+
+	vfs := newVFS(t, client)
+	vfs.WriteEnabled = true
+	vfs.WriteSyncInterval = 10 * time.Millisecond
+	vfs.PollInterval = 25 * time.Millisecond
+	vfsName := registerTestVFS(t, vfs)
+
+	dsn := fmt.Sprintf("file:%s?vfs=%s&_busy_timeout=5000", filepath.ToSlash(filepath.Join(t.TempDir(), "stress-write.db")), vfsName)
+	sqldb, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		t.Fatalf("open write db: %v", err)
+	}
+	defer sqldb.Close()
+	sqldb.SetMaxOpenConns(4)
+	sqldb.SetMaxIdleConns(4)
+
+	const totalWrites = 50
+	for i := 0; i < totalWrites; i++ {
+		if _, err := sqldb.Exec("INSERT INTO t (value) VALUES (?)", fmt.Sprintf("row-%d", i)); err != nil {
+			if strings.Contains(err.Error(), "conflict") || errors.Is(err, litestream.ErrConflict) {
+				t.Fatalf("false ErrConflict on write %d: %v", i, err)
+			}
+			t.Fatalf("write %d failed: %v", i, err)
+		}
+		// Brief pause every 5 writes to allow sync ticker to fire,
+		// which causes TXID advancement and exercises the coordination logic
+		if (i+1)%5 == 0 {
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+
+	var count int
+	if err := sqldb.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	expected := totalWrites + 1 // +1 for seed row
+	if count != expected {
+		t.Fatalf("expected %d rows, got %d", expected, count)
+	}
+}
+
 func newVFS(tb testing.TB, client litestream.ReplicaClient) *testVFS {
 	tb.Helper()
 
