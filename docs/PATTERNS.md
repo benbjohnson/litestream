@@ -132,6 +132,22 @@ func writeFileDirect(path string, data []byte) error {
 
 ## Error Handling
 
+### Decision Rule
+
+When you handle an error, ask: "Does the caller need to know about this failure?"
+
+- **Yes → return the error.** This is the default for virtually all cases in Litestream.
+  - The result is needed for correctness
+  - Failure could corrupt data or state
+  - You're in a loop processing items
+
+- **No → DEBUG log only.** This is rare. Only when ALL of these are true:
+  - A valid fallback path exists that doesn't depend on the result
+  - Failure cannot affect correctness
+  - The operation is purely supplementary (e.g., reading an optimization hint)
+
+When in doubt, return the error. In a disaster recovery tool, silent failures are worse than noisy ones.
+
 ### DO: Return errors immediately
 
 ```go

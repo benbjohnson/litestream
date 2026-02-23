@@ -2,6 +2,10 @@
 
 Claude-specific optimizations for Litestream. See [AGENTS.md](AGENTS.md) for project documentation.
 
+## Critical Coding Rules
+
+- **Always return errors, never log and continue.** The only exception is DEBUG logging for best-effort operations that don't affect correctness. This is the #1 cause of PR review feedback. See [docs/PATTERNS.md](docs/PATTERNS.md#error-handling) for the full decision framework.
+
 ## Context Window
 
 With Claude's large context window, load documentation as needed:
