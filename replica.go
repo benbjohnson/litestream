@@ -1370,9 +1370,17 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 		}
 	}
 
-	// Return an error if we are unable to find any set of LTX files before
-	// target TXID. This shouldn't happen under normal circumstances. Only if
-	// lower level LTX files are removed before a snapshot has occurred.
+	if len(infos) > 0 && txID == 0 && timestamp.IsZero() {
+		for _, cursor := range cursors {
+			if err := cursor.ensureCurrent(); err != nil {
+				return nil, err
+			}
+			if cursor.current != nil && cursor.current.MinTXID > currentMax+1 {
+				return nil, fmt.Errorf("non-contiguous ltx files: have up to %s but next file starts at %s", currentMax, cursor.current.MinTXID)
+			}
+		}
+	}
+
 	if len(infos) == 0 {
 		return nil, ErrTxNotAvailable
 	}

@@ -342,7 +342,7 @@ func TestVFS_WriteBufferDiscardedOnOpen(t *testing.T) {
 	require.NoError(t, err)
 
 	// Verify write buffer file exists
-	bufferPath := filepath.Join(bufferDir, ".litestream-write-buffer")
+	bufferPath := filepath.Join(bufferDir, ".litestream-buffer")
 	_, err = os.Stat(bufferPath)
 	require.NoError(t, err, "write buffer file should exist")
 

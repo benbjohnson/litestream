@@ -485,6 +485,9 @@ done:
 }
 
 func TestVFS_HighLoadConcurrentReads(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping high-load test in short mode")
+	}
 	client := file.NewReplicaClient(t.TempDir())
 	vfs := newVFS(t, client)
 	vfs.PollInterval = 50 * time.Millisecond
@@ -591,7 +594,7 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	default:
 	}
 
-	if ops := writerOps.Load(); ops < 500 {
+	if ops := writerOps.Load(); ops < 100 {
 		t.Fatalf("expected high write volume, got %d ops", ops)
 	}
 

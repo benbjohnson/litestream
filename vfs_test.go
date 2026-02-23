@@ -149,11 +149,11 @@ func TestVFSFile_PendingIndexRace(t *testing.T) {
 	}()
 
 	var wg sync.WaitGroup
-	buf := make([]byte, 4096)
 	for i := 0; i < 8; i++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
+			buf := make([]byte, 4096)
 			for {
 				select {
 				case <-ctx.Done():

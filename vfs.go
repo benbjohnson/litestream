@@ -2442,7 +2442,12 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
 	combined := make(map[uint32]ltx.PageIndexElem)
+
+	f.mu.Lock()
 	baseCommit := f.commit
+	maxTXID1Snapshot := f.maxTXID1
+	f.mu.Unlock()
+
 	newCommit := baseCommit
 	replaceIndex := false
 
@@ -2467,7 +2472,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		}
 	}
 
-	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, f.maxTXID1, baseCommit)
+	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
 	}
