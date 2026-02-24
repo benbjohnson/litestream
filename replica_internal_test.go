@@ -3,6 +3,7 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"fmt"
 	"io"
 	"os"
@@ -11,6 +12,8 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+
+	_ "modernc.org/sqlite"
 )
 
 func TestReplica_ApplyNewLTXFiles_FillGapWithOverlappingCompactedFile(t *testing.T) {
@@ -276,4 +279,84 @@ func mustCreateWritableDBFile(tb testing.TB) *os.File {
 
 func ltxFixtureKey(level int, minTXID, maxTXID ltx.TXID) string {
 	return fmt.Sprintf("%d:%s:%s", level, minTXID, maxTXID)
+}
+
+func mustCreateValidSQLiteDB(tb testing.TB) string {
+	tb.Helper()
+	dbPath := filepath.Join(tb.TempDir(), "test.db")
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		tb.Fatal(err)
+	}
+	defer func() { _ = db.Close() }()
+	if _, err := db.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"); err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := db.Exec("INSERT INTO t (name) VALUES ('a'), ('b'), ('c')"); err != nil {
+		tb.Fatal(err)
+	}
+	if _, err := db.Exec("CREATE INDEX idx_t_name ON t(name)"); err != nil {
+		tb.Fatal(err)
+	}
+	return dbPath
+}
+
+func TestCheckIntegrity_Quick_ValidDB(t *testing.T) {
+	dbPath := mustCreateValidSQLiteDB(t)
+	if err := checkIntegrity(dbPath, IntegrityCheckQuick); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+}
+
+func TestCheckIntegrity_Full_ValidDB(t *testing.T) {
+	dbPath := mustCreateValidSQLiteDB(t)
+	if err := checkIntegrity(dbPath, IntegrityCheckFull); err != nil {
+		t.Fatalf("expected no error, got: %v", err)
+	}
+}
+
+func TestCheckIntegrity_None_Skips(t *testing.T) {
+	if err := checkIntegrity("/nonexistent/path.db", IntegrityCheckNone); err != nil {
+		t.Fatalf("expected nil for IntegrityCheckNone, got: %v", err)
+	}
+}
+
+func TestCheckIntegrity_CorruptDB(t *testing.T) {
+	dbPath := mustCreateValidSQLiteDB(t)
+
+	// Remove any WAL/SHM files so we have a clean single-file database.
+	_ = os.Remove(dbPath + "-wal")
+	_ = os.Remove(dbPath + "-shm")
+
+	// Read the page size from the database header (bytes 16-17, big-endian).
+	f, err := os.OpenFile(dbPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Corrupt page 2 onwards. Page 1 is the header/schema page. Corrupting
+	// pages that contain table/index data triggers integrity check failures.
+	// We overwrite from byte offset 4096 (start of page 2 for 4096-byte pages,
+	// which is the default) with garbage data.
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+
+	// Overwrite everything after the first page with garbage to ensure corruption.
+	pageSize := int64(4096)
+	if info.Size() > pageSize {
+		garbage := bytes.Repeat([]byte{0xDE}, int(info.Size()-pageSize))
+		if _, err := f.WriteAt(garbage, pageSize); err != nil {
+			_ = f.Close()
+			t.Fatal(err)
+		}
+	}
+	_ = f.Close()
+
+	err = checkIntegrity(dbPath, IntegrityCheckFull)
+	if err == nil {
+		t.Fatal("expected integrity check to fail on corrupt database")
+	}
 }

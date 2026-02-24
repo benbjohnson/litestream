@@ -30,6 +30,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
+	integrityCheck := fs.String("integrity-check", "none", "post-restore integrity check: none, quick, or full")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -55,6 +56,17 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}()
 		ctx = cancelCtx
 		defer cancel()
+	}
+
+	switch *integrityCheck {
+	case "none":
+		opt.IntegrityCheck = litestream.IntegrityCheckNone
+	case "quick":
+		opt.IntegrityCheck = litestream.IntegrityCheckQuick
+	case "full":
+		opt.IntegrityCheck = litestream.IntegrityCheckFull
+	default:
+		return fmt.Errorf("invalid -integrity-check value: %s", *integrityCheck)
 	}
 
 	// Parse timestamp, if specified.
@@ -210,6 +222,11 @@ Arguments:
 	-parallelism NUM
 	    Determines the number of WAL files downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
+
+	-integrity-check MODE
+	    Run a post-restore integrity check on the database.
+	    MODE is one of: none, quick, full.
+	    Defaults to none.
 
 
 Examples:
