@@ -1,0 +1,417 @@
+name: PR Build Metrics
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: pr-metrics-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  build-base:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+
+      - name: Set up Go
+        id: setup-go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Cache base binary
+        id: cache-base
+        uses: actions/cache@v4
+        with:
+          path: litestream-base
+          key: pr-metrics-base-${{ github.event.pull_request.base.sha }}-${{ steps.setup-go.outputs.go-version }}
+
+      - name: Build base binary
+        if: steps.cache-base.outputs.cache-hit != 'true'
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o litestream-base ./cmd/litestream
+
+      - name: Record base binary size
+        run: stat --format=%s litestream-base > base-size.txt
+
+      - name: Upload base size
+        uses: actions/upload-artifact@v4
+        with:
+          name: base-size
+          path: base-size.txt
+
+  build-pr:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build PR binary
+        run: |
+          START=$SECONDS
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o litestream-pr ./cmd/litestream
+          echo "$((SECONDS - START))" > build-time.txt
+          go version | awk '{print $3}' > go-version.txt
+
+      - name: Record PR binary size
+        run: stat --format=%s litestream-pr > pr-size.txt
+
+      - name: Upload PR size
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-size
+          path: pr-size.txt
+
+      - name: Upload build info
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-info
+          path: |
+            build-time.txt
+            go-version.txt
+
+  analyze-deps:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          path: pr
+
+      - name: Checkout base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: pr/go.mod
+
+      - name: Diff go.mod dependencies
+        run: |
+          extract_require_deps() {
+            local gomod="$1"
+            awk '/^require \(/{found=1; next} found && /^\)/{found=0} found && /^\t/' "$gomod" | sed 's/^\t//' | sort
+          }
+          extract_require_deps base/go.mod > /tmp/base-deps.txt
+          extract_require_deps pr/go.mod > /tmp/pr-deps.txt
+
+          {
+            echo "## Added"
+            comm -13 /tmp/base-deps.txt /tmp/pr-deps.txt
+            echo "## Removed"
+            comm -23 /tmp/base-deps.txt /tmp/pr-deps.txt
+          } > deps-diff.txt
+
+      - name: Module graph size
+        run: |
+          cd base && go mod graph | wc -l | tr -d ' ' > ../base-graph-size.txt && cd ..
+          cd pr && go mod graph | wc -l | tr -d ' ' > ../pr-graph-size.txt && cd ..
+
+      - name: Run govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          cd pr
+          govulncheck ./... > ../vulncheck-results.txt 2>&1 || true
+
+      - name: Check Go toolchain freshness
+        run: |
+          CURRENT=$(grep '^toolchain ' pr/go.mod | awk '{print $2}' | sed 's/^go//')
+          if [ -z "$CURRENT" ]; then
+            CURRENT=$(grep '^go ' pr/go.mod | awk '{print $2}')
+          fi
+          MINOR=$(echo "$CURRENT" | grep -oE '^[0-9]+\.[0-9]+')
+
+          LATEST=$(curl -sf 'https://go.dev/dl/?mode=json&include=all' | \
+            python3 -c "import sys,json; releases=json.load(sys.stdin); print(next(r['version'] for r in releases if r['stable'] and r['version'].startswith('go${MINOR}.')))" 2>/dev/null | sed 's/^go//')
+
+          if [ -z "$LATEST" ]; then
+            echo "current=${CURRENT}" > go-toolchain.txt
+            echo "latest=unknown" >> go-toolchain.txt
+            echo "stale=false" >> go-toolchain.txt
+          elif [ "$CURRENT" = "$LATEST" ]; then
+            echo "current=${CURRENT}" > go-toolchain.txt
+            echo "latest=${LATEST}" >> go-toolchain.txt
+            echo "stale=false" >> go-toolchain.txt
+          else
+            echo "current=${CURRENT}" > go-toolchain.txt
+            echo "latest=${LATEST}" >> go-toolchain.txt
+            echo "stale=true" >> go-toolchain.txt
+          fi
+
+      - name: Upload dependency analysis
+        uses: actions/upload-artifact@v4
+        with:
+          name: dep-analysis
+          path: |
+            deps-diff.txt
+            base-graph-size.txt
+            pr-graph-size.txt
+            vulncheck-results.txt
+            go-toolchain.txt
+
+  post-comment:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    needs: [build-base, build-pr, analyze-deps]
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+
+      - name: Post PR comment and manage labels
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const issue_number = context.issue.number;
+
+            const baseSize = parseInt(fs.readFileSync('base-size/base-size.txt', 'utf8').trim());
+            const prSize = parseInt(fs.readFileSync('pr-size/pr-size.txt', 'utf8').trim());
+            const buildTime = fs.readFileSync('build-info/build-time.txt', 'utf8').trim();
+            const goVersion = fs.readFileSync('build-info/go-version.txt', 'utf8').trim();
+            const depsDiff = fs.readFileSync('dep-analysis/deps-diff.txt', 'utf8').trim();
+            const baseGraphSize = fs.readFileSync('dep-analysis/base-graph-size.txt', 'utf8').trim();
+            const prGraphSize = fs.readFileSync('dep-analysis/pr-graph-size.txt', 'utf8').trim();
+            let vulncheck = fs.readFileSync('dep-analysis/vulncheck-results.txt', 'utf8').trim();
+            const toolchainData = fs.readFileSync('dep-analysis/go-toolchain.txt', 'utf8').trim();
+
+            const MAX_VULNCHECK_LEN = 10000;
+            if (vulncheck.length > MAX_VULNCHECK_LEN) {
+              vulncheck = vulncheck.substring(0, MAX_VULNCHECK_LEN) + '\n... (truncated, see workflow run for full output)';
+            }
+
+            // --- Parse Go toolchain freshness ---
+            const tcLines = Object.fromEntries(toolchainData.split('\n').map(l => l.split('=')));
+            const goCurrent = tcLines.current || 'unknown';
+            const goLatest = tcLines.latest || 'unknown';
+            const goStale = tcLines.stale === 'true';
+
+            // --- Compute metrics ---
+            const diff = prSize - baseSize;
+            const absPct = baseSize > 0 ? Math.abs((diff / baseSize) * 100) : 0;
+            const pct = baseSize > 0 ? ((diff / baseSize) * 100).toFixed(2) : 'N/A';
+            const sign = diff > 0 ? '+' : '';
+            const fmt = (bytes) => (bytes / 1024 / 1024).toFixed(2) + ' MB';
+
+            const addedSection = depsDiff.split('## Removed')[0].replace('## Added', '').trim();
+            const removedSection = depsDiff.split('## Removed')[1]?.trim() || '';
+            const addedDeps = addedSection ? addedSection.split('\n').filter(l => l.trim()) : [];
+            const removedDeps = removedSection ? removedSection.split('\n').filter(l => l.trim()) : [];
+            const depsChanged = addedDeps.length + removedDeps.length;
+
+            const graphDiff = parseInt(prGraphSize) - parseInt(baseGraphSize);
+            const graphSign = graphDiff > 0 ? '+' : '';
+
+            const hasVulns = vulncheck.includes('Vulnerability #') || vulncheck.includes('GO-');
+
+            // --- Determine status ---
+            const flags = [];
+            let sizeIcon = '✅';
+            if (diff > 0 && absPct >= 10) { sizeIcon = '🚨'; flags.push('binary size >10%'); }
+            else if (diff > 0 && absPct >= 5) { sizeIcon = '⚠️'; flags.push('binary size >5%'); }
+            else if (diff < 0) { sizeIcon = '📉'; }
+
+            const vulnIcon = hasVulns ? '⚠️' : '✅';
+            if (hasVulns) flags.push('vulnerabilities found');
+
+            const goIcon = goStale ? '⚠️' : '✅';
+            if (goStale) flags.push(`Go toolchain outdated (${goCurrent} → ${goLatest})`);
+
+            const depsIcon = depsChanged > 0 ? 'ℹ️' : '✅';
+
+            const overallIcon = flags.length > 0 ? '⚠️' : '✅';
+            const overallText = flags.length > 0
+              ? `**Attention needed** — ${flags.join(', ')}`
+              : '**All clear** — no issues detected';
+
+            // --- Build compact comment ---
+            let depsDetail = 'No dependency changes.';
+            if (depsChanged > 0) {
+              const parts = [];
+              if (addedDeps.length > 0) parts.push('**Added:**\n' + addedDeps.map(d => `- \`${d}\``).join('\n'));
+              if (removedDeps.length > 0) parts.push('**Removed:**\n' + removedDeps.map(d => `- \`${d}\``).join('\n'));
+              depsDetail = parts.join('\n\n');
+            }
+
+            const body = `## PR Build Metrics
+
+            ${overallIcon} ${overallText}
+
+            | Check | Status | Summary |
+            |:------|:------:|:--------|
+            | Binary size | ${sizeIcon} | ${fmt(prSize)} (${sign}${(diff / 1024).toFixed(1)} KB / ${sign}${pct}%) |
+            | Dependencies | ${depsIcon} | ${depsChanged > 0 ? `${addedDeps.length} added, ${removedDeps.length} removed` : 'No changes'} |
+            | Vulnerabilities | ${vulnIcon} | ${hasVulns ? 'Issues found — expand details below' : 'None detected'} |
+            | Go toolchain | ${goIcon} | ${goCurrent}${goStale ? ` → ${goLatest} available` : ' (latest)'} |
+            | Module graph | ✅ | ${prGraphSize} edges (${graphSign}${graphDiff}) |
+
+            <details>
+            <summary>Binary size details</summary>
+
+            | | Size | Change |
+            |---|---:|---:|
+            | Base (\`${context.payload.pull_request.base.sha.substring(0, 7)}\`) | ${fmt(baseSize)} | |
+            | PR (\`${context.sha.substring(0, 7)}\`) | ${fmt(prSize)} | ${sign}${(diff / 1024).toFixed(1)} KB (${sign}${pct}%) |
+
+            </details>
+
+            <details>
+            <summary>Dependency changes</summary>
+
+            ${depsDetail}
+
+            </details>
+
+            <details>
+            <summary>govulncheck output</summary>
+
+            \`\`\`
+            ${vulncheck}
+            \`\`\`
+
+            </details>
+
+            <details>
+            <summary>Build info</summary>
+
+            | Metric | Value |
+            |---|---|
+            | Build time | ${buildTime}s |
+            | Go version | \`${goVersion}\` |
+            | Commit | \`${context.sha.substring(0, 7)}\` |
+
+            </details>
+
+            <!-- history -->
+            ---
+            <sub>🤖 Updated on each push.</sub>`.replace(/^            /gm, '');
+
+            // --- Post or update comment (with history) ---
+            const marker = '## PR Build Metrics';
+            const historyMarker = '<!-- history -->';
+            let existing = null;
+            for await (const response of github.paginate.iterator(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 }
+            )) {
+              existing = response.data.find(c => c.body?.startsWith(marker));
+              if (existing) break;
+            }
+
+            if (existing) {
+              // Extract previous summary line and history from existing comment
+              const prevBody = existing.body;
+              const prevStatusMatch = prevBody.match(/\| Binary size \|[^\n]+/);
+              const prevCommitMatch = prevBody.match(/\| Commit \| `([^`]+)` \|/);
+              const prevSummary = prevStatusMatch ? prevStatusMatch[0] : null;
+              const prevCommit = prevCommitMatch ? prevCommitMatch[1] : '?';
+
+              // Extract existing history entries
+              let historyEntries = '';
+              const historyIdx = prevBody.indexOf(historyMarker);
+              if (historyIdx !== -1) {
+                const afterMarker = prevBody.substring(historyIdx + historyMarker.length);
+                const detailsMatch = afterMarker.match(/<details>[\s\S]*?<\/details>/);
+                if (detailsMatch) {
+                  const innerMatch = detailsMatch[0].match(/<summary>[^<]*<\/summary>([\s\S]*?)<\/details>/);
+                  if (innerMatch) historyEntries = innerMatch[1].trim();
+                }
+              }
+
+              // Build new history (most recent first, cap at 10)
+              const now = new Date().toISOString().replace('T', ' ').substring(0, 16) + ' UTC';
+              const newEntry = prevSummary
+                ? `| \`${prevCommit}\` | ${now} | ${prevSummary.replace(/\| Binary size \|/, '').trim().replace(/^\||\|$/g, '').trim()} |`
+                : null;
+
+              let historyRows = '';
+              if (newEntry || historyEntries) {
+                const existingRows = historyEntries
+                  .split('\n')
+                  .filter(l => l.startsWith('|') && !l.startsWith('| Commit') && !l.startsWith('|:'))
+                  .slice(0, 9);
+                const allRows = newEntry ? [newEntry, ...existingRows] : existingRows;
+                if (allRows.length > 0) {
+                  historyRows = `\n<details>\n<summary>History (${allRows.length} previous)</summary>\n\n| Commit | Updated | Status | Summary |\n|:-------|:--------|:------:|:--------|\n${allRows.join('\n')}\n\n</details>`;
+                }
+              }
+
+              // Insert history into body
+              const finalBody = body.replace(historyMarker, historyMarker + historyRows);
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body: finalBody });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+            // --- Manage labels ---
+            const LABELS = {
+              SIZE_WARNING: 'metrics: size-warning',
+              SIZE_ALERT: 'metrics: size-alert',
+              VULNS: 'metrics: vulns-found',
+              GO_UPDATE: 'metrics: go-update',
+            };
+
+            const ensureLabel = async (name, color, description) => {
+              try {
+                await github.rest.issues.getLabel({ owner, repo, name });
+              } catch {
+                await github.rest.issues.createLabel({ owner, repo, name, color, description });
+              }
+            };
+
+            const addLabel = async (name) => {
+              await github.rest.issues.addLabels({ owner, repo, issue_number, labels: [name] });
+            };
+
+            const removeLabel = async (name) => {
+              try {
+                await github.rest.issues.removeLabel({ owner, repo, issue_number, name });
+              } catch { /* label not present, ignore */ }
+            };
+
+            // Size labels
+            await ensureLabel(LABELS.SIZE_WARNING, 'fbca04', 'Binary size increased 5-10%');
+            await ensureLabel(LABELS.SIZE_ALERT, 'e11d48', 'Binary size increased >10%');
+            await ensureLabel(LABELS.VULNS, 'e11d48', 'govulncheck found vulnerabilities');
+            await ensureLabel(LABELS.GO_UPDATE, 'fbca04', 'Go toolchain has a newer patch release');
+
+            if (diff > 0 && absPct >= 10) {
+              await addLabel(LABELS.SIZE_ALERT);
+              await removeLabel(LABELS.SIZE_WARNING);
+            } else if (diff > 0 && absPct >= 5) {
+              await addLabel(LABELS.SIZE_WARNING);
+              await removeLabel(LABELS.SIZE_ALERT);
+            } else {
+              await removeLabel(LABELS.SIZE_WARNING);
+              await removeLabel(LABELS.SIZE_ALERT);
+            }
+
+            // Vuln label
+            if (hasVulns) {
+              await addLabel(LABELS.VULNS);
+            } else {
+              await removeLabel(LABELS.VULNS);
+            }
+
+            // Go toolchain label
+            if (goStale) {
+              await addLabel(LABELS.GO_UPDATE);
+            } else {
+              await removeLabel(LABELS.GO_UPDATE);
+            }
