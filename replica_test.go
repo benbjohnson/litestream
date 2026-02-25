@@ -2351,6 +2351,73 @@ func TestReplica_Restore_Follow_StaleTXID(t *testing.T) {
 	}
 }
 
+func TestReplica_Restore_Follow_AheadTXID(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 10_000); err != nil {
+		t.Fatal(err)
+	}
+
+	// Ensure snapshot-based validation path is used.
+	level0Dir := c.LTXLevelDir(0)
+	if entries, err := os.ReadDir(level0Dir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(level0Dir, e.Name()))
+		}
+	}
+	snapshotDir := c.LTXLevelDir(litestream.SnapshotLevel)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snapshotDir, "0000000000000001-000000000000000a.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for TXID ahead of latest snapshot")
+	}
+	if !strings.Contains(err.Error(), "ahead of latest snapshot") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestReplica_Restore_Follow_StaleTXID_NoSnapshots(t *testing.T) {
 	ctx := context.Background()
 
@@ -2485,6 +2552,198 @@ func TestReplica_Restore_Follow_StaleTXID_NoSnapshotsWithGap(t *testing.T) {
 		t.Fatal("expected error for saved TXID in unavailable range")
 	}
 	if !strings.Contains(err.Error(), "next TXID") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplica_Restore_Follow_AheadTXID_NoSnapshots(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 50); err != nil {
+		t.Fatal(err)
+	}
+
+	for level := 0; level < litestream.SnapshotLevel; level++ {
+		levelDir := c.LTXLevelDir(level)
+		if entries, err := os.ReadDir(levelDir); err == nil {
+			for _, e := range entries {
+				os.Remove(filepath.Join(levelDir, e.Name()))
+			}
+		}
+	}
+
+	level0Dir := c.LTXLevelDir(0)
+	if err := os.MkdirAll(level0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(level0Dir, "0000000000000001-000000000000000a.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotDir := c.LTXLevelDir(litestream.SnapshotLevel)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for TXID ahead of latest available LTX file")
+	}
+	if !strings.Contains(err.Error(), "ahead of latest available LTX file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplica_Restore_Follow_UncoveredSavedTXID_NoSnapshots(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 15); err != nil {
+		t.Fatal(err)
+	}
+
+	for level := 0; level < litestream.SnapshotLevel; level++ {
+		levelDir := c.LTXLevelDir(level)
+		if entries, err := os.ReadDir(levelDir); err == nil {
+			for _, e := range entries {
+				os.Remove(filepath.Join(levelDir, e.Name()))
+			}
+		}
+	}
+
+	level0Dir := c.LTXLevelDir(0)
+	if err := os.MkdirAll(level0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(level0Dir, "0000000000000001-000000000000000a.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(level0Dir, "0000000000000014-000000000000001e.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotDir := c.LTXLevelDir(litestream.SnapshotLevel)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for saved TXID not covered by available ranges")
+	}
+	if !strings.Contains(err.Error(), "saved TXID") || !strings.Contains(err.Error(), "not covered by any available LTX file range") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplica_Restore_Follow_NoSnapshotsAndNoLTXFiles(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	for level := 0; level <= litestream.SnapshotLevel; level++ {
+		levelDir := c.LTXLevelDir(level)
+		if entries, err := os.ReadDir(levelDir); err == nil {
+			for _, e := range entries {
+				os.Remove(filepath.Join(levelDir, e.Name()))
+			}
+		}
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error when no snapshots and no LTX files are available")
+	}
+	if !strings.Contains(err.Error(), "no snapshots or LTX files available") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
