@@ -119,9 +119,25 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		}
 	}()
 
-	var minTXID, maxTXID ltx.TXID
+	var minTXID, maxTXID, expectedMinTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
+
+		// expectedMinTXID is zero until the first file is processed, then
+		// set to MaxTXID+1 after each file. We skip the contiguity check
+		// for the first file because LTXFiles filtering semantics vary
+		// across backends (e.g., file client filters by MinTXID, S3 by
+		// prefix) so we accept whatever the iterator returns first.
+		if expectedMinTXID != 0 && info.MinTXID != expectedMinTXID {
+			if info.MinTXID < expectedMinTXID {
+				return nil, fmt.Errorf("overlapping transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
+			}
+			c.logger.Warn("stopping compaction at TXID gap",
+				"level", srcLevel,
+				"expected_min_txid", expectedMinTXID,
+				"actual_min_txid", info.MinTXID)
+			break
+		}
 
 		if minTXID == 0 || info.MinTXID < minTXID {
 			minTXID = info.MinTXID
@@ -133,6 +149,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		if c.LocalFileOpener != nil {
 			if f, err := c.LocalFileOpener(srcLevel, info.MinTXID, info.MaxTXID); err == nil {
 				rdrs = append(rdrs, f)
+				expectedMinTXID = info.MaxTXID + 1
 				continue
 			} else if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("open local ltx file: %w", err)
@@ -144,6 +161,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
 		rdrs = append(rdrs, f)
+		expectedMinTXID = info.MaxTXID + 1
 	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction
