@@ -610,6 +610,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
+	defer func() { _ = os.Remove(tmpOutputPath) }()
 	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
 
 	f, err := os.Create(tmpOutputPath)

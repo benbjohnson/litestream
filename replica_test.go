@@ -857,6 +857,79 @@ func TestReplica_Restore_InvalidFileSize(t *testing.T) {
 	})
 }
 
+func TestReplica_Restore_OutputPathExists(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	var c mock.ReplicaClient
+	r := litestream.NewReplicaWithClient(db, &c)
+
+	outputPath := t.TempDir() + "/existing.db"
+	if err := os.WriteFile(outputPath, []byte("existing"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: outputPath})
+	if err == nil || !strings.Contains(err.Error(), "already exists") {
+		t.Fatalf("expected 'already exists' error, got %v", err)
+	}
+}
+
+func TestReplica_Restore_CleanupTempFileOnDecodeError(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	var c mock.ReplicaClient
+	c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+		if level == litestream.SnapshotLevel {
+			return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+				Level:   litestream.SnapshotLevel,
+				MinTXID: 1,
+				MaxTXID: 1,
+				Size:    ltx.HeaderSize,
+			}}), nil
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	c.OpenLTXFileFunc = func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset int64, size int64) (io.ReadCloser, error) {
+		return io.NopCloser(strings.NewReader("not-an-ltx")), nil
+	}
+
+	r := litestream.NewReplicaWithClient(db, &c)
+	outputPath := t.TempDir() + "/restored.db"
+	tmpPath := outputPath + ".tmp"
+
+	err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: outputPath})
+	if err == nil {
+		t.Fatal("expected decode error, got nil")
+	}
+	if _, statErr := os.Stat(tmpPath); !os.IsNotExist(statErr) {
+		t.Fatalf("expected temp file to be removed, stat err=%v", statErr)
+	}
+}
+
+func TestReplica_Restore_ContextCancellation(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	var c mock.ReplicaClient
+	c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+
+	r := litestream.NewReplicaWithClient(db, &c)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := r.Restore(ctx, litestream.RestoreOptions{OutputPath: t.TempDir() + "/restored.db"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled error, got %v", err)
+	}
+}
+
 func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	// This test verifies that context cancellation errors are not logged during shutdown.
 	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded
