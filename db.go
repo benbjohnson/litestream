@@ -1314,7 +1314,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	if fi, err := os.Stat(db.WALPath()); err != nil {
 		return info, fmt.Errorf("open wal file: %w", err)
 	} else if info.offset > fi.Size() {
-		wasSynced := db.syncedToWALEnd
 		db.syncedToWALEnd = false
 
 		hdr, err := readWALHeader(db.WALPath())
@@ -1325,18 +1324,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		info.offset = WALHeaderSize
 		info.salt1 = binary.BigEndian.Uint32(hdr[16:])
 		info.salt2 = binary.BigEndian.Uint32(hdr[20:])
-
-		if wasSynced {
-			info.snapshotting = false
-			info.reason = "wal truncated but all frames already synced"
-
-			db.Logger.Log(ctx, internal.LevelTrace, "wal truncated, skipping snapshot (fully synced)",
-				"new_salt1", info.salt1,
-				"new_salt2", info.salt2)
-
-			return info, nil
-		}
-
 		info.reason = "wal truncated, snapshotting for complete page coverage"
 
 		db.Logger.Log(ctx, internal.LevelTrace, "wal truncated, forcing snapshot",
