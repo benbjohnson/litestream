@@ -1655,8 +1655,10 @@ func TestDB_Verify_ForceSnapshotAfterCheckpointWALRestart(t *testing.T) {
 	expectedSalt1 := binary.BigEndian.Uint32(walHdr[16:])
 	expectedSalt2 := binary.BigEndian.Uint32(walHdr[20:])
 
-	// Set forceNextSnapshot (simulates what checkpoint() does on WAL restart).
+	// Set forceNextSnapshot (simulates what checkpoint() does on WAL restart)
+	// with syncedToWALEnd=false (simulates unsynced WAL frames before restart).
 	db.forceNextSnapshot = true
+	db.syncedToWALEnd = false
 
 	info, err = db.verify(ctx)
 	if err != nil {
@@ -2065,4 +2067,290 @@ func TestDB_Sync_InitErrorMetrics(t *testing.T) {
 	if syncErrorValue <= baselineErrors {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v (init error should be counted)", syncErrorValue, baselineErrors)
 	}
+}
+
+func TestDB_Verify_ForceSnapshotSkippedWhenSyncedToWALEnd(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatalf("read WAL header: %v", err)
+	}
+	expectedSalt1 := binary.BigEndian.Uint32(walHdr[16:])
+	expectedSalt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	db.forceNextSnapshot = true
+	db.syncedToWALEnd = true
+
+	info, err := db.verify(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if info.snapshotting {
+		t.Fatal("expected snapshotting=false when syncedToWALEnd=true")
+	}
+	if info.offset != WALHeaderSize {
+		t.Fatalf("offset=%d, want %d", info.offset, WALHeaderSize)
+	}
+	if info.salt1 != expectedSalt1 || info.salt2 != expectedSalt2 {
+		t.Fatalf("salt mismatch: got (%d,%d), want (%d,%d)", info.salt1, info.salt2, expectedSalt1, expectedSalt2)
+	}
+	if db.forceNextSnapshot {
+		t.Fatal("forceNextSnapshot should be cleared")
+	}
+	if db.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd should be cleared")
+	}
+}
+
+func TestDB_Verify_WALTruncationSkippedWhenSyncedToWALEnd(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db.syncedToWALEnd = true
+
+	walPath := db.WALPath()
+	walHdr, err := readWALHeader(walPath)
+	if err != nil {
+		t.Fatalf("read WAL header: %v", err)
+	}
+
+	if err := os.Truncate(walPath, WALHeaderSize); err != nil {
+		t.Fatalf("truncate WAL: %v", err)
+	}
+
+	expectedSalt1 := binary.BigEndian.Uint32(walHdr[16:])
+	expectedSalt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	info, err := db.verify(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if info.snapshotting {
+		t.Fatal("expected snapshotting=false when syncedToWALEnd was true")
+	}
+	if info.offset != WALHeaderSize {
+		t.Fatalf("offset=%d, want %d", info.offset, WALHeaderSize)
+	}
+	if info.salt1 != expectedSalt1 || info.salt2 != expectedSalt2 {
+		t.Fatalf("salt mismatch: got (%d,%d), want (%d,%d)", info.salt1, info.salt2, expectedSalt1, expectedSalt2)
+	}
+	if db.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd should be cleared")
+	}
+}
+
+func TestDB_Verify_WALTruncationForcesSnapshotWhenNotSyncedToWALEnd(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db.syncedToWALEnd = false
+
+	walPath := db.WALPath()
+	if err := os.Truncate(walPath, WALHeaderSize); err != nil {
+		t.Fatalf("truncate WAL: %v", err)
+	}
+
+	info, err := db.verify(ctx)
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if !info.snapshotting {
+		t.Fatal("expected snapshotting=true when syncedToWALEnd=false")
+	}
+	if info.offset != WALHeaderSize {
+		t.Fatalf("offset=%d, want %d", info.offset, WALHeaderSize)
+	}
+}
+
+func TestDB_CheckpointDoesNotCreateSnapshotWhenFullySynced(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, zeroblob(4096))`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preTXID := pos.TXID
+
+	if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'small')`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pos, err = db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	fi, err := os.Stat(ltxPath)
+	if err != nil {
+		t.Fatalf("stat ltx: %v", err)
+	}
+
+	preLTXPath := db.LTXPath(0, preTXID, preTXID)
+	preFI, err := os.Stat(preLTXPath)
+	if err != nil {
+		t.Fatalf("stat pre-checkpoint ltx: %v", err)
+	}
+
+	if fi.Size() >= preFI.Size() {
+		t.Fatalf("post-checkpoint LTX (%d bytes) should be smaller than pre-checkpoint LTX (%d bytes); snapshot was not avoided",
+			fi.Size(), preFI.Size())
+	}
+
+	_ = preTXID
 }
