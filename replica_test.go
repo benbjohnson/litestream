@@ -2351,6 +2351,144 @@ func TestReplica_Restore_Follow_StaleTXID(t *testing.T) {
 	}
 }
 
+func TestReplica_Restore_Follow_StaleTXID_NoSnapshots(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate retention pruning with no snapshots retained: only a newer LTX file remains.
+	level0Dir := c.LTXLevelDir(0)
+	if entries, err := os.ReadDir(level0Dir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(level0Dir, e.Name()))
+		}
+	}
+	if err := os.MkdirAll(level0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(level0Dir, "0000000000000005-0000000000000005.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotDir := c.LTXLevelDir(litestream.SnapshotLevel)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for stale TXID with no snapshots")
+	}
+	if !strings.Contains(err.Error(), "behind earliest available LTX file") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplica_Restore_Follow_StaleTXID_NoSnapshotsWithGap(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY, value TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1, 'seed')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	outputPath := filepath.Join(t.TempDir(), "follower.db")
+	if err := os.WriteFile(outputPath, []byte("fake-db-content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := litestream.WriteTXIDFile(outputPath, 50); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate non-snapshot history with a gap: [1-50] and [100-120].
+	// saved TXID=50 is covered, but next TXID (51) is unreachable.
+	for level := 0; level < litestream.SnapshotLevel; level++ {
+		levelDir := c.LTXLevelDir(level)
+		if entries, err := os.ReadDir(levelDir); err == nil {
+			for _, e := range entries {
+				os.Remove(filepath.Join(levelDir, e.Name()))
+			}
+		}
+	}
+
+	level0Dir := c.LTXLevelDir(0)
+	if err := os.MkdirAll(level0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(level0Dir, "0000000000000001-0000000000000032.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(level0Dir, "0000000000000064-0000000000000078.ltx"), []byte("dummy"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	snapshotDir := c.LTXLevelDir(litestream.SnapshotLevel)
+	if entries, err := os.ReadDir(snapshotDir); err == nil {
+		for _, e := range entries {
+			os.Remove(filepath.Join(snapshotDir, e.Name()))
+		}
+	}
+
+	err := r.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     outputPath,
+		Follow:         true,
+		FollowInterval: 50 * time.Millisecond,
+	})
+	if err == nil {
+		t.Fatal("expected error for saved TXID in unavailable range")
+	}
+	if !strings.Contains(err.Error(), "next TXID") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // verifyRestoredDB verifies that the restored database is valid.
 func verifyRestoredDB(t *testing.T, path string) {
 	t.Helper()
@@ -2375,5 +2513,130 @@ func verifyRestoredDB(t *testing.T, path string) {
 	}
 	if result != "ok" {
 		t.Fatalf("integrity check returned: %s", result)
+	}
+}
+
+// TestReplica_Restore_Follow_CrashRecovery_NewerSnapshotDoesNotBlockResume is
+// a regression test for a bug where crash-recovery validation compared the
+// saved TXID against the newest snapshot's MinTXID instead of the earliest.
+//
+// When multiple snapshots coexist within the retention window, the newest
+// snapshot can have a MinTXID higher than the saved TXID, falsely triggering
+// the "replica history has been pruned" error even though an older snapshot
+// still covers the saved TXID.
+func TestReplica_Restore_Follow_CrashRecovery_NewerSnapshotDoesNotBlockResume(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE test(id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(ctx, `INSERT INTO test VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaDir := t.TempDir()
+	c := file.NewReplicaClient(replicaDir)
+	r := litestream.NewReplicaWithClient(db, c)
+
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// First run: restore+follow then cancel to simulate a crash.
+	outputPath := t.TempDir() + "/follower.db"
+	firstCtx, firstCancel := context.WithCancel(ctx)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- r.Restore(firstCtx, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(outputPath + "-txid"); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	firstCancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("first Restore returned error: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first Restore did not shut down")
+	}
+
+	savedTXID, err := litestream.ReadTXIDFile(outputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if savedTXID == 0 {
+		t.Fatal("expected non-zero saved TXID")
+	}
+
+	// Inject two snapshot files at SnapshotLevel to reproduce the multi-snapshot
+	// retention scenario:
+	//   oldSnap: MinTXID=1, MaxTXID=savedTXID  (the original, covers savedTXID)
+	//   newSnap: MinTXID=savedTXID+10           (a newer snapshot, after savedTXID)
+	//
+	// With the old bug, crash recovery iterated all snapshots keeping only the
+	// last (newSnap) and checked newSnap.MinTXID > savedTXID, which is true —
+	// incorrectly reporting "replica history has been pruned".
+	// With the fix, it uses earliestSnapshot.MinTXID (1) > savedTXID — false —
+	// and correctly allows resumption.
+	snapshotDir := c.LTXLevelDir(litestream.SnapshotLevel)
+	if err := os.MkdirAll(snapshotDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{
+		fmt.Sprintf("%016x-%016x.ltx", uint64(1), uint64(savedTXID)),
+		fmt.Sprintf("%016x-%016x.ltx", uint64(savedTXID+10), uint64(savedTXID+20)),
+	} {
+		if err := os.WriteFile(filepath.Join(snapshotDir, name), []byte{}, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Crash recovery must succeed: savedTXID is covered by the oldest snapshot.
+	followCtx, followCancel := context.WithCancel(ctx)
+	defer followCancel()
+
+	errCh2 := make(chan error, 1)
+	go func() {
+		errCh2 <- r.Restore(followCtx, litestream.RestoreOptions{
+			OutputPath:     outputPath,
+			Follow:         true,
+			FollowInterval: 50 * time.Millisecond,
+		})
+	}()
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		followCancel()
+	}()
+
+	select {
+	case err := <-errCh2:
+		if err != nil {
+			t.Fatalf("crash recovery incorrectly rejected savedTXID with newer snapshot present: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("crash recovery did not complete within timeout")
 	}
 }
