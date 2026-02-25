@@ -28,13 +28,19 @@ var (
 func SetVFSConfig(dbName string, cfg *VFSConfig) {
 	vfsConfigsMu.Lock()
 	defer vfsConfigsMu.Unlock()
-	vfsConfigs[dbName] = cfg
+	copied := *cfg
+	vfsConfigs[dbName] = &copied
 }
 
 func GetVFSConfig(dbName string) *VFSConfig {
 	vfsConfigsMu.RLock()
 	defer vfsConfigsMu.RUnlock()
-	return vfsConfigs[dbName]
+	orig := vfsConfigs[dbName]
+	if orig == nil {
+		return nil
+	}
+	copied := *orig
+	return &copied
 }
 
 func DeleteVFSConfig(dbName string) {

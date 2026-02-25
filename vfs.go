@@ -149,6 +149,10 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 		perConnClient = true
 	}
 
+	if client == nil {
+		return nil, 0, fmt.Errorf("no replica client configured: set LITESTREAM_REPLICA_URL or use SetVFSConfig")
+	}
+
 	f := NewVFSFile(client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
@@ -230,6 +234,11 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	if err := f.Open(); err != nil {
+		if perConnClient {
+			if closer, ok := client.(io.Closer); ok {
+				closer.Close()
+			}
+		}
 		return nil, 0, err
 	}
 
@@ -2430,80 +2439,6 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, fmt.Errorf("invalid value for litestream_write_enabled: %s (use 0 or 1)", *pragmaValue)
 		}
 
-	case "litestream_poll_interval":
-		f.mu.Lock()
-		if pragmaValue == nil {
-			result := f.PollInterval.String()
-			f.mu.Unlock()
-			return &result, nil
-		}
-		d, err := time.ParseDuration(*pragmaValue)
-		if err != nil {
-			f.mu.Unlock()
-			return nil, fmt.Errorf("invalid poll_interval: %w", err)
-		}
-		f.PollInterval = d
-		f.mu.Unlock()
-		return nil, nil
-
-	case "litestream_cache_size":
-		f.mu.Lock()
-		if pragmaValue == nil {
-			result := strconv.Itoa(f.CacheSize)
-			f.mu.Unlock()
-			return &result, nil
-		}
-		n, err := strconv.Atoi(*pragmaValue)
-		if err != nil {
-			f.mu.Unlock()
-			return nil, fmt.Errorf("invalid cache_size: %w", err)
-		}
-		f.CacheSize = n
-		f.mu.Unlock()
-		return nil, nil
-
-	case "litestream_hydration_enabled":
-		if pragmaValue != nil {
-			return nil, fmt.Errorf("litestream_hydration_enabled is read-only")
-		}
-		if f.hydrator != nil {
-			result := "1"
-			return &result, nil
-		}
-		result := "0"
-		return &result, nil
-
-	case "litestream_log_level":
-		if pragmaValue == nil {
-			if f.logger.Enabled(context.Background(), slog.LevelDebug) {
-				result := "debug"
-				return &result, nil
-			}
-			result := "info"
-			return &result, nil
-		}
-		switch strings.ToLower(*pragmaValue) {
-		case "debug":
-			f.logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelDebug})).With("name", f.name)
-		case "info":
-			f.logger = slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo})).With("name", f.name)
-		default:
-			return nil, fmt.Errorf("invalid log_level: %s (use \"debug\" or \"info\")", *pragmaValue)
-		}
-		return nil, nil
-
-	case "litestream_replica_url":
-		if pragmaValue != nil {
-			return nil, fmt.Errorf("litestream_replica_url is read-only")
-		}
-		cfg := GetVFSConfig(f.name)
-		if cfg != nil && cfg.ReplicaURL != "" {
-			result := cfg.ReplicaURL
-			return &result, nil
-		}
-		result := ""
-		return &result, nil
-
 	default:
 		return nil, sqlite3vfs.NotFoundError
 	}
@@ -2541,10 +2476,7 @@ func isRetryablePageError(err error) bool {
 }
 
 func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
-	f.mu.Lock()
-	pollInterval := f.PollInterval
-	f.mu.Unlock()
-	ticker := time.NewTicker(pollInterval)
+	ticker := time.NewTicker(f.PollInterval)
 	defer ticker.Stop()
 
 	for {
