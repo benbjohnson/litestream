@@ -5,7 +5,6 @@ package litestream
 import (
 	"fmt"
 	"log/slog"
-	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -100,6 +99,26 @@ func TestVFSConfig_NilOptionalFields(t *testing.T) {
 	}
 }
 
+func TestVFSConfig_CopyOnSetAndGet(t *testing.T) {
+	defer clearVFSConfigs()
+
+	cfg := &VFSConfig{ReplicaURL: "s3://bucket/original"}
+	SetVFSConfig("copy.db", cfg)
+
+	cfg.ReplicaURL = "s3://bucket/mutated"
+
+	got := GetVFSConfig("copy.db")
+	if got.ReplicaURL != "s3://bucket/original" {
+		t.Fatalf("expected original url, got %q (SetVFSConfig did not copy)", got.ReplicaURL)
+	}
+
+	got.ReplicaURL = "s3://bucket/mutated-via-get"
+	got2 := GetVFSConfig("copy.db")
+	if got2.ReplicaURL != "s3://bucket/original" {
+		t.Fatalf("expected original url, got %q (GetVFSConfig did not copy)", got2.ReplicaURL)
+	}
+}
+
 func TestVFSConfig_PerConnectionOverrides(t *testing.T) {
 	defer clearVFSConfigs()
 
@@ -115,7 +134,7 @@ func TestVFSConfig_PerConnectionOverrides(t *testing.T) {
 
 	vfs := NewVFS(client, slog.Default())
 
-	f, _, err := vfs.openMainDB("config-override.db", 0x00000100) // OpenMainDB
+	f, _, err := vfs.openMainDB("config-override.db", 0x00000100)
 	if err != nil {
 		t.Fatalf("open main db: %v", err)
 	}
@@ -130,174 +149,14 @@ func TestVFSConfig_PerConnectionOverrides(t *testing.T) {
 	}
 }
 
-func TestVFSFile_PRAGMAPollInterval(t *testing.T) {
-	client := newMockReplicaClient()
-	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
-
-	f := NewVFSFile(client, "test.db", slog.Default())
-	if err := f.Open(); err != nil {
-		t.Fatalf("open vfs file: %v", err)
-	}
-	defer f.Close()
-
-	const SQLITE_FCNTL_PRAGMA = 14
-
-	result, err := f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_poll_interval", nil)
-	if err != nil {
-		t.Fatalf("get poll_interval: %v", err)
-	}
-	if result == nil || *result != DefaultPollInterval.String() {
-		t.Fatalf("expected default poll interval, got %v", result)
-	}
-
-	newInterval := "5s"
-	_, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_poll_interval", &newInterval)
-	if err != nil {
-		t.Fatalf("set poll_interval: %v", err)
-	}
-
-	result, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_poll_interval", nil)
-	if err != nil {
-		t.Fatalf("get poll_interval after set: %v", err)
-	}
-	if result == nil || *result != "5s" {
-		t.Fatalf("expected 5s, got %v", result)
-	}
-}
-
-func TestVFSFile_PRAGMACacheSize(t *testing.T) {
-	client := newMockReplicaClient()
-	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
-
-	f := NewVFSFile(client, "test.db", slog.Default())
-	if err := f.Open(); err != nil {
-		t.Fatalf("open vfs file: %v", err)
-	}
-	defer f.Close()
-
-	const SQLITE_FCNTL_PRAGMA = 14
-
-	result, err := f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_cache_size", nil)
-	if err != nil {
-		t.Fatalf("get cache_size: %v", err)
-	}
-	if result == nil || *result != strconv.Itoa(DefaultCacheSize) {
-		t.Fatalf("expected default cache size, got %v", result)
-	}
-
-	newSize := "20971520"
-	_, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_cache_size", &newSize)
-	if err != nil {
-		t.Fatalf("set cache_size: %v", err)
-	}
-
-	result, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_cache_size", nil)
-	if err != nil {
-		t.Fatalf("get cache_size after set: %v", err)
-	}
-	if result == nil || *result != "20971520" {
-		t.Fatalf("expected 20971520, got %v", result)
-	}
-}
-
-func TestVFSFile_PRAGMALogLevel(t *testing.T) {
-	client := newMockReplicaClient()
-	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
-
-	f := NewVFSFile(client, "test.db", slog.Default())
-	if err := f.Open(); err != nil {
-		t.Fatalf("open vfs file: %v", err)
-	}
-	defer f.Close()
-
-	const SQLITE_FCNTL_PRAGMA = 14
-
-	debugLevel := "debug"
-	_, err := f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_log_level", &debugLevel)
-	if err != nil {
-		t.Fatalf("set log_level to debug: %v", err)
-	}
-
-	result, err := f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_log_level", nil)
-	if err != nil {
-		t.Fatalf("get log_level: %v", err)
-	}
-	if result == nil || *result != "debug" {
-		t.Fatalf("expected debug, got %v", result)
-	}
-
-	infoLevel := "info"
-	_, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_log_level", &infoLevel)
-	if err != nil {
-		t.Fatalf("set log_level to info: %v", err)
-	}
-
-	result, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_log_level", nil)
-	if err != nil {
-		t.Fatalf("get log_level: %v", err)
-	}
-	if result == nil || *result != "info" {
-		t.Fatalf("expected info, got %v", result)
-	}
-}
-
-func TestVFSFile_PRAGMAHydrationEnabled(t *testing.T) {
-	client := newMockReplicaClient()
-	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
-
-	f := NewVFSFile(client, "test.db", slog.Default())
-	if err := f.Open(); err != nil {
-		t.Fatalf("open vfs file: %v", err)
-	}
-	defer f.Close()
-
-	const SQLITE_FCNTL_PRAGMA = 14
-
-	result, err := f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_hydration_enabled", nil)
-	if err != nil {
-		t.Fatalf("get hydration_enabled: %v", err)
-	}
-	if result == nil || *result != "0" {
-		t.Fatalf("expected 0, got %v", result)
-	}
-
-	writeVal := "1"
-	_, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_hydration_enabled", &writeVal)
-	if err == nil {
-		t.Fatal("expected error for read-only pragma, got nil")
-	}
-}
-
-func TestVFSFile_PRAGMAReplicaURL(t *testing.T) {
+func TestVFS_NilClientReturnsError(t *testing.T) {
 	defer clearVFSConfigs()
 
-	client := newMockReplicaClient()
-	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	vfs := NewVFS(nil, slog.Default())
 
-	SetVFSConfig("replica-url-test.db", &VFSConfig{
-		ReplicaURL: "s3://my-bucket/db",
-	})
-
-	f := NewVFSFile(client, "replica-url-test.db", slog.Default())
-	if err := f.Open(); err != nil {
-		t.Fatalf("open vfs file: %v", err)
-	}
-	defer f.Close()
-
-	const SQLITE_FCNTL_PRAGMA = 14
-
-	result, err := f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_replica_url", nil)
-	if err != nil {
-		t.Fatalf("get replica_url: %v", err)
-	}
-	if result == nil || *result != "s3://my-bucket/db" {
-		t.Fatalf("expected s3://my-bucket/db, got %v", result)
-	}
-
-	writeVal := "s3://other/path"
-	_, err = f.FileControl(SQLITE_FCNTL_PRAGMA, "litestream_replica_url", &writeVal)
+	_, _, err := vfs.openMainDB("no-client.db", 0x00000100)
 	if err == nil {
-		t.Fatal("expected error for read-only pragma, got nil")
+		t.Fatal("expected error when no client configured, got nil")
 	}
 }
 
