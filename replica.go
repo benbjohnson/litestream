@@ -508,6 +508,15 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 	return updatedAt, nil
 }
 
+type restoreMode uint8
+
+const (
+	restoreModeUnknown restoreMode = iota
+	restoreModeFull
+	restoreModeResume
+	restoreModeV3
+)
+
 // Replica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
@@ -531,40 +540,95 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot use follow mode with -timestamp")
 	}
 
-	// In follow mode, if the database already exists, attempt crash recovery
-	// by reading the last applied TXID from the sidecar file.
-	if opt.Follow {
-		if _, statErr := os.Stat(opt.OutputPath); statErr == nil {
-			return r.resumeFollowFromCrashRecovery(ctx, opt)
-		} else if !os.IsNotExist(statErr) {
-			return statErr
-		}
-	}
-
-	// Ensure output path does not already exist.
-	if _, err := os.Stat(opt.OutputPath); err == nil {
-		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
-	} else if !os.IsNotExist(err) {
+	mode, err := r.classifyRestoreMode(ctx, opt)
+	if err != nil {
 		return err
 	}
 
-	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is specified).
-	// Skip V3 format when follow mode is enabled (V3 doesn't support incremental following).
+	var followTXID ltx.TXID
+	switch mode {
+	case restoreModeV3:
+		return r.RestoreV3(ctx, opt)
+	case restoreModeResume:
+		txid, err := r.restoreResume(ctx, opt.OutputPath)
+		if err != nil {
+			return err
+		}
+		followTXID = txid
+	case restoreModeFull:
+		maxTXID, err := r.restoreFull(ctx, opt)
+		if err != nil {
+			return err
+		}
+		followTXID = maxTXID
+
+		if opt.Follow {
+			if err := WriteTXIDFile(opt.OutputPath, followTXID); err != nil {
+				return fmt.Errorf("write initial txid file: %w", err)
+			}
+		}
+	default:
+		return fmt.Errorf("invalid restore mode: %d", mode)
+	}
+
+	if opt.Follow {
+		return r.follow(ctx, opt.OutputPath, followTXID, opt.FollowInterval)
+	}
+
+	return nil
+}
+
+func (r *Replica) classifyRestoreMode(ctx context.Context, opt RestoreOptions) (mode restoreMode, err error) {
+	_, statErr := os.Stat(opt.OutputPath)
+	exists := statErr == nil
+	switch {
+	case statErr != nil && !os.IsNotExist(statErr):
+		return 0, statErr
+	case opt.Follow && exists:
+		return restoreModeResume, nil
+	case !opt.Follow && exists:
+		return 0, fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
+	}
+
+	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is
+	// specified). Skip V3 format when follow mode is enabled (V3 doesn't support
+	// incremental following).
 	if opt.TXID == 0 && !opt.Follow {
 		if client, ok := r.Client.(ReplicaClientV3); ok {
 			useV3, err := r.shouldUseV3Restore(ctx, client, opt.Timestamp)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if useV3 {
-				return r.RestoreV3(ctx, opt)
+				return restoreModeV3, nil
 			}
 		}
 	}
 
+	return restoreModeFull, nil
+}
+
+func (r *Replica) restoreResume(ctx context.Context, outputPath string) (txid ltx.TXID, err error) {
+	txid, err = ReadTXIDFile(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("read txid file for crash recovery: %w", err)
+	}
+	if txid == 0 {
+		return 0, fmt.Errorf("cannot resume follow mode: database exists but no -txid file found; delete the database to re-restore: %s", outputPath)
+	}
+
+	if err := r.validateCrashRecoveryTXID(ctx, txid, outputPath); err != nil {
+		return 0, err
+	}
+
+	r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", outputPath)
+	return txid, nil
+}
+
+func (r *Replica) restoreFull(ctx context.Context, opt RestoreOptions) (ltx.TXID, error) {
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
-		return fmt.Errorf("cannot calc restore plan: %w", err)
+		return 0, fmt.Errorf("cannot calc restore plan: %w", err)
 	}
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
@@ -579,9 +643,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}()
 
 	for _, info := range infos {
-		// Validate file size - must be at least header size to be readable
+		// Validate file size - must be at least header size to be readable.
 		if info.Size < ltx.HeaderSize {
-			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
+			return 0, fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
 				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
 		}
 
@@ -590,13 +654,13 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		// Add file to be compacted.
 		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
-			return fmt.Errorf("open ltx file: %w", err)
+			return 0, fmt.Errorf("open ltx file: %w", err)
 		}
 		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
-		return fmt.Errorf("no matching backup files available")
+		return 0, fmt.Errorf("no matching backup files available")
 	}
 
 	// Create parent directory if it doesn't exist.
@@ -605,7 +669,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		dirInfo = db.dirInfo
 	}
 	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
-		return fmt.Errorf("create parent directory: %w", err)
+		return 0, fmt.Errorf("create parent directory: %w", err)
 	}
 
 	// Output to temp file & atomically rename.
@@ -615,7 +679,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	f, err := os.Create(tmpOutputPath)
 	if err != nil {
-		return fmt.Errorf("create temp database path: %w", err)
+		return 0, fmt.Errorf("create temp database path: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -633,55 +697,22 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	dec := ltx.NewDecoder(pr)
 	if err := dec.DecodeDatabaseTo(f); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+		return 0, fmt.Errorf("decode database: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
-		return err
+		return 0, err
 	} else if err := f.Close(); err != nil {
-		return err
+		return 0, err
 	}
 
 	// Copy file to final location.
 	r.Logger().Debug("renaming database from temporary location")
 	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
-		return err
+		return 0, err
 	}
 
-	// Enter follow mode if enabled, continuously applying new LTX files.
-	if opt.Follow {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-		rdrs = nil
-
-		maxTXID := infos[len(infos)-1].MaxTXID
-		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
-			return fmt.Errorf("write initial txid file: %w", err)
-		}
-		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
-	}
-
-	return nil
-}
-
-func (r *Replica) resumeFollowFromCrashRecovery(ctx context.Context, opt RestoreOptions) error {
-	txid, err := ReadTXIDFile(opt.OutputPath)
-	if err != nil {
-		return fmt.Errorf("read txid file for crash recovery: %w", err)
-	}
-	if txid == 0 {
-		return fmt.Errorf("cannot resume follow mode: database exists but no -txid file found; delete the database to re-restore: %s", opt.OutputPath)
-	}
-
-	if err := r.validateCrashRecoveryTXID(ctx, txid, opt.OutputPath); err != nil {
-		return err
-	}
-
-	r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
-	return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
+	return infos[len(infos)-1].MaxTXID, nil
 }
 
 func (r *Replica) validateCrashRecoveryTXID(ctx context.Context, txid ltx.TXID, outputPath string) error {
