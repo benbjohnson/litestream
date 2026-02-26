@@ -681,7 +681,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
-		if err := checkIntegrity(opt.OutputPath, opt.IntegrityCheck); err != nil {
+		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
 			_ = os.Remove(opt.OutputPath)
 			_ = os.Remove(opt.OutputPath + "-shm")
 			_ = os.Remove(opt.OutputPath + "-wal")
@@ -1064,7 +1064,7 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
-		if err := checkIntegrity(opt.OutputPath, opt.IntegrityCheck); err != nil {
+		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
 			_ = os.Remove(opt.OutputPath)
 			_ = os.Remove(opt.OutputPath + "-shm")
 			_ = os.Remove(opt.OutputPath + "-wal")
@@ -1198,7 +1198,7 @@ func checkpointV3(dbPath string) error {
 }
 
 // checkIntegrity runs a SQLite integrity check on the database at dbPath.
-func checkIntegrity(dbPath string, mode IntegrityCheckMode) error {
+func checkIntegrity(ctx context.Context, dbPath string, mode IntegrityCheckMode) error {
 	if mode == IntegrityCheckNone {
 		return nil
 	}
@@ -1209,12 +1209,17 @@ func checkIntegrity(dbPath string, mode IntegrityCheckMode) error {
 	}
 	defer func() { _ = db.Close() }()
 
-	pragma := "quick_check"
-	if mode == IntegrityCheckFull {
+	var pragma string
+	switch mode {
+	case IntegrityCheckQuick:
+		pragma = "quick_check"
+	case IntegrityCheckFull:
 		pragma = "integrity_check"
+	default:
+		return fmt.Errorf("unsupported integrity check mode: %d", mode)
 	}
 
-	rows, err := db.Query("PRAGMA " + pragma)
+	rows, err := db.QueryContext(ctx, "PRAGMA "+pragma)
 	if err != nil {
 		return fmt.Errorf("integrity check: %w", err)
 	}

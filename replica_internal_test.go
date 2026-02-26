@@ -303,20 +303,20 @@ func mustCreateValidSQLiteDB(tb testing.TB) string {
 
 func TestCheckIntegrity_Quick_ValidDB(t *testing.T) {
 	dbPath := mustCreateValidSQLiteDB(t)
-	if err := checkIntegrity(dbPath, IntegrityCheckQuick); err != nil {
+	if err := checkIntegrity(context.Background(), dbPath, IntegrityCheckQuick); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 }
 
 func TestCheckIntegrity_Full_ValidDB(t *testing.T) {
 	dbPath := mustCreateValidSQLiteDB(t)
-	if err := checkIntegrity(dbPath, IntegrityCheckFull); err != nil {
+	if err := checkIntegrity(context.Background(), dbPath, IntegrityCheckFull); err != nil {
 		t.Fatalf("expected no error, got: %v", err)
 	}
 }
 
 func TestCheckIntegrity_None_Skips(t *testing.T) {
-	if err := checkIntegrity("/nonexistent/path.db", IntegrityCheckNone); err != nil {
+	if err := checkIntegrity(context.Background(), "/nonexistent/path.db", IntegrityCheckNone); err != nil {
 		t.Fatalf("expected nil for IntegrityCheckNone, got: %v", err)
 	}
 }
@@ -355,7 +355,7 @@ func TestCheckIntegrity_CorruptDB(t *testing.T) {
 	}
 	_ = f.Close()
 
-	err = checkIntegrity(dbPath, IntegrityCheckFull)
+	err = checkIntegrity(context.Background(), dbPath, IntegrityCheckFull)
 	if err == nil {
 		t.Fatal("expected integrity check to fail on corrupt database")
 	}
