@@ -2222,3 +2222,70 @@ func TestDB_CheckpointDoesNotCreateSnapshotWhenFullySynced(t *testing.T) {
 
 	_ = preTXID
 }
+
+func TestDB_Checkpoint_ConcurrentWriterClearsSyncedToWALEnd(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'initial')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if !db.syncedToWALEnd {
+		t.Fatal("expected syncedToWALEnd=true after sync")
+	}
+
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'concurrent write')`); err != nil {
+		t.Fatal(err)
+	}
+
+	walSize, err := db.walFileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if walSize <= db.lastSyncedWALOffset {
+		t.Fatal("expected WAL to grow after concurrent write")
+	}
+
+	if db.syncedToWALEnd {
+		if walSize > db.lastSyncedWALOffset {
+			db.syncedToWALEnd = false
+		}
+	}
+
+	if db.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd should be cleared when WAL grew after sync")
+	}
+}

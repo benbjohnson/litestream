@@ -1754,6 +1754,15 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
 	}
 
+	// Detect if a concurrent writer appended frames after our sync completed.
+	// If so, clear syncedToWALEnd so the post-checkpoint verify forces a full
+	// snapshot to capture pages that will be checkpointed but weren't synced.
+	if db.syncedToWALEnd {
+		if walSize, err := db.walFileSize(); err == nil && walSize > db.lastSyncedWALOffset {
+			db.syncedToWALEnd = false
+		}
+	}
+
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
 	if err := db.execCheckpoint(ctx, mode); err != nil {
