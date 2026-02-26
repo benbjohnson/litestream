@@ -1278,6 +1278,9 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		info.salt1 = binary.BigEndian.Uint32(hdr[16:])
 		info.salt2 = binary.BigEndian.Uint32(hdr[20:])
 
+		// Safe to skip snapshot: forceNextSnapshot is only set by checkpoint(),
+		// which calls verifyAndSync() immediately before, guaranteeing that
+		// syncedToWALEnd reflects the WAL state right before the checkpoint.
 		if db.syncedToWALEnd {
 			db.syncedToWALEnd = false
 			info.snapshotting = false
