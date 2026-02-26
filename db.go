@@ -1637,14 +1637,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	finalOffset := info.offset + sz
 	db.lastSyncedWALOffset = finalOffset
 
-	// Track if we synced to the exact end of the WAL file.
-	// This is used by verify() to distinguish expected checkpoint truncation
-	// from unexpected external WAL modifications. See issue #927.
-	if walSize, err := db.walFileSize(); err == nil {
-		db.syncedToWALEnd = finalOffset == walSize
-	} else {
-		db.syncedToWALEnd = false
-	}
+	// The WALReader reads all valid frames, stopping at salt mismatch or EOF,
+	// so finalOffset represents the logical end of valid WAL content.
+	// Using physical file size was incorrect after a WAL restart because
+	// the file retains stale data from the previous generation. See issue #1165.
+	db.syncedToWALEnd = true
 
 	db.Logger.Debug("db sync", "status", "ok")
 
@@ -1755,11 +1752,24 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 
 	// Detect if a concurrent writer appended frames after our sync completed.
-	// If so, clear syncedToWALEnd so the post-checkpoint verify forces a full
-	// snapshot to capture pages that will be checkpointed but weren't synced.
+	// Read the frame header at lastSyncedWALOffset and check if its salts match
+	// the current WAL header. Matching salts indicate a valid frame from a
+	// concurrent writer; mismatched salts indicate stale data from a previous
+	// WAL generation. Using physical file size was incorrect because stale data
+	// after a WAL restart inflates the file size. See issue #1165.
 	if db.syncedToWALEnd {
-		if walSize, err := db.walFileSize(); err == nil && walSize > db.lastSyncedWALOffset {
-			db.syncedToWALEnd = false
+		if f, err := os.Open(db.WALPath()); err == nil {
+			frmHdr := make([]byte, WALFrameHeaderSize)
+			if n, _ := f.ReadAt(frmHdr, db.lastSyncedWALOffset); n == WALFrameHeaderSize {
+				frameSalt1 := binary.BigEndian.Uint32(frmHdr[8:])
+				frameSalt2 := binary.BigEndian.Uint32(frmHdr[12:])
+				walSalt1 := binary.BigEndian.Uint32(hdr[16:])
+				walSalt2 := binary.BigEndian.Uint32(hdr[20:])
+				if frameSalt1 == walSalt1 && frameSalt2 == walSalt2 {
+					db.syncedToWALEnd = false
+				}
+			}
+			f.Close()
 		}
 	}
 
