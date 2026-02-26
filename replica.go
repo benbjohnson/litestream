@@ -572,6 +572,11 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	if opt.Follow {
+		if opt.OnRestored != nil {
+			if err := opt.OnRestored(); err != nil {
+				return fmt.Errorf("on restored: %w", err)
+			}
+		}
 		return r.follow(ctx, opt.OutputPath, followTXID, opt.FollowInterval)
 	}
 

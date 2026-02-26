@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"strings"
 	"testing"
 	"time"
 
@@ -59,4 +61,39 @@ func TestRestoreCommand_FollowIntervalFlag(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRestoreCommand_ExecImpliesFollow(t *testing.T) {
+	t.Run("ExecWithTXID", func(t *testing.T) {
+		cmd := &RestoreCommand{}
+		err := cmd.Run(context.Background(), []string{"-exec", "echo test", "-txid", "0000000000000001", "/tmp/db"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "cannot use follow mode with -txid") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ExecWithTimestamp", func(t *testing.T) {
+		cmd := &RestoreCommand{}
+		err := cmd.Run(context.Background(), []string{"-exec", "echo test", "-timestamp", "2020-01-01T00:00:00Z", "/tmp/db"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "cannot use follow mode with -timestamp") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("ExecEmptyCommand", func(t *testing.T) {
+		cmd := &RestoreCommand{}
+		err := cmd.Run(context.Background(), []string{"-exec", "   ", "/tmp/db"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if !strings.Contains(err.Error(), "exec command is empty") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
 }
