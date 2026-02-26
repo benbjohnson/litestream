@@ -18,7 +18,10 @@ import (
 )
 
 // RestoreCommand represents a command to restore a database from a backup.
-type RestoreCommand struct{}
+type RestoreCommand struct {
+	signalChanFn func() <-chan os.Signal
+	restoreFn    func(context.Context, *litestream.Replica, litestream.RestoreOptions) error
+}
 
 // Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
@@ -84,7 +87,11 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	)
 
 	if opt.Follow {
-		ch := signalChan()
+		signalChFn := c.signalChanFn
+		if signalChFn == nil {
+			signalChFn = signalChan
+		}
+		ch := signalChFn()
 		ctx, cancel = context.WithCancel(ctx)
 		defer cancel()
 
@@ -170,7 +177,13 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	err = r.Restore(ctx, opt)
+	restoreFn := c.restoreFn
+	if restoreFn == nil {
+		restoreFn = func(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) error {
+			return r.Restore(ctx, opt)
+		}
+	}
+	err = restoreFn(ctx, r, opt)
 	if errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
