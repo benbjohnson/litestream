@@ -508,6 +508,15 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 	return updatedAt, nil
 }
 
+type restoreMode uint8
+
+const (
+	restoreModeUnknown restoreMode = iota
+	restoreModeFull
+	restoreModeResume
+	restoreModeV3
+)
+
 // Replica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
@@ -531,73 +540,100 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot use follow mode with -timestamp")
 	}
 
-	// In follow mode, if the database already exists, attempt crash recovery
-	// by reading the last applied TXID from the sidecar file.
-	if opt.Follow {
-		if _, statErr := os.Stat(opt.OutputPath); statErr == nil {
-			txid, readErr := ReadTXIDFile(opt.OutputPath)
-			if readErr != nil {
-				return fmt.Errorf("read txid file for crash recovery: %w", readErr)
-			}
-			if txid == 0 {
-				return fmt.Errorf("cannot resume follow mode: database exists but no -txid file found; delete the database to re-restore: %s", opt.OutputPath)
-			}
-			// Validate saved TXID is still reachable. If the earliest snapshot
-			// starts after our saved TXID, retention has pruned the history
-			// and we can't catch up incrementally.
-			snapshotItr, itrErr := r.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
-			if itrErr != nil {
-				return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", itrErr)
-			}
-
-			var latestSnapshot *ltx.FileInfo
-			for snapshotItr.Next() {
-				latestSnapshot = snapshotItr.Item()
-			}
-			if err := snapshotItr.Err(); err != nil {
-				_ = snapshotItr.Close()
-				return fmt.Errorf("iterate snapshots for crash recovery validation: %w", err)
-			}
-			_ = snapshotItr.Close()
-
-			if latestSnapshot != nil {
-				if latestSnapshot.MinTXID > txid {
-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
-				}
-				if txid > latestSnapshot.MaxTXID {
-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
-				}
-			}
-
-			r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", opt.OutputPath)
-			return r.follow(ctx, opt.OutputPath, txid, opt.FollowInterval)
-		}
-	}
-
-	// Ensure output path does not already exist.
-	if _, err := os.Stat(opt.OutputPath); err == nil {
-		return fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
-	} else if !os.IsNotExist(err) {
+	mode, err := r.classifyRestoreMode(ctx, opt)
+	if err != nil {
 		return err
 	}
 
-	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is specified).
-	// Skip V3 format when follow mode is enabled (V3 doesn't support incremental following).
+	var followTXID ltx.TXID
+	switch mode {
+	case restoreModeV3:
+		return r.RestoreV3(ctx, opt)
+	case restoreModeResume:
+		txid, err := r.restoreResume(ctx, opt.OutputPath)
+		if err != nil {
+			return err
+		}
+		followTXID = txid
+	case restoreModeFull:
+		maxTXID, err := r.restoreFull(ctx, opt)
+		if err != nil {
+			return err
+		}
+		followTXID = maxTXID
+
+		if opt.Follow {
+			if err := WriteTXIDFile(opt.OutputPath, followTXID); err != nil {
+				return fmt.Errorf("write initial txid file: %w", err)
+			}
+		}
+	default:
+		return fmt.Errorf("invalid restore mode: %d", mode)
+	}
+
+	if opt.Follow {
+		if opt.OnRestored != nil {
+			if err := opt.OnRestored(); err != nil {
+				return fmt.Errorf("on restored: %w", err)
+			}
+		}
+		return r.follow(ctx, opt.OutputPath, followTXID, opt.FollowInterval)
+	}
+
+	return nil
+}
+
+func (r *Replica) classifyRestoreMode(ctx context.Context, opt RestoreOptions) (mode restoreMode, err error) {
+	_, statErr := os.Stat(opt.OutputPath)
+	exists := statErr == nil
+	switch {
+	case statErr != nil && !os.IsNotExist(statErr):
+		return 0, statErr
+	case opt.Follow && exists:
+		return restoreModeResume, nil
+	case !opt.Follow && exists:
+		return 0, fmt.Errorf("cannot restore, output path already exists: %s", opt.OutputPath)
+	}
+
+	// Compare v0.3.x and LTX formats to find the best backup (unless TXID is
+	// specified). Skip V3 format when follow mode is enabled (V3 doesn't support
+	// incremental following).
 	if opt.TXID == 0 && !opt.Follow {
 		if client, ok := r.Client.(ReplicaClientV3); ok {
 			useV3, err := r.shouldUseV3Restore(ctx, client, opt.Timestamp)
 			if err != nil {
-				return err
+				return 0, err
 			}
 			if useV3 {
-				return r.RestoreV3(ctx, opt)
+				return restoreModeV3, nil
 			}
 		}
 	}
 
+	return restoreModeFull, nil
+}
+
+func (r *Replica) restoreResume(ctx context.Context, outputPath string) (txid ltx.TXID, err error) {
+	txid, err = ReadTXIDFile(outputPath)
+	if err != nil {
+		return 0, fmt.Errorf("read txid file for crash recovery: %w", err)
+	}
+	if txid == 0 {
+		return 0, fmt.Errorf("cannot resume follow mode: database exists but no -txid file found; delete the database to re-restore: %s", outputPath)
+	}
+
+	if err := r.validateCrashRecoveryTXID(ctx, txid, outputPath); err != nil {
+		return 0, err
+	}
+
+	r.Logger().Info("resuming follow mode from crash recovery", "txid", txid, "output", outputPath)
+	return txid, nil
+}
+
+func (r *Replica) restoreFull(ctx context.Context, opt RestoreOptions) (ltx.TXID, error) {
 	infos, err := CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
-		return fmt.Errorf("cannot calc restore plan: %w", err)
+		return 0, fmt.Errorf("cannot calc restore plan: %w", err)
 	}
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
@@ -612,9 +648,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}()
 
 	for _, info := range infos {
-		// Validate file size - must be at least header size to be readable
+		// Validate file size - must be at least header size to be readable.
 		if info.Size < ltx.HeaderSize {
-			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
+			return 0, fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
 				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
 		}
 
@@ -623,13 +659,13 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		// Add file to be compacted.
 		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
-			return fmt.Errorf("open ltx file: %w", err)
+			return 0, fmt.Errorf("open ltx file: %w", err)
 		}
 		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
-		return fmt.Errorf("no matching backup files available")
+		return 0, fmt.Errorf("no matching backup files available")
 	}
 
 	// Create parent directory if it doesn't exist.
@@ -638,16 +674,17 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		dirInfo = db.dirInfo
 	}
 	if err := internal.MkdirAll(filepath.Dir(opt.OutputPath), dirInfo); err != nil {
-		return fmt.Errorf("create parent directory: %w", err)
+		return 0, fmt.Errorf("create parent directory: %w", err)
 	}
 
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
+	defer func() { _ = os.Remove(tmpOutputPath) }()
 	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
 
 	f, err := os.Create(tmpOutputPath)
 	if err != nil {
-		return fmt.Errorf("create temp database path: %w", err)
+		return 0, fmt.Errorf("create temp database path: %w", err)
 	}
 	defer func() { _ = f.Close() }()
 
@@ -665,35 +702,113 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	dec := ltx.NewDecoder(pr)
 	if err := dec.DecodeDatabaseTo(f); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+		return 0, fmt.Errorf("decode database: %w", err)
 	}
 
 	if err := f.Sync(); err != nil {
-		return err
+		return 0, err
 	} else if err := f.Close(); err != nil {
-		return err
+		return 0, err
 	}
 
 	// Copy file to final location.
 	r.Logger().Debug("renaming database from temporary location")
 	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
-		return err
+		return 0, err
 	}
 
-	// Enter follow mode if enabled, continuously applying new LTX files.
-	if opt.Follow {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
+	return infos[len(infos)-1].MaxTXID, nil
+}
+
+func (r *Replica) validateCrashRecoveryTXID(ctx context.Context, txid ltx.TXID, outputPath string) error {
+	// Validate saved TXID is still reachable. If the earliest snapshot starts
+	// after our saved TXID, retention has pruned the history and we cannot
+	// catch up incrementally.
+	snapshotItr, err := r.Client.LTXFiles(ctx, SnapshotLevel, 0, false)
+	if err != nil {
+		return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", err)
+	}
+
+	var earliestSnapshot, latestSnapshot *ltx.FileInfo
+	for snapshotItr.Next() {
+		if earliestSnapshot == nil {
+			earliestSnapshot = snapshotItr.Item()
+		}
+		latestSnapshot = snapshotItr.Item()
+	}
+	if err := snapshotItr.Err(); err != nil {
+		_ = snapshotItr.Close()
+		return fmt.Errorf("iterate snapshots for crash recovery validation: %w", err)
+	}
+	_ = snapshotItr.Close()
+
+	if earliestSnapshot != nil {
+		if earliestSnapshot.MinTXID > txid {
+			return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, earliestSnapshot.MinTXID, outputPath, outputPath)
+		}
+		if txid > latestSnapshot.MaxTXID {
+			return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, outputPath, outputPath)
+		}
+		return nil
+	}
+
+	return r.validateCrashRecoveryTXIDWithoutSnapshots(ctx, txid, outputPath)
+}
+
+func (r *Replica) validateCrashRecoveryTXIDWithoutSnapshots(ctx context.Context, txid ltx.TXID, outputPath string) error {
+	// Some replicas may have no retained snapshots. Fall back to checking
+	// all non-snapshot levels so we can still detect stale/ahead TXIDs
+	// instead of silently following from an unreachable position.
+	var earliestFile, latestFile *ltx.FileInfo
+	var txidCovered, resumeTXIDCovered bool
+
+	resumeTXID := txid
+	if txid != ^ltx.TXID(0) {
+		resumeTXID = txid + 1
+	}
+
+	for level := 0; level < SnapshotLevel; level++ {
+		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+		if err != nil {
+			return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", err)
+		}
+
+		for itr.Next() {
+			item := *itr.Item()
+			if earliestFile == nil || item.MinTXID < earliestFile.MinTXID {
+				earliestFile = &item
+			}
+			if latestFile == nil || item.MaxTXID > latestFile.MaxTXID {
+				latestFile = &item
+			}
+			if item.MinTXID <= txid && txid <= item.MaxTXID {
+				txidCovered = true
+			}
+			if item.MinTXID <= resumeTXID && resumeTXID <= item.MaxTXID {
+				resumeTXIDCovered = true
 			}
 		}
-		rdrs = nil
-
-		maxTXID := infos[len(infos)-1].MaxTXID
-		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
-			return fmt.Errorf("write initial txid file: %w", err)
+		if err := itr.Err(); err != nil {
+			_ = itr.Close()
+			return fmt.Errorf("iterate ltx files for crash recovery validation: %w", err)
 		}
-		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
+		_ = itr.Close()
+	}
+
+	if earliestFile == nil {
+		return fmt.Errorf("cannot resume follow mode: no snapshots or LTX files available to validate saved TXID %s; delete %s and %s-txid to re-restore", txid, outputPath, outputPath)
+	}
+	if earliestFile.MinTXID > txid {
+		return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind earliest available LTX file (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, earliestFile.MinTXID, outputPath, outputPath)
+	}
+	if txid > latestFile.MaxTXID {
+		return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest available LTX file (max TXID %s); delete %s and %s-txid to re-restore", txid, latestFile.MaxTXID, outputPath, outputPath)
+	}
+	if !txidCovered {
+		return fmt.Errorf("cannot resume follow mode: saved TXID %s is not covered by any available LTX file range; replica history has gaps -- delete %s and %s-txid to re-restore", txid, outputPath, outputPath)
+	}
+	if latestFile.MaxTXID > txid && !resumeTXIDCovered {
+		return fmt.Errorf("cannot resume follow mode: next TXID %s is not covered by any available LTX file range; replica history has gaps -- delete %s and %s-txid to re-restore", resumeTXID, outputPath, outputPath)
 	}
 
 	return nil
