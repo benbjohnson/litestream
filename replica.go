@@ -680,6 +680,16 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return err
 	}
 
+	if opt.IntegrityCheck != IntegrityCheckNone {
+		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
+			_ = os.Remove(opt.OutputPath)
+			_ = os.Remove(opt.OutputPath + "-shm")
+			_ = os.Remove(opt.OutputPath + "-wal")
+			return fmt.Errorf("post-restore integrity check: %w", err)
+		}
+		r.Logger().Info("post-restore integrity check passed")
+	}
+
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
 		for _, rd := range rdrs {
@@ -1053,6 +1063,16 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 		return fmt.Errorf("rename to output path: %w", err)
 	}
 
+	if opt.IntegrityCheck != IntegrityCheckNone {
+		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
+			_ = os.Remove(opt.OutputPath)
+			_ = os.Remove(opt.OutputPath + "-shm")
+			_ = os.Remove(opt.OutputPath + "-wal")
+			return fmt.Errorf("post-restore integrity check: %w", err)
+		}
+		r.Logger().Info("post-restore integrity check passed")
+	}
+
 	return nil
 }
 
@@ -1175,6 +1195,59 @@ func checkpointV3(dbPath string) error {
 
 	_, err = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
+}
+
+// checkIntegrity runs a SQLite integrity check on the database at dbPath.
+func checkIntegrity(ctx context.Context, dbPath string, mode IntegrityCheckMode) error {
+	if mode == IntegrityCheckNone {
+		return nil
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open database for integrity check: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var pragma string
+	switch mode {
+	case IntegrityCheckQuick:
+		pragma = "quick_check"
+	case IntegrityCheckFull:
+		pragma = "integrity_check"
+	default:
+		return fmt.Errorf("unsupported integrity check mode: %d", mode)
+	}
+
+	rows, err := db.QueryContext(ctx, "PRAGMA "+pragma)
+	if err != nil {
+		return fmt.Errorf("integrity check: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var results []string
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			return fmt.Errorf("scan integrity check result: %w", err)
+		}
+		if result != "ok" {
+			results = append(results, result)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("iterate integrity check results: %w", err)
+	}
+
+	if len(results) > 0 {
+		return fmt.Errorf("integrity check failed: %s", results[0])
+	}
+
+	// Clean up -shm and -wal files that SQLite may create during the PRAGMA.
+	_ = os.Remove(dbPath + "-shm")
+	_ = os.Remove(dbPath + "-wal")
+
+	return nil
 }
 
 // findBestV3SnapshotForTimestamp returns the best v0.3.x snapshot for the given timestamp.

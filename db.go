@@ -500,6 +500,7 @@ func (db *DB) EnsureExists(ctx context.Context) error {
 
 	opt := NewRestoreOptions()
 	opt.OutputPath = db.Path()
+	opt.IntegrityCheck = IntegrityCheckQuick
 
 	if err := db.Replica.Restore(ctx, opt); err != nil {
 		if errors.Is(err, ErrTxNotAvailable) || errors.Is(err, ErrNoSnapshots) {
@@ -2367,6 +2368,15 @@ const DefaultRestoreParallelism = 8
 // DefaultFollowInterval is the default polling interval for follow mode.
 const DefaultFollowInterval = 1 * time.Second
 
+// IntegrityCheckMode specifies the level of integrity checking after restore.
+type IntegrityCheckMode int
+
+const (
+	IntegrityCheckNone IntegrityCheckMode = iota
+	IntegrityCheckQuick
+	IntegrityCheckFull
+)
+
 // RestoreOptions represents options for DB.Restore().
 type RestoreOptions struct {
 	// Target path to restore into.
@@ -2390,6 +2400,10 @@ type RestoreOptions struct {
 
 	// FollowInterval specifies how often to poll for new LTX files in follow mode.
 	FollowInterval time.Duration
+
+	// IntegrityCheck specifies the level of integrity checking after restore.
+	// Zero value (IntegrityCheckNone) skips the check for backward compatibility.
+	IntegrityCheck IntegrityCheckMode
 }
 
 // NewRestoreOptions returns a new instance of RestoreOptions with defaults.
