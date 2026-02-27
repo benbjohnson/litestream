@@ -6,6 +6,7 @@ import (
 	"crypto/md5"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -113,6 +114,11 @@ type ReplicaClient struct {
 	// Server-Side Encryption - AWS KMS (SSE-KMS)
 	// Only works with AWS S3 (not S3-compatible providers)
 	SSEKMSKeyID string // KMS key ID, ARN, or alias
+
+	ManifestEnabled      bool // when true, LTXFiles() reads from manifest instead of LIST (readers)
+	ManifestWriteEnabled bool // when true, WriteLTXFile/DeleteLTXFiles maintain the manifest (writers)
+	manifestMu           sync.Mutex
+	manifest             *Manifest
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -603,6 +609,16 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
+
+	if c.ManifestEnabled && !useMetadata {
+		m, err := c.readManifest(ctx)
+		if err != nil {
+			slog.Debug("manifest: read failed, falling back to LIST", "error", err)
+		} else if m != nil {
+			return newManifestIterator(m.EntriesForLevel(level, seek)), nil
+		}
+	}
+
 	return newFileIterator(ctx, c, level, seek, useMetadata), nil
 }
 
@@ -718,6 +734,8 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if out.ETag == nil {
 		return nil, fmt.Errorf("s3: upload failed: no ETag returned")
 	}
+
+	c.updateManifestAfterWrite(ctx, info)
 
 	return info, nil
 }
@@ -1093,6 +1111,8 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		objIDs = objIDs[n:]
 	}
 
+	c.updateManifestAfterDelete(ctx, a)
+
 	return nil
 }
 
@@ -1140,7 +1160,137 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		objIDs = objIDs[n:]
 	}
 
+	c.manifestMu.Lock()
+	c.manifest = nil
+	c.manifestMu.Unlock()
+
 	return nil
+}
+
+func (c *ReplicaClient) manifestKey() string {
+	return c.Path + "/manifest.json"
+}
+
+func (c *ReplicaClient) readManifest(ctx context.Context) (*Manifest, error) {
+	key := c.manifestKey()
+	input := &s3.GetObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	}
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+
+	out, err := c.s3.GetObject(ctx, input)
+	if err != nil {
+		if isNotExists(err) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("s3: get manifest %s: %w", key, err)
+	}
+	defer out.Body.Close()
+
+	var m Manifest
+	if err := json.NewDecoder(out.Body).Decode(&m); err != nil {
+		return nil, fmt.Errorf("s3: decode manifest: %w", err)
+	}
+	if m.Version != ManifestVersion {
+		return nil, fmt.Errorf("s3: unsupported manifest version %d", m.Version)
+	}
+	if m.Levels == nil {
+		m.Levels = make(map[int][]ManifestEntry)
+	}
+	return &m, nil
+}
+
+func (c *ReplicaClient) writeManifest(ctx context.Context, m *Manifest) error {
+	key := c.manifestKey()
+	data, err := json.Marshal(m)
+	if err != nil {
+		return fmt.Errorf("s3: encode manifest: %w", err)
+	}
+
+	input := &s3.PutObjectInput{
+		Bucket:      aws.String(c.Bucket),
+		Key:         aws.String(key),
+		Body:        bytes.NewReader(data),
+		ContentType: aws.String("application/json"),
+	}
+	if c.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(c.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(c.SSECustomerKeyMD5)
+	}
+	if c.SSEKMSKeyID != "" {
+		input.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		input.SSEKMSKeyId = aws.String(c.SSEKMSKeyID)
+	}
+
+	_, err = c.s3.PutObject(ctx, input)
+	if err != nil {
+		return fmt.Errorf("s3: put manifest %s: %w", key, err)
+	}
+	return nil
+}
+
+func (c *ReplicaClient) loadManifest(ctx context.Context) error {
+	if c.manifest != nil {
+		return nil
+	}
+
+	m, err := c.readManifest(ctx)
+	if err != nil {
+		return err
+	}
+	if m == nil {
+		m = NewManifest()
+	}
+	c.manifest = m
+	return nil
+}
+
+func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.FileInfo) {
+	if !c.ManifestWriteEnabled {
+		return
+	}
+
+	c.manifestMu.Lock()
+	defer c.manifestMu.Unlock()
+
+	if err := c.loadManifest(ctx); err != nil {
+		slog.Debug("manifest: failed to load, skipping update", "error", err)
+		return
+	}
+
+	c.manifest.AddFile(info)
+
+	if err := c.writeManifest(ctx, c.manifest); err != nil {
+		slog.Debug("manifest: failed to write after upload", "error", err)
+		c.manifest = nil
+	}
+}
+
+func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*ltx.FileInfo) {
+	if !c.ManifestWriteEnabled {
+		return
+	}
+
+	c.manifestMu.Lock()
+	defer c.manifestMu.Unlock()
+
+	if err := c.loadManifest(ctx); err != nil {
+		slog.Debug("manifest: failed to load for delete, skipping update", "error", err)
+		return
+	}
+
+	c.manifest.RemoveFiles(infos)
+
+	if err := c.writeManifest(ctx, c.manifest); err != nil {
+		slog.Debug("manifest: failed to write after delete", "error", err)
+		c.manifest = nil
+	}
 }
 
 // GenerationsV3 returns a list of v0.3.x generation IDs in the replica.

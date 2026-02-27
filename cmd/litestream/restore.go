@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/s3"
 )
 
 // RestoreCommand represents a command to restore a database from a backup.
@@ -121,6 +122,9 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	if err != nil {
 		return nil, err
 	}
+	if s3Client, ok := r.Client.(*s3.ReplicaClient); ok {
+		s3Client.ManifestEnabled = true
+	}
 	_, err = r.CalcRestoreTarget(ctx, *opt)
 	return r, err
 }
@@ -156,6 +160,9 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 		return nil, errSkipDBExists
 	}
 
+	if s3Client, ok := db.Replica.Client.(*s3.ReplicaClient); ok {
+		s3Client.ManifestEnabled = true
+	}
 	return db.Replica, nil
 }
 
