@@ -1678,6 +1678,8 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		client.SSEKMSKeyID = c.SSEKMSKeyID
 	}
 
+	client.ManifestWriteEnabled = true
+
 	return client, nil
 }
 
