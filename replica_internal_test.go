@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -410,5 +411,147 @@ func TestCheckIntegrity_CorruptDB(t *testing.T) {
 	err = checkIntegrity(context.Background(), dbPath, IntegrityCheckFull)
 	if err == nil {
 		t.Fatal("expected integrity check to fail on corrupt database")
+	}
+}
+
+func TestApplyLTXFile_TruncatesAfterWrite(t *testing.T) {
+	const pageSize = 4096
+
+	info := &ltx.FileInfo{Level: 0, MinTXID: 10, MaxTXID: 10}
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    2,
+		MinTXID:   info.MinTXID,
+		MaxTXID:   info.MaxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	page1 := make([]byte, pageSize)
+	copy(page1, []byte("SQLite format 3\000"))
+	page1[18], page1[19] = 0x01, 0x01
+	binary.BigEndian.PutUint16(page1[16:18], pageSize)
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, page1); err != nil {
+		t.Fatal(err)
+	}
+	page2 := bytes.Repeat([]byte{0xAB}, pageSize)
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 2}, page2); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ltxData := buf.Bytes()
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(ltxData)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("applyLTXFile: %v", err)
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSize := int64(2) * int64(pageSize)
+	if fi.Size() != expectedSize {
+		t.Fatalf("file size=%d, want %d", fi.Size(), expectedSize)
+	}
+
+	readBuf := make([]byte, pageSize)
+	if _, err := f.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readBuf, page2) {
+		t.Fatal("page 2 data mismatch after applyLTXFile")
+	}
+}
+
+func TestApplyLTXFile_MultiplePages(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 5
+
+	info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    numPages,
+		MinTXID:   info.MinTXID,
+		MaxTXID:   info.MaxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+
+	pages := make([][]byte, numPages)
+	for i := uint32(0); i < numPages; i++ {
+		pages[i] = bytes.Repeat([]byte{byte(0x10 + i)}, pageSize)
+		if i == 0 {
+			copy(pages[i], []byte("SQLite format 3\000"))
+			pages[i][18], pages[i][19] = 0x01, 0x01
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: i + 1}, pages[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ltxData := buf.Bytes()
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(ltxData)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("applyLTXFile: %v", err)
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSize := int64(numPages) * int64(pageSize)
+	if fi.Size() != expectedSize {
+		t.Fatalf("file size=%d, want %d", fi.Size(), expectedSize)
+	}
+
+	readBuf := make([]byte, pageSize)
+	for i := uint32(0); i < numPages; i++ {
+		if _, err := f.ReadAt(readBuf, int64(i)*int64(pageSize)); err != nil {
+			t.Fatalf("read page %d: %v", i+1, err)
+		}
+		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
+			t.Fatalf("page %d data mismatch", i+1)
+		}
 	}
 }
