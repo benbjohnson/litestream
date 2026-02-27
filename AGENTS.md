@@ -29,6 +29,7 @@ Litestream is a disaster recovery tool for SQLite that runs as a background proc
 | DB | `db.go` | Database state, restoration, WAL monitoring, library API (`SyncStatus`, `SyncAndWait`, `EnsureExists`) |
 | Replica | `replica.go` | Replication mechanics only |
 | Storage | `**/replica_client.go` | Backend implementations (includes `ReplicaClientV3` for v0.3.x restore) |
+| Manifest | `s3/manifest.go` | S3 manifest for reducing LIST operations (writer maintains, reader consumes) |
 | IPC | `server.go` | Unix socket control API (register/unregister, /txid, pprof) |
 | Leasing | `leaser.go`, `s3/leaser.go` | Distributed lease acquisition via conditional writes |
 
