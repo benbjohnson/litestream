@@ -3,6 +3,7 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"os"
@@ -276,4 +277,162 @@ func mustCreateWritableDBFile(tb testing.TB) *os.File {
 
 func ltxFixtureKey(level int, minTXID, maxTXID ltx.TXID) string {
 	return fmt.Sprintf("%d:%s:%s", level, minTXID, maxTXID)
+}
+
+// TestApplyLTXFile_TruncatesAfterWrite verifies that applyLTXFile correctly
+// truncates the database file to match the commit size in the LTX header.
+// This tests the fix from commit 9b7db29 which adds f.Sync() before truncate.
+func TestApplyLTXFile_TruncatesAfterWrite(t *testing.T) {
+	const pageSize = 4096
+
+	info := &ltx.FileInfo{Level: 0, MinTXID: 10, MaxTXID: 10}
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    2, // 2 pages = 8192 bytes
+		MinTXID:   info.MinTXID,
+		MaxTXID:   info.MaxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	// Write page 1 with SQLite-like header bytes.
+	page1 := make([]byte, pageSize)
+	copy(page1, []byte("SQLite format 3\000"))
+	page1[18], page1[19] = 0x01, 0x01
+	binary.BigEndian.PutUint16(page1[16:18], pageSize)
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, page1); err != nil {
+		t.Fatal(err)
+	}
+	// Write page 2.
+	page2 := bytes.Repeat([]byte{0xAB}, pageSize)
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 2}, page2); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ltxData := buf.Bytes()
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(ltxData)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+
+	// Create a file that's larger than the commit size (simulating a DB
+	// that will be truncated down).
+	f := mustCreateWritableDBFile(t) // 128KB
+	defer func() { _ = f.Close() }()
+
+	if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("applyLTXFile: %v", err)
+	}
+
+	// Verify the file was truncated to Commit * pageSize = 8192 bytes.
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSize := int64(2) * int64(pageSize)
+	if fi.Size() != expectedSize {
+		t.Fatalf("file size=%d, want %d (truncate failed)", fi.Size(), expectedSize)
+	}
+
+	// Verify page 2 data was written correctly.
+	readBuf := make([]byte, pageSize)
+	if _, err := f.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readBuf, page2) {
+		t.Fatal("page 2 data mismatch after applyLTXFile")
+	}
+}
+
+// TestApplyLTXFile_MultiplePages verifies that applying an LTX file with
+// multiple pages produces a valid, correctly sized database.
+func TestApplyLTXFile_MultiplePages(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 5
+
+	info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    numPages,
+		MinTXID:   info.MinTXID,
+		MaxTXID:   info.MaxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write pages with distinct fill patterns.
+	pages := make([][]byte, numPages)
+	for i := uint32(0); i < numPages; i++ {
+		pages[i] = bytes.Repeat([]byte{byte(0x10 + i)}, pageSize)
+		if i == 0 {
+			copy(pages[i], []byte("SQLite format 3\000"))
+			pages[i][18], pages[i][19] = 0x01, 0x01
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: i + 1}, pages[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ltxData := buf.Bytes()
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(ltxData)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("applyLTXFile: %v", err)
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSize := int64(numPages) * int64(pageSize)
+	if fi.Size() != expectedSize {
+		t.Fatalf("file size=%d, want %d", fi.Size(), expectedSize)
+	}
+
+	// Verify each page's content.
+	readBuf := make([]byte, pageSize)
+	for i := uint32(0); i < numPages; i++ {
+		if _, err := f.ReadAt(readBuf, int64(i)*int64(pageSize)); err != nil {
+			t.Fatalf("read page %d: %v", i+1, err)
+		}
+		// Page 1 has modified header bytes (journal mode + schema counter),
+		// so only check non-header pages exactly.
+		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
+			t.Fatalf("page %d data mismatch", i+1)
+		}
+	}
 }

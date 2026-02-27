@@ -884,6 +884,9 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 
 	if hdr.Commit > 0 {
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync before truncate: %w", err)
+		}
 		newSize := int64(hdr.Commit) * int64(pageSize)
 		if err := f.Truncate(newSize); err != nil {
 			return fmt.Errorf("truncate: %w", err)
