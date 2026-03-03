@@ -183,10 +183,15 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
-	if _, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f); err != nil {
+	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
-	r.Logger().Debug("ltx file uploaded", "filename", filename, "minTXID", minTXID, "maxTXID", maxTXID)
+	r.Logger().Info("ltx file uploaded",
+		"level", info.Level,
+		"minTXID", info.MinTXID,
+		"maxTXID", info.MaxTXID,
+		"size", info.Size)
 
 	// Track current position
 	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
