@@ -159,7 +159,11 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("no position, waiting for data")
 	}
 
-	r.Logger().Debug("replica sync", "txid", dpos.TXID.String())
+	r.Logger().Info("replica sync",
+		slog.Group("txid",
+			slog.String("replica", r.Pos().TXID.String()),
+			slog.String("db", dpos.TXID.String()),
+		))
 
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
