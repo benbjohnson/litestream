@@ -98,15 +98,7 @@ func TestSoakReplicateRestore(t *testing.T) {
 	s3URL := fmt.Sprintf("s3://%s/%s", bucket, s3Path)
 	db.ReplicaURL = s3URL
 
-	s3Config := &S3Config{
-		Endpoint:       endpoint,
-		AccessKey:      "minioadmin",
-		SecretKey:      "minioadmin",
-		Region:         "us-east-1",
-		ForcePathStyle: true,
-		SkipVerify:     true,
-	}
-	configPath := CreateSoakConfig(db.Path, s3URL, s3Config, true)
+	configPath := writeReplicateRestoreConfig(t, db.Path, s3URL, endpoint)
 	db.ConfigPath = configPath
 
 	if err := db.StartLitestreamWithConfig(configPath); err != nil {
@@ -287,6 +279,31 @@ loop:
 	}
 
 	t.Log("PASSED: no corruption detected")
+}
+
+func writeReplicateRestoreConfig(t *testing.T, dbPath, s3URL, endpoint string) string {
+	t.Helper()
+	configPath := filepath.Join(filepath.Dir(dbPath), "litestream.yml")
+	config := fmt.Sprintf(`access-key-id: minioadmin
+secret-access-key: minioadmin
+
+dbs:
+  - path: %s
+    checkpoint-interval: 1m
+    min-checkpoint-page-count: 100
+    replicas:
+      - url: %s
+        endpoint: %s
+        region: us-east-1
+        force-path-style: true
+        skip-verify: true
+        sync-interval: 1s
+        snapshot-interval: 30s
+`, filepath.ToSlash(dbPath), s3URL, endpoint)
+	if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	return configPath
 }
 
 func parseSoakDuration(t *testing.T, defaultDuration time.Duration) time.Duration {
