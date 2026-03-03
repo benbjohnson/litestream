@@ -1340,7 +1340,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	// to avoid underflow (32 - 4120 = -4088).
 	// See: https://github.com/benbjohnson/litestream/issues/900
 	if info.offset == WALHeaderSize {
-		slog.Debug("verify", "saltMatch", saltMatch, "atWALHeader", true)
+		db.Logger.Debug("verify", "saltMatch", saltMatch, "atWALHeader", true)
 		if saltMatch {
 			info.snapshotting = false
 			return info, nil
@@ -1351,7 +1351,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	// If offset is at the beginning of the first page, we can't check for previous page.
 	prevWALOffset := info.offset - frameSize
-	slog.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
+	db.Logger.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
 
 	if prevWALOffset == WALHeaderSize {
 		if saltMatch { // No writes occurred since last sync, salt still matches
@@ -1374,7 +1374,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		return info, nil
 	}
 
-	slog.Debug("verify.2", "lastPageMatch", lastPageMatch)
+	db.Logger.Debug("verify.2", "lastPageMatch", lastPageMatch)
 
 	if !saltMatch {
 		db.Logger.Log(ctx, internal.LevelTrace, "wal restarted",
