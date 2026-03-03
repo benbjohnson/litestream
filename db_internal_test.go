@@ -1655,10 +1655,16 @@ func TestDB_Verify_ForceSnapshotAfterCheckpointWALRestart(t *testing.T) {
 	expectedSalt1 := binary.BigEndian.Uint32(walHdr[16:])
 	expectedSalt2 := binary.BigEndian.Uint32(walHdr[20:])
 
-	// Set forceNextSnapshot (simulates what checkpoint() does on WAL restart)
-	// with syncedToWALEnd=false (simulates unsynced WAL frames before restart).
+	// Write more data without syncing to create unsynced WAL frames.
+	// The verify() function will detect these by checking the LTX position
+	// against the actual WAL content.
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'unsynced')`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Set forceNextSnapshot (simulates what checkpoint() does on WAL restart).
+	// With unsynced frames in the WAL, verify() should return snapshotting=true.
 	db.forceNextSnapshot = true
-	db.syncedToWALEnd = false
 
 	info, err = db.verify(ctx)
 	if err != nil {
@@ -2116,15 +2122,17 @@ func TestDB_Verify_ForceSnapshotSkippedWhenSyncedToWALEnd(t *testing.T) {
 	expectedSalt1 := binary.BigEndian.Uint32(walHdr[16:])
 	expectedSalt2 := binary.BigEndian.Uint32(walHdr[20:])
 
+	// Set forceNextSnapshot (simulates what checkpoint() does on WAL restart).
+	// Since all frames are already synced (no writes after Sync()), verify()
+	// should detect this by checking the LTX position and return snapshotting=false.
 	db.forceNextSnapshot = true
-	db.syncedToWALEnd = true
 
 	info, err := db.verify(ctx)
 	if err != nil {
 		t.Fatalf("verify: %v", err)
 	}
 	if info.snapshotting {
-		t.Fatal("expected snapshotting=false when syncedToWALEnd=true")
+		t.Fatal("expected snapshotting=false when all frames already synced")
 	}
 	if info.offset != WALHeaderSize {
 		t.Fatalf("offset=%d, want %d", info.offset, WALHeaderSize)
@@ -2134,9 +2142,6 @@ func TestDB_Verify_ForceSnapshotSkippedWhenSyncedToWALEnd(t *testing.T) {
 	}
 	if db.forceNextSnapshot {
 		t.Fatal("forceNextSnapshot should be cleared")
-	}
-	if db.syncedToWALEnd {
-		t.Fatal("syncedToWALEnd should be cleared")
 	}
 }
 
@@ -2221,71 +2226,4 @@ func TestDB_CheckpointDoesNotCreateSnapshotWhenFullySynced(t *testing.T) {
 	}
 
 	_ = preTXID
-}
-
-func TestDB_Checkpoint_ConcurrentWriterClearsSyncedToWALEnd(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		if err := db.Close(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'initial')`); err != nil {
-		t.Fatal(err)
-	}
-
-	ctx := context.Background()
-
-	if err := db.Sync(ctx); err != nil {
-		t.Fatal(err)
-	}
-
-	if !db.syncedToWALEnd {
-		t.Fatal("expected syncedToWALEnd=true after sync")
-	}
-
-	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'concurrent write')`); err != nil {
-		t.Fatal(err)
-	}
-
-	walSize, err := db.walFileSize()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if walSize <= db.lastSyncedWALOffset {
-		t.Fatal("expected WAL to grow after concurrent write")
-	}
-
-	if db.syncedToWALEnd {
-		if walSize > db.lastSyncedWALOffset {
-			db.syncedToWALEnd = false
-		}
-	}
-
-	if db.syncedToWALEnd {
-		t.Fatal("syncedToWALEnd should be cleared when WAL grew after sync")
-	}
 }

@@ -79,14 +79,6 @@ type DB struct {
 	// otherwise create unnecessary LTX files. See issue #896.
 	syncedSinceCheckpoint bool
 
-	// syncedToWALEnd tracks whether the last successful sync reached the
-	// exact end of the WAL file. When true, a subsequent WAL truncation
-	// (from checkpoint) is expected and should NOT trigger a full snapshot.
-	// This prevents issue #927 where every checkpoint triggers unnecessary
-	// full snapshots because verify() sees the old LTX position exceeds
-	// the new (truncated) WAL size.
-	syncedToWALEnd bool
-
 	// lastSyncedWALOffset tracks the logical end of the WAL content after
 	// the last successful sync. This is the WALOffset + WALSize from the
 	// last LTX file. Used for checkpoint threshold decisions instead of
@@ -1270,25 +1262,61 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	if db.forceNextSnapshot {
 		db.forceNextSnapshot = false
-		hdr, err := readWALHeader(db.WALPath())
+		newHdr, err := readWALHeader(db.WALPath())
 		if err != nil {
 			return info, fmt.Errorf("read wal header for forced snapshot: %w", err)
 		}
 		info.offset = WALHeaderSize
-		info.salt1 = binary.BigEndian.Uint32(hdr[16:])
-		info.salt2 = binary.BigEndian.Uint32(hdr[20:])
+		info.salt1 = binary.BigEndian.Uint32(newHdr[16:])
+		info.salt2 = binary.BigEndian.Uint32(newHdr[20:])
 
-		// Safe to skip snapshot: forceNextSnapshot is only set by checkpoint(),
-		// which calls verifyAndSync() immediately before, guaranteeing that
-		// syncedToWALEnd reflects the WAL state right before the checkpoint.
-		if db.syncedToWALEnd {
-			db.syncedToWALEnd = false
-			info.snapshotting = false
-			info.reason = "WAL restarted but all frames already synced"
+		// Determine if all WAL frames were synced before the restart by reading
+		// the last LTX file's position and checking for unsynced frames. This
+		// approach is persistent and survives Litestream restarts. See issue #1165.
+		ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+		ltxFile, err := os.Open(ltxPath)
+		if err != nil {
+			info.reason = "WAL restarted during checkpoint"
 			return info, nil
 		}
 
-		info.reason = "WAL restarted during checkpoint"
+		dec := ltx.NewDecoder(ltxFile)
+		if err := dec.DecodeHeader(); err != nil {
+			_ = ltxFile.Close()
+			info.reason = "WAL restarted during checkpoint"
+			return info, nil
+		}
+		_ = ltxFile.Close()
+
+		// Check if there are unsynced frames from the old WAL generation by
+		// reading at the position after the last synced frame.
+		ltxEndOffset := dec.Header().WALOffset + dec.Header().WALSize
+		oldSalt1 := dec.Header().WALSalt1
+		oldSalt2 := dec.Header().WALSalt2
+
+		walFile, err := os.Open(db.WALPath())
+		if err != nil {
+			info.reason = "WAL restarted during checkpoint"
+			return info, nil
+		}
+
+		frmHdr := make([]byte, WALFrameHeaderSize)
+		n, _ := walFile.ReadAt(frmHdr, ltxEndOffset)
+		_ = walFile.Close()
+
+		if n == WALFrameHeaderSize {
+			frameSalt1 := binary.BigEndian.Uint32(frmHdr[8:])
+			frameSalt2 := binary.BigEndian.Uint32(frmHdr[12:])
+			// If the frame has old salts, there are unsynced frames
+			if frameSalt1 == oldSalt1 && frameSalt2 == oldSalt2 {
+				info.reason = "WAL restarted with unsynced frames"
+				return info, nil
+			}
+		}
+
+		// No unsynced frames - skip snapshot
+		info.snapshotting = false
+		info.reason = "WAL restarted but all frames already synced"
 		return info, nil
 	}
 
@@ -1317,8 +1345,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	if fi, err := os.Stat(db.WALPath()); err != nil {
 		return info, fmt.Errorf("open wal file: %w", err)
 	} else if info.offset > fi.Size() {
-		db.syncedToWALEnd = false
-
 		hdr, err := readWALHeader(db.WALPath())
 		if err != nil {
 			return info, fmt.Errorf("read wal header after wal truncation: %w", err)
@@ -1634,14 +1660,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	// This is the WALOffset + WALSize from the LTX we just created.
 	// Using this instead of file size prevents issue #997 where stale
 	// frames with old salt values cause perpetual checkpoint triggering.
-	finalOffset := info.offset + sz
-	db.lastSyncedWALOffset = finalOffset
-
-	// The WALReader reads all valid frames, stopping at salt mismatch or EOF,
-	// so finalOffset represents the logical end of valid WAL content.
-	// Using physical file size was incorrect after a WAL restart because
-	// the file retains stale data from the previous generation. See issue #1165.
-	db.syncedToWALEnd = true
+	db.lastSyncedWALOffset = info.offset + sz
 
 	db.Logger.Debug("db sync", "status", "ok")
 
@@ -1749,28 +1768,6 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	// Copy end of WAL before checkpoint to copy as much as possible.
 	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
-	}
-
-	// Detect if a concurrent writer appended frames after our sync completed.
-	// Read the frame header at lastSyncedWALOffset and check if its salts match
-	// the current WAL header. Matching salts indicate a valid frame from a
-	// concurrent writer; mismatched salts indicate stale data from a previous
-	// WAL generation. Using physical file size was incorrect because stale data
-	// after a WAL restart inflates the file size. See issue #1165.
-	if db.syncedToWALEnd {
-		if f, err := os.Open(db.WALPath()); err == nil {
-			frmHdr := make([]byte, WALFrameHeaderSize)
-			if n, _ := f.ReadAt(frmHdr, db.lastSyncedWALOffset); n == WALFrameHeaderSize {
-				frameSalt1 := binary.BigEndian.Uint32(frmHdr[8:])
-				frameSalt2 := binary.BigEndian.Uint32(frmHdr[12:])
-				walSalt1 := binary.BigEndian.Uint32(hdr[16:])
-				walSalt2 := binary.BigEndian.Uint32(hdr[20:])
-				if frameSalt1 == walSalt1 && frameSalt2 == walSalt2 {
-					db.syncedToWALEnd = false
-				}
-			}
-			f.Close()
-		}
 	}
 
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
