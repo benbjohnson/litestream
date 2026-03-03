@@ -30,6 +30,8 @@ func (c *testReplicaClient) Init(_ context.Context) error { return nil }
 
 func (c *testReplicaClient) Type() string { return "test" }
 
+func (c *testReplicaClient) SetManifestEnabled(_ bool) {}
+
 func (c *testReplicaClient) LTXFiles(_ context.Context, level int, afterTXID ltx.TXID, _ bool) (ltx.FileIterator, error) {
 	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "LIST").Inc()
 

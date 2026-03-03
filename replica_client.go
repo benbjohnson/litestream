@@ -44,6 +44,11 @@ type ReplicaClient interface {
 
 	// DeleteAll deletes all files.
 	DeleteAll(ctx context.Context) error
+
+	// SetManifestEnabled enables or disables manifest-based file listing.
+	// When enabled, LTXFiles may use a cached manifest for faster iteration.
+	// Not all backends support manifests; unsupported backends ignore this setting.
+	SetManifestEnabled(enabled bool)
 }
 
 // FindLTXFiles returns a list of files that match filter.
