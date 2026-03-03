@@ -115,10 +115,12 @@ type ReplicaClient struct {
 	// Only works with AWS S3 (not S3-compatible providers)
 	SSEKMSKeyID string // KMS key ID, ARN, or alias
 
-	ManifestEnabled      bool // when true, LTXFiles() reads from manifest instead of LIST (readers)
-	ManifestWriteEnabled bool // when true, WriteLTXFile/DeleteLTXFiles maintain the manifest (writers)
-	manifestMu           sync.Mutex
-	manifest             *Manifest
+	ManifestEnabled          bool // when true, LTXFiles() reads from manifest instead of LIST (readers)
+	ManifestWriteEnabled     bool // when true, WriteLTXFile/DeleteLTXFiles maintain the manifest (writers)
+	ManifestConfigured       bool // true when manifest setting was processed from config (enables cleanup)
+	manifestMu               sync.Mutex
+	manifest                 *Manifest
+	manifestCleanupAttempted bool // tracks if we've tried to delete stale manifest when disabled
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -318,6 +320,11 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 // Type returns "s3" as the client type.
 func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
+}
+
+// SetManifestEnabled enables or disables manifest-based file listing.
+func (c *ReplicaClient) SetManifestEnabled(enabled bool) {
+	c.ManifestEnabled = enabled
 }
 
 // Init initializes the connection to S3. No-op if already initialized.
@@ -1253,6 +1260,7 @@ func (c *ReplicaClient) loadManifest(ctx context.Context) error {
 
 func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.FileInfo) {
 	if !c.ManifestWriteEnabled {
+		c.cleanupStaleManifest(ctx)
 		return
 	}
 
@@ -1274,6 +1282,7 @@ func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.
 
 func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*ltx.FileInfo) {
 	if !c.ManifestWriteEnabled {
+		c.cleanupStaleManifest(ctx)
 		return
 	}
 
@@ -1290,6 +1299,36 @@ func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*
 	if err := c.writeManifest(ctx, c.manifest); err != nil {
 		slog.Debug("manifest: failed to write after delete", "error", err)
 		c.manifest = nil
+	}
+}
+
+// cleanupStaleManifest deletes the manifest.json file if it exists when manifest
+// writing is disabled. This handles the case where a user disables manifests after
+// they were previously enabled. Only attempts cleanup once to avoid DELETE calls
+// on every mutation. Only runs for clients created from config (ManifestConfigured=true).
+func (c *ReplicaClient) cleanupStaleManifest(ctx context.Context) {
+	// Only run cleanup for clients created from config where manifest settings
+	// were explicitly processed. This prevents cleanup attempts for programmatic
+	// clients (tests) that never had manifests configured.
+	if !c.ManifestConfigured {
+		return
+	}
+
+	c.manifestMu.Lock()
+	defer c.manifestMu.Unlock()
+
+	if c.manifestCleanupAttempted {
+		return
+	}
+	c.manifestCleanupAttempted = true
+
+	key := c.manifestKey()
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil && !isNotExists(err) {
+		slog.Debug("manifest: failed to delete stale manifest", "error", err)
 	}
 }
 

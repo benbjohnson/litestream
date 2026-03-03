@@ -1015,6 +1015,12 @@ type ReplicaSettings struct {
 	// S3 Server-Side Encryption (SSE-KMS: AWS Key Management Service)
 	SSEKMSKeyID string `yaml:"sse-kms-key-id"`
 
+	// S3 manifest settings
+	// When true, maintains a manifest.json file that readers can use instead of LIST operations.
+	// This reduces S3 API costs for read replicas (follow mode) but adds PUT costs on every write.
+	// Disabled by default. Only enable if running read replicas that poll frequently.
+	Manifest *bool `yaml:"manifest"`
+
 	// ABS settings
 	AccountName string `yaml:"account-name"`
 	AccountKey  string `yaml:"account-key"`
@@ -1515,7 +1521,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		client.SSEKMSKeyID = c.SSEKMSKeyID
 	}
 
-	client.ManifestWriteEnabled = true
+	// Enable manifest writing only when explicitly configured.
+	// Mark as configured to enable stale manifest cleanup when disabled.
+	if c.Manifest != nil {
+		client.ManifestConfigured = true
+		if *c.Manifest {
+			client.ManifestWriteEnabled = true
+		}
+	}
 
 	return client, nil
 }
