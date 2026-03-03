@@ -131,6 +131,8 @@ func (c *delayedReplicaClient) Init(context.Context) error { return nil }
 
 func (c *delayedReplicaClient) SetLogger(*slog.Logger) {}
 
+func (c *delayedReplicaClient) SetManifestEnabled(bool) {}
+
 func (c *delayedReplicaClient) key(level int, min, max ltx.TXID) string {
 	return fmt.Sprintf("%d:%s:%s", level, min.String(), max.String())
 }

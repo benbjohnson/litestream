@@ -48,6 +48,11 @@ type ReplicaClient interface {
 
 	// SetLogger sets the logger for the client.
 	SetLogger(logger *slog.Logger)
+
+	// SetManifestEnabled enables or disables manifest-based file listing.
+	// When enabled, LTXFiles may use a cached manifest for faster iteration.
+	// Not all backends support manifests; unsupported backends ignore this setting.
+	SetManifestEnabled(enabled bool)
 }
 
 // FindLTXFiles returns a list of files that match filter.

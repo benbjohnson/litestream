@@ -232,6 +232,8 @@ func (*followTestReplicaClient) Init(context.Context) error { return nil }
 
 func (*followTestReplicaClient) SetLogger(*slog.Logger) {}
 
+func (*followTestReplicaClient) SetManifestEnabled(bool) {}
+
 func (c *followTestReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if c.LTXFilesFunc != nil {
 		return c.LTXFilesFunc(ctx, level, seek, useMetadata)
