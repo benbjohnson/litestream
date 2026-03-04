@@ -261,42 +261,30 @@ jobs:
             | Go toolchain | ${goIcon} | ${goCurrent}${goStale ? ` → ${goLatest} available` : ' (latest)'} |
             | Module graph | ✅ | ${prGraphSize} edges (${graphSign}${graphDiff}) |
 
-            <details>
-            <summary>Binary size details</summary>
+            ### Binary Size
 
             | | Size | Change |
             |---|---:|---:|
             | Base (\`${context.payload.pull_request.base.sha.substring(0, 7)}\`) | ${fmt(baseSize)} | |
             | PR (\`${context.sha.substring(0, 7)}\`) | ${fmt(prSize)} | ${sign}${(diff / 1024).toFixed(1)} KB (${sign}${pct}%) |
 
-            </details>
-
-            <details>
-            <summary>Dependency changes</summary>
+            ### Dependency Changes
 
             ${depsDetail}
 
-            </details>
-
-            <details>
-            <summary>govulncheck output</summary>
+            ### govulncheck Output
 
             \`\`\`
             ${vulncheck}
             \`\`\`
 
-            </details>
-
-            <details>
-            <summary>Build info</summary>
+            ### Build Info
 
             | Metric | Value |
             |---|---|
             | Build time | ${buildTime}s |
             | Go version | \`${goVersion}\` |
             | Commit | \`${context.sha.substring(0, 7)}\` |
-
-            </details>
 
             <!-- history -->
             ---
@@ -327,10 +315,15 @@ jobs:
               const historyIdx = prevBody.indexOf(historyMarker);
               if (historyIdx !== -1) {
                 const afterMarker = prevBody.substring(historyIdx + historyMarker.length);
+                // Support both old <details> format and new plain format
                 const detailsMatch = afterMarker.match(/<details>[\s\S]*?<\/details>/);
                 if (detailsMatch) {
                   const innerMatch = detailsMatch[0].match(/<summary>[^<]*<\/summary>([\s\S]*?)<\/details>/);
                   if (innerMatch) historyEntries = innerMatch[1].trim();
+                } else {
+                  // Plain format: extract table rows after the header
+                  const tableMatch = afterMarker.match(/\| Commit \| Updated[\s\S]*?(?=\n---|\n$|$)/);
+                  if (tableMatch) historyEntries = tableMatch[0].trim();
                 }
               }
 
@@ -348,7 +341,7 @@ jobs:
                   .slice(0, 9);
                 const allRows = newEntry ? [newEntry, ...existingRows] : existingRows;
                 if (allRows.length > 0) {
-                  historyRows = `\n<details>\n<summary>History (${allRows.length} previous)</summary>\n\n| Commit | Updated | Status | Summary |\n|:-------|:--------|:------:|:--------|\n${allRows.join('\n')}\n\n</details>`;
+                  historyRows = `\n### History (${allRows.length} previous)\n\n| Commit | Updated | Status | Summary |\n|:-------|:--------|:------:|:--------|\n${allRows.join('\n')}`;
                 }
               }
 
