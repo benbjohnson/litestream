@@ -267,9 +267,9 @@ func TestMinIOSoak(t *testing.T) {
 	testPassed := true
 	issues := []string{}
 
-	if criticalErrors > 0 {
+	if len(errors) > 0 {
 		testPassed = false
-		issues = append(issues, fmt.Sprintf("Critical errors detected: %d", criticalErrors))
+		issues = append(issues, fmt.Sprintf("Critical errors detected: %d", len(errors)))
 	}
 
 	if finalObjects == 0 {
