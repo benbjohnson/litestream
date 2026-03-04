@@ -159,7 +159,11 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		return fmt.Errorf("no position, waiting for data")
 	}
 
-	r.Logger().Debug("replica sync", "txid", dpos.TXID.String())
+	r.Logger().Info("replica sync",
+		slog.Group("txid",
+			slog.String("replica", r.Pos().TXID.String()),
+			slog.String("db", dpos.TXID.String()),
+		))
 
 	// Replicate all L0 LTX files since last replica position.
 	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
@@ -183,10 +187,15 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	}
 	defer func() { _ = f.Close() }()
 
-	if _, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f); err != nil {
+	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
-	r.Logger().Debug("ltx file uploaded", "filename", filename, "minTXID", minTXID, "maxTXID", maxTXID)
+	r.Logger().Info("ltx file uploaded",
+		"level", info.Level,
+		"minTXID", info.MinTXID,
+		"maxTXID", info.MaxTXID,
+		"size", info.Size)
 
 	// Track current position
 	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
