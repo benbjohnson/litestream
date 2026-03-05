@@ -7,14 +7,21 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/mattn/go-shellwords"
 )
 
 // RestoreCommand represents a command to restore a database from a backup.
-type RestoreCommand struct{}
+type RestoreCommand struct {
+	signalChanFn func() <-chan os.Signal
+	restoreFn    func(context.Context, *litestream.Replica, litestream.RestoreOptions) error
+}
 
 // Run executes the command.
 func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
@@ -22,6 +29,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
+	execFlag := fs.String("exec", "", "execute subcommand")
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.Var((*txidVar)(&opt.TXID), "txid", "transaction ID")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
@@ -41,26 +49,107 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 
 	initLog(os.Stdout, "INFO", "text")
 
-	// When follow mode is enabled, set up signal handling so Ctrl+C stops
-	// the follow loop cleanly.
-	if opt.Follow {
-		ch := signalChan()
-		cancelCtx, cancel := context.WithCancel(ctx)
-		go func() {
-			select {
-			case <-ch:
-				cancel()
-			case <-cancelCtx.Done():
-			}
-		}()
-		ctx = cancelCtx
-		defer cancel()
-	}
-
 	// Parse timestamp, if specified.
 	if *timestampStr != "" {
 		if opt.Timestamp, err = time.Parse(time.RFC3339, *timestampStr); err != nil {
 			return errors.New("invalid -timestamp, must specify in ISO 8601 format (e.g. 2000-01-01T00:00:00Z)")
+		}
+	}
+
+	var execArgs []string
+	if *execFlag != "" {
+		execArgs, err = shellwords.Parse(*execFlag)
+		if err != nil {
+			return fmt.Errorf("cannot parse exec command: %w", err)
+		}
+		if len(execArgs) == 0 {
+			return fmt.Errorf("exec command is empty")
+		}
+
+		// -exec always implies follow mode.
+		opt.Follow = true
+	}
+
+	if opt.Follow && opt.TXID != 0 {
+		return fmt.Errorf("cannot use follow mode with -txid")
+	}
+	if opt.Follow && !opt.Timestamp.IsZero() {
+		return fmt.Errorf("cannot use follow mode with -timestamp")
+	}
+
+	var (
+		cancel   context.CancelFunc
+		waitDone chan struct{}
+		execErr  error
+		cmd      *exec.Cmd
+		signaled bool
+		mu       sync.Mutex
+	)
+
+	if opt.Follow {
+		signalChFn := c.signalChanFn
+		if signalChFn == nil {
+			signalChFn = signalChan
+		}
+		ch := signalChFn()
+		ctx, cancel = context.WithCancel(ctx)
+		defer cancel()
+
+		go func() {
+			signalCount := 0
+			for {
+				select {
+				case sig := <-ch:
+					signalCount++
+					mu.Lock()
+					signaled = true
+					mu.Unlock()
+
+					mu.Lock()
+					c := cmd
+					mu.Unlock()
+
+					if c != nil {
+						if err := c.Process.Signal(sig); err != nil {
+							slog.Warn("cannot signal exec process", "error", err)
+						}
+					}
+
+					if c == nil || signalCount > 1 {
+						cancel()
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	if len(execArgs) > 0 {
+		opt.OnRestored = func() error {
+			c := exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
+			c.Env = os.Environ()
+			c.Stdout = os.Stdout
+			c.Stderr = os.Stderr
+			if err := c.Start(); err != nil {
+				return fmt.Errorf("cannot start exec command: %w", err)
+			}
+
+			mu.Lock()
+			cmd = c
+			waitDone = make(chan struct{})
+			mu.Unlock()
+
+			go func() {
+				err := c.Wait()
+				mu.Lock()
+				execErr = err
+				close(waitDone)
+				mu.Unlock()
+				cancel()
+			}()
+
+			return nil
 		}
 	}
 
@@ -88,16 +177,65 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
+	restoreFn := c.restoreFn
+	if restoreFn == nil {
+		restoreFn = func(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) error {
+			return r.Restore(ctx, opt)
+		}
+	}
+	err = restoreFn(ctx, r, opt)
+	if errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
 			return nil
 		}
 		return fmt.Errorf("no matching backup files available")
-	} else if err != nil {
+	}
+
+	if len(execArgs) > 0 {
+		if err != nil && cancel != nil {
+			cancel()
+		}
+
+		mu.Lock()
+		ch := waitDone
+		mu.Unlock()
+		if ch != nil {
+			<-ch
+		}
+
+		mu.Lock()
+		e := execErr
+		s := signaled
+		mu.Unlock()
+
+		if err != nil && !errors.Is(err, context.Canceled) {
+			return err
+		}
+
+		if e != nil {
+			if s && isSignalExitError(e) {
+				return nil
+			}
+			return e
+		}
+	}
+
+	if err != nil {
 		return err
 	}
 	return nil
+}
+
+func isSignalExitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if strings.HasPrefix(err.Error(), "signal:") {
+		return true
+	}
+	var exitErr *exec.ExitError
+	return errors.As(err, &exitErr) && exitErr.ExitCode() == -1
 }
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
@@ -207,6 +345,10 @@ Arguments:
 	    Polling interval for follow mode.
 	    Defaults to 1s.
 
+	-exec CMD
+	    Executes a subcommand after initial restore completes.
+	    This flag implies -f and litestream exits when the child exits.
+
 	-parallelism NUM
 	    Determines the number of WAL files downloaded in parallel.
 	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
@@ -228,6 +370,9 @@ Examples:
 
 	# Continuously restore (follow) a database from a replica.
 	$ litestream restore -f -o /tmp/read-replica.db s3://mybucket/db
+
+	# Restore in follow mode and run a subprocess.
+	$ litestream restore -exec "my-app --readonly" -o /tmp/read-replica.db s3://mybucket/db
 
 `[1:],
 		DefaultConfigPath(),
