@@ -133,8 +133,31 @@ func readWALHeader(filename string) ([]byte, error) {
 	return buf[:n], err
 }
 
-// readWALFileAt reads a slice from a file. Do not use this with database files
-// as it causes problems with non-OFD locks.
+// readSHMMxFrameKey reads the mxFrame field (4 bytes at offset 16) from the
+// WAL-index (-shm) file. mxFrame is the count of valid WAL frames and advances
+// on every commit, so it reliably indicates WAL changes even when SQLite reuses
+// WAL space after checkpointing. Returns the value in big-endian form to match
+// SQLite's WAL format.
+func readSHMMxFrameKey(shmPath string) (uint32, error) {
+	f, err := os.Open(shmPath)
+	if err != nil {
+		return 0, err
+	}
+	defer f.Close()
+
+	buf := make([]byte, 4)
+	n, err := f.ReadAt(buf, 16)
+	if err != nil {
+		return 0, err
+	}
+	if n < 4 {
+		return 0, io.ErrUnexpectedEOF
+	}
+	return binary.BigEndian.Uint32(buf), nil
+}
+
+// readWALFileAt reads a slice from a file.
+// Do not use this with database files as it causes problems with non-OFD locks.
 func readWALFileAt(filename string, offset, n int64) ([]byte, error) {
 	f, err := os.Open(filename)
 	if err != nil {

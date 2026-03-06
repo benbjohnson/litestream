@@ -1222,6 +1222,189 @@ func TestDB_Monitor_DetectsSaltChangeAfterRestart(t *testing.T) {
 	}
 }
 
+// TestDB_Monitor_MissesWritesWhenWALSizeUnchanged reproduces issue #1037:
+// after a RESTART checkpoint, the WAL is reset (new salt in header) but the
+// file is NOT truncated, so its physical size stays the same. The monitor
+// detects the first post-reset write via the header salt change, but
+// subsequent writes within the old file bounds change neither the file size
+// nor the header — so the monitor's cheap change detection skips Sync().
+func TestDB_Monitor_MissesWritesWhenWALSizeUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 50 * time.Millisecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a table and insert enough rows to build up a large WAL.
+	// We need the WAL file to be large enough that post-reset writes
+	// don't extend past the old file size.
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, fmt.Sprintf("initial-%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wait for initial sync to process all the writes.
+	time.Sleep(200 * time.Millisecond)
+
+	walPath := db.WALPath()
+	fiBefore, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("WAL size after initial writes: %d bytes", fiBefore.Size())
+
+	// Use litestream's own checkpoint which properly releases the read lock,
+	// allowing the RESTART to fully reset the WAL. RESTART resets the WAL
+	// (new salt values in header) but does NOT truncate the file — the
+	// physical file keeps its old size.
+	ctx := context.Background()
+	if err := db.Checkpoint(ctx, CheckpointModeRestart); err != nil {
+		t.Fatal(err)
+	}
+
+	// The checkpoint itself writes a frame (the _litestream_seq insert),
+	// so the WAL now has at least 1 frame with new salt.
+	// Wait for monitor to detect the salt change and sync.
+	time.Sleep(200 * time.Millisecond)
+
+	// Record the baseline: WAL size and header after the reset was detected.
+	fi, err := os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walSizeBaseline := fi.Size()
+	headerBaseline, err := readWALHeader(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	syncMetric := syncNCounterVec.WithLabelValues(db.Path())
+	syncCountBaseline := testutil.ToFloat64(syncMetric)
+	t.Logf("baseline: sync_count=%v, wal_size=%d, header_salt=%x",
+		syncCountBaseline, walSizeBaseline, headerBaseline[12:20])
+
+	// Now perform several writes. Since the WAL was reset but the file
+	// wasn't truncated, these writes overwrite positions within the old
+	// file bounds. The file size and header should remain unchanged.
+	const numWrites = 5
+	for i := 0; i < numWrites; i++ {
+		if _, err := sqldb.Exec(`UPDATE t SET val = ? WHERE id = ?`,
+			fmt.Sprintf("updated-%d", i), i); err != nil {
+			t.Fatal(err)
+		}
+		// Give the monitor time to tick between writes.
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Allow a few more monitor ticks after the last write.
+	time.Sleep(200 * time.Millisecond)
+
+	// Check if the bug condition was reproduced.
+	fi, err = os.Stat(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	walSizeAfter := fi.Size()
+	headerAfter, err := readWALHeader(walPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	sizeUnchanged := walSizeBaseline == walSizeAfter
+	headerUnchanged := bytes.Equal(headerBaseline, headerAfter)
+	t.Logf("after %d writes: wal_size=%d (unchanged=%v), header_salt=%x (unchanged=%v)",
+		numWrites, walSizeAfter, sizeUnchanged, headerAfter[12:20], headerUnchanged)
+
+	syncCountAfter := testutil.ToFloat64(syncMetric)
+	t.Logf("sync_count: baseline=%v, after=%v", syncCountBaseline, syncCountAfter)
+
+	if !sizeUnchanged || !headerUnchanged {
+		// WAL state changed, so existing detection works. This means the
+		// bug condition wasn't reproduced (possibly different SQLite behavior).
+		if syncCountAfter <= syncCountBaseline {
+			t.Fatalf("monitor missed writes even though WAL state changed: "+
+				"sync_count baseline=%v, after=%v", syncCountBaseline, syncCountAfter)
+		}
+		t.Skip("WAL size or header changed after writes; bug condition from issue #1037 not reproduced")
+	}
+
+	// Bug condition confirmed: WAL size and header are both unchanged after
+	// writes. The monitor's change detection (size + header) misses these.
+	if syncCountAfter <= syncCountBaseline {
+		t.Fatalf("issue #1037: monitor missed %d writes when WAL size (%d) and header "+
+			"were unchanged after RESTART checkpoint; sync_count stayed at %v "+
+			"(expected increase). The change detection needs an additional signal "+
+			"like mtime or SHM mxFrame to detect WAL-reuse writes.",
+			numWrites, walSizeAfter, syncCountBaseline)
+	}
+}
+
+// TestReadSHMMxFrameKey verifies reading the mxFrame value from a SHM file.
+func TestReadSHMMxFrameKey(t *testing.T) {
+	dir := t.TempDir()
+	shmPath := filepath.Join(dir, "db-shm")
+
+	// Create a file with 20 bytes so offset 16 has room for 4 bytes. mxFrame = 42 in big-endian.
+	buf := make([]byte, 20)
+	binary.BigEndian.PutUint32(buf[16:20], 42)
+	if err := os.WriteFile(shmPath, buf, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := readSHMMxFrameKey(shmPath)
+	if err != nil {
+		t.Fatalf("readSHMMxFrameKey: %v", err)
+	}
+	if got != 42 {
+		t.Errorf("readSHMMxFrameKey() = %d, want 42", got)
+	}
+}
+
+// TestReadSHMMxFrameKey_Error verifies errors when the SHM file is missing or too short.
+func TestReadSHMMxFrameKey_Error(t *testing.T) {
+	dir := t.TempDir()
+
+	t.Run("missing file", func(t *testing.T) {
+		_, err := readSHMMxFrameKey(filepath.Join(dir, "nonexistent-shm"))
+		if err == nil {
+			t.Fatal("expected error for missing file")
+		}
+	})
+
+	t.Run("file too short", func(t *testing.T) {
+		shmPath := filepath.Join(dir, "short-shm")
+		if err := os.WriteFile(shmPath, []byte{0, 0, 0, 0}, 0600); err != nil {
+			t.Fatal(err)
+		}
+		_, err := readSHMMxFrameKey(shmPath)
+		if err == nil {
+			t.Fatal("expected error for file too short")
+		}
+	})
+}
+
 // TestIsDiskFullError tests the disk full error detection helper.
 func TestIsDiskFullError(t *testing.T) {
 	tests := []struct {
