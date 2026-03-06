@@ -22,6 +22,8 @@ type ReplicaClient struct {
 
 func (c *ReplicaClient) Type() string { return "mock" }
 
+func (c *ReplicaClient) SetManifestEnabled(enabled bool) {}
+
 func (c *ReplicaClient) Init(ctx context.Context) error {
 	if c.InitFunc != nil {
 		return c.InitFunc(ctx)

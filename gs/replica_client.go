@@ -70,6 +70,9 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
+// SetManifestEnabled is a no-op for GCS (manifests not supported).
+func (c *ReplicaClient) SetManifestEnabled(enabled bool) {}
+
 // Init initializes the connection to GS. No-op if already initialized.
 func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.mu.Lock()

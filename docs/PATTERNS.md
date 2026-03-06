@@ -12,6 +12,7 @@ This document contains detailed code patterns, examples, and anti-patterns for w
 - [Resumable Reader Pattern](#resumable-reader-pattern)
 - [Retention Bypass Pattern](#retention-bypass-pattern)
 - [Conditional Write Pattern (Distributed Locking)](#conditional-write-pattern-distributed-locking)
+- [Manifest Pattern (S3 LIST Reduction)](#manifest-pattern-s3-list-reduction)
 - [Timestamp Preservation](#timestamp-preservation)
 - [Common Pitfalls](#common-pitfalls)
 - [Component Reference](#component-reference)
@@ -354,6 +355,78 @@ _, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 
 - **HTTP 412 (PreconditionFailed)**: Another instance acquired/renewed the lease
 - **HTTP 404 (NoSuchKey)**: Lease already released
+
+## Manifest Pattern (S3 LIST Reduction)
+
+S3 LIST operations cost 5-10x more than GET. The manifest (`manifest.json`) replaces per-poll LIST calls with a single GET for read replicas (restore, follow mode).
+
+### Architecture
+
+```text
+Writer (replicate/compact)  →  Maintains manifest as side effect of mutations
+                                Always uses LIST for its own operations (correctness)
+
+Reader (restore/follow)     →  Fetches manifest via GET
+                                Falls back to LIST when manifest is missing/corrupt
+```
+
+- **Writer independence**: The writer NEVER reads from the manifest for its own operations. It always uses LIST for correctness and writes the manifest as a side effect.
+- **Reader optimization**: Read replicas set `ManifestEnabled = true` to prefer manifest GET over LIST.
+- **Errors are non-fatal**: Manifest failures are DEBUG-logged. The reader falls back to LIST transparently.
+
+### DO: Keep manifest updates best-effort with LIST fallback
+
+```go
+func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.FileInfo) {
+    if !c.ManifestWriteEnabled {
+        return
+    }
+    c.manifestMu.Lock()
+    defer c.manifestMu.Unlock()
+
+    if err := c.loadManifest(ctx); err != nil {
+        slog.Debug("manifest: failed to load, skipping update", "error", err)
+        return // Non-fatal — LIST still works
+    }
+    c.manifest.AddFile(info)
+    if err := c.writeManifest(ctx, c.manifest); err != nil {
+        slog.Debug("manifest: failed to write after upload", "error", err)
+        c.manifest = nil // Invalidate cache on failure
+    }
+}
+```
+
+### DON'T: Fail writes when manifest update fails
+
+```go
+func (c *ReplicaClient) WriteLTXFile(...) (*ltx.FileInfo, error) {
+    // ... upload LTX file ...
+    if err := c.writeManifest(ctx, m); err != nil {
+        return nil, err // WRONG — manifest failure should not block replication
+    }
+}
+```
+
+### DON'T: Have the writer read from its own manifest
+
+```go
+func (c *ReplicaClient) LTXFiles(...) (ltx.FileIterator, error) {
+    // WRONG — writer must always use LIST for correctness
+    m, _ := c.readManifest(ctx)
+    return newManifestIterator(m.EntriesForLevel(level, seek)), nil
+}
+```
+
+### Backward Compatibility
+
+| Scenario | Behavior |
+|----------|----------|
+| Old writer + new reader | No manifest.json → reader falls back to LIST |
+| New writer + old reader | manifest.json ignored (doesn't match LTX filename pattern) |
+| Corrupt manifest | JSON decode fails → reader falls back to LIST |
+| Unsupported version | Version mismatch → reader falls back to LIST |
+
+Reference: `s3/manifest.go`, `s3/replica_client.go`
 
 ## Timestamp Preservation
 

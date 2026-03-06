@@ -67,6 +67,9 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
+// SetManifestEnabled is a no-op for file replica (manifests not supported).
+func (c *ReplicaClient) SetManifestEnabled(enabled bool) {}
+
 // Init is a no-op for file replica client as no initialization is required.
 func (c *ReplicaClient) Init(ctx context.Context) error {
 	return nil
