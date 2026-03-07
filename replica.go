@@ -1219,28 +1219,12 @@ func checkIntegrity(ctx context.Context, dbPath string, mode IntegrityCheckMode)
 		return fmt.Errorf("unsupported integrity check mode: %d", mode)
 	}
 
-	rows, err := db.QueryContext(ctx, "PRAGMA "+pragma)
-	if err != nil {
+	var result string
+	if err := db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&result); err != nil {
 		return fmt.Errorf("integrity check: %w", err)
 	}
-	defer func() { _ = rows.Close() }()
-
-	var results []string
-	for rows.Next() {
-		var result string
-		if err := rows.Scan(&result); err != nil {
-			return fmt.Errorf("scan integrity check result: %w", err)
-		}
-		if result != "ok" {
-			results = append(results, result)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("iterate integrity check results: %w", err)
-	}
-
-	if len(results) > 0 {
-		return fmt.Errorf("integrity check failed: %s", results[0])
+	if result != "ok" {
+		return fmt.Errorf("integrity check failed: %s", result)
 	}
 
 	// Clean up -shm and -wal files that SQLite may create during the PRAGMA.
