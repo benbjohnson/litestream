@@ -538,6 +538,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot use follow mode with -txid")
 	} else if opt.Follow && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot use follow mode with -timestamp")
+	} else if opt.IntegrityCheck != IntegrityCheckNone && opt.IntegrityCheck != IntegrityCheckQuick && opt.IntegrityCheck != IntegrityCheckFull {
+		return fmt.Errorf("unsupported integrity check mode: %d", opt.IntegrityCheck)
 	}
 
 	// In follow mode, if the database already exists, attempt crash recovery
@@ -687,6 +689,18 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	r.Logger().Debug("renaming database from temporary location")
 	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
 		return err
+	}
+
+	if opt.IntegrityCheck != IntegrityCheckNone {
+		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
+			if ctx.Err() == nil {
+				_ = os.Remove(opt.OutputPath)
+				_ = os.Remove(opt.OutputPath + "-shm")
+				_ = os.Remove(opt.OutputPath + "-wal")
+			}
+			return fmt.Errorf("post-restore integrity check: %w", err)
+		}
+		r.Logger().Info("post-restore integrity check passed")
 	}
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
@@ -980,6 +994,8 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	// Validate options.
 	if opt.OutputPath == "" {
 		return fmt.Errorf("output path required")
+	} else if opt.IntegrityCheck != IntegrityCheckNone && opt.IntegrityCheck != IntegrityCheckQuick && opt.IntegrityCheck != IntegrityCheckFull {
+		return fmt.Errorf("unsupported integrity check mode: %d", opt.IntegrityCheck)
 	}
 
 	// Ensure output path does not already exist.
@@ -1060,6 +1076,18 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	// Rename to final path.
 	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
 		return fmt.Errorf("rename to output path: %w", err)
+	}
+
+	if opt.IntegrityCheck != IntegrityCheckNone {
+		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
+			if ctx.Err() == nil {
+				_ = os.Remove(opt.OutputPath)
+				_ = os.Remove(opt.OutputPath + "-shm")
+				_ = os.Remove(opt.OutputPath + "-wal")
+			}
+			return fmt.Errorf("post-restore integrity check: %w", err)
+		}
+		r.Logger().Info("post-restore integrity check passed")
 	}
 
 	return nil
@@ -1184,6 +1212,43 @@ func checkpointV3(dbPath string) error {
 
 	_, err = db.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
 	return err
+}
+
+// checkIntegrity runs a SQLite integrity check on the database at dbPath.
+func checkIntegrity(ctx context.Context, dbPath string, mode IntegrityCheckMode) error {
+	if mode == IntegrityCheckNone {
+		return nil
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return fmt.Errorf("open database for integrity check: %w", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var pragma string
+	switch mode {
+	case IntegrityCheckQuick:
+		pragma = "quick_check"
+	case IntegrityCheckFull:
+		pragma = "integrity_check"
+	default:
+		return fmt.Errorf("unsupported integrity check mode: %d", mode)
+	}
+
+	var result string
+	if err := db.QueryRowContext(ctx, "PRAGMA "+pragma).Scan(&result); err != nil {
+		return fmt.Errorf("integrity check: %w", err)
+	}
+	if result != "ok" {
+		return fmt.Errorf("integrity check failed: %s", result)
+	}
+
+	// Clean up -shm and -wal files that SQLite may create during the PRAGMA.
+	_ = os.Remove(dbPath + "-shm")
+	_ = os.Remove(dbPath + "-wal")
+
+	return nil
 }
 
 // findBestV3SnapshotForTimestamp returns the best v0.3.x snapshot for the given timestamp.
