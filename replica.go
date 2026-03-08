@@ -529,6 +529,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot use follow mode with -txid")
 	} else if opt.Follow && !opt.Timestamp.IsZero() {
 		return fmt.Errorf("cannot use follow mode with -timestamp")
+	} else if opt.IntegrityCheck != IntegrityCheckNone && opt.IntegrityCheck != IntegrityCheckQuick && opt.IntegrityCheck != IntegrityCheckFull {
+		return fmt.Errorf("unsupported integrity check mode: %d", opt.IntegrityCheck)
 	}
 
 	// In follow mode, if the database already exists, attempt crash recovery
@@ -682,9 +684,11 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
 		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
-			_ = os.Remove(opt.OutputPath)
-			_ = os.Remove(opt.OutputPath + "-shm")
-			_ = os.Remove(opt.OutputPath + "-wal")
+			if ctx.Err() == nil {
+				_ = os.Remove(opt.OutputPath)
+				_ = os.Remove(opt.OutputPath + "-shm")
+				_ = os.Remove(opt.OutputPath + "-wal")
+			}
 			return fmt.Errorf("post-restore integrity check: %w", err)
 		}
 		r.Logger().Info("post-restore integrity check passed")
@@ -981,6 +985,8 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	// Validate options.
 	if opt.OutputPath == "" {
 		return fmt.Errorf("output path required")
+	} else if opt.IntegrityCheck != IntegrityCheckNone && opt.IntegrityCheck != IntegrityCheckQuick && opt.IntegrityCheck != IntegrityCheckFull {
+		return fmt.Errorf("unsupported integrity check mode: %d", opt.IntegrityCheck)
 	}
 
 	// Ensure output path does not already exist.
@@ -1065,9 +1071,11 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
 		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
-			_ = os.Remove(opt.OutputPath)
-			_ = os.Remove(opt.OutputPath + "-shm")
-			_ = os.Remove(opt.OutputPath + "-wal")
+			if ctx.Err() == nil {
+				_ = os.Remove(opt.OutputPath)
+				_ = os.Remove(opt.OutputPath + "-shm")
+				_ = os.Remove(opt.OutputPath + "-wal")
+			}
 			return fmt.Errorf("post-restore integrity check: %w", err)
 		}
 		r.Logger().Info("post-restore integrity check passed")
