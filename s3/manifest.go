@@ -40,9 +40,14 @@ func (m *Manifest) AddFile(info *ltx.FileInfo) {
 	i := sort.Search(len(entries), func(i int) bool {
 		return entries[i].MinTXID >= entry.MinTXID
 	})
-	entries = append(entries, ManifestEntry{})
-	copy(entries[i+1:], entries[i:])
-	entries[i] = entry
+
+	if i < len(entries) && entries[i].MinTXID == entry.MinTXID && entries[i].MaxTXID == entry.MaxTXID {
+		entries[i] = entry
+	} else {
+		entries = append(entries, ManifestEntry{})
+		copy(entries[i+1:], entries[i:])
+		entries[i] = entry
+	}
 	m.Levels[info.Level] = entries
 }
 
@@ -69,7 +74,7 @@ func (m *Manifest) EntriesForLevel(level int, seek ltx.TXID) []*ltx.FileInfo {
 
 	var result []*ltx.FileInfo
 	for _, e := range entries {
-		if e.MaxTXID < seek {
+		if e.MinTXID < seek {
 			continue
 		}
 		result = append(result, &ltx.FileInfo{
