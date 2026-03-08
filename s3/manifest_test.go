@@ -62,6 +62,21 @@ func TestManifest_RemoveFiles(t *testing.T) {
 	}
 }
 
+func TestManifest_AddFile_DeduplicatesOnRewrite(t *testing.T) {
+	m := s3.NewManifest()
+
+	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100})
+	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 200})
+
+	entries := m.EntriesForLevel(0, 0)
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry after duplicate add, got %d", len(entries))
+	}
+	if entries[0].Size != 200 {
+		t.Fatalf("expected updated size=200, got %d", entries[0].Size)
+	}
+}
+
 func TestManifest_RemoveFiles_CleansEmptyLevel(t *testing.T) {
 	m := s3.NewManifest()
 
@@ -96,18 +111,18 @@ func TestManifest_EntriesForLevel(t *testing.T) {
 	}
 }
 
-func TestManifest_EntriesForLevel_SeekWithinRange(t *testing.T) {
+func TestManifest_EntriesForLevel_SeekSkipsLowerMinTXID(t *testing.T) {
 	m := s3.NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 5, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 6, MaxTXID: 10, Size: 200})
 
 	entries := m.EntriesForLevel(0, 3)
-	if len(entries) != 2 {
-		t.Fatalf("expected 2 entries when seek is within range, got %d", len(entries))
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry (MinTXID >= seek), got %d", len(entries))
 	}
-	if entries[0].MinTXID != 1 {
-		t.Fatalf("expected entry with MinTXID=1 (MaxTXID=5 >= seek=3), got %d", entries[0].MinTXID)
+	if entries[0].MinTXID != 6 {
+		t.Fatalf("expected entry with MinTXID=6, got %d", entries[0].MinTXID)
 	}
 }
 

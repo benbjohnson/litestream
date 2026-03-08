@@ -40,6 +40,9 @@ type ReplicaClient interface {
 
     // Deletes all files for this database
     DeleteAll(ctx context.Context) error
+
+    // Enables/disables manifest-based file listing (no-op for backends without manifest support)
+    SetManifestEnabled(enabled bool)
 }
 ```
 
