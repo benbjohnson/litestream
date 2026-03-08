@@ -1123,6 +1123,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	if rs.SSEKMSKeyID == "" {
 		rs.SSEKMSKeyID = src.SSEKMSKeyID
 	}
+	if rs.Manifest == nil && src.Manifest != nil {
+		rs.Manifest = src.Manifest
+	}
 
 	// ABS settings
 	if rs.AccountName == "" {
@@ -1521,13 +1524,11 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		client.SSEKMSKeyID = c.SSEKMSKeyID
 	}
 
-	// Enable manifest writing only when explicitly configured.
-	// Mark as configured to enable stale manifest cleanup when disabled.
-	if c.Manifest != nil {
-		client.ManifestConfigured = true
-		if *c.Manifest {
-			client.ManifestWriteEnabled = true
-		}
+	// Mark as configured so stale manifest cleanup runs when disabled.
+	// This ensures cleanup even when the manifest key is removed from config entirely.
+	client.ManifestConfigured = true
+	if c.Manifest != nil && *c.Manifest {
+		client.ManifestWriteEnabled = true
 	}
 
 	return client, nil

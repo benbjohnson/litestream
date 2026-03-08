@@ -1276,7 +1276,7 @@ func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.
 
 	if err := c.writeManifest(ctx, c.manifest); err != nil {
 		slog.Debug("manifest: failed to write after upload", "error", err)
-		c.manifest = nil
+		c.invalidateManifest(ctx)
 	}
 }
 
@@ -1298,7 +1298,22 @@ func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*
 
 	if err := c.writeManifest(ctx, c.manifest); err != nil {
 		slog.Debug("manifest: failed to write after delete", "error", err)
-		c.manifest = nil
+		c.invalidateManifest(ctx)
+	}
+}
+
+// invalidateManifest clears the in-memory cache and deletes the S3 manifest
+// so readers fall back to LIST until the next successful write rebuilds it.
+// Must be called with manifestMu held.
+func (c *ReplicaClient) invalidateManifest(ctx context.Context) {
+	c.manifest = nil
+	key := c.manifestKey()
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil && !isNotExists(err) {
+		slog.Debug("manifest: failed to delete after write failure", "error", err)
 	}
 }
 
