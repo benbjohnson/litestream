@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"testing"
 
-	"github.com/felixge/fgprof"
-
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 
@@ -39,7 +37,6 @@ import (
 //
 //	# Then in another terminal:
 //	go tool pprof http://localhost:6060/debug/pprof/profile?seconds=30
-//	go tool pprof http://localhost:6060/debug/fgprof?seconds=30
 //	go tool pprof http://localhost:6060/debug/pprof/goroutine
 //	go tool pprof http://localhost:6060/debug/pprof/heap
 func TestIdleCPUProfile(t *testing.T) {
@@ -57,10 +54,7 @@ func TestIdleCPUProfile(t *testing.T) {
 		addr = s
 	}
 
-	// Register fgprof handler alongside net/http/pprof (registered via blank import).
-	http.DefaultServeMux.Handle("/debug/fgprof", fgprof.Handler())
-
-	// Start HTTP server for profiling.
+	// Start HTTP server for profiling (net/http/pprof registered via blank import).
 	go func() {
 		log.Printf("pprof server listening on %s", addr)
 		if err := http.ListenAndServe(addr, nil); err != nil {
@@ -122,7 +116,6 @@ func TestIdleCPUProfile(t *testing.T) {
 	t.Logf("")
 	t.Logf("profiling endpoints:")
 	t.Logf("  CPU (on-cpu):     go tool pprof http://localhost%s/debug/pprof/profile?seconds=30", addr)
-	t.Logf("  CPU (on+off-cpu): go tool pprof http://localhost%s/debug/fgprof?seconds=30", addr)
 	t.Logf("  goroutines:       go tool pprof http://localhost%s/debug/pprof/goroutine", addr)
 	t.Logf("  heap:             go tool pprof http://localhost%s/debug/pprof/heap", addr)
 	t.Logf("")
