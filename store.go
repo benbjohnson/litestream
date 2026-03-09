@@ -130,6 +130,8 @@ type Store struct {
 
 	// How often to run validation checks. Zero disables periodic validation.
 	ValidationInterval time.Duration
+
+	Logger *slog.Logger
 }
 
 func NewStore(dbs []*DB, levels CompactionLevels) *Store {
@@ -146,6 +148,7 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
+		Logger:                   slog.Default(),
 	}
 
 	for _, db := range dbs {
@@ -298,7 +301,7 @@ func (s *Store) RegisterDB(db *DB) error {
 			// Release lock before closing to avoid potential deadlock.
 			s.mu.Unlock()
 			if err := db.Close(context.Background()); err != nil {
-				slog.Error("close duplicate db", "path", db.Path(), "error", err)
+				db.Logger.Error("close duplicate db", "path", db.Path(), "error", err)
 			}
 			return nil
 		}
@@ -530,7 +533,7 @@ func (s *Store) SnapshotLevel() *CompactionLevel {
 }
 
 func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel) {
-	slog.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
+	s.Logger.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
 
 	retryDeadline := time.Time{}
 	timer := time.NewTimer(time.Nanosecond)
@@ -556,18 +559,18 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
-				slog.Debug("no compaction", "level", lvl.Level, "path", db.Path())
+				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
-				slog.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
+				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
-				slog.Error("compaction failed", "level", lvl.Level, "error", err)
+				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
 			}
 
 			if lvl.Level == SnapshotLevel {
 				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
 					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-					slog.Error("retention enforcement failed", "error", err)
+					db.Logger.Error("retention enforcement failed", "error", err)
 				}
 			}
 		}
@@ -578,10 +581,10 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 				retryDeadline = now.Add(DefaultDBInitTimeout)
 			}
 			nextDelay = time.Second
-			slog.Debug("scheduling retry for unready dbs", "level", lvl.Level)
+			s.Logger.Debug("scheduling retry for unready dbs", "level", lvl.Level)
 		} else {
 			if timedOut {
-				slog.Warn("timeout waiting for db initialization",
+				s.Logger.Warn("timeout waiting for db initialization",
 					"level", lvl.Level,
 					"dbs", notReadyDBs,
 					"timeout", DefaultDBInitTimeout,
@@ -598,7 +601,7 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 }
 
 func (s *Store) monitorL0Retention(ctx context.Context) {
-	slog.Info("starting L0 retention monitor", "interval", s.L0RetentionCheckInterval, "retention", s.L0Retention)
+	s.Logger.Info("starting L0 retention monitor", "interval", s.L0RetentionCheckInterval, "retention", s.L0Retention)
 
 	ticker := time.NewTicker(s.L0RetentionCheckInterval)
 	defer ticker.Stop()
@@ -619,7 +622,7 @@ LOOP:
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					continue
 				}
-				slog.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
+				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
 			}
 		}
 	}
@@ -661,7 +664,7 @@ func (s *Store) hasHeartbeatConfigLocked() bool {
 // Heartbeat pings are only sent when ALL databases have synced successfully
 // within the heartbeat interval.
 func (s *Store) monitorHeartbeats(ctx context.Context) {
-	slog.Info("starting heartbeat monitor", "interval", s.HeartbeatCheckInterval)
+	s.Logger.Info("starting heartbeat monitor", "interval", s.HeartbeatCheckInterval)
 
 	ticker := time.NewTicker(s.HeartbeatCheckInterval)
 	defer ticker.Stop()
@@ -705,11 +708,11 @@ func (s *Store) sendHeartbeatIfNeeded(ctx context.Context) {
 	hb.RecordPing()
 
 	if err := hb.Ping(ctx); err != nil {
-		slog.Error("heartbeat ping failed", "url", hb.URL, "error", err)
+		s.Logger.Error("heartbeat ping failed", "url", hb.URL, "error", err)
 		return
 	}
 
-	slog.Debug("heartbeat ping sent", "url", hb.URL)
+	s.Logger.Debug("heartbeat ping sent", "url", hb.URL)
 }
 
 // allDatabasesHealthy returns true if all databases have synced successfully
@@ -759,7 +762,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		if err != nil {
 			return info, err
 		}
-		slog.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
+		db.Logger.InfoContext(ctx, "snapshot complete", "txid", info.MaxTXID.String(), "size", info.Size)
 		return info, nil
 	}
 
@@ -780,7 +783,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		return info, err
 	}
 
-	slog.InfoContext(ctx, "compaction complete",
+	db.Logger.InfoContext(ctx, "compaction complete",
 		"level", dstLevel,
 		slog.Group("txid",
 			"min", info.MinTXID.String(),
@@ -854,7 +857,7 @@ func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
 
 // monitorValidation periodically runs validation checks on all databases.
 func (s *Store) monitorValidation(ctx context.Context) {
-	slog.Info("starting validation monitor", "interval", s.ValidationInterval)
+	s.Logger.Info("starting validation monitor", "interval", s.ValidationInterval)
 
 	ticker := time.NewTicker(s.ValidationInterval)
 	defer ticker.Stop()
@@ -872,13 +875,13 @@ LOOP:
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				continue
 			}
-			slog.Error("validation check failed", "error", err)
+			s.Logger.Error("validation check failed", "error", err)
 			continue
 		}
 
 		if !result.Valid {
 			for _, verr := range result.Errors {
-				slog.Warn("validation error detected",
+				s.Logger.Warn("validation error detected",
 					"level", verr.Level,
 					"type", verr.Type,
 					"message", verr.Message,
