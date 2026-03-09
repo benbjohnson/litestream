@@ -60,14 +60,15 @@ jobs:
         with:
           images: litestream/litestream
           flavor: |
-            latest=false
+            latest=auto
+            suffix=-scratch
           tags: |
-            type=ref,event=branch,suffix=-scratch
-            type=ref,event=pr,suffix=-scratch
-            type=sha,suffix=-scratch
-            type=sha,format=long,suffix=-scratch
-            type=semver,pattern={{version}},suffix=-scratch
-            type=semver,pattern={{major}}.{{minor}},suffix=-scratch
+            type=ref,event=branch
+            type=ref,event=pr
+            type=sha
+            type=sha,format=long
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
 
       - uses: docker/build-push-action@v6
         with:
