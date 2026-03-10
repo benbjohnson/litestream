@@ -101,6 +101,13 @@ type DB struct {
 		m map[int]*ltx.FileInfo
 	}
 
+	// Cached position from the latest L0 LTX file.
+	// nil means cache is invalid; non-nil is the cached position.
+	pos struct {
+		sync.Mutex
+		value *ltx.Pos
+	}
+
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
 
@@ -300,6 +307,8 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.maxLTXFileInfos.Unlock()
 
+	db.invalidatePosCache()
+
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
 }
@@ -329,6 +338,9 @@ func (db *DB) deleteLocalLTXFile(level int, minTXID, maxTXID ltx.TXID) error {
 	path := db.LTXPath(level, minTXID, maxTXID)
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
+	}
+	if level == 0 {
+		db.invalidatePosCache()
 	}
 	return nil
 }
@@ -364,7 +376,15 @@ func (db *DB) DirInfo() os.FileInfo {
 }
 
 // Pos returns the current replication position of the database.
+// The result is cached and invalidated when L0 LTX files change.
 func (db *DB) Pos() (ltx.Pos, error) {
+	db.pos.Lock()
+	defer db.pos.Unlock()
+
+	if db.pos.value != nil {
+		return *db.pos.value, nil
+	}
+
 	minTXID, maxTXID, err := db.MaxLTX()
 	if err != nil {
 		return ltx.Pos{}, err
@@ -382,7 +402,20 @@ func (db *DB) Pos() (ltx.Pos, error) {
 	if err := dec.Verify(); err != nil {
 		return ltx.Pos{}, fmt.Errorf("ltx verification failed: %w", err)
 	}
-	return dec.PostApplyPos(), nil
+
+	pos := dec.PostApplyPos()
+	db.pos.value = &pos
+
+	return pos, nil
+}
+
+// invalidatePosCache clears the cached position so the next call to Pos()
+// recomputes it from disk. Call this when L0 LTX files are deleted or
+// when the L0 directory is cleared.
+func (db *DB) invalidatePosCache() {
+	db.pos.Lock()
+	db.pos.value = nil
+	db.pos.Unlock()
 }
 
 // Notify returns a channel that closes when the shadow WAL changes.
@@ -1195,6 +1228,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	if err := os.RemoveAll(l0Dir); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove L0 directory: %w", err)
 	}
+	db.invalidatePosCache()
 	if err := internal.MkdirAll(l0Dir, db.dirInfo); err != nil {
 		return fmt.Errorf("recreate L0 directory: %w", err)
 	}
@@ -1235,6 +1269,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		return fmt.Errorf("rename L0 file: %w", err)
 	}
+	db.invalidatePosCache()
 
 	db.Logger.Info("fetched latest L0 file from replica",
 		"min_txid", minTXID,
@@ -1632,6 +1667,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 		db.maxLTXFileInfos.Lock()
 		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
 		db.maxLTXFileInfos.Unlock()
+		db.invalidatePosCache()
 		return false, fmt.Errorf("rename ltx file: %w", err)
 	}
 
@@ -1645,6 +1681,12 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 		Size:      enc.N(),
 	}
 	db.maxLTXFileInfos.Unlock()
+
+	// Update cached position from the encoder.
+	encPos := enc.PostApplyPos()
+	db.pos.Lock()
+	db.pos.value = &encPos
+	db.pos.Unlock()
 
 	// Track the logical end of WAL content for checkpoint decisions.
 	// This is the WALOffset + WALSize from the LTX we just created.
@@ -2176,6 +2218,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 			db.Logger.Error("failed to remove local l0 file", "path", localPath, "error", err)
 		}
+	}
+	if len(deleted) > 0 {
+		db.invalidatePosCache()
 	}
 
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)

@@ -656,6 +656,9 @@ func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Invalidate cached position since we wrote an L0 file directly.
+	db.invalidatePosCache()
+
 	// Now call verify - before the fix, this would fail with:
 	// "prev WAL offset is less than the header size: -4088"
 	info, err := db.verify(context.Background())
@@ -775,6 +778,9 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	if err := f.Close(); err != nil {
 		t.Fatal(err)
 	}
+
+	// Invalidate cached position since we wrote an L0 file directly.
+	db.invalidatePosCache()
 
 	// Call verify - should succeed but indicate snapshotting due to salt mismatch
 	info, err := db.verify(context.Background())
