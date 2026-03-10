@@ -247,9 +247,17 @@ func NewDB(path string) *DB {
 
 // SetLogger updates the database logger and propagates to subsystems.
 func (db *DB) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
 	db.Logger = logger
 	if db.compactor != nil {
 		db.compactor.setLogger(logger.With("subsystem", "compactor"))
+	}
+	if db.Replica != nil && db.Replica.Client != nil {
+		if sl, ok := db.Replica.Client.(interface{ SetLogger(*slog.Logger) }); ok {
+			sl.SetLogger(db.Replica.Logger())
+		}
 	}
 }
 
