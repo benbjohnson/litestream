@@ -16,7 +16,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -104,7 +103,10 @@ type DB struct {
 
 	// Cached position from the latest L0 LTX file.
 	// nil means cache is invalid; non-nil is the cached position.
-	posCache atomic.Pointer[ltx.Pos]
+	pos struct {
+		sync.Mutex
+		value *ltx.Pos
+	}
 
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
@@ -376,8 +378,11 @@ func (db *DB) DirInfo() os.FileInfo {
 // Pos returns the current replication position of the database.
 // The result is cached and invalidated when L0 LTX files change.
 func (db *DB) Pos() (ltx.Pos, error) {
-	if p := db.posCache.Load(); p != nil {
-		return *p, nil
+	db.pos.Lock()
+	defer db.pos.Unlock()
+
+	if db.pos.value != nil {
+		return *db.pos.value, nil
 	}
 
 	minTXID, maxTXID, err := db.MaxLTX()
@@ -399,7 +404,7 @@ func (db *DB) Pos() (ltx.Pos, error) {
 	}
 
 	pos := dec.PostApplyPos()
-	db.posCache.Store(&pos)
+	db.pos.value = &pos
 
 	return pos, nil
 }
@@ -408,7 +413,9 @@ func (db *DB) Pos() (ltx.Pos, error) {
 // recomputes it from disk. Call this when L0 LTX files are deleted or
 // when the L0 directory is cleared.
 func (db *DB) invalidatePosCache() {
-	db.posCache.Store(nil)
+	db.pos.Lock()
+	db.pos.value = nil
+	db.pos.Unlock()
 }
 
 // Notify returns a channel that closes when the shadow WAL changes.
@@ -1677,7 +1684,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 
 	// Update cached position from the encoder.
 	encPos := enc.PostApplyPos()
-	db.posCache.Store(&encPos)
+	db.pos.Lock()
+	db.pos.value = &encPos
+	db.pos.Unlock()
 
 	// Track the logical end of WAL content for checkpoint decisions.
 	// This is the WALOffset + WALSize from the LTX we just created.
