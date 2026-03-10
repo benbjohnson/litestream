@@ -82,6 +82,10 @@ func NewReplicaClient() *ReplicaClient {
 	}
 }
 
+func (c *ReplicaClient) SetLogger(logger *slog.Logger) {
+	c.logger = logger.WithGroup(ReplicaClientType)
+}
+
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
 // URL format: oss://bucket[.oss-region.aliyuncs.com]/path

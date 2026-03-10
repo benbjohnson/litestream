@@ -64,6 +64,10 @@ func NewLeaser() *Leaser {
 	}
 }
 
+func (l *Leaser) SetLogger(logger *slog.Logger) {
+	l.logger = logger.WithGroup("s3-leaser")
+}
+
 func (l *Leaser) Client() S3API {
 	return l.s3
 }

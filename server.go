@@ -68,7 +68,7 @@ func NewServer(store *Store) *Server {
 		SocketPerms: 0600,
 		ctx:         ctx,
 		cancel:      cancel,
-		logger:      slog.Default(),
+		logger:      slog.Default().With("system", "server"),
 	}
 
 	mux := http.NewServeMux()

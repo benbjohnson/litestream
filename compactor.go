@@ -63,6 +63,10 @@ func NewCompactor(client ReplicaClient, logger *slog.Logger) *Compactor {
 	}
 }
 
+func (c *Compactor) setLogger(logger *slog.Logger) {
+	c.logger = logger
+}
+
 // MaxLTXFileInfo returns metadata for the last LTX file in a level.
 // Uses cache if available, otherwise fetches from remote.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
