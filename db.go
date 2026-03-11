@@ -255,9 +255,7 @@ func (db *DB) SetLogger(logger *slog.Logger) {
 		db.compactor.setLogger(logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	}
 	if db.Replica != nil && db.Replica.Client != nil {
-		if sl, ok := db.Replica.Client.(LoggerSetter); ok {
-			sl.SetLogger(db.Replica.Logger())
-		}
+		db.Replica.Client.SetLogger(db.Replica.Logger())
 	}
 }
 

@@ -41,7 +41,6 @@ const ReplicaClientType = "abs"
 const MetadataKeyTimestamp = "litestreamtimestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
-var _ litestream.LoggerSetter = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Azure Blob Storage.
 type ReplicaClient struct {

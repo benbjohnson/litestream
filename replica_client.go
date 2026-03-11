@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 
 	"github.com/superfly/ltx"
 )
@@ -44,6 +45,9 @@ type ReplicaClient interface {
 
 	// DeleteAll deletes all files.
 	DeleteAll(ctx context.Context) error
+
+	// SetLogger sets the logger for the client.
+	SetLogger(logger *slog.Logger)
 }
 
 // FindLTXFiles returns a list of files that match filter.

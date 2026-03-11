@@ -73,7 +73,6 @@ type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
-var _ litestream.LoggerSetter = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
