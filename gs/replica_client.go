@@ -32,6 +32,7 @@ const ReplicaClientType = "gs"
 const MetadataKeyTimestamp = "litestream-timestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.LoggerSetter = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Google Cloud Storage.
 type ReplicaClient struct {

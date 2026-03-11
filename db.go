@@ -208,7 +208,7 @@ func NewDB(path string) *DB {
 		RetentionEnabled:     true,
 		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval: DefaultShutdownSyncInterval,
-		Logger:               slog.With("db", filepath.Base(path)),
+		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 
@@ -226,7 +226,7 @@ func NewDB(path string) *DB {
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
-	db.compactor = NewCompactor(nil, db.Logger.With("subsystem", "compactor"))
+	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
 	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
@@ -252,10 +252,10 @@ func (db *DB) SetLogger(logger *slog.Logger) {
 	}
 	db.Logger = logger
 	if db.compactor != nil {
-		db.compactor.setLogger(logger.With("subsystem", "compactor"))
+		db.compactor.setLogger(logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	}
 	if db.Replica != nil && db.Replica.Client != nil {
-		if sl, ok := db.Replica.Client.(interface{ SetLogger(*slog.Logger) }); ok {
+		if sl, ok := db.Replica.Client.(LoggerSetter); ok {
 			sl.SetLogger(db.Replica.Logger())
 		}
 	}
@@ -1457,7 +1457,7 @@ func (db *DB) detectFullCheckpoint(ctx context.Context, knownSalts [][2]uint32) 
 		lastKnownSalt = knownSalts[len(knownSalts)-1]
 	}
 
-	rd, err := NewWALReader(walFile, db.Logger.With("subsystem", "wal-reader"))
+	rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
 	if err != nil {
 		return false, fmt.Errorf("new wal reader: %w", err)
 	}
@@ -1529,7 +1529,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	}
 	defer walFile.Close()
 
-	walReaderLogger := db.Logger.With("subsystem", "wal-reader")
+	walReaderLogger := db.Logger.With(LogKeySubsystem, LogSubsystemWALReader)
 	var rd *WALReader
 	if info.offset == WALHeaderSize {
 		if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
@@ -1916,7 +1916,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		}
 		defer walFile.Close()
 
-		rd, err := NewWALReader(walFile, db.Logger.With("subsystem", "wal-reader"))
+		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
 			return

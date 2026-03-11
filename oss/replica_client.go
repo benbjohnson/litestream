@@ -47,6 +47,7 @@ const DefaultRegion = "cn-hangzhou"
 const DefaultMetadataConcurrency = 50
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.LoggerSetter = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Alibaba Cloud OSS.
 type ReplicaClient struct {

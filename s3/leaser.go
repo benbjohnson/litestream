@@ -18,6 +18,8 @@ import (
 	"github.com/benbjohnson/litestream"
 )
 
+var _ litestream.LoggerSetter = (*Leaser)(nil)
+
 const (
 	DefaultLeaseTTL  = 30 * time.Second
 	DefaultLeasePath = "lock.json"

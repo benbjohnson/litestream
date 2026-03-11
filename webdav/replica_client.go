@@ -32,6 +32,7 @@ const (
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.LoggerSetter = (*ReplicaClient)(nil)
 
 type ReplicaClient struct {
 	mu     sync.Mutex

@@ -149,11 +149,11 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
 		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
-		Logger:                   slog.Default().With("system", "store"),
+		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
 	}
 
 	for _, db := range dbs {
-		db.SetLogger(s.Logger.With("db", filepath.Base(db.Path())))
+		db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 		db.L0Retention = s.L0Retention
 		db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 		db.ShutdownSyncInterval = s.ShutdownSyncInterval
@@ -280,7 +280,7 @@ func (s *Store) RegisterDB(db *DB) error {
 	s.mu.Unlock()
 
 	// Apply store-wide settings before opening the database.
-	db.SetLogger(s.Logger.With("db", filepath.Base(db.Path())))
+	db.SetLogger(s.Logger.With(LogKeyDB, filepath.Base(db.Path())))
 	db.L0Retention = s.L0Retention
 	db.ShutdownSyncTimeout = s.ShutdownSyncTimeout
 	db.ShutdownSyncInterval = s.ShutdownSyncInterval
