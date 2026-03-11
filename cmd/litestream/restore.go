@@ -133,6 +133,7 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	if err != nil {
 		return nil, err
 	}
+	r.Client.SetManifestEnabled(true)
 	_, err = r.CalcRestoreTarget(ctx, *opt)
 	return r, err
 }
@@ -168,6 +169,7 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 		return nil, errSkipDBExists
 	}
 
+	db.Replica.Client.SetManifestEnabled(true)
 	return db.Replica, nil
 }
 

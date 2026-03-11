@@ -84,6 +84,9 @@ func (c *ReplicaClient) Type() string {
 	return ReplicaClientType
 }
 
+// SetManifestEnabled is a no-op for WebDAV (manifests not supported).
+func (c *ReplicaClient) SetManifestEnabled(enabled bool) {}
+
 func (c *ReplicaClient) Init(ctx context.Context) error {
 	_, err := c.init(ctx)
 	return err
