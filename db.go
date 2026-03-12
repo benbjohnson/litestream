@@ -215,7 +215,7 @@ func NewDB(path string) *DB {
 		RetentionEnabled:     true,
 		ShutdownSyncTimeout:  DefaultShutdownSyncTimeout,
 		ShutdownSyncInterval: DefaultShutdownSyncInterval,
-		Logger:               slog.With("db", filepath.Base(path)),
+		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 
@@ -233,7 +233,7 @@ func NewDB(path string) *DB {
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
-	db.compactor = NewCompactor(nil, db.Logger)
+	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
 	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
@@ -250,6 +250,20 @@ func NewDB(path string) *DB {
 	}
 
 	return db
+}
+
+// SetLogger updates the database logger and propagates to subsystems.
+func (db *DB) SetLogger(logger *slog.Logger) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	db.Logger = logger
+	if db.compactor != nil {
+		db.compactor.setLogger(logger.With(LogKeySubsystem, LogSubsystemCompactor))
+	}
+	if db.Replica != nil && db.Replica.Client != nil {
+		db.Replica.Client.SetLogger(db.Replica.Logger())
+	}
 }
 
 // SQLDB returns a reference to the underlying sql.DB connection.
@@ -1361,7 +1375,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	// to avoid underflow (32 - 4120 = -4088).
 	// See: https://github.com/benbjohnson/litestream/issues/900
 	if info.offset == WALHeaderSize {
-		slog.Debug("verify", "saltMatch", saltMatch, "atWALHeader", true)
+		db.Logger.Debug("verify", "saltMatch", saltMatch, "atWALHeader", true)
 		if saltMatch {
 			info.snapshotting = false
 			return info, nil
@@ -1372,7 +1386,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	// If offset is at the beginning of the first page, we can't check for previous page.
 	prevWALOffset := info.offset - frameSize
-	slog.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
+	db.Logger.Debug("verify", "saltMatch", saltMatch, "prevWALOffset", prevWALOffset)
 
 	if prevWALOffset == WALHeaderSize {
 		if saltMatch { // No writes occurred since last sync, salt still matches
@@ -1395,7 +1409,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		return info, nil
 	}
 
-	slog.Debug("verify.2", "lastPageMatch", lastPageMatch)
+	db.Logger.Debug("verify.2", "lastPageMatch", lastPageMatch)
 
 	// Salt has changed which could indicate a FULL checkpoint.
 	// If we have a last page match, then we can assume that the WAL has not been overwritten.
@@ -1476,7 +1490,7 @@ func (db *DB) detectFullCheckpoint(ctx context.Context, knownSalts [][2]uint32) 
 		lastKnownSalt = knownSalts[len(knownSalts)-1]
 	}
 
-	rd, err := NewWALReader(walFile, db.Logger)
+	rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
 	if err != nil {
 		return false, fmt.Errorf("new wal reader: %w", err)
 	}
@@ -1548,18 +1562,19 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 	}
 	defer walFile.Close()
 
+	walReaderLogger := db.Logger.With(LogKeySubsystem, LogSubsystemWALReader)
 	var rd *WALReader
 	if info.offset == WALHeaderSize {
-		if rd, err = NewWALReader(walFile, db.Logger); err != nil {
+		if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
 			return false, fmt.Errorf("new wal reader: %w", err)
 		}
 	} else {
 		// If we cannot verify the previous frame
 		var pfmError *PrevFrameMismatchError
-		if rd, err = NewWALReaderWithOffset(ctx, walFile, info.offset, info.salt1, info.salt2, db.Logger); errors.As(err, &pfmError) {
+		if rd, err = NewWALReaderWithOffset(ctx, walFile, info.offset, info.salt1, info.salt2, walReaderLogger); errors.As(err, &pfmError) {
 			db.Logger.Log(ctx, internal.LevelTrace, "prev frame mismatch, snapshotting", "err", pfmError.Err)
 			info.offset = WALHeaderSize
-			if rd, err = NewWALReader(walFile, db.Logger); err != nil {
+			if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
 				return false, fmt.Errorf("new wal reader, after reset")
 			}
 		} else if err != nil {
@@ -1941,7 +1956,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		}
 		defer walFile.Close()
 
-		rd, err := NewWALReader(walFile, db.Logger)
+		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
 			return

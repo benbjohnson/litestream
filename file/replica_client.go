@@ -44,6 +44,10 @@ func NewReplicaClient(path string) *ReplicaClient {
 	}
 }
 
+func (c *ReplicaClient) SetLogger(logger *slog.Logger) {
+	c.logger = logger.WithGroup(ReplicaClientType)
+}
+
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
 func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {

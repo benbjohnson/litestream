@@ -3,6 +3,7 @@ package mock
 import (
 	"context"
 	"io"
+	"log/slog"
 
 	"github.com/superfly/ltx"
 
@@ -48,3 +49,5 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
 	return c.DeleteLTXFilesFunc(ctx, a)
 }
+
+func (c *ReplicaClient) SetLogger(_ *slog.Logger) {}
