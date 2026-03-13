@@ -408,24 +408,44 @@ func PrintBehaviorReport(t *testing.T, report *LTXBehaviorReport) {
 
 // --- Log parsing helpers ---
 
-var timeRegexp = regexp.MustCompile(`^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d+[+-]\d{2}:\d{2}|\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})`)
+// timeRegexp matches slog text format: time=2026-03-13T00:01:22.611Z
+// Also matches standalone ISO timestamps and older log formats.
+var timeRegexp = regexp.MustCompile(`(?:time=)?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))|\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}`)
 
 func parseLogTime(line string) (time.Time, bool) {
-	m := timeRegexp.FindString(line)
-	if m == "" {
-		return time.Time{}, false
-	}
-
-	for _, layout := range []string{
-		time.RFC3339Nano,
-		"2006-01-02T15:04:05.000000-07:00",
-		"2006-01-02T15:04:05.000-07:00",
-		"2006/01/02 15:04:05",
-	} {
-		if t, err := time.Parse(layout, m); err == nil {
-			return t, true
+	// Try slog text format first: time=2026-03-13T00:01:22.611Z
+	if idx := strings.Index(line, "time="); idx != -1 {
+		rest := line[idx+5:]
+		end := strings.IndexAny(rest, " \t\n")
+		if end == -1 {
+			end = len(rest)
+		}
+		ts := rest[:end]
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+			"2006-01-02T15:04:05.000Z",
+			"2006-01-02T15:04:05.000000Z",
+		} {
+			if t, err := time.Parse(layout, ts); err == nil {
+				return t, true
+			}
 		}
 	}
+
+	// Fallback: timestamp at start of line
+	m := timeRegexp.FindStringSubmatch(line)
+	if len(m) > 1 && m[1] != "" {
+		for _, layout := range []string{
+			time.RFC3339Nano,
+			time.RFC3339,
+		} {
+			if t, err := time.Parse(layout, m[1]); err == nil {
+				return t, true
+			}
+		}
+	}
+
 	return time.Time{}, false
 }
 
@@ -462,8 +482,13 @@ func parseCompactionComplete(line string) (LTXEvent, bool) {
 		Type: "compaction",
 	}
 
-	if v := extractField(line, "level="); v != "" {
-		ev.Level, _ = strconv.Atoi(v)
+	// Extract compaction level — skip past msg= to avoid matching log level=INFO
+	msgIdx := strings.Index(line, "compaction complete")
+	if msgIdx != -1 {
+		rest := line[msgIdx:]
+		if v := extractField(rest, "level="); v != "" {
+			ev.Level, _ = strconv.Atoi(v)
+		}
 	}
 	if v := extractField(line, "txid.min="); v != "" {
 		ev.MinTXID = v
@@ -479,10 +504,16 @@ func parseCompactionComplete(line string) (LTXEvent, bool) {
 }
 
 func parseCheckpoint(line string) (LTXEvent, bool) {
-	if !strings.Contains(line, "checkpoint") || strings.Contains(line, "compaction") || strings.Contains(line, "snapshot") {
+	// Match checkpoint log lines: msg=checkpoint mode=PASSIVE/TRUNCATE
+	// Also match: msg="checkpoint" mode=...
+	// Exclude compaction/snapshot lines that happen to contain "checkpoint"
+	if strings.Contains(line, "compaction") || strings.Contains(line, "snapshot") {
 		return LTXEvent{}, false
 	}
-	if !strings.Contains(line, "mode=") {
+
+	isCheckpoint := (strings.Contains(line, "msg=checkpoint") || strings.Contains(line, `msg="checkpoint"`)) &&
+		strings.Contains(line, "mode=")
+	if !isCheckpoint {
 		return LTXEvent{}, false
 	}
 
@@ -495,7 +526,11 @@ func parseCheckpoint(line string) (LTXEvent, bool) {
 }
 
 func parseSyncWithSnap(line string) (LTXEvent, bool) {
-	if !strings.Contains(line, "\"msg\":\"sync\"") && !strings.Contains(line, "msg=sync") {
+	// Match slog text format: msg=sync or msg="sync", or JSON: "msg":"sync"
+	isSyncMsg := strings.Contains(line, "msg=sync") ||
+		strings.Contains(line, `msg="sync"`) ||
+		strings.Contains(line, `"msg":"sync"`)
+	if !isSyncMsg {
 		return LTXEvent{}, false
 	}
 

@@ -58,10 +58,8 @@ func TestLTXBehavior_NoExcessiveSnapshots(t *testing.T) {
 		duration = 2 * time.Minute
 	}
 
-	snapshotInterval := 10 * time.Minute
-	if shortMode {
-		snapshotInterval = 1 * time.Minute
-	}
+	// Use the same snapshot interval as CreateSoakConfig to keep assertions aligned
+	snapshotInterval := ProfileSnapshotInterval(shortMode)
 
 	profile := LoadProfile{
 		Name:            "checkpoint-snapshot-regression",
