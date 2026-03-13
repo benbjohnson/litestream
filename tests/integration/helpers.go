@@ -200,6 +200,36 @@ func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time
 	return nil
 }
 
+func (db *TestDB) GenerateLoadWithOptions(ctx context.Context, writeRate int, duration time.Duration, pattern string, workers int, payloadSize int) error {
+	args := []string{
+		"load",
+		"-db", db.Path,
+		"-write-rate", fmt.Sprintf("%d", writeRate),
+		"-duration", duration.String(),
+		"-pattern", pattern,
+	}
+	if workers > 0 {
+		args = append(args, "-workers", fmt.Sprintf("%d", workers))
+	}
+	if payloadSize > 0 {
+		args = append(args, "-payload-size", fmt.Sprintf("%d", payloadSize))
+	}
+
+	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), args...)
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+
+	db.t.Logf("Starting load generation: %d writes/sec for %v (%s pattern, %d workers, %d byte payload)",
+		writeRate, duration, pattern, workers, payloadSize)
+
+	if err := cmd.Run(); err != nil {
+		if output := combinedOutput(stdoutBuf, stderrBuf); output != "" {
+			return fmt.Errorf("load generation failed: %w\nOutput: %s", err, output)
+		}
+		return fmt.Errorf("load generation failed: %w", err)
+	}
+	return nil
+}
+
 func (db *TestDB) StartLitestream() error {
 	logPath := filepath.Join(db.TempDir, "litestream.log")
 	logFile, err := os.Create(logPath)
@@ -244,6 +274,7 @@ func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
 	cmd := exec.Command(getBinaryPath("litestream"), "replicate",
 		"-config", configPath,
 	)
+	cmd.Env = append(os.Environ(), "LOG_LEVEL=DEBUG")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 

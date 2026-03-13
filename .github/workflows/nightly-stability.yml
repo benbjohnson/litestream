@@ -73,6 +73,7 @@ jobs:
             ./tests/integration/
         env:
           SOAK_KEEP_TEMP: "1"
+          SOAK_DURATION: ${{ inputs.duration || '' }}
 
       - name: Run snapshot regression test
         run: |
@@ -83,6 +84,7 @@ jobs:
             ./tests/integration/
         env:
           SOAK_KEEP_TEMP: "1"
+          SOAK_DURATION: ${{ inputs.duration || '' }}
 
       - name: Upload test artifacts
         if: always()

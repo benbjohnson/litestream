@@ -5,7 +5,9 @@ package integration
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -117,13 +119,13 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	configPath := CreateSoakConfig(db.Path, replicaURL, nil, shortMode)
 	db.ConfigPath = configPath
 
-	// Start Litestream
+	// Start Litestream (LOG_LEVEL=DEBUG is set automatically by StartLitestreamWithConfig)
 	t.Log("Starting Litestream...")
 	if err := db.StartLitestreamWithConfig(configPath); err != nil {
 		t.Fatalf("Failed to start Litestream: %v", err)
 	}
 
-	// Run load generation
+	// Run load generation with profile-specific workers and payload size
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
@@ -137,10 +139,14 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 
 	loadDone := make(chan error, 1)
 	go func() {
-		loadDone <- db.GenerateLoad(ctx, profile.WriteRate, duration, profile.Pattern)
+		loadDone <- db.GenerateLoadWithOptions(ctx, profile.WriteRate, duration, profile.Pattern, profile.Workers, profile.PayloadSize)
 	}()
 
-	// Monitor
+	// Track peak WAL size during monitoring
+	walPath := db.Path + "-wal"
+	var peakWALSize int64
+	var walMu sync.Mutex
+
 	refreshStats := func() {
 		testInfo.RowCount, _ = db.GetRowCount("load_test")
 		if testInfo.RowCount == 0 {
@@ -150,6 +156,15 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 			testInfo.RowCount, _ = db.GetRowCount("test_data")
 		}
 		testInfo.FileCount, _ = db.GetReplicaFileCount()
+
+		// Sample WAL size for peak tracking
+		if info, err := os.Stat(walPath); err == nil {
+			walMu.Lock()
+			if info.Size() > peakWALSize {
+				peakWALSize = info.Size()
+			}
+			walMu.Unlock()
+		}
 	}
 
 	logMetrics := func() {
@@ -158,8 +173,13 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 
 	MonitorSoakTest(t, db, ctx, testInfo, refreshStats, logMetrics)
 
+	// Check load generation result — fail on real errors, not context cancellation
 	if err := <-loadDone; err != nil {
-		t.Logf("Load generation completed: %v", err)
+		if ctx.Err() != nil {
+			t.Logf("Load generation stopped (context done): %v", err)
+		} else {
+			t.Fatalf("Load generation failed unexpectedly: %v", err)
+		}
 	}
 
 	// Give Litestream a moment to finish pending operations
@@ -202,8 +222,8 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	t.Logf("Behavioral Assertions: %s", profile.Name)
 	t.Log("================================================")
 
-	// 1. Snapshot cadence — snapshots should not be too frequent
-	snapshotTolerance := time.Duration(float64(snapshotInterval) * 0.5)
+	// 1. Snapshot cadence — use profile's snapshot window for tolerance
+	snapshotTolerance := time.Duration(float64(snapshotInterval) * (1 - 1/profile.SnapshotWindow))
 	AssertSnapshotCadence(t, report, snapshotInterval, snapshotTolerance)
 
 	// 2. No excessive snapshots
@@ -216,9 +236,11 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	// 4. Compaction timing should match configured intervals
 	AssertCompactionTiming(t, report, compactionIntervals, profile.CompactionSlack)
 
-	// 5. WAL should stay bounded
-	walPath := db.Path + "-wal"
-	AssertWALBounded(t, walPath, profile.MaxWALSizeMB)
+	// 5. WAL should stay bounded (check both current and peak size)
+	walMu.Lock()
+	peak := peakWALSize
+	walMu.Unlock()
+	AssertWALBounded(t, walPath, profile.MaxWALSizeMB, peak)
 
 	// 6. No snapshot-on-checkpoint bug
 	AssertNoSnapshotOnCheckpoint(t, report)

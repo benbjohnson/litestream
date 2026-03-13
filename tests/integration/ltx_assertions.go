@@ -305,26 +305,41 @@ func AssertCompactionTiming(t *testing.T, report *LTXBehaviorReport, levelInterv
 	}
 }
 
-// AssertWALBounded checks that the WAL file never grew unbounded during the test.
-// It checks the WAL size at test end since we can't retroactively check size over time.
-func AssertWALBounded(t *testing.T, walPath string, maxWALSizeMB float64) {
+// AssertWALBounded checks that the WAL file stayed bounded during the test.
+// It checks both the current WAL size and the peak WAL size observed during monitoring.
+// peakWALSize is the maximum WAL size in bytes sampled during the test run.
+func AssertWALBounded(t *testing.T, walPath string, maxWALSizeMB float64, peakWALSize int64) {
 	t.Helper()
 
+	var currentSizeMB float64
 	info, err := os.Stat(walPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			t.Logf("  [wal-bounded] PASS: WAL file does not exist (already checkpointed)")
+			currentSizeMB = 0
+		} else {
+			t.Logf("  [wal-bounded] Skipped: cannot stat WAL: %v", err)
 			return
 		}
-		t.Logf("  [wal-bounded] Skipped: cannot stat WAL: %v", err)
-		return
+	} else {
+		currentSizeMB = float64(info.Size()) / (1024 * 1024)
 	}
 
-	sizeMB := float64(info.Size()) / (1024 * 1024)
-	if sizeMB > maxWALSizeMB {
-		t.Errorf("  [wal-bounded] FAIL: WAL is %.2f MB (max allowed: %.2f MB)", sizeMB, maxWALSizeMB)
+	peakSizeMB := float64(peakWALSize) / (1024 * 1024)
+
+	// Use whichever is larger: current or peak
+	checkSizeMB := currentSizeMB
+	label := "current"
+	if peakSizeMB > currentSizeMB {
+		checkSizeMB = peakSizeMB
+		label = "peak"
+	}
+
+	if checkSizeMB > maxWALSizeMB {
+		t.Errorf("  [wal-bounded] FAIL: WAL %s is %.2f MB (max allowed: %.2f MB, current: %.2f MB, peak: %.2f MB)",
+			label, checkSizeMB, maxWALSizeMB, currentSizeMB, peakSizeMB)
 	} else {
-		t.Logf("  [wal-bounded] PASS: WAL is %.2f MB (max allowed: %.2f MB)", sizeMB, maxWALSizeMB)
+		t.Logf("  [wal-bounded] PASS: WAL current %.2f MB, peak %.2f MB (max allowed: %.2f MB)",
+			currentSizeMB, peakSizeMB, maxWALSizeMB)
 	}
 }
 

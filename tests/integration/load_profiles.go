@@ -2,7 +2,10 @@
 
 package integration
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // LoadProfile defines a data shape for behavioral testing.
 // Each profile represents a different production workload pattern.
@@ -120,12 +123,19 @@ func ShortBurstVolumeProfile() LoadProfile {
 	p := BurstVolumeProfile()
 	p.WriteRate = 500
 	p.Workers = 2
+	p.MaxL0Pages = 300
 	p.InitialSize = "5MB"
 	return p
 }
 
 // ProfileDuration returns the test duration for a profile.
+// Honors the SOAK_DURATION env var for nightly workflow overrides.
 func ProfileDuration(shortMode bool) time.Duration {
+	if v := os.Getenv("SOAK_DURATION"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
 	if shortMode {
 		return 2 * time.Minute
 	}
@@ -153,5 +163,7 @@ func ProfileCompactionIntervals(shortMode bool) map[int]time.Duration {
 		1: 30 * time.Second,
 		2: 1 * time.Minute,
 		3: 5 * time.Minute,
+		4: 15 * time.Minute,
+		5: 30 * time.Minute,
 	}
 }

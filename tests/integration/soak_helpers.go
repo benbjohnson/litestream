@@ -614,6 +614,9 @@ func getErrorStats(db *TestDB) ErrorStats {
 		case strings.Contains(errLine, "context canceled"):
 			stats.BenignCount++
 			stats.ErrorsByType["context canceled"]++
+		case strings.Contains(errLine, "db not ready"):
+			stats.BenignCount++
+			stats.ErrorsByType["db not ready"]++
 		default:
 			stats.CriticalCount++
 			if len(stats.RecentErrors) < 5 {

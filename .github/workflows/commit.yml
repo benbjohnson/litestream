@@ -189,11 +189,11 @@ jobs:
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
 
-      - name: Run LTX behavioral test (short mode)
+      - name: Run LTX behavioral tests (short mode)
         run: |
           go test -tags 'integration,soak' \
-            -run 'TestLTXBehavior_NoExcessiveSnapshots' \
-            -short -v -timeout 10m \
+            -run 'TestLTXBehavior' \
+            -short -v -timeout 15m \
             ./tests/integration/
 
   s3-mock-test:
