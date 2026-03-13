@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -264,13 +265,25 @@ func (db *TestDB) StopLitestream() error {
 		return nil
 	}
 
-	if err := db.LitestreamCmd.Process.Kill(); err != nil {
-		return fmt.Errorf("kill litestream: %w", err)
+	// Send SIGTERM for graceful shutdown so Litestream can flush pending syncs.
+	if err := db.LitestreamCmd.Process.Signal(syscall.SIGTERM); err != nil {
+		// Process may have already exited.
+		db.LitestreamCmd.Wait()
+		return nil
 	}
 
-	db.LitestreamCmd.Wait()
-	time.Sleep(1 * time.Second)
+	// Wait for graceful exit with timeout.
+	done := make(chan error, 1)
+	go func() { done <- db.LitestreamCmd.Wait() }()
 
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		db.LitestreamCmd.Process.Kill()
+		<-done
+	}
+
+	time.Sleep(1 * time.Second)
 	return nil
 }
 
