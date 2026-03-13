@@ -211,7 +211,7 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 
 	// 3. L0 file page counts should be small (not snapshot-sized)
 	pageSize := 4096 // default SQLite page size
-	AssertL0PageCount(t, report, pageSize, profile.MaxL0Pages)
+	AssertL0PageCount(t, report, pageSize, profile.MaxL0Pages, db.ReplicaPath)
 
 	// 4. Compaction timing should match configured intervals
 	AssertCompactionTiming(t, report, compactionIntervals, profile.CompactionSlack)

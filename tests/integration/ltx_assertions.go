@@ -6,6 +6,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -145,11 +146,14 @@ func BuildBehaviorReport(events []LTXEvent, duration time.Duration) *LTXBehavior
 // AssertSnapshotCadence checks that snapshots occur approximately at the expected interval.
 // It fails if snapshots are too frequent (less than minInterval) which indicates the
 // "snapshot on checkpoint" bug or similar regression.
+//
+// The first snapshot interval is skipped because the initial snapshot always occurs
+// quickly when Litestream starts (it captures the initial database state).
 func AssertSnapshotCadence(t *testing.T, report *LTXBehaviorReport, expectedInterval, tolerance time.Duration) {
 	t.Helper()
 
-	if report.SnapshotCount == 0 {
-		t.Log("  [snapshot-cadence] No snapshots recorded, skipping cadence check")
+	if report.SnapshotCount <= 1 {
+		t.Logf("  [snapshot-cadence] Only %d snapshot(s) recorded, skipping cadence check", report.SnapshotCount)
 		return
 	}
 
@@ -158,21 +162,28 @@ func AssertSnapshotCadence(t *testing.T, report *LTXBehaviorReport, expectedInte
 		minAllowed = 0
 	}
 
+	// Skip the first interval — the initial snapshot pair (startup + first scheduled)
+	// often has a short interval that doesn't represent steady-state behavior.
+	intervals := report.SnapshotIntervals
+	if len(intervals) > 1 {
+		intervals = intervals[1:]
+	}
+
 	violations := 0
-	for i, interval := range report.SnapshotIntervals {
+	for i, interval := range intervals {
 		if interval < minAllowed {
-			t.Errorf("  [snapshot-cadence] Snapshot #%d occurred too soon: %v (min allowed: %v)",
-				i+1, interval.Round(time.Second), minAllowed.Round(time.Second))
+			t.Errorf("  [snapshot-cadence] Snapshot interval #%d: %v (min allowed: %v)",
+				i+2, interval.Round(time.Second), minAllowed.Round(time.Second))
 			violations++
 		}
 	}
 
 	if violations == 0 {
-		t.Logf("  [snapshot-cadence] PASS: %d snapshots, all intervals >= %v",
+		t.Logf("  [snapshot-cadence] PASS: %d snapshots, steady-state intervals >= %v (skipped first interval)",
 			report.SnapshotCount, minAllowed.Round(time.Second))
 	} else {
-		t.Errorf("  [snapshot-cadence] FAIL: %d/%d snapshot intervals violated minimum cadence",
-			violations, len(report.SnapshotIntervals))
+		t.Errorf("  [snapshot-cadence] FAIL: %d/%d steady-state snapshot intervals violated minimum cadence",
+			violations, len(intervals))
 	}
 }
 
@@ -197,11 +208,31 @@ func AssertNoExcessiveSnapshots(t *testing.T, report *LTXBehaviorReport, expecte
 // AssertL0PageCount checks that L0 LTX files are approximately the right size.
 // Under normal incremental syncs with moderate writes, each L0 should contain
 // only a handful of pages, not a full database snapshot worth.
-func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, maxPagesPerL0 int) {
+//
+// It reads file sizes directly from the replica L0 directory since sync events
+// are logged at DEBUG level and may not be present in the log.
+func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, maxPagesPerL0 int, replicaPath string) {
 	t.Helper()
 
-	if len(report.L0Sizes) == 0 {
-		t.Log("  [l0-page-count] No L0 files recorded, skipping check")
+	// Read L0 file sizes directly from replica directory
+	l0Dir := filepath.Join(replicaPath, "ltx", "0")
+	l0Files, err := filepath.Glob(filepath.Join(l0Dir, "*.ltx"))
+	if err != nil || len(l0Files) == 0 {
+		t.Logf("  [l0-page-count] No L0 files found in %s, skipping check", l0Dir)
+		return
+	}
+
+	var sizes []int64
+	for _, f := range l0Files {
+		info, err := os.Stat(f)
+		if err != nil {
+			continue
+		}
+		sizes = append(sizes, info.Size())
+	}
+
+	if len(sizes) == 0 {
+		t.Log("  [l0-page-count] No L0 file sizes available, skipping check")
 		return
 	}
 
@@ -209,7 +240,7 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 	oversized := 0
 	var maxSeen int64
 
-	for _, size := range report.L0Sizes {
+	for _, size := range sizes {
 		if size > maxSeen {
 			maxSeen = size
 		}
@@ -220,16 +251,16 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 
 	// Allow a small percentage of oversized files (snapshots are expected occasionally)
 	maxOversizedPct := 0.05 // 5%
-	oversizedPct := float64(oversized) / float64(len(report.L0Sizes))
+	oversizedPct := float64(oversized) / float64(len(sizes))
 
 	if oversizedPct > maxOversizedPct {
 		t.Errorf("  [l0-page-count] FAIL: %d/%d (%.1f%%) L0 files exceed %d pages (%s). Max seen: %s",
-			oversized, len(report.L0Sizes), oversizedPct*100,
+			oversized, len(sizes), oversizedPct*100,
 			maxPagesPerL0, formatBytes(maxSizeBytes), formatBytes(maxSeen))
 	} else {
-		avgSize := avgInt64(report.L0Sizes)
-		t.Logf("  [l0-page-count] PASS: avg L0 size %s, max %s (%d/%d oversized, threshold %d pages)",
-			formatBytes(avgSize), formatBytes(maxSeen), oversized, len(report.L0Sizes), maxPagesPerL0)
+		avgSize := avgInt64(sizes)
+		t.Logf("  [l0-page-count] PASS: %d L0 files, avg size %s, max %s (%d/%d oversized, threshold %d pages)",
+			len(sizes), formatBytes(avgSize), formatBytes(maxSeen), oversized, len(sizes), maxPagesPerL0)
 	}
 }
 
