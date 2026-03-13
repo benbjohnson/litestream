@@ -298,8 +298,10 @@ func (db *TestDB) StopLitestream() error {
 
 	// Send SIGTERM for graceful shutdown so Litestream can flush pending syncs.
 	if err := db.LitestreamCmd.Process.Signal(syscall.SIGTERM); err != nil {
-		// Process may have already exited.
-		db.LitestreamCmd.Wait()
+		// Process may have already exited — check exit status.
+		if state, waitErr := db.LitestreamCmd.Process.Wait(); waitErr == nil && state != nil && !state.Success() {
+			return fmt.Errorf("litestream exited before shutdown: %s", state)
+		}
 		return nil
 	}
 

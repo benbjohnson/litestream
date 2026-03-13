@@ -211,6 +211,10 @@ func AssertNoExcessiveSnapshots(t *testing.T, report *LTXBehaviorReport, expecte
 //
 // It reads file sizes directly from the replica L0 directory since sync events
 // are logged at DEBUG level and may not be present in the log.
+//
+// NOTE: This only inspects files surviving at test end. Oversized L0 files
+// created earlier may have been compacted away. A future improvement could
+// sample L0 sizes periodically during the run.
 func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, maxPagesPerL0 int, replicaPath string) {
 	t.Helper()
 

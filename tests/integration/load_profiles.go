@@ -129,25 +129,26 @@ func ShortBurstVolumeProfile() LoadProfile {
 }
 
 // ProfileDuration returns the test duration for a profile.
-// Honors the SOAK_DURATION env var for nightly workflow overrides.
+// Honors the SOAK_DURATION env var for nightly workflow overrides (ignored in short mode).
 func ProfileDuration(shortMode bool) time.Duration {
+	if shortMode {
+		return 2 * time.Minute
+	}
 	if v := os.Getenv("SOAK_DURATION"); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
 		}
 	}
-	if shortMode {
-		return 2 * time.Minute
-	}
 	return 30 * time.Minute
 }
 
 // ProfileSnapshotInterval returns the snapshot interval for test configs.
+// Must match the value written by CreateSoakConfig.
 func ProfileSnapshotInterval(shortMode bool) time.Duration {
 	if shortMode {
 		return 30 * time.Second
 	}
-	return 5 * time.Minute
+	return 10 * time.Minute
 }
 
 // ProfileCompactionIntervals returns compaction level intervals for test configs.

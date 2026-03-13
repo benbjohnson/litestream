@@ -18,6 +18,10 @@ on:
         required: false
         type: string
 
+permissions:
+  contents: read
+  issues: write
+
 env:
   GOFLAGS: "-mod=readonly"
 
@@ -185,7 +189,7 @@ jobs:
     name: Notify on Failure
     runs-on: ubuntu-latest
     needs: [race-detector-sweep, ltx-behavioral-soak, minio-soak, comprehensive-soak]
-    if: failure()
+    if: failure() || cancelled()
     steps:
       - name: Create failure issue
         uses: actions/github-script@v7
