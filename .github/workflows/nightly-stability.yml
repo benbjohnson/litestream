@@ -1,22 +1,19 @@
 name: Nightly Stability
 on:
   schedule:
-    - cron: '0 3 * * 1-5'   # Weekdays at 3 AM UTC (short mode)
-    - cron: '0 3 * * 6'     # Saturdays at 3 AM UTC (full mode)
+    - cron: '0 3 * * 1-5'   # Weekdays at 3 AM UTC (30m per profile)
+    - cron: '0 3 * * 6'     # Saturdays at 3 AM UTC (2h per profile)
   workflow_dispatch:
     inputs:
-      mode:
-        description: 'Test mode'
-        required: true
-        default: 'short'
-        type: choice
-        options:
-          - short
-          - full
       duration:
-        description: 'Override test duration (e.g., 30m, 2h). Ignored in short mode.'
+        description: 'Test duration per profile (e.g., 30m, 2h)'
         required: false
+        default: '30m'
         type: string
+
+concurrency:
+  group: nightly-stability
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -41,9 +38,13 @@ jobs:
         run: go test -race -count=3 -timeout 45m ./...
 
   ltx-behavioral-soak:
-    name: LTX Behavioral Soak (${{ github.event.schedule == '0 3 * * 6' && 'full' || inputs.mode || 'short' }})
+    name: LTX Behavioral Soak (${{ matrix.profile }})
     runs-on: ubuntu-latest
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [low-volume, high-volume, burst-volume]
     steps:
       - uses: actions/checkout@v4
 
@@ -56,50 +57,71 @@ jobs:
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
 
-      - name: Determine test mode
-        id: mode
+      - name: Determine duration
+        id: config
         run: |
-          # Saturday schedule or explicit "full" dispatch
-          if [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]] || [[ "${{ inputs.mode }}" == "full" ]]; then
-            echo "short_flag=" >> $GITHUB_OUTPUT
-            echo "mode=full" >> $GITHUB_OUTPUT
+          if [[ -n "${{ inputs.duration }}" ]]; then
+            echo "duration=${{ inputs.duration }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]]; then
+            echo "duration=2h" >> $GITHUB_OUTPUT
           else
-            echo "short_flag=-short" >> $GITHUB_OUTPUT
-            echo "mode=short" >> $GITHUB_OUTPUT
+            echo "duration=30m" >> $GITHUB_OUTPUT
           fi
+          echo "Selected duration: $(cat $GITHUB_OUTPUT | grep duration)"
 
-      - name: Run LTX behavioral tests
+      - name: Run LTX behavioral test (${{ matrix.profile }})
         run: |
           go test -tags 'integration,soak' \
-            -run 'TestLTXBehavior$$' \
-            ${{ steps.mode.outputs.short_flag }} \
-            -v -timeout 150m \
+            -run 'TestLTXBehavior$/${{ matrix.profile }}' \
+            -v -timeout 170m \
             ./tests/integration/
         env:
           SOAK_KEEP_TEMP: "1"
-          SOAK_DURATION: ${{ inputs.duration || '' }}
-
-      - name: Run snapshot regression test
-        run: |
-          go test -tags 'integration,soak' \
-            -run 'TestLTXBehavior_NoExcessiveSnapshots' \
-            ${{ steps.mode.outputs.short_flag }} \
-            -v -timeout 30m \
-            ./tests/integration/
-        env:
-          SOAK_KEEP_TEMP: "1"
-          SOAK_DURATION: ${{ inputs.duration || '' }}
+          SOAK_DURATION: ${{ steps.config.outputs.duration }}
 
       - name: Upload test artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ltx-behavioral-results-${{ steps.mode.outputs.mode }}
+          name: ltx-behavioral-${{ matrix.profile }}
+          path: /tmp/litestream-ltx-behavior-*/
+          retention-days: 14
+
+  ltx-snapshot-regression:
+    name: LTX Snapshot Regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run snapshot regression test
+        run: |
+          go test -tags 'integration,soak' \
+            -run 'TestLTXBehavior_NoExcessiveSnapshots' \
+            -v -timeout 20m \
+            ./tests/integration/
+        env:
+          SOAK_KEEP_TEMP: "1"
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ltx-snapshot-regression
           path: /tmp/litestream-ltx-behavior-*/
           retention-days: 14
 
   minio-soak:
-    name: MinIO Soak (${{ github.event.schedule == '0 3 * * 6' && 'full' || inputs.mode || 'short' }})
+    name: MinIO Soak
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -114,25 +136,27 @@ jobs:
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
 
-      - name: Determine test mode
-        id: mode
+      - name: Determine duration
+        id: config
         run: |
-          if [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]] || [[ "${{ inputs.mode }}" == "full" ]]; then
-            echo "short_flag=" >> $GITHUB_OUTPUT
+          if [[ -n "${{ inputs.duration }}" ]]; then
+            echo "duration=${{ inputs.duration }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]]; then
+            echo "duration=2h" >> $GITHUB_OUTPUT
           else
-            echo "short_flag=-short" >> $GITHUB_OUTPUT
+            echo "duration=30m" >> $GITHUB_OUTPUT
           fi
 
       - name: Run MinIO soak test
         run: |
           go test -tags 'integration,soak,docker' \
             -run 'TestMinIOSoak' \
-            ${{ steps.mode.outputs.short_flag }} \
-            -v -timeout 150m \
+            -v -timeout 170m \
             ./tests/integration/
         env:
           SOAK_KEEP_TEMP: "1"
           SOAK_AUTO_PURGE: "yes"
+          SOAK_DURATION: ${{ steps.config.outputs.duration }}
 
       - name: Upload test artifacts
         if: always()
@@ -143,7 +167,7 @@ jobs:
           retention-days: 14
 
   comprehensive-soak:
-    name: Comprehensive Soak (${{ github.event.schedule == '0 3 * * 6' && 'full' || inputs.mode || 'short' }})
+    name: Comprehensive Soak
     runs-on: ubuntu-latest
     timeout-minutes: 180
     steps:
@@ -158,24 +182,26 @@ jobs:
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
 
-      - name: Determine test mode
-        id: mode
+      - name: Determine duration
+        id: config
         run: |
-          if [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]] || [[ "${{ inputs.mode }}" == "full" ]]; then
-            echo "short_flag=" >> $GITHUB_OUTPUT
+          if [[ -n "${{ inputs.duration }}" ]]; then
+            echo "duration=${{ inputs.duration }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]]; then
+            echo "duration=2h" >> $GITHUB_OUTPUT
           else
-            echo "short_flag=-short" >> $GITHUB_OUTPUT
+            echo "duration=30m" >> $GITHUB_OUTPUT
           fi
 
       - name: Run comprehensive soak test
         run: |
           go test -tags 'integration,soak' \
             -run 'TestComprehensiveSoak' \
-            ${{ steps.mode.outputs.short_flag }} \
-            -v -timeout 150m \
+            -v -timeout 170m \
             ./tests/integration/
         env:
           SOAK_KEEP_TEMP: "1"
+          SOAK_DURATION: ${{ steps.config.outputs.duration }}
 
       - name: Upload test artifacts
         if: always()
@@ -188,7 +214,7 @@ jobs:
   notify-on-failure:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [race-detector-sweep, ltx-behavioral-soak, minio-soak, comprehensive-soak]
+    needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, comprehensive-soak]
     if: failure() || cancelled()
     steps:
       - name: Create failure issue

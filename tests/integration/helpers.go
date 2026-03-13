@@ -512,6 +512,12 @@ func GetTestDuration(t *testing.T, defaultDuration time.Duration) time.Duration 
 		return defaultDuration / 10
 	}
 
+	if v := os.Getenv("SOAK_DURATION"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+
 	return defaultDuration
 }
 
