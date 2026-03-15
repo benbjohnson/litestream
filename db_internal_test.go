@@ -1686,6 +1686,115 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
 }
 
+// TestDB_CheckpointWithConcurrentWrites verifies that checkpoints do not trigger
+// unwanted full snapshots when concurrent writes arrive during the checkpoint flow.
+//
+// Regression test for issue #1198. Under high write load, the pre-checkpoint sync
+// inside checkpoint() may not reach the WAL end (because an external writer adds
+// frames during the sync), clearing syncedToWALEnd. The post-checkpoint sync then
+// sees the WAL truncation as unexpected and triggers a full snapshot at L0.
+func TestDB_CheckpointWithConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Initial sync
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write data to grow WAL
+	for i := range 50 {
+		blob := make([]byte, 2000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync all frames — sets syncedToWALEnd=true
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Simulate the race: under high write load, the pre-checkpoint sync
+	// doesn't reach WAL end, clearing the flag.
+	db.syncedToWALEnd = false
+
+	// Record L0 file count before checkpoint (local LTX directory)
+	l0Dir := db.LTXLevelDir(0)
+	l0BeforeEntries, _ := os.ReadDir(l0Dir)
+	l0BeforeNames := make(map[string]bool)
+	for _, e := range l0BeforeEntries {
+		l0BeforeNames[e.Name()] = true
+	}
+
+	// Get database size before checkpoint for comparison
+	dbInfo, _ := os.Stat(dbPath)
+	dbSize := dbInfo.Size()
+
+	// Checkpoint through the full checkpoint() path. With the fix,
+	// checkpoint() sets syncedToWALEnd=true after execCheckpoint, so the
+	// post-checkpoint verify() treats the WAL truncation as expected.
+	// Without the fix, verify() sees syncedToWALEnd=false and triggers
+	// writeLTXFromDB() — a full database dump to L0.
+	if err := db.checkpoint(ctx, CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Check L0 files created during checkpoint for full snapshot evidence.
+	l0AfterEntries, _ := os.ReadDir(l0Dir)
+	var maxNewL0Size int64
+	for _, entry := range l0AfterEntries {
+		if l0BeforeNames[entry.Name()] {
+			continue
+		}
+		fi, _ := entry.Info()
+		if fi != nil && fi.Size() > maxNewL0Size {
+			maxNewL0Size = fi.Size()
+		}
+	}
+
+	// A full snapshot L0 would be close to the database size (~118KB).
+	// Normal incremental L0 files from checkpoint overhead should be <5KB.
+	if maxNewL0Size > dbSize/2 {
+		t.Errorf("checkpoint with syncedToWALEnd=false triggered a full snapshot "+
+			"(new L0 file %d bytes, db %d bytes). checkpoint() should set "+
+			"syncedToWALEnd=true after execCheckpoint so verify() treats the "+
+			"WAL truncation as expected. See issue #1198.",
+			maxNewL0Size, dbSize)
+	}
+}
+
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
 // when db.init() fails. Regression test for issue #1128.
 func TestDB_Sync_InitErrorMetrics(t *testing.T) {

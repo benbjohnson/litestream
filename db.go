@@ -1835,6 +1835,13 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return err
 	}
 
+	// The checkpoint just truncated/restarted the WAL. Mark that we've
+	// synced to the end so verify() treats the truncation as expected
+	// rather than triggering a full snapshot. This fixes the race where
+	// new writes between the pre-checkpoint sync and checkpoint clear
+	// the flag, causing the post-checkpoint sync to snapshot. See #1198.
+	db.syncedToWALEnd = true
+
 	// If WAL hasn't been restarted, exit.
 	if other, err := readWALHeader(db.WALPath()); err != nil {
 		return err
