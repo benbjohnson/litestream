@@ -25,6 +25,14 @@ log ""
 
 cd "$REPO_DIR"
 
+# Clean up old test artifacts so results are unambiguous.
+# Every error in the run is guaranteed to be from THIS run.
+log "Cleaning old test artifacts..."
+rm -rf /tmp/litestream-ltx-behavior-* /tmp/litestream-minio-soak-* /tmp/litestream-comprehensive-soak-*
+go clean -testcache
+log "Clean complete."
+log ""
+
 # Build binaries
 log "Building binaries..."
 go build -o bin/litestream ./cmd/litestream
