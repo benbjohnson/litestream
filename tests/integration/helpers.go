@@ -311,7 +311,7 @@ func (db *TestDB) StopLitestream() error {
 
 	select {
 	case <-done:
-	case <-time.After(10 * time.Second):
+	case <-time.After(35 * time.Second):
 		db.LitestreamCmd.Process.Kill()
 		<-done
 	}

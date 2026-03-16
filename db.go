@@ -2035,7 +2035,13 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	// arrive between iterations. This minimizes the race window between
 	// our final read and the checkpoint's EXCLUSIVE lock acquisition.
 	var gapPageNos []uint32
+	var gapFramesScanned int64
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	syncedFrames := int64(0)
+	if frameSize > 0 && db.lastSyncedWALOffset >= WALHeaderSize {
+		syncedFrames = (db.lastSyncedWALOffset - WALHeaderSize) / frameSize
+	}
+
 	if f, err := os.Open(db.WALPath()); err == nil {
 		seen := make(map[uint32]bool)
 		buf := make([]byte, 4)
@@ -2056,6 +2062,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 					seen[pgno] = true
 					gapPageNos = append(gapPageNos, pgno)
 				}
+				gapFramesScanned++
 				scanOffset = off + frameSize
 			}
 
@@ -2070,7 +2077,8 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written. The checkpoint result tells us exactly how many
 	// frames were in the WAL when SQLite acquired the EXCLUSIVE lock.
-	if _, err := db.execCheckpoint(ctx, mode); err != nil {
+	result, err := db.execCheckpoint(ctx, mode)
+	if err != nil {
 		return err
 	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
 		return err
@@ -2103,6 +2111,23 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 				"pages", len(gapPageNos))
 		}
 	}
+
+	// Compare accounted frames (synced + gap-scanned) with actual frames
+	// present at checkpoint time. If the checkpoint saw more frames than
+	// we scanned, new writes arrived between the gap scan and the
+	// checkpoint's EXCLUSIVE lock acquisition. Schedule a full snapshot
+	// to capture those unaccounted pages from the DB file.
+	accountedFrames := syncedFrames + gapFramesScanned
+	if result.log > 0 && int64(result.log) > accountedFrames {
+		missed := int64(result.log) - accountedFrames
+		db.Logger.Warn("checkpoint found unaccounted WAL frames, scheduling snapshot",
+			"checkpoint_frames", result.log,
+			"synced_frames", syncedFrames,
+			"gap_frames", gapFramesScanned,
+			"missed", missed)
+		db.checkpointGapSnapshot = true
+	}
+
 	db.syncedToWALEnd = true
 
 	// Start a transaction. This will be promoted immediately after.
