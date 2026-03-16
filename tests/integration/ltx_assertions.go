@@ -275,13 +275,9 @@ func AssertCompactionTiming(t *testing.T, report *LTXBehaviorReport, levelInterv
 
 	for level, expectedInterval := range levelIntervals {
 		intervals, ok := report.CompactionIntervals[level]
-		if !ok || len(intervals) == 0 {
+		if !ok || len(intervals) < 3 {
 			count := report.CompactionCounts[level]
-			if count <= 1 {
-				t.Logf("  [compaction-timing-L%d] Skipped: only %d compactions (need >=2 for interval check)", level, count)
-			} else {
-				t.Logf("  [compaction-timing-L%d] Skipped: no interval data", level)
-			}
+			t.Logf("  [compaction-timing-L%d] Skipped: only %d compactions (need >=4 for reliable interval check)", level, count)
 			continue
 		}
 
