@@ -182,8 +182,11 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 		}
 	}
 
-	// Give Litestream a moment to finish pending operations
-	time.Sleep(3 * time.Second)
+	// Give Litestream time to flush final syncs and run gap recovery.
+	// Under high write load, the last checkpoints can create TOCTOU gaps
+	// that need one more sync + compaction cycle to heal.
+	t.Log("Waiting for final sync/compaction cycle...")
+	time.Sleep(45 * time.Second)
 
 	// Stop Litestream
 	t.Log("Stopping Litestream...")
