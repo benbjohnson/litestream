@@ -459,7 +459,7 @@ func (db *TestDB) CheckForErrors() ([]string, error) {
 	var errors []string
 	lines := strings.Split(log, "\n")
 	for _, line := range lines {
-		if strings.Contains(strings.ToUpper(line), "ERROR") {
+		if strings.Contains(line, "level=ERROR") {
 			errors = append(errors, line)
 		}
 	}

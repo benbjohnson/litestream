@@ -2202,14 +2202,17 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 
 	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
 
-	// Prevent internal checkpoints during sync.
+	// Prevent internal checkpoints during the entire snapshot encoding.
+	// The goroutine below reads WAL pages; if a checkpoint truncates the
+	// WAL before it finishes, ReadAt hits EOF. Hold the RLock until the
+	// goroutine completes rather than releasing it when this func returns.
 	db.chkMu.RLock()
-	defer db.chkMu.RUnlock()
 
 	// TODO(ltx): Read database size from database header.
 
 	fi, err := db.f.Stat()
 	if err != nil {
+		db.chkMu.RUnlock()
 		return pos, nil, err
 	}
 	commit := uint32(fi.Size() / int64(db.pageSize))
@@ -2217,6 +2220,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 	// Execute encoding in a separate goroutine so the caller can initialize before reading.
 	pr, pw := io.Pipe()
 	go func() {
+		defer db.chkMu.RUnlock()
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
 			pw.CloseWithError(err)
