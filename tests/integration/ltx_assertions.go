@@ -374,7 +374,7 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 		for _, snapEv := range snapSyncEvents {
 			diff := snapEv.Time.Sub(chkTime)
 			if diff >= 0 && diff <= checkpointWindow {
-				if snapEv.Reason == "checkpoint gap recovery" {
+				if isExpectedRecoverySnapshot(snapEv.Reason) {
 					expectedRecoveries++
 					continue
 				}
@@ -396,6 +396,15 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	} else {
 		t.Errorf("  [no-snap-on-checkpoint] FAIL: %d snapshot-on-checkpoint violations detected", violations)
 	}
+}
+
+// isExpectedRecoverySnapshot returns true if the snapshot reason indicates an
+// intentional recovery mechanism (gap healing, compaction repair) rather than
+// the checkpoint-triggers-unwanted-snapshot bug.
+func isExpectedRecoverySnapshot(reason string) bool {
+	return strings.Contains(reason, "checkpoint gap recovery") ||
+		strings.Contains(reason, "repair snapshot") ||
+		strings.Contains(reason, "compaction detected missing")
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.

@@ -1824,41 +1824,6 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 	return nil
 }
 
-// parsePageGap extracts missing page numbers from a compaction error like
-// "nonsequential page numbers in snapshot transaction: 72041,72044".
-// Returns pages 72042 and 72043 (the gap between the two reported numbers).
-func parsePageGap(errMsg string) []uint32 {
-	const marker = "nonsequential page numbers in snapshot transaction: "
-	idx := strings.Index(errMsg, marker)
-	if idx < 0 {
-		return nil
-	}
-	pair := errMsg[idx+len(marker):]
-	parts := strings.SplitN(pair, ",", 2)
-	if len(parts) != 2 {
-		return nil
-	}
-	lo, err1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 32)
-	hi, err2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 32)
-	if err1 != nil || err2 != nil || hi <= lo+1 {
-		return nil
-	}
-	var pages []uint32
-	for p := uint32(lo + 1); p < uint32(hi); p++ {
-		pages = append(pages, p)
-	}
-	return pages
-}
-
-// readCurrentWALSalt reads the salt values from the current WAL header.
-func (db *DB) readCurrentWALSalt() (salt1, salt2 uint32) {
-	hdr, err := readWALHeader(db.WALPath())
-	if err != nil || len(hdr) < 24 {
-		return 0, 0
-	}
-	return binary.BigEndian.Uint32(hdr[16:]), binary.BigEndian.Uint32(hdr[20:])
-}
-
 // writeGapRecoveryL0 creates a small L0 file containing only the specified
 // pages read from the database file. This is used to fill in pages that were
 // lost during a TRUNCATE checkpoint's TOCTOU gap — pages that were checkpointed
@@ -2345,79 +2310,22 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	return info, nil
 }
 
-// healCompactionGap handles "nonsequential page numbers" errors at any
-// compaction level by writing gap recovery L0 files and re-compacting
-// intermediate levels so the gap pages propagate to the target level.
-func (db *DB) healCompactionGap(ctx context.Context, dstLevel int, origErr error) (*ltx.FileInfo, error) {
-	var totalHealed int
-	err := origErr
-
-	for attempt := 0; attempt < 100; attempt++ {
-		gapPages := parsePageGap(err.Error())
-		if len(gapPages) == 0 {
-			break
-		}
-
-		db.mu.Lock()
-		walSalt1, walSalt2 := db.readCurrentWALSalt()
-		recErr := db.writeGapRecoveryL0(ctx, gapPages, walSalt1, walSalt2)
-		db.mu.Unlock()
-
-		if recErr != nil {
-			db.Logger.Warn("compaction gap recovery failed",
-				"level", dstLevel, "error", recErr)
-			break
-		}
-		totalHealed += len(gapPages)
-
-		// Re-compact intermediate levels so gap L0 pages propagate up.
-		// L1 reads from L0, L2 reads from L1, etc.
-		cascadeOK := true
-		for lvl := 1; lvl < dstLevel; lvl++ {
-			if _, cErr := db.compactor.Compact(ctx, lvl); cErr != nil {
-				if strings.Contains(cErr.Error(), "nonsequential page numbers in snapshot") {
-					cascadeOK = false
-					break
-				}
-				if !errors.Is(cErr, ErrNoCompaction) {
-					db.Logger.Debug("cascade re-compaction skipped",
-						"level", lvl, "error", cErr)
-				}
-			}
-		}
-
-		if !cascadeOK {
-			break
-		}
-
-		var info *ltx.FileInfo
-		info, err = db.compactor.Compact(ctx, dstLevel)
-		if err == nil || !strings.Contains(err.Error(), "nonsequential page numbers in snapshot") {
-			if totalHealed > 0 {
-				db.Logger.Info("compaction gaps healed",
-					"level", dstLevel, "pages", totalHealed, "success", err == nil)
-			}
-			if err != nil {
-				return nil, err
-			}
-			return info, nil
-		}
-	}
-
-	if totalHealed > 0 {
-		db.Logger.Info("compaction gaps healed (partial)",
-			"level", dstLevel, "pages", totalHealed)
-	}
-
+// healCompactionGap handles "nonsequential page numbers" errors during
+// compaction by scheduling a full snapshot on the next sync cycle. The
+// snapshot captures all pages from the DB file, which fills any gaps
+// caused by TOCTOU races during checkpoint. The snapshot flows through
+// the normal sync → replica upload → compaction pipeline, so the next
+// compaction attempt (on its scheduled interval) will succeed.
+func (db *DB) healCompactionGap(_ context.Context, dstLevel int, origErr error) (*ltx.FileInfo, error) {
 	db.mu.Lock()
 	if !db.checkpointGapSnapshot {
 		db.checkpointGapSnapshot = true
-		db.Logger.Warn("scheduling full snapshot for compaction gap",
-			"level", dstLevel)
+		db.Logger.Warn("compaction gap detected, scheduling full snapshot",
+			"level", dstLevel, "error", origErr)
 	}
 	db.mu.Unlock()
 
-	return nil, err
+	return nil, origErr
 }
 
 // SnapshotDB writes a snapshot to the replica for the current position of the database.
