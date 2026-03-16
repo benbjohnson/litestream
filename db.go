@@ -414,7 +414,8 @@ func (db *DB) Pos() (ltx.Pos, error) {
 		return ltx.Pos{}, nil // no replication yet
 	}
 
-	f, err := os.Open(db.LTXPath(0, minTXID, maxTXID))
+	ltxPath := db.LTXPath(0, minTXID, maxTXID)
+	f, err := os.Open(ltxPath)
 	if err != nil {
 		return ltx.Pos{}, err
 	}
@@ -422,7 +423,11 @@ func (db *DB) Pos() (ltx.Pos, error) {
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.Verify(); err != nil {
-		return ltx.Pos{}, fmt.Errorf("ltx verification failed: %w", err)
+		db.Logger.Warn("L0 file verification failed, using TXID from filename",
+			"path", ltxPath, "txid", maxTXID, "error", err)
+		pos := ltx.Pos{TXID: maxTXID}
+		db.pos.value = &pos
+		return pos, nil
 	}
 
 	pos := dec.PostApplyPos()
@@ -1864,11 +1869,13 @@ func (db *DB) writeGapRecoveryL0(ctx context.Context, pageNos []uint32, walSalt1
 	}
 	slices.Sort(pageNos)
 
-	pos, err := db.Pos()
+	_, maxTXID, err := db.MaxLTX()
 	if err != nil {
-		return fmt.Errorf("pos: %w", err)
+		return fmt.Errorf("max ltx: %w", err)
+	} else if maxTXID == 0 {
+		return fmt.Errorf("no L0 files exist")
 	}
-	txID := pos.TXID + 1
+	txID := maxTXID + 1
 	filename := db.LTXPath(0, txID, txID)
 
 	fi, err := db.f.Stat()
@@ -1956,10 +1963,7 @@ func (db *DB) writeGapRecoveryL0(ctx context.Context, pageNos []uint32, walSalt1
 	}
 	db.maxLTXFileInfos.Unlock()
 
-	encPos := enc.PostApplyPos()
-	db.pos.Lock()
-	db.pos.value = &encPos
-	db.pos.Unlock()
+	db.invalidatePosCache()
 
 	db.Logger.Info("gap recovery L0 written",
 		"txid", txID,
