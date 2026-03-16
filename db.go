@@ -2355,10 +2355,8 @@ func (db *DB) healCompactionGap(ctx context.Context, dstLevel int, origErr error
 					break
 				}
 				if !errors.Is(cErr, ErrNoCompaction) {
-					db.Logger.Warn("cascade re-compaction failed",
+					db.Logger.Debug("cascade re-compaction skipped",
 						"level", lvl, "error", cErr)
-					cascadeOK = false
-					break
 				}
 			}
 		}
