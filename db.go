@@ -95,6 +95,14 @@ type DB struct {
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
 
+	// checkpointGapSnapshot is set when the checkpoint function detects
+	// that new WAL frames arrived between releasing the write lock and
+	// executing the checkpoint (TOCTOU gap). Those frames were checkpointed
+	// from WAL to DB but not captured in any L0 file. Setting this flag
+	// tells verify() to trigger a full snapshot so the gap pages are
+	// captured from the DB file. See issues #927, #1198.
+	checkpointGapSnapshot bool
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -1306,6 +1314,17 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		return info, nil // first sync
 	}
 
+	// If checkpoint detected a TOCTOU gap (new WAL frames arrived between
+	// releasing the write lock and executing checkpoint), force a full
+	// snapshot to capture those pages from the DB file.
+	if db.checkpointGapSnapshot {
+		db.checkpointGapSnapshot = false
+		info.offset = WALHeaderSize
+		info.reason = "checkpoint gap recovery"
+		db.Logger.Info("triggering snapshot for checkpoint gap recovery")
+		return info, nil
+	}
+
 	// Determine last WAL offset we save from.
 	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
 	ltxFile, err := os.Open(ltxPath)
@@ -1800,6 +1819,156 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 	return nil
 }
 
+// parsePageGap extracts missing page numbers from a compaction error like
+// "nonsequential page numbers in snapshot transaction: 72041,72044".
+// Returns pages 72042 and 72043 (the gap between the two reported numbers).
+func parsePageGap(errMsg string) []uint32 {
+	const marker = "nonsequential page numbers in snapshot transaction: "
+	idx := strings.Index(errMsg, marker)
+	if idx < 0 {
+		return nil
+	}
+	pair := errMsg[idx+len(marker):]
+	parts := strings.SplitN(pair, ",", 2)
+	if len(parts) != 2 {
+		return nil
+	}
+	lo, err1 := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 32)
+	hi, err2 := strconv.ParseUint(strings.TrimSpace(parts[1]), 10, 32)
+	if err1 != nil || err2 != nil || hi <= lo+1 {
+		return nil
+	}
+	var pages []uint32
+	for p := uint32(lo + 1); p < uint32(hi); p++ {
+		pages = append(pages, p)
+	}
+	return pages
+}
+
+// readCurrentWALSalt reads the salt values from the current WAL header.
+func (db *DB) readCurrentWALSalt() (salt1, salt2 uint32) {
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil || len(hdr) < 24 {
+		return 0, 0
+	}
+	return binary.BigEndian.Uint32(hdr[16:]), binary.BigEndian.Uint32(hdr[20:])
+}
+
+// writeGapRecoveryL0 creates a small L0 file containing only the specified
+// pages read from the database file. This is used to fill in pages that were
+// lost during a TRUNCATE checkpoint's TOCTOU gap — pages that were checkpointed
+// from WAL to DB but not captured in any L0 file before the WAL was truncated.
+func (db *DB) writeGapRecoveryL0(ctx context.Context, pageNos []uint32, walSalt1, walSalt2 uint32) error {
+	if len(pageNos) == 0 {
+		return nil
+	}
+	slices.Sort(pageNos)
+
+	pos, err := db.Pos()
+	if err != nil {
+		return fmt.Errorf("pos: %w", err)
+	}
+	txID := pos.TXID + 1
+	filename := db.LTXPath(0, txID, txID)
+
+	fi, err := db.f.Stat()
+	if err != nil {
+		return fmt.Errorf("stat db: %w", err)
+	}
+	commit := uint32(fi.Size() / int64(db.pageSize))
+
+	tmpFilename := filename + ".tmp"
+	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
+		return err
+	}
+	ltxFile, err := os.OpenFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, fi.Mode())
+	if err != nil {
+		return fmt.Errorf("open temp ltx: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpFilename) }()
+	defer func() { _ = ltxFile.Close() }()
+
+	enc, err := ltx.NewEncoder(ltxFile)
+	if err != nil {
+		return fmt.Errorf("new encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    commit,
+		MinTXID:   txID,
+		MaxTXID:   txID,
+		Timestamp: time.Now().UnixMilli(),
+		WALOffset: WALHeaderSize,
+		WALSize:   0,
+		WALSalt1:  walSalt1,
+		WALSalt2:  walSalt2,
+	}); err != nil {
+		return fmt.Errorf("encode header: %w", err)
+	}
+
+	lockPgno := ltx.LockPgno(uint32(db.pageSize))
+	data := make([]byte, db.pageSize)
+	encoded := 0
+	for _, pgno := range pageNos {
+		if pgno == lockPgno || pgno > commit || pgno == 0 {
+			continue
+		}
+		offset := int64(pgno-1) * int64(db.pageSize)
+		if _, err := db.f.ReadAt(data, offset); err != nil {
+			return fmt.Errorf("read gap page %d: %w", pgno, err)
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+			return fmt.Errorf("encode gap page %d: %w", pgno, err)
+		}
+		encoded++
+	}
+
+	if encoded == 0 {
+		return nil
+	}
+
+	if err := enc.Close(); err != nil {
+		return fmt.Errorf("close encoder: %w", err)
+	}
+	if err := ltxFile.Sync(); err != nil {
+		return fmt.Errorf("sync ltx: %w", err)
+	}
+	if err := ltxFile.Close(); err != nil {
+		return fmt.Errorf("close ltx: %w", err)
+	}
+	if err := os.Rename(tmpFilename, filename); err != nil {
+		db.maxLTXFileInfos.Lock()
+		delete(db.maxLTXFileInfos.m, 0)
+		db.maxLTXFileInfos.Unlock()
+		db.invalidatePosCache()
+		return fmt.Errorf("rename ltx: %w", err)
+	}
+
+	db.maxLTXFileInfos.Lock()
+	db.maxLTXFileInfos.m[0] = &ltx.FileInfo{
+		Level:     0,
+		MinTXID:   txID,
+		MaxTXID:   txID,
+		CreatedAt: time.Now(),
+		Size:      enc.N(),
+	}
+	db.maxLTXFileInfos.Unlock()
+
+	encPos := enc.PostApplyPos()
+	db.pos.Lock()
+	db.pos.value = &encPos
+	db.pos.Unlock()
+
+	db.Logger.Info("gap recovery L0 written",
+		"txid", txID,
+		"pages", encoded,
+		"size", enc.N())
+
+	return nil
+}
+
 // Checkpoint performs a checkpoint on the WAL file.
 func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 	db.mu.Lock()
@@ -1822,33 +1991,115 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return err
 	}
 
-	// Copy end of WAL before checkpoint to copy as much as possible.
+	// Acquire the SQLite write lock BEFORE the pre-checkpoint sync.
+	// This prevents new application commits between the sync and checkpoint,
+	// ensuring the sync captures ALL committed WAL data. Without this lock,
+	// commits arriving after the sync but before execCheckpoint would be
+	// checkpointed from WAL to DB and then lost when the WAL is truncated,
+	// leaving pages that exist only in the DB file and not in any L0 file.
+	// See: TestDB_CheckpointPageGapWithConcurrentWrites
+	preTx, err := db.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin pre-checkpoint tx: %w", err)
+	}
+	if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+		_ = rollback(preTx)
+		return fmt.Errorf("pre-checkpoint write lock: %w", err)
+	}
+
+	// Copy end of WAL before checkpoint. With write lock held, no new
+	// commits can arrive, so sync captures everything.
 	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+		_ = rollback(preTx)
 		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
 	}
 
+	// Release the write lock so execCheckpoint can proceed.
+	if err := rollback(preTx); err != nil {
+		return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
+	}
+
+	// Sync frames that arrived during the TOCTOU gap between releasing the
+	// write lock and checkpoint execution.
+	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+		return fmt.Errorf("cannot copy wal gap frames before checkpoint: %w", err)
+	}
+
+	// Read page numbers of any remaining unsync'd WAL frames BEFORE the
+	// checkpoint truncates the WAL. Use a tight convergence loop: keep
+	// re-reading the WAL size and scanning new frames until no new frames
+	// arrive between iterations. This minimizes the race window between
+	// our final read and the checkpoint's EXCLUSIVE lock acquisition.
+	var gapPageNos []uint32
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	if f, err := os.Open(db.WALPath()); err == nil {
+		seen := make(map[uint32]bool)
+		buf := make([]byte, 4)
+		scanOffset := db.lastSyncedWALOffset
+
+		for iter := 0; iter < 10; iter++ {
+			walSize, err := db.walFileSize()
+			if err != nil || walSize <= scanOffset || frameSize <= 0 {
+				break
+			}
+
+			for off := scanOffset; off+frameSize <= walSize; off += frameSize {
+				if _, err := f.ReadAt(buf, off); err != nil {
+					break
+				}
+				pgno := binary.BigEndian.Uint32(buf)
+				if pgno > 0 && !seen[pgno] {
+					seen[pgno] = true
+					gapPageNos = append(gapPageNos, pgno)
+				}
+				scanOffset = off + frameSize
+			}
+
+			newSize, _ := db.walFileSize()
+			if newSize <= walSize {
+				break
+			}
+		}
+		f.Close()
+	}
+
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
-	// a new page is written.
-	if err := db.execCheckpoint(ctx, mode); err != nil {
+	// a new page is written. The checkpoint result tells us exactly how many
+	// frames were in the WAL when SQLite acquired the EXCLUSIVE lock.
+	if _, err := db.execCheckpoint(ctx, mode); err != nil {
 		return err
 	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
 		return err
 	}
 
-	// The checkpoint just truncated/restarted the WAL. Mark that we've
-	// synced to the end so verify() treats the truncation as expected
-	// rather than triggering a full snapshot. This fixes the race where
-	// new writes between the pre-checkpoint sync and checkpoint clear
-	// the flag, causing the post-checkpoint sync to snapshot. See #1198.
-	db.syncedToWALEnd = true
-
 	// If WAL hasn't been restarted, exit.
-	if other, err := readWALHeader(db.WALPath()); err != nil {
+	other, err := readWALHeader(db.WALPath())
+	if err != nil {
 		return err
-	} else if bytes.Equal(hdr, other) {
+	}
+	if bytes.Equal(hdr, other) {
 		db.syncedSinceCheckpoint = false
+		db.syncedToWALEnd = true
 		return nil
 	}
+
+	// WAL was restarted by TRUNCATE checkpoint. If we identified gap pages
+	// before checkpoint, write a targeted L0 with just those pages from the
+	// DB file. This is much cheaper than a full snapshot and precisely fills
+	// the gap that would otherwise cause "nonsequential page numbers" errors
+	// during compaction.
+	if len(gapPageNos) > 0 {
+		newSalt1 := binary.BigEndian.Uint32(other[16:])
+		newSalt2 := binary.BigEndian.Uint32(other[20:])
+		if err := db.writeGapRecoveryL0(ctx, gapPageNos, newSalt1, newSalt2); err != nil {
+			db.Logger.Warn("gap recovery L0 failed, will full snapshot", "error", err)
+			db.checkpointGapSnapshot = true
+		} else {
+			db.Logger.Info("checkpoint gap recovered",
+				"pages", len(gapPageNos))
+		}
+	}
+	db.syncedToWALEnd = true
 
 	// Start a transaction. This will be promoted immediately after.
 	tx, err := db.db.BeginTx(ctx, nil)
@@ -1881,10 +2132,17 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	return nil
 }
 
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
+// checkpointResult holds the results from PRAGMA wal_checkpoint.
+type checkpointResult struct {
+	busy int // 0 = success, 1 = blocked
+	log  int // total frames in WAL before checkpoint
+	ckpt int // frames checkpointed
+}
+
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (result checkpointResult, err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
-		return nil
+		return result, nil
 	}
 
 	// Track checkpoint metrics.
@@ -1901,7 +2159,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ensure the read lock has been removed before issuing a checkpoint.
 	// We defer the re-acquire to ensure it occurs even on an early return.
 	if err := db.releaseReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return result, fmt.Errorf("release read lock: %w", err)
 	}
 	defer func() { _ = db.acquireReadLock(ctx) }()
 
@@ -1913,18 +2171,17 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
-	var row [3]int
-	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return err
+	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&result.busy, &result.log, &result.ckpt); err != nil {
+		return result, err
 	}
-	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
+	db.Logger.Debug("checkpoint", "mode", mode, "busy", result.busy, "log", result.log, "ckpt", result.ckpt)
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(ctx); err != nil {
-		return fmt.Errorf("reacquire read lock: %w", err)
+		return result, fmt.Errorf("reacquire read lock: %w", err)
 	}
 
-	return nil
+	return result, nil
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
@@ -2034,6 +2291,10 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 // if no new files are available to be compacted.
 func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
 	info, err := db.compactor.Compact(ctx, dstLevel)
+	if err != nil && strings.Contains(err.Error(), "nonsequential page numbers in snapshot") {
+		info, err = db.healCompactionGap(ctx, dstLevel, err)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -2049,6 +2310,83 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	}
 
 	return info, nil
+}
+
+// healCompactionGap handles "nonsequential page numbers" errors at any
+// compaction level by writing gap recovery L0 files and re-compacting
+// intermediate levels so the gap pages propagate to the target level.
+func (db *DB) healCompactionGap(ctx context.Context, dstLevel int, origErr error) (*ltx.FileInfo, error) {
+	var totalHealed int
+	err := origErr
+
+	for attempt := 0; attempt < 100; attempt++ {
+		gapPages := parsePageGap(err.Error())
+		if len(gapPages) == 0 {
+			break
+		}
+
+		db.mu.Lock()
+		walSalt1, walSalt2 := db.readCurrentWALSalt()
+		recErr := db.writeGapRecoveryL0(ctx, gapPages, walSalt1, walSalt2)
+		db.mu.Unlock()
+
+		if recErr != nil {
+			db.Logger.Warn("compaction gap recovery failed",
+				"level", dstLevel, "error", recErr)
+			break
+		}
+		totalHealed += len(gapPages)
+
+		// Re-compact intermediate levels so gap L0 pages propagate up.
+		// L1 reads from L0, L2 reads from L1, etc.
+		cascadeOK := true
+		for lvl := 1; lvl < dstLevel; lvl++ {
+			if _, cErr := db.compactor.Compact(ctx, lvl); cErr != nil {
+				if strings.Contains(cErr.Error(), "nonsequential page numbers in snapshot") {
+					cascadeOK = false
+					break
+				}
+				if !errors.Is(cErr, ErrNoCompaction) {
+					db.Logger.Warn("cascade re-compaction failed",
+						"level", lvl, "error", cErr)
+					cascadeOK = false
+					break
+				}
+			}
+		}
+
+		if !cascadeOK {
+			break
+		}
+
+		var info *ltx.FileInfo
+		info, err = db.compactor.Compact(ctx, dstLevel)
+		if err == nil || !strings.Contains(err.Error(), "nonsequential page numbers in snapshot") {
+			if totalHealed > 0 {
+				db.Logger.Info("compaction gaps healed",
+					"level", dstLevel, "pages", totalHealed, "success", err == nil)
+			}
+			if err != nil {
+				return nil, err
+			}
+			return info, nil
+		}
+	}
+
+	if totalHealed > 0 {
+		db.Logger.Info("compaction gaps healed (partial)",
+			"level", dstLevel, "pages", totalHealed)
+	}
+
+	db.mu.Lock()
+	if !db.checkpointGapSnapshot {
+		db.checkpointGapSnapshot = true
+		db.Logger.Warn("scheduling full snapshot for compaction gap",
+			"level", dstLevel)
+	}
+	db.mu.Unlock()
+
+	return nil, err
 }
 
 // SnapshotDB writes a snapshot to the replica for the current position of the database.

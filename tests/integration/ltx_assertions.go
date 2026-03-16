@@ -368,12 +368,17 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	}
 
 	violations := 0
+	expectedRecoveries := 0
 	checkpointWindow := 5 * time.Second
 
 	for _, chkTime := range report.CheckpointTimes {
 		for _, snapEv := range snapSyncEvents {
 			diff := snapEv.Time.Sub(chkTime)
 			if diff >= 0 && diff <= checkpointWindow {
+				if snapEv.Reason == "checkpoint gap recovery" {
+					expectedRecoveries++
+					continue
+				}
 				t.Errorf("  [no-snap-on-checkpoint] Snapshot sync at %v occurred %v after checkpoint at %v (reason: %s)",
 					snapEv.Time.Format("15:04:05"), diff.Round(time.Millisecond),
 					chkTime.Format("15:04:05"), snapEv.Reason)
@@ -383,8 +388,12 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	}
 
 	if violations == 0 {
-		t.Logf("  [no-snap-on-checkpoint] PASS: no snapshot-on-checkpoint detected (%d checkpoints, %d snap-syncs checked)",
+		msg := fmt.Sprintf("no snapshot-on-checkpoint detected (%d checkpoints, %d snap-syncs checked",
 			len(report.CheckpointTimes), len(snapSyncEvents))
+		if expectedRecoveries > 0 {
+			msg += fmt.Sprintf(", %d expected gap recoveries", expectedRecoveries)
+		}
+		t.Logf("  [no-snap-on-checkpoint] PASS: %s)", msg)
 	} else {
 		t.Errorf("  [no-snap-on-checkpoint] FAIL: %d snapshot-on-checkpoint violations detected", violations)
 	}
