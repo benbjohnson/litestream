@@ -253,8 +253,11 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 		}
 	}
 
-	// Allow a small percentage of oversized files (snapshots are expected occasionally)
-	maxOversizedPct := 0.05 // 5%
+	// Allow a percentage of oversized files. Occasional full-DB snapshots are
+	// expected from gap recovery (checkpointGapSnapshot) and scheduled L9
+	// snapshots that land in L0. The original bug showed >50% oversized, so
+	// 15% catches systematic issues while allowing legitimate recovery snapshots.
+	maxOversizedPct := 0.15 // 15%
 	oversizedPct := float64(oversized) / float64(len(sizes))
 
 	if oversizedPct > maxOversizedPct {
