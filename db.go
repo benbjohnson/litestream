@@ -1319,13 +1319,16 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	pos, err := db.Pos()
 	if err != nil {
-		_, maxTXID, _ := db.MaxLTX()
-		db.Logger.Warn("L0 position error, triggering snapshot recovery",
-			"error", err, "txid", maxTXID)
-		info.offset = WALHeaderSize
-		info.reason = "L0 file corrupted"
-		info.lastTXID = maxTXID
-		return info, nil
+		if strings.Contains(err.Error(), "verify L0") {
+			_, maxTXID, _ := db.MaxLTX()
+			db.Logger.Warn("L0 position error, triggering snapshot recovery",
+				"error", err, "txid", maxTXID)
+			info.offset = WALHeaderSize
+			info.reason = "L0 file corrupted"
+			info.lastTXID = maxTXID
+			return info, nil
+		}
+		return info, fmt.Errorf("pos: %w", err)
 	} else if pos.TXID == 0 {
 		info.offset = WALHeaderSize
 		return info, nil // first sync
@@ -1876,6 +1879,9 @@ func (db *DB) writeGapRecoveryL0(ctx context.Context, pageNos []uint32, walSalt1
 	}
 	defer func() { _ = os.Remove(tmpFilename) }()
 	defer func() { _ = ltxFile.Close() }()
+
+	uid, gid := internal.Fileinfo(db.fileInfo)
+	_ = os.Chown(tmpFilename, uid, gid)
 
 	enc, err := ltx.NewEncoder(ltxFile)
 	if err != nil {
