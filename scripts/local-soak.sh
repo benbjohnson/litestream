@@ -49,6 +49,9 @@ else
     log "Running all profiles: low-volume, high-volume, burst-volume"
 fi
 
+# Disable errexit around test commands so we always reach the summary.
+set +e
+
 # Run LTX behavioral tests
 log "Starting LTX behavioral tests..."
 SOAK_DURATION="$DURATION" go test -tags 'integration,soak' \
@@ -67,6 +70,8 @@ go test -tags 'integration,soak' \
     ./tests/integration/ 2>&1 | tee -a "$LOG_FILE"
 
 SNAP_EXIT=${PIPESTATUS[0]}
+
+set -e
 
 # Summary
 log ""

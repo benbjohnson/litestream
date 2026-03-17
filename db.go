@@ -2029,9 +2029,12 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		syncedFrames = (db.lastSyncedWALOffset - WALHeaderSize) / frameSize
 	}
 
+	walSalt1 := binary.BigEndian.Uint32(hdr[16:20])
+	walSalt2 := binary.BigEndian.Uint32(hdr[20:24])
+
 	if f, err := os.Open(db.WALPath()); err == nil {
 		seen := make(map[uint32]bool)
-		buf := make([]byte, 4)
+		frameBuf := make([]byte, WALFrameHeaderSize)
 		scanOffset := db.lastSyncedWALOffset
 
 		for iter := 0; iter < 10; iter++ {
@@ -2041,10 +2044,15 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 			}
 
 			for off := scanOffset; off+frameSize <= walSize; off += frameSize {
-				if _, err := f.ReadAt(buf, off); err != nil {
+				if _, err := f.ReadAt(frameBuf, off); err != nil {
 					break
 				}
-				pgno := binary.BigEndian.Uint32(buf)
+				frameSalt1 := binary.BigEndian.Uint32(frameBuf[8:12])
+				frameSalt2 := binary.BigEndian.Uint32(frameBuf[12:16])
+				if frameSalt1 != walSalt1 || frameSalt2 != walSalt2 {
+					break
+				}
+				pgno := binary.BigEndian.Uint32(frameBuf)
 				if pgno > 0 && !seen[pgno] {
 					seen[pgno] = true
 					gapPageNos = append(gapPageNos, pgno)
