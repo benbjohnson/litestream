@@ -1326,10 +1326,9 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		ltxHdr = db.ltxHdrCache.hdr
 	} else {
 		ltxFile, err := os.Open(ltxPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
-			}
+		if os.IsNotExist(err) {
+			return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+		} else if err != nil {
 			return info, fmt.Errorf("open ltx file %s: %w", ltxPath, err)
 		}
 		defer func() { _ = ltxFile.Close() }()
@@ -1483,15 +1482,18 @@ func (db *DB) lastPageMatch(_ context.Context, ltxPath string, ltxHdr ltx.Header
 
 	// If we don't have an open decoder (cache-hit path), open the LTX file and
 	// advance past the header so DecodePage reads from the correct position.
+	// Use NewLTXError for consistency with the cache-miss path in verify() so
+	// that Replica.monitor's errors.As(*LTXError) recovery logic triggers on
+	// corruption or missing files discovered here too.
 	if ltxDec == nil {
 		ltxFile, err := os.Open(ltxPath)
 		if err != nil {
-			return false, fmt.Errorf("open ltx file for page match: %w", err)
+			return false, NewLTXError("open", ltxPath, 0, uint64(ltxHdr.MinTXID), uint64(ltxHdr.MaxTXID), err)
 		}
 		defer func() { _ = ltxFile.Close() }()
 		ltxDec = ltx.NewDecoder(ltxFile)
 		if err := ltxDec.DecodeHeader(); err != nil {
-			return false, fmt.Errorf("decode ltx header for page match: %w", err)
+			return false, NewLTXError("decode", ltxPath, 0, uint64(ltxHdr.MinTXID), uint64(ltxHdr.MaxTXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
 		}
 	}
 
