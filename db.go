@@ -423,11 +423,7 @@ func (db *DB) Pos() (ltx.Pos, error) {
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.Verify(); err != nil {
-		db.Logger.Warn("L0 file verification failed, using TXID from filename",
-			"path", ltxPath, "txid", maxTXID, "error", err)
-		pos := ltx.Pos{TXID: maxTXID}
-		db.pos.value = &pos
-		return pos, nil
+		return ltx.Pos{}, fmt.Errorf("verify L0 %s: %w", ltxPath, err)
 	}
 
 	pos := dec.PostApplyPos()
@@ -1311,14 +1307,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
-	pos, err := db.Pos()
-	if err != nil {
-		return info, fmt.Errorf("pos: %w", err)
-	} else if pos.TXID == 0 {
-		info.offset = WALHeaderSize
-		return info, nil // first sync
-	}
-
 	// If checkpoint detected a TOCTOU gap (new WAL frames arrived between
 	// releasing the write lock and executing checkpoint), force a full
 	// snapshot to capture those pages from the DB file.
@@ -1327,6 +1315,17 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		info.reason = "checkpoint gap recovery"
 		db.Logger.Info("triggering snapshot for checkpoint gap recovery")
 		return info, nil
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		db.Logger.Warn("L0 position error, triggering snapshot recovery", "error", err)
+		info.offset = WALHeaderSize
+		info.reason = "L0 file corrupted"
+		return info, nil
+	} else if pos.TXID == 0 {
+		info.offset = WALHeaderSize
+		return info, nil // first sync
 	}
 
 	// Determine last WAL offset we save from.
@@ -2064,7 +2063,6 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 	if bytes.Equal(hdr, other) {
 		db.syncedSinceCheckpoint = false
-		db.syncedToWALEnd = true
 		return nil
 	}
 
