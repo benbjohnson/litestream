@@ -2118,6 +2118,8 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		db.checkpointGapSnapshot = true
 	}
 
+	db.syncedToWALEnd = true
+
 	// Start a transaction. This will be promoted immediately after.
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2137,8 +2139,6 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
-
-	db.syncedToWALEnd = true
 
 	// Release write lock before exiting.
 	// Use rollback() helper for consistency with releaseReadLock() and the
