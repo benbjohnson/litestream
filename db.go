@@ -444,6 +444,9 @@ func (db *DB) invalidatePosCache() {
 // quarantineCorruptL0 renames the newest L0 file to a .corrupt suffix so
 // that downstream operations (replica sync, compaction) skip it. The pos
 // cache is invalidated so MaxLTX() returns the previous healthy TXID.
+// It also deletes the corrupt file from the remote replica (if present)
+// and resets the replica position so the next Replica.Sync() re-uploads
+// the recovery file.
 func (db *DB) quarantineCorruptL0() error {
 	_, maxTXID, err := db.MaxLTX()
 	if err != nil || maxTXID == 0 {
@@ -457,6 +460,15 @@ func (db *DB) quarantineCorruptL0() error {
 	db.maxLTXFileInfos.Lock()
 	delete(db.maxLTXFileInfos.m, 0)
 	db.maxLTXFileInfos.Unlock()
+
+	if db.Replica != nil {
+		_ = db.Replica.Client.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{
+			Level:   0,
+			MinTXID: maxTXID,
+			MaxTXID: maxTXID,
+		}})
+		db.Replica.SetPos(ltx.Pos{})
+	}
 	return nil
 }
 
