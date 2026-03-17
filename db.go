@@ -1320,9 +1320,12 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	pos, err := db.Pos()
 	if err != nil {
 		if strings.Contains(err.Error(), "verify L0") {
-			_, maxTXID, _ := db.MaxLTX()
-			db.Logger.Warn("L0 position error, triggering snapshot recovery",
-				"error", err, "txid", maxTXID)
+			minTXID, maxTXID, _ := db.MaxLTX()
+			corruptPath := db.LTXPath(0, minTXID, maxTXID)
+			db.Logger.Warn("L0 position error, removing corrupt file and triggering snapshot recovery",
+				"error", err, "txid", maxTXID, "path", corruptPath)
+			_ = os.Remove(corruptPath)
+			db.invalidatePosCache()
 			info.offset = WALHeaderSize
 			info.reason = "L0 file corrupted"
 			info.lastTXID = maxTXID
@@ -2115,8 +2118,6 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		db.checkpointGapSnapshot = true
 	}
 
-	db.syncedToWALEnd = true
-
 	// Start a transaction. This will be promoted immediately after.
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -2136,6 +2137,8 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
+
+	db.syncedToWALEnd = true
 
 	// Release write lock before exiting.
 	// Use rollback() helper for consistency with releaseReadLock() and the
