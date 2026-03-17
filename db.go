@@ -1320,12 +1320,9 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	pos, err := db.Pos()
 	if err != nil {
 		if strings.Contains(err.Error(), "verify L0") {
-			minTXID, maxTXID, _ := db.MaxLTX()
-			corruptPath := db.LTXPath(0, minTXID, maxTXID)
-			db.Logger.Warn("L0 position error, removing corrupt file and triggering snapshot recovery",
-				"error", err, "txid", maxTXID, "path", corruptPath)
-			_ = os.Remove(corruptPath)
-			db.invalidatePosCache()
+			_, maxTXID, _ := db.MaxLTX()
+			db.Logger.Warn("L0 verification failed, triggering snapshot recovery",
+				"error", err, "txid", maxTXID)
 			info.offset = WALHeaderSize
 			info.reason = "L0 file corrupted"
 			info.lastTXID = maxTXID
@@ -1986,38 +1983,37 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return err
 	}
 
-	// Acquire the SQLite write lock BEFORE the pre-checkpoint sync.
-	// This prevents new application commits between the sync and checkpoint,
-	// ensuring the sync captures ALL committed WAL data. Without this lock,
-	// commits arriving after the sync but before execCheckpoint would be
-	// checkpointed from WAL to DB and then lost when the WAL is truncated,
-	// leaving pages that exist only in the DB file and not in any L0 file.
+	// For TRUNCATE checkpoints, acquire the write lock to prevent the TOCTOU
+	// gap where commits arrive between sync and checkpoint, leaving pages
+	// that exist only in the DB file and not in any L0 file.
+	// PASSIVE checkpoints don't truncate the WAL, so this isn't needed.
 	// See: TestDB_CheckpointPageGapWithConcurrentWrites
-	preTx, err := db.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin pre-checkpoint tx: %w", err)
-	}
-	if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		_ = rollback(preTx)
-		return fmt.Errorf("pre-checkpoint write lock: %w", err)
-	}
+	if mode == CheckpointModeTruncate {
+		preTx, err := db.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin pre-checkpoint tx: %w", err)
+		}
+		if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+			_ = rollback(preTx)
+			return fmt.Errorf("pre-checkpoint write lock: %w", err)
+		}
 
-	// Copy end of WAL before checkpoint. With write lock held, no new
-	// commits can arrive, so sync captures everything.
-	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
-		_ = rollback(preTx)
-		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
-	}
+		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+			_ = rollback(preTx)
+			return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+		}
 
-	// Release the write lock so execCheckpoint can proceed.
-	if err := rollback(preTx); err != nil {
-		return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
-	}
+		if err := rollback(preTx); err != nil {
+			return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
+		}
 
-	// Sync frames that arrived during the TOCTOU gap between releasing the
-	// write lock and checkpoint execution.
-	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
-		return fmt.Errorf("cannot copy wal gap frames before checkpoint: %w", err)
+		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+			return fmt.Errorf("cannot copy wal gap frames before checkpoint: %w", err)
+		}
+	} else {
+		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+			return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+		}
 	}
 
 	// Read page numbers of any remaining unsync'd WAL frames BEFORE the

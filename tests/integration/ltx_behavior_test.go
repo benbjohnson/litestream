@@ -171,14 +171,26 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 		LogSoakMetrics(t, db, profile.Name)
 	}
 
+	// Monitor load gen errors concurrently — capture whether the context
+	// was done at the time load gen exited so we can distinguish expected
+	// shutdown from early failure after MonitorSoakTest returns.
+	var loadErr error
+	var loadCtxDone bool
+	loadErrCh := make(chan struct{})
+	go func() {
+		loadErr = <-loadDone
+		loadCtxDone = ctx.Err() != nil
+		close(loadErrCh)
+	}()
+
 	MonitorSoakTest(t, db, ctx, testInfo, refreshStats, logMetrics)
 
-	// Check load generation result — fail on real errors, not context cancellation
-	if err := <-loadDone; err != nil {
-		if ctx.Err() != nil {
-			t.Logf("Load generation stopped (context done): %v", err)
+	<-loadErrCh
+	if loadErr != nil {
+		if loadCtxDone {
+			t.Logf("Load generation stopped (context done): %v", loadErr)
 		} else {
-			t.Fatalf("Load generation failed unexpectedly: %v", err)
+			t.Fatalf("Load generation failed unexpectedly: %v", loadErr)
 		}
 	}
 
