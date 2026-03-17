@@ -192,7 +192,7 @@ jobs:
       - name: Run LTX behavioral tests (short mode)
         run: |
           go test -tags 'integration,soak' \
-            -run 'TestLTXBehavior' \
+            -run '^TestLTXBehavior$' \
             -short -v -timeout 15m \
             ./tests/integration/
 

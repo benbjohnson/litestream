@@ -1319,9 +1319,12 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	pos, err := db.Pos()
 	if err != nil {
-		db.Logger.Warn("L0 position error, triggering snapshot recovery", "error", err)
+		_, maxTXID, _ := db.MaxLTX()
+		db.Logger.Warn("L0 position error, triggering snapshot recovery",
+			"error", err, "txid", maxTXID)
 		info.offset = WALHeaderSize
 		info.reason = "L0 file corrupted"
+		info.lastTXID = maxTXID
 		return info, nil
 	} else if pos.TXID == 0 {
 		info.offset = WALHeaderSize
@@ -1536,19 +1539,26 @@ type syncInfo struct {
 	offset       int64 // end of the previous LTX read
 	salt1        uint32
 	salt2        uint32
-	snapshotting bool   // if true, a full snapshot is required
-	reason       string // reason for snapshot
+	snapshotting bool     // if true, a full snapshot is required
+	reason       string   // reason for snapshot
+	lastTXID     ltx.TXID // if non-zero, use instead of Pos() in sync
 }
 
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
 func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (synced bool, err error) {
 	// Determine the next sequential transaction ID.
-	pos, err := db.Pos()
-	if err != nil {
-		return false, fmt.Errorf("pos: %w", err)
+	// Use lastTXID from verify() when Pos() would fail (e.g. corrupt L0).
+	var txID ltx.TXID
+	if info.lastTXID != 0 {
+		txID = info.lastTXID + 1
+	} else {
+		pos, err := db.Pos()
+		if err != nil {
+			return false, fmt.Errorf("pos: %w", err)
+		}
+		txID = pos.TXID + 1
 	}
-	txID := pos.TXID + 1
 
 	filename := db.LTXPath(0, txID, txID)
 
