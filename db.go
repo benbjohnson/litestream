@@ -1323,7 +1323,6 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	// releasing the write lock and executing checkpoint), force a full
 	// snapshot to capture those pages from the DB file.
 	if db.checkpointGapSnapshot {
-		db.checkpointGapSnapshot = false
 		info.offset = WALHeaderSize
 		info.reason = "checkpoint gap recovery"
 		db.Logger.Info("triggering snapshot for checkpoint gap recovery")
@@ -1343,9 +1342,11 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	dec := ltx.NewDecoder(ltxFile)
 	if err := dec.DecodeHeader(); err != nil {
-		// Decode failure indicates corruption
-		ltxErr := NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
-		return info, ltxErr
+		db.Logger.Warn("L0 file corrupted, triggering snapshot recovery",
+			"path", ltxPath, "txid", pos.TXID, "error", err)
+		info.offset = WALHeaderSize
+		info.reason = "L0 file corrupted"
+		return info, nil
 	}
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
 	info.salt1 = dec.Header().WALSalt1
@@ -1741,6 +1742,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (sync
 		db.syncedToWALEnd = finalOffset == walSize
 	} else {
 		db.syncedToWALEnd = false
+	}
+
+	// Clear checkpoint gap flag only after the recovery snapshot L0 is
+	// committed. If the sync had failed, the flag remains set so verify()
+	// retries on the next cycle.
+	if db.checkpointGapSnapshot && info.snapshotting {
+		db.checkpointGapSnapshot = false
 	}
 
 	db.Logger.Debug("db sync", "status", "ok")
@@ -2179,7 +2187,8 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (result checkpoin
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
-func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+// The caller MUST close the returned ReadCloser to release the checkpoint lock.
+func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	if db.PageSize() == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
 		return ltx.Pos{}, nil, &DBNotReadyError{Reason: "page size not initialized"}
@@ -2334,6 +2343,7 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Close()
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
 		return info, err

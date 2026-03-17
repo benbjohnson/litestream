@@ -404,7 +404,8 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 func isExpectedRecoverySnapshot(reason string) bool {
 	return strings.Contains(reason, "checkpoint gap recovery") ||
 		strings.Contains(reason, "repair snapshot") ||
-		strings.Contains(reason, "compaction detected missing")
+		strings.Contains(reason, "compaction detected missing") ||
+		strings.Contains(reason, "L0 file corrupted")
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
