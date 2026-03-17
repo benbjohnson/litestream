@@ -108,6 +108,14 @@ type DB struct {
 		value *ltx.Pos
 	}
 
+	// ltxHdrCache caches the header of the most recently decoded L0 LTX file
+	// so that verify() can skip re-opening the file when the TXID is unchanged.
+	// Accessed only under db.mu, so no additional locking is needed.
+	ltxHdrCache struct {
+		txID ltx.TXID
+		hdr  ltx.Header
+	}
+
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
 
@@ -1306,26 +1314,36 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		return info, nil // first sync
 	}
 
-	// Determine last WAL offset we save from.
+	// Get the LTX header for this TXID. Use the in-memory cache to avoid
+	// re-opening the file on every monitor tick when nothing has changed.
+	// On a cache miss the file is opened and the decoder kept alive so that
+	// lastPageMatch can continue reading pages from the same handle — one open
+	// serves both the header decode and the page-match scan.
 	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
-	ltxFile, err := os.Open(ltxPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+	var ltxHdr ltx.Header
+	var ltxDec *ltx.Decoder // non-nil only on cache-miss; reused by lastPageMatch
+	if db.ltxHdrCache.txID == pos.TXID {
+		ltxHdr = db.ltxHdrCache.hdr
+	} else {
+		ltxFile, err := os.Open(ltxPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+			}
+			return info, fmt.Errorf("open ltx file %s: %w", ltxPath, err)
 		}
-		return info, fmt.Errorf("open ltx file %s: %w", ltxPath, err)
+		defer func() { _ = ltxFile.Close() }()
+		ltxDec = ltx.NewDecoder(ltxFile)
+		if err := ltxDec.DecodeHeader(); err != nil {
+			return info, NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+		}
+		ltxHdr = ltxDec.Header()
+		db.ltxHdrCache.txID = pos.TXID
+		db.ltxHdrCache.hdr = ltxHdr
 	}
-	defer func() { _ = ltxFile.Close() }()
-
-	dec := ltx.NewDecoder(ltxFile)
-	if err := dec.DecodeHeader(); err != nil {
-		// Decode failure indicates corruption
-		ltxErr := NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
-		return info, ltxErr
-	}
-	info.offset = dec.Header().WALOffset + dec.Header().WALSize
-	info.salt1 = dec.Header().WALSalt1
-	info.salt2 = dec.Header().WALSalt2
+	info.offset = ltxHdr.WALOffset + ltxHdr.WALSize
+	info.salt1 = ltxHdr.WALSalt1
+	info.salt2 = ltxHdr.WALSalt2
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
@@ -1367,7 +1385,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	}
 	salt1 := binary.BigEndian.Uint32(hdr0[16:])
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
-	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
+	saltMatch := salt1 == ltxHdr.WALSalt1 && salt2 == ltxHdr.WALSalt2
 
 	// Handle edge case where we're at WAL header (WALOffset=32, WALSize=0).
 	// This can happen when an LTX file represents a state at the beginning of the WAL
@@ -1401,7 +1419,9 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	}
 
 	// If we can't verify the last page is in the last LTX file, then we need to snapshot.
-	lastPageMatch, err := db.lastPageMatch(ctx, dec, prevWALOffset, frameSize)
+	// Pass ltxDec when available (cache-miss path) to reuse the open file handle.
+	// On cache-hit (ltxDec == nil) lastPageMatch opens the file itself.
+	lastPageMatch, err := db.lastPageMatch(ctx, ltxPath, ltxHdr, ltxDec, prevWALOffset, frameSize)
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
@@ -1421,7 +1441,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 		info.offset = WALHeaderSize
 		info.salt1, info.salt2 = salt1, salt2
 
-		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {dec.Header().WALSalt1, dec.Header().WALSalt2}}); err != nil {
+		if detected, err := db.detectFullCheckpoint(ctx, [][2]uint32{{salt1, salt2}, {ltxHdr.WALSalt1, ltxHdr.WALSalt2}}); err != nil {
 			return info, fmt.Errorf("detect full checkpoint: %w", err)
 		} else if detected {
 			info.reason = "full or restart checkpoint detected, snapshotting"
@@ -1438,7 +1458,12 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 }
 
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
-func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
+//
+// ltxDec may be non-nil when called from the cache-miss path of verify(): in that
+// case the LTX file is already open and the decoder is positioned right after the
+// header, so no additional open is needed. When ltxDec is nil (cache-hit path) the
+// function opens ltxPath itself and advances past the header before scanning pages.
+func (db *DB) lastPageMatch(_ context.Context, ltxPath string, ltxHdr ltx.Header, ltxDec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
 	if prevWALOffset <= WALHeaderSize {
 		return false, nil
 	}
@@ -1452,15 +1477,29 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 	fsalt2 := binary.BigEndian.Uint32(frame[12:])
 	data := frame[WALFrameHeaderSize:]
 
-	if fsalt1 != dec.Header().WALSalt1 || fsalt2 != dec.Header().WALSalt2 {
+	if fsalt1 != ltxHdr.WALSalt1 || fsalt2 != ltxHdr.WALSalt2 {
 		return false, nil
 	}
 
+	// If we don't have an open decoder (cache-hit path), open the LTX file and
+	// advance past the header so DecodePage reads from the correct position.
+	if ltxDec == nil {
+		ltxFile, err := os.Open(ltxPath)
+		if err != nil {
+			return false, fmt.Errorf("open ltx file for page match: %w", err)
+		}
+		defer func() { _ = ltxFile.Close() }()
+		ltxDec = ltx.NewDecoder(ltxFile)
+		if err := ltxDec.DecodeHeader(); err != nil {
+			return false, fmt.Errorf("decode ltx header for page match: %w", err)
+		}
+	}
+
 	// Verify that the last page in the WAL exists in the last LTX file.
-	buf := make([]byte, dec.Header().PageSize)
+	buf := make([]byte, ltxHdr.PageSize)
 	for {
 		var hdr ltx.PageHeader
-		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
+		if err := ltxDec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
 			return false, nil // page not found in LTX file
 		} else if err != nil {
 			return false, fmt.Errorf("decode ltx page: %w", err)
