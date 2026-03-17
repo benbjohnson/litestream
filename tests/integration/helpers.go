@@ -297,6 +297,13 @@ func (db *TestDB) StopLitestream() error {
 	}
 
 	// Send SIGTERM for graceful shutdown so Litestream can flush pending syncs.
+	// On Windows, SIGTERM is unsupported — fall back to Kill().
+	if runtime.GOOS == "windows" {
+		db.LitestreamCmd.Process.Kill()
+		db.LitestreamCmd.Wait()
+		time.Sleep(1 * time.Second)
+		return nil
+	}
 	if err := db.LitestreamCmd.Process.Signal(syscall.SIGTERM); err != nil {
 		// Process may have already exited — check exit status.
 		if state, waitErr := db.LitestreamCmd.Process.Wait(); waitErr == nil && state != nil && !state.Success() {

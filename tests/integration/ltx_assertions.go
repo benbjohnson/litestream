@@ -574,8 +574,9 @@ func parseCompactionComplete(line string) (LTXEvent, bool) {
 func parseCheckpoint(line string) (LTXEvent, bool) {
 	// Match checkpoint log lines: msg=checkpoint mode=PASSIVE/TRUNCATE
 	// Also match: msg="checkpoint" mode=...
-	// Exclude compaction/snapshot lines that happen to contain "checkpoint"
-	if strings.Contains(line, "compaction") || strings.Contains(line, "snapshot") {
+	// Exclude compaction/snapshot msg= lines (not substring in db name/path)
+	if strings.Contains(line, "msg=compaction") || strings.Contains(line, `msg="compaction"`) ||
+		strings.Contains(line, "msg=snapshot") || strings.Contains(line, `msg="snapshot"`) {
 		return LTXEvent{}, false
 	}
 

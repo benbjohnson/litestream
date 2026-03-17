@@ -248,6 +248,13 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	// 6. No snapshot-on-checkpoint bug
 	AssertNoSnapshotOnCheckpoint(t, report)
 
+	// 7. Ensure at least one checkpoint occurred so assertion 6 is non-vacuous
+	if len(report.CheckpointTimes) == 0 {
+		t.Errorf("  [checkpoint-observed] FAIL: no checkpoints occurred during test — snapshot-on-checkpoint assertion is vacuous")
+	} else {
+		t.Logf("  [checkpoint-observed] PASS: %d checkpoints observed", len(report.CheckpointTimes))
+	}
+
 	// Verify restoration
 	t.Log("")
 	t.Log("Testing restoration...")
