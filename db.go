@@ -441,6 +441,25 @@ func (db *DB) invalidatePosCache() {
 	db.pos.Unlock()
 }
 
+// quarantineCorruptL0 renames the newest L0 file to a .corrupt suffix so
+// that downstream operations (replica sync, compaction) skip it. The pos
+// cache is invalidated so MaxLTX() returns the previous healthy TXID.
+func (db *DB) quarantineCorruptL0() error {
+	_, maxTXID, err := db.MaxLTX()
+	if err != nil || maxTXID == 0 {
+		return fmt.Errorf("max ltx: %w", err)
+	}
+	path := db.LTXPath(0, maxTXID, maxTXID)
+	if err := os.Rename(path, path+".corrupt"); err != nil {
+		return err
+	}
+	db.invalidatePosCache()
+	db.maxLTXFileInfos.Lock()
+	delete(db.maxLTXFileInfos.m, 0)
+	db.maxLTXFileInfos.Unlock()
+	return nil
+}
+
 // Notify returns a channel that closes when the shadow WAL changes.
 func (db *DB) Notify() <-chan struct{} {
 	db.mu.RLock()
@@ -1320,6 +1339,9 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	pos, err := db.Pos()
 	if err != nil {
 		if strings.Contains(err.Error(), "verify L0") {
+			if qErr := db.quarantineCorruptL0(); qErr != nil {
+				db.Logger.Warn("failed to quarantine corrupt L0", "error", qErr)
+			}
 			_, maxTXID, _ := db.MaxLTX()
 			db.Logger.Warn("L0 verification failed, triggering snapshot recovery",
 				"error", err, "txid", maxTXID)
@@ -1347,6 +1369,10 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 
 	dec := ltx.NewDecoder(ltxFile)
 	if err := dec.DecodeHeader(); err != nil {
+		_ = ltxFile.Close()
+		if qErr := os.Rename(ltxPath, ltxPath+".corrupt"); qErr == nil {
+			db.invalidatePosCache()
+		}
 		db.Logger.Warn("L0 file corrupted, triggering snapshot recovery",
 			"path", ltxPath, "txid", pos.TXID, "error", err)
 		info.offset = WALHeaderSize

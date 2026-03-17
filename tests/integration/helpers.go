@@ -466,7 +466,10 @@ func (db *TestDB) CheckForErrors() ([]string, error) {
 	var errors []string
 	lines := strings.Split(log, "\n")
 	for _, line := range lines {
-		if strings.Contains(line, "level=ERROR") {
+		if strings.Contains(line, "level=ERROR") ||
+			strings.Contains(line, "panic:") ||
+			strings.Contains(line, "fatal error:") ||
+			strings.Contains(line, "SIGSEGV") {
 			errors = append(errors, line)
 		}
 	}
