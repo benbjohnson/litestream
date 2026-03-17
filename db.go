@@ -462,11 +462,13 @@ func (db *DB) quarantineCorruptL0() error {
 	db.maxLTXFileInfos.Unlock()
 
 	if db.Replica != nil {
-		_ = db.Replica.Client.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{
+		if err := db.Replica.Client.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{
 			Level:   0,
 			MinTXID: maxTXID,
 			MaxTXID: maxTXID,
-		}})
+		}}); err != nil {
+			return fmt.Errorf("delete corrupt L0 from replica: %w", err)
+		}
 		db.Replica.SetPos(ltx.Pos{})
 	}
 	return nil
@@ -1382,8 +1384,8 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	dec := ltx.NewDecoder(ltxFile)
 	if err := dec.DecodeHeader(); err != nil {
 		_ = ltxFile.Close()
-		if qErr := os.Rename(ltxPath, ltxPath+".corrupt"); qErr == nil {
-			db.invalidatePosCache()
+		if qErr := db.quarantineCorruptL0(); qErr != nil {
+			db.Logger.Warn("failed to quarantine corrupt L0", "error", qErr)
 		}
 		db.Logger.Warn("L0 file corrupted, triggering snapshot recovery",
 			"path", ltxPath, "txid", pos.TXID, "error", err)
