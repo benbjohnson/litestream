@@ -254,9 +254,8 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 	}
 
 	// Allow a percentage of oversized files. Occasional full-DB snapshots are
-	// expected from gap recovery (checkpointGapSnapshot) and scheduled L9
-	// snapshots that land in L0. The original bug showed >50% oversized, so
-	// 15% catches systematic issues while allowing legitimate recovery snapshots.
+	// expected from scheduled L9 snapshots that land in L0. The original bug
+	// showed >50% oversized, so 15% catches systematic issues.
 	maxOversizedPct := 0.15 // 15%
 	oversizedPct := float64(oversized) / float64(len(sizes))
 
@@ -399,13 +398,11 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 }
 
 // isExpectedRecoverySnapshot returns true if the snapshot reason indicates an
-// intentional recovery mechanism (gap healing, compaction repair) rather than
-// the checkpoint-triggers-unwanted-snapshot bug.
+// intentional recovery mechanism rather than the checkpoint-triggers-unwanted-
+// snapshot bug.
 func isExpectedRecoverySnapshot(reason string) bool {
-	return strings.Contains(reason, "checkpoint gap recovery") ||
-		strings.Contains(reason, "repair snapshot") ||
-		strings.Contains(reason, "compaction detected missing") ||
-		strings.Contains(reason, "L0 file corrupted")
+	return strings.Contains(reason, "repair snapshot") ||
+		strings.Contains(reason, "compaction detected missing")
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
