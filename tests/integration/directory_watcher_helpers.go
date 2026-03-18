@@ -394,6 +394,10 @@ func CheckForCriticalErrors(t *testing.T, db *TestDB) ([]string, error) {
 				strings.Contains(errLine, "disk I/O error")) {
 			continue
 		}
+		// Skip benign "db not ready" messages that appear at DEBUG level during startup
+		if strings.Contains(errLine, "db not ready") {
+			continue
+		}
 		criticalErrors = append(criticalErrors, errLine)
 	}
 

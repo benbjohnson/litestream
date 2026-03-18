@@ -125,6 +125,33 @@ pre-commit install
 - Ensure existing tests pass before submitting PRs
 - Integration tests require specific environment setup (see test files for details)
 
+## Stability and Release Gating
+
+### Stability Label
+
+Issues that involve lockups, data corruption, or regressions in core replication are
+labeled **`stability`**. These take priority over feature work.
+
+### Release Requirements
+
+Before tagging a new release:
+
+- Zero open issues with the `stability` label
+- Nightly CI must be green (`.github/workflows/nightly-stability.yml`)
+- All PR CI checks pass including the LTX behavioral gate
+
+### Core Replication Changes
+
+PRs touching core replication, compaction, or WAL handling must pass the soak test
+before merging:
+
+```bash
+go test -tags 'integration,soak' -run TestLTXBehavior -short -v ./tests/integration/
+```
+
+This verifies LTX files are the right size and frequency, snapshots aren't excessive,
+and compaction timing is correct.
+
 ## Security
 
 If you discover a security vulnerability, please:

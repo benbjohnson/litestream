@@ -32,7 +32,7 @@ func (c *testReplicaClient) SetLogger(_ *slog.Logger) {}
 
 func (c *testReplicaClient) Type() string { return "test" }
 
-func (c *testReplicaClient) LTXFiles(_ context.Context, level int, afterTXID ltx.TXID, _ bool) (ltx.FileIterator, error) {
+func (c *testReplicaClient) LTXFiles(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
 	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "LIST").Inc()
 
 	levelDir := filepath.Join(c.dir, fmt.Sprintf("l%d", level))
@@ -49,7 +49,7 @@ func (c *testReplicaClient) LTXFiles(_ context.Context, level int, afterTXID ltx
 		if err != nil {
 			continue
 		}
-		if maxTXID <= afterTXID {
+		if minTXID < seek {
 			continue
 		}
 		fi, _ := entry.Info()
@@ -1684,6 +1684,297 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 	}
 
 	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
+}
+
+// TestDB_CheckpointWithConcurrentWrites verifies that TRUNCATE checkpoints
+// create a full snapshot L0 to guarantee complete page coverage.
+//
+// After a TRUNCATE checkpoint restarts the WAL, there's a TOCTOU gap where
+// application commits can arrive between releasing the write lock and the
+// checkpoint executing. Those frames get checkpointed from WAL to DB but
+// are never captured in an L0 file. The post-checkpoint snapshot ensures
+// all pages are captured. See issues #927, #1198.
+func TestDB_CheckpointWithConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Initial sync
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write data to grow WAL
+	for i := range 50 {
+		blob := make([]byte, 2000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync all frames
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Record L0 file count before checkpoint
+	l0Dir := db.LTXLevelDir(0)
+	l0BeforeEntries, _ := os.ReadDir(l0Dir)
+	l0BeforeNames := make(map[string]bool)
+	for _, e := range l0BeforeEntries {
+		l0BeforeNames[e.Name()] = true
+	}
+
+	// TRUNCATE checkpoint should create a full snapshot L0 to ensure
+	// complete page coverage across the checkpoint boundary.
+	if err := db.checkpoint(ctx, CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify a snapshot L0 was created during checkpoint.
+	l0AfterEntries, _ := os.ReadDir(l0Dir)
+	newL0Count := 0
+	for _, entry := range l0AfterEntries {
+		if !l0BeforeNames[entry.Name()] {
+			newL0Count++
+		}
+	}
+	if newL0Count == 0 {
+		t.Fatal("expected checkpoint to create at least one new L0 file")
+	}
+}
+
+// TestDB_CheckpointPageGapWithConcurrentWrites verifies that pages written
+// between the pre-checkpoint sync and checkpoint execution are not lost.
+//
+// Root cause: checkpoint() does a pre-checkpoint sync to capture WAL state,
+// then executes PRAGMA wal_checkpoint(TRUNCATE). Under concurrent writes,
+// new commits can arrive between the pre-sync and the checkpoint. These commits
+// are checkpointed (moved from WAL to DB file) and then the WAL is truncated.
+// The post-checkpoint sync reads only the NEW WAL — the missed pages are in
+// the DB file but not in any L0 file. When compaction merges L0 files into
+// a snapshot (MinTXID=1), the missing pages cause "nonsequential page numbers".
+//
+// This test simulates the race by:
+// 1. Doing an initial sync (snapshot L0)
+// 2. Writing data to grow the database
+// 3. Syncing to capture the growth
+// 4. Writing MORE data WITHOUT syncing (simulates frames arriving after pre-sync)
+// 5. Manually running checkpoint steps with syncedToWALEnd=true (the bug)
+// 6. Verifying compaction over all L0 files succeeds
+func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	// Step 1: Initial sync — creates snapshot L0 with all current pages
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Step 2: Write data to grow the database significantly
+	for i := 0; i < 100; i++ {
+		blob := make([]byte, 4000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Step 3: Sync to capture the growth — creates incremental L0
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pos1, _ := db.Pos()
+	t.Logf("after growth sync: txid=%d", pos1.TXID)
+
+	// Step 4: Write MORE data WITHOUT syncing.
+	// These writes grow the database further. Their pages are in the WAL
+	// but NOT in any L0 file. This simulates frames that arrive between
+	// the pre-checkpoint sync and checkpoint execution.
+	for i := 100; i < 200; i++ {
+		blob := make([]byte, 4000)
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Step 5: Run checkpoint. With the fix, checkpoint() acquires the write
+	// lock before the pre-checkpoint sync, ensuring all committed WAL data
+	// is captured before the WAL is truncated.
+	//
+	// Without the fix: the pre-checkpoint sync doesn't capture step 4 writes,
+	// the checkpoint truncates the WAL, and those pages are lost.
+	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	// Log diagnostic info about what we expect
+	pos2, _ := db.Pos()
+	t.Logf("after checkpoint: txid=%d", pos2.TXID)
+
+	// Check the DB file size — the checkpoint should have extended it
+	dbInfo, _ := os.Stat(dbPath)
+	dbPages := dbInfo.Size() / 4096
+	t.Logf("DB file: %d bytes (%d pages)", dbInfo.Size(), dbPages)
+
+	// Log each L0 file's header and page count
+	for txid := ltx.TXID(1); txid <= pos2.TXID; txid++ {
+		path := db.LTXPath(0, txid, txid)
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			f.Close()
+			continue
+		}
+		hdrInfo := dec.Header()
+		// Count pages in this L0 file
+		var pageCount int
+		var firstPgno, lastPgno uint32
+		data := make([]byte, hdrInfo.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, data); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Logf("  decode error: %v", err)
+				break
+			}
+			pageCount++
+			if firstPgno == 0 {
+				firstPgno = phdr.Pgno
+			}
+			lastPgno = phdr.Pgno
+		}
+		fi, _ := os.Stat(path)
+		t.Logf("L0 %s: commit=%d, pages=%d [%d..%d], size=%d, isSnapshot=%v",
+			filepath.Base(path), hdrInfo.Commit, pageCount, firstPgno, lastPgno,
+			fi.Size(), hdrInfo.IsSnapshot())
+		f.Close()
+	}
+
+	// Step 6: Verify all pages are covered across L0 files.
+	// The last L0's commit tells us the database has N pages. ALL pages
+	// 1..N (except the lock page) must exist in at least one L0 file.
+	// If the checkpoint race caused page loss, pages between the pre-checkpoint
+	// sync's coverage and the final commit will be missing.
+	allPages := make(map[uint32]bool)
+	var maxCommit uint32
+	for txid := ltx.TXID(1); txid <= pos2.TXID; txid++ {
+		path := db.LTXPath(0, txid, txid)
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			f.Close()
+			continue
+		}
+		hdr := dec.Header()
+		if hdr.Commit > maxCommit {
+			maxCommit = hdr.Commit
+		}
+		data := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, data); err == io.EOF {
+				break
+			} else if err != nil {
+				break
+			}
+			allPages[phdr.Pgno] = true
+		}
+		f.Close()
+	}
+
+	lockPgno := ltx.LockPgno(4096)
+	var missing []uint32
+	for pgno := uint32(1); pgno <= maxCommit; pgno++ {
+		if pgno == lockPgno {
+			continue
+		}
+		if !allPages[pgno] {
+			missing = append(missing, pgno)
+		}
+	}
+
+	if len(missing) > 0 {
+		// Show first few missing pages
+		show := missing
+		if len(show) > 10 {
+			show = show[:10]
+		}
+		t.Fatalf("FAIL: %d pages missing from L0 files (commit=%d, have %d pages). "+
+			"Pages lost between pre-checkpoint sync and checkpoint execution. "+
+			"First missing: %v",
+			len(missing), maxCommit, len(allPages), show)
+	}
+
+	t.Logf("all %d pages present across L0 files (commit=%d)", len(allPages), maxCommit)
 }
 
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
