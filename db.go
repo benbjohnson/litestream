@@ -1513,26 +1513,19 @@ type syncInfo struct {
 	offset       int64 // end of the previous LTX read
 	salt1        uint32
 	salt2        uint32
-	snapshotting bool     // if true, a full snapshot is required
-	reason       string   // reason for snapshot
-	lastTXID     ltx.TXID // if non-zero, use instead of Pos() in sync
+	snapshotting bool   // if true, a full snapshot is required
+	reason       string // reason for snapshot
 }
 
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
 func (db *DB) sync(ctx context.Context, checkpointing bool, info syncInfo) (synced bool, err error) {
 	// Determine the next sequential transaction ID.
-	// Use lastTXID from verify() when Pos() would fail (e.g. corrupt L0).
-	var txID ltx.TXID
-	if info.lastTXID != 0 {
-		txID = info.lastTXID + 1
-	} else {
-		pos, err := db.Pos()
-		if err != nil {
-			return false, fmt.Errorf("pos: %w", err)
-		}
-		txID = pos.TXID + 1
+	pos, err := db.Pos()
+	if err != nil {
+		return false, fmt.Errorf("pos: %w", err)
 	}
+	txID := pos.TXID + 1
 
 	filename := db.LTXPath(0, txID, txID)
 
@@ -1878,18 +1871,16 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	// after the checkpoint restarted the WAL.
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return fmt.Errorf("begin post-checkpoint tx: %w", err)
 	}
-	defer func() { _ = rollback(tx) }()
-
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		return fmt.Errorf("_litestream_lock: %w", err)
+		_ = rollback(tx)
+		return fmt.Errorf("post-checkpoint write lock: %w", err)
 	}
-
 	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+		_ = rollback(tx)
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
-
 	if err := rollback(tx); err != nil {
 		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
 	}
