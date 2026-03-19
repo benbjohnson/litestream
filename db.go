@@ -1825,12 +1825,13 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return err
 	}
 
-	// For TRUNCATE checkpoints, block writers and sync all pending WAL
-	// frames so we know the exact WAL state before deciding whether
-	// TRUNCATE is safe. PASSIVE checkpoints are non-blocking by design
-	// and don't need a write lock — unsynced frames are preserved in
-	// the WAL since PASSIVE never truncates.
-	if mode == CheckpointModeTruncate {
+	// For TRUNCATE and RESTART checkpoints, block writers and sync all
+	// pending WAL frames so we know the exact WAL state before deciding
+	// whether the checkpoint is safe. Both modes restart the WAL from
+	// the beginning, so unsynced frames would be lost. PASSIVE checkpoints
+	// are non-blocking by design and don't need a write lock — unsynced
+	// frames are preserved in the WAL since PASSIVE never truncates.
+	if mode == CheckpointModeTruncate || mode == CheckpointModeRestart {
 		preTx, err := db.db.BeginTx(ctx, nil)
 		if err != nil {
 			return fmt.Errorf("begin pre-checkpoint tx: %w", err)
@@ -1848,8 +1849,8 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		}
 
 		// Downgrade to PASSIVE if we didn't sync to the exact end of
-		// the WAL. This prevents the TOCTOU gap where TRUNCATE destroys
-		// frames that haven't been captured in any L0 file.
+		// the WAL. This prevents the TOCTOU gap where TRUNCATE/RESTART
+		// destroys frames that haven't been captured in any L0 file.
 		if !db.syncedToWALEnd {
 			db.Logger.Info("downgrading checkpoint to PASSIVE (WAL not fully synced)")
 			mode = CheckpointModePassive
