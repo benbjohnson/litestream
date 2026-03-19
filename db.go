@@ -1816,37 +1816,48 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 	defer db.chkMu.Unlock()
 
+	if db.db == nil {
+		return nil
+	}
+
 	hdr, err := readWALHeader(db.WALPath())
 	if err != nil {
 		return err
 	}
 
-	// Block writers and sync all pending WAL frames so that we know the
-	// exact WAL state before deciding whether TRUNCATE is safe.
-	preTx, err := db.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin pre-checkpoint tx: %w", err)
-	}
-	if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		_ = rollback(preTx)
-		return fmt.Errorf("pre-checkpoint write lock: %w", err)
-	}
-	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
-		_ = rollback(preTx)
-		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
-	}
-	if err := rollback(preTx); err != nil {
-		return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
-	}
+	// For TRUNCATE checkpoints, block writers and sync all pending WAL
+	// frames so we know the exact WAL state before deciding whether
+	// TRUNCATE is safe. PASSIVE checkpoints are non-blocking by design
+	// and don't need a write lock — unsynced frames are preserved in
+	// the WAL since PASSIVE never truncates.
+	if mode == CheckpointModeTruncate {
+		preTx, err := db.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin pre-checkpoint tx: %w", err)
+		}
+		if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+			_ = rollback(preTx)
+			return fmt.Errorf("pre-checkpoint write lock: %w", err)
+		}
+		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+			_ = rollback(preTx)
+			return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+		}
+		if err := rollback(preTx); err != nil {
+			return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
+		}
 
-	// Only use TRUNCATE if we synced to the exact end of the WAL.
-	// If new frames arrived in the tiny window after releasing the write
-	// lock, downgrade to PASSIVE so those frames stay in the WAL for the
-	// next sync cycle. This prevents the TOCTOU gap where TRUNCATE
-	// destroys frames that haven't been captured in any L0 file.
-	if mode == CheckpointModeTruncate && !db.syncedToWALEnd {
-		db.Logger.Info("downgrading checkpoint to PASSIVE (WAL not fully synced)")
-		mode = CheckpointModePassive
+		// Downgrade to PASSIVE if we didn't sync to the exact end of
+		// the WAL. This prevents the TOCTOU gap where TRUNCATE destroys
+		// frames that haven't been captured in any L0 file.
+		if !db.syncedToWALEnd {
+			db.Logger.Info("downgrading checkpoint to PASSIVE (WAL not fully synced)")
+			mode = CheckpointModePassive
+		}
+	} else {
+		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+			return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+		}
 	}
 
 	if _, err := db.execCheckpoint(ctx, mode); err != nil {
