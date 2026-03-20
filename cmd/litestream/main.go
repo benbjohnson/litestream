@@ -19,6 +19,7 @@ import (
 
 	"github.com/dustin/go-humanize"
 	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
 	"github.com/superfly/ltx"
 	_ "golang.org/x/crypto/x509roots/fallback"
 	"gopkg.in/yaml.v2"
@@ -2041,10 +2042,15 @@ func initLog(w io.Writer, level, typ string, addSource bool) {
 	case "json":
 		logHandler = slog.NewJSONHandler(w, &logOptions)
 	case "pretty":
+		noColor := true
+		if f, ok := w.(*os.File); ok {
+			noColor = !isatty.IsTerminal(f.Fd()) && !isatty.IsCygwinTerminal(f.Fd())
+		}
 		logHandler = tint.NewHandler(w, &tint.Options{
 			Level:       logOptions.Level,
 			AddSource:   addSource,
 			TimeFormat:  time.TimeOnly,
+			NoColor:     noColor,
 			ReplaceAttr: internal.ReplaceAttr,
 		})
 	case "text", "":

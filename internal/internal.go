@@ -4,6 +4,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path"
 	"runtime/debug"
 	"strings"
 	"syscall"
@@ -14,10 +15,12 @@ import (
 )
 
 var modulePrefix string
+var moduleLastSegment string
 
 func init() {
 	if info, ok := debug.ReadBuildInfo(); ok && info.Main.Path != "" {
 		modulePrefix = info.Main.Path + "/"
+		moduleLastSegment = path.Base(info.Main.Path)
 	}
 }
 
@@ -175,6 +178,14 @@ func CleanSourcePath(src *slog.Source) {
 		rest := src.File[idx+len(moduleName):]
 		if slashIdx := strings.Index(rest, "/"); slashIdx >= 0 {
 			src.File = rest[slashIdx+1:]
+		}
+		return
+	}
+
+	if moduleLastSegment != "" {
+		sep := "/" + moduleLastSegment + "/"
+		if idx := strings.LastIndex(src.File, sep); idx >= 0 {
+			src.File = src.File[idx+len(sep):]
 		}
 	}
 }

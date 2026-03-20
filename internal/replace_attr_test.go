@@ -59,6 +59,16 @@ func TestCleanSourcePath(t *testing.T) {
 			want: "db.go",
 		},
 		{
+			name: "absolute checkout path",
+			file: "/Users/dev/projects/litestream/db.go",
+			want: "db.go",
+		},
+		{
+			name: "absolute checkout nested path",
+			file: "/workspace/litestream/internal/internal.go",
+			want: "internal/internal.go",
+		},
+		{
 			name: "no module prefix",
 			file: "other/package/file.go",
 			want: "other/package/file.go",
