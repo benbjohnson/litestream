@@ -18,6 +18,8 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/lmittmann/tint"
+	"github.com/mattn/go-isatty"
 	"github.com/superfly/ltx"
 	_ "golang.org/x/crypto/x509roots/fallback"
 	"gopkg.in/yaml.v2"
@@ -77,7 +79,7 @@ func (e *ConfigValidationError) Unwrap() error {
 }
 
 func main() {
-	initLog(os.Stdout, "INFO", "text")
+	initLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
@@ -317,6 +319,7 @@ type LoggingConfig struct {
 	Level  string `yaml:"level"`
 	Type   string `yaml:"type"`
 	Stderr bool   `yaml:"stderr"`
+	Source bool   `yaml:"source"`
 }
 
 // propagateGlobalSettings copies global replica settings to individual replica configs.
@@ -606,7 +609,7 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	initLog(logOutput, config.Logging.Level, config.Logging.Type)
+	initLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 
 	return config, nil
 }
@@ -2009,9 +2012,10 @@ func (v *levelVar) Set(s string) error {
 	return nil
 }
 
-func initLog(w io.Writer, level, typ string) {
+func initLog(w io.Writer, level, typ string, addSource bool) {
 	logOptions := slog.HandlerOptions{
 		Level:       slog.LevelInfo,
+		AddSource:   addSource,
 		ReplaceAttr: internal.ReplaceAttr,
 	}
 
@@ -2037,6 +2041,18 @@ func initLog(w io.Writer, level, typ string) {
 	switch typ {
 	case "json":
 		logHandler = slog.NewJSONHandler(w, &logOptions)
+	case "pretty":
+		noColor := true
+		if f, ok := w.(*os.File); ok {
+			noColor = !isatty.IsTerminal(f.Fd()) && !isatty.IsCygwinTerminal(f.Fd())
+		}
+		logHandler = tint.NewHandler(w, &tint.Options{
+			Level:       logOptions.Level,
+			AddSource:   addSource,
+			TimeFormat:  time.TimeOnly,
+			NoColor:     noColor,
+			ReplaceAttr: internal.ReplaceAttr,
+		})
 	case "text", "":
 		logHandler = slog.NewTextHandler(w, &logOptions)
 	}

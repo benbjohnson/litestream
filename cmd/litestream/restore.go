@@ -40,7 +40,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("too many arguments")
 	}
 
-	initLog(os.Stdout, "INFO", "text")
+	initLog(os.Stdout, "INFO", "text", false)
 
 	// When follow mode is enabled, set up signal handling so Ctrl+C stops
 	// the follow loop cleanly.

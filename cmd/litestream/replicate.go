@@ -95,7 +95,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 			if c.Config.Logging.Stderr {
 				logOutput = os.Stderr
 			}
-			initLog(logOutput, c.Config.Logging.Level, c.Config.Logging.Type)
+			initLog(logOutput, c.Config.Logging.Level, c.Config.Logging.Type, c.Config.Logging.Source)
 		}
 
 	case 1:
@@ -117,7 +117,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 			os.Setenv("LOG_LEVEL", *logLevelFlag)
 		}
 		c.Config.Logging.Level = logLevel
-		initLog(os.Stdout, logLevel, "text")
+		initLog(os.Stdout, logLevel, "text", false)
 
 		dbConfig := &DBConfig{
 			Path:                 fs.Arg(0),
