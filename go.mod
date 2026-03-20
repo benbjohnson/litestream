@@ -58,6 +58,7 @@ require (
 )
 
 require (
+	github.com/lmittmann/tint v1.1.3
 	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260209214922-2f26647a795e
