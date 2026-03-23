@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1775,7 +1777,7 @@ func TestDB_CheckpointWithConcurrentWrites(t *testing.T) {
 }
 
 // TestDB_CheckpointPageGapWithConcurrentWrites verifies that pages written
-// between the pre-checkpoint sync and checkpoint execution are not lost.
+// concurrently with checkpoint execution are not lost.
 //
 // Root cause: checkpoint() does a pre-checkpoint sync to capture WAL state,
 // then executes PRAGMA wal_checkpoint(TRUNCATE). Under concurrent writes,
@@ -1785,13 +1787,12 @@ func TestDB_CheckpointWithConcurrentWrites(t *testing.T) {
 // the DB file but not in any L0 file. When compaction merges L0 files into
 // a snapshot (MinTXID=1), the missing pages cause "nonsequential page numbers".
 //
-// This test simulates the race by:
+// This test exercises the race by:
 // 1. Doing an initial sync (snapshot L0)
 // 2. Writing data to grow the database
 // 3. Syncing to capture the growth
-// 4. Writing MORE data WITHOUT syncing (simulates frames arriving after pre-sync)
-// 5. Manually running checkpoint steps with syncedToWALEnd=true (the bug)
-// 6. Verifying compaction over all L0 files succeeds
+// 4. Running checkpoint CONCURRENTLY with more writes
+// 5. Verifying all pages are covered across L0 files
 func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
@@ -1848,26 +1849,53 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	pos1, _ := db.Pos()
 	t.Logf("after growth sync: txid=%d", pos1.TXID)
 
-	// Step 4: Write MORE data WITHOUT syncing.
-	// These writes grow the database further. Their pages are in the WAL
-	// but NOT in any L0 file. This simulates frames that arrive between
-	// the pre-checkpoint sync and checkpoint execution.
-	for i := 100; i < 200; i++ {
-		blob := make([]byte, 4000)
-		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
-			t.Fatal(err)
-		}
-	}
+	// Step 4: Run checkpoint CONCURRENTLY with more writes.
+	// The writer goroutine continuously inserts rows while checkpoint runs.
+	// This exercises the TOCTOU window where frames arrive after the
+	// pre-checkpoint sync but before WAL truncation.
+	writerCtx, cancelWriter := context.WithCancel(ctx)
+	writerDone := make(chan error, 1)
+	var writtenRows int64
 
-	// Step 5: Run checkpoint. With the fix, checkpoint() acquires the write
-	// lock before the pre-checkpoint sync, ensuring all committed WAL data
-	// is captured before the WAL is truncated.
-	//
-	// Without the fix: the pre-checkpoint sync doesn't capture step 4 writes,
-	// the checkpoint truncates the WAL, and those pages are lost.
+	go func() {
+		var i int64 = 100
+		for {
+			select {
+			case <-writerCtx.Done():
+				writerDone <- nil
+				return
+			default:
+				blob := make([]byte, 4000)
+				_, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob)
+				if err != nil {
+					// SQLITE_BUSY is expected during concurrent checkpoint - retry
+					if strings.Contains(err.Error(), "database is locked") ||
+						strings.Contains(err.Error(), "SQLITE_BUSY") {
+						time.Sleep(time.Millisecond)
+						continue
+					}
+					writerDone <- err
+					return
+				}
+				atomic.AddInt64(&writtenRows, 1)
+				i++
+			}
+		}
+	}()
+
+	// Let writer run a bit, then checkpoint while it's still running
+	time.Sleep(10 * time.Millisecond)
 	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+		cancelWriter()
+		<-writerDone
 		t.Fatal(err)
 	}
+	cancelWriter()
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+
+	t.Logf("concurrent writer inserted %d rows during/around checkpoint", atomic.LoadInt64(&writtenRows))
 
 	// Log diagnostic info about what we expect
 	pos2, _ := db.Pos()
