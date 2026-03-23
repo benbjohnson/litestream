@@ -186,14 +186,10 @@ func (c *LoadCommand) calculateRate(stats *LoadStats) float64 {
 	case "random":
 		return rand.Float64() * 2.0
 	case "wave":
-		return (1.0 + 0.5*waveFunction(elapsed/10.0))
+		return 1.0 + 0.4*sinApprox(elapsed/10.0)
 	default:
 		return 1.0
 	}
-}
-
-func waveFunction(t float64) float64 {
-	return (1.0 + 0.8*sinApprox(t)) / 2.0
 }
 
 func sinApprox(x float64) float64 {
