@@ -18,8 +18,6 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/lmittmann/tint"
-	"github.com/mattn/go-isatty"
 	"github.com/superfly/ltx"
 	_ "golang.org/x/crypto/x509roots/fallback"
 	"gopkg.in/yaml.v2"
@@ -29,7 +27,6 @@ import (
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
-	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
@@ -312,14 +309,6 @@ type RetentionConfig struct {
 // ValidationConfig configures periodic validation checks.
 type ValidationConfig struct {
 	Interval *time.Duration `yaml:"interval"`
-}
-
-// LoggingConfig configures logging.
-type LoggingConfig struct {
-	Level  string `yaml:"level"`
-	Type   string `yaml:"type"`
-	Stderr bool   `yaml:"stderr"`
-	Source bool   `yaml:"source"`
 }
 
 // propagateGlobalSettings copies global replica settings to individual replica configs.
@@ -2010,53 +1999,4 @@ func (v *levelVar) Set(s string) error {
 	}
 	*v = levelVar(n)
 	return nil
-}
-
-func initLog(w io.Writer, level, typ string, addSource bool) {
-	logOptions := slog.HandlerOptions{
-		Level:       slog.LevelInfo,
-		AddSource:   addSource,
-		ReplaceAttr: internal.ReplaceAttr,
-	}
-
-	// Read log level from environment, if available.
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
-		level = v
-	}
-
-	switch strings.ToUpper(level) {
-	case "TRACE":
-		logOptions.Level = internal.LevelTrace
-	case "DEBUG":
-		logOptions.Level = slog.LevelDebug
-	case "INFO":
-		logOptions.Level = slog.LevelInfo
-	case "WARN", "WARNING":
-		logOptions.Level = slog.LevelWarn
-	case "ERROR":
-		logOptions.Level = slog.LevelError
-	}
-
-	var logHandler slog.Handler
-	switch typ {
-	case "json":
-		logHandler = slog.NewJSONHandler(w, &logOptions)
-	case "pretty":
-		noColor := true
-		if f, ok := w.(*os.File); ok {
-			noColor = !isatty.IsTerminal(f.Fd()) && !isatty.IsCygwinTerminal(f.Fd())
-		}
-		logHandler = tint.NewHandler(w, &tint.Options{
-			Level:       logOptions.Level,
-			AddSource:   addSource,
-			TimeFormat:  time.TimeOnly,
-			NoColor:     noColor,
-			ReplaceAttr: internal.ReplaceAttr,
-		})
-	case "text", "":
-		logHandler = slog.NewTextHandler(w, &logOptions)
-	}
-
-	// Set global default logger.
-	slog.SetDefault(slog.New(logHandler))
 }

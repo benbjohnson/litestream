@@ -47,7 +47,7 @@ func TestInitLog_PrettyAddSource(t *testing.T) {
 	slog.Default().Info("test message")
 
 	output := buf.String()
-	if !strings.Contains(output, "initlog_test.go") {
+	if !strings.Contains(output, "log_test.go") {
 		t.Fatalf("expected source file in output, got: %s", output)
 	}
 }
