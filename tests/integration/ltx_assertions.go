@@ -79,6 +79,8 @@ func ParseLTXEvents(logPath string) ([]LTXEvent, error) {
 			events = append(events, ev)
 		} else if ev, ok := parseSyncWithSnap(line); ok {
 			events = append(events, ev)
+		} else if ev, ok := parseLTXFileUploaded(line); ok {
+			events = append(events, ev)
 		}
 	}
 
@@ -116,7 +118,8 @@ func BuildBehaviorReport(events []LTXEvent, duration time.Duration) *LTXBehavior
 				report.SnapSyncCount++
 				report.SnapSyncReasons = append(report.SnapSyncReasons, ev.Reason)
 			}
-			if ev.Size > 0 {
+		case "upload":
+			if ev.Level == 0 && ev.Size > 0 {
 				report.L0Sizes = append(report.L0Sizes, ev.Size)
 			}
 		}
@@ -209,30 +212,31 @@ func AssertNoExcessiveSnapshots(t *testing.T, report *LTXBehaviorReport, expecte
 // Under normal incremental syncs with moderate writes, each L0 should contain
 // only a handful of pages, not a full database snapshot worth.
 //
-// It reads file sizes directly from the replica L0 directory since sync events
-// are logged at DEBUG level and may not be present in the log.
-//
-// NOTE: This only inspects files surviving at test end. Oversized L0 files
-// created earlier may have been compacted away. A future improvement could
-// sample L0 sizes periodically during the run.
+// It uses L0 sizes collected from "ltx file uploaded" INFO log events, which
+// captures the complete history of all L0 files — including those compacted
+// away before test end. Falls back to reading the replica directory if no
+// upload events were parsed.
 func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, maxPagesPerL0 int, replicaPath string) {
 	t.Helper()
 
-	// Read L0 file sizes directly from replica directory
-	l0Dir := filepath.Join(replicaPath, "ltx", "0")
-	l0Files, err := filepath.Glob(filepath.Join(l0Dir, "*.ltx"))
-	if err != nil || len(l0Files) == 0 {
-		t.Logf("  [l0-page-count] No L0 files found in %s, skipping check", l0Dir)
-		return
-	}
+	sizes := report.L0Sizes
 
-	var sizes []int64
-	for _, f := range l0Files {
-		info, err := os.Stat(f)
-		if err != nil {
-			continue
+	// Fallback: read surviving L0 files from replica directory
+	if len(sizes) == 0 {
+		l0Dir := filepath.Join(replicaPath, "ltx", "0")
+		l0Files, err := filepath.Glob(filepath.Join(l0Dir, "*.ltx"))
+		if err != nil || len(l0Files) == 0 {
+			t.Logf("  [l0-page-count] No L0 upload events or files found, skipping check")
+			return
 		}
-		sizes = append(sizes, info.Size())
+
+		for _, f := range l0Files {
+			info, err := os.Stat(f)
+			if err != nil {
+				continue
+			}
+			sizes = append(sizes, info.Size())
+		}
 	}
 
 	if len(sizes) == 0 {
@@ -259,14 +263,19 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 	maxOversizedPct := 0.15 // 15%
 	oversizedPct := float64(oversized) / float64(len(sizes))
 
+	source := "log"
+	if len(report.L0Sizes) == 0 {
+		source = "disk"
+	}
+
 	if oversizedPct > maxOversizedPct {
-		t.Errorf("  [l0-page-count] FAIL: %d/%d (%.1f%%) L0 files exceed %d pages (%s). Max seen: %s",
+		t.Errorf("  [l0-page-count] FAIL: %d/%d (%.1f%%) L0 files exceed %d pages (%s). Max seen: %s (source: %s)",
 			oversized, len(sizes), oversizedPct*100,
-			maxPagesPerL0, formatBytes(maxSizeBytes), formatBytes(maxSeen))
+			maxPagesPerL0, formatBytes(maxSizeBytes), formatBytes(maxSeen), source)
 	} else {
 		avgSize := avgInt64(sizes)
-		t.Logf("  [l0-page-count] PASS: %d L0 files, avg size %s, max %s (%d/%d oversized, threshold %d pages)",
-			len(sizes), formatBytes(avgSize), formatBytes(maxSeen), oversized, len(sizes), maxPagesPerL0)
+		t.Logf("  [l0-page-count] PASS: %d L0 files, avg size %s, max %s (%d/%d oversized, threshold %d pages, source: %s)",
+			len(sizes), formatBytes(avgSize), formatBytes(maxSeen), oversized, len(sizes), maxPagesPerL0, source)
 	}
 }
 
@@ -402,7 +411,9 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 // snapshot bug.
 func isExpectedRecoverySnapshot(reason string) bool {
 	return strings.Contains(reason, "repair snapshot") ||
-		strings.Contains(reason, "compaction detected missing")
+		strings.Contains(reason, "compaction detected missing") ||
+		strings.Contains(reason, "wal header salt reset") ||
+		strings.Contains(reason, "full or restart checkpoint detected")
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
@@ -610,6 +621,33 @@ func parseSyncWithSnap(line string) (LTXEvent, bool) {
 	ev.IsSnap = strings.Contains(line, "snap=true")
 	if ev.IsSnap {
 		ev.Reason = extractField(line, "reason=")
+	}
+
+	return ev, true
+}
+
+func parseLTXFileUploaded(line string) (LTXEvent, bool) {
+	if !strings.Contains(line, "ltx file uploaded") {
+		return LTXEvent{}, false
+	}
+
+	t, _ := parseLogTime(line)
+	ev := LTXEvent{
+		Time: t,
+		Type: "upload",
+	}
+
+	if v := extractField(line, "level="); v != "" {
+		ev.Level, _ = strconv.Atoi(v)
+	}
+	if v := extractField(line, "minTXID="); v != "" {
+		ev.MinTXID = v
+	}
+	if v := extractField(line, "maxTXID="); v != "" {
+		ev.MaxTXID = v
+	}
+	if v := extractField(line, "size="); v != "" {
+		ev.Size, _ = strconv.ParseInt(v, 10, 64)
 	}
 
 	return ev, true

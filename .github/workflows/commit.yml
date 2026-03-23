@@ -190,6 +190,8 @@ jobs:
           go build -o bin/litestream-test ./cmd/litestream-test
 
       - name: Run LTX behavioral tests (short mode)
+        env:
+          LOG_LEVEL: DEBUG
         run: |
           go test -tags 'integration,soak' \
             -run '^TestLTXBehavior$' \

@@ -618,11 +618,17 @@ func getErrorStats(db *TestDB) ErrorStats {
 			stats.BenignCount++
 			stats.ErrorsByType["db not ready"]++
 		case strings.Contains(errLine, "nonsequential page numbers"):
-			stats.BenignCount++
-			stats.ErrorsByType["compaction gap (self-healing)"]++
+			stats.CriticalCount++
+			stats.ErrorsByType["nonsequential page numbers"]++
+			if len(stats.RecentErrors) < 5 {
+				stats.RecentErrors = append(stats.RecentErrors, errLine)
+			}
 		case strings.Contains(errLine, "compaction gap"):
-			stats.BenignCount++
-			stats.ErrorsByType["compaction gap (self-healing)"]++
+			stats.CriticalCount++
+			stats.ErrorsByType["compaction gap"]++
+			if len(stats.RecentErrors) < 5 {
+				stats.RecentErrors = append(stats.RecentErrors, errLine)
+			}
 		default:
 			stats.CriticalCount++
 			if len(stats.RecentErrors) < 5 {

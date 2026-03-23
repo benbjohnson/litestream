@@ -134,7 +134,7 @@ func (c *LoadCommand) worker(ctx context.Context, db *sql.DB, workerID int, stat
 			return
 		case <-ticker.C:
 			rate := c.calculateRate(stats)
-			if rate == 0 {
+			if rate <= 0 || (rate < 1.0 && rand.Float64() > rate) {
 				continue
 			}
 

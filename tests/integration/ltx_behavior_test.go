@@ -142,10 +142,36 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 		loadDone <- db.GenerateLoadWithOptions(ctx, profile.WriteRate, duration, profile.Pattern, profile.Workers, profile.PayloadSize)
 	}()
 
-	// Track peak WAL size during monitoring
+	// Track peak WAL size with a fast sampler (every 1s) to catch transient spikes
 	walPath := db.Path + "-wal"
 	var peakWALSize int64
 	var walMu sync.Mutex
+
+	walSampleCtx, walSampleCancel := context.WithCancel(context.Background())
+	walSampleDone := make(chan struct{})
+	go func() {
+		defer close(walSampleDone)
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-walSampleCtx.Done():
+				return
+			case <-ticker.C:
+				if info, err := os.Stat(walPath); err == nil {
+					walMu.Lock()
+					if info.Size() > peakWALSize {
+						peakWALSize = info.Size()
+					}
+					walMu.Unlock()
+				}
+			}
+		}
+	}()
+	defer func() {
+		walSampleCancel()
+		<-walSampleDone
+	}()
 
 	refreshStats := func() {
 		testInfo.RowCount, _ = db.GetRowCount("load_test")
@@ -156,15 +182,6 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 			testInfo.RowCount, _ = db.GetRowCount("test_data")
 		}
 		testInfo.FileCount, _ = db.GetReplicaFileCount()
-
-		// Sample WAL size for peak tracking
-		if info, err := os.Stat(walPath); err == nil {
-			walMu.Lock()
-			if info.Size() > peakWALSize {
-				peakWALSize = info.Size()
-			}
-			walMu.Unlock()
-		}
 	}
 
 	logMetrics := func() {
