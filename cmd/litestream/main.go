@@ -27,6 +27,7 @@ import (
 	"github.com/benbjohnson/litestream/abs"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
+	"github.com/benbjohnson/litestream/internal"
 	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/oss"
 	"github.com/benbjohnson/litestream/s3"
@@ -76,7 +77,7 @@ func (e *ConfigValidationError) Unwrap() error {
 }
 
 func main() {
-	initLog(os.Stdout, "INFO", "text", false)
+	internal.InitLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
@@ -281,7 +282,7 @@ type Config struct {
 	Exec string `yaml:"exec"`
 
 	// Logging
-	Logging LoggingConfig `yaml:"logging"`
+	Logging internal.LoggingConfig `yaml:"logging"`
 
 	// MCP server options
 	MCPAddr string `yaml:"mcp-addr"`
@@ -598,7 +599,7 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	initLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 
 	return config, nil
 }

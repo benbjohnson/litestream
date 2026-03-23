@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // LTXCommand represents a command to list LTX files for a database.
@@ -37,7 +38,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
-		initLog(os.Stdout, "INFO", "text", false)
+		internal.InitLog(os.Stdout, "INFO", "text", false)
 	} else {
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
