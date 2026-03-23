@@ -215,7 +215,7 @@ jobs:
     name: Notify on Failure
     runs-on: ubuntu-latest
     needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, comprehensive-soak]
-    if: failure() || cancelled()
+    if: failure()
     steps:
       - name: Create failure issue
         uses: actions/github-script@v7

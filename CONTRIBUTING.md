@@ -146,6 +146,11 @@ PRs touching core replication, compaction, or WAL handling must pass the soak te
 before merging:
 
 ```bash
+# Build required binaries first (tests skip if these don't exist)
+go build -o bin/litestream ./cmd/litestream
+go build -o bin/litestream-test ./cmd/litestream-test
+
+# Run the behavioral test suite
 go test -tags 'integration,soak' -run TestLTXBehavior -short -v ./tests/integration/
 ```
 

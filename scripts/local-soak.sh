@@ -54,7 +54,7 @@ set +e
 
 # Run LTX behavioral tests
 log "Starting LTX behavioral tests..."
-SOAK_DURATION="$DURATION" go test -tags 'integration,soak' \
+SOAK_DURATION="$DURATION" SOAK_KEEP_TEMP=1 go test -tags 'integration,soak' \
     -run "$RUN_FILTER" \
     -v -timeout 8h \
     ./tests/integration/ 2>&1 | tee -a "$LOG_FILE"
@@ -64,7 +64,7 @@ LTX_EXIT=${PIPESTATUS[0]}
 # Run snapshot regression test
 log ""
 log "Starting snapshot regression test..."
-go test -tags 'integration,soak' \
+SOAK_KEEP_TEMP=1 go test -tags 'integration,soak' \
     -run 'TestLTXBehavior_NoExcessiveSnapshots' \
     -v -timeout 20m \
     ./tests/integration/ 2>&1 | tee -a "$LOG_FILE"
