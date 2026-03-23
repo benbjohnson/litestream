@@ -411,22 +411,22 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	config.WriteString("    replica:\n")
 	config.WriteString(fmt.Sprintf("      url: %s\n", replicaURL))
 
-	// Add S3-specific settings if provided
+	// Add S3-specific settings if provided (same indent level as url:)
 	if s3Config != nil {
 		if s3Config.Endpoint != "" {
-			config.WriteString(fmt.Sprintf("        endpoint: %s\n", s3Config.Endpoint))
+			config.WriteString(fmt.Sprintf("      endpoint: %s\n", s3Config.Endpoint))
 		}
 		if s3Config.Region != "" {
-			config.WriteString(fmt.Sprintf("        region: %s\n", s3Config.Region))
+			config.WriteString(fmt.Sprintf("      region: %s\n", s3Config.Region))
 		}
 		if s3Config.ForcePathStyle {
-			config.WriteString("        force-path-style: true\n")
+			config.WriteString("      force-path-style: true\n")
 		}
 		if s3Config.SkipVerify {
-			config.WriteString("        skip-verify: true\n")
+			config.WriteString("      skip-verify: true\n")
 		}
 		if s3Config.SSE != "" {
-			config.WriteString(fmt.Sprintf("        sse: %s\n", s3Config.SSE))
+			config.WriteString(fmt.Sprintf("      sse: %s\n", s3Config.SSE))
 		}
 		if s3Config.SSEKMSKeyID != "" {
 			config.WriteString(fmt.Sprintf("        sse-kms-key-id: %s\n", s3Config.SSEKMSKeyID))

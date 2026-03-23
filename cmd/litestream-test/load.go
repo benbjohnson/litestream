@@ -133,41 +133,29 @@ func (c *LoadCommand) worker(ctx context.Context, db *sql.DB, workerID int, stat
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// calculateRate() returns a modulation factor (not a multiplier
+			// on the number of ops). The ticker already fires at the base
+			// write-rate, so rate is used only to gate whether this tick
+			// produces an operation: <=0 means skip, <1 means probabilistic,
+			// >=1 means always fire.
 			rate := c.calculateRate(stats)
-			if rate <= 0 {
+			if rate <= 0 || (rate < 1.0 && rand.Float64() > rate) {
 				continue
 			}
 
-			// Calculate how many operations to perform this tick.
-			// For rate < 1: probabilistic single operation
-			// For rate >= 1: guaranteed int(rate) ops + probabilistic fractional op
-			var ops int
-			if rate < 1.0 {
-				if rand.Float64() < rate {
-					ops = 1
+			if rand.Float64() < c.ReadRatio {
+				if err := c.performRead(db); err != nil {
+					atomic.AddInt64(&stats.errors, 1)
+					slog.Error("Read failed", "error", err)
+				} else {
+					atomic.AddInt64(&stats.reads, 1)
 				}
 			} else {
-				ops = int(rate)
-				if frac := rate - float64(ops); frac > 0 && rand.Float64() < frac {
-					ops++
-				}
-			}
-
-			for range ops {
-				if rand.Float64() < c.ReadRatio {
-					if err := c.performRead(db); err != nil {
-						atomic.AddInt64(&stats.errors, 1)
-						slog.Error("Read failed", "error", err)
-					} else {
-						atomic.AddInt64(&stats.reads, 1)
-					}
+				if err := c.performWrite(db, data); err != nil {
+					atomic.AddInt64(&stats.errors, 1)
+					slog.Error("Write failed", "error", err)
 				} else {
-					if err := c.performWrite(db, data); err != nil {
-						atomic.AddInt64(&stats.errors, 1)
-						slog.Error("Write failed", "error", err)
-					} else {
-						atomic.AddInt64(&stats.writes, 1)
-					}
+					atomic.AddInt64(&stats.writes, 1)
 				}
 			}
 		}
