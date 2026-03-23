@@ -1724,6 +1724,132 @@ func TestDB_Sync_InitErrorMetrics(t *testing.T) {
 	}
 }
 
+// TestDB_Verify_LTXHeaderCache_SkipsFileOnSameTXID verifies that verify() does
+// not re-open the LTX file when the TXID has not changed since the last call.
+//
+// The test manufactures an LTX file with WALOffset=WALHeaderSize and
+// WALSize=frameSize so that info.offset = WALHeaderSize+frameSize and
+// prevWALOffset = WALHeaderSize. verify() exits early in that branch and never
+// calls lastPageMatch, meaning the only LTX file access is the header read.
+// After the first call populates the cache, the file is made unreadable: a
+// second call must succeed using only the cached values.
+func TestDB_Verify_LTXHeaderCache_SkipsFileOnSameTXID(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		pos, _ := db.Pos()
+		if pos.TXID > 0 {
+			_ = os.Chmod(db.LTXPath(0, pos.TXID, pos.TXID), 0o644)
+		}
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial sync establishes page size and a base LTX file. We replace it
+	// below with a hand-crafted one that has exactly 1 frame of WAL data.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read WAL header to get current salt values; the fake LTX must match.
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt1 := binary.BigEndian.Uint32(walHdr[16:])
+	salt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	// Build an LTX file with WALOffset=WALHeaderSize and WALSize=frameSize.
+	// This gives info.offset = WALHeaderSize+frameSize and
+	// prevWALOffset = WALHeaderSize, so verify() returns before lastPageMatch.
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+
+	f, err := os.Create(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := ltx.NewEncoder(f)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    1,
+		MinTXID:   pos.TXID,
+		MaxTXID:   pos.TXID,
+		Timestamp: 1000000,
+		WALOffset: WALHeaderSize,
+		WALSize:   frameSize,
+		WALSalt1:  salt1,
+		WALSalt2:  salt2,
+	}); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+
+	// First verify call: reads and caches the LTX header.
+	info1, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() #1 error: %v", err)
+	}
+
+	// Make the LTX file unreadable. A second call must succeed from cache alone.
+	if err := os.Chmod(ltxPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(ltxPath); err == nil {
+		f.Close()
+		t.Skip("running as root or filesystem ignores permissions; skipping")
+	}
+
+	info2, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() #2 failed — LTX header cache not used: %v", err)
+	}
+	if info1 != info2 {
+		t.Errorf("cached result differs from original:\n  first:  %+v\n  second: %+v", info1, info2)
+	}
+}
+
 // TestDB_Verify_LTXHeaderCache_SameResult verifies that repeated verify() calls
 // with the same TXID return identical results. This is the behavioral contract
 // the LTX header cache must satisfy: cached values must equal what a fresh
