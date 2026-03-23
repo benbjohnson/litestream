@@ -762,7 +762,3 @@ func sortedKeys(m map[int]int) []int {
 	sort.Ints(keys)
 	return keys
 }
-
-// criticalErrors is a package-level variable used by soak tests to track error count.
-// It's referenced from comprehensive_soak_test.go and minio_soak_test.go.
-var criticalErrors int
