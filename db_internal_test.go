@@ -1895,7 +1895,11 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	t.Logf("concurrent writer inserted %d rows during/around checkpoint", atomic.LoadInt64(&writtenRows))
+	rows := atomic.LoadInt64(&writtenRows)
+	t.Logf("concurrent writer inserted %d rows during/around checkpoint", rows)
+	if rows == 0 {
+		t.Fatal("concurrent writer inserted 0 rows — race was not exercised")
+	}
 
 	// Log diagnostic info about what we expect
 	pos2, _ := db.Pos()

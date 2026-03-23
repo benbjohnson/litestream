@@ -244,7 +244,11 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 		return
 	}
 
-	maxSizeBytes := int64(maxPagesPerL0 * pageSize)
+	// LTX files include a file header, per-page headers (4 bytes each),
+	// and a trailer, so raw size > pages * pageSize. Account for overhead.
+	const ltxOverheadPerPage = 4
+	const ltxFixedOverhead = 200
+	maxSizeBytes := int64(maxPagesPerL0*(pageSize+ltxOverheadPerPage)) + ltxFixedOverhead
 	oversized := 0
 	var maxSeen int64
 
@@ -637,8 +641,12 @@ func parseLTXFileUploaded(line string) (LTXEvent, bool) {
 		Type: "upload",
 	}
 
-	if v := extractField(line, "level="); v != "" {
-		ev.Level, _ = strconv.Atoi(v)
+	// Search for the replica level field AFTER the message text to avoid
+	// matching the slog severity field (e.g. "level=INFO").
+	if msgIdx := strings.Index(line, "ltx file uploaded"); msgIdx != -1 {
+		if v := extractField(line[msgIdx:], "level="); v != "" {
+			ev.Level, _ = strconv.Atoi(v)
+		}
 	}
 	if v := extractField(line, "minTXID="); v != "" {
 		ev.MinTXID = v
