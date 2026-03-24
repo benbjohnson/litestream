@@ -168,8 +168,12 @@ func AssertSnapshotCadence(t *testing.T, report *LTXBehaviorReport, expectedInte
 	// Skip the first interval — the initial snapshot pair (startup + first scheduled)
 	// often has a short interval that doesn't represent steady-state behavior.
 	intervals := report.SnapshotIntervals
-	if len(intervals) > 1 {
+	if len(intervals) >= 1 {
 		intervals = intervals[1:]
+	}
+	if len(intervals) == 0 {
+		t.Logf("  [snapshot-cadence] Only startup interval available, skipping cadence check")
+		return
 	}
 
 	violations := 0
@@ -412,12 +416,12 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 
 // isExpectedRecoverySnapshot returns true if the snapshot reason indicates an
 // intentional recovery mechanism rather than the checkpoint-triggers-unwanted-
-// snapshot bug.
+// snapshot bug. NOTE: "full or restart checkpoint detected" is intentionally
+// NOT in this list — that is the exact bug this assertion catches.
 func isExpectedRecoverySnapshot(reason string) bool {
 	return strings.Contains(reason, "repair snapshot") ||
 		strings.Contains(reason, "compaction detected missing") ||
-		strings.Contains(reason, "wal header salt reset") ||
-		strings.Contains(reason, "full or restart checkpoint detected")
+		strings.Contains(reason, "wal header salt reset")
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
