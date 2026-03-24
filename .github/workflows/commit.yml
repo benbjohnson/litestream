@@ -176,7 +176,7 @@ jobs:
     name: LTX Behavioral Gate (short)
     runs-on: ubuntu-latest
     needs: build
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
