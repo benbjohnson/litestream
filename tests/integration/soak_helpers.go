@@ -429,9 +429,9 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 			config.WriteString(fmt.Sprintf("      sse: %s\n", s3Config.SSE))
 		}
 		if s3Config.SSEKMSKeyID != "" {
-			config.WriteString(fmt.Sprintf("        sse-kms-key-id: %s\n", s3Config.SSEKMSKeyID))
+			config.WriteString(fmt.Sprintf("      sse-kms-key-id: %s\n", s3Config.SSEKMSKeyID))
 		}
-		config.WriteString(fmt.Sprintf("        retention-check-interval: %s\n", retentionCheckInterval))
+		config.WriteString(fmt.Sprintf("      retention-check-interval: %s\n", retentionCheckInterval))
 	}
 
 	if err := os.WriteFile(configPath, []byte(config.String()), 0644); err != nil {
