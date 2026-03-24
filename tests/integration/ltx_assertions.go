@@ -494,7 +494,8 @@ func PrintBehaviorReport(t *testing.T, report *LTXBehaviorReport) {
 
 // timeRegexp matches slog text format: time=2026-03-13T00:01:22.611Z
 // Also matches standalone ISO timestamps and older log formats.
-var timeRegexp = regexp.MustCompile(`(?:time=)?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))|\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}`)
+// Both alternatives are captured so m[1] or m[2] contains the timestamp.
+var timeRegexp = regexp.MustCompile(`(?:time=)?(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2}))|(\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2})`)
 
 func parseLogTime(line string) (time.Time, bool) {
 	// Try slog text format first: time=2026-03-13T00:01:22.611Z
@@ -519,12 +520,20 @@ func parseLogTime(line string) (time.Time, bool) {
 
 	// Fallback: timestamp at start of line
 	m := timeRegexp.FindStringSubmatch(line)
-	if len(m) > 1 && m[1] != "" {
-		for _, layout := range []string{
-			time.RFC3339Nano,
-			time.RFC3339,
-		} {
-			if t, err := time.Parse(layout, m[1]); err == nil {
+	if len(m) > 1 {
+		// m[1] is ISO format (2006-01-02T15:04:05Z), m[2] is older format (2006/01/02 15:04:05)
+		if m[1] != "" {
+			for _, layout := range []string{
+				time.RFC3339Nano,
+				time.RFC3339,
+			} {
+				if t, err := time.Parse(layout, m[1]); err == nil {
+					return t, true
+				}
+			}
+		}
+		if len(m) > 2 && m[2] != "" {
+			if t, err := time.Parse("2006/01/02 15:04:05", m[2]); err == nil {
 				return t, true
 			}
 		}
@@ -626,9 +635,14 @@ func parseSyncWithSnap(line string) (LTXEvent, bool) {
 		Level: 0,
 	}
 
-	ev.IsSnap = strings.Contains(line, "snap=true")
+	// Check for snap field in both text and JSON formats
+	ev.IsSnap = strings.Contains(line, "snap=true") || strings.Contains(line, `"snap":true`)
 	if ev.IsSnap {
+		// Extract reason from text format or JSON format
 		ev.Reason = extractField(line, "reason=")
+		if ev.Reason == "" {
+			ev.Reason = extractJSONField(line, "reason")
+		}
 	}
 
 	return ev, true
@@ -647,9 +661,17 @@ func parseLTXFileUploaded(line string) (LTXEvent, bool) {
 
 	// Search for the replica level field AFTER the message text to avoid
 	// matching the slog severity field (e.g. "level=INFO").
+	// Try text format first, then JSON format.
 	if msgIdx := strings.Index(line, "ltx file uploaded"); msgIdx != -1 {
 		if v := extractField(line[msgIdx:], "level="); v != "" {
 			ev.Level, _ = strconv.Atoi(v)
+		}
+	}
+	if ev.Level == 0 {
+		// Try JSON format: "level":N (note: this is the replica level, not slog severity)
+		// Look for "level": followed by a number after the message marker
+		if v := extractJSONIntField(line, "level"); v > 0 {
+			ev.Level = v
 		}
 	}
 	if v := extractField(line, "minTXID="); v != "" {
@@ -686,6 +708,31 @@ func extractField(line, prefix string) string {
 		return strings.TrimSpace(rest)
 	}
 	return rest[:end]
+}
+
+// extractJSONField extracts a string value from a JSON field like "key":"value".
+func extractJSONField(line, key string) string {
+	// Match "key":"value" or "key": "value"
+	pattern := `"` + key + `"\s*:\s*"([^"]*)"`
+	re := regexp.MustCompile(pattern)
+	m := re.FindStringSubmatch(line)
+	if len(m) > 1 {
+		return m[1]
+	}
+	return ""
+}
+
+// extractJSONIntField extracts an integer value from a JSON field like "key":123.
+func extractJSONIntField(line, key string) int {
+	// Match "key":123 or "key": 123
+	pattern := `"` + key + `"\s*:\s*(\d+)`
+	re := regexp.MustCompile(pattern)
+	m := re.FindStringSubmatch(line)
+	if len(m) > 1 {
+		v, _ := strconv.Atoi(m[1])
+		return v
+	}
+	return 0
 }
 
 // --- Utility helpers ---
