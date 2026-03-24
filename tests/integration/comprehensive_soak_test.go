@@ -192,9 +192,9 @@ func TestComprehensiveSoak(t *testing.T) {
 		t.Logf("  LTX segments: %d", fileCount)
 	}
 
-	// Check for errors
-	errors, _ := db.CheckForErrors()
-	t.Logf("  Critical errors: %d", len(errors))
+	// Check for errors (filter benign shutdown errors like "context canceled")
+	errStats := getErrorStats(db)
+	t.Logf("  Total errors: %d (critical: %d, benign: %d)", errStats.TotalCount, errStats.CriticalCount, errStats.BenignCount)
 	t.Log("")
 
 	// Test restoration
@@ -226,9 +226,9 @@ func TestComprehensiveSoak(t *testing.T) {
 	testPassed := true
 	issues := []string{}
 
-	if len(errors) > 0 {
+	if errStats.CriticalCount > 0 {
 		testPassed = false
-		issues = append(issues, fmt.Sprintf("Critical errors detected: %d", len(errors)))
+		issues = append(issues, fmt.Sprintf("Critical errors detected: %d", errStats.CriticalCount))
 	}
 
 	if analysis.FinalFileCount == 0 {
