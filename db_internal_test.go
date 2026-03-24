@@ -1688,7 +1688,7 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
 }
 
-// TestDB_CheckpointWithConcurrentWrites verifies that TRUNCATE checkpoints
+// TestDB_CheckpointCreatesSnapshotL0 verifies that TRUNCATE checkpoints
 // create a full snapshot L0 to guarantee complete page coverage.
 //
 // After a TRUNCATE checkpoint restarts the WAL, there's a TOCTOU gap where
@@ -1696,7 +1696,7 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 // checkpoint executing. Those frames get checkpointed from WAL to DB but
 // are never captured in an L0 file. The post-checkpoint snapshot ensures
 // all pages are captured. See issues #927, #1198.
-func TestDB_CheckpointWithConcurrentWrites(t *testing.T) {
+func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -1855,10 +1855,12 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	// pre-checkpoint sync but before WAL truncation.
 	writerCtx, cancelWriter := context.WithCancel(ctx)
 	writerDone := make(chan error, 1)
+	writerStarted := make(chan struct{})
 	var writtenRows int64
 
 	go func() {
 		var i int64 = 100
+		started := false
 		for {
 			select {
 			case <-writerCtx.Done():
@@ -1878,13 +1880,22 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 					return
 				}
 				atomic.AddInt64(&writtenRows, 1)
+				if !started {
+					close(writerStarted)
+					started = true
+				}
 				i++
 			}
 		}
 	}()
 
-	// Let writer run a bit, then checkpoint while it's still running
-	time.Sleep(10 * time.Millisecond)
+	// Wait for the writer to confirm at least one successful write before
+	// starting the checkpoint. This avoids a timing-dependent 10ms sleep.
+	select {
+	case <-writerStarted:
+	case err := <-writerDone:
+		t.Fatalf("writer exited before starting: %v", err)
+	}
 	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
 		cancelWriter()
 		<-writerDone

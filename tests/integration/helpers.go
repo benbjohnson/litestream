@@ -316,15 +316,16 @@ func (db *TestDB) StopLitestream() error {
 	done := make(chan error, 1)
 	go func() { done <- db.LitestreamCmd.Wait() }()
 
+	var waitErr error
 	select {
-	case <-done:
+	case waitErr = <-done:
 	case <-time.After(35 * time.Second):
 		db.LitestreamCmd.Process.Kill()
-		<-done
+		waitErr = <-done
 	}
 
 	time.Sleep(1 * time.Second)
-	return nil
+	return waitErr
 }
 
 func (db *TestDB) Restore(outputPath string) error {

@@ -98,8 +98,6 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	t.Logf("  Write rate: %d/sec, Pattern: %s, Workers: %d", profile.WriteRate, profile.Pattern, profile.Workers)
 	t.Log("")
 
-	startTime := time.Now()
-
 	// Setup test database
 	db := SetupTestDB(t, fmt.Sprintf("ltx-behavior-%s", profile.Name))
 	defer db.Cleanup()
@@ -124,6 +122,9 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	if err := db.StartLitestreamWithConfig(configPath); err != nil {
 		t.Fatalf("Failed to start Litestream: %v", err)
 	}
+
+	// Record start time AFTER setup to avoid inflating duration used by assertions.
+	startTime := time.Now()
 
 	// Run load generation with profile-specific workers and payload size
 	ctx, cancel := context.WithTimeout(context.Background(), duration)

@@ -195,9 +195,9 @@ func AssertSnapshotCadence(t *testing.T, report *LTXBehaviorReport, expectedInte
 func AssertNoExcessiveSnapshots(t *testing.T, report *LTXBehaviorReport, expectedInterval time.Duration) {
 	t.Helper()
 
-	// Allow 2x the expected count as tolerance (timing jitter, startup snapshot, etc.)
+	// Allow expected + 1 for timing jitter and startup snapshot.
 	expectedCount := int(report.Duration/expectedInterval) + 1
-	maxAllowed := expectedCount * 2
+	maxAllowed := expectedCount + 1
 
 	if report.SnapshotCount > maxAllowed {
 		t.Errorf("  [excessive-snapshots] FAIL: %d snapshots in %v (expected ~%d, max allowed %d)",
