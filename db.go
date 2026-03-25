@@ -101,8 +101,14 @@ type DB struct {
 	lastSyncedWALOffset int64
 
 	// WAL file size at the end of the last Sync(). Used with lastSyncedWALOffset
-	// to detect whether new WAL data has been written since the last sync.
+	// and the WAL header salts to detect whether new WAL data has been written
+	// since the last sync.
 	lastWALFileSize int64
+
+	// WAL header salt values cached at the end of the last Sync(). Used to detect
+	// checkpoint-induced WAL resets where the file size remains the same but
+	// the content has changed (salt rotation after RESTART/FULL checkpoint).
+	lastWALSalt1, lastWALSalt2 uint32
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -343,6 +349,8 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 
 	// Clear WAL change detection cache so next sync processes everything fresh.
 	db.lastWALFileSize = 0
+	db.lastWALSalt1 = 0
+	db.lastWALSalt2 = 0
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
@@ -1040,24 +1048,38 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	}
 
 	// Fast path: skip expensive verify+sync if WAL has no new data.
-	// Compare WAL file size against lastSyncedWALOffset and lastWALFileSize
-	// to determine if any new frames have been written. Still run
+	// Compare WAL file size and header salts against cached values.
+	// We must check salts because content can change while size stays constant
+	// after checkpoint operations (RESTART/FULL mode rewrites salts in place,
+	// then new writes can refill to the same byte length). Still run
 	// checkpointIfNeeded() since time-based checkpoints may be pending.
 	var synced bool
 	var origWALSize, newWALSize int64
 	walUnchanged := false
 
-	if walFi, statErr := os.Stat(db.WALPath()); statErr == nil {
-		walFileSize := walFi.Size()
-		if db.lastSyncedWALOffset > 0 &&
-			walFileSize == db.lastWALFileSize &&
-			walFileSize == db.lastSyncedWALOffset {
-			db.syncSkippedNCounter.Inc()
-			db.dbIdleGauge.Set(1)
-			db.Logger.Log(ctx, internal.LevelTrace, "sync: skip verify+sync", "reason", "wal unchanged")
-			walUnchanged = true
-			origWALSize = db.lastSyncedWALOffset
-			newWALSize = db.lastSyncedWALOffset
+	if db.lastSyncedWALOffset > 0 {
+		walPath := db.WALPath()
+		if walFi, statErr := os.Stat(walPath); statErr == nil {
+			walFileSize := walFi.Size()
+			if walFileSize == db.lastWALFileSize && walFileSize == db.lastSyncedWALOffset {
+				// Size matches, now verify salts haven't changed (checkpoint detection)
+				if f, openErr := os.Open(walPath); openErr == nil {
+					var hdr [24]byte
+					if _, readErr := io.ReadFull(f, hdr[:]); readErr == nil {
+						salt1 := binary.BigEndian.Uint32(hdr[16:])
+						salt2 := binary.BigEndian.Uint32(hdr[20:])
+						if salt1 == db.lastWALSalt1 && salt2 == db.lastWALSalt2 {
+							db.syncSkippedNCounter.Inc()
+							db.dbIdleGauge.Set(1)
+							db.Logger.Log(ctx, internal.LevelTrace, "sync: skip verify+sync", "reason", "wal unchanged")
+							walUnchanged = true
+							origWALSize = db.lastSyncedWALOffset
+							newWALSize = db.lastSyncedWALOffset
+						}
+					}
+					_ = f.Close()
+				}
+			}
 		}
 	}
 
@@ -1093,9 +1115,18 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		db.walSizeGauge.Set(float64(newWALSize))
 	}
 
-	// Update WAL file size cache for change detection.
-	if walFi, statErr := os.Stat(db.WALPath()); statErr == nil {
+	// Update WAL file size and salt cache for change detection.
+	walPath := db.WALPath()
+	if walFi, statErr := os.Stat(walPath); statErr == nil {
 		db.lastWALFileSize = walFi.Size()
+	}
+	if f, openErr := os.Open(walPath); openErr == nil {
+		var hdr [24]byte
+		if _, readErr := io.ReadFull(f, hdr[:]); readErr == nil {
+			db.lastWALSalt1 = binary.BigEndian.Uint32(hdr[16:])
+			db.lastWALSalt2 = binary.BigEndian.Uint32(hdr[20:])
+		}
+		_ = f.Close()
 	}
 
 	// Notify replicas of WAL changes only when data was actually synced.
