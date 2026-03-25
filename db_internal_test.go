@@ -488,7 +488,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -2055,5 +2055,112 @@ func TestDB_Sync_InitErrorMetrics(t *testing.T) {
 	syncErrorValue := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
 	if syncErrorValue <= baselineErrors {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v (init error should be counted)", syncErrorValue, baselineErrors)
+	}
+}
+
+func TestDB_Checkpoint_TOCTOU_DowngradesWhenNotSynced(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Force syncedToWALEnd to false so TRUNCATE should be downgraded.
+	db.syncedToWALEnd = false
+
+	// Record baseline PASSIVE checkpoint count.
+	passiveBefore := testutil.ToFloat64(db.checkpointNCounterVec.WithLabelValues("PASSIVE"))
+
+	// Request a TRUNCATE checkpoint; it should be downgraded to PASSIVE.
+	if err := db.checkpoint(context.Background(), CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	passiveAfter := testutil.ToFloat64(db.checkpointNCounterVec.WithLabelValues("PASSIVE"))
+	if passiveAfter <= passiveBefore {
+		t.Fatalf("expected PASSIVE checkpoint count to increase (was %v, now %v); TRUNCATE was not downgraded", passiveBefore, passiveAfter)
+	}
+}
+
+func TestDB_SnapshotReader_ReleasesLockAfterEncoding(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	_, r, err := db.SnapshotReader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	// chkMu should NOT be held after SnapshotReader returns because encoding
+	// completes synchronously to a temp file before returning. This allows
+	// checkpoints to proceed while the caller reads/uploads the snapshot.
+	if !db.chkMu.TryLock() {
+		t.Fatal("expected chkMu to be released after SnapshotReader returned, but TryLock failed")
+	}
+	db.chkMu.Unlock()
+
+	// Verify the reader still produces valid data after lock is released.
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		t.Fatal(err)
 	}
 }
