@@ -43,11 +43,6 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
-
-	// Idle backoff configuration.
-	// When no WAL changes are detected, the monitor interval progressively
-	// increases to reduce CPU and I/O on idle databases.
-	DefaultMaxIdleInterval = 60 * time.Second
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -168,10 +163,6 @@ type DB struct {
 	// larger than this may exceed it. Set to zero to process all
 	// committed WAL frames in one run.
 	MaxSyncWALBytes int64
-
-	// Maximum polling interval when no WAL changes are detected.
-	// The monitor backs off exponentially from MonitorInterval to this value.
-	MaxIdleInterval time.Duration
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
@@ -339,7 +330,6 @@ func NewDB(path string) *DB {
 		CheckpointInterval:   DefaultCheckpointInterval,
 		MonitorInterval:      DefaultMonitorInterval,
 		MaxSyncWALBytes:      DefaultMaxSyncWALBytes,
-		MaxIdleInterval:      DefaultMaxIdleInterval,
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
 		RetentionEnabled:     true,
