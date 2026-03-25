@@ -78,10 +78,11 @@ func TestRapidCheckpoints(t *testing.T) {
 
 	t.Logf("✓ Generated 1000 writes with %d checkpoints", checkpointCount)
 
-	time.Sleep(5 * time.Second)
+	// Allow time for final sync/compaction cycle after checkpoint stress.
+	t.Log("Waiting for final sync/compaction cycle...")
+	time.Sleep(45 * time.Second)
 
 	db.StopLitestream()
-	time.Sleep(2 * time.Second)
 
 	t.Log("[3] Checking for errors...")
 	errors, err := db.CheckForErrors()
@@ -193,7 +194,11 @@ func TestWALGrowth(t *testing.T) {
 
 	t.Log("✓ Load generation complete")
 
-	time.Sleep(5 * time.Second)
+	// Allow time for final sync/compaction cycle. Under heavy write load,
+	// checkpoints can create TOCTOU gaps that need one more sync + snapshot
+	// to heal before the replica is restorable.
+	t.Log("Waiting for final sync/compaction cycle...")
+	time.Sleep(45 * time.Second)
 
 	t.Log("[4] Checking WAL size...")
 	walPath := db.Path + "-wal"
@@ -321,7 +326,9 @@ func TestConcurrentOperations(t *testing.T) {
 
 	t.Log("✓ Concurrent load complete")
 
-	time.Sleep(5 * time.Second)
+	// Allow time for final sync/compaction cycle.
+	t.Log("Waiting for final sync/compaction cycle...")
+	time.Sleep(45 * time.Second)
 
 	t.Log("[4] Stopping all Litestream instances...")
 	for _, db := range dbs {

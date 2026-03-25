@@ -172,22 +172,31 @@ jobs:
       - run: go test -v ./cmd/litestream
 
 
-#  long-running-test:
-#    name: Run Long Running Unit Test
-#    runs-on: ubuntu-latest
-#    steps:
-#      - uses: actions/checkout@v2
-#      - uses: actions/setup-go@v2
-#        with:
-#          go-version: '1.24'
-#      - uses: actions/cache@v2
-#        with:
-#          path: ~/go/pkg/mod
-#          key: ${{ inputs.os }}-go-${{ hashFiles('**/go.sum') }}
-#          restore-keys: ${{ inputs.os }}-go-
-#
-#      - run: go install ./cmd/litestream
-#      - run: go test -v -run=TestCmd_Replicate_LongRunning ./integration -long-running-duration 1m
+  ltx-behavioral-gate:
+    name: LTX Behavioral Gate (short)
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Run LTX behavioral tests (short mode)
+        env:
+          LOG_LEVEL: DEBUG
+        run: |
+          go test -tags 'integration,soak' \
+            -run '^TestLTXBehavior$' \
+            -short -v -timeout 15m \
+            ./tests/integration/
 
   s3-mock-test:
     name: Run S3 Mock Tests

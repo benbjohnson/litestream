@@ -133,8 +133,13 @@ func (c *LoadCommand) worker(ctx context.Context, db *sql.DB, workerID int, stat
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// calculateRate() returns a modulation factor (not a multiplier
+			// on the number of ops). The ticker already fires at the base
+			// write-rate, so rate is used only to gate whether this tick
+			// produces an operation: <=0 means skip, <1 means probabilistic,
+			// >=1 means always fire.
 			rate := c.calculateRate(stats)
-			if rate == 0 {
+			if rate <= 0 || (rate < 1.0 && rand.Float64() > rate) {
 				continue
 			}
 
@@ -169,14 +174,10 @@ func (c *LoadCommand) calculateRate(stats *LoadStats) float64 {
 	case "random":
 		return rand.Float64() * 2.0
 	case "wave":
-		return (1.0 + 0.5*waveFunction(elapsed/10.0))
+		return 1.0 + 0.4*sinApprox(elapsed/10.0)
 	default:
 		return 1.0
 	}
-}
-
-func waveFunction(t float64) float64 {
-	return (1.0 + 0.8*sinApprox(t)) / 2.0
 }
 
 func sinApprox(x float64) float64 {

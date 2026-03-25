@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -199,6 +200,36 @@ func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time
 	return nil
 }
 
+func (db *TestDB) GenerateLoadWithOptions(ctx context.Context, writeRate int, duration time.Duration, pattern string, workers int, payloadSize int) error {
+	args := []string{
+		"load",
+		"-db", db.Path,
+		"-write-rate", fmt.Sprintf("%d", writeRate),
+		"-duration", duration.String(),
+		"-pattern", pattern,
+	}
+	if workers > 0 {
+		args = append(args, "-workers", fmt.Sprintf("%d", workers))
+	}
+	if payloadSize > 0 {
+		args = append(args, "-payload-size", fmt.Sprintf("%d", payloadSize))
+	}
+
+	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), args...)
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+
+	db.t.Logf("Starting load generation: %d writes/sec for %v (%s pattern, %d workers, %d byte payload)",
+		writeRate, duration, pattern, workers, payloadSize)
+
+	if err := cmd.Run(); err != nil {
+		if output := combinedOutput(stdoutBuf, stderrBuf); output != "" {
+			return fmt.Errorf("load generation failed: %w\nOutput: %s", err, output)
+		}
+		return fmt.Errorf("load generation failed: %w", err)
+	}
+	return nil
+}
+
 func (db *TestDB) StartLitestream() error {
 	logPath := filepath.Join(db.TempDir, "litestream.log")
 	logFile, err := os.Create(logPath)
@@ -243,6 +274,7 @@ func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
 	cmd := exec.Command(getBinaryPath("litestream"), "replicate",
 		"-config", configPath,
 	)
+	cmd.Env = append(os.Environ(), "LOG_LEVEL=DEBUG")
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 
@@ -264,14 +296,36 @@ func (db *TestDB) StopLitestream() error {
 		return nil
 	}
 
-	if err := db.LitestreamCmd.Process.Kill(); err != nil {
-		return fmt.Errorf("kill litestream: %w", err)
+	// Send SIGTERM for graceful shutdown so Litestream can flush pending syncs.
+	// On Windows, SIGTERM is unsupported — fall back to Kill().
+	if runtime.GOOS == "windows" {
+		db.LitestreamCmd.Process.Kill()
+		db.LitestreamCmd.Wait()
+		time.Sleep(1 * time.Second)
+		return nil
+	}
+	if err := db.LitestreamCmd.Process.Signal(syscall.SIGTERM); err != nil {
+		// Process may have already exited — check exit status.
+		if state, waitErr := db.LitestreamCmd.Process.Wait(); waitErr == nil && state != nil && !state.Success() {
+			return fmt.Errorf("litestream exited before shutdown: %s", state)
+		}
+		return nil
 	}
 
-	db.LitestreamCmd.Wait()
-	time.Sleep(1 * time.Second)
+	// Wait for graceful exit with timeout.
+	done := make(chan error, 1)
+	go func() { done <- db.LitestreamCmd.Wait() }()
 
-	return nil
+	var waitErr error
+	select {
+	case waitErr = <-done:
+	case <-time.After(35 * time.Second):
+		db.LitestreamCmd.Process.Kill()
+		waitErr = <-done
+	}
+
+	time.Sleep(1 * time.Second)
+	return waitErr
 }
 
 func (db *TestDB) Restore(outputPath string) error {
@@ -413,7 +467,11 @@ func (db *TestDB) CheckForErrors() ([]string, error) {
 	var errors []string
 	lines := strings.Split(log, "\n")
 	for _, line := range lines {
-		if strings.Contains(strings.ToUpper(line), "ERROR") {
+		if strings.Contains(line, "level=ERROR") ||
+			strings.Contains(line, `"level":"ERROR"`) ||
+			strings.Contains(line, "panic:") ||
+			strings.Contains(line, "fatal error:") ||
+			strings.Contains(line, "SIGSEGV") {
 			errors = append(errors, line)
 		}
 	}
@@ -464,6 +522,12 @@ func GetTestDuration(t *testing.T, defaultDuration time.Duration) time.Duration 
 
 	if testing.Short() {
 		return defaultDuration / 10
+	}
+
+	if v := os.Getenv("SOAK_DURATION"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
 	}
 
 	return defaultDuration
