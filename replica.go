@@ -22,6 +22,11 @@ import (
 // Default replica settings.
 const (
 	DefaultSyncInterval = 1 * time.Second
+
+	// IdleWakeupInterval is the maximum time a replica waits for a notify
+	// before waking up anyway. This ensures LastSuccessfulSyncAt stays fresh
+	// for heartbeat health checks, even when the database is idle.
+	IdleWakeupInterval = 1 * time.Minute
 )
 
 // Replica connects a database to a replication destination via a ReplicaClient.
@@ -358,11 +363,14 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Wait for changes to the database, unless we need to retry a failed sync.
 		// This ensures transient errors on idle databases don't block retries forever.
+		// Also wake up periodically (IdleWakeupInterval) to keep LastSuccessfulSyncAt
+		// fresh for heartbeat health checks during idle periods.
 		if !needsRetry {
 			select {
 			case <-ctx.Done():
 				return
 			case <-notify:
+			case <-time.After(IdleWakeupInterval):
 			}
 		}
 		needsRetry = false

@@ -105,6 +105,12 @@ type DB struct {
 	// the content has changed (salt rotation after RESTART/FULL checkpoint).
 	lastWALSalt1, lastWALSalt2 uint32
 
+	// syncedDuringCurrentSync tracks whether any LTX was created during the
+	// current Sync() call. Set by verifyAndSync() and checked by deferred
+	// notification at the end of Sync(). This ensures checkpoint-generated
+	// LTX files are also covered by the notification.
+	syncedDuringCurrentSync bool
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -1014,6 +1020,19 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Reset sync tracking. This flag is set by verifyAndSync() (including
+	// calls from checkpoint()) when LTX is created. Deferred notification
+	// checks this flag to ensure all LTX creation is complete before waking
+	// replicas - this prevents replicas from syncing while checkpoint is
+	// still creating additional LTX files.
+	db.syncedDuringCurrentSync = false
+	defer func() {
+		if db.syncedDuringCurrentSync {
+			close(db.notify)
+			db.notify = make(chan struct{})
+		}
+	}()
+
 	// Track total sync metrics.
 	t := time.Now()
 	defer func() {
@@ -1083,13 +1102,6 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		if synced {
 			db.syncedSinceCheckpoint = true
 			db.dbIdleGauge.Set(0)
-
-			// Notify replicas immediately after verifyAndSync succeeds.
-			// This must happen before checkpointIfNeeded()/Pos() which can fail,
-			// otherwise a post-sync error would leave replicas unnotified about
-			// the newly created TXID.
-			close(db.notify)
-			db.notify = make(chan struct{})
 		}
 	}
 
@@ -1153,6 +1165,13 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSiz
 	synced, err = db.sync(ctx, checkpointing, info)
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("sync: %w", err)
+	}
+
+	// Track that LTX was created during this Sync() cycle.
+	// Used by deferred notification at the end of Sync() to ensure
+	// checkpoint-generated LTX files are also covered.
+	if synced {
+		db.syncedDuringCurrentSync = true
 	}
 
 	// Use the logical WAL offset (from LTX) for checkpoint decisions.
