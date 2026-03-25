@@ -1083,6 +1083,13 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		if synced {
 			db.syncedSinceCheckpoint = true
 			db.dbIdleGauge.Set(0)
+
+			// Notify replicas immediately after verifyAndSync succeeds.
+			// This must happen before checkpointIfNeeded()/Pos() which can fail,
+			// otherwise a post-sync error would leave replicas unnotified about
+			// the newly created TXID.
+			close(db.notify)
+			db.notify = make(chan struct{})
 		}
 	}
 
@@ -1117,12 +1124,6 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 			db.lastWALSalt2 = binary.BigEndian.Uint32(hdr[20:])
 		}
 		_ = f.Close()
-	}
-
-	// Notify replicas of WAL changes only when data was actually synced.
-	if synced {
-		close(db.notify)
-		db.notify = make(chan struct{})
 	}
 
 	return nil
