@@ -2,7 +2,6 @@ package internal
 
 import (
 	"io"
-	"log/slog"
 	"os"
 	"syscall"
 
@@ -10,8 +9,6 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 )
-
-const LevelTrace = slog.LevelDebug - 4
 
 // ReadCloser wraps a reader to also attach a separate closer.
 type ReadCloser struct {
@@ -148,13 +145,6 @@ func MkdirAll(path string, fi os.FileInfo) error {
 	}
 	_ = os.Chown(path, uid, gid)
 	return nil
-}
-
-func ReplaceAttr(groups []string, a slog.Attr) slog.Attr {
-	if a.Key == slog.LevelKey && a.Value.Any() == LevelTrace {
-		a.Value = slog.StringValue("TRACE")
-	}
-	return a
 }
 
 // Shared replica metrics.

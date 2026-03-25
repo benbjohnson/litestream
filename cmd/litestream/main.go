@@ -77,7 +77,7 @@ func (e *ConfigValidationError) Unwrap() error {
 }
 
 func main() {
-	initLog(os.Stdout, "INFO", "text")
+	internal.InitLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
 	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
@@ -282,7 +282,7 @@ type Config struct {
 	Exec string `yaml:"exec"`
 
 	// Logging
-	Logging LoggingConfig `yaml:"logging"`
+	Logging internal.LoggingConfig `yaml:"logging"`
 
 	// MCP server options
 	MCPAddr string `yaml:"mcp-addr"`
@@ -310,13 +310,6 @@ type RetentionConfig struct {
 // ValidationConfig configures periodic validation checks.
 type ValidationConfig struct {
 	Interval *time.Duration `yaml:"interval"`
-}
-
-// LoggingConfig configures logging.
-type LoggingConfig struct {
-	Level  string `yaml:"level"`
-	Type   string `yaml:"type"`
-	Stderr bool   `yaml:"stderr"`
 }
 
 // propagateGlobalSettings copies global replica settings to individual replica configs.
@@ -606,7 +599,7 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	initLog(logOutput, config.Logging.Level, config.Logging.Type)
+	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 
 	return config, nil
 }
@@ -2007,40 +2000,4 @@ func (v *levelVar) Set(s string) error {
 	}
 	*v = levelVar(n)
 	return nil
-}
-
-func initLog(w io.Writer, level, typ string) {
-	logOptions := slog.HandlerOptions{
-		Level:       slog.LevelInfo,
-		ReplaceAttr: internal.ReplaceAttr,
-	}
-
-	// Read log level from environment, if available.
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
-		level = v
-	}
-
-	switch strings.ToUpper(level) {
-	case "TRACE":
-		logOptions.Level = internal.LevelTrace
-	case "DEBUG":
-		logOptions.Level = slog.LevelDebug
-	case "INFO":
-		logOptions.Level = slog.LevelInfo
-	case "WARN", "WARNING":
-		logOptions.Level = slog.LevelWarn
-	case "ERROR":
-		logOptions.Level = slog.LevelError
-	}
-
-	var logHandler slog.Handler
-	switch typ {
-	case "json":
-		logHandler = slog.NewJSONHandler(w, &logOptions)
-	case "text", "":
-		logHandler = slog.NewTextHandler(w, &logOptions)
-	}
-
-	// Set global default logger.
-	slog.SetDefault(slog.New(logHandler))
 }
