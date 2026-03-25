@@ -1800,26 +1800,17 @@ func TestDB_Sync_SkipsWhenWALUnchanged(t *testing.T) {
 	}
 }
 
-func TestDB_Monitor_IdleBackoff(t *testing.T) {
+func TestDB_Sync_IdleMetrics(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
-	// Create initial data.
+	// Create initial data and sync.
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-
-	// Configure fast monitor intervals for testing.
-	db.MonitorInterval = 10 * time.Millisecond
-	db.MaxIdleInterval = 100 * time.Millisecond
-
-	// Start the monitor by calling the internal method via Open/Close cycle.
-	// Instead, we'll test the idle backoff behavior indirectly:
-	// After first idle sync, subsequent syncs should not advance TXID.
-	// After a write, the next sync should advance TXID.
 
 	// Perform multiple idle syncs — TXID should not change.
 	pos0, _ := db.Pos()

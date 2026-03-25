@@ -2313,9 +2313,10 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
 //
-// Also implements adaptive idle backoff: when no WAL changes are detected,
-// the polling interval progressively increases from MonitorInterval to
-// MaxIdleInterval. Resets immediately when activity is detected. See issue #1210.
+// Idle CPU is reduced by the WAL change detection in Sync() which skips
+// expensive verify+sync work when the WAL has no new data (issue #1210).
+// The monitor continues polling at MonitorInterval to maintain low sync
+// latency when writes resume.
 func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
@@ -2325,9 +2326,6 @@ func (db *DB) monitor() {
 	var lastLogTime time.Time
 	var consecutiveErrs int
 
-	// Idle backoff state.
-	var idleBackoff time.Duration
-
 	for {
 		// Wait for ticker or context close.
 		select {
@@ -2336,7 +2334,7 @@ func (db *DB) monitor() {
 		case <-ticker.C:
 		}
 
-		// If in error backoff mode, wait additional time before retrying.
+		// If in backoff mode, wait additional time before retrying.
 		if backoff > 0 {
 			select {
 			case <-db.ctx.Done():
@@ -2345,21 +2343,9 @@ func (db *DB) monitor() {
 			}
 		}
 
-		// If in idle backoff mode, wait additional time before syncing.
-		if idleBackoff > 0 {
-			select {
-			case <-db.ctx.Done():
-				return
-			case <-time.After(idleBackoff):
-			}
-		}
-
-		prePos, _ := db.Pos()
-
 		// Sync the database to the shadow WAL.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
-			idleBackoff = 0
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
 			if backoff == 0 {
@@ -2390,30 +2376,12 @@ func (db *DB) monitor() {
 			continue
 		}
 
-		// Success - reset error backoff and error counter.
+		// Success - reset backoff and error counter.
 		if consecutiveErrs > 0 {
 			db.Logger.Info("sync recovered", "previous_errors", consecutiveErrs)
 		}
 		backoff = 0
 		consecutiveErrs = 0
-
-		// Adaptive idle backoff: increase interval when no changes detected.
-		postPos, _ := db.Pos()
-		if prePos.TXID == postPos.TXID {
-			if idleBackoff == 0 {
-				idleBackoff = db.MonitorInterval
-			} else {
-				idleBackoff *= 2
-				if idleBackoff > db.MaxIdleInterval {
-					idleBackoff = db.MaxIdleInterval
-				}
-			}
-		} else {
-			if idleBackoff > 0 {
-				db.Logger.Debug("monitor: activity detected, resetting idle backoff")
-			}
-			idleBackoff = 0
-		}
 	}
 }
 
