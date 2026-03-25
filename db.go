@@ -43,6 +43,11 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
+
+	// Idle backoff configuration.
+	// When no WAL changes are detected, the monitor interval progressively
+	// increases to reduce CPU and I/O on idle databases.
+	DefaultMaxIdleInterval = 60 * time.Second
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -78,6 +83,10 @@ type DB struct {
 	opened    bool          // true if Open() was called and Close() not yet called
 	syncState syncState
 	syncDiag  diagState
+
+	// WAL file size at the end of the last Sync(). Used with lastSyncedWALOffset
+	// to detect whether new WAL data has been written since the last sync.
+	lastWALFileSize int64
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -116,6 +125,8 @@ type DB struct {
 	checkpointNCounterVec       *prometheus.CounterVec
 	checkpointErrorNCounterVec  *prometheus.CounterVec
 	checkpointSecondsCounterVec *prometheus.CounterVec
+	syncSkippedNCounter         prometheus.Counter
+	dbIdleGauge                 prometheus.Gauge
 
 	// Minimum threshold of WAL size, in pages, before a passive checkpoint.
 	// A passive checkpoint will attempt a checkpoint but fail if there are
@@ -151,6 +162,10 @@ type DB struct {
 	// larger than this may exceed it. Set to zero to process all
 	// committed WAL frames in one run.
 	MaxSyncWALBytes int64
+
+	// Maximum polling interval when no WAL changes are detected.
+	// The monitor backs off exponentially from MonitorInterval to this value.
+	MaxIdleInterval time.Duration
 
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
@@ -318,6 +333,7 @@ func NewDB(path string) *DB {
 		CheckpointInterval:   DefaultCheckpointInterval,
 		MonitorInterval:      DefaultMonitorInterval,
 		MaxSyncWALBytes:      DefaultMaxSyncWALBytes,
+		MaxIdleInterval:      DefaultMaxIdleInterval,
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
 		RetentionEnabled:     true,
@@ -339,6 +355,8 @@ func NewDB(path string) *DB {
 	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.syncSkippedNCounter = syncSkippedNCounterVec.WithLabelValues(db.path)
+	db.dbIdleGauge = dbIdleGaugeVec.WithLabelValues(db.path)
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
@@ -538,6 +556,9 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.maxLTXFileInfos.Unlock()
 
 	db.invalidatePosCache()
+
+	// Clear WAL change detection cache so next sync processes everything fresh.
+	db.lastWALFileSize = 0
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
@@ -1293,18 +1314,42 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		return result, fmt.Errorf("ensure wal exists: %w", err)
 	}
 
-	db.setSyncDiagPhase(diagPhaseVerifyAndSync, func(s *diagState) {
-		s.txID = exec.pos.TXID + 1
-	})
-	result, err = db.verifyAndSyncWithExecutor(ctx, false, exec, maxSyncWALBytes)
-	if err != nil {
-		return result, err
+	// Fast path: skip expensive verify+sync if WAL has no new data.
+	// Compare WAL file size against lastSyncedWALOffset and lastWALFileSize
+	// to determine if any new frames have been written. Still run
+	// checkpointIfNeeded() since time-based checkpoints may be pending.
+	walUnchanged := false
+
+	if walFi, statErr := os.Stat(db.WALPath()); statErr == nil {
+		walFileSize := walFi.Size()
+		if exec.state.lastSyncedWALOffset > 0 &&
+			walFileSize == db.lastWALFileSize &&
+			walFileSize == exec.state.lastSyncedWALOffset {
+			db.syncSkippedNCounter.Inc()
+			db.dbIdleGauge.Set(1)
+			db.Logger.Log(ctx, internal.LevelTrace, "sync: skip verify+sync", "reason", "wal unchanged")
+			walUnchanged = true
+			result.origWALSize = exec.state.lastSyncedWALOffset
+			result.newWALSize = exec.state.lastSyncedWALOffset
+			result.syncedToWALEnd = exec.state.syncedToWALEnd
+		}
+	}
+
+	if !walUnchanged {
+		db.setSyncDiagPhase(diagPhaseVerifyAndSync, func(s *diagState) {
+			s.txID = exec.pos.TXID + 1
+		})
+		result, err = db.verifyAndSyncWithExecutor(ctx, false, exec, maxSyncWALBytes)
+		if err != nil {
+			return result, err
+		}
 	}
 	exec.applySyncResult(result)
 
 	// Track that data was synced for time-based checkpoint decisions.
 	if result.synced {
 		exec.state.syncedSinceCheckpoint = true
+		db.dbIdleGauge.Set(0)
 	}
 
 	// Checkpoint checks normally wait until the WAL is fully synced, but the
@@ -1330,10 +1375,17 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 	db.txIDGauge.Set(float64(exec.pos.TXID))
 
 	// Update file size metrics.
-	if fi, err := os.Stat(db.path); err == nil {
-		db.dbSizeGauge.Set(float64(fi.Size()))
+	if !walUnchanged {
+		if fi, err := os.Stat(db.path); err == nil {
+			db.dbSizeGauge.Set(float64(fi.Size()))
+		}
 	}
 	db.walSizeGauge.Set(float64(exec.state.lastSyncedWALOffset))
+
+	// Update WAL file size cache for change detection.
+	if walFi, statErr := os.Stat(db.WALPath()); statErr == nil {
+		db.lastWALFileSize = walFi.Size()
+	}
 
 	return result, nil
 }
@@ -3139,6 +3191,10 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 //
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
+//
+// Also implements adaptive idle backoff: when no WAL changes are detected,
+// the polling interval progressively increases from MonitorInterval to
+// MaxIdleInterval. Resets immediately when activity is detected. See issue #1210.
 func (db *DB) monitor() {
 	ticker := time.NewTicker(db.MonitorInterval)
 	defer ticker.Stop()
@@ -3148,6 +3204,9 @@ func (db *DB) monitor() {
 	var lastLogTime time.Time
 	var consecutiveErrs int
 
+	// Idle backoff state.
+	var idleBackoff time.Duration
+
 	for {
 		// Wait for ticker or context close.
 		select {
@@ -3156,7 +3215,7 @@ func (db *DB) monitor() {
 		case <-ticker.C:
 		}
 
-		// If in backoff mode, wait additional time before retrying.
+		// If in error backoff mode, wait additional time before retrying.
 		if backoff > 0 {
 			select {
 			case <-db.ctx.Done():
@@ -3164,6 +3223,17 @@ func (db *DB) monitor() {
 			case <-time.After(backoff):
 			}
 		}
+
+		// If in idle backoff mode, wait additional time before syncing.
+		if idleBackoff > 0 {
+			select {
+			case <-db.ctx.Done():
+				return
+			case <-time.After(idleBackoff):
+			}
+		}
+
+		prePos, _ := db.Pos()
 
 		// Sync the database to the shadow WAL. Sync() loops over bounded
 		// chunks, releasing the executor lock between each so checkpoints
@@ -3173,6 +3243,7 @@ func (db *DB) monitor() {
 		// emergency checkpoint while behind, growing the WAL unbounded.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
+			idleBackoff = 0
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
 			if backoff == 0 {
@@ -3216,12 +3287,30 @@ func (db *DB) monitor() {
 			continue
 		}
 
-		// Success - reset backoff and error counter.
+		// Success - reset error backoff and error counter.
 		if consecutiveErrs > 0 {
 			db.Logger.Info("sync recovered", "previous_errors", consecutiveErrs)
 		}
 		backoff = 0
 		consecutiveErrs = 0
+
+		// Adaptive idle backoff: increase interval when no changes detected.
+		postPos, _ := db.Pos()
+		if prePos.TXID == postPos.TXID {
+			if idleBackoff == 0 {
+				idleBackoff = db.MonitorInterval
+			} else {
+				idleBackoff *= 2
+				if idleBackoff > db.MaxIdleInterval {
+					idleBackoff = db.MaxIdleInterval
+				}
+			}
+		} else {
+			if idleBackoff > 0 {
+				db.Logger.Debug("monitor: activity detected, resetting idle backoff")
+			}
+			idleBackoff = 0
+		}
 	}
 }
 
@@ -3393,5 +3482,15 @@ var (
 	compactionVerifyErrorCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "litestream_compaction_verify_error_count",
 		Help: "Number of post-compaction verification failures",
+	}, []string{"db"})
+
+	syncSkippedNCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_sync_skipped_total",
+		Help: "Number of sync operations skipped due to unchanged WAL",
+	}, []string{"db"})
+
+	dbIdleGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_db_idle",
+		Help: "Whether the database is idle (1) or active (0)",
 	}, []string{"db"})
 )
