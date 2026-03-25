@@ -537,6 +537,11 @@ func (db *DB) LTXDir() string {
 // This is useful for recovering from corrupted or missing LTX files.
 // The database file itself is not modified.
 func (db *DB) ResetLocalState(ctx context.Context) error {
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
+	defer db.execSem.Release(1)
+
 	db.Logger.Info("resetting local litestream state",
 		"meta_path", db.metaPath,
 		"ltx_dir", db.LTXDir())
