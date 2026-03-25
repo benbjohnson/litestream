@@ -1776,7 +1776,7 @@ func TestDB_Checkpoint_TOCTOU_DowngradesWhenNotSynced(t *testing.T) {
 	}
 }
 
-func TestDB_SnapshotReader_HoldsCheckpointLockDuringEncoding(t *testing.T) {
+func TestDB_SnapshotReader_ReleasesLockAfterEncoding(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -1815,31 +1815,18 @@ func TestDB_SnapshotReader_HoldsCheckpointLockDuringEncoding(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer r.Close()
 
-	// chkMu should be held (RLocked) while the reader is open.
-	// TryLock acquires an exclusive lock, which should fail if RLock is held.
-	if db.chkMu.TryLock() {
-		db.chkMu.Unlock()
-		t.Fatal("expected chkMu to be held during snapshot encoding, but TryLock succeeded")
+	// chkMu should NOT be held after SnapshotReader returns because encoding
+	// completes synchronously to a temp file before returning. This allows
+	// checkpoints to proceed while the caller reads/uploads the snapshot.
+	if !db.chkMu.TryLock() {
+		t.Fatal("expected chkMu to be released after SnapshotReader returned, but TryLock failed")
 	}
+	db.chkMu.Unlock()
 
-	// Drain and close the reader.
+	// Verify the reader still produces valid data after lock is released.
 	if _, err := io.Copy(io.Discard, r); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	// After close, the goroutine should have released the RLock.
-	// Give it a moment to complete.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if db.chkMu.TryLock() {
-			db.chkMu.Unlock()
-			return // success
-		}
-		time.Sleep(time.Millisecond)
-	}
-	t.Fatal("chkMu still held after closing SnapshotReader; expected it to be released")
 }

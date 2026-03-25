@@ -1877,8 +1877,6 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return nil
 	}
 
-	db.syncedToWALEnd = true
-
 	// Post-checkpoint: acquire write lock and sync any frames written
 	// after the checkpoint restarted the WAL.
 	tx, err := db.db.BeginTx(ctx, nil)
@@ -1897,6 +1895,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
 	}
 
+	db.syncedToWALEnd = true
 	db.syncedSinceCheckpoint = false
 	return nil
 }
@@ -1952,7 +1951,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (result checkpoin
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
-// The caller MUST close the returned ReadCloser to release the checkpoint lock.
+// The caller MUST close the returned ReadCloser to clean up the temp file.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	if db.PageSize() == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
@@ -1966,96 +1965,132 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error
 
 	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
 
-	// Prevent internal checkpoints during the entire snapshot encoding.
-	// The goroutine below reads WAL pages; if a checkpoint truncates the
-	// WAL before it finishes, ReadAt hits EOF. Hold the RLock until the
-	// goroutine completes rather than releasing it when this func returns.
+	// Encode the snapshot to a temp file while holding the checkpoint lock.
+	// This prevents checkpoints from truncating the WAL during encoding.
+	// We encode to a temp file rather than streaming via io.Pipe so that
+	// the lock is held only for local encoding (fast), not for the entire
+	// upload to S3/GCS (potentially minutes for large databases).
+	tmpFile, err := db.encodeSnapshotToTempFile(ctx, pos)
+	if err != nil {
+		return pos, nil, err
+	}
+
+	return pos, tmpFile, nil
+}
+
+// encodeSnapshotToTempFile encodes a full database snapshot to a temp file
+// while holding the checkpoint lock. Returns the temp file seeked to the
+// beginning, ready for reading.
+func (db *DB) encodeSnapshotToTempFile(ctx context.Context, pos ltx.Pos) (*snapshotTempFile, error) {
 	db.chkMu.RLock()
+	defer db.chkMu.RUnlock()
 
 	// TODO(ltx): Read database size from database header.
 
 	fi, err := db.f.Stat()
 	if err != nil {
-		db.chkMu.RUnlock()
-		return pos, nil, err
+		return nil, err
 	}
 	commit := uint32(fi.Size() / int64(db.pageSize))
 
-	// Execute encoding in a separate goroutine so the caller can initialize before reading.
-	pr, pw := io.Pipe()
-	go func() {
-		defer db.chkMu.RUnlock()
-		walFile, err := os.Open(db.WALPath())
-		if err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		defer walFile.Close()
+	tmpFile, err := os.CreateTemp("", "litestream-snapshot-*")
+	if err != nil {
+		return nil, fmt.Errorf("create snapshot temp file: %w", err)
+	}
 
-		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
-			return
-		}
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, err
+	}
+	defer walFile.Close()
 
-		// Build a mapping of changed page numbers and their latest content.
-		pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("page map: %w", err))
-			return
-		}
-		if walCommit > 0 {
-			commit = walCommit
-		}
+	rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("new wal reader: %w", err)
+	}
 
-		var sz int64
-		if maxOffset > 0 {
-			sz = maxOffset - rd.Offset()
-		}
+	pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("page map: %w", err)
+	}
+	if walCommit > 0 {
+		commit = walCommit
+	}
 
-		db.Logger.Debug("encode snapshot header",
-			"txid", pos.TXID.String(),
-			"commit", commit,
-			"walOffset", rd.Offset(),
-			"walSize", sz,
-			"salt1", rd.salt1,
-			"salt2", rd.salt2)
+	var sz int64
+	if maxOffset > 0 {
+		sz = maxOffset - rd.Offset()
+	}
 
-		enc, err := ltx.NewEncoder(pw)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
-			return
-		}
-		if err := enc.EncodeHeader(ltx.Header{
-			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  uint32(db.pageSize),
-			Commit:    commit,
-			MinTXID:   1,
-			MaxTXID:   pos.TXID,
-			Timestamp: time.Now().UnixMilli(),
-			WALOffset: rd.Offset(),
-			WALSize:   sz,
-			WALSalt1:  rd.salt1,
-			WALSalt2:  rd.salt2,
-		}); err != nil {
-			pw.CloseWithError(fmt.Errorf("encode ltx snapshot header: %w", err))
-			return
-		}
+	db.Logger.Debug("encode snapshot header",
+		"txid", pos.TXID.String(),
+		"commit", commit,
+		"walOffset", rd.Offset(),
+		"walSize", sz,
+		"salt1", rd.salt1,
+		"salt2", rd.salt2)
 
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
-			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
-			return
-		}
+	enc, err := ltx.NewEncoder(tmpFile)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("new ltx encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    commit,
+		MinTXID:   1,
+		MaxTXID:   pos.TXID,
+		Timestamp: time.Now().UnixMilli(),
+		WALOffset: rd.Offset(),
+		WALSize:   sz,
+		WALSalt1:  rd.salt1,
+		WALSalt2:  rd.salt2,
+	}); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("encode ltx snapshot header: %w", err)
+	}
 
-		if err := enc.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("close ltx snapshot encoder: %w", err))
-			return
-		}
-		_ = pw.Close()
-	}()
+	if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("write snapshot ltx: %w", err)
+	}
 
-	return pos, pr, nil
+	if err := enc.Close(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("close ltx snapshot encoder: %w", err)
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("seek snapshot temp file: %w", err)
+	}
+
+	return &snapshotTempFile{File: tmpFile}, nil
+}
+
+// snapshotTempFile wraps an os.File and removes the temp file on Close.
+type snapshotTempFile struct {
+	*os.File
+}
+
+func (f *snapshotTempFile) Close() error {
+	name := f.File.Name()
+	err := f.File.Close()
+	os.Remove(name)
+	return err
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
