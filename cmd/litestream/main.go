@@ -618,7 +618,6 @@ type DBConfig struct {
 	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
-	MaxIdleInterval    *time.Duration `yaml:"max-idle-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
@@ -651,9 +650,6 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.MonitorInterval != nil {
 		db.MonitorInterval = *dbc.MonitorInterval
-	}
-	if dbc.MaxIdleInterval != nil {
-		db.MaxIdleInterval = *dbc.MaxIdleInterval
 	}
 	if dbc.CheckpointInterval != nil {
 		db.CheckpointInterval = *dbc.CheckpointInterval

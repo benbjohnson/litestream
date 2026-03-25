@@ -335,6 +335,7 @@ func (r *Replica) monitor(ctx context.Context) {
 	var backoff time.Duration
 	var lastLogTime time.Time
 	var consecutiveErrs int
+	var needsRetry bool // Skip notify wait when retrying after error
 
 	for initial := true; ; initial = false {
 		// Enforce a minimum time between synchronization.
@@ -355,12 +356,16 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 		}
 
-		// Wait for changes to the database.
-		select {
-		case <-ctx.Done():
-			return
-		case <-notify:
+		// Wait for changes to the database, unless we need to retry a failed sync.
+		// This ensures transient errors on idle databases don't block retries forever.
+		if !needsRetry {
+			select {
+			case <-ctx.Done():
+				return
+			case <-notify:
+			}
 		}
+		needsRetry = false
 
 		// Fetch new notify channel before replicating data.
 		notify = r.db.Notify()
@@ -426,6 +431,7 @@ func (r *Replica) monitor(ctx context.Context) {
 					}
 				}
 			}
+			needsRetry = true // Retry after backoff without waiting for notify
 			continue
 		}
 
