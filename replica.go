@@ -332,6 +332,11 @@ func (r *Replica) monitor(ctx context.Context) {
 	ticker := time.NewTicker(r.SyncInterval)
 	defer ticker.Stop()
 
+	// Reusable timer for idle wakeups. Avoids allocating a new timer each
+	// iteration which would create GC pressure with many replicas.
+	idleTimer := time.NewTimer(IdleWakeupInterval)
+	defer idleTimer.Stop()
+
 	// Continuously check for new data to replicate.
 	ch := make(chan struct{})
 	close(ch)
@@ -370,8 +375,17 @@ func (r *Replica) monitor(ctx context.Context) {
 			case <-ctx.Done():
 				return
 			case <-notify:
-			case <-time.After(IdleWakeupInterval):
+				// Drain the idle timer if notify fired first
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
+					}
+				}
+			case <-idleTimer.C:
 			}
+			// Reset timer for next iteration
+			idleTimer.Reset(IdleWakeupInterval)
 		}
 		needsRetry = false
 

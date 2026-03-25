@@ -344,9 +344,12 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.invalidatePosCache()
 
 	// Clear WAL change detection cache so next sync processes everything fresh.
+	// Hold db.mu to synchronize with Sync() which reads/writes these fields.
+	db.mu.Lock()
 	db.lastWALFileSize = 0
 	db.lastWALSalt1 = 0
 	db.lastWALSalt2 = 0
+	db.mu.Unlock()
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
