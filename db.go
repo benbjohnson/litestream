@@ -1836,24 +1836,35 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		if err != nil {
 			return fmt.Errorf("begin pre-checkpoint tx: %w", err)
 		}
-		if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+		if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); isSQLiteBusyError(err) {
+			// A concurrent writer holds the lock. We can't freeze
+			// the WAL state, so downgrade to PASSIVE to avoid
+			// truncating WAL frames that haven't been synced.
+			_ = rollback(preTx)
+			db.Logger.Info("downgrading checkpoint to PASSIVE (writer active)")
+			mode = CheckpointModePassive
+			if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+				return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+			}
+		} else if err != nil {
 			_ = rollback(preTx)
 			return fmt.Errorf("pre-checkpoint write lock: %w", err)
-		}
-		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
-			_ = rollback(preTx)
-			return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
-		}
-		if err := rollback(preTx); err != nil {
-			return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
-		}
+		} else {
+			if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+				_ = rollback(preTx)
+				return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+			}
+			if err := rollback(preTx); err != nil {
+				return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
+			}
 
-		// Downgrade to PASSIVE if we didn't sync to the exact end of
-		// the WAL. This prevents the TOCTOU gap where TRUNCATE/RESTART
-		// destroys frames that haven't been captured in any L0 file.
-		if !db.syncedToWALEnd {
-			db.Logger.Info("downgrading checkpoint to PASSIVE (WAL not fully synced)")
-			mode = CheckpointModePassive
+			// Downgrade to PASSIVE if we didn't sync to the exact end of
+			// the WAL. This prevents the TOCTOU gap where TRUNCATE/RESTART
+			// destroys frames that haven't been captured in any L0 file.
+			if !db.syncedToWALEnd {
+				db.Logger.Info("downgrading checkpoint to PASSIVE (WAL not fully synced)")
+				mode = CheckpointModePassive
+			}
 		}
 	} else {
 		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
