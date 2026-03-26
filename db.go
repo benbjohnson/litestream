@@ -40,6 +40,11 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
+
+	// FullVerifyInterval is the maximum time between full LTX verification runs.
+	// Even when WAL is unchanged, we periodically run verifyAndSync() to detect
+	// corrupted/missing LTX files that could otherwise go unnoticed during idle.
+	FullVerifyInterval = 1 * time.Minute
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -110,6 +115,12 @@ type DB struct {
 	// notification at the end of Sync(). This ensures checkpoint-generated
 	// LTX files are also covered by the notification.
 	syncedDuringCurrentSync bool
+
+	// lastFullVerifyTime tracks when we last ran full LTX verification.
+	// Even when WAL is unchanged, we periodically run verifyAndSync() to
+	// detect corrupted/missing LTX files that could go unnoticed during
+	// idle periods.
+	lastFullVerifyTime time.Time
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -1065,11 +1076,17 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	// after checkpoint operations (RESTART/FULL mode rewrites salts in place,
 	// then new writes can refill to the same byte length). Still run
 	// checkpointIfNeeded() since time-based checkpoints may be pending.
+	//
+	// Even when WAL is unchanged, we periodically run full verifyAndSync() to
+	// detect corrupted/missing LTX files that could go unnoticed during idle.
 	var synced bool
 	var origWALSize, newWALSize int64
 	walUnchanged := false
 
-	if db.lastSyncedWALOffset > 0 {
+	// Check if periodic full verification is due (even when WAL unchanged)
+	needsFullVerify := time.Since(db.lastFullVerifyTime) >= FullVerifyInterval
+
+	if db.lastSyncedWALOffset > 0 && !needsFullVerify {
 		walPath := db.WALPath()
 		if walFi, statErr := os.Stat(walPath); statErr == nil {
 			walFileSize := walFi.Size()
@@ -1101,6 +1118,9 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
+
+		// Update full verification timestamp - LTX integrity was checked
+		db.lastFullVerifyTime = time.Now()
 
 		if synced {
 			db.syncedSinceCheckpoint = true
