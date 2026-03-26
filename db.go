@@ -43,6 +43,11 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
+
+	// FullVerifyInterval is the maximum time between full LTX verification runs.
+	// Even when WAL is unchanged, we periodically run verifyAndSync() to detect
+	// corrupted/missing LTX files that could otherwise go unnoticed during idle.
+	FullVerifyInterval = 1 * time.Minute
 )
 
 // DB represents a managed instance of a SQLite database in the file system.
@@ -88,6 +93,12 @@ type DB struct {
 	// checkpoint-induced WAL resets where the file size remains the same but
 	// the content has changed (salt rotation after RESTART/FULL checkpoint).
 	lastWALSalt1, lastWALSalt2 uint32
+
+	// lastFullVerifyTime tracks when we last ran full LTX verification.
+	// Even when WAL is unchanged, we periodically run verifyAndSync() to
+	// detect corrupted/missing LTX files that could go unnoticed during
+	// idle periods.
+	lastFullVerifyTime time.Time
 
 	// last file info for each level
 	maxLTXFileInfos struct {
@@ -1323,9 +1334,13 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 	// after checkpoint operations (RESTART/FULL mode rewrites salts in place,
 	// then new writes can refill to the same byte length). Still run
 	// checkpointIfNeeded() since time-based checkpoints may be pending.
+	//
+	// Even when WAL is unchanged, we periodically run full verifyAndSync() to
+	// detect corrupted/missing LTX files that could go unnoticed during idle.
 	walUnchanged := false
+	needsFullVerify := time.Since(db.lastFullVerifyTime) >= FullVerifyInterval
 
-	if exec.state.lastSyncedWALOffset > 0 {
+	if exec.state.lastSyncedWALOffset > 0 && !needsFullVerify {
 		walPath := db.WALPath()
 		if walFi, statErr := os.Stat(walPath); statErr == nil {
 			walFileSize := walFi.Size()
@@ -1359,6 +1374,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		if err != nil {
 			return result, err
 		}
+		db.lastFullVerifyTime = time.Now()
 	}
 	exec.applySyncResult(result)
 
