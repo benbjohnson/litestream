@@ -1114,7 +1114,15 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Fill input channel with all WAL indexes to be loaded in order.
 	// Verify every index has at least one offset.
-	ch := make(chan int, maxWALIndex-minWALIndex+1)
+	//
+	// NOTE: We are reading the min & max from separate places so the max can end
+	// up being less than the min. This can happen if we are restoring to a specific
+	// snapshot but no WAL segments exist after the snapshot.
+	sz := maxWALIndex - minWALIndex
+	if sz < 0 {
+		sz = 0
+	}
+	ch := make(chan int, sz+1)
 	for index := minWALIndex; index <= maxWALIndex; index++ {
 		if len(walSegmentMap[index]) == 0 {
 			return fmt.Errorf("missing WAL index: %s/%08x", opt.Generation, index)
@@ -1126,7 +1134,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Track load state for each WAL.
 	var mu sync.Mutex
 	cond := sync.NewCond(&mu)
-	walStates := make([]walRestoreState, maxWALIndex-minWALIndex+1)
+	walStates := make([]walRestoreState, sz+1)
 
 	parallelism := opt.Parallelism
 	if parallelism < 1 {
