@@ -1054,6 +1054,38 @@ func TestReplica_ValidateLevel(t *testing.T) {
 		}
 	})
 }
+
+func TestReplica_Monitor_FreshDBWaitsOnNotify(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	c := file.NewReplicaClient(t.TempDir())
+	r := litestream.NewReplicaWithClient(db, c)
+	r.SyncInterval = 30 * time.Millisecond
+	db.Replica = r
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	time.Sleep(95 * time.Millisecond)
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(40 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		if r.Pos().TXID != 0 {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	t.Fatalf("replica did not upload new data within %s after notify", 40*time.Millisecond)
+}
 func TestReplica_RestoreV3(t *testing.T) {
 	t.Run("SnapshotOnly", func(t *testing.T) {
 		ctx := context.Background()

@@ -48,6 +48,13 @@ const (
 	FullVerifyInterval = 1 * time.Minute
 )
 
+var monitorJitter = func(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(interval)))
+}
+
 // DB represents a managed instance of a SQLite database in the file system.
 //
 // Checkpoint Strategy:
@@ -2387,20 +2394,13 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 // The monitor continues polling at MonitorInterval to maintain low sync
 // latency when writes resume.
 func (db *DB) monitor() {
-	// Jitter the initial start time to spread wakeups across the interval.
-	// Without this, all databases opened simultaneously (e.g., Store.Open())
-	// create tickers at the same instant, causing synchronized bursts of
-	// syscalls every MonitorInterval. Profiling at 400 DBs shows this
-	// contributes ~24% of CPU overhead from scheduler contention.
-	jitter := time.Duration(rand.Int64N(int64(db.MonitorInterval)))
-	select {
-	case <-db.ctx.Done():
-		return
-	case <-time.After(jitter):
+	jitter := monitorJitter(db.MonitorInterval)
+	timer := time.NewTimer(db.MonitorInterval)
+	defer timer.Stop()
+	var applyJitter bool
+	if jitter > 0 {
+		applyJitter = true
 	}
-
-	ticker := time.NewTicker(db.MonitorInterval)
-	defer ticker.Stop()
 
 	// Backoff state for error handling.
 	var backoff time.Duration
@@ -2408,11 +2408,17 @@ func (db *DB) monitor() {
 	var consecutiveErrs int
 
 	for {
-		// Wait for ticker or context close.
 		select {
 		case <-db.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
+		}
+
+		if applyJitter {
+			timer.Reset(jitter)
+			applyJitter = false
+		} else {
+			timer.Reset(db.MonitorInterval)
 		}
 
 		// If in backoff mode, wait additional time before retrying.

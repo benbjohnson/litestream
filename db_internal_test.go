@@ -69,6 +69,60 @@ func (c *testReplicaClient) LTXFiles(_ context.Context, level int, seek ltx.TXID
 	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
+func TestDB_Monitor_FirstSyncDoesNotWaitExtraInterval(t *testing.T) {
+	prevMonitorJitter := monitorJitter
+	monitorJitter = func(interval time.Duration) time.Duration { return interval - 5*time.Millisecond }
+	t.Cleanup(func() { monitorJitter = prevMonitorJitter })
+
+	dir := t.TempDir()
+	db := NewDB(filepath.Join(dir, "db"))
+	db.MonitorInterval = 60 * time.Millisecond
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout = 5000;`); err != nil {
+		t.Fatal(err)
+	}
+
+	notify := db.Notify()
+	start := time.Now()
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-notify:
+		if elapsed := time.Since(start); elapsed > db.MonitorInterval+40*time.Millisecond {
+			t.Fatalf("first sync took %s, expected no more than %s", elapsed, db.MonitorInterval+40*time.Millisecond)
+		}
+	case <-time.After(db.MonitorInterval + 40*time.Millisecond):
+		t.Fatalf("expected first sync within %s", db.MonitorInterval+40*time.Millisecond)
+	}
+}
+
 func (c *testReplicaClient) OpenLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _, _ int64) (io.ReadCloser, error) {
 	internal.OperationTotalCounterVec.WithLabelValues(c.Type(), "GET").Inc()
 
