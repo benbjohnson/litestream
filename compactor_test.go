@@ -45,6 +45,74 @@ func TestCompactor_Compact(t *testing.T) {
 		}
 	})
 
+	t.Run("L0GapStopsAtGap", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
+		// gap: TXID 4 missing
+		createTestLTXFile(t, client, 0, 5, 5)
+		createTestLTXFile(t, client, 0, 6, 6)
+
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 1 || info.MaxTXID != 3 {
+			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
+		}
+
+		// Fill the gap and re-compact
+		createTestLTXFile(t, client, 0, 4, 4)
+
+		info, err = compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 4 || info.MaxTXID != 6 {
+			t.Errorf("TXID range=%d-%d, want 4-6", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("L0GapAtStart", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Files 3,4,5 with gap at start (1,2 missing).
+		// The file client filters by minTXID >= seekTXID, so with no L1
+		// files these are all returned. The compactor should compact
+		// whatever contiguous set is available.
+		createTestLTXFile(t, client, 0, 3, 3)
+		createTestLTXFile(t, client, 0, 4, 4)
+		createTestLTXFile(t, client, 0, 5, 5)
+
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 3 || info.MaxTXID != 5 {
+			t.Errorf("TXID range=%d-%d, want 3-5", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("L0OverlapReturnsError", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		createTestLTXFile(t, client, 0, 1, 3)
+		createTestLTXFile(t, client, 0, 2, 4) // overlap: MinTXID 2 < expected 4
+
+		_, err := compactor.Compact(context.Background(), 1)
+		if err == nil {
+			t.Fatal("expected error for overlapping files, got nil")
+		}
+		if !containsString(err.Error(), "overlapping") {
+			t.Errorf("expected overlapping error, got: %v", err)
+		}
+	})
+
 	t.Run("L1ToL2", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
