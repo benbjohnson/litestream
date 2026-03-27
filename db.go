@@ -10,6 +10,7 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -40,7 +41,19 @@ const (
 	// When sync errors occur repeatedly (e.g., disk full), backoff doubles each time.
 	DefaultSyncBackoffMax = 5 * time.Minute  // Maximum backoff between retries
 	SyncErrorLogInterval  = 30 * time.Second // Rate-limit repeated error logging
+
+	// FullVerifyInterval is the maximum time between full LTX verification runs.
+	// Even when WAL is unchanged, we periodically run verifyAndSync() to detect
+	// corrupted/missing LTX files that could otherwise go unnoticed during idle.
+	FullVerifyInterval = 1 * time.Minute
 )
+
+var monitorJitter = func(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(interval)))
+}
 
 // DB represents a managed instance of a SQLite database in the file system.
 //
@@ -95,6 +108,28 @@ type DB struct {
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
 
+	// WAL file size at the end of the last Sync(). Used with lastSyncedWALOffset
+	// and the WAL header salts to detect whether new WAL data has been written
+	// since the last sync.
+	lastWALFileSize int64
+
+	// WAL header salt values cached at the end of the last Sync(). Used to detect
+	// checkpoint-induced WAL resets where the file size remains the same but
+	// the content has changed (salt rotation after RESTART/FULL checkpoint).
+	lastWALSalt1, lastWALSalt2 uint32
+
+	// syncedDuringCurrentSync tracks whether any LTX was created during the
+	// current Sync() call. Set by verifyAndSync() and checked by deferred
+	// notification at the end of Sync(). This ensures checkpoint-generated
+	// LTX files are also covered by the notification.
+	syncedDuringCurrentSync bool
+
+	// lastFullVerifyTime tracks when we last ran full LTX verification.
+	// Even when WAL is unchanged, we periodically run verifyAndSync() to
+	// detect corrupted/missing LTX files that could go unnoticed during
+	// idle periods.
+	lastFullVerifyTime time.Time
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -127,6 +162,8 @@ type DB struct {
 	checkpointNCounterVec       *prometheus.CounterVec
 	checkpointErrorNCounterVec  *prometheus.CounterVec
 	checkpointSecondsCounterVec *prometheus.CounterVec
+	syncSkippedNCounter         prometheus.Counter
+	dbIdleGauge                 prometheus.Gauge
 
 	// Minimum threshold of WAL size, in pages, before a passive checkpoint.
 	// A passive checkpoint will attempt a checkpoint but fail if there are
@@ -229,6 +266,8 @@ func NewDB(path string) *DB {
 	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.syncSkippedNCounter = syncSkippedNCounterVec.WithLabelValues(db.path)
+	db.dbIdleGauge = dbIdleGaugeVec.WithLabelValues(db.path)
 
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
@@ -322,6 +361,14 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.maxLTXFileInfos.Unlock()
 
 	db.invalidatePosCache()
+
+	// Clear WAL change detection cache so next sync processes everything fresh.
+	// Hold db.mu to synchronize with Sync() which reads/writes these fields.
+	db.mu.Lock()
+	db.lastWALFileSize = 0
+	db.lastWALSalt1 = 0
+	db.lastWALSalt2 = 0
+	db.mu.Unlock()
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
@@ -995,6 +1042,19 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
+	// Reset sync tracking. This flag is set by verifyAndSync() (including
+	// calls from checkpoint()) when LTX is created. Deferred notification
+	// checks this flag to ensure all LTX creation is complete before waking
+	// replicas - this prevents replicas from syncing while checkpoint is
+	// still creating additional LTX files.
+	db.syncedDuringCurrentSync = false
+	defer func() {
+		if db.syncedDuringCurrentSync {
+			close(db.notify)
+			db.notify = make(chan struct{})
+		}
+	}()
+
 	// Track total sync metrics.
 	t := time.Now()
 	defer func() {
@@ -1013,19 +1073,71 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 		return nil
 	}
 
-	// Ensure WAL has at least one frame in it.
-	if err := db.ensureWALExists(ctx); err != nil {
-		return fmt.Errorf("ensure wal exists: %w", err)
+	// Fast path: skip expensive verify+sync if WAL has no new data.
+	// When lastSyncedWALOffset > 0, we know the WAL exists from a prior sync,
+	// so we can skip ensureWALExists() and check for changes directly.
+	//
+	// We open the WAL file once and use f.Stat() to get the size, then read
+	// the header salts — this reduces the idle path from 6 syscalls (stat +
+	// stat + open + read + close + stat) to 3 (open + fstat + read + close).
+	//
+	// We must check salts because content can change while size stays constant
+	// after checkpoint operations (salt rotation after RESTART/FULL checkpoint).
+	//
+	// Even when WAL is unchanged, we periodically run full verifyAndSync() to
+	// detect corrupted/missing LTX files that could go unnoticed during idle.
+	var synced bool
+	var origWALSize, newWALSize int64
+	walUnchanged := false
+
+	needsFullVerify := time.Since(db.lastFullVerifyTime) >= FullVerifyInterval
+
+	if db.lastSyncedWALOffset > 0 && !needsFullVerify {
+		if f, openErr := os.Open(db.WALPath()); openErr == nil {
+			if walFi, statErr := f.Stat(); statErr == nil {
+				walFileSize := walFi.Size()
+				if walFileSize == db.lastWALFileSize && walFileSize == db.lastSyncedWALOffset {
+					var hdr [24]byte
+					if _, readErr := io.ReadFull(f, hdr[:]); readErr == nil {
+						salt1 := binary.BigEndian.Uint32(hdr[16:])
+						salt2 := binary.BigEndian.Uint32(hdr[20:])
+						if salt1 == db.lastWALSalt1 && salt2 == db.lastWALSalt2 {
+							db.syncSkippedNCounter.Inc()
+							db.dbIdleGauge.Set(1)
+							db.Logger.Log(ctx, internal.LevelTrace, "sync: skip verify+sync", "reason", "wal unchanged")
+							walUnchanged = true
+							origWALSize = db.lastSyncedWALOffset
+							newWALSize = db.lastSyncedWALOffset
+						}
+					}
+				}
+			}
+			_ = f.Close()
+		}
 	}
 
-	origWALSize, newWALSize, synced, err := db.verifyAndSync(ctx, false)
-	if err != nil {
-		return err
+	// Ensure WAL has at least one frame in it (only needed on first sync or
+	// when the fast path didn't apply).
+	if !walUnchanged {
+		if err := db.ensureWALExists(ctx); err != nil {
+			return fmt.Errorf("ensure wal exists: %w", err)
+		}
 	}
 
-	// Track that data was synced for time-based checkpoint decisions.
-	if synced {
-		db.syncedSinceCheckpoint = true
+	if !walUnchanged {
+		var err error
+		origWALSize, newWALSize, synced, err = db.verifyAndSync(ctx, false)
+		if err != nil {
+			return err
+		}
+
+		// Update full verification timestamp - LTX integrity was checked
+		db.lastFullVerifyTime = time.Now()
+
+		if synced {
+			db.syncedSinceCheckpoint = true
+			db.dbIdleGauge.Set(0)
+		}
 	}
 
 	if err := db.checkpointIfNeeded(ctx, origWALSize, newWALSize); err != nil {
@@ -1040,16 +1152,26 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	db.txIDGauge.Set(float64(pos.TXID))
 
 	// Update file size metrics.
-	if fi, err := os.Stat(db.path); err == nil {
-		db.dbSizeGauge.Set(float64(fi.Size()))
+	if !walUnchanged {
+		if fi, err := os.Stat(db.path); err == nil {
+			db.dbSizeGauge.Set(float64(fi.Size()))
+		}
+		db.walSizeGauge.Set(float64(newWALSize))
 	}
-	db.walSizeGauge.Set(float64(newWALSize))
 
-	// Notify replicas of WAL changes.
-	// if changed {
-	close(db.notify)
-	db.notify = make(chan struct{})
-	// }
+	// Update WAL file size and salt cache for change detection.
+	walPath := db.WALPath()
+	if walFi, statErr := os.Stat(walPath); statErr == nil {
+		db.lastWALFileSize = walFi.Size()
+	}
+	if f, openErr := os.Open(walPath); openErr == nil {
+		var hdr [24]byte
+		if _, readErr := io.ReadFull(f, hdr[:]); readErr == nil {
+			db.lastWALSalt1 = binary.BigEndian.Uint32(hdr[16:])
+			db.lastWALSalt2 = binary.BigEndian.Uint32(hdr[20:])
+		}
+		_ = f.Close()
+	}
 
 	return nil
 }
@@ -1078,6 +1200,13 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool) (origWALSiz
 	synced, err = db.sync(ctx, checkpointing, info)
 	if err != nil {
 		return 0, 0, false, fmt.Errorf("sync: %w", err)
+	}
+
+	// Track that LTX was created during this Sync() cycle.
+	// Used by deferred notification at the end of Sync() to ensure
+	// checkpoint-generated LTX files are also covered.
+	if synced {
+		db.syncedDuringCurrentSync = true
 	}
 
 	// Use the logical WAL offset (from LTX) for checkpoint decisions.
@@ -1296,6 +1425,12 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 // the real WAL. Check info.ok if verification was successful.
 func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+
+	// Default to snapshotting=true. This is correct because:
+	// - First sync (TXID==0) needs a full snapshot to initialize.
+	// - Most error/edge-case paths (salt mismatch, unexpected truncation)
+	//   require a snapshot for correctness.
+	// - Normal incremental paths explicitly set snapshotting=false below.
 	info.snapshotting = true
 
 	pos, err := db.Pos()
@@ -2253,9 +2388,19 @@ func (db *DB) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TX
 //
 // Implements exponential backoff on repeated sync errors to prevent disk churn
 // when persistent errors (like disk full) occur. See issue #927.
+//
+// Idle CPU is reduced by the WAL change detection in Sync() which skips
+// expensive verify+sync work when the WAL has no new data (issue #1210).
+// The monitor continues polling at MonitorInterval to maintain low sync
+// latency when writes resume.
 func (db *DB) monitor() {
-	ticker := time.NewTicker(db.MonitorInterval)
-	defer ticker.Stop()
+	jitter := monitorJitter(db.MonitorInterval)
+	timer := time.NewTimer(db.MonitorInterval)
+	defer timer.Stop()
+	var applyJitter bool
+	if jitter > 0 {
+		applyJitter = true
+	}
 
 	// Backoff state for error handling.
 	var backoff time.Duration
@@ -2263,11 +2408,17 @@ func (db *DB) monitor() {
 	var consecutiveErrs int
 
 	for {
-		// Wait for ticker or context close.
 		select {
 		case <-db.ctx.Done():
 			return
-		case <-ticker.C:
+		case <-timer.C:
+		}
+
+		if applyJitter {
+			timer.Reset(jitter)
+			applyJitter = false
+		} else {
+			timer.Reset(db.MonitorInterval)
 		}
 
 		// If in backoff mode, wait additional time before retrying.
@@ -2487,5 +2638,15 @@ var (
 	compactionVerifyErrorCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "litestream_compaction_verify_error_count",
 		Help: "Number of post-compaction verification failures",
+	}, []string{"db"})
+
+	syncSkippedNCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_sync_skipped_total",
+		Help: "Number of sync operations skipped due to unchanged WAL",
+	}, []string{"db"})
+
+	dbIdleGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_db_idle",
+		Help: "Whether the database is idle (1) or active (0)",
 	}, []string{"db"})
 )

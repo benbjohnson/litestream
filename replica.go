@@ -22,7 +22,14 @@ import (
 // Default replica settings.
 const (
 	DefaultSyncInterval = 1 * time.Second
+
+	// IdleWakeupInterval is the maximum time a replica waits for a notify
+	// before waking up anyway. This ensures LastSuccessfulSyncAt stays fresh
+	// for heartbeat health checks, even when the database is idle.
+	IdleWakeupInterval = 1 * time.Minute
 )
+
+var errNoPositionWaitingForData = errors.New("no position, waiting for data")
 
 // Replica connects a database to a replication destination via a ReplicaClient.
 // The replica manages periodic synchronization and maintaining the current
@@ -156,7 +163,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot determine current position: %w", err)
 	} else if dpos.IsZero() {
-		return fmt.Errorf("no position, waiting for data")
+		return errNoPositionWaitingForData
 	}
 
 	r.Logger().Info("replica sync",
@@ -327,6 +334,11 @@ func (r *Replica) monitor(ctx context.Context) {
 	ticker := time.NewTicker(r.SyncInterval)
 	defer ticker.Stop()
 
+	// Reusable timer for idle wakeups. Avoids allocating a new timer each
+	// iteration which would create GC pressure with many replicas.
+	idleTimer := time.NewTimer(IdleWakeupInterval)
+	defer idleTimer.Stop()
+
 	// Continuously check for new data to replicate.
 	ch := make(chan struct{})
 	close(ch)
@@ -335,16 +347,18 @@ func (r *Replica) monitor(ctx context.Context) {
 	var backoff time.Duration
 	var lastLogTime time.Time
 	var consecutiveErrs int
+	var needsRetry bool // Skip notify wait when retrying after error
+	var waitForInterval bool
 
-	for initial := true; ; initial = false {
-		// Enforce a minimum time between synchronization.
-		if !initial {
+	for {
+		if waitForInterval {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 			}
 		}
+		waitForInterval = true
 
 		// If in backoff mode, wait additional time before retrying.
 		if backoff > 0 {
@@ -355,18 +369,41 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 		}
 
-		// Wait for changes to the database.
-		select {
-		case <-ctx.Done():
-			return
-		case <-notify:
+		// Wait for changes to the database, unless we need to retry a failed sync.
+		// This ensures transient errors on idle databases don't block retries forever.
+		// Also wake up periodically (IdleWakeupInterval) to keep LastSuccessfulSyncAt
+		// fresh for heartbeat health checks during idle periods.
+		if !needsRetry {
+			select {
+			case <-ctx.Done():
+				return
+			case <-notify:
+				// Drain the idle timer if notify fired first
+				if !idleTimer.Stop() {
+					select {
+					case <-idleTimer.C:
+					default:
+					}
+				}
+			case <-idleTimer.C:
+			}
+			// Reset timer for next iteration
+			idleTimer.Reset(IdleWakeupInterval)
 		}
+		needsRetry = false
 
 		// Fetch new notify channel before replicating data.
 		notify = r.db.Notify()
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
+			if errors.Is(err, errNoPositionWaitingForData) {
+				backoff = 0
+				consecutiveErrs = 0
+				waitForInterval = false
+				continue
+			}
+
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				consecutiveErrs++
@@ -426,6 +463,7 @@ func (r *Replica) monitor(ctx context.Context) {
 					}
 				}
 			}
+			needsRetry = true // Retry after backoff without waiting for notify
 			continue
 		}
 

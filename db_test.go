@@ -1706,3 +1706,133 @@ func TestDB_ResetLocalState(t *testing.T) {
 		t.Fatalf("expected zero TXID after reset, got %d", posAfter.TXID)
 	}
 }
+
+func TestDB_Sync_NotifyOnlyOnChange(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create a table to ensure WAL has data.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial sync: notify channel should close (new data synced).
+	notify := db.Notify()
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-notify:
+	default:
+		t.Fatal("expected notify channel to close after initial sync with data")
+	}
+
+	// Second sync with no new writes: notify channel should stay open.
+	notify = db.Notify()
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-notify:
+		t.Fatal("expected notify channel to remain open when no data changed")
+	default:
+	}
+
+	// Write new data and sync again: notify channel should close.
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz')`); err != nil {
+		t.Fatal(err)
+	}
+	notify = db.Notify()
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-notify:
+	default:
+		t.Fatal("expected notify channel to close after sync with new data")
+	}
+}
+
+func TestDB_Sync_SkipsWhenWALUnchanged(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create a table and perform initial sync.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	pos0, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync again without any writes — should be a no-op (WAL unchanged).
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	pos1, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos1.TXID != pos0.TXID {
+		t.Fatalf("expected TXID to remain %v after idle sync, got %v", pos0.TXID, pos1.TXID)
+	}
+
+	// Now write data and sync — TXID should advance.
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	pos2, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pos2.TXID <= pos1.TXID {
+		t.Fatalf("expected TXID to advance after data write, got %v (was %v)", pos2.TXID, pos1.TXID)
+	}
+}
+
+func TestDB_Sync_IdleMetrics(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	// Create initial data and sync.
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE foo (bar TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Perform multiple idle syncs — TXID should not change.
+	pos0, _ := db.Pos()
+	for i := 0; i < 5; i++ {
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pos1, _ := db.Pos()
+	if pos1.TXID != pos0.TXID {
+		t.Fatalf("expected TXID to remain %v after idle syncs, got %v", pos0.TXID, pos1.TXID)
+	}
+
+	// Write data and sync — should advance.
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO foo (bar) VALUES ('baz')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	pos2, _ := db.Pos()
+	if pos2.TXID <= pos1.TXID {
+		t.Fatalf("expected TXID to advance after write, got %v (was %v)", pos2.TXID, pos1.TXID)
+	}
+}
