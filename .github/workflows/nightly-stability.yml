@@ -16,6 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  actions: read
   contents: read
   issues: write
 
@@ -217,46 +218,384 @@ jobs:
     needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, comprehensive-soak]
     if: failure()
     steps:
-      - name: Create failure issue
+      - name: Create or update failure issue
         uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         with:
           script: |
-            const title = `Nightly stability failure: ${new Date().toISOString().split('T')[0]}`;
+            const fs = require('fs');
+            const crypto = require('crypto');
 
-            // Check if an issue already exists for today
-            const existing = await github.rest.issues.listForRepo({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const runId = context.runId;
+            const runAttempt = Number(process.env.GITHUB_RUN_ATTEMPT || '1');
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${runId}`;
+            const branch = context.ref.replace(/^refs\/heads\//, '');
+            const shortSha = context.sha.substring(0, 8);
+            const markerPrefix = '<!-- nightly-stability-';
+            const summaryPath = process.env.GITHUB_STEP_SUMMARY;
+
+            function stripAnsi(value) {
+              return value.replace(/\u001b\[[0-9;]*m/g, '');
+            }
+
+            function unwrapLogLine(line) {
+              const clean = stripAnsi(line).replace(/\r/g, '');
+              const parts = clean.split('\t');
+              return (parts.length >= 4 ? parts.slice(3).join('\t') : clean).trim();
+            }
+
+            function sanitizeSnippet(line, maxLength = 220) {
+              let value = unwrapLogLine(line)
+                .replace(/\s+/g, ' ')
+                .replace(/https?:\/\/\S+/g, '<url>')
+                .replace(/[0-9a-f]{40,}/gi, '<sha>')
+                .trim();
+
+              if (value.length > maxLength) {
+                value = `${value.slice(0, maxLength - 1)}…`;
+              }
+
+              return value;
+            }
+
+            function normalizeForFingerprint(value) {
+              return sanitizeSnippet(value, 320)
+                .toLowerCase()
+                .replace(/\b[0-9]{4}-[0-9]{2}-[0-9]{2}t[0-9:.+-z]+\b/g, '<datetime>')
+                .replace(/\b[0-9]{4}[/-][0-9]{2}[/-][0-9]{2}\b/g, '<date>')
+                .replace(/\b[0-9]+(?:\.[0-9]+)?(?:ms|s|m|h)\b/g, '<duration>')
+                .replace(/\b[0-9]+\b/g, '<n>')
+                .replace(/\b[0-9a-f]{8,}\b/gi, '<hex>');
+            }
+
+            function escapeTableCell(value) {
+              return value.replace(/\|/g, '\\|');
+            }
+
+            function readMarker(body, name) {
+              const match = body.match(new RegExp(`<!-- nightly-stability-${name}: ([^\\n]+) -->`));
+              return match ? match[1].trim() : null;
+            }
+
+            function isInterestingLine(line) {
+              const value = sanitizeSnippet(line, 400);
+              if (!value) {
+                return false;
+              }
+
+              if (
+                /^##\[group\]/.test(value) ||
+                /^##\[endgroup\]/.test(value) ||
+                /^shell: /.test(value) ||
+                /^env:$/.test(value) ||
+                /^GOFLAGS: /.test(value) ||
+                /^SOAK_/.test(value) ||
+                /^Uploaded bytes /.test(value) ||
+                /^Artifact /.test(value) ||
+                /^SHA256 digest /.test(value) ||
+                /^Finalizing artifact upload/.test(value) ||
+                /^Finished uploading artifact/.test(value) ||
+                /^Post job cleanup\./.test(value) ||
+                /^Cleaning up orphan processes/.test(value) ||
+                /^Temporarily overriding HOME=/.test(value) ||
+                /^Adding repository directory /.test(value) ||
+                /^\[command\]/.test(value) ||
+                /^git version /.test(value) ||
+                /^No files were found with the provided path: /.test(value) ||
+                /^latest: Pulling from /.test(value) ||
+                /^[a-f0-9]{12,}:/.test(value) ||
+                /^Digest: /.test(value) ||
+                /^Status: Downloaded newer image /.test(value) ||
+                /^Pulling fs layer$/.test(value) ||
+                /^Download complete$/.test(value) ||
+                /^Pull complete$/.test(value) ||
+                /^Waiting$/.test(value) ||
+                /^Verifying Checksum$/.test(value) ||
+                /Node\.js 20 actions are deprecated/.test(value)
+              ) {
+                return false;
+              }
+
+              return true;
+            }
+
+            function scoreSnippet(value) {
+              let score = 0;
+
+              if (/\[no-snap-on-checkpoint\]\s+FAIL:/i.test(value)) score += 200;
+              if (/\[[^\]]+\]\s+FAIL:/i.test(value)) score += 140;
+              if (/bad format for links/i.test(value)) score += 130;
+              if (/panic:/i.test(value)) score += 120;
+              if (/\b(?:Create .* failed|.* failed:)/i.test(value)) score += 110;
+              if (/database or disk is full/i.test(value)) score += 100;
+              if (/database is locked/i.test(value)) score += 60;
+              if (/\berror=/.test(value) || /\blevel=ERROR\b/.test(value)) score += 90;
+              if (/--- FAIL:/.test(value)) score += 30;
+              if (/^FAIL$/.test(value) || /^FAIL\s+/.test(value)) score += 10;
+              if (/Process completed with exit code/i.test(value)) score += 5;
+
+              return score;
+            }
+
+            function summarizeSnippet(value, fallback) {
+              if (/bad format for links/i.test(value)) return 'bad Docker link format';
+              if (/snapshot-on-checkpoint/i.test(value)) return 'snapshot-on-checkpoint violations';
+              if (/compaction-timing-l1/i.test(value)) return 'L1 compaction timing failures';
+              if (/database or disk is full/i.test(value)) return 'database or disk is full';
+              if (/database is locked/i.test(value)) return 'database locked errors';
+              if (/panic:/i.test(value)) return value.replace(/^.*?panic:\s*/i, 'panic: ').slice(0, 90);
+
+              const simplified = value
+                .replace(/^\[[^\]]+\]\s+FAIL:\s*/i, '')
+                .replace(/^.*?failed:\s*/i, '')
+                .replace(/^.*?\berror="?/i, '')
+                .replace(/"?$/, '')
+                .trim();
+
+              return (simplified || fallback).slice(0, 90);
+            }
+
+            function extractFailureSnippets(logText) {
+              const lines = logText.split('\n');
+              const candidates = [];
+
+              for (let index = 0; index < lines.length; index += 1) {
+                const raw = lines[index];
+                if (!isInterestingLine(raw)) {
+                  continue;
+                }
+
+                const value = sanitizeSnippet(raw, 260);
+                const score = scoreSnippet(value);
+
+                if (score <= 0) {
+                  continue;
+                }
+
+                candidates.push({ index, score, value, normalized: normalizeForFingerprint(value) });
+              }
+
+              candidates.sort((a, b) => {
+                if (b.score !== a.score) return b.score - a.score;
+                return b.index - a.index;
+              });
+
+              const snippets = [];
+              const seen = new Set();
+              for (const candidate of candidates) {
+                if (seen.has(candidate.normalized)) {
+                  continue;
+                }
+                seen.add(candidate.normalized);
+                snippets.push(candidate.value);
+                if (snippets.length === 3) {
+                  break;
+                }
+              }
+
+              return snippets;
+            }
+
+            const jobs = await github.paginate(
+              'GET /repos/{owner}/{repo}/actions/runs/{run_id}/attempts/{attempt_number}/jobs',
+              {
+                owner,
+                repo,
+                run_id: runId,
+                attempt_number: runAttempt,
+                per_page: 100,
+              },
+              response => response.data.jobs
+            );
+
+            const failedConclusions = new Set(['failure', 'timed_out', 'action_required', 'cancelled', 'startup_failure']);
+            const failedJobs = jobs.filter(job => failedConclusions.has(job.conclusion || ''));
+
+            if (failedJobs.length === 0) {
+              console.log('No failed jobs found for this run');
+              return;
+            }
+
+            const failures = [];
+            for (const job of failedJobs) {
+              const failedSteps = (job.steps || [])
+                .filter(step => step.conclusion === 'failure')
+                .map(step => step.name);
+
+              let logText = '';
+              try {
+                const response = await fetch(
+                  `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${job.id}/logs`,
+                  {
+                    headers: {
+                      Accept: 'application/vnd.github+json',
+                      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                      'X-GitHub-Api-Version': '2022-11-28',
+                    },
+                  }
+                );
+
+                if (!response.ok) {
+                  throw new Error(`Unable to fetch logs (${response.status})`);
+                }
+
+                logText = await response.text();
+              } catch (error) {
+                logText = `Log download failed: ${error.message}`;
+              }
+
+              const snippets = extractFailureSnippets(logText);
+              const primarySource = snippets[0] || failedSteps[0] || `${job.name} failed`;
+              const primarySignature = summarizeSnippet(primarySource, job.name);
+
+              failures.push({
+                name: job.name,
+                url: job.html_url || job.url,
+                failedSteps,
+                snippets: snippets.length > 0 ? snippets : [sanitizeSnippet(primarySource)],
+                primarySignature,
+                fingerprintKey: `${job.name}:${normalizeForFingerprint(primarySignature)}`,
+              });
+            }
+
+            failures.sort((a, b) => a.name.localeCompare(b.name));
+
+            const fingerprintSource = failures.map(item => item.fingerprintKey).join('\n');
+            const fingerprint = crypto.createHash('sha256').update(fingerprintSource).digest('hex').slice(0, 16);
+            const issueMarker = `${markerPrefix}fingerprint: ${fingerprint} -->`;
+            const titleParts = failures.map(item => item.primarySignature).slice(0, 2);
+            const titleSuffix = failures.length > 2 ? ` (+${failures.length - 2} more)` : '';
+            let title = `Nightly stability failure: ${titleParts.join('; ')}${titleSuffix}`;
+            if (title.length > 120) {
+              title = `${title.slice(0, 117)}…`;
+            }
+
+            const openIssues = await github.paginate(github.rest.issues.listForRepo, {
+              owner,
+              repo,
               state: 'open',
               labels: 'stability',
               per_page: 100,
             });
 
-            const today = new Date().toISOString().split('T')[0];
-            const alreadyExists = existing.data.some(i => i.title.includes(today));
-            if (alreadyExists) {
-              console.log('Issue already exists for today, skipping creation');
-              return;
+            const existingIssue = openIssues.find(issue => !issue.pull_request && issue.body && issue.body.includes(issueMarker));
+            const observedAt = new Date().toISOString();
+            const firstSeen = existingIssue
+              ? readMarker(existingIssue.body, 'first-seen') || existingIssue.created_at
+              : observedAt;
+            const priorOccurrences = existingIssue
+              ? Number(readMarker(existingIssue.body, 'occurrences') || '1')
+              : 0;
+            const occurrences = priorOccurrences + 1;
+            const lastSeen = observedAt;
+
+            const failedJobsTable = failures
+              .map(item => {
+                const failedStep = item.failedSteps.length > 0 ? item.failedSteps.join(', ') : 'Unavailable';
+                return `| ${escapeTableCell(item.name)} | ${escapeTableCell(failedStep)} | ${escapeTableCell(item.primarySignature)} |`;
+              })
+              .join('\n');
+
+            const failureDetails = failures
+              .map(item => {
+                const failedStep = item.failedSteps.length > 0 ? item.failedSteps.join(', ') : 'Unavailable';
+                const snippetBlock = item.snippets.map(line => line.slice(0, 240)).join('\n');
+                return [
+                  `#### ${item.name}`,
+                  '',
+                  `- Job: ${item.url}`,
+                  `- Failed step: \`${failedStep}\``,
+                  `- Summary: ${item.primarySignature}`,
+                  '',
+                  '```text',
+                  snippetBlock,
+                  '```',
+                ].join('\n');
+              })
+              .join('\n\n');
+
+            const issueBody = [
+              '## Nightly Stability Failure',
+              '',
+              `**Latest run:** ${runUrl}`,
+              `**Branch:** \`${branch}\``,
+              `**Commit:** \`${shortSha}\``,
+              `**First seen:** ${firstSeen}`,
+              `**Last seen:** ${lastSeen}`,
+              `**Occurrences:** ${occurrences}`,
+              `**Fingerprint:** \`${fingerprint}\``,
+              '',
+              '### Failed Jobs',
+              '',
+              '| Job | Failed step | Summary |',
+              '|---|---|---|',
+              failedJobsTable,
+              '',
+              '### Failure Details',
+              '',
+              failureDetails,
+              '',
+              issueMarker,
+              `<!-- nightly-stability-first-seen: ${firstSeen} -->`,
+              `<!-- nightly-stability-last-seen: ${lastSeen} -->`,
+              `<!-- nightly-stability-occurrences: ${occurrences} -->`,
+            ].join('\n');
+
+            let issueNumber;
+            let issueUrl;
+
+            if (existingIssue) {
+              issueNumber = existingIssue.number;
+              issueUrl = existingIssue.html_url;
+
+              await github.rest.issues.update({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                title,
+                body: issueBody,
+              });
+
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: issueNumber,
+                body: [
+                  `Recurring failure observed in ${runUrl} on \`${shortSha}\`.`,
+                  '',
+                  ...failures.map(item => `- **${item.name}**: ${item.primarySignature}`),
+                ].join('\n'),
+              });
+            } else {
+              const created = await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                labels: ['stability', 'bug'],
+                body: issueBody,
+              });
+
+              issueNumber = created.data.number;
+              issueUrl = created.data.html_url;
             }
 
-            await github.rest.issues.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: title,
-              labels: ['stability', 'bug'],
-              body: [
-                '## Nightly Stability Failure',
-                '',
-                `**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
-                `**Branch:** \`${context.ref}\``,
-                `**Commit:** \`${context.sha.substring(0, 8)}\``,
-                '',
-                'One or more nightly stability tests failed. Check the run artifacts for details.',
-                '',
-                '### Failed Jobs',
-                '',
-                '- [ ] Review failure logs',
-                '- [ ] Identify root cause',
-                '- [ ] Fix or open tracking issue',
-              ].join('\n'),
-            });
+            const workflowSummary = [
+              '## Nightly Failure Summary',
+              '',
+              `- Run: ${runUrl}`,
+              `- Branch: \`${branch}\``,
+              `- Commit: \`${shortSha}\``,
+              `- Fingerprint: \`${fingerprint}\``,
+              `- Tracking issue: #${issueNumber} (${issueUrl})`,
+              '',
+              '| Job | Failed step | Summary |',
+              '|---|---|---|',
+              failedJobsTable,
+            ].join('\n');
+
+            if (summaryPath) {
+              fs.appendFileSync(summaryPath, `${workflowSummary}\n`);
+            }
