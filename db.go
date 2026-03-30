@@ -406,7 +406,8 @@ func (db *DB) Pos() (ltx.Pos, error) {
 		return ltx.Pos{}, nil // no replication yet
 	}
 
-	f, err := os.Open(db.LTXPath(0, minTXID, maxTXID))
+	ltxPath := db.LTXPath(0, minTXID, maxTXID)
+	f, err := os.Open(ltxPath)
 	if err != nil {
 		return ltx.Pos{}, err
 	}
@@ -414,7 +415,7 @@ func (db *DB) Pos() (ltx.Pos, error) {
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.Verify(); err != nil {
-		return ltx.Pos{}, fmt.Errorf("ltx verification failed: %w", err)
+		return ltx.Pos{}, fmt.Errorf("verify L0 %s: %w", ltxPath, err)
 	}
 
 	pos := dec.PostApplyPos()
@@ -1810,74 +1811,115 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 // checkpoint performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, mode string) error {
-	// Try getting a checkpoint lock, will fail during snapshots.
 	if !db.chkMu.TryLock() {
 		return nil
 	}
 	defer db.chkMu.Unlock()
 
-	// Read WAL header before checkpoint to check if it has been restarted.
+	if db.db == nil {
+		return nil
+	}
+
 	hdr, err := readWALHeader(db.WALPath())
 	if err != nil {
 		return err
 	}
 
-	// Copy end of WAL before checkpoint to copy as much as possible.
-	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
-		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+	// For TRUNCATE and RESTART checkpoints, block writers and sync all
+	// pending WAL frames so we know the exact WAL state before deciding
+	// whether the checkpoint is safe. Both modes restart the WAL from
+	// the beginning, so unsynced frames would be lost. PASSIVE checkpoints
+	// are non-blocking by design and don't need a write lock — unsynced
+	// frames are preserved in the WAL since PASSIVE never truncates.
+	if mode == CheckpointModeTruncate || mode == CheckpointModeRestart {
+		preTx, err := db.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin pre-checkpoint tx: %w", err)
+		}
+		if _, err := preTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); isSQLiteBusyError(err) {
+			// A concurrent writer holds the lock. We can't freeze
+			// the WAL state, so downgrade to PASSIVE to avoid
+			// truncating WAL frames that haven't been synced.
+			_ = rollback(preTx)
+			db.Logger.Info("downgrading checkpoint to PASSIVE (writer active)")
+			mode = CheckpointModePassive
+			if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+				return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+			}
+		} else if err != nil {
+			_ = rollback(preTx)
+			return fmt.Errorf("pre-checkpoint write lock: %w", err)
+		} else {
+			if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+				_ = rollback(preTx)
+				return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+			}
+			if err := rollback(preTx); err != nil {
+				return fmt.Errorf("rollback pre-checkpoint tx: %w", err)
+			}
+
+			// Downgrade to PASSIVE if we didn't sync to the exact end of
+			// the WAL. This prevents the TOCTOU gap where TRUNCATE/RESTART
+			// destroys frames that haven't been captured in any L0 file.
+			if !db.syncedToWALEnd {
+				db.Logger.Info("downgrading checkpoint to PASSIVE (WAL not fully synced)")
+				mode = CheckpointModePassive
+			}
+		}
+	} else {
+		if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+			return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+		}
 	}
 
-	// Execute checkpoint and immediately issue a write to the WAL to ensure
-	// a new page is written.
-	if err := db.execCheckpoint(ctx, mode); err != nil {
+	if _, err := db.execCheckpoint(ctx, mode); err != nil {
 		return err
 	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
 		return err
 	}
 
 	// If WAL hasn't been restarted, exit.
-	if other, err := readWALHeader(db.WALPath()); err != nil {
+	other, err := readWALHeader(db.WALPath())
+	if err != nil {
 		return err
-	} else if bytes.Equal(hdr, other) {
+	}
+	if bytes.Equal(hdr, other) {
 		db.syncedSinceCheckpoint = false
 		return nil
 	}
 
-	// Start a transaction. This will be promoted immediately after.
+	// Post-checkpoint: acquire write lock and sync any frames written
+	// after the checkpoint restarted the WAL.
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
-		return fmt.Errorf("begin: %w", err)
+		return fmt.Errorf("begin post-checkpoint tx: %w", err)
 	}
-	defer func() { _ = rollback(tx) }()
-
-	// Insert into the lock table to promote to a write tx. The lock table
-	// insert will never actually occur because our tx will be rolled back,
-	// however, it will ensure our tx grabs the write lock. Unfortunately,
-	// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		return fmt.Errorf("_litestream_lock: %w", err)
+		_ = rollback(tx)
+		return fmt.Errorf("post-checkpoint write lock: %w", err)
 	}
-
-	// Copy anything that may have occurred after the checkpoint.
 	if _, _, _, err := db.verifyAndSync(ctx, true); err != nil {
+		_ = rollback(tx)
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
-
-	// Release write lock before exiting.
-	// Use rollback() helper for consistency with releaseReadLock() and the
-	// defer above. See issue #934.
 	if err := rollback(tx); err != nil {
 		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
 	}
 
+	db.syncedToWALEnd = true
 	db.syncedSinceCheckpoint = false
 	return nil
 }
 
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
-	// Ignore if there is no underlying database.
+type checkpointResult struct {
+	busy int // 0 = success, 1 = blocked
+	log  int // total frames in WAL before checkpoint
+	ckpt int // frames checkpointed
+}
+
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (result checkpointResult, err error) {
 	if db.db == nil {
-		return nil
+		return result, nil
 	}
 
 	// Track checkpoint metrics.
@@ -1894,7 +1936,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ensure the read lock has been removed before issuing a checkpoint.
 	// We defer the re-acquire to ensure it occurs even on an early return.
 	if err := db.releaseReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return result, fmt.Errorf("release read lock: %w", err)
 	}
 	defer func() { _ = db.acquireReadLock(ctx) }()
 
@@ -1906,22 +1948,22 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
-	var row [3]int
-	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return err
+	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&result.busy, &result.log, &result.ckpt); err != nil {
+		return result, err
 	}
-	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
+	db.Logger.Debug("checkpoint", "mode", mode, "busy", result.busy, "log", result.log, "ckpt", result.ckpt)
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(ctx); err != nil {
-		return fmt.Errorf("reacquire read lock: %w", err)
+		return result, fmt.Errorf("reacquire read lock: %w", err)
 	}
 
-	return nil
+	return result, nil
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
-func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+// The caller MUST close the returned ReadCloser to clean up the temp file.
+func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	if db.PageSize() == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
 		return ltx.Pos{}, nil, &DBNotReadyError{Reason: "page size not initialized"}
@@ -1934,7 +1976,23 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 
 	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
 
-	// Prevent internal checkpoints during sync.
+	// Encode the snapshot to a temp file while holding the checkpoint lock.
+	// This prevents checkpoints from truncating the WAL during encoding.
+	// We encode to a temp file rather than streaming via io.Pipe so that
+	// the lock is held only for local encoding (fast), not for the entire
+	// upload to S3/GCS (potentially minutes for large databases).
+	tmpFile, err := db.encodeSnapshotToTempFile(ctx, pos)
+	if err != nil {
+		return pos, nil, err
+	}
+
+	return pos, tmpFile, nil
+}
+
+// encodeSnapshotToTempFile encodes a full database snapshot to a temp file
+// while holding the checkpoint lock. Returns the temp file seeked to the
+// beginning, ready for reading.
+func (db *DB) encodeSnapshotToTempFile(ctx context.Context, pos ltx.Pos) (*snapshotTempFile, error) {
 	db.chkMu.RLock()
 	defer db.chkMu.RUnlock()
 
@@ -1942,84 +2000,108 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 
 	fi, err := db.f.Stat()
 	if err != nil {
-		return pos, nil, err
+		return nil, err
 	}
 	commit := uint32(fi.Size() / int64(db.pageSize))
 
-	// Execute encoding in a separate goroutine so the caller can initialize before reading.
-	pr, pw := io.Pipe()
-	go func() {
-		walFile, err := os.Open(db.WALPath())
-		if err != nil {
-			pw.CloseWithError(err)
-			return
-		}
-		defer walFile.Close()
+	tmpFile, err := os.CreateTemp("", "litestream-snapshot-*")
+	if err != nil {
+		return nil, fmt.Errorf("create snapshot temp file: %w", err)
+	}
 
-		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
-			return
-		}
+	walFile, err := os.Open(db.WALPath())
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, err
+	}
+	defer walFile.Close()
 
-		// Build a mapping of changed page numbers and their latest content.
-		pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("page map: %w", err))
-			return
-		}
-		if walCommit > 0 {
-			commit = walCommit
-		}
+	rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("new wal reader: %w", err)
+	}
 
-		var sz int64
-		if maxOffset > 0 {
-			sz = maxOffset - rd.Offset()
-		}
+	pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("page map: %w", err)
+	}
+	if walCommit > 0 {
+		commit = walCommit
+	}
 
-		db.Logger.Debug("encode snapshot header",
-			"txid", pos.TXID.String(),
-			"commit", commit,
-			"walOffset", rd.Offset(),
-			"walSize", sz,
-			"salt1", rd.salt1,
-			"salt2", rd.salt2)
+	var sz int64
+	if maxOffset > 0 {
+		sz = maxOffset - rd.Offset()
+	}
 
-		enc, err := ltx.NewEncoder(pw)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
-			return
-		}
-		if err := enc.EncodeHeader(ltx.Header{
-			Version:   ltx.Version,
-			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  uint32(db.pageSize),
-			Commit:    commit,
-			MinTXID:   1,
-			MaxTXID:   pos.TXID,
-			Timestamp: time.Now().UnixMilli(),
-			WALOffset: rd.Offset(),
-			WALSize:   sz,
-			WALSalt1:  rd.salt1,
-			WALSalt2:  rd.salt2,
-		}); err != nil {
-			pw.CloseWithError(fmt.Errorf("encode ltx snapshot header: %w", err))
-			return
-		}
+	db.Logger.Debug("encode snapshot header",
+		"txid", pos.TXID.String(),
+		"commit", commit,
+		"walOffset", rd.Offset(),
+		"walSize", sz,
+		"salt1", rd.salt1,
+		"salt2", rd.salt2)
 
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
-			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
-			return
-		}
+	enc, err := ltx.NewEncoder(tmpFile)
+	if err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("new ltx encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    commit,
+		MinTXID:   1,
+		MaxTXID:   pos.TXID,
+		Timestamp: time.Now().UnixMilli(),
+		WALOffset: rd.Offset(),
+		WALSize:   sz,
+		WALSalt1:  rd.salt1,
+		WALSalt2:  rd.salt2,
+	}); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("encode ltx snapshot header: %w", err)
+	}
 
-		if err := enc.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("close ltx snapshot encoder: %w", err))
-			return
-		}
-		_ = pw.Close()
-	}()
+	if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("write snapshot ltx: %w", err)
+	}
 
-	return pos, pr, nil
+	if err := enc.Close(); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("close ltx snapshot encoder: %w", err)
+	}
+
+	if _, err := tmpFile.Seek(0, io.SeekStart); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return nil, fmt.Errorf("seek snapshot temp file: %w", err)
+	}
+
+	return &snapshotTempFile{File: tmpFile}, nil
+}
+
+// snapshotTempFile wraps an os.File and removes the temp file on Close.
+type snapshotTempFile struct {
+	*os.File
+}
+
+func (f *snapshotTempFile) Close() error {
+	name := f.File.Name()
+	err := f.File.Close()
+	os.Remove(name)
+	return err
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
@@ -2034,7 +2116,6 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
 		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
@@ -2050,6 +2131,7 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer r.Close()
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
 		return info, err
