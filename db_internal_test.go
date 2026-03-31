@@ -2057,3 +2057,380 @@ func TestDB_Sync_InitErrorMetrics(t *testing.T) {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v (init error should be counted)", syncErrorValue, baselineErrors)
 	}
 }
+
+// TestDB_Verify_LTXHeaderCache_SkipsFileOnSameTXID verifies that verify() does
+// not re-open the LTX file when the TXID has not changed since the last call.
+//
+// The test manufactures an LTX file with WALOffset=WALHeaderSize and
+// WALSize=frameSize so that info.offset = WALHeaderSize+frameSize and
+// prevWALOffset = WALHeaderSize. verify() exits early in that branch and never
+// calls lastPageMatch, meaning the only LTX file access is the header read.
+// After the first call populates the cache, the file is made unreadable: a
+// second call must succeed using only the cached values.
+func TestDB_Verify_LTXHeaderCache_SkipsFileOnSameTXID(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		pos, _ := db.Pos()
+		if pos.TXID > 0 {
+			_ = os.Chmod(db.LTXPath(0, pos.TXID, pos.TXID), 0o644)
+		}
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial sync establishes page size and a base LTX file. We replace it
+	// below with a hand-crafted one that has exactly 1 frame of WAL data.
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read WAL header to get current salt values; the fake LTX must match.
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	salt1 := binary.BigEndian.Uint32(walHdr[16:])
+	salt2 := binary.BigEndian.Uint32(walHdr[20:])
+
+	// Build an LTX file with WALOffset=WALHeaderSize and WALSize=frameSize.
+	// This gives info.offset = WALHeaderSize+frameSize and
+	// prevWALOffset = WALHeaderSize, so verify() returns before lastPageMatch.
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+
+	f, err := os.Create(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := ltx.NewEncoder(f)
+	if err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    1,
+		MinTXID:   pos.TXID,
+		MaxTXID:   pos.TXID,
+		Timestamp: 1000000,
+		WALOffset: WALHeaderSize,
+		WALSize:   frameSize,
+		WALSalt1:  salt1,
+		WALSalt2:  salt2,
+	}); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+
+	// First verify call: reads and caches the LTX header.
+	info1, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() #1 error: %v", err)
+	}
+
+	// Make the LTX file unreadable. A second call must succeed from cache alone.
+	if err := os.Chmod(ltxPath, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := os.Open(ltxPath); err == nil {
+		f.Close()
+		t.Skip("running as root or filesystem ignores permissions; skipping")
+	}
+
+	info2, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() #2 failed — LTX header cache not used: %v", err)
+	}
+	if info1 != info2 {
+		t.Errorf("cached result differs from original:\n  first:  %+v\n  second: %+v", info1, info2)
+	}
+}
+
+// TestDB_Verify_LTXHeaderCache_SameResult verifies that repeated verify() calls
+// with the same TXID return identical results. This is the behavioral contract
+// the LTX header cache must satisfy: cached values must equal what a fresh
+// file read would return.
+func TestDB_Verify_LTXHeaderCache_SameResult(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// First verify call populates the cache.
+	info1, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() #1 error: %v", err)
+	}
+
+	// Second verify call with the same TXID should use cached LTX header.
+	info2, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() #2 error: %v", err)
+	}
+
+	if info1 != info2 {
+		t.Errorf("verify() returned different results on repeated calls:\n  first:  %+v\n  second: %+v", info1, info2)
+	}
+}
+
+// TestDB_Verify_LTXHeaderCache_Invalidated verifies that after a new sync
+// advances the TXID, the next verify() call returns updated values reflecting
+// the new LTX header — not stale cached values from the previous TXID.
+func TestDB_Verify_LTXHeaderCache_Invalidated(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Capture verify result for TXID 1.
+	info1, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() for txid 1: %v", err)
+	}
+
+	// Write new data and sync to advance TXID.
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// verify() must reflect the new LTX header, not the cached TXID-1 values.
+	info2, err := db.verify(context.Background())
+	if err != nil {
+		t.Fatalf("verify() for txid 2: %v", err)
+	}
+
+	// After a new write + sync the WAL offset must have advanced.
+	if info2.offset <= info1.offset {
+		t.Errorf("expected offset to advance after new sync: info1.offset=%d info2.offset=%d", info1.offset, info2.offset)
+	}
+}
+
+// BenchmarkDB_Verify_Idle_NoLastPageMatch measures verify() for the common idle
+// case where prevWALOffset == WALHeaderSize (exactly 1 WAL frame), so lastPageMatch
+// is never called. This is the path most improved by LTX header caching: after the
+// first call, zero LTX file opens occur.
+func BenchmarkDB_Verify_Idle_NoLastPageMatch(b *testing.B) {
+	dir := b.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: b.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+
+	// Build LTX with WALOffset=WALHeaderSize, WALSize=frameSize so
+	// prevWALOffset == WALHeaderSize and lastPageMatch is never invoked.
+	walHdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		b.Fatal(err)
+	}
+	salt1 := binary.BigEndian.Uint32(walHdr[16:])
+	salt2 := binary.BigEndian.Uint32(walHdr[20:])
+	pos, err := db.Pos()
+	if err != nil {
+		b.Fatal(err)
+	}
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	f, err := os.Create(ltxPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	enc, err := ltx.NewEncoder(f)
+	if err != nil {
+		f.Close()
+		b.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(db.pageSize),
+		Commit:    1,
+		MinTXID:   pos.TXID,
+		MaxTXID:   pos.TXID,
+		Timestamp: 1000000,
+		WALOffset: WALHeaderSize,
+		WALSize:   frameSize,
+		WALSalt1:  salt1,
+		WALSalt2:  salt2,
+	}); err != nil {
+		f.Close()
+		b.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		f.Close()
+		b.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		b.Fatal(err)
+	}
+	db.invalidatePosCache()
+
+	ctx := context.Background()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := db.verify(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkDB_Verify_Idle measures the cost of verify() when the database is
+// idle (no writes). With LTX header caching, repeated calls for the same TXID
+// should skip the LTX file open entirely.
+func BenchmarkDB_Verify_Idle(b *testing.B) {
+	dir := b.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: b.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		b.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		b.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+		b.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		b.Fatal(err)
+	}
+
+	ctx := context.Background()
+	b.ResetTimer()
+	for range b.N {
+		if _, err := db.verify(ctx); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
