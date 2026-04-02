@@ -570,7 +570,14 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
 			}
 
-			if lvl.Level == SnapshotLevel {
+			// Enforce retention unless the snapshot compaction actually failed.
+			// ErrNoCompaction and ErrCompactionTooEarly are not failures —
+			// retention should still run to prune expired snapshots.
+			compactionFailed := err != nil &&
+				!errors.Is(err, ErrNoCompaction) &&
+				!errors.Is(err, ErrCompactionTooEarly) &&
+				!errors.Is(err, ErrDBNotReady)
+			if lvl.Level == SnapshotLevel && !compactionFailed {
 				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
 					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					db.Logger.Error("retention enforcement failed", "error", err)
