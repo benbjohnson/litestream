@@ -60,6 +60,8 @@ Long-running soak tests live alongside the other integration tests and share the
 | Test | Tags | Defaults | Purpose | Extra Requirements |
 | --- | --- | --- | --- | --- |
 | `TestComprehensiveSoak` | `integration,soak` | 2h duration, 50 MB DB, 500 writes/s | File-backed end-to-end stress | Litestream binaries in `./bin` |
+| `TestRapidCheckpointSoak` | `integration,soak` | 30m duration, 20 MB DB, external `PASSIVE` checkpoints | Long-running checkpoint pressure with restore validation | Litestream binaries in `./bin` |
+| `TestRestartRecoverySoak` | `integration,soak` | 30m duration, 20 MB DB, periodic Litestream restarts | Restart recovery under active replication load | Litestream binaries in `./bin` |
 | `TestMinIOSoak` | `integration,soak,docker` | 2h duration, 5 MB DB (short=2 m), 100 writes/s | S3-compatible replication via MinIO | Docker daemon, `docker` CLI |
 | `TestOvernightS3Soak` | `integration,soak,aws` | 8h duration, 50 MB DB | Real S3 replication & restore | AWS credentials, `aws` CLI |
 
@@ -88,6 +90,20 @@ File-based soak (short mode with preserved artifacts and debug logging):
 ```bash
 SOAK_KEEP_TEMP=1 SOAK_DEBUG=1 go test -v -tags="integration,soak" \
   -run=TestComprehensiveSoak -test.short -timeout=1h ./tests/integration
+```
+
+Targeted checkpoint soak:
+
+```bash
+go test -v -tags="integration,soak" \
+  -run=TestRapidCheckpointSoak -test.short -timeout=30m ./tests/integration
+```
+
+Targeted restart soak:
+
+```bash
+go test -v -tags="integration,soak" \
+  -run=TestRestartRecoverySoak -test.short -timeout=30m ./tests/integration
 ```
 
 MinIO soak (short mode, auto-purges bucket, preserves results):
