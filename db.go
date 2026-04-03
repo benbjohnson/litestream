@@ -1833,25 +1833,9 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 	}
 	defer db.chkMu.Unlock()
 
-	hdr, err := readWALHeader(db.WALPath())
+	before, mode, err := db.checkpointStart(ctx, mode, state)
 	if err != nil {
 		return err
-	}
-
-	if err := db.checkpointPreSync(ctx, state); err != nil {
-		return err
-	}
-	preCheckpointFrameN := calcWALFrameN(db.pageSize, state.lastSyncedWALOffset)
-
-	// If the pre-sync couldn't capture all WAL frames (sustained writes),
-	// downgrade TRUNCATE to PASSIVE to prevent the TOCTOU page gap where
-	// frames written between pre-sync and truncation are moved to the DB
-	// but never captured in an L0 file. PASSIVE copies pages without
-	// truncating, so uncaptured frames remain in the WAL for the next sync.
-	if mode == CheckpointModeTruncate && !state.syncedToWALEnd {
-		db.Logger.Debug("checkpoint: downgrading TRUNCATE to PASSIVE",
-			"reason", "pre-sync did not reach WAL end under sustained writes")
-		mode = CheckpointModePassive
 	}
 
 	result, err := db.checkpointExec(ctx, mode)
@@ -1859,24 +1843,65 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 		return err
 	}
 
-	state.syncedToWALEnd = false
+	return db.checkpointFinish(ctx, state, before, result)
+}
 
-	other, err := readWALHeader(db.WALPath())
+type checkpointStartState struct {
+	walHeader    []byte
+	syncedFrameN int
+}
+
+func (db *DB) checkpointStart(ctx context.Context, mode string, state *syncState) (checkpointStartState, string, error) {
+	walHeader, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return checkpointStartState{}, mode, err
+	}
+
+	if err := db.checkpointPreSync(ctx, state); err != nil {
+		return checkpointStartState{}, mode, err
+	}
+
+	if mode == CheckpointModeTruncate && !state.syncedToWALEnd {
+		db.Logger.Debug("checkpoint: downgrading TRUNCATE to PASSIVE",
+			"reason", "pre-sync did not reach WAL end under sustained writes")
+		mode = CheckpointModePassive
+	}
+
+	return checkpointStartState{
+		walHeader:    walHeader,
+		syncedFrameN: calcWALFrameN(db.pageSize, state.lastSyncedWALOffset),
+	}, mode, nil
+}
+
+func (db *DB) checkpointFinish(ctx context.Context, state *syncState, before checkpointStartState, result checkpointExecResult) error {
+	state.syncedToWALEnd = false
+	if err := db.checkpointFollowUp(ctx, state, before, result); err != nil {
+		return err
+	}
+	state.syncedSinceCheckpoint = false
+	return nil
+}
+
+func (db *DB) checkpointFollowUp(ctx context.Context, state *syncState, before checkpointStartState, result checkpointExecResult) error {
+	changed, err := db.walHeaderChanged(before.walHeader)
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(hdr, other) {
-		if result.checkpointedFrameN > preCheckpointFrameN {
-			if err := db.checkpointPostSnapshot(ctx, state); err != nil {
-				return err
-			}
-		} else if err := db.checkpointPostSync(ctx, state); err != nil {
-			return err
-		}
+	if !changed {
+		return nil
 	}
+	if result.checkpointedFrameN > before.syncedFrameN {
+		return db.checkpointPostSnapshot(ctx, state)
+	}
+	return db.checkpointPostSync(ctx, state)
+}
 
-	state.syncedSinceCheckpoint = false
-	return nil
+func (db *DB) walHeaderChanged(prev []byte) (bool, error) {
+	next, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return false, err
+	}
+	return !bytes.Equal(prev, next), nil
 }
 
 func (db *DB) checkpointPreSync(ctx context.Context, state *syncState) error {
@@ -1889,8 +1914,6 @@ func (db *DB) checkpointPreSync(ctx context.Context, state *syncState) error {
 }
 
 type checkpointExecResult struct {
-	busy               int
-	logFrameN          int
 	checkpointedFrameN int
 }
 
@@ -1988,15 +2011,13 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (result checkpoin
 	// See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
-	var row [3]int
-	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
+	var busy, logFrameN, checkpointedFrameN int
+	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&busy, &logFrameN, &checkpointedFrameN); err != nil {
 		return result, err
 	}
-	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
+	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", busy, logFrameN, checkpointedFrameN))
 	result = checkpointExecResult{
-		busy:               row[0],
-		logFrameN:          row[1],
-		checkpointedFrameN: row[2],
+		checkpointedFrameN: checkpointedFrameN,
 	}
 
 	// Reacquire the read lock immediately after the checkpoint.
