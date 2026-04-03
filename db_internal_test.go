@@ -725,7 +725,7 @@ func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
 
 	// Now call verify - before the fix, this would fail with:
 	// "prev WAL offset is less than the header size: -4088"
-	info, err := db.verify(context.Background())
+	info, err := db.verify(context.Background(), &db.syncState)
 	if err != nil {
 		t.Fatalf("verify() returned error: %v", err)
 	}
@@ -847,7 +847,7 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	db.invalidatePosCache()
 
 	// Call verify - should succeed but indicate snapshotting due to salt mismatch
-	info, err := db.verify(context.Background())
+	info, err := db.verify(context.Background(), &db.syncState)
 	if err != nil {
 		t.Fatalf("verify() returned error: %v", err)
 	}
@@ -1004,7 +1004,7 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	t.Logf("After pre-checkpoint sync: TXID=%d", pos2.TXID)
 
 	// Call verify() BEFORE checkpoint to confirm snapshotting=false
-	info1, err := db.verify(ctx)
+	info1, err := db.verify(ctx, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1028,7 +1028,7 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	// - Old LTX has WALOffset+WALSize pointing to old (larger) WAL
 	// - New WAL is truncated (smaller)
 	// - Line 973: info.offset > fi.Size() → "wal truncated" → snapshotting=true
-	info2, err := db.verify(ctx)
+	info2, err := db.verify(ctx, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1096,7 +1096,7 @@ func TestDB_MultipleCheckpointsWithWrites(t *testing.T) {
 		}
 
 		// Check if this was a snapshot
-		info, err := db.verify(ctx)
+		info, err := db.verify(ctx, &db.syncState)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1819,7 +1819,7 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 
 	// TRUNCATE checkpoint should create a full snapshot L0 to ensure
 	// complete page coverage across the checkpoint boundary.
-	if err := db.checkpoint(ctx, CheckpointModeTruncate); err != nil {
+	if err := db.checkpoint(ctx, CheckpointModeTruncate, &db.syncState); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2301,11 +2301,11 @@ func TestApplySyncResult(t *testing.T) {
 		db.mu.Lock()
 		defer db.mu.Unlock()
 
-		db.applySyncResult(syncResult{walOffset: 12345, atWALEnd: true})
-		if db.lastSyncedWALOffset != 12345 {
-			t.Fatalf("lastSyncedWALOffset=%d, want 12345", db.lastSyncedWALOffset)
+		db.applySyncResult(&db.syncState, syncResult{walOffset: 12345, atWALEnd: true})
+		if db.syncState.lastSyncedWALOffset != 12345 {
+			t.Fatalf("lastSyncedWALOffset=%d, want 12345", db.syncState.lastSyncedWALOffset)
 		}
-		if !db.syncedToWALEnd {
+		if !db.syncState.syncedToWALEnd {
 			t.Fatal("syncedToWALEnd=false, want true")
 		}
 	})
@@ -2315,7 +2315,7 @@ func TestApplySyncResult(t *testing.T) {
 		defer db.mu.Unlock()
 
 		pos := ltx.Pos{TXID: 42}
-		db.applySyncResult(syncResult{pos: &pos})
+		db.applySyncResult(&db.syncState, syncResult{pos: &pos})
 
 		db.pos.Lock()
 		got := db.pos.value
@@ -2334,7 +2334,7 @@ func TestApplySyncResult(t *testing.T) {
 		db.pos.value = &existing
 		db.pos.Unlock()
 
-		db.applySyncResult(syncResult{pos: nil})
+		db.applySyncResult(&db.syncState, syncResult{pos: nil})
 
 		db.pos.Lock()
 		got := db.pos.value
@@ -2349,7 +2349,7 @@ func TestApplySyncResult(t *testing.T) {
 		defer db.mu.Unlock()
 
 		info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
-		db.applySyncResult(syncResult{l0FileInfo: info})
+		db.applySyncResult(&db.syncState, syncResult{l0FileInfo: info})
 
 		db.maxLTXFileInfos.Lock()
 		got := db.maxLTXFileInfos.m[0]
@@ -2410,7 +2410,7 @@ func TestCheckpointDoesNotTriggerSnapshot_SustainedWrites(t *testing.T) {
 	}
 
 	db.mu.Lock()
-	db.syncedToWALEnd = false
+	db.syncState.syncedToWALEnd = false
 	db.mu.Unlock()
 
 	for i := 0; i < 50; i++ {
@@ -2524,8 +2524,8 @@ func TestVerify_WALTruncation_SyncedToWALEnd_Incremental(t *testing.T) {
 	walFile.Close()
 
 	t.Run("SyncedToWALEnd=true does incremental", func(t *testing.T) {
-		db.syncedToWALEnd = true
-		info, err := db.verify(context.Background())
+		db.syncState.syncedToWALEnd = true
+		info, err := db.verify(context.Background(), &db.syncState)
 		if err != nil {
 			db.mu.Unlock()
 			t.Fatal(err)
@@ -2541,8 +2541,8 @@ func TestVerify_WALTruncation_SyncedToWALEnd_Incremental(t *testing.T) {
 	})
 
 	t.Run("SyncedToWALEnd=false triggers snapshot", func(t *testing.T) {
-		db.syncedToWALEnd = false
-		info, err := db.verify(context.Background())
+		db.syncState.syncedToWALEnd = false
+		info, err := db.verify(context.Background(), &db.syncState)
 		if err != nil {
 			db.mu.Unlock()
 			t.Fatal(err)
