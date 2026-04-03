@@ -2458,15 +2458,47 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	defer db.chkMu.Unlock()
 	exec.checkpointAttempted = true
 
+	before, err := db.checkpointStart(ctx, mode, exec)
+	if err != nil {
+		return false, err
+	}
+	defer func() {
+		if before.barrierTx != nil {
+			_ = rollback(before.barrierTx)
+		}
+	}()
+
+	walFrameN, err := db.checkpointExec(ctx, mode, exec, &before)
+	if err != nil {
+		return false, err
+	}
+
+	return db.checkpointFinish(ctx, mode, exec, before, walFrameN)
+}
+
+type checkpointStartState struct {
+	walHeader           []byte
+	barrierTx           *sql.Tx
+	preCheckpointFrameN int
+}
+
+func (db *DB) checkpointStart(ctx context.Context, mode string, exec *syncExecutor) (state checkpointStartState, err error) {
+	defer func() {
+		if err != nil && state.barrierTx != nil {
+			_ = rollback(state.barrierTx)
+			state.barrierTx = nil
+		}
+	}()
+
 	// Read WAL header before checkpoint to check if it has been restarted.
 	db.setSyncDiagPhase(diagPhaseCheckpointReadWALHeader,
 		func(s *diagState) {
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	hdr, err := readWALHeader(db.WALPath())
+	state.walHeader, err = readWALHeader(db.WALPath())
 	if err != nil {
-		return false, err
+		return state, err
 	}
 
 	// Copy end of WAL before checkpoint to copy as much as possible.
@@ -2477,39 +2509,36 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		})
 	result, err := db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
 	if err != nil {
-		return false, fmt.Errorf("cannot copy wal before checkpoint: %w", err)
+		return state, fmt.Errorf("cannot copy wal before checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
 
-	var barrierTx *sql.Tx
 	if mode == CheckpointModePassive {
-		barrierTx, err = db.db.BeginTx(ctx, nil)
+		state.barrierTx, err = db.db.BeginTx(ctx, nil)
 		if err != nil {
-			return false, fmt.Errorf("begin passive checkpoint barrier: %w", err)
+			return state, fmt.Errorf("begin passive checkpoint barrier: %w", err)
 		}
-		defer func() {
-			if barrierTx != nil {
-				_ = rollback(barrierTx)
-			}
-		}()
 
-		if _, err := barrierTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-			return false, fmt.Errorf("_litestream_lock: %w", err)
+		if _, err := state.barrierTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+			return state, fmt.Errorf("_litestream_lock: %w", err)
 		}
 
 		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
 		if err != nil {
-			return false, fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
+			return state, fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
 		}
 		exec.applySyncResult(result)
 	}
 
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
-	preCheckpointFrameN := 0
 	if exec.state.lastSyncedWALOffset > WALHeaderSize {
-		preCheckpointFrameN = int((exec.state.lastSyncedWALOffset - WALHeaderSize) / frameSize)
+		state.preCheckpointFrameN = int((exec.state.lastSyncedWALOffset - WALHeaderSize) / frameSize)
 	}
 
+	return state, nil
+}
+
+func (db *DB) checkpointExec(ctx context.Context, mode string, exec *syncExecutor, before *checkpointStartState) (int, error) {
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
 	db.setSyncDiagPhase(diagPhaseCheckpointExec,
@@ -2519,20 +2548,24 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		})
 	walFrameN, err := db.execCheckpoint(ctx, mode)
 	if err != nil {
-		return false, err
+		return 0, err
 	}
 
-	if barrierTx != nil {
-		if err = rollback(barrierTx); err != nil {
-			return false, fmt.Errorf("rollback passive checkpoint barrier: %w", err)
+	if before.barrierTx != nil {
+		if err = rollback(before.barrierTx); err != nil {
+			return 0, fmt.Errorf("rollback passive checkpoint barrier: %w", err)
 		}
-		barrierTx = nil
+		before.barrierTx = nil
 	}
 
 	if err = db.bumpLitestreamSeq(ctx); err != nil {
-		return false, fmt.Errorf("bump litestream seq: %w", err)
+		return 0, fmt.Errorf("bump litestream seq: %w", err)
 	}
 
+	return walFrameN, nil
+}
+
+func (db *DB) checkpointFinish(ctx context.Context, mode string, exec *syncExecutor, before checkpointStartState, walFrameN int) (bool, error) {
 	// If WAL hasn't been restarted, exit.
 	db.setSyncDiagPhase(diagPhaseCheckpointVerifyRestart,
 		func(s *diagState) {
@@ -2542,19 +2575,16 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	other, err := readWALHeader(db.WALPath())
 	if err != nil {
 		return false, err
-	} else if bytes.Equal(hdr, other) {
+	} else if bytes.Equal(before.walHeader, other) {
 		exec.state.syncedSinceCheckpoint = false
 		return false, nil
 	}
 	exec.state.truncatePassiveFailed = false
 
 	if mode == CheckpointModePassive {
-		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
-		if err != nil {
-			return false, fmt.Errorf("cannot copy wal after passive checkpoint: %w", err)
+		if err := db.checkpointPostSync(ctx, exec, "cannot copy wal after passive checkpoint"); err != nil {
+			return false, err
 		}
-		exec.applySyncResult(result)
-		exec.state.syncedSinceCheckpoint = false
 		return true, nil
 	}
 
@@ -2564,16 +2594,30 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	// sync and the checkpoint taking the writer lock. Those commits are
 	// backfilled and truncated unseen, so TRUNCATE must take the boundary
 	// snapshot unconditionally.
-	if mode != CheckpointModeTruncate && walFrameN <= preCheckpointFrameN {
-		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
-		if err != nil {
-			return false, fmt.Errorf("cannot copy wal after checkpoint: %w", err)
+	if mode != CheckpointModeTruncate && walFrameN <= before.preCheckpointFrameN {
+		if err := db.checkpointPostSync(ctx, exec, "cannot copy wal after checkpoint"); err != nil {
+			return false, err
 		}
-		exec.applySyncResult(result)
-		exec.state.syncedSinceCheckpoint = false
 		return true, nil
 	}
 
+	if err := db.checkpointPostSnapshot(ctx, mode, exec, other); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (db *DB) checkpointPostSync(ctx context.Context, exec *syncExecutor, message string) error {
+	result, err := db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+	if err != nil {
+		return fmt.Errorf("%s: %w", message, err)
+	}
+	exec.applySyncResult(result)
+	exec.state.syncedSinceCheckpoint = false
+	return nil
+}
+
+func (db *DB) checkpointPostSnapshot(ctx context.Context, mode string, exec *syncExecutor, walHeader []byte) error {
 	// Start a transaction. This will be promoted immediately after.
 	db.setSyncDiagPhase(diagPhaseCheckpointSnapshotBoundaryLock,
 		func(s *diagState) {
@@ -2582,7 +2626,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		})
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("begin: %w", err)
+		return fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = rollback(tx) }()
 
@@ -2591,7 +2635,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	// however, it will ensure our tx grabs the write lock. Unfortunately,
 	// we can't call "BEGIN IMMEDIATE" as we are already in a transaction.
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
-		return false, fmt.Errorf("_litestream_lock: %w", err)
+		return fmt.Errorf("_litestream_lock: %w", err)
 	}
 
 	// Copy anything that may have occurred after the checkpoint.
@@ -2602,14 +2646,14 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		})
 	snapshotInfo := syncInfo{
 		offset:       WALHeaderSize,
-		salt1:        binary.BigEndian.Uint32(other[16:]),
-		salt2:        binary.BigEndian.Uint32(other[20:]),
+		salt1:        binary.BigEndian.Uint32(walHeader[16:]),
+		salt2:        binary.BigEndian.Uint32(walHeader[20:]),
 		snapshotting: true,
 		reason:       "checkpoint boundary snapshot",
 	}
-	result, err = db.sync(ctx, true, exec, snapshotInfo, 0)
+	result, err := db.sync(ctx, true, exec, snapshotInfo, 0)
 	if err != nil {
-		return false, fmt.Errorf("cannot snapshot after checkpoint: %w", err)
+		return fmt.Errorf("cannot snapshot after checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
 
@@ -2617,11 +2661,11 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	// Use rollback() helper for consistency with releaseReadLock() and the
 	// defer above. See issue #934.
 	if err := rollback(tx); err != nil {
-		return false, fmt.Errorf("rollback post-checkpoint tx: %w", err)
+		return fmt.Errorf("rollback post-checkpoint tx: %w", err)
 	}
 
 	exec.state.syncedSinceCheckpoint = false
-	return true, nil
+	return nil
 }
 
 // execCheckpoint issues a wal_checkpoint PRAGMA in the given mode and returns
