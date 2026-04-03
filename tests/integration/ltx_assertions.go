@@ -265,12 +265,12 @@ func AssertL0PageCount(t *testing.T, report *LTXBehaviorReport, pageSize int, ma
 		}
 	}
 
-	// Allow a percentage of oversized files. Post-checkpoint snapshots create
-	// full-DB L0 files (~1 per checkpoint), and scheduled L9 snapshots also
-	// land in L0. Under high write load with ~121 checkpoints and ~300 total
-	// L0 files, up to ~40% can be snapshot-sized. The original bug showed
-	// >50% oversized with no checkpoints, so 50% catches systematic issues.
-	maxOversizedPct := 0.50 // 50%
+	// Allow a percentage of oversized files. Scheduled L9 snapshots still land
+	// in L0, and checkpoint gap recovery can occasionally require a larger
+	// repair snapshot under bursty load. After the checkpoint follow-up fix,
+	// these should be the exception instead of the norm, so keep the threshold
+	// tight enough to catch a regression without flaking on legitimate recovery.
+	maxOversizedPct := 0.15 // 15%
 	oversizedPct := float64(oversized) / float64(len(sizes))
 
 	source := "log"

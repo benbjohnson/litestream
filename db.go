@@ -1177,6 +1177,13 @@ func calcWALSize(pageSize uint32, pageN uint32) int64 {
 	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
 }
 
+func calcWALFrameN(pageSize int, walOffset int64) int {
+	if pageSize <= 0 || walOffset <= WALHeaderSize {
+		return 0
+	}
+	return int((walOffset - WALHeaderSize) / int64(WALFrameHeaderSize+pageSize))
+}
+
 // ensureWALExists checks that the real WAL exists and has a header.
 func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	// Exit early if WAL header exists.
@@ -1834,6 +1841,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 	if err := db.checkpointPreSync(ctx, state); err != nil {
 		return err
 	}
+	preCheckpointFrameN := calcWALFrameN(db.pageSize, state.lastSyncedWALOffset)
 
 	// If the pre-sync couldn't capture all WAL frames (sustained writes),
 	// downgrade TRUNCATE to PASSIVE to prevent the TOCTOU page gap where
@@ -1846,7 +1854,8 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 		mode = CheckpointModePassive
 	}
 
-	if err := db.checkpointExec(ctx, mode); err != nil {
+	result, err := db.checkpointExec(ctx, mode)
+	if err != nil {
 		return err
 	}
 
@@ -1857,7 +1866,11 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 		return err
 	}
 	if !bytes.Equal(hdr, other) {
-		if err := db.checkpointPostSnapshot(ctx, state); err != nil {
+		if result.checkpointedFrameN > preCheckpointFrameN {
+			if err := db.checkpointPostSnapshot(ctx, state); err != nil {
+				return err
+			}
+		} else if err := db.checkpointPostSync(ctx, state); err != nil {
 			return err
 		}
 	}
@@ -1875,12 +1888,36 @@ func (db *DB) checkpointPreSync(ctx context.Context, state *syncState) error {
 	return nil
 }
 
-func (db *DB) checkpointExec(ctx context.Context, mode string) error {
-	if err := db.execCheckpoint(ctx, mode); err != nil {
+type checkpointExecResult struct {
+	busy               int
+	logFrameN          int
+	checkpointedFrameN int
+}
+
+func (db *DB) checkpointExec(ctx context.Context, mode string) (checkpointExecResult, error) {
+	result, err := db.execCheckpoint(ctx, mode)
+	if err != nil {
+		return checkpointExecResult{}, err
+	}
+	_, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
+	return result, err
+}
+
+func (db *DB) checkpointPostSync(ctx context.Context, state *syncState) error {
+	info := syncInfo{offset: WALHeaderSize}
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil {
 		return err
 	}
-	_, err := db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
-	return err
+	info.salt1 = binary.BigEndian.Uint32(hdr[16:])
+	info.salt2 = binary.BigEndian.Uint32(hdr[20:])
+
+	result, err := db.sync(ctx, true, state, info)
+	if err != nil {
+		return fmt.Errorf("post-checkpoint sync: %w", err)
+	}
+	db.applySyncResult(state, result)
+	return nil
 }
 
 func (db *DB) checkpointPostSnapshot(ctx context.Context, state *syncState) error {
@@ -1919,10 +1956,10 @@ func (db *DB) checkpointPostSnapshot(ctx context.Context, state *syncState) erro
 	return nil
 }
 
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (result checkpointExecResult, err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
-		return nil
+		return result, nil
 	}
 
 	// Track checkpoint metrics.
@@ -1939,7 +1976,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ensure the read lock has been removed before issuing a checkpoint.
 	// We defer the re-acquire to ensure it occurs even on an early return.
 	if err := db.releaseReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return result, fmt.Errorf("release read lock: %w", err)
 	}
 	defer func() { _ = db.acquireReadLock(ctx) }()
 
@@ -1953,16 +1990,21 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 
 	var row [3]int
 	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return err
+		return result, err
 	}
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
+	result = checkpointExecResult{
+		busy:               row[0],
+		logFrameN:          row[1],
+		checkpointedFrameN: row[2],
+	}
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(ctx); err != nil {
-		return fmt.Errorf("reacquire read lock: %w", err)
+		return result, fmt.Errorf("reacquire read lock: %w", err)
 	}
 
-	return nil
+	return result, nil
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.

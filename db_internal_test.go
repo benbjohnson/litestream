@@ -548,7 +548,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -1748,15 +1748,7 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 	t.Logf("compaction succeeded: %d bytes, %d input files", buf.Len(), len(readers))
 }
 
-// TestDB_CheckpointCreatesSnapshotL0 verifies that TRUNCATE checkpoints
-// create a full snapshot L0 to guarantee complete page coverage.
-//
-// After a TRUNCATE checkpoint restarts the WAL, there's a TOCTOU gap where
-// application commits can arrive between releasing the write lock and the
-// checkpoint executing. Those frames get checkpointed from WAL to DB but
-// are never captured in an L0 file. The post-checkpoint snapshot ensures
-// all pages are captured. See issues #927, #1198.
-func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
+func TestDB_CheckpointCreatesIncrementalL0WhenAlreadySynced(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -1817,22 +1809,48 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 		l0BeforeNames[e.Name()] = true
 	}
 
-	// TRUNCATE checkpoint should create a full snapshot L0 to ensure
-	// complete page coverage across the checkpoint boundary.
 	if err := db.checkpoint(ctx, CheckpointModeTruncate, &db.syncState); err != nil {
 		t.Fatal(err)
 	}
 
-	// Verify a snapshot L0 was created during checkpoint.
 	l0AfterEntries, _ := os.ReadDir(l0Dir)
-	newL0Count := 0
+	var newL0Path string
 	for _, entry := range l0AfterEntries {
 		if !l0BeforeNames[entry.Name()] {
-			newL0Count++
+			newL0Path = filepath.Join(l0Dir, entry.Name())
+			break
 		}
 	}
-	if newL0Count == 0 {
-		t.Fatal("expected checkpoint to create at least one new L0 file")
+	if newL0Path == "" {
+		t.Fatal("expected checkpoint to create a new L0 file")
+	}
+
+	f, err := os.Open(newL0Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	hdr := dec.Header()
+
+	data := make([]byte, hdr.PageSize)
+	pageCount := 0
+	for {
+		var phdr ltx.PageHeader
+		if err := dec.DecodePage(&phdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		pageCount++
+	}
+
+	if hdr.Commit > 1 && pageCount >= int(hdr.Commit)-1 {
+		t.Fatalf("expected checkpoint to create an incremental L0, got pageCount=%d commit=%d", pageCount, hdr.Commit)
 	}
 }
 
