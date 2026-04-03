@@ -1041,7 +1041,9 @@ func (db *DB) Sync(ctx context.Context) (err error) {
 	if fi, err := os.Stat(db.path); err == nil {
 		db.dbSizeGauge.Set(float64(fi.Size()))
 	}
-	db.walSizeGauge.Set(float64(result.walOffset))
+	if walSize, err := db.walFileSize(); err == nil {
+		db.walSizeGauge.Set(float64(walSize))
+	}
 
 	// Notify replicas of WAL changes.
 	// if changed {
@@ -1839,6 +1841,11 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 	}
 	defer db.chkMu.Unlock()
 
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return err
+	}
+
 	if err := db.checkpointPreSync(ctx); err != nil {
 		return err
 	}
@@ -1858,14 +1865,16 @@ func (db *DB) checkpoint(ctx context.Context, mode string) error {
 		return err
 	}
 
-	// Always do a post-sync after checkpoint. During execCheckpoint(),
-	// db.rtx is released which allows the application's auto-checkpoint
-	// (wal_autocheckpoint) to move WAL frames to the DB. Those pages
-	// must be captured in an L0 file. If the WAL restarted, the post-sync
-	// creates a snapshot (syncedToWALEnd was cleared by checkpointExec).
-	// If the WAL didn't restart, the post-sync captures any new frames.
-	if err := db.checkpointPostSync(ctx); err != nil {
+	db.syncedToWALEnd = false
+
+	other, err := readWALHeader(db.WALPath())
+	if err != nil {
 		return err
+	}
+	if !bytes.Equal(hdr, other) {
+		if err := db.checkpointPostSnapshot(ctx); err != nil {
+			return err
+		}
 	}
 
 	db.syncedSinceCheckpoint = false
@@ -1882,15 +1891,6 @@ func (db *DB) checkpointPreSync(ctx context.Context) error {
 }
 
 func (db *DB) checkpointExec(ctx context.Context, mode string) error {
-	// Clear syncedToWALEnd before releasing db.rtx in execCheckpoint.
-	// During the window where db.rtx is released, the application's
-	// auto-checkpoint can move WAL frames to the DB and trigger a WAL
-	// restart. If that happens, the post-sync must create a snapshot to
-	// capture pages that moved from WAL to DB. Setting the flag to false
-	// ensures verify() triggers a snapshot on any WAL restart detected
-	// after this point.
-	db.syncedToWALEnd = false
-
 	if err := db.execCheckpoint(ctx, mode); err != nil {
 		return err
 	}
@@ -1898,7 +1898,7 @@ func (db *DB) checkpointExec(ctx context.Context, mode string) error {
 	return err
 }
 
-func (db *DB) checkpointPostSync(ctx context.Context) error {
+func (db *DB) checkpointPostSnapshot(ctx context.Context) error {
 	tx, err := db.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin: %w", err)
@@ -1909,14 +1909,6 @@ func (db *DB) checkpointPostSync(ctx context.Context) error {
 		return fmt.Errorf("_litestream_lock: %w", err)
 	}
 
-	// Always snapshot after checkpoint. During execCheckpoint(), db.rtx
-	// is released which allows the application's auto-checkpoint to move
-	// WAL frames to the DB. We can't detect exactly what happened in that
-	// window (WAL restart, frame movement, salt changes, etc.) — the
-	// interactions between our checkpoint, the app's auto-checkpoint, and
-	// concurrent writes create too many edge cases for flag-based detection.
-	// A snapshot reads ALL pages from the DB under the write lock and is
-	// correct by construction.
 	info := syncInfo{
 		offset:       WALHeaderSize,
 		snapshotting: true,

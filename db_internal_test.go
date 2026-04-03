@@ -271,6 +271,66 @@ func TestDB_Sync_UpdatesMetrics(t *testing.T) {
 	}
 }
 
+func TestDB_Sync_UpdatesWALMetricAfterRestartCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, strings.Repeat("x", 400)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(context.Background(), CheckpointModeRestart); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, 1000, "after restart"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	walSizeValue := testutil.ToFloat64(walSizeGaugeVec.WithLabelValues(db.Path()))
+	walFileInfo, err := os.Stat(db.WALPath())
+	if err != nil {
+		t.Fatalf("failed to stat wal file: %v", err)
+	}
+	if walSizeValue != float64(walFileInfo.Size()) {
+		t.Fatalf("litestream_wal_size=%v, want %v", walSizeValue, walFileInfo.Size())
+	}
+}
+
 // TestDB_Checkpoint_UpdatesMetrics verifies that checkpoint metrics are updated.
 func TestDB_Checkpoint_UpdatesMetrics(t *testing.T) {
 	dir := t.TempDir()
@@ -2384,7 +2444,7 @@ func TestCheckpointDoesNotTriggerSnapshot_SustainedWrites(t *testing.T) {
 
 	hdr := dec.Header()
 	if hdr.WALOffset == 0 || hdr.WALSize == 0 {
-		t.Log("last LTX is a snapshot (WALOffset=0 or WALSize=0) — this may indicate an unnecessary snapshot was triggered after checkpoint")
+		t.Fatalf("last LTX unexpectedly snapshot after passive checkpoint path: WALOffset=%d WALSize=%d", hdr.WALOffset, hdr.WALSize)
 	}
 
 	if hdr.Commit == 0 {
