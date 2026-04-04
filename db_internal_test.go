@@ -2378,6 +2378,116 @@ func TestApplySyncResult(t *testing.T) {
 	})
 }
 
+func TestCheckpointStart_PreservesTruncateModeWhenPreSyncFallsBehind(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	writerCtx, cancelWriter := context.WithCancel(ctx)
+	defer cancelWriter()
+
+	writerStarted := make(chan struct{})
+	writerDone := make(chan error, 1)
+
+	go func() {
+		var i int64 = 1
+		started := false
+		for {
+			select {
+			case <-writerCtx.Done():
+				writerDone <- nil
+				return
+			default:
+			}
+
+			blob := make([]byte, 4000)
+			if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, blob); err != nil {
+				if strings.Contains(err.Error(), "database is locked") ||
+					strings.Contains(err.Error(), "SQLITE_BUSY") {
+					time.Sleep(time.Millisecond)
+					continue
+				}
+				writerDone <- err
+				return
+			}
+
+			if !started {
+				close(writerStarted)
+				started = true
+			}
+			i++
+		}
+	}()
+
+	select {
+	case <-writerStarted:
+	case err := <-writerDone:
+		t.Fatalf("writer exited before starting: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not start")
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		db.mu.Lock()
+		_, mode, err := db.checkpointStart(ctx, CheckpointModeTruncate, false, &db.syncState)
+		syncedToWALEnd := db.syncState.syncedToWALEnd
+		db.mu.Unlock()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !syncedToWALEnd {
+			if mode != CheckpointModeTruncate {
+				t.Fatalf("checkpoint mode=%s, want %s when pre-sync falls behind", mode, CheckpointModeTruncate)
+			}
+			cancelWriter()
+			if err := <-writerDone; err != nil {
+				t.Fatal(err)
+			}
+			return
+		}
+	}
+
+	cancelWriter()
+	if err := <-writerDone; err != nil {
+		t.Fatal(err)
+	}
+	t.Fatal("pre-sync never fell behind under sustained writes")
+}
+
 func TestCheckpointDoesNotTriggerSnapshot_SustainedWrites(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "test.db")
 	sqldb, err := sql.Open("sqlite", dbPath)

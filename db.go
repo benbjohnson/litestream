@@ -1090,7 +1090,7 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, state *syncState, origWALS
 		db.Logger.Info("forcing truncate checkpoint",
 			"wal_size", origWALSize,
 			"threshold", calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)))
-		return db.checkpoint(ctx, CheckpointModeTruncate, state)
+		return db.checkpointWithPassiveFallback(ctx, CheckpointModeTruncate, false, state)
 	}
 
 	// Priority 2: Regular checkpoint at min threshold (PASSIVE mode, non-blocking)
@@ -1828,12 +1828,16 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 // checkpoint performs a checkpoint on the WAL file and initializes a
 // new shadow WAL file.
 func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) error {
+	return db.checkpointWithPassiveFallback(ctx, mode, true, state)
+}
+
+func (db *DB) checkpointWithPassiveFallback(ctx context.Context, mode string, allowPassiveFallback bool, state *syncState) error {
 	if !db.chkMu.TryLock() {
 		return nil
 	}
 	defer db.chkMu.Unlock()
 
-	before, mode, err := db.checkpointStart(ctx, mode, state)
+	before, mode, err := db.checkpointStart(ctx, mode, allowPassiveFallback, state)
 	if err != nil {
 		return err
 	}
@@ -1851,7 +1855,7 @@ type checkpointStartState struct {
 	syncedFrameN int
 }
 
-func (db *DB) checkpointStart(ctx context.Context, mode string, state *syncState) (checkpointStartState, string, error) {
+func (db *DB) checkpointStart(ctx context.Context, mode string, allowPassiveFallback bool, state *syncState) (checkpointStartState, string, error) {
 	walHeader, err := readWALHeader(db.WALPath())
 	if err != nil {
 		return checkpointStartState{}, mode, err
@@ -1861,7 +1865,7 @@ func (db *DB) checkpointStart(ctx context.Context, mode string, state *syncState
 		return checkpointStartState{}, mode, err
 	}
 
-	if mode == CheckpointModeTruncate && !state.syncedToWALEnd {
+	if allowPassiveFallback && mode == CheckpointModeTruncate && !state.syncedToWALEnd {
 		db.Logger.Debug("checkpoint: downgrading TRUNCATE to PASSIVE",
 			"reason", "pre-sync did not reach WAL end under sustained writes")
 		mode = CheckpointModePassive
