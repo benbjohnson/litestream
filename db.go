@@ -1171,6 +1171,14 @@ func (db *DB) walFileSize() (int64, error) {
 	return fi.Size(), nil
 }
 
+func (db *DB) walAdvancedSinceOffset(offset int64) (bool, error) {
+	size, err := db.walFileSize()
+	if err != nil {
+		return false, err
+	}
+	return size > offset, nil
+}
+
 // calcWALSize returns the size of the WAL for a given page size & count.
 // Casts to int64 before multiplication to prevent uint32 overflow with large page sizes.
 func calcWALSize(pageSize uint32, pageN uint32) int64 {
@@ -1865,10 +1873,16 @@ func (db *DB) checkpointStart(ctx context.Context, mode string, allowPassiveFall
 		return checkpointStartState{}, mode, err
 	}
 
-	if allowPassiveFallback && mode == CheckpointModeTruncate && !state.syncedToWALEnd {
-		db.Logger.Debug("checkpoint: downgrading TRUNCATE to PASSIVE",
-			"reason", "pre-sync did not reach WAL end under sustained writes")
-		mode = CheckpointModePassive
+	if allowPassiveFallback && mode == CheckpointModeTruncate {
+		advanced, err := db.walAdvancedSinceOffset(state.lastSyncedWALOffset)
+		if err != nil {
+			return checkpointStartState{}, mode, err
+		}
+		if advanced {
+			db.Logger.Debug("checkpoint: downgrading TRUNCATE to PASSIVE",
+				"reason", "wal advanced after pre-sync")
+			mode = CheckpointModePassive
+		}
 	}
 
 	return checkpointStartState{
