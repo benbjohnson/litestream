@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os/exec"
 	"path/filepath"
@@ -289,8 +288,7 @@ func TestMinIOSoak(t *testing.T) {
 		}
 		t.Log("")
 		t.Log("Review the logs for details:")
-		logPath, _ := db.GetLitestreamLog()
-		t.Logf("  %s", logPath)
+		t.Logf("  %s", db.LitestreamLogPath())
 		t.Fail()
 	}
 
@@ -342,21 +340,4 @@ func countMinIOLTXFiles(t *testing.T, containerID, bucket string) int {
 	}
 
 	return ltxCount
-}
-
-// getRowCountFromPath gets row count from a database file path
-func getRowCountFromPath(dbPath, table string) (int, error) {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return 0, err
-	}
-	defer db.Close()
-
-	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
-	if err := db.QueryRow(query).Scan(&count); err != nil {
-		return 0, err
-	}
-
-	return count, nil
 }

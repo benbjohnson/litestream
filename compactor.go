@@ -347,18 +347,26 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 	if err != nil {
 		return fmt.Errorf("fetch l1 files: %w", err)
 	}
-	var maxL1TXID ltx.TXID
+	type txidRange struct{ min, max ltx.TXID }
+	var l1Ranges []txidRange
 	for itr.Next() {
 		info := itr.Item()
-		if info.MaxTXID > maxL1TXID {
-			maxL1TXID = info.MaxTXID
-		}
+		l1Ranges = append(l1Ranges, txidRange{info.MinTXID, info.MaxTXID})
 	}
 	if err := itr.Close(); err != nil {
 		return fmt.Errorf("close l1 iterator: %w", err)
 	}
-	if maxL1TXID == 0 {
+	if len(l1Ranges) == 0 {
 		return nil
+	}
+
+	coveredByL1 := func(txid ltx.TXID) bool {
+		for _, r := range l1Ranges {
+			if txid >= r.min && txid <= r.max {
+				return true
+			}
+		}
+		return false
 	}
 
 	threshold := time.Now().Add(-retention)
@@ -387,7 +395,7 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 			break
 		}
 
-		if info.MaxTXID <= maxL1TXID {
+		if coveredByL1(info.MaxTXID) {
 			deleted = append(deleted, info)
 		}
 	}
@@ -417,7 +425,7 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 		}
 	}
 
-	c.logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
+	c.logger.Info("l0 retention enforced", "deleted_count", len(deleted), "l1_ranges", len(l1Ranges))
 
 	return nil
 }

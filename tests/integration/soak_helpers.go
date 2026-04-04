@@ -586,8 +586,8 @@ func performGracefulShutdown(t *testing.T, testInfo *TestInfo) {
 	t.Log("Test artifacts preserved at:")
 	t.Logf("  %s", testInfo.DB.TempDir)
 
-	if logPath, err := testInfo.DB.GetLitestreamLog(); err == nil {
-		t.Logf("  Log: %s", logPath)
+	if testInfo.DB != nil {
+		t.Logf("  Log: %s", testInfo.DB.LitestreamLogPath())
 	}
 
 	t.Log("")
@@ -969,10 +969,7 @@ func AnalyzeSoakTest(t *testing.T, db *TestDB, duration time.Duration) *SoakTest
 	}
 
 	// Parse litestream log
-	logPath, _ := db.GetLitestreamLog()
-	if logPath != "" {
-		parseLog(logPath, analysis)
-	}
+	parseLog(db.LitestreamLogPath(), analysis)
 
 	return analysis
 }
