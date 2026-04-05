@@ -2191,3 +2191,129 @@ func TestApplySyncResult(t *testing.T) {
 		}
 	})
 }
+
+func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'after')`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	oldWALOffset := db.lastSyncedWALOffset
+	oldSyncedToWALEnd := db.syncedToWALEnd
+
+	db.pos.Lock()
+	if db.pos.value == nil {
+		db.pos.Unlock()
+		t.Fatal("cached pos is nil after initial sync")
+	}
+	oldPos := *db.pos.value
+	db.pos.Unlock()
+
+	db.maxLTXFileInfos.Lock()
+	oldL0 := db.maxLTXFileInfos.m[0]
+	db.maxLTXFileInfos.Unlock()
+	if oldL0 == nil {
+		t.Fatal("cached l0 file info is nil after initial sync")
+	}
+
+	result, err := db.verifyAndSync(ctx, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("verifyAndSync did not report a sync after new writes")
+	}
+	if result.newWALSize == oldWALOffset {
+		t.Fatalf("newWALSize=%d, want change from %d", result.newWALSize, oldWALOffset)
+	}
+	if result.pos == nil || result.pos.TXID <= oldPos.TXID {
+		t.Fatalf("result.pos=%v, want TXID > %d", result.pos, oldPos.TXID)
+	}
+	if result.l0FileInfo == nil || result.l0FileInfo.MaxTXID <= oldL0.MaxTXID {
+		t.Fatalf("result.l0FileInfo=%v, want MaxTXID > %d", result.l0FileInfo, oldL0.MaxTXID)
+	}
+
+	if db.lastSyncedWALOffset != oldWALOffset {
+		t.Fatalf("lastSyncedWALOffset mutated early: got %d, want %d", db.lastSyncedWALOffset, oldWALOffset)
+	}
+	if db.syncedToWALEnd != oldSyncedToWALEnd {
+		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncedToWALEnd, oldSyncedToWALEnd)
+	}
+
+	db.pos.Lock()
+	gotPosBeforeApply := db.pos.value
+	db.pos.Unlock()
+	if gotPosBeforeApply == nil || gotPosBeforeApply.TXID != oldPos.TXID {
+		t.Fatalf("cached pos mutated early: got %v, want TXID=%d", gotPosBeforeApply, oldPos.TXID)
+	}
+
+	db.maxLTXFileInfos.Lock()
+	gotL0BeforeApply := db.maxLTXFileInfos.m[0]
+	db.maxLTXFileInfos.Unlock()
+	if gotL0BeforeApply == nil || gotL0BeforeApply.MaxTXID != oldL0.MaxTXID {
+		t.Fatalf("cached l0 file info mutated early: got %v, want MaxTXID=%d", gotL0BeforeApply, oldL0.MaxTXID)
+	}
+
+	db.applySyncResult(result)
+
+	if db.lastSyncedWALOffset != result.newWALSize {
+		t.Fatalf("lastSyncedWALOffset=%d, want %d", db.lastSyncedWALOffset, result.newWALSize)
+	}
+	if db.syncedToWALEnd != result.syncedToWALEnd {
+		t.Fatalf("syncedToWALEnd=%t, want %t", db.syncedToWALEnd, result.syncedToWALEnd)
+	}
+
+	db.pos.Lock()
+	gotPosAfterApply := db.pos.value
+	db.pos.Unlock()
+	if gotPosAfterApply == nil || gotPosAfterApply.TXID != result.pos.TXID {
+		t.Fatalf("cached pos=%v, want TXID=%d", gotPosAfterApply, result.pos.TXID)
+	}
+
+	db.maxLTXFileInfos.Lock()
+	gotL0AfterApply := db.maxLTXFileInfos.m[0]
+	db.maxLTXFileInfos.Unlock()
+	if gotL0AfterApply == nil || gotL0AfterApply.MaxTXID != result.l0FileInfo.MaxTXID {
+		t.Fatalf("cached l0 file info=%v, want MaxTXID=%d", gotL0AfterApply, result.l0FileInfo.MaxTXID)
+	}
+}
