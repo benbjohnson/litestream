@@ -2125,3 +2125,69 @@ func TestDB_Pos_VerifyErrorReturnsLTXError(t *testing.T) {
 		t.Fatal("corruption error should be auto-recoverable")
 	}
 }
+
+func TestApplySyncResult(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+
+	t.Run("WALState", func(t *testing.T) {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+
+		db.applySyncResult(syncResult{newWALSize: 12345, syncedToWALEnd: true})
+		if got := db.lastSyncedWALOffset; got != 12345 {
+			t.Fatalf("lastSyncedWALOffset=%d, want 12345", got)
+		}
+		if !db.syncedToWALEnd {
+			t.Fatal("syncedToWALEnd=false, want true")
+		}
+	})
+
+	t.Run("Pos", func(t *testing.T) {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+
+		pos := ltx.Pos{TXID: 42}
+		db.applySyncResult(syncResult{pos: &pos})
+
+		db.pos.Lock()
+		got := db.pos.value
+		db.pos.Unlock()
+		if got == nil || got.TXID != 42 {
+			t.Fatalf("pos=%v, want TXID=42", got)
+		}
+	})
+
+	t.Run("NilPosPreservesExisting", func(t *testing.T) {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+
+		existing := ltx.Pos{TXID: 99}
+		db.pos.Lock()
+		db.pos.value = &existing
+		db.pos.Unlock()
+
+		db.applySyncResult(syncResult{})
+
+		db.pos.Lock()
+		got := db.pos.value
+		db.pos.Unlock()
+		if got == nil || got.TXID != 99 {
+			t.Fatalf("pos=%v, want TXID=99", got)
+		}
+	})
+
+	t.Run("L0FileInfo", func(t *testing.T) {
+		db.mu.Lock()
+		defer db.mu.Unlock()
+
+		info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
+		db.applySyncResult(syncResult{l0FileInfo: info})
+
+		db.maxLTXFileInfos.Lock()
+		got := db.maxLTXFileInfos.m[0]
+		db.maxLTXFileInfos.Unlock()
+		if got != info {
+			t.Fatalf("l0FileInfo=%v, want %v", got, info)
+		}
+	})
+}
