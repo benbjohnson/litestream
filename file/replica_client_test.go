@@ -3,6 +3,7 @@ package file_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 
 	"github.com/benbjohnson/litestream/file"
 )
@@ -760,3 +763,49 @@ func TestReplica_Sync(t *testing.T) {
 	})
 }
 */
+
+func TestReplicaClient_OpenLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
+	t.Run("MissingFile", func(t *testing.T) {
+		c := file.NewReplicaClient(t.TempDir())
+
+		_, err := c.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+		if err == nil {
+			t.Fatal("expected error for missing LTX file")
+		}
+
+		var ltxErr *litestream.LTXError
+		if !errors.As(err, &ltxErr) {
+			t.Fatalf("expected *LTXError, got %T: %v", err, err)
+		}
+		if ltxErr.Op != "open" {
+			t.Fatalf("expected op=open, got %q", ltxErr.Op)
+		}
+	})
+
+	t.Run("PermissionDenied", func(t *testing.T) {
+		dir := t.TempDir()
+		c := file.NewReplicaClient(dir)
+
+		path := c.LTXFilePath(0, 1, 1)
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte("data"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(path, 0o644) })
+
+		_, err := c.OpenLTXFile(context.Background(), 0, 1, 1, 0, 0)
+		if err == nil {
+			t.Fatal("expected error for unreadable LTX file")
+		}
+
+		var ltxErr *litestream.LTXError
+		if !errors.As(err, &ltxErr) {
+			t.Fatalf("expected *LTXError, got %T: %v", err, err)
+		}
+		if ltxErr.Op != "open" {
+			t.Fatalf("expected op=open, got %q", ltxErr.Op)
+		}
+	})
+}
