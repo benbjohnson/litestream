@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -136,6 +137,24 @@ func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	}
 	if got, want := err.Error(), "level 0 listing failed"; !bytes.Contains([]byte(got), []byte(want)) {
 		t.Fatalf("error=%q, want substring %q", got, want)
+	}
+}
+
+func TestReplica_UploadLTXFile_MissingFileReturnsLTXError(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+	r := NewReplicaWithClient(db, &followTestReplicaClient{})
+
+	err := r.uploadLTXFile(context.Background(), 0, 1, 1)
+	if err == nil {
+		t.Fatal("expected error for missing LTX file")
+	}
+
+	var ltxErr *LTXError
+	if !errors.As(err, &ltxErr) {
+		t.Fatalf("expected *LTXError, got %T: %v", err, err)
+	}
+	if ltxErr.Op != "open" {
+		t.Fatalf("expected op=open, got %q", ltxErr.Op)
 	}
 }
 
