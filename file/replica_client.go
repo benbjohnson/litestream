@@ -136,10 +136,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	path := c.LTXFilePath(level, minTXID, maxTXID)
 	f, err := os.Open(path)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, litestream.NewLTXError("open", path, level, uint64(minTXID), uint64(maxTXID), err)
-		}
-		return nil, fmt.Errorf("open ltx file %s: %w", path, err)
+		return nil, litestream.NewLTXError("open", path, level, uint64(minTXID), uint64(maxTXID), err)
 	}
 
 	if offset > 0 {

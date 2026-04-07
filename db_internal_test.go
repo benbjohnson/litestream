@@ -2057,3 +2057,71 @@ func TestDB_Sync_InitErrorMetrics(t *testing.T) {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v (init error should be counted)", syncErrorValue, baselineErrors)
 	}
 }
+
+func TestDB_Pos_OpenErrorReturnsLTXError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root (chmod 000 has no effect as root)")
+	}
+
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+
+	ltxDir := db.LTXLevelDir(0)
+	if err := os.MkdirAll(ltxDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ltxPath := db.LTXPath(0, 1, 1)
+	if err := os.WriteFile(ltxPath, []byte("dummy"), 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(ltxPath, 0o644) })
+
+	_, err := db.Pos()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	var ltxErr *LTXError
+	if !errors.As(err, &ltxErr) {
+		t.Fatalf("expected *LTXError, got %T: %v", err, err)
+	}
+	if ltxErr.Op != "open" {
+		t.Fatalf("expected op=open, got %q", ltxErr.Op)
+	}
+	if ltxErr.IsAutoRecoverable() {
+		t.Fatal("permission-denied error should not be auto-recoverable")
+	}
+}
+
+func TestDB_Pos_VerifyErrorReturnsLTXError(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+
+	ltxDir := db.LTXLevelDir(0)
+	if err := os.MkdirAll(ltxDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ltxPath := db.LTXPath(0, 1, 1)
+	if err := os.WriteFile(ltxPath, []byte("not a valid ltx file"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := db.Pos()
+	if err == nil {
+		t.Fatal("expected error")
+	}
+
+	var ltxErr *LTXError
+	if !errors.As(err, &ltxErr) {
+		t.Fatalf("expected *LTXError, got %T: %v", err, err)
+	}
+	if ltxErr.Op != "verify" {
+		t.Fatalf("expected op=verify, got %q", ltxErr.Op)
+	}
+	if !errors.Is(err, ErrLTXCorrupted) {
+		t.Fatal("verify error should wrap ErrLTXCorrupted")
+	}
+	if !ltxErr.IsAutoRecoverable() {
+		t.Fatal("corruption error should be auto-recoverable")
+	}
+}

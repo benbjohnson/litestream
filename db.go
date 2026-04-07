@@ -406,15 +406,16 @@ func (db *DB) Pos() (ltx.Pos, error) {
 		return ltx.Pos{}, nil // no replication yet
 	}
 
-	f, err := os.Open(db.LTXPath(0, minTXID, maxTXID))
+	ltxPath := db.LTXPath(0, minTXID, maxTXID)
+	f, err := os.Open(ltxPath)
 	if err != nil {
-		return ltx.Pos{}, err
+		return ltx.Pos{}, NewLTXError("open", ltxPath, 0, uint64(minTXID), uint64(maxTXID), err)
 	}
 	defer func() { _ = f.Close() }()
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.Verify(); err != nil {
-		return ltx.Pos{}, fmt.Errorf("ltx verification failed: %w", err)
+		return ltx.Pos{}, NewLTXError("verify", ltxPath, 0, uint64(minTXID), uint64(maxTXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
 	}
 
 	pos := dec.PostApplyPos()
@@ -1310,10 +1311,7 @@ func (db *DB) verify(ctx context.Context) (info syncInfo, err error) {
 	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
 	ltxFile, err := os.Open(ltxPath)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
-		}
-		return info, fmt.Errorf("open ltx file %s: %w", ltxPath, err)
+		return info, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
 	}
 	defer func() { _ = ltxFile.Close() }()
 
