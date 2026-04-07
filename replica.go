@@ -403,8 +403,10 @@ func (r *Replica) monitor(ctx context.Context) {
 						lastLogTime = time.Now()
 					}
 
-					// Attempt auto-recovery if enabled
-					if r.AutoRecoverEnabled {
+					// Attempt auto-recovery only for missing/corrupt LTX files.
+					// Transient OS errors (EMFILE, EIO, EACCES) should retry
+					// with backoff rather than destructively resetting state.
+					if r.AutoRecoverEnabled && ltxErr.IsAutoRecoverable() {
 						r.Logger().Warn("auto-recovery enabled, resetting local state")
 						if resetErr := r.db.ResetLocalState(ctx); resetErr != nil {
 							r.Logger().Error("auto-recovery failed", "error", resetErr)

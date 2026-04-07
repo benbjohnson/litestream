@@ -415,7 +415,7 @@ func (db *DB) Pos() (ltx.Pos, error) {
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.Verify(); err != nil {
-		return ltx.Pos{}, NewLTXError("verify", ltxPath, 0, uint64(minTXID), uint64(maxTXID), err)
+		return ltx.Pos{}, NewLTXError("verify", ltxPath, 0, uint64(minTXID), uint64(maxTXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
 	}
 
 	pos := dec.PostApplyPos()

@@ -56,6 +56,20 @@ func (e *LTXError) Error() string {
 
 func (e *LTXError) Unwrap() error { return e.Err }
 
+// IsAutoRecoverable reports whether the underlying error indicates local state
+// corruption that can be fixed by resetting and re-downloading from remote.
+// Returns false for transient OS errors (EMFILE, EIO, EACCES) that should be
+// retried with backoff instead.
+func (e *LTXError) IsAutoRecoverable() bool {
+	if os.IsNotExist(e.Err) || errors.Is(e.Err, ErrLTXMissing) {
+		return true
+	}
+	if errors.Is(e.Err, ErrLTXCorrupted) || errors.Is(e.Err, ErrChecksumMismatch) {
+		return true
+	}
+	return false
+}
+
 // NewLTXError creates a new LTX error with appropriate hints based on the error type.
 func NewLTXError(op, path string, level int, minTXID, maxTXID uint64, err error) *LTXError {
 	ltxErr := &LTXError{

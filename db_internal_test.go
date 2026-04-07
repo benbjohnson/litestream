@@ -2059,6 +2059,10 @@ func TestDB_Sync_InitErrorMetrics(t *testing.T) {
 }
 
 func TestDB_Pos_OpenErrorReturnsLTXError(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("test requires non-root (chmod 000 has no effect as root)")
+	}
+
 	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
 
 	ltxDir := db.LTXLevelDir(0)
@@ -2083,6 +2087,9 @@ func TestDB_Pos_OpenErrorReturnsLTXError(t *testing.T) {
 	}
 	if ltxErr.Op != "open" {
 		t.Fatalf("expected op=open, got %q", ltxErr.Op)
+	}
+	if ltxErr.IsAutoRecoverable() {
+		t.Fatal("permission-denied error should not be auto-recoverable")
 	}
 }
 
@@ -2110,5 +2117,11 @@ func TestDB_Pos_VerifyErrorReturnsLTXError(t *testing.T) {
 	}
 	if ltxErr.Op != "verify" {
 		t.Fatalf("expected op=verify, got %q", ltxErr.Op)
+	}
+	if !errors.Is(err, ErrLTXCorrupted) {
+		t.Fatal("verify error should wrap ErrLTXCorrupted")
+	}
+	if !ltxErr.IsAutoRecoverable() {
+		t.Fatal("corruption error should be auto-recoverable")
 	}
 }

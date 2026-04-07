@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -133,4 +134,30 @@ func TestLTXErrorHints(t *testing.T) {
 			t.Errorf("hint should mention reset command, got: %s", err.Hint)
 		}
 	})
+}
+
+func TestLTXError_IsAutoRecoverable(t *testing.T) {
+	tests := []struct {
+		name        string
+		err         error
+		recoverable bool
+	}{
+		{"NotExist", os.ErrNotExist, true},
+		{"LTXMissing", litestream.ErrLTXMissing, true},
+		{"LTXCorrupted", litestream.ErrLTXCorrupted, true},
+		{"ChecksumMismatch", litestream.ErrChecksumMismatch, true},
+		{"WrappedCorrupted", fmt.Errorf("%w: bad data", litestream.ErrLTXCorrupted), true},
+		{"PermissionDenied", os.ErrPermission, false},
+		{"GenericError", errors.New("something went wrong"), false},
+		{"IOError", fmt.Errorf("disk failure: %w", errors.New("EIO")), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ltxErr := litestream.NewLTXError("open", "/path/to/file.ltx", 0, 1, 1, tt.err)
+			if got := ltxErr.IsAutoRecoverable(); got != tt.recoverable {
+				t.Fatalf("IsAutoRecoverable()=%v, want %v (err=%v)", got, tt.recoverable, tt.err)
+			}
+		})
+	}
 }

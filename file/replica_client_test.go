@@ -780,9 +780,16 @@ func TestReplicaClient_OpenLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
 		if ltxErr.Op != "open" {
 			t.Fatalf("expected op=open, got %q", ltxErr.Op)
 		}
+		if !ltxErr.IsAutoRecoverable() {
+			t.Fatal("missing file error should be auto-recoverable")
+		}
 	})
 
 	t.Run("PermissionDenied", func(t *testing.T) {
+		if os.Getuid() == 0 {
+			t.Skip("test requires non-root (chmod 000 has no effect as root)")
+		}
+
 		dir := t.TempDir()
 		c := file.NewReplicaClient(dir)
 
@@ -806,6 +813,9 @@ func TestReplicaClient_OpenLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
 		}
 		if ltxErr.Op != "open" {
 			t.Fatalf("expected op=open, got %q", ltxErr.Op)
+		}
+		if ltxErr.IsAutoRecoverable() {
+			t.Fatal("permission-denied error should not be auto-recoverable")
 		}
 	})
 }
