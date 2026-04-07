@@ -183,7 +183,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	filename := r.db.LTXPath(level, minTXID, maxTXID)
 	f, err := os.Open(filename)
 	if err != nil {
-		return err
+		return NewLTXError("open", filename, level, uint64(minTXID), uint64(maxTXID), err)
 	}
 	defer func() { _ = f.Close() }()
 

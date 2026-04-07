@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -137,6 +138,54 @@ func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	if got, want := err.Error(), "level 0 listing failed"; !bytes.Contains([]byte(got), []byte(want)) {
 		t.Fatalf("error=%q, want substring %q", got, want)
 	}
+}
+
+func TestReplica_UploadLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
+	t.Run("MissingFile", func(t *testing.T) {
+		db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+		r := NewReplicaWithClient(db, &followTestReplicaClient{})
+
+		err := r.uploadLTXFile(context.Background(), 0, 1, 1)
+		if err == nil {
+			t.Fatal("expected error for missing LTX file")
+		}
+
+		var ltxErr *LTXError
+		if !errors.As(err, &ltxErr) {
+			t.Fatalf("expected *LTXError, got %T: %v", err, err)
+		}
+		if ltxErr.Op != "open" {
+			t.Fatalf("expected op=open, got %q", ltxErr.Op)
+		}
+	})
+
+	t.Run("PermissionDenied", func(t *testing.T) {
+		dir := t.TempDir()
+		db := NewDB(filepath.Join(dir, "test.db"))
+		r := NewReplicaWithClient(db, &followTestReplicaClient{})
+
+		ltxDir := db.LTXLevelDir(0)
+		if err := os.MkdirAll(ltxDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		ltxPath := db.LTXPath(0, 1, 1)
+		if err := os.WriteFile(ltxPath, []byte("data"), 0o000); err != nil {
+			t.Fatal(err)
+		}
+
+		err := r.uploadLTXFile(context.Background(), 0, 1, 1)
+		if err == nil {
+			t.Fatal("expected error for permission denied")
+		}
+
+		var ltxErr *LTXError
+		if !errors.As(err, &ltxErr) {
+			t.Fatalf("expected *LTXError, got %T: %v", err, err)
+		}
+		if ltxErr.Op != "open" {
+			t.Fatalf("expected op=open, got %q", ltxErr.Op)
+		}
+	})
 }
 
 func TestReplica_ApplyLTXFile_VerifiesChecksumOnClose(t *testing.T) {
