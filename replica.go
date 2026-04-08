@@ -1200,17 +1200,17 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 				return err
 			}
 		}
-		if err := r.writeWALSegmentV3(ctx, client, generation, seg, f); err != nil {
+		if err := r.appendWALSegmentV3(ctx, client, generation, seg, f); err != nil {
 			return fmt.Errorf("write WAL segment %d/%d: %w", seg.Index, seg.Offset, err)
 		}
-		r.Logger().Debug("wrote WAL segment", "index", seg.Index, "offset", seg.Offset)
+		r.Logger().Debug("wrote WAL segment", "generation", generation, "index", seg.Index, "offset", seg.Offset)
 	}
 
 	return applyLastWalFile()
 }
 
-// writeWALSegmentV3 writes a single WAL segment to the WAL file.
-func (r *Replica) writeWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, f *os.File) error {
+// appendWALSegmentV3 appends the specified segment to an open WAL file f.
+func (r *Replica) appendWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, f *os.File) error {
 	// Download WAL segment.
 	rc, err := client.OpenWALSegmentV3(ctx, generation, seg.Index, seg.Offset)
 	if err != nil {
