@@ -1177,7 +1177,7 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 		}
 	}()
 
-	applyLastWalSegment := func() error {
+	applyLastWalFile := func() error {
 		if f == nil {
 			return nil
 		} else if err = f.Close(); err != nil {
@@ -1191,11 +1191,11 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 	// to the db.
 	for _, seg := range segments {
 		if seg.Offset == 0 {
-			// Apply the last WAL segment, if any
-			if err = applyLastWalSegment(); err != nil {
+			// Apply the last WAL file, if any
+			if err = applyLastWalFile(); err != nil {
 				return err
 			}
-			// Open a new WAL segment
+			// Open a new WAL file
 			if f, err = os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY, 0644); err != nil {
 				return err
 			}
@@ -1206,7 +1206,7 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 		r.Logger().Debug("wrote WAL segment", "index", seg.Index, "offset", seg.Offset)
 	}
 
-	return applyLastWalSegment()
+	return applyLastWalFile()
 }
 
 // writeWALSegmentV3 writes a single WAL segment to the WAL file.
