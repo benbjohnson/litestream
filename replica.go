@@ -1168,18 +1168,49 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 
 	// Write all WAL segments to the WAL file.
 	walPath := dbPath + "-wal"
-	for _, seg := range segments {
-		if err := r.writeWALSegmentV3(ctx, client, generation, seg, walPath); err != nil {
-			return fmt.Errorf("write WAL segment %d/%d: %w", seg.Index, seg.Offset, err)
+	var f *os.File
+	var err error
+
+	defer func() {
+		if f != nil {
+			_ = f.Close()
 		}
+	}()
+
+	applyLastWalFile := func() error {
+		if f == nil {
+			return nil
+		} else if err = f.Close(); err != nil {
+			return err
+		}
+		f = nil
+		return checkpointV3(dbPath)
 	}
 
-	// Checkpoint to apply WAL to database.
-	return checkpointV3(dbPath)
+	// Reconstruct each wal file, appending non-zero offsets, and apply them
+	// to the db.
+	for _, seg := range segments {
+		if seg.Offset == 0 {
+			// Apply the last WAL file, if any
+			if err = applyLastWalFile(); err != nil {
+				return err
+			}
+			// Open a new WAL file
+			if f, err = os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY, 0644); err != nil {
+				return err
+			}
+		}
+		if err := r.appendWALSegmentV3(ctx, client, generation, seg, f); err != nil {
+			return fmt.Errorf("write WAL segment %d/%d: %w", seg.Index, seg.Offset, err)
+		}
+		r.Logger().Debug("wrote WAL segment", "generation", generation, "index", seg.Index, "offset", seg.Offset)
+	}
+
+	return applyLastWalFile()
 }
 
-// writeWALSegmentV3 writes a single WAL segment to the WAL file.
-func (r *Replica) writeWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, walPath string) error {
+// appendWALSegmentV3 appends the specified segment to an open WAL file f.
+func (r *Replica) appendWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, f *os.File) error {
 	// Download WAL segment.
 	rc, err := client.OpenWALSegmentV3(ctx, generation, seg.Index, seg.Offset)
 	if err != nil {
@@ -1187,21 +1218,8 @@ func (r *Replica) writeWALSegmentV3(ctx context.Context, client ReplicaClientV3,
 	}
 	defer func() { _ = rc.Close() }()
 
-	// Open WAL file for writing.
-	f, err := os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY, 0644)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = f.Close() }()
-
-	// Seek to offset and write.
-	if _, err := f.Seek(seg.Offset, io.SeekStart); err != nil {
-		return err
-	}
-	if _, err := io.Copy(f, rc); err != nil {
-		return err
-	}
-	return f.Sync()
+	_, err = io.Copy(f, rc)
+	return err
 }
 
 // checkpointV3 checkpoints the WAL file into the database.
