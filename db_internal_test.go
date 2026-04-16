@@ -2317,3 +2317,75 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatalf("cached l0 file info=%v, want MaxTXID=%d", gotL0AfterApply, result.l0FileInfo.MaxTXID)
 	}
 }
+
+func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if !db.syncState.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd=false, want true after sync")
+	}
+	oldSyncedToWALEnd := db.syncState.syncedToWALEnd
+
+	if err := os.Truncate(db.WALPath(), WALHeaderSize); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.verifyAndSync(ctx, false, &db.syncState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.synced {
+		t.Fatal("verifyAndSync reported a sync, want no sync after truncation without new writes")
+	}
+	if result.syncedToWALEnd {
+		t.Fatal("result.syncedToWALEnd=true, want false")
+	}
+	if db.syncState.syncedToWALEnd != oldSyncedToWALEnd {
+		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncState.syncedToWALEnd, oldSyncedToWALEnd)
+	}
+
+	db.applySyncResult(&db.syncState, result)
+
+	if db.syncState.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd=true after apply, want false")
+	}
+}
