@@ -1129,9 +1129,19 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.TruncatePageN > 0 && origWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)) {
+		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
 		db.Logger.Info("forcing truncate checkpoint",
 			"wal_size", origWALSize,
-			"threshold", calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)))
+			"threshold", truncateThreshold)
+
+		if err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
+			if !isSQLiteBusyError(err) {
+				return err
+			}
+		} else if exec.state.lastSyncedWALOffset < truncateThreshold {
+			return nil
+		}
+
 		return db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
 	}
 
@@ -1964,6 +1974,8 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	defer db.chkMu.Unlock()
 
+	const checkpointSeqSQL = `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
+
 	// Read WAL header before checkpoint to check if it has been restarted.
 	hdr, err := readWALHeader(db.WALPath())
 	if err != nil {
@@ -1977,11 +1989,52 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	exec.applySyncResult(result)
 
+	var barrierTx *sql.Tx
+	if mode == CheckpointModePassive {
+		barrierTx, err = db.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin passive checkpoint barrier: %w", err)
+		}
+		defer func() {
+			if barrierTx != nil {
+				_ = rollback(barrierTx)
+			}
+		}()
+
+		if _, err := barrierTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+			return fmt.Errorf("_litestream_lock: %w", err)
+		}
+
+		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec)
+		if err != nil {
+			return fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
+		}
+		exec.applySyncResult(result)
+	}
+
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	preCheckpointFrameN := 0
+	if exec.state.lastSyncedWALOffset > WALHeaderSize {
+		preCheckpointFrameN = int((exec.state.lastSyncedWALOffset - WALHeaderSize) / frameSize)
+	}
+
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
-	if err := db.execCheckpoint(ctx, mode); err != nil {
+	checkpointRow, err := db.execCheckpoint(ctx, mode)
+	if err != nil {
 		return err
-	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
+	}
+
+	if barrierTx != nil {
+		if _, err = barrierTx.ExecContext(ctx, checkpointSeqSQL); err != nil {
+			return err
+		} else if _, err = barrierTx.ExecContext(ctx, `DELETE FROM _litestream_lock`); err != nil {
+			return err
+		} else if err = barrierTx.Commit(); err != nil {
+			return err
+		}
+		barrierTx = nil
+	} else if _, err = db.db.ExecContext(ctx, checkpointSeqSQL); err != nil {
 		return err
 	}
 
@@ -1989,6 +2042,26 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	if err != nil {
 		return err
 	} else if bytes.Equal(hdr, other) {
+		exec.state.syncedSinceCheckpoint = false
+		return nil
+	}
+
+	if mode == CheckpointModePassive {
+		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec)
+		if err != nil {
+			return fmt.Errorf("cannot copy wal after passive checkpoint: %w", err)
+		}
+		exec.applySyncResult(result)
+		exec.state.syncedSinceCheckpoint = false
+		return nil
+	}
+
+	if checkpointRow[1] <= preCheckpointFrameN {
+		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec)
+		if err != nil {
+			return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
+		}
+		exec.applySyncResult(result)
 		exec.state.syncedSinceCheckpoint = false
 		return nil
 	}
@@ -2033,10 +2106,10 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	return nil
 }
 
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (row [3]int, err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
-		return nil
+		return row, nil
 	}
 
 	// Track checkpoint metrics.
@@ -2053,7 +2126,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ensure the read lock has been removed before issuing a checkpoint.
 	// We defer the re-acquire to ensure it occurs even on an early return.
 	if err := db.releaseReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return row, fmt.Errorf("release read lock: %w", err)
 	}
 	defer func() { _ = db.acquireReadLock(ctx) }()
 
@@ -2065,18 +2138,17 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
-	var row [3]int
 	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return err
+		return row, err
 	}
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(ctx); err != nil {
-		return fmt.Errorf("reacquire read lock: %w", err)
+		return row, fmt.Errorf("reacquire read lock: %w", err)
 	}
 
-	return nil
+	return row, nil
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.

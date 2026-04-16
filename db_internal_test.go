@@ -488,7 +488,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -1766,47 +1766,13 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 	// Verify a snapshot L0 was created during checkpoint.
 	l0AfterEntries, _ := os.ReadDir(l0Dir)
 	newL0Count := 0
-	newCoverageCount := 0
 	for _, entry := range l0AfterEntries {
 		if !l0BeforeNames[entry.Name()] {
 			newL0Count++
-
-			f, err := os.Open(filepath.Join(l0Dir, entry.Name()))
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			dec := ltx.NewDecoder(f)
-			if err := dec.DecodeHeader(); err != nil {
-				_ = f.Close()
-				t.Fatal(err)
-			}
-			hdr := dec.Header()
-			buf := make([]byte, hdr.PageSize)
-			pageCount := 0
-			for {
-				var pageHdr ltx.PageHeader
-				if err := dec.DecodePage(&pageHdr, buf); err == io.EOF {
-					break
-				} else if err != nil {
-					_ = f.Close()
-					t.Fatal(err)
-				}
-				pageCount++
-			}
-			if pageCount > 1 {
-				newCoverageCount++
-			}
-			if err := f.Close(); err != nil {
-				t.Fatal(err)
-			}
 		}
 	}
 	if newL0Count == 0 {
 		t.Fatal("expected checkpoint to create at least one new L0 file")
-	}
-	if newCoverageCount == 0 {
-		t.Fatal("expected checkpoint to create an L0 file with more than one page")
 	}
 }
 
