@@ -2026,15 +2026,13 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 
 	if barrierTx != nil {
-		if _, err = barrierTx.ExecContext(ctx, checkpointSeqSQL); err != nil {
-			return err
-		} else if _, err = barrierTx.ExecContext(ctx, `DELETE FROM _litestream_lock`); err != nil {
-			return err
-		} else if err = barrierTx.Commit(); err != nil {
-			return err
+		if err = rollback(barrierTx); err != nil {
+			return fmt.Errorf("rollback passive checkpoint barrier: %w", err)
 		}
 		barrierTx = nil
-	} else if _, err = db.db.ExecContext(ctx, checkpointSeqSQL); err != nil {
+	}
+
+	if _, err = db.db.ExecContext(ctx, checkpointSeqSQL); err != nil {
 		return err
 	}
 
