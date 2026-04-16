@@ -1870,14 +1870,6 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 		return
 	}
 
-	db.mu.Lock()
-	db.syncState = exec.state
-	if notify && exec.synced {
-		close(db.notify)
-		db.notify = make(chan struct{})
-	}
-	db.mu.Unlock()
-
 	// Only publish the position if this executor advanced it. Republishing
 	// the snapshot taken at executor start would clobber concurrent cache
 	// invalidation (e.g. ResetLocalState) with a stale position.
@@ -1894,6 +1886,14 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 		db.maxLTXFileInfos.m[0] = &info
 		db.maxLTXFileInfos.Unlock()
 	}
+
+	db.mu.Lock()
+	db.syncState = exec.state
+	if notify && exec.synced {
+		close(db.notify)
+		db.notify = make(chan struct{})
+	}
+	db.mu.Unlock()
 }
 
 func (exec *syncExecutor) applySyncResult(result syncResult) {
@@ -2358,7 +2358,8 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	if other, err := readWALHeader(db.WALPath()); err != nil {
+	other, err := readWALHeader(db.WALPath())
+	if err != nil {
 		return err
 	} else if bytes.Equal(hdr, other) {
 		exec.state.syncedSinceCheckpoint = false
@@ -2391,9 +2392,16 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+	snapshotInfo := syncInfo{
+		offset:       WALHeaderSize,
+		salt1:        binary.BigEndian.Uint32(other[16:]),
+		salt2:        binary.BigEndian.Uint32(other[20:]),
+		snapshotting: true,
+		reason:       "checkpoint boundary snapshot",
+	}
+	result, err = db.sync(ctx, true, exec, snapshotInfo, 0)
 	if err != nil {
-		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
+		return fmt.Errorf("cannot snapshot after checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
 
