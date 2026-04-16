@@ -1766,13 +1766,47 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 	// Verify a snapshot L0 was created during checkpoint.
 	l0AfterEntries, _ := os.ReadDir(l0Dir)
 	newL0Count := 0
+	newCoverageCount := 0
 	for _, entry := range l0AfterEntries {
 		if !l0BeforeNames[entry.Name()] {
 			newL0Count++
+
+			f, err := os.Open(filepath.Join(l0Dir, entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			dec := ltx.NewDecoder(f)
+			if err := dec.DecodeHeader(); err != nil {
+				_ = f.Close()
+				t.Fatal(err)
+			}
+			hdr := dec.Header()
+			buf := make([]byte, hdr.PageSize)
+			pageCount := 0
+			for {
+				var pageHdr ltx.PageHeader
+				if err := dec.DecodePage(&pageHdr, buf); err == io.EOF {
+					break
+				} else if err != nil {
+					_ = f.Close()
+					t.Fatal(err)
+				}
+				pageCount++
+			}
+			if pageCount > 1 {
+				newCoverageCount++
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	if newL0Count == 0 {
 		t.Fatal("expected checkpoint to create at least one new L0 file")
+	}
+	if newCoverageCount == 0 {
+		t.Fatal("expected checkpoint to create an L0 file with more than one page")
 	}
 }
 
@@ -1896,10 +1930,18 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	case err := <-writerDone:
 		t.Fatalf("writer exited before starting: %v", err)
 	}
-	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
-		cancelWriter()
-		<-writerDone
-		t.Fatal(err)
+	checkpointDeadline := time.Now().Add(5 * time.Second)
+	for {
+		err := db.Checkpoint(ctx, CheckpointModeTruncate)
+		if err == nil {
+			break
+		}
+		if !isSQLiteBusyError(err) || time.Now().After(checkpointDeadline) {
+			cancelWriter()
+			<-writerDone
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancelWriter()
 	if err := <-writerDone; err != nil {
@@ -2018,6 +2060,55 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	}
 
 	t.Logf("all %d pages present across L0 files (commit=%d)", len(allPages), maxCommit)
+
+	replicaDir := t.TempDir()
+	replicaL0Dir := filepath.Join(replicaDir, "l0")
+	if err := os.Mkdir(replicaL0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l0Entries, err := os.ReadDir(db.LTXLevelDir(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range l0Entries {
+		srcPath := filepath.Join(db.LTXLevelDir(0), entry.Name())
+		dstPath := filepath.Join(replicaL0Dir, entry.Name())
+
+		src, err := os.Open(srcPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			_ = src.Close()
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			_ = src.Close()
+			_ = dst.Close()
+			t.Fatal(err)
+		}
+		if err := src.Close(); err != nil {
+			_ = dst.Close()
+			t.Fatal(err)
+		}
+		if err := dst.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	restorePath := filepath.Join(dir, "restored.db")
+	restoreDB := NewDB(restorePath)
+	restoreReplica := NewReplica(restoreDB)
+	restoreReplica.Client = &testReplicaClient{dir: replicaDir}
+
+	restoreOpt := NewRestoreOptions()
+	restoreOpt.OutputPath = restorePath
+	restoreOpt.IntegrityCheck = IntegrityCheckFull
+
+	if err := restoreReplica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatalf("restore from local ltx chain: %v", err)
+	}
 }
 
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
