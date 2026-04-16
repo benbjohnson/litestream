@@ -1502,6 +1502,13 @@ func calcWALSize(pageSize uint32, pageN uint32) int64 {
 	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
 }
 
+const bumpLitestreamSeqSQL = `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
+
+func (db *DB) bumpLitestreamSeq(ctx context.Context) error {
+	_, err := db.db.ExecContext(ctx, bumpLitestreamSeqSQL)
+	return err
+}
+
 // ensureWALExists checks that the real WAL exists and has a header.
 func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	// Exit early if WAL header exists.
@@ -1510,8 +1517,7 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	}
 
 	// Otherwise create transaction that updates the internal litestream table.
-	_, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
-	return err
+	return db.bumpLitestreamSeq(ctx)
 }
 
 // checkDatabaseBehindReplica detects when a database has been restored to an
@@ -2326,8 +2332,6 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	defer db.chkMu.Unlock()
 
-	const checkpointSeqSQL = `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
-
 	// Read WAL header before checkpoint to check if it has been restarted.
 	db.setSyncDiagPhase(diagPhaseCheckpointReadWALHeader,
 		func(s *diagState) {
@@ -2399,8 +2403,8 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		barrierTx = nil
 	}
 
-	if _, err = db.db.ExecContext(ctx, checkpointSeqSQL); err != nil {
-		return err
+	if err = db.bumpLitestreamSeq(ctx); err != nil {
+		return fmt.Errorf("bump litestream seq: %w", err)
 	}
 
 	// If WAL hasn't been restarted, exit.
