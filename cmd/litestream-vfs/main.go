@@ -17,14 +17,12 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 	"unsafe"
 
-	"github.com/psanford/sqlite3vfs"
-
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal/sqlite3vfs"
 
 	// Import all replica backends to register their URL factories.
 	_ "github.com/benbjohnson/litestream/abs"
@@ -120,41 +118,8 @@ func GoLitestreamConfigure(dbName *C.char, key *C.char, value *C.char) *C.char {
 		cfg = &litestream.VFSConfig{}
 	}
 
-	switch k {
-	case "replica_url":
-		cfg.ReplicaURL = v
-	case "write_enabled":
-		b := strings.ToLower(v) == "true" || v == "1"
-		cfg.WriteEnabled = &b
-	case "sync_interval":
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return C.CString(fmt.Sprintf("invalid sync_interval: %s", err))
-		}
-		cfg.SyncInterval = &d
-	case "buffer_path":
-		cfg.BufferPath = v
-	case "hydration_enabled":
-		b := strings.ToLower(v) == "true" || v == "1"
-		cfg.HydrationEnabled = &b
-	case "hydration_path":
-		cfg.HydrationPath = v
-	case "poll_interval":
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return C.CString(fmt.Sprintf("invalid poll_interval: %s", err))
-		}
-		cfg.PollInterval = &d
-	case "cache_size":
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return C.CString(fmt.Sprintf("invalid cache_size: %s", err))
-		}
-		cfg.CacheSize = &n
-	case "log_level":
-		cfg.LogLevel = v
-	default:
-		return C.CString(fmt.Sprintf("unknown config key: %s", k))
+	if err := cfg.Set(k, v); err != nil {
+		return C.CString(err.Error())
 	}
 
 	litestream.SetVFSConfig(name, cfg)
