@@ -23,8 +23,9 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/markusmobius/go-dateparser"
-	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal/sqlite3vfs"
 )
 
 const (
@@ -40,10 +41,10 @@ const (
 var ErrConflict = errors.New("remote has newer transactions than expected")
 
 var (
-	//go:linkname sqlite3vfsFileMap github.com/psanford/sqlite3vfs.fileMap
+	//go:linkname sqlite3vfsFileMap github.com/benbjohnson/litestream/internal/sqlite3vfs.fileMap
 	sqlite3vfsFileMap map[uint64]sqlite3vfs.File
 
-	//go:linkname sqlite3vfsFileMux github.com/psanford/sqlite3vfs.fileMux
+	//go:linkname sqlite3vfsFileMux github.com/benbjohnson/litestream/internal/sqlite3vfs.fileMux
 	sqlite3vfsFileMux sync.Mutex
 
 	vfsConnectionMap sync.Map // map[uintptr]uint64
@@ -125,25 +126,32 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	slog.Debug("opening file", "name", name, "flags", flags)
+	return vfs.OpenFilename(sqlite3vfs.NewFilename(name, nil), flags)
+}
+
+func (vfs *VFS) OpenFilename(name sqlite3vfs.Filename, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	fileName := name.String()
+	slog.Debug("opening file", "name", fileName, "flags", flags)
 
 	switch {
 	case flags&sqlite3vfs.OpenMainDB != 0:
-		return vfs.openMainDB(name, flags)
+		return vfs.openMainDB(fileName, name.URIParameters(), flags)
 	case vfs.requiresTempFile(flags):
-		return vfs.openTempFile(name, flags)
+		return vfs.openTempFile(fileName, flags)
 	default:
 		return nil, flags, sqlite3vfs.CantOpenError
 	}
 }
 
-func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	cfg := GetVFSConfig(name)
+func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	cfg, err := vfs.configForOpen(name, uriParameters)
+	if err != nil {
+		return nil, 0, err
+	}
 
 	client := vfs.client
 	var perConnClient bool
 	if cfg != nil && cfg.ReplicaURL != "" {
-		var err error
 		client, err = NewReplicaClientFromURL(cfg.ReplicaURL)
 		if err != nil {
 			return nil, 0, fmt.Errorf("create per-connection replica client: %w", err)
@@ -155,7 +163,7 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	if client == nil {
-		return nil, 0, fmt.Errorf("no replica client configured: set LITESTREAM_REPLICA_URL or use SetVFSConfig")
+		return nil, 0, fmt.Errorf("no replica client configured: set LITESTREAM_REPLICA_URL, use SetVFSConfig, or pass replica_url in the database URI")
 	}
 
 	f := NewVFSFile(client, name, vfs.logger.With("name", name))
@@ -274,6 +282,15 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	return f, flags, nil
+}
+
+func (vfs *VFS) configForOpen(name string, uriParameters map[string]string) (*VFSConfig, error) {
+	cfg := GetVFSConfig(name)
+	uriCfg, err := ParseVFSURIConfig(uriParameters)
+	if err != nil {
+		return nil, err
+	}
+	return MergeVFSConfig(cfg, uriCfg), nil
 }
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
