@@ -102,20 +102,52 @@ func TestVFSConfig_NilOptionalFields(t *testing.T) {
 func TestVFSConfig_CopyOnSetAndGet(t *testing.T) {
 	defer clearVFSConfigs()
 
-	cfg := &VFSConfig{ReplicaURL: "s3://bucket/original"}
+	writeEnabled := true
+	syncInterval := time.Second
+	hydrationEnabled := true
+	pollInterval := 5 * time.Second
+	cacheSize := 1024
+	cfg := &VFSConfig{
+		ReplicaURL:       "s3://bucket/original",
+		WriteEnabled:     &writeEnabled,
+		SyncInterval:     &syncInterval,
+		HydrationEnabled: &hydrationEnabled,
+		PollInterval:     &pollInterval,
+		CacheSize:        &cacheSize,
+	}
 	SetVFSConfig("copy.db", cfg)
 
 	cfg.ReplicaURL = "s3://bucket/mutated"
+	writeEnabled = false
+	syncInterval = 2 * time.Second
+	hydrationEnabled = false
+	pollInterval = 10 * time.Second
+	cacheSize = 2048
 
 	got := GetVFSConfig("copy.db")
 	if got.ReplicaURL != "s3://bucket/original" {
 		t.Fatalf("expected original url, got %q (SetVFSConfig did not copy)", got.ReplicaURL)
 	}
+	assertVFSConfigPointerValues(t, got, true, time.Second, true, 5*time.Second, 1024)
 
 	got.ReplicaURL = "s3://bucket/mutated-via-get"
+	*got.WriteEnabled = false
+	*got.SyncInterval = 3 * time.Second
+	*got.HydrationEnabled = false
+	*got.PollInterval = 30 * time.Second
+	*got.CacheSize = 4096
+
 	got2 := GetVFSConfig("copy.db")
 	if got2.ReplicaURL != "s3://bucket/original" {
 		t.Fatalf("expected original url, got %q (GetVFSConfig did not copy)", got2.ReplicaURL)
+	}
+	assertVFSConfigPointerValues(t, got2, true, time.Second, true, 5*time.Second, 1024)
+}
+
+func TestVFSConfig_LogLevelUnsupported(t *testing.T) {
+	cfg := &VFSConfig{}
+	if err := cfg.Set("log_level", "debug"); err == nil {
+		t.Fatal("expected unsupported log_level to return error")
 	}
 }
 
@@ -134,7 +166,7 @@ func TestVFSConfig_PerConnectionOverrides(t *testing.T) {
 
 	vfs := NewVFS(client, slog.Default())
 
-	f, _, err := vfs.openMainDB("config-override.db", 0x00000100)
+	f, _, err := vfs.openMainDB("config-override.db", nil, 0x00000100)
 	if err != nil {
 		t.Fatalf("open main db: %v", err)
 	}
@@ -149,12 +181,35 @@ func TestVFSConfig_PerConnectionOverrides(t *testing.T) {
 	}
 }
 
+func TestVFSConfig_URIOverridesRegistry(t *testing.T) {
+	defer clearVFSConfigs()
+
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+
+	registryPoll := 3 * time.Second
+	SetVFSConfig("uri-override.db", &VFSConfig{PollInterval: &registryPoll})
+
+	vfs := NewVFS(client, slog.Default())
+
+	f, _, err := vfs.openMainDB("uri-override.db", map[string]string{"poll_interval": "7s"}, 0x00000100)
+	if err != nil {
+		t.Fatalf("open main db: %v", err)
+	}
+	defer f.Close()
+
+	vfsFile := f.(*VFSFile)
+	if vfsFile.PollInterval != 7*time.Second {
+		t.Fatalf("expected poll interval 7s, got %v", vfsFile.PollInterval)
+	}
+}
+
 func TestVFS_NilClientReturnsError(t *testing.T) {
 	defer clearVFSConfigs()
 
 	vfs := NewVFS(nil, slog.Default())
 
-	_, _, err := vfs.openMainDB("no-client.db", 0x00000100)
+	_, _, err := vfs.openMainDB("no-client.db", nil, 0x00000100)
 	if err == nil {
 		t.Fatal("expected error when no client configured, got nil")
 	}
@@ -164,4 +219,23 @@ func clearVFSConfigs() {
 	vfsConfigsMu.Lock()
 	defer vfsConfigsMu.Unlock()
 	vfsConfigs = make(map[string]*VFSConfig)
+}
+
+func assertVFSConfigPointerValues(tb testing.TB, cfg *VFSConfig, writeEnabled bool, syncInterval time.Duration, hydrationEnabled bool, pollInterval time.Duration, cacheSize int) {
+	tb.Helper()
+	if cfg.WriteEnabled == nil || *cfg.WriteEnabled != writeEnabled {
+		tb.Fatalf("expected write enabled %v, got %v", writeEnabled, cfg.WriteEnabled)
+	}
+	if cfg.SyncInterval == nil || *cfg.SyncInterval != syncInterval {
+		tb.Fatalf("expected sync interval %v, got %v", syncInterval, cfg.SyncInterval)
+	}
+	if cfg.HydrationEnabled == nil || *cfg.HydrationEnabled != hydrationEnabled {
+		tb.Fatalf("expected hydration enabled %v, got %v", hydrationEnabled, cfg.HydrationEnabled)
+	}
+	if cfg.PollInterval == nil || *cfg.PollInterval != pollInterval {
+		tb.Fatalf("expected poll interval %v, got %v", pollInterval, cfg.PollInterval)
+	}
+	if cfg.CacheSize == nil || *cfg.CacheSize != cacheSize {
+		tb.Fatalf("expected cache size %v, got %v", cacheSize, cfg.CacheSize)
+	}
 }
