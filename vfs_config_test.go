@@ -3,8 +3,11 @@
 package litestream
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/url"
 	"sync"
 	"testing"
 	"time"
@@ -215,10 +218,61 @@ func TestVFS_NilClientReturnsError(t *testing.T) {
 	}
 }
 
+func TestVFS_PerConnectionReplicaClientInitFailureClosesClient(t *testing.T) {
+	defer clearVFSConfigs()
+
+	initErr := errors.New("init failed")
+	client := &initFailReplicaClient{mockReplicaClient: newMockReplicaClient(), initErr: initErr}
+	registerTestReplicaClientFactory(t, "vfs-init-fail", func(string, string, string, url.Values, *url.Userinfo) (ReplicaClient, error) {
+		return client, nil
+	})
+
+	vfs := NewVFS(nil, slog.Default())
+	_, _, err := vfs.openMainDB("init-fail.db", map[string]string{"replica_url": "vfs-init-fail://bucket/path"}, 0x00000100)
+	if !errors.Is(err, initErr) {
+		t.Fatalf("expected init error, got %v", err)
+	}
+	if !client.closed {
+		t.Fatal("expected init-failed per-connection client to close")
+	}
+}
+
 func clearVFSConfigs() {
 	vfsConfigsMu.Lock()
 	defer vfsConfigsMu.Unlock()
 	vfsConfigs = make(map[string]*VFSConfig)
+}
+
+func registerTestReplicaClientFactory(tb testing.TB, scheme string, factory ReplicaClientFactory) {
+	tb.Helper()
+
+	replicaClientFactoriesMu.Lock()
+	oldFactory, hadOldFactory := replicaClientFactories[scheme]
+	replicaClientFactories[scheme] = factory
+	replicaClientFactoriesMu.Unlock()
+
+	tb.Cleanup(func() {
+		replicaClientFactoriesMu.Lock()
+		defer replicaClientFactoriesMu.Unlock()
+		if hadOldFactory {
+			replicaClientFactories[scheme] = oldFactory
+		} else {
+			delete(replicaClientFactories, scheme)
+		}
+	})
+}
+
+type initFailReplicaClient struct {
+	*mockReplicaClient
+	initErr error
+	closed  bool
+}
+
+func (c *initFailReplicaClient) Init(context.Context) error { return c.initErr }
+
+func (c *initFailReplicaClient) Close() error {
+	c.closed = true
+	return nil
 }
 
 func assertVFSConfigPointerValues(tb testing.TB, cfg *VFSConfig, writeEnabled bool, syncInterval time.Duration, hydrationEnabled bool, pollInterval time.Duration, cacheSize int) {
