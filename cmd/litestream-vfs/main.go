@@ -21,7 +21,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/psanford/sqlite3vfs"
+	"github.com/corylanou/sqlite3vfs"
 
 	"github.com/benbjohnson/litestream"
 
