@@ -57,6 +57,7 @@ require (
 )
 
 require (
+	github.com/corylanou/sqlite3vfs v0.0.0-20260421183553-1656bf6ea7f7
 	github.com/pierrec/lz4/v4 v4.1.22
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260209214922-2f26647a795e
@@ -114,7 +115,6 @@ require (
 	github.com/prometheus/client_model v0.5.0 // indirect
 	github.com/prometheus/common v0.45.0 // indirect
 	github.com/prometheus/procfs v0.12.0 // indirect
-	github.com/psanford/sqlite3vfs v0.0.0-20260421161058-a9ece85b5678
 	github.com/spf13/cast v1.7.1 // indirect
 	github.com/tetratelabs/wazero v1.2.1 // indirect
 	github.com/wasilibs/go-re2 v1.3.0 // indirect
@@ -137,5 +137,3 @@ require (
 	google.golang.org/protobuf v1.33.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/psanford/sqlite3vfs => github.com/corylanou/sqlite3vfs v0.0.0-20260421161058-a9ece85b5678

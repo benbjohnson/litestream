@@ -83,8 +83,8 @@ github.com/client9/misspell v0.3.4/go.mod h1:qj6jICC3Q7zFZvVWo7KLAzC3yx5G7kyvSDk
 github.com/cncf/udpa/go v0.0.0-20191209042840-269d4d468f6f/go.mod h1:M8M6+tZqaGXZJjfX53e64911xZQV5JYwmTeXPW+k8Sc=
 github.com/cncf/xds/go v0.0.0-20230607035331-e9ce68804cb4 h1:/inchEIKaYC1Akx+H+gqO04wryn5h75LSazbRlnya1k=
 github.com/cncf/xds/go v0.0.0-20230607035331-e9ce68804cb4/go.mod h1:eXthEFrGJvWHgFFCl3hGmgk+/aYT6PnTQLykKQRLhEs=
-github.com/corylanou/sqlite3vfs v0.0.0-20260421161058-a9ece85b5678 h1:KXSrAXQcdyfWXTzXTP9vHt3AEB2rxa3LiUeqRPnQLNk=
-github.com/corylanou/sqlite3vfs v0.0.0-20260421161058-a9ece85b5678/go.mod h1:iW4cSew5PAb1sMZiTEkVJAIBNrepaB6jTYjeP47WtI0=
+github.com/corylanou/sqlite3vfs v0.0.0-20260421183553-1656bf6ea7f7 h1:cl1ivhZRkA37uS9PVz6HjTCfl/lGmTpjvrukJ3blG7k=
+github.com/corylanou/sqlite3vfs v0.0.0-20260421183553-1656bf6ea7f7/go.mod h1:hsxGkc2fmUszYBRven+QBWYVXDLMLMnrLzPCuJ/wPPU=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c=
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
