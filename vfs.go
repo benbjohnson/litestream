@@ -157,6 +157,11 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 			return nil, 0, fmt.Errorf("create per-connection replica client: %w", err)
 		}
 		if err := client.Init(context.Background()); err != nil {
+			if closer, ok := client.(io.Closer); ok {
+				if closeErr := closer.Close(); closeErr != nil {
+					return nil, 0, fmt.Errorf("init per-connection replica client: %w", errors.Join(err, closeErr))
+				}
+			}
 			return nil, 0, fmt.Errorf("init per-connection replica client: %w", err)
 		}
 		perConnClient = true
