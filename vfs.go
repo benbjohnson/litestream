@@ -25,7 +25,7 @@ import (
 	"github.com/markusmobius/go-dateparser"
 	"github.com/superfly/ltx"
 
-	"github.com/benbjohnson/litestream/internal/sqlite3vfs"
+	"github.com/psanford/sqlite3vfs"
 )
 
 const (
@@ -41,10 +41,10 @@ const (
 var ErrConflict = errors.New("remote has newer transactions than expected")
 
 var (
-	//go:linkname sqlite3vfsFileMap github.com/benbjohnson/litestream/internal/sqlite3vfs.fileMap
+	//go:linkname sqlite3vfsFileMap github.com/psanford/sqlite3vfs.fileMap
 	sqlite3vfsFileMap map[uint64]sqlite3vfs.File
 
-	//go:linkname sqlite3vfsFileMux github.com/benbjohnson/litestream/internal/sqlite3vfs.fileMux
+	//go:linkname sqlite3vfsFileMux github.com/psanford/sqlite3vfs.fileMux
 	sqlite3vfsFileMux sync.Mutex
 
 	vfsConnectionMap sync.Map // map[uintptr]uint64
