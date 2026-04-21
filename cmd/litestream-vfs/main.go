@@ -21,8 +21,9 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/psanford/sqlite3vfs"
+
 	"github.com/benbjohnson/litestream"
-	"github.com/benbjohnson/litestream/internal/sqlite3vfs"
 
 	// Import all replica backends to register their URL factories.
 	_ "github.com/benbjohnson/litestream/abs"
