@@ -23,8 +23,9 @@ import (
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/markusmobius/go-dateparser"
-	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
+
+	"github.com/psanford/sqlite3vfs"
 )
 
 const (
@@ -125,39 +126,106 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	slog.Debug("opening file", "name", name, "flags", flags)
+	return vfs.OpenFilename(sqlite3vfs.NewFilename(name, nil), flags)
+}
+
+func (vfs *VFS) OpenFilename(name sqlite3vfs.Filename, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	fileName := name.String()
+	slog.Debug("opening file", "name", fileName, "flags", flags)
 
 	switch {
 	case flags&sqlite3vfs.OpenMainDB != 0:
-		return vfs.openMainDB(name, flags)
+		return vfs.openMainDB(fileName, name.URIParameters(), flags)
 	case vfs.requiresTempFile(flags):
-		return vfs.openTempFile(name, flags)
+		return vfs.openTempFile(fileName, flags)
 	default:
 		return nil, flags, sqlite3vfs.CantOpenError
 	}
 }
 
-func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	f := NewVFSFile(vfs.client, name, vfs.logger.With("name", name))
+func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	cfg, err := vfs.configForOpen(name, uriParameters)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	client := vfs.client
+	var perConnClient bool
+	if cfg != nil && cfg.ReplicaURL != "" {
+		client, err = NewReplicaClientFromURL(cfg.ReplicaURL)
+		if err != nil {
+			return nil, 0, fmt.Errorf("create per-connection replica client: %w", err)
+		}
+		if err := client.Init(context.Background()); err != nil {
+			if closer, ok := client.(io.Closer); ok {
+				if closeErr := closer.Close(); closeErr != nil {
+					return nil, 0, fmt.Errorf("init per-connection replica client: %w", errors.Join(err, closeErr))
+				}
+			}
+			return nil, 0, fmt.Errorf("init per-connection replica client: %w", err)
+		}
+		perConnClient = true
+	}
+
+	if client == nil {
+		return nil, 0, fmt.Errorf("no replica client configured: set LITESTREAM_REPLICA_URL, use SetVFSConfig, or pass replica_url in the database URI")
+	}
+
+	f := NewVFSFile(client, name, vfs.logger.With("name", name))
 	f.PollInterval = vfs.PollInterval
 	f.CacheSize = vfs.CacheSize
-	f.vfs = vfs // Store reference to parent VFS for config access
+	f.vfs = vfs
+	f.perConnClient = perConnClient
+
+	if cfg != nil {
+		if cfg.PollInterval != nil {
+			f.PollInterval = *cfg.PollInterval
+		}
+		if cfg.CacheSize != nil {
+			f.CacheSize = *cfg.CacheSize
+		}
+	}
+
+	writeEnabled := vfs.WriteEnabled
+	if cfg != nil && cfg.WriteEnabled != nil {
+		writeEnabled = *cfg.WriteEnabled
+	}
+
+	syncInterval := vfs.WriteSyncInterval
+	if cfg != nil && cfg.SyncInterval != nil {
+		syncInterval = *cfg.SyncInterval
+	}
+
+	bufferPath := vfs.WriteBufferPath
+	if cfg != nil && cfg.BufferPath != "" {
+		bufferPath = cfg.BufferPath
+	}
+
+	hydrationEnabled := vfs.HydrationEnabled
+	if cfg != nil && cfg.HydrationEnabled != nil {
+		hydrationEnabled = *cfg.HydrationEnabled
+	}
+
+	hydrationPath := vfs.HydrationPath
+	if cfg != nil && cfg.HydrationPath != "" {
+		hydrationPath = cfg.HydrationPath
+	}
 
 	// Initialize write support if enabled
-	if vfs.WriteEnabled {
+	if writeEnabled {
 		f.writeEnabled = true
 		f.dirty = make(map[uint32]int64)
-		f.syncInterval = vfs.WriteSyncInterval
+		f.syncInterval = syncInterval
 		if f.syncInterval == 0 {
 			f.syncInterval = DefaultSyncInterval
 		}
 
 		writeSeq := atomic.AddUint64(&vfs.writeSeq, 1)
-		if vfs.WriteBufferPath != "" {
+		if bufferPath != "" {
 			if writeSeq == 1 {
-				f.bufferPath = vfs.WriteBufferPath
+				f.bufferPath = bufferPath
 			} else {
-				f.bufferPath = vfs.WriteBufferPath + "." + strconv.FormatUint(writeSeq, 10)
+				f.bufferPath = bufferPath + "." + strconv.FormatUint(writeSeq, 10)
 			}
 		} else {
 			dir, err := vfs.ensureTempDir()
@@ -169,18 +237,16 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 
 		// Initialize compaction if enabled
 		if vfs.CompactionEnabled {
-			f.compactor = NewCompactor(vfs.client, f.logger)
-			// VFS has no local files, so leave LocalFileOpener/LocalFileDeleter nil
+			f.compactor = NewCompactor(client, f.logger)
 		}
 	}
 
 	// Initialize hydration support if enabled
-	if vfs.HydrationEnabled {
-		if vfs.HydrationPath != "" {
-			f.hydrationPath = vfs.HydrationPath
+	if hydrationEnabled {
+		if hydrationPath != "" {
+			f.hydrationPath = hydrationPath
 			f.hydrationPersistent = true
 		} else {
-			// Use a temp file if no path specified
 			dir, err := vfs.ensureTempDir()
 			if err != nil {
 				return nil, 0, fmt.Errorf("create temp dir for hydration: %w", err)
@@ -190,10 +256,15 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	if err := f.Open(); err != nil {
+		if perConnClient {
+			if closer, ok := client.(io.Closer); ok {
+				closer.Close()
+			}
+		}
 		return nil, 0, err
 	}
 
-	if vfs.WriteEnabled {
+	if writeEnabled {
 		vfs.writeMu.Lock()
 		if f.expectedTXID > vfs.lastSyncedTXID {
 			vfs.lastSyncedTXID = f.expectedTXID
@@ -216,6 +287,15 @@ func (vfs *VFS) openMainDB(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.F
 	}
 
 	return f, flags, nil
+}
+
+func (vfs *VFS) configForOpen(name string, uriParameters map[string]string) (*VFSConfig, error) {
+	cfg := GetVFSConfig(name)
+	uriCfg, err := ParseVFSURIConfig(uriParameters)
+	if err != nil {
+		return nil, err
+	}
+	return MergeVFSConfig(cfg, uriCfg), nil
 }
 
 func (vfs *VFS) Delete(name string, dirSync bool) error {
@@ -542,6 +622,8 @@ type VFSFile struct {
 	inTransaction bool             // True during active write transaction
 	disabling     bool             // True when write disable is in progress
 	cond          *sync.Cond       // Signals transaction state changes
+
+	perConnClient bool // True when client was created from config registry (close on file close)
 
 	hydrator            *Hydrator // Background hydration (nil if disabled)
 	hydrationPath       string    // Path for hydration file (set during Open)
@@ -1414,6 +1496,14 @@ func (f *VFSFile) Close() error {
 			f.vfs.writeFile = nil
 		}
 		f.vfs.writeMu.Unlock()
+	}
+
+	if f.perConnClient {
+		if closer, ok := f.client.(io.Closer); ok {
+			if err := closer.Close(); err != nil {
+				f.logger.Warn("failed to close per-connection client", "error", err)
+			}
+		}
 	}
 
 	return nil

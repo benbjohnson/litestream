@@ -17,8 +17,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
+
+	"github.com/psanford/sqlite3vfs"
 )
 
 // writeTestReplicaClient is a mock ReplicaClient for testing write functionality.
@@ -1773,7 +1774,7 @@ func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
 
 func openWriteVFSFile(t *testing.T, vfs *VFS) *VFSFile {
 	t.Helper()
-	file, _, err := vfs.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+	file, _, err := vfs.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1888,7 +1889,7 @@ func TestVFS_ConcurrentOpenAllSucceed(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			f, _, err := v.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+			f, _, err := v.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
 			errs[idx] = err
 			files[idx] = f
 		}(i)
@@ -1966,7 +1967,7 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 	v.WriteEnabled = true
 
 	// Open and acquire RESERVED
-	file1, _, err := v.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+	file1, _, err := v.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}

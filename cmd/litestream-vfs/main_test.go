@@ -21,10 +21,11 @@ import (
 	"time"
 
 	sqlite3 "github.com/mattn/go-sqlite3"
-	"github.com/psanford/sqlite3vfs"
 	"github.com/stretchr/testify/require"
 
 	"github.com/superfly/ltx"
+
+	"github.com/psanford/sqlite3vfs"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -64,6 +65,42 @@ func TestVFS_Simple(t *testing.T) {
 
 	// Execute query - wait for value to be replicated
 	waitForReplicaValue(t, sqldb1, "SELECT * FROM t", 100, 10*time.Second, db.MonitorInterval)
+}
+
+func TestVFS_URIReplicaURL(t *testing.T) {
+	replicaDir := t.TempDir()
+	client := file.NewReplicaClient(replicaDir)
+	vfsName := registerTestVFS(t, newVFS(t, nil))
+
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 100 * time.Millisecond
+	db.Replica = litestream.NewReplica(db)
+	db.Replica.Client = client
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close(context.Background()) })
+
+	sqldb0 := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb0)
+
+	if _, err := sqldb0.Exec("CREATE TABLE t (x)"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb0.Exec("INSERT INTO t (x) VALUES (100)"); err != nil {
+		t.Fatal(err)
+	}
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+
+	replicaURL := "file://" + filepath.ToSlash(replicaDir)
+	replicaPath := filepath.ToSlash(filepath.Join(t.TempDir(), "uri-replica.db"))
+	sqldb1, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?vfs=%s&replica_url=%s&poll_interval=25ms", replicaPath, vfsName, replicaURL))
+	if err != nil {
+		t.Fatalf("open replica db: %v", err)
+	}
+	defer sqldb1.Close()
+
+	waitForReplicaValue(t, sqldb1, "SELECT * FROM t", 100, 10*time.Second, 25*time.Millisecond)
 }
 
 func TestVFS_Updating(t *testing.T) {
@@ -1978,6 +2015,14 @@ func (v *testVFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File,
 		return nil, flags, err
 	}
 	return &injectingFile{File: f, vfs: v, name: name}, flags, nil
+}
+
+func (v *testVFS) OpenFilename(name sqlite3vfs.Filename, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	f, flags, err := v.VFS.OpenFilename(name, flags)
+	if err != nil {
+		return nil, flags, err
+	}
+	return &injectingFile{File: f, vfs: v, name: name.String()}, flags, nil
 }
 
 func (v *testVFS) Inject(path string, err error) {
