@@ -106,6 +106,20 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
+func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.execMu.Lock()
+	defer db.execMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	err := db.Sync(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want context deadline exceeded", err)
+	}
+}
+
 // TestCalcWALSize ensures calcWALSize doesn't overflow with large page sizes.
 // Regression test for uint32 overflow bug where large page sizes (>=16KB)
 // caused incorrect WAL size calculations, triggering checkpoints too early.

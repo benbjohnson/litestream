@@ -1011,10 +1011,32 @@ func (db *DB) releaseReadLock() error {
 
 // Sync copies pending data from the WAL to the shadow WAL.
 func (db *DB) Sync(ctx context.Context) (err error) {
-	db.execMu.Lock()
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
 	defer db.execMu.Unlock()
 
 	return db.syncLocked(ctx)
+}
+
+func (db *DB) lockExec(ctx context.Context) error {
+	if db.execMu.TryLock() {
+		return nil
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			if db.execMu.TryLock() {
+				return nil
+			}
+		}
+	}
 }
 
 func (db *DB) syncLocked(ctx context.Context) (err error) {
@@ -1948,7 +1970,9 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 
 // Checkpoint performs a checkpoint on the WAL file.
 func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
-	db.execMu.Lock()
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
 	defer db.execMu.Unlock()
 
 	exec, err := db.newSyncExecutor(ctx)
@@ -2174,7 +2198,9 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (row [3]int, err 
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	db.execMu.Lock()
+	if err := db.lockExec(ctx); err != nil {
+		return ltx.Pos{}, nil, err
+	}
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
 	db.execMu.Unlock()
