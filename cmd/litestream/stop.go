@@ -103,5 +103,15 @@ Options:
 
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
+
+Examples:
+  # Stop replication for a database.
+  $ litestream stop /path/to/db
+
+  # Stop replication using a non-default control socket.
+  $ litestream stop -socket /tmp/litestream.sock /path/to/db
+
+  # Stop replication and wait up to 10 seconds for final sync and shutdown.
+  $ litestream stop -timeout 10 /path/to/db
 `[1:])
 }
