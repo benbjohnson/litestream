@@ -2,15 +2,12 @@ package main_test
 
 import (
 	"context"
-	"net/url"
 	"path/filepath"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
-	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
-	"github.com/benbjohnson/litestream/s3"
 )
 
 func TestRegisterCommand_Run(t *testing.T) {
@@ -135,13 +132,6 @@ func TestRegisterCommand_Run(t *testing.T) {
 	})
 
 	t.Run("SuggestedReplicaHintExample", func(t *testing.T) {
-		litestream.RegisterReplicaClientFactory("s3", func(string, string, string, url.Values, *url.Userinfo) (litestream.ReplicaClient, error) {
-			return file.NewReplicaClient(t.TempDir()), nil
-		})
-		t.Cleanup(func() {
-			litestream.RegisterReplicaClientFactory("s3", s3.NewReplicaClientFromURL)
-		})
-
 		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
 		store.CompactionMonitorEnabled = false
 		if err := store.Open(context.Background()); err != nil {
