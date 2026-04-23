@@ -28,7 +28,7 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err == nil {
 			t.Error("expected error for missing replica flag")
 		}
-		if err.Error() != "replica URL required (use -replica flag)" {
+		if err.Error() != "-replica is required. Try: litestream register -replica s3://bucket/prefix /path/to/db" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})

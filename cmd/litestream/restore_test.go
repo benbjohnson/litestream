@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"testing"
 	"time"
@@ -58,5 +59,16 @@ func TestRestoreCommand_FollowIntervalFlag(t *testing.T) {
 				t.Fatalf("FollowInterval=%v, want %v", opt.FollowInterval, tt.wantVal)
 			}
 		})
+	}
+}
+
+func TestRestoreCommand_RunMissingOutputPathForReplicaURL(t *testing.T) {
+	cmd := &RestoreCommand{}
+	err := cmd.Run(context.Background(), []string{"s3://bucket/prefix"})
+	if err == nil {
+		t.Fatal("expected error for missing output path")
+	}
+	if err.Error() != "-o is required when restoring from a replica URL. Try: litestream restore -o /path/to/db s3://bucket/prefix" {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
