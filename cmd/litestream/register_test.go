@@ -2,7 +2,10 @@ package main_test
 
 import (
 	"context"
+	"io"
+	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -159,4 +162,49 @@ func TestRegisterCommand_Run(t *testing.T) {
 			t.Fatalf("expected 1 database in store, got %d", len(store.DBs()))
 		}
 	})
+}
+
+func TestRegisterCommand_Usage(t *testing.T) {
+	output := captureStdout(t, func() {
+		(&main.RegisterCommand{}).Usage()
+	})
+
+	for _, example := range []string{
+		"Examples:",
+		"$ litestream register -replica s3://mybucket/db /path/to/db",
+		"$ litestream register -replica file:///backup/path /path/to/db",
+		"$ litestream register -socket /tmp/litestream.sock -replica s3://mybucket/db /path/to/db",
+	} {
+		if !strings.Contains(output, example) {
+			t.Fatalf("usage output missing %q:\n%s", example, output)
+		}
+	}
+}
+
+func captureStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		os.Stdout = orig
+	})
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
