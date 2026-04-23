@@ -68,6 +68,12 @@ Arguments:
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
+Examples:
+
+	$ litestream databases
+	$ litestream databases -config /path/to/litestream.yml
+	$ litestream databases -no-expand-env -config /path/to/litestream.yml
+
 `[1:],
 		DefaultConfigPath(),
 	)
