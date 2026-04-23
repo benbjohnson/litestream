@@ -109,5 +109,10 @@ Options:
 
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
+
+Examples:
+  $ litestream sync /path/to/db
+  $ litestream sync -wait /path/to/db
+  $ litestream sync -wait -timeout 120 /path/to/db
 `[1:])
 }
