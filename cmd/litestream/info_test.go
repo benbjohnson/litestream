@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -123,4 +124,21 @@ func TestInfoCommand_Run(t *testing.T) {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestInfoCommand_Usage(t *testing.T) {
+	output := captureStdout(t, func() {
+		(&main.InfoCommand{}).Usage()
+	})
+
+	for _, example := range []string{
+		"Examples:",
+		"$ litestream info",
+		"$ litestream info -json",
+		"$ litestream info -socket /tmp/litestream.sock",
+	} {
+		if !strings.Contains(output, example) {
+			t.Fatalf("usage output missing %q:\n%s", example, output)
+		}
+	}
 }
