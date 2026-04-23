@@ -2,12 +2,15 @@ package main_test
 
 import (
 	"context"
+	"net/url"
 	"path/filepath"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
+	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/s3"
 )
 
 func TestRegisterCommand_Run(t *testing.T) {
@@ -128,6 +131,42 @@ func TestRegisterCommand_Run(t *testing.T) {
 		// Still only 1 database - didn't register a duplicate.
 		if len(store.DBs()) != 1 {
 			t.Errorf("expected 1 database in store, got %d", len(store.DBs()))
+		}
+	})
+
+	t.Run("SuggestedReplicaHintExample", func(t *testing.T) {
+		litestream.RegisterReplicaClientFactory("s3", func(string, string, string, url.Values, *url.Userinfo) (litestream.ReplicaClient, error) {
+			return file.NewReplicaClient(t.TempDir()), nil
+		})
+		t.Cleanup(func() {
+			litestream.RegisterReplicaClientFactory("s3", s3.NewReplicaClientFromURL)
+		})
+
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		db, sqldb := testingutil.MustOpenDBs(t)
+		testingutil.MustCloseDBs(t, db, sqldb)
+
+		cmd := &main.RegisterCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "s3://bucket/prefix", db.Path()})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(store.DBs()) != 1 {
+			t.Fatalf("expected 1 database in store, got %d", len(store.DBs()))
 		}
 	})
 }
