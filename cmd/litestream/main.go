@@ -202,7 +202,10 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		fmt.Fprintln(os.Stderr, "Warning: 'wal' command is deprecated, please use 'ltx' instead")
 		return (&LTXCommand{}).Run(ctx, args)
 	default:
-		if cmd == "" || cmd == "help" || strings.HasPrefix(cmd, "-") {
+		if cmd == "help" || cmd == "-h" || cmd == "--help" {
+			m.Usage()
+			return nil
+		} else if cmd == "" || strings.HasPrefix(cmd, "-") {
 			m.Usage()
 			return flag.ErrHelp
 		}

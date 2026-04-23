@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/x509"
 	"errors"
+	"flag"
 	"os"
 	"os/exec"
 	"os/user"
@@ -21,6 +22,43 @@ import (
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
+
+func TestMain_RunHelp(t *testing.T) {
+	t.Run("ExplicitShortHelp", func(t *testing.T) {
+		err := main.NewMain().Run(context.Background(), []string{"-h"})
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	})
+
+	t.Run("ExplicitLongHelp", func(t *testing.T) {
+		err := main.NewMain().Run(context.Background(), []string{"--help"})
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	})
+
+	t.Run("HelpCommand", func(t *testing.T) {
+		err := main.NewMain().Run(context.Background(), []string{"help"})
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	})
+
+	t.Run("NoCommand", func(t *testing.T) {
+		err := main.NewMain().Run(context.Background(), nil)
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("Run returned error %v, want %v", err, flag.ErrHelp)
+		}
+	})
+
+	t.Run("UnknownFlag", func(t *testing.T) {
+		err := main.NewMain().Run(context.Background(), []string{"-config", "litestream.yml"})
+		if !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("Run returned error %v, want %v", err, flag.ErrHelp)
+		}
+	})
+}
 
 func TestOpenConfigFile(t *testing.T) {
 	t.Run("Success", func(t *testing.T) {
