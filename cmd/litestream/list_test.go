@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -130,4 +131,21 @@ func TestListCommand_Run(t *testing.T) {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestListCommand_Usage(t *testing.T) {
+	output := captureStdout(t, func() {
+		(&main.ListCommand{}).Usage()
+	})
+
+	for _, example := range []string{
+		"Examples:",
+		"$ litestream list",
+		"$ litestream list -json",
+		"$ litestream list -socket /tmp/litestream.sock",
+	} {
+		if !strings.Contains(output, example) {
+			t.Fatalf("usage output missing %q:\n%s", example, output)
+		}
+	}
 }
