@@ -114,5 +114,15 @@ Options:
 
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
+
+Examples:
+  # Register a database with an S3 replica.
+  $ litestream register -replica s3://mybucket/db /path/to/db
+
+  # Register a database with a file replica.
+  $ litestream register -replica file:///backup/path /path/to/db
+
+  # Register using a non-default control socket.
+  $ litestream register -socket /tmp/litestream.sock -replica s3://mybucket/db /path/to/db
 `[1:])
 }
