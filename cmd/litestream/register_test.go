@@ -124,9 +124,14 @@ func TestRegisterCommand_Run(t *testing.T) {
 		backupDir := filepath.Join(t.TempDir(), "backup")
 
 		cmd := &main.RegisterCommand{}
-		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, db.Path()})
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
+		output := captureStdout(t, func() {
+			err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, db.Path()})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+		if !strings.Contains(output, "status: already registered") {
+			t.Fatalf("expected already registered status, got:\n%s", output)
 		}
 
 		// Still only 1 database - didn't register a duplicate.
