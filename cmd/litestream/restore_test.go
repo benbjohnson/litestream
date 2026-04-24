@@ -183,6 +183,62 @@ func TestRestoreCommand_RunDryRunJSONOutput(t *testing.T) {
 	}
 }
 
+func TestRestoreCommand_RunRequiresForceForExistingOutput(t *testing.T) {
+	ctx := context.Background()
+	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+	if err := os.WriteFile(restorePath, []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &RestoreCommand{}
+	err := cmd.Run(ctx, []string{"-o", restorePath, "file://" + replicaPath})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	expected := "cannot restore, output path already exists and is not empty: " + restorePath + ". Use -force to overwrite"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	buf, err := os.ReadFile(restorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != "existing" {
+		t.Fatalf("existing output was modified: %q", string(buf))
+	}
+}
+
+func TestRestoreCommand_RunForceOverwritesExistingOutput(t *testing.T) {
+	ctx := context.Background()
+	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+	for _, path := range []string{restorePath, restorePath + "-wal", restorePath + "-shm"} {
+		if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	cmd := &RestoreCommand{}
+	if err := cmd.Run(ctx, []string{"-force", "-o", restorePath, "file://" + replicaPath}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertRestoreCommandDB(t, restorePath)
+}
+
+func TestRestoreCommand_RunAllowsEmptyOutput(t *testing.T) {
+	ctx := context.Background()
+	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+	if err := os.WriteFile(restorePath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &RestoreCommand{}
+	if err := cmd.Run(ctx, []string{"-o", restorePath, "file://" + replicaPath}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	assertRestoreCommandDB(t, restorePath)
+}
+
 func createRestoreCommandTestData(t *testing.T, ctx context.Context) (string, string) {
 	t.Helper()
 
@@ -220,4 +276,23 @@ func createRestoreCommandTestData(t *testing.T, ctx context.Context) (string, st
 	}
 
 	return replicaPath, restorePath
+}
+
+func assertRestoreCommandDB(t *testing.T, path string) {
+	t.Helper()
+
+	sqldb := testingutil.MustOpenSQLDB(t, path)
+	defer func() {
+		if err := sqldb.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	var count int
+	if err := sqldb.QueryRowContext(context.Background(), `SELECT COUNT(*) FROM t`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("count=%d, want 1", count)
+	}
 }
