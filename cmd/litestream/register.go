@@ -102,7 +102,7 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	fmt.Printf("status: %s\n", confirmation.Status)
+	fmt.Printf("status: %s\n", registerDisplayStatus(confirmation.Status))
 	fmt.Printf("db_path: %s\n", confirmation.DBPath)
 	fmt.Printf("replica: %s\n", confirmation.Replica)
 	fmt.Printf("socket: %s\n", confirmation.Socket)
@@ -115,6 +115,13 @@ type RegisterResult struct {
 	DBPath  string `json:"db_path"`
 	Replica string `json:"replica"`
 	Socket  string `json:"socket"`
+}
+
+func registerDisplayStatus(status string) string {
+	if status == "already_exists" {
+		return "already registered"
+	}
+	return status
 }
 
 func (c *RegisterCommand) Usage() {
