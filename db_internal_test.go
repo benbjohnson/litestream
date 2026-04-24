@@ -1896,10 +1896,29 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	case err := <-writerDone:
 		t.Fatalf("writer exited before starting: %v", err)
 	}
-	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+	// Retry SQLITE_BUSY on the checkpoint just as the writer does — wal_checkpoint(TRUNCATE)
+	// can legitimately return BUSY while a writer is actively committing on a slow runner,
+	// and a BUSY return means no checkpoint happened so there is nothing to verify.
+	checkpointDeadline := time.Now().Add(30 * time.Second)
+	var checkpointErr error
+	for {
+		checkpointErr = db.Checkpoint(ctx, CheckpointModeTruncate)
+		if checkpointErr == nil {
+			break
+		}
+		if !strings.Contains(checkpointErr.Error(), "database is locked") &&
+			!strings.Contains(checkpointErr.Error(), "SQLITE_BUSY") {
+			break
+		}
+		if time.Now().After(checkpointDeadline) {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if checkpointErr != nil {
 		cancelWriter()
 		<-writerDone
-		t.Fatal(err)
+		t.Fatal(checkpointErr)
 	}
 	cancelWriter()
 	if err := <-writerDone; err != nil {
