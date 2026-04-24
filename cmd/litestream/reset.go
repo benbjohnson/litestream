@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 
@@ -17,6 +18,7 @@ type ResetCommand struct{}
 func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-reset", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
+	dryRun := fs.Bool("dry-run", false, "print local state that would be removed without deleting")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -85,6 +87,27 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 		return nil
 	}
 
+	if *dryRun {
+		files, err := localLTXFiles(db.LTXDir())
+		if err != nil {
+			return fmt.Errorf("dry run failed: %w", err)
+		}
+
+		fmt.Printf("Dry run: local Litestream state would be reset for: %s\n", dbPath)
+		fmt.Printf("Would remove: %s\n", db.LTXDir())
+		if len(files) == 0 {
+			fmt.Println("No local LTX files would be removed.")
+			return nil
+		}
+
+		fmt.Println("Files that would be removed:")
+		for _, file := range files {
+			fmt.Printf("  %s\n", file)
+		}
+		fmt.Println("No files were removed.")
+		return nil
+	}
+
 	// Perform the reset
 	fmt.Printf("Resetting local Litestream state for: %s\n", dbPath)
 	fmt.Printf("Removing: %s\n", db.LTXDir())
@@ -95,6 +118,29 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 
 	fmt.Println("Reset complete. Next replication sync will create a fresh snapshot.")
 	return nil
+}
+
+func localLTXFiles(root string) ([]string, error) {
+	if _, err := os.Stat(root); os.IsNotExist(err) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+
+	var files []string
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		files = append(files, path)
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return files, nil
 }
 
 // Usage prints the help screen to STDOUT.
@@ -120,10 +166,16 @@ Arguments:
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
+	-dry-run
+	    Print the local LTX files that would be removed without deleting them.
+
 Examples:
 
 	# Reset local state for a specific database
 	litestream reset /path/to/database.db
+
+	# Preview local files that would be removed
+	litestream reset -dry-run /path/to/database.db
 
 	# Reset using a specific configuration file
 	litestream reset -config /etc/litestream.yml /path/to/database.db
