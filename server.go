@@ -190,9 +190,20 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
-	if err := s.store.EnableDB(ctx, expandedPath); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("database not found: %s", expandedPath), nil)
 		return
+	}
+
+	status := "started"
+	if db.IsOpen() {
+		status = "already_running"
+	} else {
+		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+			return
+		}
 	}
 	txID, err := s.storeTXID(expandedPath)
 	if err != nil {
@@ -201,7 +212,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, StartResponse{
-		Status: "started",
+		Status: status,
 		Path:   expandedPath,
 		TXID:   txID,
 	})
@@ -232,9 +243,20 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	if err := s.store.DisableDB(ctx, expandedPath); err != nil {
-		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("database not found: %s", expandedPath), nil)
 		return
+	}
+
+	status := "stopped"
+	if !db.IsOpen() {
+		status = "already_stopped"
+	} else {
+		if err := s.store.DisableDB(ctx, expandedPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+			return
+		}
 	}
 	txID, err := s.storeTXID(expandedPath)
 	if err != nil {
@@ -243,7 +265,7 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, StopResponse{
-		Status: "stopped",
+		Status: status,
 		Path:   expandedPath,
 		TXID:   txID,
 	})
