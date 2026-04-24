@@ -34,6 +34,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
 	dryRun := fs.Bool("dry-run", false, "print restore plan without writing")
+	force := fs.Bool("force", false, "overwrite existing output database")
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
@@ -128,6 +129,12 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 		c.printDryRunPlan(plan)
 		return nil
+	}
+
+	if !opt.Follow {
+		if err := c.prepareOutputPath(opt.OutputPath, *force); err != nil {
+			return err
+		}
 	}
 
 	txid := c.restoreTXID(ctx, r, opt)
@@ -255,6 +262,37 @@ func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica,
 	return infos[len(infos)-1].MaxTXID.String()
 }
 
+func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
+	info, err := os.Stat(path)
+	if os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("cannot access output path: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("cannot restore, output path is a directory: %s", path)
+	}
+
+	if info.Size() > 0 && !force {
+		return fmt.Errorf("cannot restore, output path already exists and is not empty: %s. Use -force to overwrite", path)
+	}
+
+	for _, sidecarPath := range []string{path + "-wal", path + "-shm"} {
+		if _, err := os.Stat(sidecarPath); err == nil && !force {
+			return fmt.Errorf("cannot restore, SQLite sidecar path already exists: %s. Use -force to overwrite", sidecarPath)
+		} else if err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("cannot access SQLite sidecar path: %w", err)
+		}
+	}
+
+	for _, removePath := range []string{path, path + "-wal", path + "-shm"} {
+		if err := os.Remove(removePath); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove existing output path: %w", err)
+		}
+	}
+	return nil
+}
+
 // loadFromURL creates a replica & updates the restore options from a replica URL.
 func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	if opt.OutputPath == "" {
@@ -354,6 +392,9 @@ Arguments:
 
 	-dry-run
 	    Print the restore plan and exit without writing a database.
+
+	-force
+	    Overwrite an existing output database and SQLite sidecar files.
 
 	-json
 	    Output raw JSON summary on successful restore.
