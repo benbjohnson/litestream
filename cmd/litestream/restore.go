@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,6 +30,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
 	integrityCheck := fs.String("integrity-check", "none", "post-restore integrity check: none, quick, or full")
@@ -41,7 +43,11 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return fmt.Errorf("too many arguments")
 	}
 
-	internal.InitLog(os.Stdout, "INFO", "text", false)
+	logOutput := os.Stdout
+	if *jsonOutput {
+		logOutput = os.Stderr
+	}
+	internal.InitLog(logOutput, "INFO", "text", false)
 
 	// When follow mode is enabled, set up signal handling so Ctrl+C stops
 	// the follow loop cleanly.
@@ -101,6 +107,8 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
+	txid := c.restoreTXID(ctx, r, opt)
+	start := time.Now()
 	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
@@ -110,7 +118,42 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	} else if err != nil {
 		return err
 	}
+	if *jsonOutput {
+		output, err := json.MarshalIndent(RestoreResult{
+			DBPath:         opt.OutputPath,
+			Replica:        r.Client.Type(),
+			TXID:           txid,
+			DurationMS:     time.Since(start).Milliseconds(),
+			IntegrityCheck: *integrityCheck,
+		}, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+	}
 	return nil
+}
+
+type RestoreResult struct {
+	DBPath         string `json:"db_path"`
+	Replica        string `json:"replica"`
+	TXID           string `json:"txid"`
+	DurationMS     int64  `json:"duration_ms"`
+	IntegrityCheck string `json:"integrity_check"`
+}
+
+func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) string {
+	if opt.TXID != 0 {
+		return opt.TXID.String()
+	}
+	if opt.Follow {
+		return ""
+	}
+	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
+	if err != nil || len(infos) == 0 {
+		return ""
+	}
+	return infos[len(infos)-1].MaxTXID.String()
 }
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
@@ -209,6 +252,9 @@ Arguments:
 
 	-if-replica-exists
 	    Returns exit code of 0 if no backups found.
+
+	-json
+	    Output raw JSON summary on successful restore.
 
 	-f
 	    Follow mode. After restoring, continuously poll for and apply
