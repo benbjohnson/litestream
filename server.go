@@ -626,6 +626,7 @@ func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var txID uint64
+	status := "not_registered"
 	if db != nil {
 		_, maxTXID, err := db.MaxLTX()
 		if err != nil {
@@ -633,10 +634,11 @@ func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		txID = uint64(maxTXID)
+		status = "unregistered"
 	}
 
 	writeJSON(w, http.StatusOK, UnregisterDatabaseResponse{
-		Status: "unregistered",
+		Status: status,
 		Path:   expandedPath,
 		TXID:   txID,
 	})
