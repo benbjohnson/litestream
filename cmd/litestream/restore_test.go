@@ -106,6 +106,86 @@ func TestRestoreCommand_RunSuggestedOutputArgs(t *testing.T) {
 
 func TestRestoreCommand_RunJSONOutput(t *testing.T) {
 	ctx := context.Background()
+	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+
+	output := captureLTXCommandStdout(t, func() {
+		cmd := &RestoreCommand{}
+		if err := cmd.Run(ctx, []string{"-json", "-o", restorePath, "file://" + replicaPath}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var got RestoreResult
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("failed to parse output: %v\n%s", err, output)
+	}
+	if got.DBPath != restorePath {
+		t.Fatalf("unexpected db path: %s", got.DBPath)
+	}
+	if got.Replica != "file" {
+		t.Fatalf("unexpected replica: %s", got.Replica)
+	}
+	if got.TXID == "" {
+		t.Fatal("expected txid")
+	}
+	if got.DurationMS < 0 {
+		t.Fatalf("unexpected duration_ms: %d", got.DurationMS)
+	}
+	if got.IntegrityCheck != "none" {
+		t.Fatalf("unexpected integrity check: %s", got.IntegrityCheck)
+	}
+	if _, err := os.Stat(restorePath); err != nil {
+		t.Fatalf("expected restored database: %v", err)
+	}
+}
+
+func TestRestoreCommand_RunDryRunJSONOutput(t *testing.T) {
+	ctx := context.Background()
+	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+
+	output := captureLTXCommandStdout(t, func() {
+		cmd := &RestoreCommand{}
+		if err := cmd.Run(ctx, []string{"-dry-run", "-json", "-o", restorePath, "file://" + replicaPath}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var got RestorePlan
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("failed to parse output: %v\n%s", err, output)
+	}
+	if got.Source != "file://"+replicaPath {
+		t.Fatalf("unexpected source: %s", got.Source)
+	}
+	if got.TargetPath != restorePath {
+		t.Fatalf("unexpected target path: %s", got.TargetPath)
+	}
+	if got.Replica != "file" {
+		t.Fatalf("unexpected replica: %s", got.Replica)
+	}
+	if got.MinTXID == "" {
+		t.Fatal("expected min txid")
+	}
+	if got.MaxTXID == "" {
+		t.Fatal("expected max txid")
+	}
+	if len(got.Files) == 0 {
+		t.Fatal("expected files")
+	}
+	if got.Files[0].Name == "" {
+		t.Fatal("expected file name")
+	}
+	if got.Files[0].Timestamp == "" {
+		t.Fatal("expected file timestamp")
+	}
+	if _, err := os.Stat(restorePath); !os.IsNotExist(err) {
+		t.Fatalf("expected no restored database, stat err=%v", err)
+	}
+}
+
+func createRestoreCommandTestData(t *testing.T, ctx context.Context) (string, string) {
+	t.Helper()
+
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db.sqlite")
 	replicaPath := filepath.Join(dir, "replica")
@@ -139,33 +219,5 @@ func TestRestoreCommand_RunJSONOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	output := captureLTXCommandStdout(t, func() {
-		cmd := &RestoreCommand{}
-		if err := cmd.Run(ctx, []string{"-json", "-o", restorePath, "file://" + replicaPath}); err != nil {
-			t.Fatalf("unexpected error: %v", err)
-		}
-	})
-
-	var got RestoreResult
-	if err := json.Unmarshal([]byte(output), &got); err != nil {
-		t.Fatalf("failed to parse output: %v\n%s", err, output)
-	}
-	if got.DBPath != restorePath {
-		t.Fatalf("unexpected db path: %s", got.DBPath)
-	}
-	if got.Replica != "file" {
-		t.Fatalf("unexpected replica: %s", got.Replica)
-	}
-	if got.TXID == "" {
-		t.Fatal("expected txid")
-	}
-	if got.DurationMS < 0 {
-		t.Fatalf("unexpected duration_ms: %d", got.DurationMS)
-	}
-	if got.IntegrityCheck != "none" {
-		t.Fatalf("unexpected integrity check: %s", got.IntegrityCheck)
-	}
-	if _, err := os.Stat(restorePath); err != nil {
-		t.Fatalf("expected restored database: %v", err)
-	}
+	return replicaPath, restorePath
 }
