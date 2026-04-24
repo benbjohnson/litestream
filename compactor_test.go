@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -105,6 +107,37 @@ func TestCompactor_CompactResumesRemoteReads(t *testing.T) {
 	}
 	if client.reopenCount == 0 {
 		t.Fatal("expected compaction to reopen at least one source LTX stream")
+	}
+}
+
+func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
+	client := newEarlyReturnCompactionClient()
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
+	client.failWrites = true
+
+	before := countCompactorPipeWriters()
+	if _, err := compactor.Compact(context.Background(), 1); err == nil {
+		t.Fatal("expected error")
+	} else if !strings.Contains(err.Error(), "write ltx file: early write failure") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := countCompactorPipeWriters(); got <= before {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("compactor goroutine leaked: got %d, want <= %d", countCompactorPipeWriters(), before)
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -725,3 +758,25 @@ func (r *shortReadCloser) Read(p []byte) (int, error) {
 }
 
 func (r *shortReadCloser) Close() error { return nil }
+
+type earlyReturnCompactionClient struct {
+	*flakyCompactionClient
+	failWrites bool
+}
+
+func newEarlyReturnCompactionClient() *earlyReturnCompactionClient {
+	return &earlyReturnCompactionClient{flakyCompactionClient: newFlakyCompactionClient()}
+}
+
+func (c *earlyReturnCompactionClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if c.failWrites {
+		return nil, fmt.Errorf("early write failure")
+	}
+	return c.flakyCompactionClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func countCompactorPipeWriters() int {
+	buf := make([]byte, 2<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "github.com/benbjohnson/litestream.(*Compactor).Compact.func")
+}

@@ -117,13 +117,19 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	defer itr.Close()
 
 	var rdrs []io.Reader
-	defer func() {
+	readersClosed := false
+	closeReaders := func() {
+		if readersClosed {
+			return
+		}
+		readersClosed = true
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
 				_ = closer.Close()
 			}
 		}
-	}()
+	}
+	defer closeReaders()
 
 	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
@@ -156,19 +162,29 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}
 
 	pr, pw := io.Pipe()
+	compactErrCh := make(chan error, 1)
 	go func() {
 		comp, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			err = fmt.Errorf("new ltx compactor: %w", err)
+			_ = pw.CloseWithError(err)
+			compactErrCh <- err
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(comp.Compact(ctx))
+		err = comp.Compact(ctx)
+		_ = pw.CloseWithError(err)
+		compactErrCh <- err
 	}()
 
 	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	_ = pr.CloseWithError(err)
+	compactErr := <-compactErrCh
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)
+	}
+	if compactErr != nil {
+		return nil, fmt.Errorf("compact ltx file: %w", compactErr)
 	}
 
 	if c.CacheSetter != nil {
