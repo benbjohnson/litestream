@@ -508,6 +508,7 @@ type UnregisterDatabaseRequest struct {
 type UnregisterDatabaseResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -595,14 +596,26 @@ func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
+	db := s.store.FindDB(expandedPath)
+
 	// Remove database from store (this also closes it).
 	if err := s.store.UnregisterDB(ctx, expandedPath); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to unregister database: %v", err), nil)
 		return
 	}
+	var txID uint64
+	if db != nil {
+		_, maxTXID, err := db.MaxLTX()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read final txid: %v", err), nil)
+			return
+		}
+		txID = uint64(maxTXID)
+	}
 
 	writeJSON(w, http.StatusOK, UnregisterDatabaseResponse{
 		Status: "unregistered",
 		Path:   expandedPath,
+		TXID:   txID,
 	})
 }
