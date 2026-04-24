@@ -462,7 +462,8 @@ func TestServer_HandleUnregister(t *testing.T) {
 
 		var result litestream.UnregisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "unregistered", result.Status)
+		require.Equal(t, "not_registered", result.Status)
+		require.Zero(t, result.TXID)
 	})
 
 	t.Run("Success", func(t *testing.T) {
