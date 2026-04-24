@@ -9,7 +9,10 @@ import (
 	"log/slog"
 	"os"
 	"strconv"
+	"text/tabwriter"
 	"time"
+
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -30,6 +33,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
+	dryRun := fs.Bool("dry-run", false, "print restore plan without writing")
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.BoolVar(&opt.Follow, "f", false, "follow mode")
 	fs.DurationVar(&opt.FollowInterval, "follow-interval", opt.FollowInterval, "polling interval for follow mode")
@@ -107,6 +111,25 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
+	if *dryRun {
+		plan, err := c.dryRunPlan(ctx, fs.Arg(0), r, opt)
+		if errors.Is(err, litestream.ErrTxNotAvailable) {
+			return fmt.Errorf("no matching backup files available")
+		} else if err != nil {
+			return err
+		}
+		if *jsonOutput {
+			output, err := json.MarshalIndent(plan, "", "  ")
+			if err != nil {
+				return fmt.Errorf("failed to format response: %w", err)
+			}
+			fmt.Println(string(output))
+			return nil
+		}
+		c.printDryRunPlan(plan)
+		return nil
+	}
+
 	txid := c.restoreTXID(ctx, r, opt)
 	start := time.Now()
 	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
@@ -134,12 +157,88 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	return nil
 }
 
+type RestorePlan struct {
+	Source     string            `json:"source"`
+	TargetPath string            `json:"target_path"`
+	Replica    string            `json:"replica"`
+	MinTXID    string            `json:"min_txid"`
+	MaxTXID    string            `json:"max_txid"`
+	Files      []RestorePlanFile `json:"files"`
+}
+
+type RestorePlanFile struct {
+	Level     int    `json:"level"`
+	Name      string `json:"name"`
+	MinTXID   string `json:"min_txid"`
+	MaxTXID   string `json:"max_txid"`
+	Size      int64  `json:"size"`
+	Timestamp string `json:"timestamp"`
+}
+
 type RestoreResult struct {
 	DBPath         string `json:"db_path"`
 	Replica        string `json:"replica"`
 	TXID           string `json:"txid"`
 	DurationMS     int64  `json:"duration_ms"`
 	IntegrityCheck string `json:"integrity_check"`
+}
+
+func (c *RestoreCommand) dryRunPlan(ctx context.Context, source string, r *litestream.Replica, opt litestream.RestoreOptions) (RestorePlan, error) {
+	if opt.Follow {
+		return RestorePlan{}, fmt.Errorf("cannot use -dry-run with -f")
+	}
+
+	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
+	if err != nil {
+		return RestorePlan{}, err
+	}
+	if len(infos) == 0 {
+		return RestorePlan{}, litestream.ErrTxNotAvailable
+	}
+
+	plan := RestorePlan{
+		Source:     source,
+		TargetPath: opt.OutputPath,
+		Replica:    r.Client.Type(),
+		MinTXID:    infos[0].MinTXID.String(),
+		MaxTXID:    infos[len(infos)-1].MaxTXID.String(),
+		Files:      make([]RestorePlanFile, 0, len(infos)),
+	}
+	for _, info := range infos {
+		plan.Files = append(plan.Files, RestorePlanFile{
+			Level:     info.Level,
+			Name:      ltx.FormatFilename(info.MinTXID, info.MaxTXID),
+			MinTXID:   info.MinTXID.String(),
+			MaxTXID:   info.MaxTXID.String(),
+			Size:      info.Size,
+			Timestamp: info.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	return plan, nil
+}
+
+func (c *RestoreCommand) printDryRunPlan(plan RestorePlan) {
+	fmt.Println("Restore plan:")
+	fmt.Printf("  source: %s\n", plan.Source)
+	fmt.Printf("  target: %s\n", plan.TargetPath)
+	fmt.Printf("  replica: %s\n", plan.Replica)
+	fmt.Printf("  txid range: %s - %s\n", plan.MinTXID, plan.MaxTXID)
+	fmt.Println()
+	fmt.Println("Files to fetch:")
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	defer w.Flush()
+	fmt.Fprintln(w, "level\tfile\tmin_txid\tmax_txid\tsize\ttimestamp")
+	for _, file := range plan.Files {
+		fmt.Fprintf(w, "%d\t%s\t%s\t%s\t%d\t%s\n",
+			file.Level,
+			file.Name,
+			file.MinTXID,
+			file.MaxTXID,
+			file.Size,
+			file.Timestamp,
+		)
+	}
 }
 
 func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) string {
@@ -253,6 +352,9 @@ Arguments:
 	-if-replica-exists
 	    Returns exit code of 0 if no backups found.
 
+	-dry-run
+	    Print the restore plan and exit without writing a database.
+
 	-json
 	    Output raw JSON summary on successful restore.
 
@@ -289,6 +391,9 @@ Examples:
 
 	# Restore database from S3 replica URL.
 	$ litestream restore -o /tmp/db s3://mybucket/db
+
+	# Preview restore plan without writing a database.
+	$ litestream restore -dry-run -o /tmp/db s3://mybucket/db
 
 	# Continuously restore (follow) a database from a replica.
 	$ litestream restore -f -o /tmp/read-replica.db s3://mybucket/db
