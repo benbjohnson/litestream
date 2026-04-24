@@ -63,6 +63,29 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("DryRunDoesNotConnect", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			cmd := &main.UnregisterCommand{}
+			err := cmd.Run(context.Background(), []string{"-dry-run", "-socket", "/nonexistent/socket.sock", "/tmp/test.db"})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+
+		for _, substr := range []string{
+			"Dry run: unregister request preview",
+			"database: /tmp/test.db",
+			"socket: /nonexistent/socket.sock",
+			"replicas: daemon-managed replica for this database",
+			"final sync: daemon close will sync the database and replica before the command completes",
+			"No unregister request was sent.",
+		} {
+			if !strings.Contains(output, substr) {
+				t.Fatalf("output missing %q:\n%s", substr, output)
+			}
+		}
+	})
+
 	t.Run("NotFoundIsIdempotent", func(t *testing.T) {
 		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
 		store.CompactionMonitorEnabled = false
@@ -131,6 +154,7 @@ func TestUnregisterCommand_Usage(t *testing.T) {
 	for _, example := range []string{
 		"Examples:",
 		"$ litestream unregister /path/to/db",
+		"$ litestream unregister -dry-run /path/to/db",
 		"$ litestream unregister -socket /tmp/litestream.sock /path/to/db",
 		"$ litestream unregister -timeout 10 /path/to/db",
 	} {
