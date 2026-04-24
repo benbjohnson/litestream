@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	main "github.com/benbjohnson/litestream/cmd/litestream"
@@ -119,4 +120,21 @@ func TestStatusCommand_Run(t *testing.T) {
 			t.Fatalf("unexpected wal size: %s", got[0].WALSize)
 		}
 	})
+}
+
+func TestStatusCommand_Usage(t *testing.T) {
+	output := captureStdout(t, func() {
+		(&main.StatusCommand{}).Usage()
+	})
+
+	for _, example := range []string{
+		"Examples:",
+		"$ litestream status",
+		"$ litestream status /path/to/db",
+		"$ litestream status -json",
+	} {
+		if !strings.Contains(output, example) {
+			t.Fatalf("usage output missing %q:\n%s", example, output)
+		}
+	}
 }

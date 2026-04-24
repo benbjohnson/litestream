@@ -161,6 +161,12 @@ Output columns:
 Note: To see replica TXID and sync status, use the MCP tools or check logs
 while the replication daemon is running.
 
+Examples:
+
+	$ litestream status
+	$ litestream status /path/to/db
+	$ litestream status -json
+
 `[1:],
 		DefaultConfigPath(),
 	)
