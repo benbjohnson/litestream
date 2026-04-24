@@ -82,6 +82,7 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	confirmation := StartStopResult{
+		Status: result.Status,
 		DBPath: result.Path,
 		State:  "stopped",
 		TXID:   result.TXID,
