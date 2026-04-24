@@ -1,12 +1,65 @@
 package main
 
 import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 )
+
+func TestLTXCommand_Run_JSONOutput(t *testing.T) {
+	replicaDir := filepath.Join(t.TempDir(), "replica")
+	replicaURL := "file://" + replicaDir
+	r, err := NewReplicaFromConfig(&ReplicaConfig{URL: replicaURL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	timestamp := time.Date(2026, 4, 24, 12, 30, 0, 0, time.UTC)
+	data := createLTXCommandTestData(ltx.TXID(2), ltx.TXID(3), timestamp, []byte("payload"))
+	info, err := r.Client.WriteLTXFile(context.Background(), 0, ltx.TXID(2), ltx.TXID(3), bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	output := captureLTXCommandStdout(t, func() {
+		cmd := &LTXCommand{}
+		if err := cmd.Run(context.Background(), []string{"-json", replicaURL}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var got []LTXFileInfo
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("failed to parse output: %v\n%s", err, output)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 LTX file, got %d", len(got))
+	}
+	if got[0].Level != 0 {
+		t.Fatalf("unexpected level: %d", got[0].Level)
+	}
+	if got[0].MinTXID != "0000000000000002" {
+		t.Fatalf("unexpected min txid: %s", got[0].MinTXID)
+	}
+	if got[0].MaxTXID != "0000000000000003" {
+		t.Fatalf("unexpected max txid: %s", got[0].MaxTXID)
+	}
+	if got[0].Size != info.Size {
+		t.Fatalf("unexpected size: %d", got[0].Size)
+	}
+	if got[0].Timestamp != timestamp.Format(time.RFC3339) {
+		t.Fatalf("unexpected timestamp: %s", got[0].Timestamp)
+	}
+}
 
 func TestTXIDVarParsing(t *testing.T) {
 	tests := []struct {
@@ -69,6 +122,53 @@ func TestTXIDVarParsing(t *testing.T) {
 			}
 		})
 	}
+}
+
+func createLTXCommandTestData(minTXID, maxTXID ltx.TXID, timestamp time.Time, data []byte) []byte {
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		PageSize:  4096,
+		Commit:    1,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Timestamp: timestamp.UnixMilli(),
+	}
+	if minTXID == 1 {
+		hdr.PreApplyChecksum = 0
+	} else {
+		hdr.PreApplyChecksum = ltx.ChecksumFlag
+	}
+
+	header, _ := hdr.MarshalBinary()
+	return append(header, data...)
+}
+
+func captureLTXCommandStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	orig := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = w
+	t.Cleanup(func() {
+		os.Stdout = orig
+	})
+
+	fn()
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
 
 func TestTXIDVarString(t *testing.T) {
