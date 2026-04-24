@@ -23,6 +23,7 @@ func (c *StartCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-start", flag.ContinueOnError)
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -86,11 +87,40 @@ Run 'litestream start -h' for usage details.
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	confirmation := StartStopResult{
+		DBPath: result.Path,
+		State:  "running",
+		TXID:   result.TXID,
+		Socket: *socketPath,
 	}
-	fmt.Println(string(output))
+	if err := printStartStopResult(confirmation, *jsonOutput); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type StartStopResult struct {
+	DBPath string `json:"db_path"`
+	State  string `json:"state"`
+	TXID   uint64 `json:"txid"`
+	Socket string `json:"socket"`
+}
+
+func printStartStopResult(result StartStopResult, jsonOutput bool) error {
+	if jsonOutput {
+		output, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+		return nil
+	}
+
+	fmt.Printf("db_path: %s\n", result.DBPath)
+	fmt.Printf("state: %s\n", result.State)
+	fmt.Printf("txid: %d\n", result.TXID)
+	fmt.Printf("socket: %s\n", result.Socket)
 
 	return nil
 }
@@ -109,9 +139,15 @@ Options:
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 
+  -json
+      Output raw JSON instead of human-readable text.
+
 Examples:
   # Start replication for a database on the running daemon.
   $ litestream start /path/to/db
+
+  # Start replication and emit a JSON confirmation.
+  $ litestream start -json /path/to/db
 
   # Start replication using a non-default control socket.
   $ litestream start -socket /tmp/litestream.sock /path/to/db
