@@ -48,6 +48,9 @@ func TestStartCommand_RunJSONOutput(t *testing.T) {
 	if got.DBPath != db.Path() {
 		t.Fatalf("unexpected db path: %s", got.DBPath)
 	}
+	if got.Status != "started" {
+		t.Fatalf("unexpected status: %s", got.Status)
+	}
 	if got.State != "running" {
 		t.Fatalf("unexpected state: %s", got.State)
 	}
@@ -56,6 +59,45 @@ func TestStartCommand_RunJSONOutput(t *testing.T) {
 	}
 	if got.Socket != server.SocketPath {
 		t.Fatalf("unexpected socket: %s", got.Socket)
+	}
+}
+
+func TestStartCommand_RunAlreadyRunning(t *testing.T) {
+	db, _ := newStartStopCommandDB(t)
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(t.Context())
+
+	server := litestream.NewServer(store)
+	server.SocketPath = testSocketPath(t)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	output := captureStdout(t, func() {
+		cmd := &main.StartCommand{}
+		if err := cmd.Run(context.Background(), []string{"-json", "-socket", server.SocketPath, db.Path()}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var got main.StartStopResult
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("failed to parse output: %v\n%s", err, output)
+	}
+	if got.Status != "already_running" {
+		t.Fatalf("unexpected status: %s", got.Status)
+	}
+	if got.State != "running" {
+		t.Fatalf("unexpected state: %s", got.State)
+	}
+	if got.TXID == 0 {
+		t.Fatal("expected non-zero txid")
 	}
 }
 
@@ -90,6 +132,9 @@ func TestStopCommand_RunJSONOutput(t *testing.T) {
 	if got.DBPath != db.Path() {
 		t.Fatalf("unexpected db path: %s", got.DBPath)
 	}
+	if got.Status != "stopped" {
+		t.Fatalf("unexpected status: %s", got.Status)
+	}
 	if got.State != "stopped" {
 		t.Fatalf("unexpected state: %s", got.State)
 	}
@@ -98,6 +143,48 @@ func TestStopCommand_RunJSONOutput(t *testing.T) {
 	}
 	if got.Socket != server.SocketPath {
 		t.Fatalf("unexpected socket: %s", got.Socket)
+	}
+}
+
+func TestStopCommand_RunAlreadyStopped(t *testing.T) {
+	db, sqldb := newStartStopCommandDB(t)
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	defer store.Close(t.Context())
+
+	server := litestream.NewServer(store)
+	server.SocketPath = testSocketPath(t)
+	if err := server.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer server.Close()
+
+	output := captureStdout(t, func() {
+		cmd := &main.StopCommand{}
+		if err := cmd.Run(context.Background(), []string{"-json", "-socket", server.SocketPath, db.Path()}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	var got main.StartStopResult
+	if err := json.Unmarshal([]byte(output), &got); err != nil {
+		t.Fatalf("failed to parse output: %v\n%s", err, output)
+	}
+	if got.Status != "already_stopped" {
+		t.Fatalf("unexpected status: %s", got.Status)
+	}
+	if got.State != "stopped" {
+		t.Fatalf("unexpected state: %s", got.State)
+	}
+	if got.TXID == 0 {
+		t.Fatal("expected non-zero txid")
 	}
 }
 

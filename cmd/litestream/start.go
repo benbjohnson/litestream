@@ -88,6 +88,7 @@ Run 'litestream start -h' for usage details.
 	}
 
 	confirmation := StartStopResult{
+		Status: result.Status,
 		DBPath: result.Path,
 		State:  "running",
 		TXID:   result.TXID,
@@ -101,6 +102,7 @@ Run 'litestream start -h' for usage details.
 }
 
 type StartStopResult struct {
+	Status string `json:"status"`
 	DBPath string `json:"db_path"`
 	State  string `json:"state"`
 	TXID   uint64 `json:"txid"`
@@ -117,6 +119,7 @@ func printStartStopResult(result StartStopResult, jsonOutput bool) error {
 		return nil
 	}
 
+	fmt.Printf("status: %s\n", result.Status)
 	fmt.Printf("db_path: %s\n", result.DBPath)
 	fmt.Printf("state: %s\n", result.State)
 	fmt.Printf("txid: %d\n", result.TXID)
