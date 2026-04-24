@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -134,6 +135,52 @@ func TestRegisterCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("JSONOutput", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		db, sqldb := testingutil.MustOpenDBs(t)
+		testingutil.MustCloseDBs(t, db, sqldb)
+		backupDir := filepath.Join(t.TempDir(), "backup")
+		replicaURL := "file://" + backupDir
+
+		output := captureStdout(t, func() {
+			cmd := &main.RegisterCommand{}
+			err := cmd.Run(context.Background(), []string{"-json", "-socket", server.SocketPath, "-replica", replicaURL, db.Path()})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		var got main.RegisterResult
+		if err := json.Unmarshal([]byte(output), &got); err != nil {
+			t.Fatalf("failed to parse output: %v\n%s", err, output)
+		}
+		if got.Status != "registered" {
+			t.Fatalf("unexpected status: %s", got.Status)
+		}
+		if got.DBPath != db.Path() {
+			t.Fatalf("unexpected db path: %s", got.DBPath)
+		}
+		if got.Replica != replicaURL {
+			t.Fatalf("unexpected replica: %s", got.Replica)
+		}
+		if got.Socket != server.SocketPath {
+			t.Fatalf("unexpected socket: %s", got.Socket)
+		}
+	})
+
 	t.Run("SuggestedReplicaHintExample", func(t *testing.T) {
 		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
 		store.CompactionMonitorEnabled = false
@@ -174,6 +221,7 @@ func TestRegisterCommand_Usage(t *testing.T) {
 		"$ litestream register -replica s3://mybucket/db /path/to/db",
 		"$ litestream register -replica file:///backup/path /path/to/db",
 		"$ litestream register -socket /tmp/litestream.sock -replica s3://mybucket/db /path/to/db",
+		"$ litestream register -json -replica s3://mybucket/db /path/to/db",
 	} {
 		if !strings.Contains(output, example) {
 			t.Fatalf("usage output missing %q:\n%s", example, output)
