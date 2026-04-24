@@ -193,10 +193,16 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		return
 	}
+	txID, err := s.storeTXID(expandedPath)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, StartResponse{
 		Status: "started",
 		Path:   expandedPath,
+		TXID:   txID,
 	})
 }
 
@@ -229,11 +235,30 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		return
 	}
+	txID, err := s.storeTXID(expandedPath)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+		return
+	}
 
 	writeJSON(w, http.StatusOK, StopResponse{
 		Status: "stopped",
 		Path:   expandedPath,
+		TXID:   txID,
 	})
+}
+
+func (s *Server) storeTXID(path string) (uint64, error) {
+	db := s.store.FindDB(path)
+	if db == nil {
+		return 0, fmt.Errorf("database not found: %s", path)
+	}
+
+	_, maxTXID, err := db.MaxLTX()
+	if err != nil {
+		return 0, fmt.Errorf("read txid: %w", err)
+	}
+	return uint64(maxTXID), nil
 }
 
 func (s *Server) handleTXID(w http.ResponseWriter, r *http.Request) {
@@ -291,6 +316,7 @@ type StartRequest struct {
 type StartResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 // StopRequest is the request body for the /stop endpoint.
@@ -303,6 +329,7 @@ type StopRequest struct {
 type StopResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 // ErrorResponse is returned when an error occurs.
