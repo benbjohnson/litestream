@@ -1896,9 +1896,20 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	case err := <-writerDone:
 		t.Fatalf("writer exited before starting: %v", err)
 	}
+	// Run the checkpoint exactly once. wal_checkpoint(TRUNCATE) can legitimately
+	// return SQLITE_BUSY while a writer is actively committing on a slow runner.
+	// Retrying db.Checkpoint() would re-run its internal pre-checkpoint sync and
+	// upload additional L0 files, which would widen the page coverage across
+	// attempts and could mask the very TOCTOU page-gap bug this test is meant
+	// to detect. On BUSY, skip this iteration instead — no checkpoint occurred,
+	// so there is nothing to verify.
 	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
 		cancelWriter()
 		<-writerDone
+		if strings.Contains(err.Error(), "database is locked") ||
+			strings.Contains(err.Error(), "SQLITE_BUSY") {
+			t.Skipf("checkpoint returned BUSY under concurrent writer; no checkpoint occurred so the page-gap invariant cannot be validated this run: %v", err)
+		}
 		t.Fatal(err)
 	}
 	cancelWriter()
