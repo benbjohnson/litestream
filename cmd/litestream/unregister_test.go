@@ -102,11 +102,19 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		}
 		defer server.Close()
 
-		cmd := &main.UnregisterCommand{}
-		// Should not error even though database doesn't exist.
-		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "/nonexistent/db"})
-		if err != nil {
-			t.Errorf("unexpected error: %v", err)
+		output := captureStdout(t, func() {
+			cmd := &main.UnregisterCommand{}
+			// Should not error even though database doesn't exist.
+			err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "/nonexistent/db"})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+		if !strings.Contains(output, "status: not_registered") {
+			t.Fatalf("expected not_registered status, got:\n%s", output)
+		}
+		if !strings.Contains(output, "final_txid: 0") {
+			t.Fatalf("expected zero final txid, got:\n%s", output)
 		}
 	})
 
