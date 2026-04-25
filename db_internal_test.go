@@ -120,6 +120,46 @@ func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 	}
 }
 
+func TestDB_WriteLTXFromWALHonorsCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	walPath := filepath.Join(dir, "db-wal")
+
+	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	db := NewDB(dbPath)
+	db.pageSize = 1024
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:  ltx.Version,
+		Flags:    ltx.HeaderFlagNoChecksum,
+		PageSize: 1024,
+		Commit:   1,
+		MinTXID:  1,
+		MaxTXID:  1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = db.writeLTXFromWAL(ctx, enc, walFile, 0, 1, map[uint32]int64{1: 0})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+}
+
 // TestCalcWALSize ensures calcWALSize doesn't overflow with large page sizes.
 // Regression test for uint32 overflow bug where large page sizes (>=16KB)
 // caused incorrect WAL size calculations, triggering checkpoints too early.
