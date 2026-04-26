@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -66,6 +67,10 @@ const DefaultMetadataConcurrency = 50
 // DefaultR2Concurrency is the default number of concurrent multipart upload
 // parts for Cloudflare R2, which has strict concurrent upload limits.
 const DefaultR2Concurrency = 2
+
+const s3MaxRetryAttempts = 10
+
+const s3RequestCanceledErrorCode = "RequestCanceled"
 
 // contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
 // through the middleware stack from Serialize to Finalize phase.
@@ -382,10 +387,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
-		// Use adaptive retry mode for better resilience with 24 hour timeout
-		// This matches Azure's approach for long-running operations
-		config.WithRetryMode(aws.RetryModeAdaptive),
-		config.WithRetryMaxAttempts(10), // Increase retry attempts for resilience
+		config.WithRetryer(newS3Retryer),
 	}
 
 	// Add HTTP client with proper timeout
@@ -474,6 +476,22 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.uploader = manager.NewUploader(c.s3, uploaderOpts...)
 
 	return nil
+}
+
+func newS3Retryer() aws.Retryer {
+	return retry.AddWithErrorCodes(
+		retry.NewAdaptiveMode(func(o *retry.AdaptiveModeOptions) {
+			o.StandardOptions = append(o.StandardOptions, func(so *retry.StandardOptions) {
+				so.MaxAttempts = s3MaxRetryAttempts
+				so.Retryables = append(so.Retryables, retry.RetryableHTTPStatusCode{
+					Codes: map[int]struct{}{
+						http.StatusRequestTimeout: {},
+					},
+				})
+			})
+		}),
+		s3RequestCanceledErrorCode,
+	)
 }
 
 // configureEndpoint adds custom endpoint configuration to S3 client options if needed.
