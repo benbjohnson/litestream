@@ -1880,19 +1880,31 @@ func TestReplicaClient_NoSSE_Headers(t *testing.T) {
 	}
 }
 
-// TestReplicaClient_R2ConcurrencyDefault tests that Cloudflare R2 endpoints get
-// Concurrency=2 by default to avoid their strict concurrent upload limits.
-// This is a regression test for issue #948.
-func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
+// TestReplicaClient_ProviderUploadDefaults verifies provider-specific upload
+// defaults for S3-compatible endpoints with known concurrency limits.
+func TestReplicaClient_ProviderUploadDefaults(t *testing.T) {
 	tests := []struct {
 		name            string
 		url             string
 		wantConcurrency int
+		wantPartSize    int64
 	}{
 		{
 			name:            "R2_DefaultConcurrency",
 			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
 			wantConcurrency: 2,
+		},
+		{
+			name:            "Tigris_DefaultUploadShape",
+			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev",
+			wantConcurrency: DefaultTigrisConcurrency,
+			wantPartSize:    DefaultTigrisPartSize,
+		},
+		{
+			name:            "Tigris_ExplicitUploadShape",
+			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev&concurrency=4&part-size=33554432",
+			wantConcurrency: 4,
+			wantPartSize:    33554432,
 		},
 		{
 			name:            "AWS_NoConcurrencyOverride",
@@ -1916,6 +1928,9 @@ func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
 
 			if c.Concurrency != tt.wantConcurrency {
 				t.Errorf("Concurrency = %d, want %d", c.Concurrency, tt.wantConcurrency)
+			}
+			if c.PartSize != tt.wantPartSize {
+				t.Errorf("PartSize = %d, want %d", c.PartSize, tt.wantPartSize)
 			}
 		})
 	}

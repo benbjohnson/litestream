@@ -1468,6 +1468,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	if isCloudflareR2 {
 		client.Concurrency = s3.DefaultR2Concurrency
 	}
+	if isTigris {
+		client.Concurrency = s3.DefaultTigrisConcurrency
+		client.PartSize = s3.DefaultTigrisPartSize
+	}
 
 	// Apply upload configuration if specified.
 	if c.PartSize != nil {
