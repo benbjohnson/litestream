@@ -80,6 +80,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /sync", s.handleSync)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
+	mux.HandleFunc("GET /debug/sync-status", s.handleSyncStatus)
 
 	// pprof endpoints
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -266,6 +267,35 @@ func (s *Server) handleTXID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path != "" {
+		expandedPath, err := s.expandPath(path)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+			return
+		}
+
+		db := s.store.FindDB(expandedPath)
+		if db == nil {
+			writeJSONError(w, http.StatusNotFound, "database not found", nil)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, SyncDiagnosticsResponse{
+			Databases: []SyncDiagnostic{db.SyncDiagnostic()},
+		})
+		return
+	}
+
+	dbs := s.store.DBs()
+	diagnostics := make([]SyncDiagnostic, 0, len(dbs))
+	for _, db := range dbs {
+		diagnostics = append(diagnostics, db.SyncDiagnostic())
+	}
+	writeJSON(w, http.StatusOK, SyncDiagnosticsResponse{Databases: diagnostics})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -314,6 +344,11 @@ type ErrorResponse struct {
 // TXIDResponse is the response body for the /txid endpoint.
 type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
+}
+
+// SyncDiagnosticsResponse is the response body for /debug/sync-status.
+type SyncDiagnosticsResponse struct {
+	Databases []SyncDiagnostic `json:"databases"`
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
