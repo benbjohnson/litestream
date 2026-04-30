@@ -19,7 +19,7 @@ import (
 
 	"github.com/superfly/ltx"
 
-	"github.com/corylanou/sqlite3vfs"
+	"github.com/psanford/sqlite3vfs"
 )
 
 // writeTestReplicaClient is a mock ReplicaClient for testing write functionality.

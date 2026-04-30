@@ -25,7 +25,7 @@ import (
 	"github.com/markusmobius/go-dateparser"
 	"github.com/superfly/ltx"
 
-	"github.com/corylanou/sqlite3vfs"
+	"github.com/psanford/sqlite3vfs"
 )
 
 const (
@@ -41,10 +41,10 @@ const (
 var ErrConflict = errors.New("remote has newer transactions than expected")
 
 var (
-	//go:linkname sqlite3vfsFileMap github.com/corylanou/sqlite3vfs.fileMap
+	//go:linkname sqlite3vfsFileMap github.com/psanford/sqlite3vfs.fileMap
 	sqlite3vfsFileMap map[uint64]sqlite3vfs.File
 
-	//go:linkname sqlite3vfsFileMux github.com/corylanou/sqlite3vfs.fileMux
+	//go:linkname sqlite3vfsFileMux github.com/psanford/sqlite3vfs.fileMux
 	sqlite3vfsFileMux sync.Mutex
 
 	vfsConnectionMap sync.Map // map[uintptr]uint64
@@ -126,18 +126,21 @@ func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 }
 
 func (vfs *VFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	return vfs.OpenFilename(sqlite3vfs.NewFilename(name, nil), flags)
+	return vfs.open(name, nil, flags)
 }
 
-func (vfs *VFS) OpenFilename(name sqlite3vfs.Filename, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	fileName := name.String()
-	slog.Debug("opening file", "name", fileName, "flags", flags)
+func (vfs *VFS) OpenURI(name string, params map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	return vfs.open(name, params, flags)
+}
+
+func (vfs *VFS) open(name string, uriParameters map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	slog.Debug("opening file", "name", name, "flags", flags)
 
 	switch {
 	case flags&sqlite3vfs.OpenMainDB != 0:
-		return vfs.openMainDB(fileName, name.URIParameters(), flags)
+		return vfs.openMainDB(name, uriParameters, flags)
 	case vfs.requiresTempFile(flags):
-		return vfs.openTempFile(fileName, flags)
+		return vfs.openTempFile(name, flags)
 	default:
 		return nil, flags, sqlite3vfs.CantOpenError
 	}
