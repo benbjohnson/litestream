@@ -25,7 +25,7 @@ import (
 
 	"github.com/superfly/ltx"
 
-	"github.com/corylanou/sqlite3vfs"
+	"github.com/psanford/sqlite3vfs"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -2017,12 +2017,12 @@ func (v *testVFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File,
 	return &injectingFile{File: f, vfs: v, name: name}, flags, nil
 }
 
-func (v *testVFS) OpenFilename(name sqlite3vfs.Filename, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
-	f, flags, err := v.VFS.OpenFilename(name, flags)
+func (v *testVFS) OpenURI(name string, params map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	f, flags, err := v.VFS.OpenURI(name, params, flags)
 	if err != nil {
 		return nil, flags, err
 	}
-	return &injectingFile{File: f, vfs: v, name: name.String()}, flags, nil
+	return &injectingFile{File: f, vfs: v, name: name}, flags, nil
 }
 
 func (v *testVFS) Inject(path string, err error) {

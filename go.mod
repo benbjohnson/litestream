@@ -57,10 +57,10 @@ require (
 )
 
 require (
-	github.com/corylanou/sqlite3vfs v0.0.0-20260421183553-1656bf6ea7f7
 	github.com/lmittmann/tint v1.1.3
 	github.com/mattn/go-isatty v0.0.20
 	github.com/pierrec/lz4/v4 v4.1.22
+	github.com/psanford/sqlite3vfs v0.0.0-20260430143329-583d6e6c62fb
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260209214922-2f26647a795e
 )
@@ -138,3 +138,5 @@ require (
 	google.golang.org/protobuf v1.36.10 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/psanford/sqlite3vfs => github.com/corylanou/sqlite3vfs v0.0.0-20260430143329-583d6e6c62fb
