@@ -244,6 +244,24 @@ func TestWALReader(t *testing.T) {
 			t.Fatalf("unexpected error: %#v", err)
 		}
 	})
+
+	t.Run("ErrContextCanceled", func(t *testing.T) {
+		b, err := os.ReadFile("testdata/wal-reader/ok/wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		r, err := litestream.NewWALReader(bytes.NewReader(b), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, _, err := r.ReadFrame(ctx, make([]byte, 4096)); !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
 }
 
 func TestWALReader_FrameSaltsUntil(t *testing.T) {
