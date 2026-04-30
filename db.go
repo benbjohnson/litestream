@@ -33,6 +33,7 @@ const (
 	DefaultBusyTimeout          = 1 * time.Second
 	DefaultMinCheckpointPageN   = 1000
 	DefaultTruncatePageN        = 121359 // ~500MB with 4KB page size
+	DefaultMaxSyncWALBytes      = 64 << 20
 	DefaultShutdownSyncTimeout  = 30 * time.Second
 	DefaultShutdownSyncInterval = 500 * time.Millisecond
 
@@ -139,6 +140,10 @@ type DB struct {
 	// Frequency at which to perform db sync.
 	MonitorInterval time.Duration
 
+	// Maximum WAL bytes to process in a single sync executor run.
+	// Set to zero to process all committed WAL frames in one run.
+	MaxSyncWALBytes int64
+
 	// The timeout to wait for EBUSY from SQLite.
 	BusyTimeout time.Duration
 
@@ -227,7 +232,9 @@ const (
 	diagPhaseVerifyAndSync                  diagPhase = "verify_and_sync"
 	diagPhaseCheckpointIfNeeded             diagPhase = "checkpoint_if_needed"
 	diagPhaseUpdateMetrics                  diagPhase = "update_metrics"
+	diagPhaseStatWAL                        diagPhase = "stat_wal"
 	diagPhaseVerify                         diagPhase = "verify"
+	diagPhaseSyncLTX                        diagPhase = "sync_ltx"
 	diagPhaseSyncOpenLTX                    diagPhase = "sync_open_ltx"
 	diagPhaseSyncPageMap                    diagPhase = "sync_page_map"
 	diagPhaseSyncPrepareLTX                 diagPhase = "sync_prepare_ltx"
@@ -293,6 +300,7 @@ func NewDB(path string) *DB {
 		TruncatePageN:        DefaultTruncatePageN,
 		CheckpointInterval:   DefaultCheckpointInterval,
 		MonitorInterval:      DefaultMonitorInterval,
+		MaxSyncWALBytes:      DefaultMaxSyncWALBytes,
 		BusyTimeout:          DefaultBusyTimeout,
 		L0Retention:          DefaultL0Retention,
 		RetentionEnabled:     true,
@@ -773,7 +781,7 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
-		if e := db.syncLocked(ctx); e != nil {
+		if _, e := db.syncLocked(ctx, 0); e != nil {
 			err = e
 		}
 	}
@@ -1162,16 +1170,58 @@ func (db *DB) releaseReadLock() error {
 }
 
 // Sync copies pending data from the WAL to the shadow WAL.
-func (db *DB) Sync(ctx context.Context) (err error) {
-	db.execMu.Lock()
+func (db *DB) Sync(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return context.Cause(ctx)
+		}
+
+		result, err := db.syncOnce(ctx, db.MaxSyncWALBytes)
+		if err != nil {
+			return err
+		} else if !result.synced || !result.limited || result.syncedToWALEnd {
+			return nil
+		}
+	}
+}
+
+func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, error) {
+	if err := db.lockExec(ctx); err != nil {
+		return syncResult{}, err
+	}
 	defer db.execMu.Unlock()
+
+	return db.syncLocked(ctx, maxSyncWALBytes)
+}
+
+func (db *DB) lockExec(ctx context.Context) error {
+	if db.execMu.TryLock() {
+		return nil
+	}
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			err := context.Cause(ctx)
+			if err == nil {
+				err = ctx.Err()
+			}
+			return fmt.Errorf("wait for db sync executor: %w", err)
+		case <-ticker.C:
+			if db.execMu.TryLock() {
+				return nil
+			}
+		}
+	}
+}
+
+func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
 	defer func() { db.finishSyncDiag(err) }()
 
-	return db.syncLocked(ctx)
-}
-
-func (db *DB) syncLocked(ctx context.Context) (err error) {
 	// Track total sync metrics.
 	t := time.Now()
 	defer func() {
@@ -1184,10 +1234,10 @@ func (db *DB) syncLocked(ctx context.Context) (err error) {
 
 	exec, err := db.newSyncExecutor(ctx)
 	if err != nil {
-		return err
+		return result, err
 	} else if exec == nil {
 		db.Logger.Debug("sync: no database found")
-		return nil
+		return result, nil
 	}
 	defer db.applySyncExecutor(exec, true)
 
@@ -1196,13 +1246,15 @@ func (db *DB) syncLocked(ctx context.Context) (err error) {
 		s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 	})
 	if err := db.ensureWALExists(ctx); err != nil {
-		return fmt.Errorf("ensure wal exists: %w", err)
+		return result, fmt.Errorf("ensure wal exists: %w", err)
 	}
 
-	db.setSyncDiagPhase(diagPhaseVerifyAndSync)
-	result, err := db.verifyAndSyncWithExecutor(ctx, false, exec)
+	db.setSyncDiagPhase(diagPhaseVerifyAndSync, func(s *diagState) {
+		s.txID = exec.pos.TXID + 1
+	})
+	result, err = db.verifyAndSyncWithExecutor(ctx, false, exec, maxSyncWALBytes)
 	if err != nil {
-		return err
+		return result, err
 	}
 	exec.applySyncResult(result)
 
@@ -1211,14 +1263,18 @@ func (db *DB) syncLocked(ctx context.Context) (err error) {
 		exec.state.syncedSinceCheckpoint = true
 	}
 
-	db.setSyncDiagPhase(diagPhaseCheckpointIfNeeded, func(s *diagState) {
-		s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
-	})
-	if err := db.checkpointIfNeeded(ctx, exec, result.origWALSize, result.newWALSize); err != nil {
-		return fmt.Errorf("checkpoint: %w", err)
+	if !result.limited || result.syncedToWALEnd {
+		db.setSyncDiagPhase(diagPhaseCheckpointIfNeeded, func(s *diagState) {
+			s.txID = exec.pos.TXID
+			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
+		})
+		if err := db.checkpointIfNeeded(ctx, exec, result.origWALSize, result.newWALSize); err != nil {
+			return result, fmt.Errorf("checkpoint: %w", err)
+		}
 	}
 
 	db.setSyncDiagPhase(diagPhaseUpdateMetrics, func(s *diagState) {
+		s.txID = exec.pos.TXID
 		s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 	})
 
@@ -1231,7 +1287,7 @@ func (db *DB) syncLocked(ctx context.Context) (err error) {
 	}
 	db.walSizeGauge.Set(float64(exec.state.lastSyncedWALOffset))
 
-	return nil
+	return result, nil
 }
 
 func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool, state *syncState) (syncResult, error) {
@@ -1243,10 +1299,15 @@ func (db *DB) verifyAndSync(ctx context.Context, checkpointing bool, state *sync
 	return db.verifyAndSyncWithExecutor(ctx, checkpointing, &syncExecutor{
 		state: *state,
 		pos:   pos,
-	})
+	}, 0)
 }
 
-func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool, exec *syncExecutor) (syncResult, error) {
+func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool, exec *syncExecutor, maxSyncWALBytes int64) (syncResult, error) {
+	db.setSyncDiagPhase(diagPhaseStatWAL, func(s *diagState) {
+		s.txID = exec.pos.TXID + 1
+		s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
+	})
+
 	// Use the last synced WAL offset as the logical size for checkpoint decisions.
 	// This avoids using file size which may include stale frames with old salt
 	// values after a checkpoint. See issue #997.
@@ -1269,7 +1330,13 @@ func (db *DB) verifyAndSyncWithExecutor(ctx context.Context, checkpointing bool,
 		return syncResult{}, fmt.Errorf("cannot verify wal state: %w", err)
 	}
 
-	result, err := db.sync(ctx, checkpointing, exec, info)
+	db.setSyncDiagPhase(diagPhaseSyncLTX, func(s *diagState) {
+		s.txID = exec.pos.TXID + 1
+		s.snapshotting = info.snapshotting
+		s.reason = info.reason
+		s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
+	})
+	result, err := db.sync(ctx, checkpointing, exec, info, maxSyncWALBytes)
 	if err != nil {
 		return syncResult{}, fmt.Errorf("sync: %w", err)
 	}
@@ -1716,6 +1783,7 @@ type syncResult struct {
 	origWALSize    int64
 	newWALSize     int64
 	synced         bool
+	limited        bool
 	syncedToWALEnd bool
 	pos            *ltx.Pos
 	l0FileInfo     *ltx.FileInfo
@@ -1804,7 +1872,7 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
-func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo) (result syncResult, err error) {
+func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo, maxSyncWALBytes int64) (result syncResult, err error) {
 	result.newWALSize = exec.state.lastSyncedWALOffset
 	result.syncedToWALEnd = exec.state.syncedToWALEnd
 	if info.clearSyncedToWALEnd {
@@ -1883,10 +1951,14 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			s.snapshotting = info.snapshotting
 			s.reason = info.reason
 		})
-	pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
+	if info.snapshotting {
+		maxSyncWALBytes = 0
+	}
+	pageMap, maxOffset, walCommit, limited, err := rd.pageMap(ctx, maxSyncWALBytes)
 	if err != nil {
 		return result, fmt.Errorf("page map: %w", err)
 	}
+	result.limited = limited
 	if walCommit > 0 {
 		commit = walCommit
 	}
@@ -2117,6 +2189,12 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
+		}
+
 		offset := pageMap[pgno]
 
 		db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
@@ -2213,7 +2291,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	result, err := db.verifyAndSyncWithExecutor(ctx, true, exec)
+	result, err := db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
 	if err != nil {
 		return fmt.Errorf("cannot copy wal before checkpoint: %w", err)
 	}
@@ -2271,7 +2349,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	result, err = db.verifyAndSyncWithExecutor(ctx, true, exec)
+	result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
 	if err != nil {
 		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
 	}
@@ -2703,7 +2781,7 @@ func (db *DB) monitor() {
 		}
 
 		// Sync the database to the shadow WAL.
-		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if _, err := db.syncOnce(db.ctx, db.MaxSyncWALBytes); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
