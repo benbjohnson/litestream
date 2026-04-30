@@ -134,7 +134,13 @@ func (r *WALReader) ReadFrame(ctx context.Context, data []byte) (pgno, commit ui
 	return r.readFrame(ctx, data, true)
 }
 
-func (r *WALReader) readFrame(_ context.Context, data []byte, verifyChecksum bool) (pgno, commit uint32, err error) {
+func (r *WALReader) readFrame(ctx context.Context, data []byte, verifyChecksum bool) (pgno, commit uint32, err error) {
+	select {
+	case <-ctx.Done():
+		return 0, 0, context.Cause(ctx)
+	default:
+	}
+
 	if len(data) != int(r.pageSize) {
 		return 0, 0, fmt.Errorf("WALReader.ReadFrame(): buffer size (%d) must match page size (%d)", len(data), r.pageSize)
 	}
@@ -190,15 +196,22 @@ func (r *WALReader) readFrame(_ context.Context, data []byte, verifyChecksum boo
 // map of pgno to offset of the latest version of each page. Also returns the
 // max offset of the wal segment read, and the final database size, in pages.
 func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset int64, commit uint32, err error) {
+	m, maxOffset, commit, _, err = r.pageMap(ctx, 0)
+	return m, maxOffset, commit, err
+}
+
+func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
-	for i := 0; ; i++ {
+	frameSize := int64(WALFrameHeaderSize + r.pageSize)
+	startOffset := WALHeaderSize + int64(r.frameN)*frameSize
+	for {
 		pgno, fcommit, err := r.ReadFrame(ctx, data)
 		if errors.Is(err, io.EOF) {
 			break
 		} else if err != nil {
-			return nil, 0, 0, err
+			return nil, 0, 0, false, err
 		}
 
 		// Update latest offset for the page for this transaction.
@@ -211,7 +224,13 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 			for pgno, offset := range txMap {
 				m[pgno] = offset
 			}
+			txMap = make(map[uint32]int64)
 			commit = fcommit
+
+			if maxBytes > 0 && r.Offset()+frameSize-startOffset >= maxBytes {
+				limited = true
+				break
+			}
 		}
 	}
 
@@ -225,7 +244,7 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 
 	// If full transactions available, return the original offset.
 	if len(m) == 0 {
-		return m, 0, 0, nil
+		return m, 0, 0, limited, nil
 	}
 
 	// Compute the highest page offsets.
@@ -240,7 +259,7 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	end += WALFrameHeaderSize + int64(r.pageSize)
 
 	r.logger.Log(ctx, internal.LevelTrace, "page map complete", "n", len(m), "end", end, "commit", commit)
-	return m, end, commit, nil
+	return m, end, commit, limited, nil
 }
 
 // FrameSaltsUntil returns a set of all unique frame salts in the WAL file.
