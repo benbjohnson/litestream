@@ -105,6 +105,187 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
+func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.execMu.Lock()
+	defer db.execMu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	err := db.Sync(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err=%v, want context deadline exceeded", err)
+	}
+	if !strings.Contains(err.Error(), "wait for db sync executor") {
+		t.Fatalf("err=%q, want sync executor context", err)
+	}
+}
+
+func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.execMu.Lock()
+	defer db.execMu.Unlock()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Sync(ctx) }()
+
+	deadline := time.After(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	var diag SyncDiagnostic
+	for {
+		diag = db.SyncDiagnostic()
+		if diag.ExecutorWaiterCount == 1 {
+			break
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("sync returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("sync diagnostic did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+
+	if diag.ExecutorWaitStarted == nil {
+		t.Fatal("expected executor wait start time")
+	}
+	if diag.ExecutorWaitSeconds <= 0 {
+		t.Fatalf("executor_wait_seconds=%f, want positive", diag.ExecutorWaitSeconds)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+	if got := db.SyncDiagnostic().ExecutorWaiterCount; got != 0 {
+		t.Fatalf("executor_waiter_count=%d, want 0", got)
+	}
+}
+
+func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+
+	r.syncMu.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- r.Sync(ctx) }()
+
+	select {
+	case err := <-done:
+		r.syncMu.Unlock()
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err=%v, want context deadline exceeded", err)
+		}
+		if !strings.Contains(err.Error(), "wait for replica sync") {
+			t.Fatalf("err=%q, want replica sync context", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		r.syncMu.Unlock()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("replica sync did not return after lock release")
+		}
+		t.Fatal("replica sync did not honor context while waiting for sync lock")
+	}
+}
+
+func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: t.TempDir()}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t DEFAULT VALUES;`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID < 2 {
+		t.Fatalf("db txid=%s, want at least 2", dpos.TXID)
+	}
+	r.SetPos(ltx.Pos{TXID: dpos.TXID - 2})
+
+	result, err := r.syncOnce(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("expected limited replica sync to upload one file")
+	}
+	if !result.limited {
+		t.Fatal("expected limited replica sync to stop before catching up")
+	}
+	if got, want := r.Pos().TXID, dpos.TXID-1; got != want {
+		t.Fatalf("replica txid=%s, want %s", got, want)
+	}
+	if !db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("limited replica sync should not record full sync success")
+	}
+
+	result, err = r.syncOnce(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("expected final replica sync to upload remaining files")
+	}
+	if result.limited {
+		t.Fatal("expected final replica sync to catch up")
+	}
+	if got, want := r.Pos().TXID, dpos.TXID; got != want {
+		t.Fatalf("replica txid=%s, want %s", got, want)
+	}
+	if db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("full replica sync should record sync success")
+	}
+}
+
 func TestDB_SyncDiagnostic(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 
