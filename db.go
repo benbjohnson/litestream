@@ -230,6 +230,8 @@ type syncDiagnosticState struct {
 	checkpointMode      string
 	reason              string
 	err                 string
+	executorWaiterCount int
+	executorWaitStarted time.Time
 }
 
 // SyncDiagnostic reports the latest DB sync/checkpoint activity.
@@ -248,6 +250,9 @@ type SyncDiagnostic struct {
 	CheckpointMode      string     `json:"checkpoint_mode,omitempty"`
 	Reason              string     `json:"reason,omitempty"`
 	Error               string     `json:"error,omitempty"`
+	ExecutorWaiterCount int        `json:"executor_waiter_count,omitempty"`
+	ExecutorWaitStarted *time.Time `json:"executor_wait_started_at,omitempty"`
+	ExecutorWaitSeconds float64    `json:"executor_wait_seconds,omitempty"`
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -354,6 +359,12 @@ func (db *DB) SyncDiagnostic() SyncDiagnostic {
 		CheckpointMode:      db.syncDiag.checkpointMode,
 		Reason:              db.syncDiag.reason,
 		Error:               db.syncDiag.err,
+		ExecutorWaiterCount: db.syncDiag.executorWaiterCount,
+	}
+	if !db.syncDiag.executorWaitStarted.IsZero() {
+		startedAt := db.syncDiag.executorWaitStarted
+		diag.ExecutorWaitStarted = &startedAt
+		diag.ExecutorWaitSeconds = time.Since(db.syncDiag.executorWaitStarted).Seconds()
 	}
 	if !db.syncDiag.startedAt.IsZero() {
 		startedAt := db.syncDiag.startedAt
@@ -442,6 +453,27 @@ func (db *DB) finishSyncDiagnostic(err error) {
 	db.syncDiag.updatedAt = time.Now()
 	if err != nil {
 		db.syncDiag.err = err.Error()
+	}
+}
+
+func (db *DB) beginSyncExecutorWait() {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Now()
+	}
+	db.syncDiag.executorWaiterCount++
+}
+
+func (db *DB) finishSyncExecutorWait() {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.executorWaiterCount == 0 {
+		return
+	}
+	db.syncDiag.executorWaiterCount--
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Time{}
 	}
 }
 
@@ -1187,6 +1219,8 @@ func (db *DB) lockExec(ctx context.Context) error {
 	if db.execMu.TryLock() {
 		return nil
 	}
+	db.beginSyncExecutorWait()
+	defer db.finishSyncExecutorWait()
 
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
