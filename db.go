@@ -64,7 +64,7 @@ const (
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
 	mu        sync.RWMutex
-	execMu    sync.Mutex
+	execMu    contextMutex
 	path      string        // part to database
 	metaPath  string        // Path to the database metadata.
 	db        *sql.DB       // target database
@@ -181,6 +181,58 @@ type DB struct {
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
+}
+
+type contextMutex struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (m *contextMutex) init() {
+	m.once.Do(func() {
+		m.ch = make(chan struct{}, 1)
+	})
+}
+
+func (m *contextMutex) Lock() {
+	m.init()
+	m.ch <- struct{}{}
+}
+
+func (m *contextMutex) LockContext(ctx context.Context) error {
+	m.init()
+
+	select {
+	case m.ch <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		err := context.Cause(ctx)
+		if err == nil {
+			err = ctx.Err()
+		}
+		return err
+	}
+}
+
+func (m *contextMutex) TryLock() bool {
+	m.init()
+
+	select {
+	case m.ch <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m *contextMutex) Unlock() {
+	m.init()
+
+	select {
+	case <-m.ch:
+	default:
+		panic("unlock of unlocked contextMutex")
+	}
 }
 
 // syncState holds mutable sync-tracking fields extracted from DB.
@@ -1222,23 +1274,10 @@ func (db *DB) lockExec(ctx context.Context) error {
 	db.beginSyncExecutorWait()
 	defer db.finishSyncExecutorWait()
 
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			err := context.Cause(ctx)
-			if err == nil {
-				err = ctx.Err()
-			}
-			return fmt.Errorf("wait for db sync executor: %w", err)
-		case <-ticker.C:
-			if db.execMu.TryLock() {
-				return nil
-			}
-		}
+	if err := db.execMu.LockContext(ctx); err != nil {
+		return fmt.Errorf("wait for db sync executor: %w", err)
 	}
+	return nil
 }
 
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
