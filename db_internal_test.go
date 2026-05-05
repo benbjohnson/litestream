@@ -169,6 +169,71 @@ func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
 	}
 }
 
+func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.execMu.Lock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := db.lockExec(ctx)
+		if err == nil {
+			db.execMu.Unlock()
+		}
+		done <- err
+	}()
+
+	deadline := time.After(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if db.SyncDiagnostic().ExecutorWaiterCount == 1 {
+			break
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("lockExec returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("lockExec did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+
+	hogReady := make(chan struct{})
+	hogAcquired := make(chan struct{})
+	hogDone := make(chan struct{})
+	go func() {
+		close(hogReady)
+		db.execMu.Lock()
+		close(hogAcquired)
+		time.Sleep(150 * time.Millisecond)
+		db.execMu.Unlock()
+		close(hogDone)
+	}()
+	<-hogReady
+	time.Sleep(5 * time.Millisecond)
+
+	db.execMu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lockExec returned error: %v", err)
+		}
+	case <-hogAcquired:
+		<-hogDone
+		err := <-done
+		t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+	case <-ctx.Done():
+		err := <-done
+		t.Fatalf("lockExec timed out waiting behind later lock attempt: %v", err)
+	}
+}
+
 func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
