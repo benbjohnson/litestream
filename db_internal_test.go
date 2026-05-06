@@ -266,6 +266,56 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 	}
 }
 
+func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	r.syncMu.Lock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := r.lockSync(ctx)
+		if err == nil {
+			r.syncMu.Unlock()
+		}
+		done <- err
+	}()
+
+	time.Sleep(5 * time.Millisecond)
+
+	hogReady := make(chan struct{})
+	hogAcquired := make(chan struct{})
+	hogDone := make(chan struct{})
+	go func() {
+		close(hogReady)
+		r.syncMu.Lock()
+		close(hogAcquired)
+		time.Sleep(150 * time.Millisecond)
+		r.syncMu.Unlock()
+		close(hogDone)
+	}()
+	<-hogReady
+	time.Sleep(5 * time.Millisecond)
+
+	r.syncMu.Unlock()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lockSync returned error: %v", err)
+		}
+	case <-hogAcquired:
+		<-hogDone
+		err := <-done
+		t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+	case <-ctx.Done():
+		err := <-done
+		t.Fatalf("lockSync timed out waiting behind later lock attempt: %v", err)
+	}
+}
+
 func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
