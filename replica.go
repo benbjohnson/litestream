@@ -1071,7 +1071,7 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	// Apply WAL segments.
-	if err := r.applyWALSegmentsV3(ctx, client, snapshot.Generation, segments, tmpPath); err != nil {
+	if err := r.applyWALSegmentsV3(ctx, client, snapshot.Generation, snapshot.Index, segments, tmpPath); err != nil {
 		return fmt.Errorf("apply WAL segments: %w", err)
 	}
 
@@ -1161,7 +1161,7 @@ func (r *Replica) downloadSnapshotV3(ctx context.Context, client ReplicaClientV3
 }
 
 // applyWALSegmentsV3 applies WAL segments to the database file.
-func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3, generation string, segments []WALSegmentInfoV3, dbPath string) error {
+func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3, generation string, snapshotIndex int, segments []WALSegmentInfoV3, dbPath string) error {
 	if len(segments) == 0 {
 		return nil
 	}
@@ -1170,7 +1170,7 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 	walPath := dbPath + "-wal"
 	var f *os.File
 	var err error
-	index := 0
+	expectedIndex := snapshotIndex
 	offset := int64(0)
 
 	defer func() {
@@ -1189,7 +1189,7 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 		if err = checkpointV3(dbPath); err != nil {
 			return err
 		}
-		r.Logger().Info(fmt.Sprintf("applied WAL index %d (%d bytes)", index, offset))
+		r.Logger().Debug("applied WAL index", "generation", generation, "index", expectedIndex-1, "bytes", offset)
 		return nil
 	}
 
@@ -1201,17 +1201,17 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 			if err = applyLastWalFile(); err != nil {
 				return err
 			}
-			if seg.Index != index+1 {
-				return fmt.Errorf("missing WAL index %d (got %d/%d)", index+1, seg.Index, seg.Offset)
+			if seg.Index != expectedIndex {
+				return fmt.Errorf("missing WAL index: expected %d/0, got %d/%d", expectedIndex, seg.Index, seg.Offset)
 			}
-			index = seg.Index
 			offset = 0
 			// Open a new WAL file
 			if f, err = os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err != nil {
 				return err
 			}
+			expectedIndex++
 		} else if seg.Offset != offset {
-			return fmt.Errorf("missing WAL segment for index %d. Expected offset %d, got %d", seg.Index, offset, seg.Offset)
+			return fmt.Errorf("missing WAL segment: expected %d/%d, got %d/%d", seg.Index, offset, seg.Index, seg.Offset)
 		}
 		if n, err := r.appendWALSegmentV3(ctx, client, generation, seg, f); err != nil {
 			return fmt.Errorf("write WAL segment %d/%d: %w", seg.Index, seg.Offset, err)

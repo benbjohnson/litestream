@@ -1115,6 +1115,155 @@ func TestReplica_RestoreV3(t *testing.T) {
 		verifyRestoredDB(t, outputPath)
 	})
 
+	t.Run("MultipleWALIndices", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{"wal0"}, []string{"wal1"})
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData[0]},
+			{index: 1, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("MissingWALIndex", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{"wal0"}, []string{"wal2"})
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData[0]},
+			{index: 2, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "missing WAL index") {
+			t.Fatalf("expected missing WAL index error, got %v", err)
+		}
+	})
+
+	t.Run("MissingWALOffset", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALData(t, dbData)
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData},
+			{index: 0, offset: 999999, data: []byte("wal gap")},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "missing WAL segment") {
+			t.Fatalf("expected missing WAL segment error, got %v", err)
+		}
+	})
+
+	t.Run("SnapshotIndexNonZero", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{"wal5"}, []string{"wal6"})
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 5, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 5, offset: 0, data: walData[0]},
+			{index: 6, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("WALTruncationBetweenIndices", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{strings.Repeat("x", 128*1024)}, []string{"small"})
+		if len(walData[0]) <= len(walData[1]) {
+			t.Fatalf("expected first WAL to be larger than second WAL: %d <= %d", len(walData[0]), len(walData[1]))
+		}
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData[0]},
+			{index: 1, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
 	t.Run("TimestampRestore", func(t *testing.T) {
 		ctx := context.Background()
 		tmpDir := t.TempDir()
@@ -1671,7 +1820,7 @@ func writeV3WALSegment(t *testing.T, dir string, index int, offset int64, data [
 		t.Fatal(err)
 	}
 
-	filename := fmt.Sprintf("%08x-%016x.wal.lz4", index, offset)
+	filename := litestream.FormatWALSegmentFilenameV3(index, offset)
 	if err := os.WriteFile(filepath.Join(dir, filename), buf.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1698,25 +1847,43 @@ func createTestSQLiteDB(t *testing.T) []byte {
 	return data
 }
 
-// createTestWALData creates minimal valid WAL data for testing.
-// For simplicity, returns an empty WAL header (32 bytes) which is valid.
 func createTestWALData(t *testing.T, dbData []byte) []byte {
 	t.Helper()
+	return createTestWALSequence(t, dbData, []string{"wal"})[0]
+}
 
-	// Create a minimal WAL header
-	// WAL header is 32 bytes:
-	// - magic number (4 bytes): 0x377f0683 (big-endian) or 0x377f0682 (little-endian)
-	// - file format version (4 bytes): 3007000
-	// - page size (4 bytes)
-	// - checkpoint sequence (4 bytes)
-	// - salt-1 (4 bytes)
-	// - salt-2 (4 bytes)
-	// - checksum-1 (4 bytes)
-	// - checksum-2 (4 bytes)
+func createTestWALSequence(t *testing.T, dbData []byte, valuesByIndex ...[]string) [][]byte {
+	t.Helper()
 
-	// For testing, we'll create an empty WAL that doesn't need frames applied
-	// This is sufficient for testing the restore mechanism
-	return make([]byte, 32) // Empty WAL header placeholder
+	tmpPath := t.TempDir() + "/test.db"
+	if err := os.WriteFile(tmpPath, dbData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb := testingutil.MustOpenSQLDB(t, tmpPath)
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+
+	walData := make([][]byte, 0, len(valuesByIndex))
+	for _, values := range valuesByIndex {
+		for _, value := range values {
+			if _, err := sqldb.Exec(`INSERT INTO test (value) VALUES (?)`, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		data, err := os.ReadFile(tmpPath + "-wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) == 0 {
+			t.Fatal("expected WAL data")
+		}
+		walData = append(walData, append([]byte(nil), data...))
+		if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return walData
 }
 
 func TestWriteTXIDFile(t *testing.T) {
