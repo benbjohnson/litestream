@@ -36,7 +36,7 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
-	syncMu sync.Mutex // protects Sync() from concurrent calls
+	syncMu contextMutex // protects Sync() from concurrent calls
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -216,24 +216,10 @@ func (r *Replica) lockSync(ctx context.Context) error {
 	if r.syncMu.TryLock() {
 		return nil
 	}
-
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			err := context.Cause(ctx)
-			if err == nil {
-				err = ctx.Err()
-			}
-			return fmt.Errorf("wait for replica sync: %w", err)
-		case <-ticker.C:
-			if r.syncMu.TryLock() {
-				return nil
-			}
-		}
+	if err := r.syncMu.LockContext(ctx); err != nil {
+		return fmt.Errorf("wait for replica sync: %w", err)
 	}
+	return nil
 }
 
 func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (err error) {
