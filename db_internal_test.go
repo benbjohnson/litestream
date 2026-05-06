@@ -11,7 +11,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -2088,7 +2087,7 @@ func TestDB_WriteLTXFromWAL_PageGrowthCoverage(t *testing.T) {
 	}
 }
 
-func TestDB_WriteLTXFromWAL_FillsMissingGrowthPagesFromDB(t *testing.T) {
+func TestDB_WriteLTXFromWAL_RejectsMissingGrowthPages(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 	walPath := filepath.Join(dir, "db-wal")
@@ -2148,82 +2147,12 @@ func TestDB_WriteLTXFromWAL_FillsMissingGrowthPagesFromDB(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.writeLTXFromWAL(context.Background(), enc, walFile, 2, 5, pageMap); err != nil {
-		t.Fatal(err)
+	err = db.writeLTXFromWAL(context.Background(), enc, walFile, 2, 5, pageMap)
+	if err == nil {
+		t.Fatal("expected missing growth page error")
 	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	dec := ltx.NewDecoder(bytes.NewReader(buf.Bytes()))
-	if err := dec.DecodeHeader(); err != nil {
-		t.Fatal(err)
-	}
-
-	var pgnos []uint32
-	got := make(map[uint32][]byte)
-	pageBuf := make([]byte, pageSize)
-	for {
-		var phdr ltx.PageHeader
-		if err := dec.DecodePage(&phdr, pageBuf); err == io.EOF {
-			break
-		} else if err != nil {
-			t.Fatal(err)
-		}
-		pgnos = append(pgnos, phdr.Pgno)
-		got[phdr.Pgno] = append([]byte(nil), pageBuf...)
-	}
-
-	if !reflect.DeepEqual([]uint32{3, 4, 5}, pgnos) {
-		t.Fatalf("page numbers mismatch: got=%v", pgnos)
-	}
-	if !bytes.Equal(got[3], bytes.Repeat([]byte{13}, pageSize)) {
-		t.Fatal("expected page 3 to come from WAL")
-	}
-	if !bytes.Equal(got[4], bytes.Repeat([]byte{4}, pageSize)) {
-		t.Fatal("expected page 4 to come from database")
-	}
-	if !bytes.Equal(got[5], bytes.Repeat([]byte{15}, pageSize)) {
-		t.Fatal("expected page 5 to come from WAL")
-	}
-
-	snapshot := new(bytes.Buffer)
-	snapshotEnc, err := ltx.NewEncoder(snapshot)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := snapshotEnc.EncodeHeader(ltx.Header{
-		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
-		PageSize:  pageSize,
-		Commit:    2,
-		MinTXID:   1,
-		MaxTXID:   1,
-		Timestamp: time.Now().UnixMilli(),
-	}); err != nil {
-		t.Fatal(err)
-	}
-	for _, pgno := range []uint32{1, 2} {
-		page := bytes.Repeat([]byte{byte(pgno)}, pageSize)
-		if err := snapshotEnc.EncodePage(ltx.PageHeader{Pgno: uint32(pgno)}, page); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := snapshotEnc.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	compacted := new(bytes.Buffer)
-	c, err := ltx.NewCompactor(compacted, []io.Reader{
-		bytes.NewReader(snapshot.Bytes()),
-		bytes.NewReader(buf.Bytes()),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	c.HeaderFlags = ltx.HeaderFlagNoChecksum
-	if err := c.Compact(context.Background()); err != nil {
-		t.Fatalf("compaction failed: %v", err)
+	if !strings.Contains(err.Error(), "missing WAL growth page 4") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
