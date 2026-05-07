@@ -2022,9 +2022,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 	if !info.snapshotting {
 		if pgno, ok := missingGrowthPage(info.prevCommit, commit, uint32(db.pageSize), pageMap); ok {
-			info.snapshotting = true
-			info.reason = fmt.Sprintf("missing WAL growth page %d, full LTX", pgno)
-			db.Logger.Info("missing WAL growth page, writing full LTX",
+			db.Logger.Info("missing WAL growth page, reading from database",
 				"txid", txID.String(),
 				"pgno", pgno,
 				"prev_commit", info.prevCommit,
@@ -2260,14 +2258,26 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 	if err := checkContext(); err != nil {
 		return err
 	}
-	if pgno, ok := missingGrowthPage(prevCommit, commit, uint32(db.pageSize), pageMap); ok {
-		return fmt.Errorf("missing WAL growth page %d between previous commit %d and commit %d", pgno, prevCommit, commit)
-	}
 
 	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
 		pgnos = append(pgnos, pgno)
+	}
+	lockPgno := ltx.LockPgno(uint32(db.pageSize))
+	if commit > prevCommit {
+		for pgno := prevCommit + 1; pgno <= commit; pgno++ {
+			if err := checkContext(); err != nil {
+				return err
+			}
+			if pgno == lockPgno {
+				continue
+			}
+			if _, ok := pageMap[pgno]; ok {
+				continue
+			}
+			pgnos = append(pgnos, pgno)
+		}
 	}
 	slices.Sort(pgnos)
 
@@ -2276,13 +2286,21 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 		if err := checkContext(); err != nil {
 			return err
 		}
-		offset := pageMap[pgno]
-		db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
+		if offset, ok := pageMap[pgno]; ok {
+			db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
 
-		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
-			return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
-		} else if n != len(data) {
-			return fmt.Errorf("short read page %d @ %d", pgno, offset)
+			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
+				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
+			} else if n != len(data) {
+				return fmt.Errorf("short read page %d @ %d", pgno, offset)
+			}
+		} else {
+			offset := int64(pgno-1) * int64(db.pageSize)
+			db.Logger.Log(ctx, internal.LevelTrace, "encode page from database", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walgrowth")
+
+			if _, err := db.f.ReadAt(data, offset); err != nil {
+				return fmt.Errorf("read database page %d: %w", pgno, err)
+			}
 		}
 
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
