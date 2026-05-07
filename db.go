@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -64,7 +65,7 @@ const (
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
 	mu        sync.RWMutex
-	execMu    contextMutex
+	execGate  syncGate
 	path      string        // part to database
 	metaPath  string        // Path to the database metadata.
 	db        *sql.DB       // target database
@@ -185,56 +186,36 @@ type DB struct {
 	Logger *slog.Logger
 }
 
-type contextMutex struct {
+type syncGate struct {
 	once sync.Once
-	ch   chan struct{}
+	sem  *semaphore.Weighted
 }
 
-func (m *contextMutex) init() {
-	m.once.Do(func() {
-		m.ch = make(chan struct{}, 1)
+func (g *syncGate) init() {
+	g.once.Do(func() {
+		g.sem = semaphore.NewWeighted(1)
 	})
 }
 
-func (m *contextMutex) Lock() {
-	m.init()
-	m.ch <- struct{}{}
-}
-
-func (m *contextMutex) LockContext(ctx context.Context) error {
-	m.init()
-
-	select {
-	case m.ch <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		err := context.Cause(ctx)
-		if err == nil {
-			err = ctx.Err()
+func (g *syncGate) Acquire(ctx context.Context) error {
+	g.init()
+	if err := g.sem.Acquire(ctx, 1); err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
 		}
 		return err
 	}
+	return nil
 }
 
-func (m *contextMutex) TryLock() bool {
-	m.init()
-
-	select {
-	case m.ch <- struct{}{}:
-		return true
-	default:
-		return false
-	}
+func (g *syncGate) TryAcquire() bool {
+	g.init()
+	return g.sem.TryAcquire(1)
 }
 
-func (m *contextMutex) Unlock() {
-	m.init()
-
-	select {
-	case <-m.ch:
-	default:
-		panic("unlock of unlocked contextMutex")
-	}
+func (g *syncGate) Release() {
+	g.init()
+	g.sem.Release(1)
 }
 
 // syncState holds mutable sync-tracking fields extracted from DB.
@@ -862,8 +843,10 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
 
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	if err := db.execGate.Acquire(ctx); err != nil {
+		return err
+	}
+	defer db.execGate.Release()
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
@@ -1275,19 +1258,19 @@ func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, 
 	if err := db.lockExec(ctx); err != nil {
 		return syncResult{}, err
 	}
-	defer db.execMu.Unlock()
+	defer db.execGate.Release()
 
 	return db.syncLocked(ctx, maxSyncWALBytes)
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
-	if db.execMu.TryLock() {
+	if db.execGate.TryAcquire() {
 		return nil
 	}
 	db.beginSyncExecutorWait()
 	defer db.finishSyncExecutorWait()
 
-	if err := db.execMu.LockContext(ctx); err != nil {
+	if err := db.execGate.Acquire(ctx); err != nil {
 		return fmt.Errorf("wait for db sync executor: %w", err)
 	}
 	return nil
@@ -2302,8 +2285,10 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 
 // Checkpoint performs a checkpoint on the WAL file.
 func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
+	defer db.execGate.Release()
 	db.beginSyncDiag(diagOpCheckpoint)
 	defer func() { db.finishSyncDiag(err) }()
 
@@ -2500,10 +2485,12 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	db.execMu.Lock()
+	if err := db.lockExec(ctx); err != nil {
+		return ltx.Pos{}, nil, err
+	}
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
-	db.execMu.Unlock()
+	db.execGate.Release()
 
 	if pageSize == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
@@ -2921,8 +2908,10 @@ func (db *DB) monitor() {
 //
 // If dst is set, the database file is copied to that location before checksum.
 func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	if err := db.execGate.Acquire(ctx); err != nil {
+		return 0, ltx.Pos{}, err
+	}
+	defer db.execGate.Release()
 
 	exec, err := db.newSyncExecutor(ctx)
 	if err != nil {
