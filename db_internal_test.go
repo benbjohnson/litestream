@@ -18,6 +18,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -105,16 +106,16 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
-func mustAcquireGate(g *syncGate) {
-	if err := g.Acquire(context.Background()); err != nil {
+func mustAcquireSemaphore(s *semaphore.Weighted) {
+	if err := s.Acquire(context.Background(), 1); err != nil {
 		panic(err)
 	}
 }
 
 func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	mustAcquireGate(&db.execGate)
-	defer db.execGate.Release()
+	mustAcquireSemaphore(db.execSem)
+	defer db.execSem.Release(1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
@@ -130,8 +131,8 @@ func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 
 func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	mustAcquireGate(&db.execGate)
-	defer db.execGate.Release()
+	mustAcquireSemaphore(db.execSem)
+	defer db.execSem.Release(1)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -177,7 +178,7 @@ func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
 
 func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	mustAcquireGate(&db.execGate)
+	mustAcquireSemaphore(db.execSem)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -186,7 +187,7 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	go func() {
 		err := db.lockExec(ctx)
 		if err == nil {
-			db.execGate.Release()
+			db.execSem.Release(1)
 		}
 		done <- err
 	}()
@@ -214,16 +215,16 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	hogDone := make(chan struct{})
 	go func() {
 		close(hogReady)
-		mustAcquireGate(&db.execGate)
+		mustAcquireSemaphore(db.execSem)
 		close(hogAcquired)
 		time.Sleep(150 * time.Millisecond)
-		db.execGate.Release()
+		db.execSem.Release(1)
 		close(hogDone)
 	}()
 	<-hogReady
 	time.Sleep(5 * time.Millisecond)
 
-	db.execGate.Release()
+	db.execSem.Release(1)
 
 	select {
 	case err := <-done:
@@ -244,7 +245,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
 
-	mustAcquireGate(&r.syncGate)
+	mustAcquireSemaphore(r.syncSem)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
 
@@ -253,7 +254,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 
 	select {
 	case err := <-done:
-		r.syncGate.Release()
+		r.syncSem.Release(1)
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("err=%v, want context deadline exceeded", err)
 		}
@@ -261,7 +262,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 			t.Fatalf("err=%q, want replica sync context", err)
 		}
 	case <-time.After(100 * time.Millisecond):
-		r.syncGate.Release()
+		r.syncSem.Release(1)
 		select {
 		case <-done:
 		case <-time.After(time.Second):
@@ -274,7 +275,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
-	mustAcquireGate(&r.syncGate)
+	mustAcquireSemaphore(r.syncSem)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -283,7 +284,7 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	go func() {
 		err := r.lockSync(ctx)
 		if err == nil {
-			r.syncGate.Release()
+			r.syncSem.Release(1)
 		}
 		done <- err
 	}()
@@ -295,16 +296,16 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	hogDone := make(chan struct{})
 	go func() {
 		close(hogReady)
-		mustAcquireGate(&r.syncGate)
+		mustAcquireSemaphore(r.syncSem)
 		close(hogAcquired)
 		time.Sleep(150 * time.Millisecond)
-		r.syncGate.Release()
+		r.syncSem.Release(1)
 		close(hogDone)
 	}()
 	<-hogReady
 	time.Sleep(5 * time.Millisecond)
 
-	r.syncGate.Release()
+	r.syncSem.Release(1)
 
 	select {
 	case err := <-done:
