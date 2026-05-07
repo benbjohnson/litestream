@@ -105,10 +105,16 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
+func mustAcquireGate(g *syncGate) {
+	if err := g.Acquire(context.Background()); err != nil {
+		panic(err)
+	}
+}
+
 func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	mustAcquireGate(&db.execGate)
+	defer db.execGate.Release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
@@ -124,8 +130,8 @@ func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 
 func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	mustAcquireGate(&db.execGate)
+	defer db.execGate.Release()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -171,7 +177,7 @@ func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
 
 func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
-	db.execMu.Lock()
+	mustAcquireGate(&db.execGate)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -180,7 +186,7 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	go func() {
 		err := db.lockExec(ctx)
 		if err == nil {
-			db.execMu.Unlock()
+			db.execGate.Release()
 		}
 		done <- err
 	}()
@@ -208,16 +214,16 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	hogDone := make(chan struct{})
 	go func() {
 		close(hogReady)
-		db.execMu.Lock()
+		mustAcquireGate(&db.execGate)
 		close(hogAcquired)
 		time.Sleep(150 * time.Millisecond)
-		db.execMu.Unlock()
+		db.execGate.Release()
 		close(hogDone)
 	}()
 	<-hogReady
 	time.Sleep(5 * time.Millisecond)
 
-	db.execMu.Unlock()
+	db.execGate.Release()
 
 	select {
 	case err := <-done:
@@ -238,7 +244,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
 
-	r.syncMu.Lock()
+	mustAcquireGate(&r.syncGate)
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
 	defer cancel()
 
@@ -247,7 +253,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 
 	select {
 	case err := <-done:
-		r.syncMu.Unlock()
+		r.syncGate.Release()
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("err=%v, want context deadline exceeded", err)
 		}
@@ -255,7 +261,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 			t.Fatalf("err=%q, want replica sync context", err)
 		}
 	case <-time.After(100 * time.Millisecond):
-		r.syncMu.Unlock()
+		r.syncGate.Release()
 		select {
 		case <-done:
 		case <-time.After(time.Second):
@@ -268,7 +274,7 @@ func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
 func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
-	r.syncMu.Lock()
+	mustAcquireGate(&r.syncGate)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -277,7 +283,7 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	go func() {
 		err := r.lockSync(ctx)
 		if err == nil {
-			r.syncMu.Unlock()
+			r.syncGate.Release()
 		}
 		done <- err
 	}()
@@ -289,16 +295,16 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	hogDone := make(chan struct{})
 	go func() {
 		close(hogReady)
-		r.syncMu.Lock()
+		mustAcquireGate(&r.syncGate)
 		close(hogAcquired)
 		time.Sleep(150 * time.Millisecond)
-		r.syncMu.Unlock()
+		r.syncGate.Release()
 		close(hogDone)
 	}()
 	<-hogReady
 	time.Sleep(5 * time.Millisecond)
 
-	r.syncMu.Unlock()
+	r.syncGate.Release()
 
 	select {
 	case err := <-done:
