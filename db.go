@@ -65,7 +65,7 @@ const (
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
 	mu        sync.RWMutex
-	execGate  syncGate
+	execSem   *semaphore.Weighted
 	path      string        // part to database
 	metaPath  string        // Path to the database metadata.
 	db        *sql.DB       // target database
@@ -186,38 +186,6 @@ type DB struct {
 	Logger *slog.Logger
 }
 
-type syncGate struct {
-	once sync.Once
-	sem  *semaphore.Weighted
-}
-
-func (g *syncGate) init() {
-	g.once.Do(func() {
-		g.sem = semaphore.NewWeighted(1)
-	})
-}
-
-func (g *syncGate) Acquire(ctx context.Context) error {
-	g.init()
-	if err := g.sem.Acquire(ctx, 1); err != nil {
-		if cause := context.Cause(ctx); cause != nil {
-			return cause
-		}
-		return err
-	}
-	return nil
-}
-
-func (g *syncGate) TryAcquire() bool {
-	g.init()
-	return g.sem.TryAcquire(1)
-}
-
-func (g *syncGate) Release() {
-	g.init()
-	g.sem.Release(1)
-}
-
 // syncState holds mutable sync-tracking fields extracted from DB.
 // These fields are threaded through sync/checkpoint methods via pointer.
 type syncState struct {
@@ -327,6 +295,13 @@ type SyncDiagnostic struct {
 	ExecutorWaitSeconds float64    `json:"executor_wait_seconds,omitempty"`
 }
 
+func contextCause(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return err
+}
+
 // NewDB returns a new instance of DB for a given path.
 func NewDB(path string) *DB {
 	dir, file := filepath.Split(path)
@@ -334,6 +309,7 @@ func NewDB(path string) *DB {
 	db := &DB{
 		path:     path,
 		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
+		execSem:  semaphore.NewWeighted(1),
 		notify:   make(chan struct{}),
 
 		MinCheckpointPageN:   DefaultMinCheckpointPageN,
@@ -843,10 +819,10 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
 
-	if err := db.execGate.Acquire(ctx); err != nil {
-		return err
+	if err := db.execSem.Acquire(ctx, 1); err != nil {
+		return contextCause(ctx, err)
 	}
-	defer db.execGate.Release()
+	defer db.execSem.Release(1)
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
@@ -1258,20 +1234,20 @@ func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, 
 	if err := db.lockExec(ctx); err != nil {
 		return syncResult{}, err
 	}
-	defer db.execGate.Release()
+	defer db.execSem.Release(1)
 
 	return db.syncLocked(ctx, maxSyncWALBytes)
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
-	if db.execGate.TryAcquire() {
+	if db.execSem.TryAcquire(1) {
 		return nil
 	}
 	db.beginSyncExecutorWait()
 	defer db.finishSyncExecutorWait()
 
-	if err := db.execGate.Acquire(ctx); err != nil {
-		return fmt.Errorf("wait for db sync executor: %w", err)
+	if err := db.execSem.Acquire(ctx, 1); err != nil {
+		return fmt.Errorf("wait for db sync executor: %w", contextCause(ctx, err))
 	}
 	return nil
 }
@@ -2277,7 +2253,7 @@ func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
 	if err := db.lockExec(ctx); err != nil {
 		return err
 	}
-	defer db.execGate.Release()
+	defer db.execSem.Release(1)
 	db.beginSyncDiag(diagOpCheckpoint)
 	defer func() { db.finishSyncDiag(err) }()
 
@@ -2479,7 +2455,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 	}
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
-	db.execGate.Release()
+	db.execSem.Release(1)
 
 	if pageSize == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
@@ -2891,10 +2867,10 @@ func (db *DB) monitor() {
 //
 // If dst is set, the database file is copied to that location before checksum.
 func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
-	if err := db.execGate.Acquire(ctx); err != nil {
-		return 0, ltx.Pos{}, err
+	if err := db.execSem.Acquire(ctx, 1); err != nil {
+		return 0, ltx.Pos{}, contextCause(ctx, err)
 	}
-	defer db.execGate.Release()
+	defer db.execSem.Release(1)
 
 	exec, err := db.newSyncExecutor(ctx)
 	if err != nil {
