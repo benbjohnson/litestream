@@ -36,7 +36,7 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
-	syncMu contextMutex // protects Sync() from concurrent calls
+	syncGate syncGate
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -151,7 +151,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	if err := r.lockSync(ctx); err != nil {
 		return result, err
 	}
-	defer r.syncMu.Unlock()
+	defer r.syncGate.Release()
 
 	// Clear last position if if an error occurs during sync.
 	defer func() {
@@ -213,10 +213,10 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 }
 
 func (r *Replica) lockSync(ctx context.Context) error {
-	if r.syncMu.TryLock() {
+	if r.syncGate.TryAcquire() {
 		return nil
 	}
-	if err := r.syncMu.LockContext(ctx); err != nil {
+	if err := r.syncGate.Acquire(ctx); err != nil {
 		return fmt.Errorf("wait for replica sync: %w", err)
 	}
 	return nil
