@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream/internal"
 )
@@ -36,7 +37,7 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
-	syncGate syncGate
+	syncSem *semaphore.Weighted
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -67,8 +68,9 @@ type Replica struct {
 
 func NewReplica(db *DB) *Replica {
 	r := &Replica{
-		db:     db,
-		cancel: func() {},
+		db:      db,
+		syncSem: semaphore.NewWeighted(1),
+		cancel:  func() {},
 
 		SyncInterval:    DefaultSyncInterval,
 		MaxSyncLTXFiles: DefaultMaxSyncLTXFiles,
@@ -151,7 +153,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	if err := r.lockSync(ctx); err != nil {
 		return result, err
 	}
-	defer r.syncGate.Release()
+	defer r.syncSem.Release(1)
 
 	// Clear last position if if an error occurs during sync.
 	defer func() {
@@ -213,11 +215,11 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 }
 
 func (r *Replica) lockSync(ctx context.Context) error {
-	if r.syncGate.TryAcquire() {
+	if r.syncSem.TryAcquire(1) {
 		return nil
 	}
-	if err := r.syncGate.Acquire(ctx); err != nil {
-		return fmt.Errorf("wait for replica sync: %w", err)
+	if err := r.syncSem.Acquire(ctx, 1); err != nil {
+		return fmt.Errorf("wait for replica sync: %w", contextCause(ctx, err))
 	}
 	return nil
 }
