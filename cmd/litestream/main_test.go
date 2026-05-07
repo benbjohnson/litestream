@@ -441,6 +441,57 @@ snapshot:
 		}
 	})
 
+	t.Run("DBLevelCompatibility", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 10m
+      retention: 2h
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.DBs[0].Snapshot.Interval == nil || *config.DBs[0].Snapshot.Interval != 10*time.Minute {
+			t.Fatalf("expected db snapshot interval of 10m, got %v", config.DBs[0].Snapshot.Interval)
+		}
+		if config.DBs[0].Snapshot.Retention == nil || *config.DBs[0].Snapshot.Retention != 2*time.Hour {
+			t.Fatalf("expected db snapshot retention of 2h, got %v", config.DBs[0].Snapshot.Retention)
+		}
+		if config.Snapshot.Interval == nil || *config.Snapshot.Interval != 10*time.Minute {
+			t.Fatalf("expected promoted snapshot interval of 10m, got %v", config.Snapshot.Interval)
+		}
+		if config.Snapshot.Retention == nil || *config.Snapshot.Retention != 2*time.Hour {
+			t.Fatalf("expected promoted snapshot retention of 2h, got %v", config.Snapshot.Retention)
+		}
+	})
+
+	t.Run("GlobalSnapshotTakesPrecedence", func(t *testing.T) {
+		yaml := `
+snapshot:
+  interval: 1h
+  retention: 24h
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 10m
+      retention: 2h
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.Snapshot.Interval == nil || *config.Snapshot.Interval != time.Hour {
+			t.Fatalf("expected global snapshot interval of 1h, got %v", config.Snapshot.Interval)
+		}
+		if config.Snapshot.Retention == nil || *config.Snapshot.Retention != 24*time.Hour {
+			t.Fatalf("expected global snapshot retention of 24h, got %v", config.Snapshot.Retention)
+		}
+	})
+
 	t.Run("ZeroInterval", func(t *testing.T) {
 		yaml := `
 snapshot:
@@ -483,6 +534,41 @@ snapshot:
 		}
 		if !errors.Is(err, main.ErrInvalidSnapshotInterval) {
 			t.Errorf("expected ErrInvalidSnapshotInterval, got %v", err)
+		}
+	})
+
+	t.Run("DBLevelZeroInterval", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 0s
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for zero database snapshot interval")
+		}
+		if !errors.Is(err, main.ErrInvalidSnapshotInterval) {
+			t.Errorf("expected ErrInvalidSnapshotInterval, got %v", err)
+		}
+	})
+
+	t.Run("DBLevelConflictingIntervals", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/a.db
+    snapshot:
+      interval: 10m
+  - path: /tmp/b.db
+    snapshot:
+      interval: 20m
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for conflicting database snapshot intervals")
+		}
+		if !strings.Contains(err.Error(), "conflicting database snapshot intervals") {
+			t.Errorf("expected conflicting interval error, got %v", err)
 		}
 	})
 

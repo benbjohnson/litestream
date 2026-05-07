@@ -325,6 +325,42 @@ func (c *Config) propagateGlobalSettings() {
 	}
 }
 
+func (c *Config) applyDBSnapshotConfig(globalIntervalSet, globalRetentionSet bool) error {
+	var interval *time.Duration
+	var intervalDB string
+	var retention *time.Duration
+	var retentionDB string
+
+	for _, db := range c.DBs {
+		dbID := db.Path
+		if dbID == "" {
+			dbID = db.Dir
+		}
+		if db.Snapshot.Interval != nil {
+			if interval != nil && *interval != *db.Snapshot.Interval {
+				return fmt.Errorf("conflicting database snapshot intervals: %s has %v, %s has %v", intervalDB, *interval, dbID, *db.Snapshot.Interval)
+			}
+			interval = db.Snapshot.Interval
+			intervalDB = dbID
+		}
+		if db.Snapshot.Retention != nil {
+			if retention != nil && *retention != *db.Snapshot.Retention {
+				return fmt.Errorf("conflicting database snapshot retentions: %s has %v, %s has %v", retentionDB, *retention, dbID, *db.Snapshot.Retention)
+			}
+			retention = db.Snapshot.Retention
+			retentionDB = dbID
+		}
+	}
+
+	if !globalIntervalSet && interval != nil {
+		c.Snapshot.Interval = interval
+	}
+	if !globalRetentionSet && retention != nil {
+		c.Snapshot.Retention = retention
+	}
+	return nil
+}
+
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
 	defaultSnapshotInterval := 24 * time.Hour
@@ -448,6 +484,21 @@ func (c *Config) Validate() error {
 			dbIdentifier = db.Dir
 		}
 
+		if db.Snapshot.Interval != nil && *db.Snapshot.Interval <= 0 {
+			return &ConfigValidationError{
+				Err:   ErrInvalidSnapshotInterval,
+				Field: fmt.Sprintf("dbs[%s].snapshot.interval", dbIdentifier),
+				Value: *db.Snapshot.Interval,
+			}
+		}
+		if db.Snapshot.Retention != nil && *db.Snapshot.Retention <= 0 {
+			return &ConfigValidationError{
+				Err:   ErrInvalidSnapshotRetention,
+				Field: fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
+				Value: *db.Snapshot.Retention,
+			}
+		}
+
 		// Validate sync intervals for replicas
 		if db.Replica != nil && db.Replica.SyncInterval != nil && *db.Replica.SyncInterval <= 0 {
 			return &ConfigValidationError{
@@ -549,6 +600,15 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		}))
 	}
 
+	var raw struct {
+		Snapshot *SnapshotConfig `yaml:"snapshot"`
+	}
+	if err := yaml.Unmarshal(buf, &raw); err != nil {
+		return config, err
+	}
+	globalSnapshotIntervalSet := raw.Snapshot != nil && raw.Snapshot.Interval != nil
+	globalSnapshotRetentionSet := raw.Snapshot != nil && raw.Snapshot.Retention != nil
+
 	// Save defaults before unmarshaling
 	defaultSnapshotInterval := config.Snapshot.Interval
 	defaultSnapshotRetention := config.Snapshot.Retention
@@ -571,6 +631,9 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 	if config.L0RetentionCheckInterval == nil {
 		config.L0RetentionCheckInterval = defaultL0RetentionCheckInterval
+	}
+	if err := config.applyDBSnapshotConfig(globalSnapshotIntervalSet, globalSnapshotRetentionSet); err != nil {
+		return config, err
 	}
 
 	// Normalize paths.
@@ -616,6 +679,7 @@ type DBConfig struct {
 	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
 	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
 	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
+	Snapshot           SnapshotConfig `yaml:"snapshot"`
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
