@@ -254,6 +254,31 @@ func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
 	t.Log("Test passed: New data after restore was successfully replicated")
 }
 
+func TestReplica_RestoreRetriesInitialLTXOpenError(t *testing.T) {
+	ctx := context.Background()
+
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	client := &transientOpenFailureClient{
+		flakyCompactionClient: newFlakyCompactionClient(),
+		remainingFailures:     2,
+	}
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+
+	r := litestream.NewReplicaWithClient(db, client)
+	restorePath := filepath.Join(t.TempDir(), "restored.db")
+	if err := r.Restore(ctx, litestream.RestoreOptions{OutputPath: restorePath}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(restorePath); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.openCount, 3; got < want {
+		t.Fatalf("OpenLTXFile() count=%d, want at least %d", got, want)
+	}
+}
+
 func TestReplica_CalcRestorePlan(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -528,6 +553,21 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			t.Fatalf("expected ErrTxNotAvailable, got %v", err)
 		}
 	})
+}
+
+type transientOpenFailureClient struct {
+	*flakyCompactionClient
+	remainingFailures int
+	openCount         int
+}
+
+func (c *transientOpenFailureClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.openCount++
+	if offset == 0 && c.remainingFailures > 0 {
+		c.remainingFailures--
+		return nil, fmt.Errorf("net/http: TLS handshake timeout")
+	}
+	return c.flakyCompactionClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
 }
 
 func TestReplica_TimeBounds(t *testing.T) {
