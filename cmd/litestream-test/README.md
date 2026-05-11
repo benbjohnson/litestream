@@ -112,6 +112,7 @@ litestream-test validate [options]
   - `integrity` - SQLite PRAGMA integrity_check
   - `checksum` - Full database checksum comparison
   - `full` - All validation types
+- `-txid` - Restore target transaction ID
 - `-ltx-continuity` - Check LTX file continuity (default: false)
 - `-config` - Litestream config file path (alternative to replica-url)
 
