@@ -2594,21 +2594,36 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (row [3]int, err 
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	if err := db.lockExec(ctx); err != nil {
-		return ltx.Pos{}, nil, err
+	pos, pageSize, err := db.snapshotPosition(ctx)
+	if err != nil {
+		return pos, nil, err
 	}
+
+	r, err := db.snapshotReader(ctx, pos, pageSize)
+	return pos, r, err
+}
+
+func (db *DB) snapshotPosition(ctx context.Context) (ltx.Pos, int, error) {
+	if err := db.lockExec(ctx); err != nil {
+		return ltx.Pos{}, 0, err
+	}
+	defer db.execSem.Release(1)
+
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
-	db.execSem.Release(1)
 
 	if pageSize == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
-		return ltx.Pos{}, nil, &DBNotReadyError{Reason: "page size not initialized"}
+		return ltx.Pos{}, 0, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 	if err != nil {
-		return pos, nil, fmt.Errorf("pos: %w", err)
+		return pos, pageSize, fmt.Errorf("pos: %w", err)
 	}
 
+	return pos, pageSize, nil
+}
+
+func (db *DB) snapshotReader(ctx context.Context, pos ltx.Pos, pageSize int) (io.Reader, error) {
 	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
 
 	// Prevent internal checkpoints during sync.
@@ -2619,7 +2634,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 
 	fi, err := db.f.Stat()
 	if err != nil {
-		return pos, nil, err
+		return nil, err
 	}
 	commit := uint32(fi.Size() / int64(pageSize))
 
@@ -2696,7 +2711,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		_ = pw.Close()
 	}()
 
-	return pos, pr, nil
+	return pr, nil
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
@@ -2721,12 +2736,24 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	return info, nil
 }
 
-// SnapshotDB writes a snapshot to the replica for the current position of the database.
+// Snapshot writes a snapshot to the replica for the current database position.
 func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
-	pos, r, err := db.SnapshotReader(ctx)
+	pos, pageSize, err := db.snapshotPosition(ctx)
 	if err != nil {
 		return nil, err
 	}
+	if info, ok, err := db.existingSnapshotInfo(ctx, pos.TXID); err != nil {
+		return nil, err
+	} else if ok {
+		db.Logger.Debug("snapshot already exists", "txid", pos.TXID.String(), "snapshot", info.MaxTXID.String())
+		return info, nil
+	}
+
+	r, err := db.snapshotReader(ctx, pos, pageSize)
+	if err != nil {
+		return nil, err
+	}
+
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
 		return info, err
@@ -2737,6 +2764,17 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	db.maxLTXFileInfos.Unlock()
 
 	return info, nil
+}
+
+func (db *DB) existingSnapshotInfo(ctx context.Context, txID ltx.TXID) (*ltx.FileInfo, bool, error) {
+	info, err := db.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return nil, false, err
+	}
+	if info.MaxTXID == 0 || info.MaxTXID < txID {
+		return nil, false, nil
+	}
+	return &info, true, nil
 }
 
 // EnforceSnapshotRetention enforces retention of the snapshot level in the database by timestamp.
