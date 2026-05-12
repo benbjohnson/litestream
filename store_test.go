@@ -102,6 +102,43 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 	})
 
+	t.Run("SnapshotNoProgress", func(t *testing.T) {
+		db0, sqldb0 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+		client := &snapshotCountingClient{ReplicaClient: db0.Replica.Client}
+		db0.Replica.Client = client
+
+		s := litestream.NewStore([]*litestream.DB{db0}, litestream.CompactionLevels{{Level: 0}})
+		s.SnapshotInterval = time.Nanosecond
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrNoCompaction) {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got, want := client.writeCount(), 1; got != want {
+			t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
+		}
+	})
+
 	// Regression test for GitHub issue #877: level 9 compaction fails with
 	// "page size not initialized yet" error when attempted before DB initialization.
 	t.Run("DBNotReady", func(t *testing.T) {
