@@ -572,6 +572,67 @@ func TestDB_Snapshot(t *testing.T) {
 	}
 }
 
+func TestDB_SnapshotExcludesUnsyncedWALFrames(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (2);`); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.MaxTXID != pos.TXID {
+		t.Fatalf("snapshot txid=%s, want %s", info.MaxTXID, pos.TXID)
+	}
+
+	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, pos.TXID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	restorePath := filepath.Join(t.TempDir(), "snapshot.db")
+	f, err := os.Create(restorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ltx.NewDecoder(rc).DecodeDatabaseTo(f); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := testingutil.MustOpenSQLDB(t, restorePath)
+	defer testingutil.MustCloseSQLDB(t, restored)
+
+	var count int
+	if err := restored.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM t;`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("restored row count=%d, want 1", count)
+	}
+}
+
 func TestDB_SnapshotSkipsExistingTXID(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
