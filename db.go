@@ -2592,20 +2592,38 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (row [3]int, err 
 	return row, nil
 }
 
-// SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
-func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	pos, pageSize, err := db.snapshotPosition(ctx)
-	if err != nil {
-		return pos, nil, err
-	}
-
-	r, err := db.snapshotReader(ctx, pos, pageSize)
-	return pos, r, err
+type snapshotReadPosition struct {
+	pos          ltx.Pos
+	pageSize     int
+	walEndOffset int64
+	db           *DB
 }
 
-func (db *DB) snapshotPosition(ctx context.Context) (ltx.Pos, int, error) {
+func (p *snapshotReadPosition) close() {
+	if p.db != nil {
+		p.db.chkMu.RUnlock()
+		p.db = nil
+	}
+}
+
+// SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
+func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+	pos, err := db.snapshotPosition(ctx)
+	if err != nil {
+		return ltx.Pos{}, nil, err
+	}
+
+	r, err := db.snapshotReader(ctx, pos)
+	if err != nil {
+		pos.close()
+		return pos.pos, nil, err
+	}
+	return pos.pos, r, nil
+}
+
+func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, error) {
 	if err := db.lockExec(ctx); err != nil {
-		return ltx.Pos{}, 0, err
+		return nil, err
 	}
 	defer db.execSem.Release(1)
 
@@ -2614,21 +2632,53 @@ func (db *DB) snapshotPosition(ctx context.Context) (ltx.Pos, int, error) {
 
 	if pageSize == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
-		return ltx.Pos{}, 0, &DBNotReadyError{Reason: "page size not initialized"}
+		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 	if err != nil {
-		return pos, pageSize, fmt.Errorf("pos: %w", err)
+		return nil, fmt.Errorf("pos: %w", err)
 	}
 
-	return pos, pageSize, nil
+	walEndOffset, err := db.snapshotWALEndOffset(ctx, pos)
+	if err != nil {
+		return nil, err
+	}
+	if walEndOffset < WALHeaderSize {
+		walEndOffset = WALHeaderSize
+	}
+
+	db.chkMu.RLock()
+	return &snapshotReadPosition{
+		pos:          pos,
+		pageSize:     pageSize,
+		walEndOffset: walEndOffset,
+		db:           db,
+	}, nil
 }
 
-func (db *DB) snapshotReader(ctx context.Context, pos ltx.Pos, pageSize int) (io.Reader, error) {
-	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
+func (db *DB) snapshotWALEndOffset(ctx context.Context, pos ltx.Pos) (int64, error) {
+	if db.syncState.lastSyncedWALOffset > 0 {
+		return db.syncState.lastSyncedWALOffset, nil
+	}
+	if pos.TXID == 0 {
+		return WALHeaderSize, nil
+	}
 
-	// Prevent internal checkpoints during sync.
-	db.chkMu.RLock()
-	defer db.chkMu.RUnlock()
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	f, err := os.Open(ltxPath)
+	if err != nil {
+		return 0, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		return 0, NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+	}
+	return dec.Header().WALOffset + dec.Header().WALSize, nil
+}
+
+func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.Reader, error) {
+	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
 
 	// TODO(ltx): Read database size from database header.
 
@@ -2636,11 +2686,13 @@ func (db *DB) snapshotReader(ctx context.Context, pos ltx.Pos, pageSize int) (io
 	if err != nil {
 		return nil, err
 	}
-	commit := uint32(fi.Size() / int64(pageSize))
+	commit := uint32(fi.Size() / int64(pos.pageSize))
 
 	// Execute encoding in a separate goroutine so the caller can initialize before reading.
 	pr, pw := io.Pipe()
 	go func() {
+		defer pos.close()
+
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
 			pw.CloseWithError(err)
@@ -2655,25 +2707,33 @@ func (db *DB) snapshotReader(ctx context.Context, pos ltx.Pos, pageSize int) (io
 		}
 
 		// Build a mapping of changed page numbers and their latest content.
-		pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("page map: %w", err))
-			return
+		maxBytes := pos.walEndOffset - WALHeaderSize
+		pageMap := make(map[uint32]int64)
+		var maxOffset int64
+		var walCommit uint32
+		if maxBytes > 0 {
+			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+			if err != nil {
+				pw.CloseWithError(fmt.Errorf("page map: %w", err))
+				return
+			}
 		}
 		if walCommit > 0 {
 			commit = walCommit
 		}
 
-		var sz int64
-		if maxOffset > 0 {
-			sz = maxOffset - rd.Offset()
+		walOffset, walSize := snapshotHeaderWALRange(pos.walEndOffset, maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
+		if maxOffset > pos.walEndOffset {
+			pw.CloseWithError(fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset))
+			return
 		}
 
 		db.Logger.Debug("encode snapshot header",
-			"txid", pos.TXID.String(),
+			"txid", pos.pos.TXID.String(),
 			"commit", commit,
-			"walOffset", rd.Offset(),
-			"walSize", sz,
+			"walOffset", walOffset,
+			"walSize", walSize,
+			"walEndOffset", pos.walEndOffset,
 			"salt1", rd.salt1,
 			"salt2", rd.salt2)
 
@@ -2685,13 +2745,13 @@ func (db *DB) snapshotReader(ctx context.Context, pos ltx.Pos, pageSize int) (io
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  uint32(pageSize),
+			PageSize:  uint32(pos.pageSize),
 			Commit:    commit,
 			MinTXID:   1,
-			MaxTXID:   pos.TXID,
+			MaxTXID:   pos.pos.TXID,
 			Timestamp: time.Now().UnixMilli(),
-			WALOffset: rd.Offset(),
-			WALSize:   sz,
+			WALOffset: walOffset,
+			WALSize:   walSize,
 			WALSalt1:  rd.salt1,
 			WALSalt2:  rd.salt2,
 		}); err != nil {
@@ -2712,6 +2772,20 @@ func (db *DB) snapshotReader(ctx context.Context, pos ltx.Pos, pageSize int) (io
 	}()
 
 	return pr, nil
+}
+
+func snapshotHeaderWALRange(walEndOffset, maxOffset, frameSize int64) (offset, size int64) {
+	if maxOffset <= WALHeaderSize || frameSize <= 0 {
+		return WALHeaderSize, 0
+	}
+	offset = maxOffset - frameSize
+	if offset < WALHeaderSize {
+		offset = WALHeaderSize
+	}
+	if maxOffset > walEndOffset {
+		maxOffset = walEndOffset
+	}
+	return offset, maxOffset - offset
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
@@ -2738,24 +2812,30 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 
 // Snapshot writes a snapshot to the replica for the current database position.
 func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
-	pos, pageSize, err := db.snapshotPosition(ctx)
+	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if info, ok, err := db.existingSnapshotInfo(ctx, pos.TXID); err != nil {
+	if info, ok, err := db.existingSnapshotInfo(ctx, pos.pos.TXID); err != nil {
+		pos.close()
 		return nil, err
 	} else if ok {
-		db.Logger.Debug("snapshot already exists", "txid", pos.TXID.String(), "snapshot", info.MaxTXID.String())
+		pos.close()
+		db.Logger.Debug("snapshot already exists", "txid", pos.pos.TXID.String(), "snapshot", info.MaxTXID.String())
 		return info, nil
 	}
 
-	r, err := db.snapshotReader(ctx, pos, pageSize)
+	r, err := db.snapshotReader(ctx, pos)
 	if err != nil {
+		pos.close()
 		return nil, err
 	}
 
-	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
+	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.pos.TXID, r)
 	if err != nil {
+		if closer, ok := r.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		return info, err
 	}
 
