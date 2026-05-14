@@ -897,6 +897,39 @@ func TestReplica_Restore_InvalidFileSize(t *testing.T) {
 	})
 }
 
+func TestReplica_Restore_RemovesTempFileOnFailure(t *testing.T) {
+	invalidLTX := bytes.Repeat([]byte{0xff}, ltx.HeaderSize)
+
+	var c mock.ReplicaClient
+	c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+		if level == litestream.SnapshotLevel {
+			return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+				Level:     litestream.SnapshotLevel,
+				MinTXID:   1,
+				MaxTXID:   1,
+				Size:      int64(len(invalidLTX)),
+				CreatedAt: time.Now(),
+			}}), nil
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	c.OpenLTXFileFunc = func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(invalidLTX)), nil
+	}
+
+	r := litestream.NewReplicaWithClient(nil, &c)
+	outputPath := filepath.Join(t.TempDir(), "restored.db")
+
+	err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: outputPath})
+	if err == nil {
+		t.Fatal("expected restore error")
+	}
+
+	if _, err := os.Stat(outputPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("expected temp restore file to be removed, err=%v", err)
+	}
+}
+
 func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	// This test verifies that context cancellation errors are not logged during shutdown.
 	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded
