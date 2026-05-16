@@ -2,9 +2,11 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 
 	"github.com/superfly/ltx"
 )
@@ -62,13 +64,21 @@ func NewResumableReader(ctx context.Context, client LTXFileOpener, level int, mi
 const resumableReaderMaxRetries = 3
 
 func (r *ResumableReader) Read(p []byte) (int, error) {
+	var lastErr error
 	for attempt := 0; attempt <= resumableReaderMaxRetries; attempt++ {
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (rc is nil after a retry).
 		if r.rc == nil {
 			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
-				return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.ctx.Err() != nil {
+					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
+				}
+				lastErr = fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
+				r.logger.Debug("reopen ltx file failed, retrying",
+					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+					"offset", r.offset, "error", err, "attempt", attempt+1)
+				continue
 			}
 			r.rc = rc
 		}
@@ -88,7 +98,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 				r.logger.Debug("premature EOF on ltx file, reconnecting",
 					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 					"offset", r.offset, "size", r.size, "attempt", attempt+1)
-				r.rc.Close()
+				_ = r.rc.Close()
 				r.rc = nil
 				if n > 0 {
 					// Return the bytes we did get. The caller (e.g. io.ReadFull)
@@ -105,7 +115,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		r.logger.Debug("read error on ltx file, reconnecting",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"error", err, "offset", r.offset, "attempt", attempt+1)
-		r.rc.Close()
+		_ = r.rc.Close()
 		r.rc = nil
 		if n > 0 {
 			return n, nil
@@ -113,6 +123,10 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		continue
 	}
 
+	if lastErr != nil {
+		return 0, fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d): %w",
+			r.level, r.minTXID, r.maxTXID, r.offset, lastErr)
+	}
 	return 0, fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d)",
 		r.level, r.minTXID, r.maxTXID, r.offset)
 }
