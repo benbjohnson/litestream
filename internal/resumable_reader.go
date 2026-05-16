@@ -139,6 +139,8 @@ func (r *ResumableReader) Close() error {
 }
 
 func (r *ResumableReader) close() {
+	// The stream is already being discarded after a read failure, so a close
+	// error should not stop recovery. Log it only to aid debugging.
 	if err := r.rc.Close(); err != nil {
 		r.logger.Debug("close ltx file",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
