@@ -98,7 +98,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 				r.logger.Debug("premature EOF on ltx file, reconnecting",
 					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 					"offset", r.offset, "size", r.size, "attempt", attempt+1)
-				r.closeAfterReadError("close ltx file after premature EOF")
+				r.close()
 				r.rc = nil
 				if n > 0 {
 					// Return the bytes we did get. The caller (e.g. io.ReadFull)
@@ -115,7 +115,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		r.logger.Debug("read error on ltx file, reconnecting",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"error", err, "offset", r.offset, "attempt", attempt+1)
-		r.closeAfterReadError("close ltx file after read error")
+		r.close()
 		r.rc = nil
 		if n > 0 {
 			return n, nil
@@ -138,9 +138,9 @@ func (r *ResumableReader) Close() error {
 	return nil
 }
 
-func (r *ResumableReader) closeAfterReadError(msg string) {
+func (r *ResumableReader) close() {
 	if err := r.rc.Close(); err != nil {
-		r.logger.Debug(msg,
+		r.logger.Debug("close ltx file",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"offset", r.offset, "error", err)
 	}
