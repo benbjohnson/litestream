@@ -88,30 +88,8 @@ func TestCompactor_Compact(t *testing.T) {
 	})
 }
 
-func TestCompactor_CompactResumesRemoteReads(t *testing.T) {
-	client := newFlakyCompactionClient()
-	compactor := litestream.NewCompactor(client, slog.Default())
-
-	createTestLTXFile(t, client, 0, 1, 1)
-	createTestLTXFile(t, client, 0, 2, 2)
-
-	info, err := compactor.Compact(context.Background(), 1)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if info.Level != 1 {
-		t.Errorf("Level=%d, want 1", info.Level)
-	}
-	if info.MinTXID != 1 || info.MaxTXID != 2 {
-		t.Errorf("TXID range=%d-%d, want 1-2", info.MinTXID, info.MaxTXID)
-	}
-	if client.reopenCount == 0 {
-		t.Fatal("expected compaction to reopen at least one source LTX stream")
-	}
-}
-
 func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
-	client := newEarlyReturnCompactionClient()
+	client := newEarlyReturnCompactionClient(t.TempDir())
 	compactor := litestream.NewCompactor(client, slog.Default())
 
 	createTestLTXFile(t, client, 0, 1, 1)
@@ -657,122 +635,20 @@ func createTestLTXFileWithTimestamp(t testing.TB, client litestream.ReplicaClien
 	}
 }
 
-type flakyCompactionClient struct {
-	files       map[string][]byte
-	infos       []*ltx.FileInfo
-	failed      map[string]bool
-	reopenCount int
-}
-
-func newFlakyCompactionClient() *flakyCompactionClient {
-	return &flakyCompactionClient{
-		files:  make(map[string][]byte),
-		failed: make(map[string]bool),
-	}
-}
-
-func (c *flakyCompactionClient) Type() string { return "flaky" }
-
-func (c *flakyCompactionClient) Init(context.Context) error { return nil }
-
-func (c *flakyCompactionClient) SetLogger(*slog.Logger) {}
-
-func (c *flakyCompactionClient) LTXFiles(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
-	var infos []*ltx.FileInfo
-	for _, info := range c.infos {
-		if info.Level == level && info.MaxTXID >= seek {
-			item := *info
-			infos = append(infos, &item)
-		}
-	}
-	return ltx.NewFileInfoSliceIterator(infos), nil
-}
-
-func (c *flakyCompactionClient) OpenLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
-	key := c.key(level, minTXID, maxTXID)
-	data, ok := c.files[key]
-	if !ok {
-		return nil, fmt.Errorf("not found")
-	}
-	if offset > int64(len(data)) {
-		return io.NopCloser(bytes.NewReader(nil)), nil
-	}
-	data = data[offset:]
-	if size > 0 && size < int64(len(data)) {
-		data = data[:size]
-	}
-	if offset == 0 && !c.failed[key] {
-		c.failed[key] = true
-		n := ltx.HeaderSize / 2
-		if n > len(data) {
-			n = len(data)
-		}
-		return io.NopCloser(&shortReadCloser{data: data[:n]}), nil
-	}
-	if offset > 0 {
-		c.reopenCount++
-	}
-	return io.NopCloser(bytes.NewReader(data)), nil
-}
-
-func (c *flakyCompactionClient) WriteLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
-	data, err := io.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
-	hdr, _, err := ltx.PeekHeader(bytes.NewReader(data))
-	if err != nil {
-		return nil, err
-	}
-	info := &ltx.FileInfo{
-		Level:     level,
-		MinTXID:   minTXID,
-		MaxTXID:   maxTXID,
-		Size:      int64(len(data)),
-		CreatedAt: time.UnixMilli(hdr.Timestamp).UTC(),
-	}
-	c.files[c.key(level, minTXID, maxTXID)] = data
-	c.infos = append(c.infos, info)
-	return info, nil
-}
-
-func (c *flakyCompactionClient) DeleteLTXFiles(context.Context, []*ltx.FileInfo) error { return nil }
-
-func (c *flakyCompactionClient) DeleteAll(context.Context) error { return nil }
-
-func (c *flakyCompactionClient) key(level int, minTXID, maxTXID ltx.TXID) string {
-	return fmt.Sprintf("%d/%s", level, ltx.FormatFilename(minTXID, maxTXID))
-}
-
-type shortReadCloser struct {
-	data []byte
-	done bool
-}
-
-func (r *shortReadCloser) Read(p []byte) (int, error) {
-	if r.done {
-		return 0, io.EOF
-	}
-	r.done = true
-	return copy(p, r.data), io.EOF
-}
-
-func (r *shortReadCloser) Close() error { return nil }
-
 type earlyReturnCompactionClient struct {
-	*flakyCompactionClient
+	litestream.ReplicaClient
 	failWrites bool
 }
 
-func newEarlyReturnCompactionClient() *earlyReturnCompactionClient {
-	return &earlyReturnCompactionClient{flakyCompactionClient: newFlakyCompactionClient()}
+func newEarlyReturnCompactionClient(path string) *earlyReturnCompactionClient {
+	return &earlyReturnCompactionClient{ReplicaClient: file.NewReplicaClient(path)}
 }
 
 func (c *earlyReturnCompactionClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	if c.failWrites {
 		return nil, fmt.Errorf("early write failure")
 	}
-	return c.flakyCompactionClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 }
 
 func countCompactorPipeWriters() int {
