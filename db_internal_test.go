@@ -105,6 +105,60 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
+func TestDB_SyncDiagnostic(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+
+	db.beginSyncDiagnostic("sync")
+	db.setSyncDiagnosticPhase("write_ltx_from_wal",
+		syncDiagnosticTXID(ltx.TXID(7)),
+		syncDiagnosticWALSize(1024),
+		syncDiagnosticLastSyncedWALOffset(2048),
+		syncDiagnosticSnapshotting(false),
+		syncDiagnosticReason("test reason"),
+	)
+
+	diag := db.SyncDiagnostic()
+	if !diag.Active {
+		t.Fatal("expected active diagnostic")
+	}
+	if diag.Path != db.Path() {
+		t.Fatalf("path=%q, want %q", diag.Path, db.Path())
+	}
+	if diag.Operation != "sync" {
+		t.Fatalf("operation=%q, want sync", diag.Operation)
+	}
+	if diag.Phase != "write_ltx_from_wal" {
+		t.Fatalf("phase=%q, want write_ltx_from_wal", diag.Phase)
+	}
+	if diag.TXID != 7 {
+		t.Fatalf("txid=%d, want 7", diag.TXID)
+	}
+	if diag.WALSize != 1024 {
+		t.Fatalf("wal_size=%d, want 1024", diag.WALSize)
+	}
+	if diag.LastSyncedWALOffset != 2048 {
+		t.Fatalf("last_synced_wal_offset=%d, want 2048", diag.LastSyncedWALOffset)
+	}
+	if diag.Reason != "test reason" {
+		t.Fatalf("reason=%q, want test reason", diag.Reason)
+	}
+	if diag.StartedAt == nil || diag.UpdatedAt == nil {
+		t.Fatalf("started_at=%v updated_at=%v, want both set", diag.StartedAt, diag.UpdatedAt)
+	}
+
+	db.finishSyncDiagnostic(errors.New("boom"))
+	diag = db.SyncDiagnostic()
+	if diag.Active {
+		t.Fatal("expected inactive diagnostic")
+	}
+	if diag.Phase != "write_ltx_from_wal" {
+		t.Fatalf("phase=%q, want last phase retained", diag.Phase)
+	}
+	if diag.Error != "boom" {
+		t.Fatalf("error=%q, want boom", diag.Error)
+	}
+}
+
 // TestCalcWALSize ensures calcWALSize doesn't overflow with large page sizes.
 // Regression test for uint32 overflow bug where large page sizes (>=16KB)
 // caused incorrect WAL size calculations, triggering checkpoints too early.
