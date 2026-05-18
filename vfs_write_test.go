@@ -110,6 +110,8 @@ func (c *writeTestReplicaClient) DeleteAll(ctx context.Context) error {
 	return nil
 }
 
+func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
+
 func ltxKey(level int, minTXID, maxTXID ltx.TXID) string {
 	return string(rune(level)) + "/" + minTXID.String() + "-" + maxTXID.String()
 }
