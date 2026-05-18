@@ -186,6 +186,33 @@ func TestResumableReader(t *testing.T) {
 		}
 	})
 
+	t.Run("TransientReopenFailure", func(t *testing.T) {
+		data := []byte("hello world")
+		callCount := 0
+		client := &testLTXFileOpener{
+			OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+				callCount++
+				switch callCount {
+				case 1:
+					return io.NopCloser(&errorAfterN{data: data, n: 5, err: fmt.Errorf("connection reset")}), nil
+				case 2, 3:
+					return nil, fmt.Errorf("request canceled")
+				default:
+					return io.NopCloser(bytes.NewReader(data[offset:])), nil
+				}
+			},
+		}
+
+		r := newTestResumableReader(client, int64(len(data)), data)
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("got %q, want %q", got, data)
+		}
+	})
+
 	t.Run("UnknownSize", func(t *testing.T) {
 		// When file size is unknown (size=0), premature EOF cannot be detected,
 		// so a clean EOF from a truncated stream is treated as legitimate.

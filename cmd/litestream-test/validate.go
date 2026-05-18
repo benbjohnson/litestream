@@ -23,6 +23,7 @@ type ValidateCommand struct {
 	ReplicaURL    string
 	RestoredDB    string
 	CheckType     string
+	TXID          string
 	LTXContinuity bool
 	ConfigPath    string
 }
@@ -41,6 +42,7 @@ func (c *ValidateCommand) Run(ctx context.Context, args []string) error {
 	fs.StringVar(&c.ReplicaURL, "replica-url", "", "Replica URL to validate")
 	fs.StringVar(&c.RestoredDB, "restored-db", "", "Path for restored database")
 	fs.StringVar(&c.CheckType, "check-type", "quick", "Type of check (quick, integrity, checksum, full)")
+	fs.StringVar(&c.TXID, "txid", "", "Restore target transaction ID")
 	fs.BoolVar(&c.LTXContinuity, "ltx-continuity", false, "Check LTX file continuity")
 	fs.StringVar(&c.ConfigPath, "config", "", "Litestream config file path")
 	fs.Usage = c.Usage
@@ -64,6 +66,7 @@ func (c *ValidateCommand) Run(ctx context.Context, args []string) error {
 		"source_db", c.SourceDB,
 		"replica_url", c.ReplicaURL,
 		"check_type", c.CheckType,
+		"txid", c.TXID,
 		"ltx_continuity", c.LTXContinuity,
 	)
 
@@ -107,20 +110,22 @@ func (c *ValidateCommand) performRestore(ctx context.Context) ValidationResult {
 		slog.Warn("Could not remove existing restored database", "error", err)
 	}
 
-	var cmd *exec.Cmd
+	args := []string{"restore"}
 	if c.ConfigPath != "" {
-		cmd = exec.CommandContext(ctx, "litestream", "restore",
-			"-config", c.ConfigPath,
-			"-o", c.RestoredDB,
-			c.SourceDB,
-		)
+		args = append(args, "-config", c.ConfigPath)
 	} else {
-		cmd = exec.CommandContext(ctx, "litestream", "restore",
-			"-o", c.RestoredDB,
-			c.ReplicaURL,
-		)
+		args = append(args, "-o", c.RestoredDB)
+	}
+	if c.TXID != "" {
+		args = append(args, "-txid", c.TXID)
+	}
+	if c.ConfigPath != "" {
+		args = append(args, "-o", c.RestoredDB, c.SourceDB)
+	} else {
+		args = append(args, c.ReplicaURL)
 	}
 
+	cmd := exec.CommandContext(ctx, "litestream", args...)
 	output, err := cmd.CombinedOutput()
 	result.Duration = time.Since(startTime)
 
@@ -482,6 +487,9 @@ Options:
 	-check-type TYPE
 	    Type of check: quick, integrity, checksum, full
 	    Default: quick
+
+	-txid TXID
+	    Restore target transaction ID
 
 	-ltx-continuity
 	    Check LTX file continuity

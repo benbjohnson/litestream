@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -97,6 +98,96 @@ func TestReplicaClient_DefaultSignPayload(t *testing.T) {
 	}
 	if !client.RequireContentMD5 {
 		t.Error("expected default RequireContentMD5 to be true for AWS S3 compatibility")
+	}
+}
+
+func TestNewS3Retryer(t *testing.T) {
+	retryer := newS3Retryer()
+	if got, want := retryer.MaxAttempts(), s3MaxRetryAttempts; got != want {
+		t.Fatalf("MaxAttempts() = %d, want %d", got, want)
+	}
+	if !retryer.IsErrorRetryable(&mockAPIError{code: s3RequestCanceledErrorCode, message: "Request is canceled."}) {
+		t.Fatal("expected RequestCanceled API error to be retryable")
+	}
+	if retryer.IsErrorRetryable(&aws.RequestCanceledError{Err: context.Canceled}) {
+		t.Fatal("expected client-side context cancellation to remain non-retryable")
+	}
+}
+
+func TestReplicaClientLTXFiles_RetriesRequestCanceledList(t *testing.T) {
+	var listCalls atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			t.Errorf("method = %s, want GET", r.Method)
+		}
+		if got := r.URL.Query().Get("list-type"); got != "2" {
+			t.Errorf("list-type = %q, want 2", got)
+		}
+		if got := r.URL.Query().Get("prefix"); got != "replica/0000/" {
+			t.Errorf("prefix = %q, want replica/0000/", got)
+		}
+
+		call := listCalls.Add(1)
+		w.Header().Set("Content-Type", "application/xml")
+		if call == 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			fmt.Fprint(w, `<Error><Code>RequestCanceled</Code><Message>Request is canceled.</Message><RequestId>test-request-id</RequestId></Error>`)
+			return
+		}
+
+		fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>test-bucket</Name>
+  <Prefix>replica/0000/</Prefix>
+  <KeyCount>1</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>replica/0000/0000000000000001-0000000000000001.ltx</Key>
+    <LastModified>2026-04-26T19:00:00.000Z</LastModified>
+    <Size>208</Size>
+  </Contents>
+</ListBucketResult>`)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+
+	itr, err := client.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		t.Fatalf("LTXFiles() error: %v", err)
+	}
+	defer itr.Close()
+
+	if !itr.Next() {
+		t.Fatalf("Next() = false, err=%v", itr.Err())
+	}
+	info := itr.Item()
+	if got, want := info.MinTXID, ltx.TXID(1); got != want {
+		t.Fatalf("MinTXID = %s, want %s", got, want)
+	}
+	if got, want := info.MaxTXID, ltx.TXID(1); got != want {
+		t.Fatalf("MaxTXID = %s, want %s", got, want)
+	}
+	if got, want := info.Size, int64(208); got != want {
+		t.Fatalf("Size = %d, want %d", got, want)
+	}
+	if itr.Next() {
+		t.Fatal("expected one LTX file")
+	}
+	if err := itr.Err(); err != nil {
+		t.Fatalf("iterator error: %v", err)
+	}
+	if got, want := int(listCalls.Load()), 2; got != want {
+		t.Fatalf("list calls = %d, want %d", got, want)
 	}
 }
 
@@ -1789,19 +1880,31 @@ func TestReplicaClient_NoSSE_Headers(t *testing.T) {
 	}
 }
 
-// TestReplicaClient_R2ConcurrencyDefault tests that Cloudflare R2 endpoints get
-// Concurrency=2 by default to avoid their strict concurrent upload limits.
-// This is a regression test for issue #948.
-func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
+// TestReplicaClient_ProviderUploadDefaults verifies provider-specific upload
+// defaults for S3-compatible endpoints with known concurrency limits.
+func TestReplicaClient_ProviderUploadDefaults(t *testing.T) {
 	tests := []struct {
 		name            string
 		url             string
 		wantConcurrency int
+		wantPartSize    int64
 	}{
 		{
 			name:            "R2_DefaultConcurrency",
 			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
 			wantConcurrency: 2,
+		},
+		{
+			name:            "Tigris_DefaultUploadShape",
+			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev",
+			wantConcurrency: DefaultTigrisConcurrency,
+			wantPartSize:    DefaultTigrisPartSize,
+		},
+		{
+			name:            "Tigris_ExplicitUploadShape",
+			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev&concurrency=4&part-size=33554432",
+			wantConcurrency: 4,
+			wantPartSize:    33554432,
 		},
 		{
 			name:            "AWS_NoConcurrencyOverride",
@@ -1825,6 +1928,9 @@ func TestReplicaClient_R2ConcurrencyDefault(t *testing.T) {
 
 			if c.Concurrency != tt.wantConcurrency {
 				t.Errorf("Concurrency = %d, want %d", c.Concurrency, tt.wantConcurrency)
+			}
+			if c.PartSize != tt.wantPartSize {
+				t.Errorf("PartSize = %d, want %d", c.PartSize, tt.wantPartSize)
 			}
 		})
 	}

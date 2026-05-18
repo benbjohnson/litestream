@@ -405,7 +405,6 @@ type SyncDBResult struct {
 // SyncDB forces an immediate sync for a database. If wait is true, blocks
 // until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
-// The timeout is best-effort as internal lock acquisition is not context-aware.
 func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
 	db := s.FindDB(path)
 	if db == nil {
@@ -761,6 +760,14 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 
 	// Shortcut if this is a snapshot since we are not pulling from a previous level.
 	if dstLevel == SnapshotLevel {
+		pos, err := db.Pos()
+		if err != nil {
+			return nil, fmt.Errorf("fetch db position: %w", err)
+		}
+		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
+			return nil, ErrNoCompaction
+		}
+
 		info, err := db.Snapshot(ctx)
 		if err != nil {
 			return info, err
