@@ -115,19 +115,13 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	defer itr.Close()
 
 	var rdrs []io.Reader
-	readersClosed := false
-	closeReaders := func() {
-		if readersClosed {
-			return
-		}
-		readersClosed = true
+	defer func() {
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
 				_ = closer.Close()
 			}
 		}
-	}
-	defer closeReaders()
+	}()
 
 	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
