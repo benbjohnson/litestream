@@ -24,6 +24,8 @@ const (
 	DefaultSyncInterval = 1 * time.Second
 )
 
+var errReplicaWaitForData = errors.New("no position, waiting for data")
+
 // Replica connects a database to a replication destination via a ReplicaClient.
 // The replica manages periodic synchronization and maintaining the current
 // replica position.
@@ -156,7 +158,7 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot determine current position: %w", err)
 	} else if dpos.IsZero() {
-		return fmt.Errorf("no position, waiting for data")
+		return errReplicaWaitForData
 	}
 
 	r.Logger().Info("replica sync",
@@ -327,10 +329,7 @@ func (r *Replica) monitor(ctx context.Context) {
 	ticker := time.NewTicker(r.SyncInterval)
 	defer ticker.Stop()
 
-	// Continuously check for new data to replicate.
-	ch := make(chan struct{})
-	close(ch)
-	var notify <-chan struct{} = ch
+	notify := r.db.Notify()
 
 	var backoff time.Duration
 	var lastLogTime time.Time
@@ -355,11 +354,17 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 		}
 
-		// Wait for changes to the database.
+		waitCh := notify
+		if pos, err := r.db.Pos(); err == nil && pos.TXID > r.Pos().TXID {
+			ch := make(chan struct{})
+			close(ch)
+			waitCh = ch
+		}
+
 		select {
 		case <-ctx.Done():
 			return
-		case <-notify:
+		case <-waitCh:
 		}
 
 		// Fetch new notify channel before replicating data.
@@ -367,6 +372,10 @@ func (r *Replica) monitor(ctx context.Context) {
 
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.Sync(ctx); err != nil {
+			if errors.Is(err, errReplicaWaitForData) {
+				continue
+			}
+
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				consecutiveErrs++
