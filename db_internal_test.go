@@ -719,7 +719,7 @@ func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
 
 	// Now call verify - before the fix, this would fail with:
 	// "prev WAL offset is less than the header size: -4088"
-	info, err := db.verify(context.Background())
+	info, err := db.verify(context.Background(), &db.syncState)
 	if err != nil {
 		t.Fatalf("verify() returned error: %v", err)
 	}
@@ -841,7 +841,7 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	db.invalidatePosCache()
 
 	// Call verify - should succeed but indicate snapshotting due to salt mismatch
-	info, err := db.verify(context.Background())
+	info, err := db.verify(context.Background(), &db.syncState)
 	if err != nil {
 		t.Fatalf("verify() returned error: %v", err)
 	}
@@ -998,7 +998,7 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	t.Logf("After pre-checkpoint sync: TXID=%d", pos2.TXID)
 
 	// Call verify() BEFORE checkpoint to confirm snapshotting=false
-	info1, err := db.verify(ctx)
+	info1, err := db.verify(ctx, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1022,7 +1022,7 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	// - Old LTX has WALOffset+WALSize pointing to old (larger) WAL
 	// - New WAL is truncated (smaller)
 	// - Line 973: info.offset > fi.Size() → "wal truncated" → snapshotting=true
-	info2, err := db.verify(ctx)
+	info2, err := db.verify(ctx, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1090,7 +1090,7 @@ func TestDB_MultipleCheckpointsWithWrites(t *testing.T) {
 		}
 
 		// Check if this was a snapshot
-		info, err := db.verify(ctx)
+		info, err := db.verify(ctx, &db.syncState)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1813,7 +1813,7 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 
 	// TRUNCATE checkpoint should create a full snapshot L0 to ensure
 	// complete page coverage across the checkpoint boundary.
-	if err := db.checkpoint(ctx, CheckpointModeTruncate); err != nil {
+	if err := db.checkpoint(ctx, CheckpointModeTruncate, &db.syncState); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2187,11 +2187,11 @@ func TestApplySyncResult(t *testing.T) {
 		db.mu.Lock()
 		defer db.mu.Unlock()
 
-		db.applySyncResult(syncResult{newWALSize: 12345, syncedToWALEnd: true})
-		if got := db.lastSyncedWALOffset; got != 12345 {
+		db.applySyncResult(&db.syncState, syncResult{newWALSize: 12345, syncedToWALEnd: true})
+		if got := db.syncState.lastSyncedWALOffset; got != 12345 {
 			t.Fatalf("lastSyncedWALOffset=%d, want 12345", got)
 		}
-		if !db.syncedToWALEnd {
+		if !db.syncState.syncedToWALEnd {
 			t.Fatal("syncedToWALEnd=false, want true")
 		}
 	})
@@ -2201,7 +2201,7 @@ func TestApplySyncResult(t *testing.T) {
 		defer db.mu.Unlock()
 
 		pos := ltx.Pos{TXID: 42}
-		db.applySyncResult(syncResult{pos: &pos})
+		db.applySyncResult(&db.syncState, syncResult{pos: &pos})
 
 		db.pos.Lock()
 		got := db.pos.value
@@ -2220,7 +2220,7 @@ func TestApplySyncResult(t *testing.T) {
 		db.pos.value = &existing
 		db.pos.Unlock()
 
-		db.applySyncResult(syncResult{})
+		db.applySyncResult(&db.syncState, syncResult{})
 
 		db.pos.Lock()
 		got := db.pos.value
@@ -2235,7 +2235,7 @@ func TestApplySyncResult(t *testing.T) {
 		defer db.mu.Unlock()
 
 		info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
-		db.applySyncResult(syncResult{l0FileInfo: info})
+		db.applySyncResult(&db.syncState, syncResult{l0FileInfo: info})
 
 		db.maxLTXFileInfos.Lock()
 		got := db.maxLTXFileInfos.m[0]
@@ -2292,8 +2292,8 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	oldWALOffset := db.lastSyncedWALOffset
-	oldSyncedToWALEnd := db.syncedToWALEnd
+	oldWALOffset := db.syncState.lastSyncedWALOffset
+	oldSyncedToWALEnd := db.syncState.syncedToWALEnd
 
 	db.pos.Lock()
 	if db.pos.value == nil {
@@ -2310,7 +2310,7 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatal("cached l0 file info is nil after initial sync")
 	}
 
-	result, err := db.verifyAndSync(ctx, false)
+	result, err := db.verifyAndSync(ctx, false, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2327,11 +2327,11 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatalf("result.l0FileInfo=%v, want MaxTXID > %d", result.l0FileInfo, oldL0.MaxTXID)
 	}
 
-	if db.lastSyncedWALOffset != oldWALOffset {
-		t.Fatalf("lastSyncedWALOffset mutated early: got %d, want %d", db.lastSyncedWALOffset, oldWALOffset)
+	if db.syncState.lastSyncedWALOffset != oldWALOffset {
+		t.Fatalf("lastSyncedWALOffset mutated early: got %d, want %d", db.syncState.lastSyncedWALOffset, oldWALOffset)
 	}
-	if db.syncedToWALEnd != oldSyncedToWALEnd {
-		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncedToWALEnd, oldSyncedToWALEnd)
+	if db.syncState.syncedToWALEnd != oldSyncedToWALEnd {
+		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncState.syncedToWALEnd, oldSyncedToWALEnd)
 	}
 
 	db.pos.Lock()
@@ -2348,13 +2348,13 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatalf("cached l0 file info mutated early: got %v, want MaxTXID=%d", gotL0BeforeApply, oldL0.MaxTXID)
 	}
 
-	db.applySyncResult(result)
+	db.applySyncResult(&db.syncState, result)
 
-	if db.lastSyncedWALOffset != result.newWALSize {
-		t.Fatalf("lastSyncedWALOffset=%d, want %d", db.lastSyncedWALOffset, result.newWALSize)
+	if db.syncState.lastSyncedWALOffset != result.newWALSize {
+		t.Fatalf("lastSyncedWALOffset=%d, want %d", db.syncState.lastSyncedWALOffset, result.newWALSize)
 	}
-	if db.syncedToWALEnd != result.syncedToWALEnd {
-		t.Fatalf("syncedToWALEnd=%t, want %t", db.syncedToWALEnd, result.syncedToWALEnd)
+	if db.syncState.syncedToWALEnd != result.syncedToWALEnd {
+		t.Fatalf("syncedToWALEnd=%t, want %t", db.syncState.syncedToWALEnd, result.syncedToWALEnd)
 	}
 
 	db.pos.Lock()
