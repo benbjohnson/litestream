@@ -122,12 +122,12 @@ jobs:
             echo "has_secrets=true" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -157,7 +157,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: s3-test-results
           path: |
@@ -183,12 +183,12 @@ jobs:
             echo "has_secrets=true" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -216,7 +216,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: tigris-test-results
           path: |
@@ -242,12 +242,12 @@ jobs:
             echo "has_secrets=true" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -277,7 +277,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: r2-test-results
           path: |
@@ -303,12 +303,12 @@ jobs:
             echo "has_secrets=true" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -338,7 +338,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: b2-test-results
           path: |
@@ -364,12 +364,12 @@ jobs:
             echo "has_secrets=true" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -402,7 +402,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: multipart-test-results
           path: |
@@ -435,12 +435,12 @@ jobs:
         env:
           GOOGLE_APPLICATION_CREDENTIALS: ${{secrets.GOOGLE_APPLICATION_CREDENTIALS}}
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -468,7 +468,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: gcs-test-results
           path: |
@@ -494,12 +494,12 @@ jobs:
             echo "has_secrets=true" >> $GITHUB_OUTPUT
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           ref: ${{ needs.setup.outputs.ref }}
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         if: steps.check-secrets.outputs.has_secrets == 'true'
         with:
           go-version-file: "go.mod"
@@ -528,7 +528,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: abs-test-results
           path: |
@@ -542,7 +542,7 @@ jobs:
     if: always()
     steps:
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         continue-on-error: true
 
       - name: Generate summary
@@ -619,7 +619,7 @@ jobs:
       - name: Comment on PR (if applicable)
         if: github.event.inputs.pr_number != ''
         continue-on-error: true
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
         with:
           script: |
             const pr_number = ${{ github.event.inputs.pr_number }};
