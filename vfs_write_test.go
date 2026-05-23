@@ -101,8 +101,6 @@ func (c *writeTestReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.Fi
 	return nil
 }
 
-func (c *writeTestReplicaClient) SetLogger(_ *slog.Logger) {}
-
 func (c *writeTestReplicaClient) DeleteAll(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
