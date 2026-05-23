@@ -527,10 +527,12 @@ type VFSFile struct {
 	lockType        sqlite3vfs.LockType        // Current lock state
 	pageSize        uint32
 	commit          uint32
+	commitTXID      ltx.TXID
 
 	// Write support fields (only used when writeEnabled is true)
 	writeEnabled  bool             // Whether write support is enabled
 	dirty         map[uint32]int64 // Dirty pages: pgno -> offset in buffer file
+	synced        map[uint32]TPage // After dirty pages and before cache.
 	pendingTXID   ltx.TXID         // Next TXID to use for sync
 	expectedTXID  ltx.TXID         // Expected remote TXID (for conflict detection)
 	bufferFile    *os.File         // Temp file for durability
@@ -562,6 +564,11 @@ type VFSFile struct {
 	compactionWg     sync.WaitGroup
 	compactionCtx    context.Context
 	compactionCancel context.CancelFunc
+}
+
+type TPage struct {
+	txid ltx.TXID
+	data []byte
 }
 
 // Hydrator handles background hydration of the database to a local file.
@@ -956,6 +963,7 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 		name:         name,
 		index:        make(map[uint32]ltx.PageIndexElem),
 		pending:      make(map[uint32]ltx.PageIndexElem),
+		synced:       make(map[uint32]TPage),
 		logger:       logger,
 		PollInterval: DefaultPollInterval,
 		CacheSize:    DefaultCacheSize,
@@ -974,21 +982,6 @@ func cacheEntryCount(cacheSize int, pageSize uint32) int {
 		return 1
 	}
 	return n
-}
-
-func (f *VFSFile) resizeCacheWithLock() {
-	if f.cache == nil {
-		return
-	}
-
-	n := cacheEntryCount(f.CacheSize, f.pageSize)
-	indexLag := f.expectedTXID > f.pos.TXID || len(f.pending) > 0 || f.mainIndexCommitWithLock() < f.commit
-	if f.writeEnabled && indexLag {
-		if commit := int(f.commit); commit > n {
-			n = commit
-		}
-	}
-	f.cache.Resize(n)
 }
 
 // Pos returns the current position of the file.
@@ -1147,8 +1140,10 @@ func (f *VFSFile) openNewDatabase() error {
 	// Initialize empty index - no pages exist yet
 	f.index = make(map[uint32]ltx.PageIndexElem)
 	f.pending = make(map[uint32]ltx.PageIndexElem)
+	f.synced = make(map[uint32]TPage)
 	f.pos = ltx.Pos{TXID: 0}
 	f.commit = 0
+	f.commitTXID = 0
 
 	// Initialize write support for new database
 	f.expectedTXID = 0
@@ -1239,9 +1234,11 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.index = index
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+	f.synced = make(map[uint32]TPage)
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
 	f.commit = commit
+	f.commitTXID = pos.TXID
 	if len(infos) > 0 {
 		f.latestLTXTime = infos[len(infos)-1].CreatedAt
 	}
@@ -1446,28 +1443,25 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	pgno := uint32(off/int64(pageSize)) + 1
 	pageOffset := int(off % int64(pageSize))
 
-	// Check dirty pages first (takes priority over cache and remote)
+	// Visible page order: dirty -> synced -> hydration -> cache -> index.
 	f.mu.Lock()
-	if f.writeEnabled {
-		if bufferOff, ok := f.dirty[pgno]; ok {
-			// Read page from buffer file
-			data := make([]byte, pageSize)
-			if _, err := f.bufferFile.ReadAt(data, bufferOff); err != nil {
-				f.mu.Unlock()
-				return 0, fmt.Errorf("read dirty page from buffer: %w", err)
-			}
-			n = copy(p, data[pageOffset:])
-			f.mu.Unlock()
-			f.logger.Debug("dirty page hit", "page", pgno, "n", n)
+	overlayData, source, sourceTXID, ok, err := f.readOverlayPageWithLock(pgno, pageSize)
+	if err != nil {
+		f.mu.Unlock()
+		return 0, err
+	}
+	if ok {
+		n = copy(p, overlayData[pageOffset:])
+		f.mu.Unlock()
+		f.logger.Debug("local overlay page hit", "source", source, "page", pgno, "txid", sourceTXID, "n", n)
 
-			// Update the first page to pretend like we are in journal mode.
-			if off == 0 && len(p) >= 28 {
-				p[18], p[19] = 0x01, 0x01
-				_, _ = rand.Read(p[24:28])
-			}
-
-			return n, nil
+		// Update the first page to pretend like we are in journal mode.
+		if off == 0 && len(p) >= 28 {
+			p[18], p[19] = 0x01, 0x01
+			_, _ = rand.Read(p[24:28])
 		}
+
+		return n, nil
 	}
 	f.mu.Unlock()
 
@@ -1556,6 +1550,27 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
+// readLocalOverlayPageWithLock returns local write pages that must be visible
+// before any hydrated file, cached remote page, or remote page index lookup.
+// Caller must hold f.mu.
+func (f *VFSFile) readOverlayPageWithLock(pgno uint32, pageSize uint32) (data []byte, source string, txid ltx.TXID, ok bool, err error) {
+	if f.writeEnabled {
+		if bufferOff, ok := f.dirty[pgno]; ok {
+			data := make([]byte, pageSize)
+			if _, err := f.bufferFile.ReadAt(data, bufferOff); err != nil {
+				return nil, "", 0, false, fmt.Errorf("read dirty page from buffer: %w", err)
+			}
+			return data, "dirty", f.pendingTXID, true, nil
+		}
+	}
+
+	if page, ok := f.synced[pgno]; ok {
+		return page.data, "synced", page.txid, true, nil
+	}
+
+	return nil, "", 0, false, nil
+}
+
 func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	f.logger.Debug("write at", "off", off, "len", len(b))
 
@@ -1581,19 +1596,10 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 		return 0, sqlite3vfs.ReadOnlyError
 	}
 
-	// Get page data - either from buffer file (if dirty) or from cache/remote
 	page := make([]byte, pageSize)
-	if bufferOff, ok := f.dirty[pgno]; ok {
-		// Page is already dirty - read from buffer file
-		if _, err := f.bufferFile.ReadAt(page, bufferOff); err != nil {
-			return 0, fmt.Errorf("read dirty page from buffer: %w", err)
-		}
-	} else {
-		// Page is not dirty - read from cache/remote
-		if err := f.readPageForWrite(pgno, page); err != nil {
-			// If page doesn't exist, use zero-filled page
-			f.logger.Debug("page not found, using empty page", "pgno", pgno)
-		}
+	if err := f.readPageForWrite(pgno, page); err != nil {
+		// If page doesn't exist, use zero-filled page
+		f.logger.Debug("page not found, using empty page", "pgno", pgno)
 	}
 
 	// Apply write to page
@@ -1603,6 +1609,7 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	if pgno > f.commit {
 		f.commit = pgno
 	}
+	f.commitTXID = f.pendingTXID
 
 	// Write to buffer for durability (this updates f.dirty with the offset)
 	if err := f.writeToBuffer(pgno, page); err != nil {
@@ -1614,12 +1621,19 @@ func (f *VFSFile) WriteAt(b []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-// readPageForWrite reads a page into buf for modification.
+// readPageForWrite reads a page into buf for modification using this order:
+// dirty -> synced -> cache -> index.
 // Must be called with f.mu held.
 func (f *VFSFile) readPageForWrite(pgno uint32, buf []byte) error {
 	pageSize := uint32(len(buf))
 
-	// Check cache first (cache is thread-safe, but we hold the lock anyway)
+	if data, _, _, ok, err := f.readOverlayPageWithLock(pgno, pageSize); err != nil {
+		return err
+	} else if ok {
+		copy(buf, data)
+		return nil
+	}
+
 	if data, ok := f.cache.Get(pgno); ok {
 		copy(buf, data)
 		return nil
@@ -1670,8 +1684,14 @@ func (f *VFSFile) Truncate(size int64) error {
 			delete(f.dirty, pgno)
 		}
 	}
+	for pgno := range f.synced {
+		if pgno > newCommit {
+			delete(f.synced, pgno)
+		}
+	}
 
 	f.commit = newCommit
+	f.commitTXID = f.pendingTXID
 	f.logger.Debug("truncated", "newCommit", newCommit)
 
 	// Truncate hydrated file if hydration is complete
@@ -1823,6 +1843,9 @@ func (f *VFSFile) SetWriteEnabledWithTimeout(enabled bool, timeout time.Duration
 	if f.dirty == nil {
 		f.dirty = make(map[uint32]int64)
 	}
+	if f.synced == nil {
+		f.synced = make(map[uint32]TPage)
+	}
 
 	// Set sync interval from VFS config if not set, falling back to default
 	// This mirrors the startup behavior where WriteSyncInterval==0 uses DefaultSyncInterval
@@ -1943,6 +1966,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
+	f.commitTXID = f.expectedTXID
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
@@ -1952,14 +1976,16 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		f.vfs.writeMu.Unlock()
 	}
 
-	// Update cache with synced pages (index will be populated naturally when pages are fetched)
-	f.resizeCacheWithLock()
+	// Keep locally synced pages visible until poll installs their TXID.
+	if f.synced == nil {
+		f.synced = make(map[uint32]TPage)
+	}
 	for pgno, bufferOff := range f.dirty {
 		cachedData := make([]byte, f.pageSize)
 		if _, err := f.bufferFile.ReadAt(cachedData, bufferOff); err != nil {
-			return fmt.Errorf("read page %d from buffer for cache: %w", pgno, err)
+			return fmt.Errorf("read page %d from buffer for synced page: %w", pgno, err)
 		}
-		f.cache.Add(pgno, cachedData)
+		f.synced[pgno] = TPage{txid: f.expectedTXID, data: cachedData}
 	}
 
 	// Apply synced pages to hydrated file if hydration is complete
@@ -2190,6 +2216,11 @@ func (f *VFSFile) FileSize() (size int64, err error) {
 			size = v
 		}
 	}
+	for pgno := range f.synced {
+		if v := int64(pgno) * int64(pageSize); v > size {
+			size = v
+		}
+	}
 	// Anchor size to f.commit which tracks the highest page written and
 	// survives syncToRemoteWithLock clearing f.dirty. Without this,
 	// FileSize can transiently shrink between a sync flush (which clears
@@ -2285,18 +2316,19 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 		f.logger.Debug("cache invalidated all pages", "count", count)
 		// Invalidate entire cache since we replaced the index
 		f.cache.Purge()
+		f.clearSyncedPagesThroughTXIDWithLock(f.pos.TXID)
 	} else if len(f.pending) > 0 {
 		// Merge pending into index
 		count := len(f.pending)
 		for k, v := range f.pending {
 			f.index[k] = v
 			f.cache.Remove(k)
+			f.clearSyncedPageWithIndexElemWithLock(k, v)
 		}
 		f.logger.Debug("cache invalidated pages", "count", count)
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
-	f.resizeCacheWithLock()
 
 	return nil
 }
@@ -2617,20 +2649,21 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		// Invalidate cache if we're updating the main index
 		if targetIsMain {
 			f.cache.Remove(k)
+			f.clearSyncedPageWithIndexElemWithLock(k, v)
 			invalidateN++
 		}
+	}
+	if replaceIndex && targetIsMain {
+		f.clearSyncedPagesThroughTXIDWithLock(applyTXID)
 	}
 
 	if invalidateN > 0 {
 		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
-	if replaceIndex {
-		if !f.writeEnabled || f.expectedTXID <= applyTXID || newCommit > f.commit {
-			f.commit = newCommit
-		}
-	} else if len(combined) > 0 && newCommit > f.commit {
+	if (replaceIndex || len(combined) > 0) && (!f.writeEnabled || applyTXID >= f.commitTXID) {
 		f.commit = newCommit
+		f.commitTXID = applyTXID
 	}
 	f.pos.TXID = applyTXID
 
@@ -2643,9 +2676,23 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 			f.logger.Error("failed to apply updates to hydrated file", "error", err)
 		}
 	}
-	f.resizeCacheWithLock()
 
 	return nil
+}
+
+func (f *VFSFile) clearSyncedPageWithIndexElemWithLock(pgno uint32, elem ltx.PageIndexElem) {
+	page, ok := f.synced[pgno]
+	if ok && elem.MaxTXID >= page.txid {
+		delete(f.synced, pgno)
+	}
+}
+
+func (f *VFSFile) clearSyncedPagesThroughTXIDWithLock(txid ltx.TXID) {
+	for pgno, page := range f.synced {
+		if page.txid <= txid {
+			delete(f.synced, pgno)
+		}
+	}
 }
 
 // indexCommitWithLock returns the page high-water represented by the installed
