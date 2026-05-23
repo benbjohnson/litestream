@@ -130,21 +130,27 @@ func TestVFS_ReadYourWrites(t *testing.T) {
 }
 
 func TestVFS_WideRepeatedInsertsDuringSync_Private(t *testing.T) {
-	// No primary key or secondary index is required. This shape failed 20/20
-	// local runs before the VFS page-visibility fix; 80 batches was race-dependent.
 	runWideRepeatedInsertsDuringSyncPrivate(t, wideRepeatedInsertsConfig{
-		payloadColumnCount: 6,
-		indexCount:         0,
-		batchCount:         90,
-		rowsPerBatch:       1427,
+		payloadColumnCount:   11,
+		indexCount:           4,
+		batchCount:           14,
+		rowsPerBatch:         1427,
+		intPrimaryKeyReplace: true,
+		syncInterval:         time.Second,
+		pollInterval:         time.Second,
+		sleepInterval:        500 * time.Millisecond,
 	})
 }
 
 type wideRepeatedInsertsConfig struct {
-	payloadColumnCount int
-	indexCount         int
-	batchCount         int
-	rowsPerBatch       int
+	payloadColumnCount   int
+	indexCount           int
+	batchCount           int
+	rowsPerBatch         int
+	intPrimaryKeyReplace bool
+	syncInterval         time.Duration
+	pollInterval         time.Duration
+	sleepInterval        time.Duration
 }
 
 func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInsertsConfig) {
@@ -153,7 +159,14 @@ func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInser
 	replicaDir := t.TempDir()
 	client := file.NewReplicaClient(replicaDir)
 
-	vfs := newWritableVFS(t, client, 100*time.Millisecond, t.TempDir())
+	syncInterval := cfg.syncInterval
+	if syncInterval == 0 {
+		syncInterval = 100 * time.Millisecond
+	}
+	vfs := newWritableVFS(t, client, syncInterval, t.TempDir())
+	if cfg.pollInterval > 0 {
+		vfs.PollInterval = cfg.pollInterval
+	}
 	vfsName := fmt.Sprintf("litestream-wide-private-inserts-%d", time.Now().UnixNano())
 	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
 
@@ -165,11 +178,28 @@ func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInser
 	defer db.Close()
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
+	runWideRepeatedInsertsDuringSyncSQL(t, db, cfg)
+}
 
+func runWideRepeatedInsertsDuringSyncSQL(t *testing.T, db *sql.DB, cfg wideRepeatedInsertsConfig) {
+	t.Helper()
+	sleepInterval := cfg.sleepInterval
+	if sleepInterval == 0 {
+		sleepInterval = 125 * time.Millisecond
+	}
 	columns := []string{"id", "revision", "shard", "marker"}
+	idType := "INTEGER"
+	if cfg.intPrimaryKeyReplace {
+		idType = "INT"
+	}
 	var ddl strings.Builder
-	ddl.WriteString(`CREATE TABLE wide_syncing_rows (
-		id INTEGER NOT NULL,
+	ddl.WriteString("CREATE TABLE wide_syncing_rows (\n\t\tid ")
+	ddl.WriteString(idType)
+	ddl.WriteString(" NOT NULL")
+	if cfg.intPrimaryKeyReplace {
+		ddl.WriteString(" PRIMARY KEY ON CONFLICT REPLACE")
+	}
+	ddl.WriteString(`,
 		revision INTEGER NOT NULL,
 		shard INTEGER NOT NULL,
 		marker INTEGER NOT NULL`)
@@ -199,7 +229,7 @@ func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInser
 		ddl.WriteString(indexes[i].sql)
 	}
 
-	_, err = db.Exec(ddl.String())
+	_, err := db.Exec(ddl.String())
 	require.NoError(t, err)
 
 	placeholders := make([]string, len(columns))
@@ -217,7 +247,6 @@ func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInser
 		start := 1 + batch*250
 		end := start + cfg.rowsPerBatch - 1
 		offset := batch * 1000000
-
 		tx, err := db.Begin()
 		require.NoError(t, err)
 		stmt, err := tx.Prepare(insertSQL)
@@ -233,8 +262,7 @@ func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInser
 		}
 		require.NoError(t, stmt.Close())
 		require.NoError(t, tx.Commit())
-
-		time.Sleep(125 * time.Millisecond)
+		time.Sleep(sleepInterval)
 	}
 }
 
