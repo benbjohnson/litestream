@@ -2135,3 +2135,85 @@ func TestVFSFile_SyncedPagesStayReadableBeforePoll(t *testing.T) {
 		}
 	}
 }
+
+func TestVFSFile_PollReplacementEvictsSyncedByVisibleState(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	createTestLTXFile(t, client, 1, pageSize, 3, map[uint32][]byte{
+		1: bytes.Repeat([]byte{1}, int(pageSize)),
+		2: bytes.Repeat([]byte{2}, int(pageSize)),
+		3: bytes.Repeat([]byte{3}, int(pageSize)),
+	})
+
+	f := setupWriteableVFSFile(t, client)
+	f.CacheSize = int(pageSize * 8)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Seed cache entries that a direct index replacement must invalidate.
+	buf := make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ReadAt(buf, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	page2 := bytes.Repeat([]byte{9}, int(pageSize))
+	page3 := bytes.Repeat([]byte{8}, int(pageSize))
+	if _, err := f.WriteAt(page2, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(page3, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	createTestLTXFile(t, client, 3, pageSize, 2, map[uint32][]byte{
+		1: bytes.Repeat([]byte{4}, int(pageSize)),
+	})
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	_, page2Synced := f.synced[2]
+	_, page3Synced := f.synced[3]
+	_, page2Indexed := f.index[2]
+	commit := f.commit
+	f.mu.Unlock()
+
+	if !page2Synced {
+		t.Fatal("expected synced page 2 to remain until a visible page index covers it")
+	}
+	if page3Synced {
+		t.Fatal("expected synced page 3 to be evicted after replacement shrank commit to page 2")
+	}
+	if page2Indexed {
+		t.Fatal("test is ineffective: replacement index already covers page 2")
+	}
+	if commit != 2 {
+		t.Fatalf("commit = %d, want 2", commit)
+	}
+
+	buf = make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, page2) {
+		t.Fatal("page 2 did not read from synced overlay after replacement")
+	}
+
+	buf = make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 0 {
+		t.Fatalf("page 3 read stale data after replacement: got first byte %d", buf[0])
+	}
+}
