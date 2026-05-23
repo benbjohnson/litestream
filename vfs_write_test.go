@@ -2077,3 +2077,61 @@ func TestVFSFile_FileSize_AfterSync(t *testing.T) {
 			sizeAfterWrite, sizeAfterSync, indexMax)
 	}
 }
+
+func TestVFSFile_SyncedPagesStayReadableBeforePoll(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 2; pgno++ {
+		pages[pgno] = bytes.Repeat([]byte{byte(pgno)}, int(pageSize))
+	}
+	createTestLTXFile(t, client, 1, pageSize, 2, pages)
+
+	f := setupWriteableVFSFile(t, client)
+	f.CacheSize = int(pageSize)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		data := bytes.Repeat([]byte{byte(pgno)}, int(pageSize))
+		off := int64(pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt(data, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	indexMax := uint32(0)
+	for pgno := range f.index {
+		if pgno > indexMax {
+			indexMax = pgno
+		}
+	}
+	f.mu.Unlock()
+
+	if indexMax > 2 {
+		t.Fatalf("index already covers page %d; test is ineffective", indexMax)
+	}
+
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		off := int64(pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt([]byte{0xff}, off+100); err != nil {
+			t.Fatal(err)
+		}
+
+		buf := make([]byte, pageSize)
+		if _, err := f.ReadAt(buf, off); err != nil {
+			t.Fatal(err)
+		}
+		if buf[0] != byte(pgno) || buf[100] != 0xff || buf[101] != byte(pgno) {
+			t.Fatalf("page %d was not preserved after sync before poll", pgno)
+		}
+	}
+}
