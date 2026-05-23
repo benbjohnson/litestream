@@ -965,6 +965,32 @@ func NewVFSFile(client ReplicaClient, name string, logger *slog.Logger) *VFSFile
 	return f
 }
 
+func cacheEntryCount(cacheSize int, pageSize uint32) int {
+	if pageSize == 0 {
+		pageSize = DefaultPageSize
+	}
+	n := cacheSize / int(pageSize)
+	if n < 1 {
+		return 1
+	}
+	return n
+}
+
+func (f *VFSFile) resizeCacheWithLock() {
+	if f.cache == nil {
+		return
+	}
+
+	n := cacheEntryCount(f.CacheSize, f.pageSize)
+	indexLag := f.expectedTXID > f.pos.TXID || len(f.pending) > 0 || f.mainIndexCommitWithLock() < f.commit
+	if f.writeEnabled && indexLag {
+		if commit := int(f.commit); commit > n {
+			n = commit
+		}
+	}
+	f.cache.Resize(n)
+}
+
 // Pos returns the current position of the file.
 func (f *VFSFile) Pos() ltx.Pos {
 	f.mu.Lock()
@@ -1040,10 +1066,7 @@ func (f *VFSFile) Open() error {
 	f.pageSize = pageSize
 
 	// Initialize page cache. Convert byte size to number of pages.
-	cacheEntries := f.CacheSize / int(pageSize)
-	if cacheEntries < 1 {
-		cacheEntries = 1
-	}
+	cacheEntries := cacheEntryCount(f.CacheSize, pageSize)
 	cache, err := lru.New[uint32, []byte](cacheEntries)
 	if err != nil {
 		return fmt.Errorf("create page cache: %w", err)
@@ -1114,10 +1137,7 @@ func (f *VFSFile) openNewDatabase() error {
 	f.pageSize = DefaultPageSize
 
 	// Initialize page cache
-	cacheEntries := f.CacheSize / int(f.pageSize)
-	if cacheEntries < 1 {
-		cacheEntries = 1
-	}
+	cacheEntries := cacheEntryCount(f.CacheSize, f.pageSize)
 	cache, err := lru.New[uint32, []byte](cacheEntries)
 	if err != nil {
 		return fmt.Errorf("create page cache: %w", err)
@@ -1198,7 +1218,7 @@ func (f *VFSFile) ResetTime(ctx context.Context) error {
 
 // rebuildIndex constructs a fresh page index and swaps it into the VFSFile.
 func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, target *time.Time) error {
-	index, err := f.buildIndexMap(ctx, infos)
+	index, commit, err := f.buildIndexMap(ctx, infos)
 	if err != nil {
 		return err
 	}
@@ -1221,6 +1241,7 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.pendingReplace = false
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
+	f.commit = commit
 	if len(infos) > 0 {
 		f.latestLTXTime = infos[len(infos)-1].CreatedAt
 	}
@@ -1248,7 +1269,7 @@ func maxLevelTXID(infos []*ltx.FileInfo, level int) ltx.TXID {
 }
 
 // buildIndexMap constructs a lookup of pgno to LTX file offsets.
-func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, error) {
+func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map[uint32]ltx.PageIndexElem, uint32, error) {
 	index := make(map[uint32]ltx.PageIndexElem)
 	var commit uint32
 	for _, info := range infos {
@@ -1257,7 +1278,7 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 		// Read page index.
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return nil, fmt.Errorf("fetch page index: %w", err)
+			return nil, 0, fmt.Errorf("fetch page index: %w", err)
 		}
 
 		// Replace pages in overall index with new pages.
@@ -1267,16 +1288,12 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 		}
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return nil, fmt.Errorf("fetch header: %w", err)
+			return nil, 0, fmt.Errorf("fetch header: %w", err)
 		}
 		commit = hdr.Commit
 	}
 
-	f.mu.Lock()
-	f.commit = commit
-	f.mu.Unlock()
-
-	return index, nil
+	return index, commit, nil
 }
 
 // buildIndex constructs a lookup of pgno to LTX file offsets (legacy wrapper).
@@ -1926,7 +1943,6 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
-	f.pos = ltx.Pos{TXID: f.expectedTXID}
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
@@ -1937,6 +1953,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	}
 
 	// Update cache with synced pages (index will be populated naturally when pages are fetched)
+	f.resizeCacheWithLock()
 	for pgno, bufferOff := range f.dirty {
 		cachedData := make([]byte, f.pageSize)
 		if _, err := f.bufferFile.ReadAt(cachedData, bufferOff); err != nil {
@@ -2224,7 +2241,6 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 			if f.vfs.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
 				f.expectedTXID = f.vfs.lastSyncedTXID
 				f.pendingTXID = f.vfs.lastSyncedTXID + 1
-				f.pos = ltx.Pos{TXID: f.expectedTXID}
 			}
 			f.vfs.writeMu.Unlock()
 		}
@@ -2280,6 +2296,7 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+	f.resizeCacheWithLock()
 
 	return nil
 }
@@ -2506,15 +2523,15 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 // pollReplicaClient fetches new LTX files from the replica client and updates
 // the page index & the current position.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
-	pos := f.Pos()
+	f.mu.Lock()
+	pos := f.pos
+	baseCommit := f.indexCommitWithLock()
+	maxTXID1Snapshot := f.maxTXID1
+	f.mu.Unlock()
+
 	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
 
 	combined := make(map[uint32]ltx.PageIndexElem)
-
-	f.mu.Lock()
-	baseCommit := f.commit
-	maxTXID1Snapshot := f.maxTXID1
-	f.mu.Unlock()
 
 	newCommit := baseCommit
 	replaceIndex := false
@@ -2568,6 +2585,10 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		return nil
 	}
 
+	applyTXID := maxTXID0
+	if maxTXID1 > applyTXID {
+		applyTXID = maxTXID1
+	}
 	// Apply updates and invalidate cache entries for updated pages
 	invalidateN := 0
 	target := f.index
@@ -2605,16 +2626,13 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	}
 
 	if replaceIndex {
-		f.commit = newCommit
+		if !f.writeEnabled || f.expectedTXID <= applyTXID || newCommit > f.commit {
+			f.commit = newCommit
+		}
 	} else if len(combined) > 0 && newCommit > f.commit {
 		f.commit = newCommit
 	}
-
-	if maxTXID0 > maxTXID1 {
-		f.pos.TXID = maxTXID0
-	} else {
-		f.pos.TXID = maxTXID1
-	}
+	f.pos.TXID = applyTXID
 
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
@@ -2625,8 +2643,35 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 			f.logger.Error("failed to apply updates to hydrated file", "error", err)
 		}
 	}
+	f.resizeCacheWithLock()
 
 	return nil
+}
+
+// indexCommitWithLock returns the page high-water represented by the installed
+// page index state. Dirty pages and f.commit are intentionally excluded.
+// Caller must hold f.mu.
+func (f *VFSFile) indexCommitWithLock() uint32 {
+	var commit uint32
+	if !f.pendingReplace {
+		commit = f.mainIndexCommitWithLock()
+	}
+	for pgno := range f.pending {
+		if pgno > commit {
+			commit = pgno
+		}
+	}
+	return commit
+}
+
+func (f *VFSFile) mainIndexCommitWithLock() uint32 {
+	var commit uint32
+	for pgno := range f.index {
+		if pgno > commit {
+			commit = pgno
+		}
+	}
+	return commit
 }
 
 // pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
