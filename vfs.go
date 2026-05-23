@@ -1550,7 +1550,7 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	return n, nil
 }
 
-// readLocalOverlayPageWithLock returns local write pages that must be visible
+// readOverlayPageWithLock returns local write pages that must be visible
 // before any hydrated file, cached remote page, or remote page index lookup.
 // Caller must hold f.mu.
 func (f *VFSFile) readOverlayPageWithLock(pgno uint32, pageSize uint32) (data []byte, source string, txid ltx.TXID, ok bool, err error) {
@@ -2316,7 +2316,10 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 		f.logger.Debug("cache invalidated all pages", "count", count)
 		// Invalidate entire cache since we replaced the index
 		f.cache.Purge()
-		f.clearSyncedPagesThroughTXIDWithLock(f.pos.TXID)
+		for k, v := range f.index {
+			f.clearSyncedPageWithIndexElemWithLock(k, v)
+		}
+		f.clearSyncedPagesBeyondCommitWithLock(f.commit)
 	} else if len(f.pending) > 0 {
 		// Merge pending into index
 		count := len(f.pending)
@@ -2634,6 +2637,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	if replaceIndex {
 		if f.lockType < sqlite3vfs.LockShared {
 			f.index = make(map[uint32]ltx.PageIndexElem)
+			f.cache.Purge()
 			target = f.index
 			targetIsMain = true
 			f.pendingReplace = false
@@ -2653,17 +2657,18 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 			invalidateN++
 		}
 	}
-	if replaceIndex && targetIsMain {
-		f.clearSyncedPagesThroughTXIDWithLock(applyTXID)
-	}
-
 	if invalidateN > 0 {
 		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
+	commitUpdated := false
 	if (replaceIndex || len(combined) > 0) && (!f.writeEnabled || applyTXID >= f.commitTXID) {
 		f.commit = newCommit
 		f.commitTXID = applyTXID
+		commitUpdated = true
+	}
+	if replaceIndex && targetIsMain && commitUpdated {
+		f.clearSyncedPagesBeyondCommitWithLock(f.commit)
 	}
 	f.pos.TXID = applyTXID
 
@@ -2687,9 +2692,9 @@ func (f *VFSFile) clearSyncedPageWithIndexElemWithLock(pgno uint32, elem ltx.Pag
 	}
 }
 
-func (f *VFSFile) clearSyncedPagesThroughTXIDWithLock(txid ltx.TXID) {
-	for pgno, page := range f.synced {
-		if page.txid <= txid {
+func (f *VFSFile) clearSyncedPagesBeyondCommitWithLock(commit uint32) {
+	for pgno := range f.synced {
+		if pgno > commit {
 			delete(f.synced, pgno)
 		}
 	}
