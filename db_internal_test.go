@@ -108,8 +108,8 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 func TestDB_SyncDiagnostic(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 
-	db.beginSyncDiagnostic(syncDiagnosticOperationSync)
-	db.setSyncDiagnosticPhase(syncDiagnosticPhaseWriteLTXFromWAL, func(s *syncDiagnosticState) {
+	db.beginSyncDiag(diagOpSync)
+	db.setSyncDiagPhase(diagPhaseWriteLTXFromWAL, func(s *diagState) {
 		s.txID = ltx.TXID(7)
 		s.walSize = 1024
 		s.lastSyncedWALOffset = 2048
@@ -146,7 +146,7 @@ func TestDB_SyncDiagnostic(t *testing.T) {
 		t.Fatalf("started_at=%v updated_at=%v, want both set", diag.StartedAt, diag.UpdatedAt)
 	}
 
-	db.finishSyncDiagnostic(errors.New("boom"))
+	db.finishSyncDiag(errors.New("boom"))
 	diag = db.SyncDiagnostic()
 	if diag.Active {
 		t.Fatal("expected inactive diagnostic")
