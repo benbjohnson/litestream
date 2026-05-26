@@ -154,29 +154,20 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}
 
 	pr, pw := io.Pipe()
-	compactErrCh := make(chan error, 1)
 	go func() {
 		comp, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
-			err = fmt.Errorf("new ltx compactor: %w", err)
-			_ = pw.CloseWithError(err)
-			compactErrCh <- err
+			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
-		err = comp.Compact(ctx)
-		_ = pw.CloseWithError(err)
-		compactErrCh <- err
+		_ = pw.CloseWithError(comp.Compact(ctx))
 	}()
 
 	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
 	_ = pr.CloseWithError(err)
-	compactErr := <-compactErrCh
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)
-	}
-	if compactErr != nil {
-		return nil, fmt.Errorf("compact ltx file: %w", compactErr)
 	}
 
 	if c.CacheSetter != nil {
