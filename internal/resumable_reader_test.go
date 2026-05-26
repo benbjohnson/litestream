@@ -67,6 +67,32 @@ func TestResumableReader(t *testing.T) {
 		}
 	})
 
+	t.Run("RetryInitialOpenError", func(t *testing.T) {
+		data := []byte("hello world")
+		callCount := 0
+		client := &testLTXFileOpener{
+			OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+				callCount++
+				if callCount <= 2 {
+					return nil, fmt.Errorf("net/http: TLS handshake timeout")
+				}
+				return io.NopCloser(bytes.NewReader(data[offset:])), nil
+			},
+		}
+
+		r := NewResumableReader(context.Background(), client, 0, 1, 1, int64(len(data)), nil, slog.Default())
+		got, err := io.ReadAll(r)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if !bytes.Equal(got, data) {
+			t.Fatalf("got %q, want %q", got, data)
+		}
+		if got, want := callCount, 3; got != want {
+			t.Fatalf("OpenLTXFile() count=%d, want %d", got, want)
+		}
+	})
+
 	t.Run("ReconnectOnPrematureEOF", func(t *testing.T) {
 		// Simulate a server that closes the connection cleanly (returns io.EOF)
 		// before all bytes are transferred. The reader detects this by comparing
