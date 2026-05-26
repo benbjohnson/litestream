@@ -3,8 +3,11 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +86,37 @@ func TestCompactor_Compact(t *testing.T) {
 			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
 		}
 	})
+}
+
+func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
+	client := newEarlyReturnCompactionClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
+	client.failWrites = true
+
+	before := countCompactorPipeWriters()
+	if _, err := compactor.Compact(context.Background(), 1); err == nil {
+		t.Fatal("expected error")
+	} else if !strings.Contains(err.Error(), "write ltx file: early write failure") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := countCompactorPipeWriters(); got <= before {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("compactor goroutine leaked: got %d, want <= %d", countCompactorPipeWriters(), before)
+		case <-ticker.C:
+		}
+	}
 }
 
 func TestCompactor_MaxLTXFileInfo(t *testing.T) {
@@ -599,4 +633,26 @@ func createTestLTXFileWithTimestamp(t testing.TB, client litestream.ReplicaClien
 	if _, err := client.WriteLTXFile(context.Background(), level, minTXID, maxTXID, io.NopCloser(&buf)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type earlyReturnCompactionClient struct {
+	litestream.ReplicaClient
+	failWrites bool
+}
+
+func newEarlyReturnCompactionClient(path string) *earlyReturnCompactionClient {
+	return &earlyReturnCompactionClient{ReplicaClient: file.NewReplicaClient(path)}
+}
+
+func (c *earlyReturnCompactionClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if c.failWrites {
+		return nil, fmt.Errorf("early write failure")
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func countCompactorPipeWriters() int {
+	buf := make([]byte, 2<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "github.com/benbjohnson/litestream.(*Compactor).Compact.func")
 }

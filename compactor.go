@@ -157,7 +157,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	go func() {
 		comp, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
@@ -165,6 +165,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}()
 
 	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	_ = pr.CloseWithError(err)
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)
 	}
