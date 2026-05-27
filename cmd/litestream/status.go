@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -19,6 +20,7 @@ type StatusCommand struct{}
 func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-status", flag.ContinueOnError)
 	configPath, noExpandEnv := registerConfigFlag(fs)
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -39,11 +41,7 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 		filterPath = fs.Arg(0)
 	}
 
-	// Print status for each database.
-	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
-	defer w.Flush()
-
-	fmt.Fprintln(w, "database\tstatus\tlocal txid\twal size")
+	var statuses []DBStatus
 
 	for _, dbConfig := range config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
@@ -56,9 +54,25 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 			continue
 		}
 
-		status := c.getDBStatus(db)
+		statuses = append(statuses, c.getDBStatus(db))
+	}
+
+	if *jsonOutput {
+		output, err := json.MarshalIndent(statuses, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+		return nil
+	}
+
+	w := tabwriter.NewWriter(os.Stdout, 0, 8, 2, ' ', 0)
+	defer w.Flush()
+
+	fmt.Fprintln(w, "database\tstatus\tlocal txid\twal size")
+	for _, status := range statuses {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%s\n",
-			db.Path(),
+			status.Database,
 			status.Status,
 			status.LocalTXID,
 			status.WALSize,
@@ -70,14 +84,16 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 
 // DBStatus holds the status information for a single database.
 type DBStatus struct {
-	Status    string
-	LocalTXID string
-	WALSize   string
+	Database  string `json:"database"`
+	Status    string `json:"status"`
+	LocalTXID string `json:"local_txid"`
+	WALSize   string `json:"wal_size"`
 }
 
 // getDBStatus gathers status information for a database.
 func (c *StatusCommand) getDBStatus(db *litestream.DB) DBStatus {
 	status := DBStatus{
+		Database:  db.Path(),
 		Status:    "unknown",
 		LocalTXID: "-",
 		WALSize:   "-",
@@ -126,6 +142,9 @@ Arguments:
 	-config PATH
 	    Specifies the configuration file.
 	    Defaults to %s
+
+	-json
+	    Output raw JSON instead of human-readable text.
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
