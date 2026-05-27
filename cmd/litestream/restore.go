@@ -277,7 +277,7 @@ func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
 		return fmt.Errorf("cannot restore, output path already exists and is not empty: %s. Use -force to overwrite", path)
 	}
 
-	for _, sidecarPath := range []string{path + "-wal", path + "-shm"} {
+	for _, sidecarPath := range []string{path + "-wal", path + "-shm", path + "-journal"} {
 		if _, err := os.Stat(sidecarPath); err == nil && !force {
 			return fmt.Errorf("cannot restore, SQLite sidecar path already exists: %s. Use -force to overwrite", sidecarPath)
 		} else if err != nil && !os.IsNotExist(err) {
@@ -285,7 +285,7 @@ func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
 		}
 	}
 
-	for _, removePath := range []string{path, path + "-wal", path + "-shm"} {
+	for _, removePath := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
 		if err := os.Remove(removePath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove existing output path: %w", err)
 		}

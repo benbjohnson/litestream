@@ -212,7 +212,7 @@ func TestRestoreCommand_RunRequiresForceForExistingOutput(t *testing.T) {
 func TestRestoreCommand_RunForceOverwritesExistingOutput(t *testing.T) {
 	ctx := context.Background()
 	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
-	for _, path := range []string{restorePath, restorePath + "-wal", restorePath + "-shm"} {
+	for _, path := range []string{restorePath, restorePath + "-wal", restorePath + "-shm", restorePath + "-journal"} {
 		if err := os.WriteFile(path, []byte("existing"), 0600); err != nil {
 			t.Fatal(err)
 		}
@@ -223,6 +223,29 @@ func TestRestoreCommand_RunForceOverwritesExistingOutput(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	assertRestoreCommandDB(t, restorePath)
+}
+
+func TestRestoreCommand_RunRequiresForceForExistingJournal(t *testing.T) {
+	ctx := context.Background()
+	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+	// Empty main file passes the size check; journal sidecar should still trip the guard.
+	if err := os.WriteFile(restorePath, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	journalPath := restorePath + "-journal"
+	if err := os.WriteFile(journalPath, []byte("existing"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &RestoreCommand{}
+	err := cmd.Run(ctx, []string{"-o", restorePath, "file://" + replicaPath})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	expected := "cannot restore, SQLite sidecar path already exists: " + journalPath + ". Use -force to overwrite"
+	if err.Error() != expected {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }
 
 func TestRestoreCommand_RunAllowsEmptyOutput(t *testing.T) {
