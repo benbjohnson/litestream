@@ -108,5 +108,15 @@ Options:
 
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
+
+Examples:
+  # Start replication for a database on the running daemon.
+  $ litestream start /path/to/db
+
+  # Start replication using a non-default control socket.
+  $ litestream start -socket /tmp/litestream.sock /path/to/db
+
+  # Start replication and wait up to 10 seconds for the daemon response.
+  $ litestream start -timeout 10 /path/to/db
 `[1:])
 }
