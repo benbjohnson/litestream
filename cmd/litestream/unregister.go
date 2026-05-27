@@ -105,5 +105,15 @@ Options:
 
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
+
+Examples:
+  # Unregister a database from the running daemon.
+  $ litestream unregister /path/to/db
+
+  # Unregister a database using a non-default control socket.
+  $ litestream unregister -socket /tmp/litestream.sock /path/to/db
+
+  # Unregister a database and wait up to 10 seconds for shutdown.
+  $ litestream unregister -timeout 10 /path/to/db
 `[1:])
 }
