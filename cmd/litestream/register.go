@@ -33,7 +33,7 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("too many arguments")
 	}
 	if *replicaFlag == "" {
-		return fmt.Errorf("replica URL required (use -replica flag)")
+		return fmt.Errorf("-replica is required. Try: litestream register -replica s3://bucket/prefix /path/to/db")
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("timeout must be greater than 0")

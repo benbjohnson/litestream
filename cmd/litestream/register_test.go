@@ -28,7 +28,7 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err == nil {
 			t.Error("expected error for missing replica flag")
 		}
-		if err.Error() != "replica URL required (use -replica flag)" {
+		if err.Error() != "-replica is required. Try: litestream register -replica s3://bucket/prefix /path/to/db" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
@@ -128,6 +128,35 @@ func TestRegisterCommand_Run(t *testing.T) {
 		// Still only 1 database - didn't register a duplicate.
 		if len(store.DBs()) != 1 {
 			t.Errorf("expected 1 database in store, got %d", len(store.DBs()))
+		}
+	})
+
+	t.Run("SuggestedReplicaHintExample", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		db, sqldb := testingutil.MustOpenDBs(t)
+		testingutil.MustCloseDBs(t, db, sqldb)
+
+		cmd := &main.RegisterCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "s3://bucket/prefix", db.Path()})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(store.DBs()) != 1 {
+			t.Fatalf("expected 1 database in store, got %d", len(store.DBs()))
 		}
 	})
 }

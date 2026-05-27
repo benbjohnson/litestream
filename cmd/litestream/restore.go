@@ -116,7 +116,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 // loadFromURL creates a replica & updates the restore options from a replica URL.
 func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	if opt.OutputPath == "" {
-		return nil, fmt.Errorf("output path required")
+		return nil, fmt.Errorf("-o is required when restoring from a replica URL. Try: litestream restore -o /path/to/db %s", replicaURL)
 	}
 
 	// Exit successfully if the output file already exists.
