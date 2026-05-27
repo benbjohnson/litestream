@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -110,4 +111,21 @@ func TestSyncCommand_Run(t *testing.T) {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
+}
+
+func TestSyncCommand_Usage(t *testing.T) {
+	output := captureStdout(t, func() {
+		(&main.SyncCommand{}).Usage()
+	})
+
+	for _, example := range []string{
+		"Examples:",
+		"$ litestream sync /path/to/db",
+		"$ litestream sync -wait /path/to/db",
+		"$ litestream sync -wait -timeout 120 /path/to/db",
+	} {
+		if !strings.Contains(output, example) {
+			t.Fatalf("usage output missing %q:\n%s", example, output)
+		}
+	}
 }
