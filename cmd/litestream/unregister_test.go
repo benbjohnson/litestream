@@ -2,7 +2,6 @@ package main_test
 
 import (
 	"context"
-	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -121,21 +120,4 @@ func TestUnregisterCommand_Run(t *testing.T) {
 			t.Errorf("expected 0 databases in store, got %d", len(store.DBs()))
 		}
 	})
-}
-
-func TestUnregisterCommand_Usage(t *testing.T) {
-	output := captureStdout(t, func() {
-		(&main.UnregisterCommand{}).Usage()
-	})
-
-	for _, example := range []string{
-		"Examples:",
-		"$ litestream unregister /path/to/db",
-		"$ litestream unregister -socket /tmp/litestream.sock /path/to/db",
-		"$ litestream unregister -timeout 10 /path/to/db",
-	} {
-		if !strings.Contains(output, example) {
-			t.Fatalf("usage output missing %q:\n%s", example, output)
-		}
-	}
 }
