@@ -28,8 +28,8 @@ require (
 	github.com/psanford/sqlite3vfs v0.0.0-20251127171934-4e34e03a991a // direct
 	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.1
-	golang.org/x/crypto v0.50.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/crypto v0.52.0
+	golang.org/x/sys v0.45.0
 	google.golang.org/api v0.155.0
 	gopkg.in/yaml.v2 v2.4.0
 	modernc.org/sqlite v1.44.3
@@ -127,9 +127,9 @@ require (
 	go.opentelemetry.io/otel v1.39.0 // indirect
 	go.opentelemetry.io/otel/metric v1.39.0 // indirect
 	go.opentelemetry.io/otel/trace v1.39.0 // indirect
-	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/oauth2 v0.34.0 // indirect
-	golang.org/x/text v0.36.0 // indirect
+	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	google.golang.org/genproto v0.0.0-20240116215550-a9fa1716bcac // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20251202230838-ff82c1b0f217 // indirect
