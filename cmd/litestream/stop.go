@@ -22,6 +22,7 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-stop", flag.ContinueOnError)
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -80,11 +81,15 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	confirmation := StartStopResult{
+		DBPath: result.Path,
+		State:  "stopped",
+		TXID:   result.TXID,
+		Socket: *socketPath,
 	}
-	fmt.Println(string(output))
+	if err := printStartStopResult(confirmation, *jsonOutput); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -104,9 +109,15 @@ Options:
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 
+  -json
+      Output raw JSON instead of human-readable text.
+
 Examples:
   # Stop replication for a database.
   $ litestream stop /path/to/db
+
+  # Stop replication and emit a JSON confirmation.
+  $ litestream stop -json /path/to/db
 
   # Stop replication using a non-default control socket.
   $ litestream stop -socket /tmp/litestream.sock /path/to/db
