@@ -117,6 +117,44 @@ written to stderr so stdout remains parseable JSON.
 | `duration_ms` | number | Restore duration in milliseconds. |
 | `integrity_check` | string | Integrity check mode used for the restore: `none`, `quick`, or `full`. |
 
+When `-dry-run` is combined with `-json`, `restore` outputs the restore plan
+instead of the final restore summary.
+
+```json
+{
+  "source": "file:///backups/app.db",
+  "target_path": "/var/lib/app.db",
+  "replica": "file",
+  "min_txid": "0000000000000001",
+  "max_txid": "0000000000000004",
+  "files": [
+    {
+      "level": 9,
+      "name": "0000000000000001-0000000000000004.ltx",
+      "min_txid": "0000000000000001",
+      "max_txid": "0000000000000004",
+      "size": 8192,
+      "timestamp": "2026-04-24T12:00:00Z"
+    }
+  ]
+}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `source` | string | Database path or replica URL passed to `restore`. |
+| `target_path` | string | Database path that would be written by a restore. |
+| `replica` | string | Replica client type used to build the plan. |
+| `min_txid` | string | Minimum transaction ID included in the plan. |
+| `max_txid` | string | Maximum transaction ID included in the plan. |
+| `files` | array | LTX files that would be fetched. |
+| `files[].level` | number | LTX compaction level. |
+| `files[].name` | string | LTX file name. |
+| `files[].min_txid` | string | Minimum transaction ID in the file. |
+| `files[].max_txid` | string | Maximum transaction ID in the file. |
+| `files[].size` | number | File size in bytes. |
+| `files[].timestamp` | string | File creation time in RFC 3339 format. |
+
 ## `litestream status -json`
 
 Outputs replication status for configured databases.
