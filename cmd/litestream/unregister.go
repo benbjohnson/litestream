@@ -21,6 +21,7 @@ func (c *UnregisterCommand) Run(ctx context.Context, args []string) error {
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	dryRun := fs.Bool("dry-run", false, "print what would be unregistered without changing the daemon")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -93,11 +94,40 @@ func (c *UnregisterCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	confirmation := UnregisterResult{
+		Status:    result.Status,
+		DBPath:    result.Path,
+		FinalTXID: result.TXID,
+		Socket:    *socketPath,
 	}
-	fmt.Println(string(output))
+	if err := printUnregisterResult(confirmation, *jsonOutput); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type UnregisterResult struct {
+	Status    string `json:"status"`
+	DBPath    string `json:"db_path"`
+	FinalTXID uint64 `json:"final_txid"`
+	Socket    string `json:"socket"`
+}
+
+func printUnregisterResult(result UnregisterResult, jsonOutput bool) error {
+	if jsonOutput {
+		output, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+		return nil
+	}
+
+	fmt.Printf("status: %s\n", result.Status)
+	fmt.Printf("db_path: %s\n", result.DBPath)
+	fmt.Printf("final_txid: %d\n", result.FinalTXID)
+	fmt.Printf("socket: %s\n", result.Socket)
 
 	return nil
 }
@@ -121,9 +151,15 @@ Options:
   -dry-run
       Preview what would be unregistered without changing the daemon.
 
+  -json
+      Output raw JSON instead of human-readable text.
+
 Examples:
   # Unregister a database from the running daemon.
   $ litestream unregister /path/to/db
+
+  # Unregister a database and emit a JSON confirmation.
+  $ litestream unregister -json /path/to/db
 
   # Preview an unregister request without changing the daemon.
   $ litestream unregister -dry-run /path/to/db

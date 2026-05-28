@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -140,6 +141,62 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		}
 
 		// Verify database was unregistered from store.
+		if len(store.DBs()) != 0 {
+			t.Errorf("expected 0 databases in store, got %d", len(store.DBs()))
+		}
+	})
+
+	t.Run("JSONOutput", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+		dbPath := db.Path()
+
+		_, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		output := captureStdout(t, func() {
+			cmd := &main.UnregisterCommand{}
+			err := cmd.Run(context.Background(), []string{"-json", "-socket", server.SocketPath, dbPath})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		var got main.UnregisterResult
+		if err := json.Unmarshal([]byte(output), &got); err != nil {
+			t.Fatalf("failed to parse output: %v\n%s", err, output)
+		}
+		if got.Status != "unregistered" {
+			t.Fatalf("unexpected status: %s", got.Status)
+		}
+		if got.DBPath != dbPath {
+			t.Fatalf("unexpected db path: %s", got.DBPath)
+		}
+		if got.FinalTXID == 0 {
+			t.Fatal("expected non-zero final txid")
+		}
+		if got.Socket != server.SocketPath {
+			t.Fatalf("unexpected socket: %s", got.Socket)
+		}
 		if len(store.DBs()) != 0 {
 			t.Errorf("expected 0 databases in store, got %d", len(store.DBs()))
 		}
