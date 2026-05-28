@@ -21,6 +21,7 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	replicaFlag := fs.String("replica", "", "replica URL (e.g., s3://bucket/prefix, file:///backup/path)")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -86,13 +87,34 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	confirmation := RegisterResult{
+		Status:  result.Status,
+		DBPath:  result.Path,
+		Replica: replicaURL,
+		Socket:  *socketPath,
 	}
-	fmt.Println(string(output))
+	if *jsonOutput {
+		output, err := json.MarshalIndent(confirmation, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+		return nil
+	}
+
+	fmt.Printf("status: %s\n", confirmation.Status)
+	fmt.Printf("db_path: %s\n", confirmation.DBPath)
+	fmt.Printf("replica: %s\n", confirmation.Replica)
+	fmt.Printf("socket: %s\n", confirmation.Socket)
 
 	return nil
+}
+
+type RegisterResult struct {
+	Status  string `json:"status"`
+	DBPath  string `json:"db_path"`
+	Replica string `json:"replica"`
+	Socket  string `json:"socket"`
 }
 
 func (c *RegisterCommand) Usage() {
@@ -115,6 +137,9 @@ Options:
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 
+  -json
+      Output raw JSON instead of human-readable text.
+
 Examples:
   # Register a database with an S3 replica.
   $ litestream register -replica s3://mybucket/db /path/to/db
@@ -124,5 +149,8 @@ Examples:
 
   # Register using a non-default control socket.
   $ litestream register -socket /tmp/litestream.sock -replica s3://mybucket/db /path/to/db
+
+  # Register and emit a JSON confirmation.
+  $ litestream register -json -replica s3://mybucket/db /path/to/db
 `[1:])
 }
