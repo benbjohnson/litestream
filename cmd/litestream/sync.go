@@ -23,6 +23,7 @@ func (c *SyncCommand) Run(ctx context.Context, args []string) error {
 	timeout := fs.Int("timeout", 30, "timeout in seconds")
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	wait := fs.Bool("wait", false, "block until sync completes")
+	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -60,11 +61,13 @@ func (c *SyncCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to marshal request: %w", err)
 	}
 
+	start := time.Now()
 	resp, err := client.Post("http://localhost/sync", "application/json", bytes.NewReader(reqBody))
 	if err != nil {
 		return fmt.Errorf("failed to connect to control socket: %w", err)
 	}
 	defer resp.Body.Close()
+	durationMS := time.Since(start).Milliseconds()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -84,11 +87,44 @@ func (c *SyncCommand) Run(ctx context.Context, args []string) error {
 		return fmt.Errorf("failed to parse response: %w", err)
 	}
 
-	output, err := json.MarshalIndent(result, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to format response: %w", err)
+	confirmation := SyncResult{
+		DBPath:     result.Path,
+		TXID:       result.TXID,
+		DurationMS: durationMS,
 	}
-	fmt.Println(string(output))
+	if *wait {
+		confirmation.ReplicaTXID = &result.ReplicatedTXID
+	}
+	if err := printSyncResult(confirmation, *jsonOutput); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+type SyncResult struct {
+	DBPath      string  `json:"db_path"`
+	TXID        uint64  `json:"txid"`
+	ReplicaTXID *uint64 `json:"replica_txid,omitempty"`
+	DurationMS  int64   `json:"duration_ms"`
+}
+
+func printSyncResult(result SyncResult, jsonOutput bool) error {
+	if jsonOutput {
+		output, err := json.MarshalIndent(result, "", "  ")
+		if err != nil {
+			return fmt.Errorf("failed to format response: %w", err)
+		}
+		fmt.Println(string(output))
+		return nil
+	}
+
+	fmt.Printf("db_path: %s\n", result.DBPath)
+	fmt.Printf("txid: %d\n", result.TXID)
+	if result.ReplicaTXID != nil {
+		fmt.Printf("replica_txid: %d\n", *result.ReplicaTXID)
+	}
+	fmt.Printf("duration_ms: %d\n", result.DurationMS)
 
 	return nil
 }
@@ -110,8 +146,12 @@ Options:
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
 
+  -json
+      Output raw JSON instead of human-readable text.
+
 Examples:
   $ litestream sync /path/to/db
+  $ litestream sync -json /path/to/db
   $ litestream sync -wait /path/to/db
   $ litestream sync -wait -timeout 120 /path/to/db
 `[1:])
