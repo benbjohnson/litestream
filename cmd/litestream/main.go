@@ -93,10 +93,6 @@ type usageError struct {
 	hint    string
 }
 
-func newUsageError(message, hint string) error {
-	return &usageError{message: message, hint: hint}
-}
-
 func (e *usageError) Error() string {
 	return e.message
 }

@@ -26,7 +26,10 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Validate arguments - need exactly one database path
 	if fs.NArg() == 0 {
-		return newUsageError("database path required", "litestream reset /path/to/db")
+		return &usageError{
+			message: "database path required",
+			hint:    "litestream reset /path/to/db",
+		}
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}

@@ -29,7 +29,10 @@ func (c *StopCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	if fs.NArg() == 0 {
-		return newUsageError("database path required", "litestream stop /path/to/db")
+		return &usageError{
+			message: "database path required",
+			hint:    "litestream stop /path/to/db",
+		}
 	}
 	if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")

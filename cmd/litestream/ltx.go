@@ -27,7 +27,10 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return newUsageError("database path or replica URL required", "litestream ltx /path/to/db")
+		return &usageError{
+			message: "database path or replica URL required",
+			hint:    "litestream ltx /path/to/db",
+		}
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
