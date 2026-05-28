@@ -83,7 +83,11 @@ func main() {
 	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
 		os.Exit(1)
 	} else if err != nil {
-		printCLIError(os.Stderr, err)
+		_, _ = fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		var usageErr *usageError
+		if errors.As(err, &usageErr) && usageErr.hint != "" {
+			_, _ = fmt.Fprintf(os.Stderr, "Try: %s\n", usageErr.hint)
+		}
 		os.Exit(1)
 	}
 }
@@ -95,15 +99,6 @@ type usageError struct {
 
 func (e *usageError) Error() string {
 	return e.message
-}
-
-func printCLIError(w io.Writer, err error) {
-	_, _ = fmt.Fprintf(w, "Error: %s\n", err)
-
-	var usageErr *usageError
-	if errors.As(err, &usageErr) && usageErr.hint != "" {
-		_, _ = fmt.Fprintf(w, "Try: %s\n", usageErr.hint)
-	}
 }
 
 // Main represents the main program execution.
