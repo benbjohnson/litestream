@@ -93,14 +93,18 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer store.Close(context.Background())
+		defer func() {
+			_ = store.Close(context.Background())
+		}()
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer server.Close()
+		defer func() {
+			_ = server.Close()
+		}()
 
 		output := captureStdout(t, func() {
 			cmd := &main.UnregisterCommand{}
@@ -110,8 +114,8 @@ func TestUnregisterCommand_Run(t *testing.T) {
 				t.Errorf("unexpected error: %v", err)
 			}
 		})
-		if !strings.Contains(output, "status: not_registered") {
-			t.Fatalf("expected not_registered status, got:\n%s", output)
+		if !strings.Contains(output, "status: already_unregistered") {
+			t.Fatalf("expected already_unregistered status, got:\n%s", output)
 		}
 		if !strings.Contains(output, "final_txid: 0") {
 			t.Fatalf("expected zero final txid, got:\n%s", output)
@@ -128,7 +132,9 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer store.Close(context.Background())
+		defer func() {
+			_ = store.Close(context.Background())
+		}()
 
 		// Verify database is initially in store.
 		if len(store.DBs()) != 1 {
@@ -140,7 +146,9 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer server.Close()
+		defer func() {
+			_ = server.Close()
+		}()
 
 		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, dbPath})
@@ -207,6 +215,45 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		}
 		if len(store.DBs()) != 0 {
 			t.Errorf("expected 0 databases in store, got %d", len(store.DBs()))
+		}
+	})
+
+	t.Run("JSONNotFoundStatus", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = store.Close(context.Background())
+		}()
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = server.Close()
+		}()
+
+		output := captureStdout(t, func() {
+			cmd := &main.UnregisterCommand{}
+			err := cmd.Run(context.Background(), []string{"-json", "-socket", server.SocketPath, "/nonexistent/db"})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		var got main.UnregisterResult
+		if err := json.Unmarshal([]byte(output), &got); err != nil {
+			t.Fatalf("failed to parse output: %v\n%s", err, output)
+		}
+		if got.Status != "already_unregistered" {
+			t.Fatalf("unexpected status: %s", got.Status)
+		}
+		if got.FinalTXID != 0 {
+			t.Fatalf("unexpected final txid: %d", got.FinalTXID)
 		}
 	})
 }

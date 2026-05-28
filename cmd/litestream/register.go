@@ -28,13 +28,13 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	if fs.NArg() == 0 {
-		return fmt.Errorf("database path required")
+		return newUsageError("database path required", "litestream register -replica s3://bucket/prefix /path/to/db")
 	}
 	if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
 	if *replicaFlag == "" {
-		return fmt.Errorf("-replica is required. Try: litestream register -replica s3://bucket/prefix /path/to/db")
+		return newUsageError("-replica is required", "litestream register -replica s3://bucket/prefix /path/to/db")
 	}
 	if *timeout <= 0 {
 		return fmt.Errorf("timeout must be greater than 0")
@@ -118,7 +118,7 @@ type RegisterResult struct {
 }
 
 func registerDisplayStatus(status string) string {
-	if status == "already_exists" {
+	if status == "already_registered" {
 		return "already registered"
 	}
 	return status

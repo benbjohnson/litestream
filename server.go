@@ -594,7 +594,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Check if database already exists.
 	if existing := s.store.FindDB(expandedPath); existing != nil {
 		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
-			Status: "already_exists",
+			Status: "already_registered",
 			Path:   expandedPath,
 		})
 		return
@@ -661,7 +661,7 @@ func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var txID uint64
-	status := "not_registered"
+	status := "already_unregistered"
 	if db != nil {
 		_, maxTXID, err := db.MaxLTX()
 		if err != nil {

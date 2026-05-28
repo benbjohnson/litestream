@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -58,6 +59,33 @@ func TestLTXCommand_Run_JSONOutput(t *testing.T) {
 	}
 	if got[0].Timestamp != timestamp.Format(time.RFC3339) {
 		t.Fatalf("unexpected timestamp: %s", got[0].Timestamp)
+	}
+}
+
+func TestLTXCommand_Run_EmptyJSONOutput(t *testing.T) {
+	replicaURL := "file://" + filepath.Join(t.TempDir(), "replica")
+
+	output := captureLTXCommandStdout(t, func() {
+		cmd := &LTXCommand{}
+		if err := cmd.Run(context.Background(), []string{"-json", replicaURL}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	if output != "[]\n" {
+		t.Fatalf("unexpected output: %q", output)
+	}
+}
+
+func TestLTXCommand_UsageOmitsReplicaFlag(t *testing.T) {
+	output := captureLTXCommandStdout(t, func() {
+		(&LTXCommand{}).Usage()
+	})
+
+	for _, substr := range []string{"-replica NAME", "litestream ltx -replica"} {
+		if strings.Contains(output, substr) {
+			t.Fatalf("usage contains stale replica flag text %q:\n%s", substr, output)
+		}
 	}
 }
 

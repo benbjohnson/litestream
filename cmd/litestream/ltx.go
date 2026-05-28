@@ -27,7 +27,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("database path required")
+		return newUsageError("database path or replica URL required", "litestream ltx /path/to/db")
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
@@ -81,7 +81,7 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		levels = []int{int(level)}
 	}
 
-	var files []LTXFileInfo
+	files := make([]LTXFileInfo, 0)
 	for _, lvl := range levels {
 		itr, err := r.Client.LTXFiles(ctx, lvl, 0, false)
 		if err != nil {
@@ -155,9 +155,6 @@ Arguments:
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
-	-replica NAME
-	    Optional, filter by a specific replica.
-
 	-level LEVEL
 	    Compaction level to list (0-9 or "all").
 	    Defaults to 0.
@@ -169,9 +166,6 @@ Examples:
 
 	# List all LTX files for a database.
 	$ litestream ltx /path/to/db
-
-	# List all LTX files on S3
-	$ litestream ltx -replica s3 /path/to/db
 
 	# List all LTX files for replica URL.
 	$ litestream ltx s3://mybkt/db

@@ -64,4 +64,23 @@ func TestDatabasesCommand_Run(t *testing.T) {
 			t.Fatalf("unexpected replica type: %s", got[0].Replica)
 		}
 	})
+
+	t.Run("EmptyJSONOutput", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "litestream.yml")
+		if err := os.WriteFile(configPath, []byte("dbs: []\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		output := captureStdout(t, func() {
+			cmd := &main.DatabasesCommand{}
+			if err := cmd.Run(context.Background(), []string{"-config", configPath, "-json"}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		if output != "[]\n" {
+			t.Fatalf("unexpected output: %q", output)
+		}
+	})
 }

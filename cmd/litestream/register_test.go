@@ -30,7 +30,7 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err == nil {
 			t.Error("expected error for missing replica flag")
 		}
-		if err.Error() != "-replica is required. Try: litestream register -replica s3://bucket/prefix /path/to/db" {
+		if err.Error() != "-replica is required" {
 			t.Errorf("unexpected error: %v", err)
 		}
 	})
@@ -71,14 +71,18 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer store.Close(context.Background())
+		defer func() {
+			_ = store.Close(context.Background())
+		}()
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer server.Close()
+		defer func() {
+			_ = server.Close()
+		}()
 
 		// Create a temporary database file.
 		db, sqldb := testingutil.MustOpenDBs(t)
@@ -109,14 +113,18 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer store.Close(context.Background())
+		defer func() {
+			_ = store.Close(context.Background())
+		}()
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer server.Close()
+		defer func() {
+			_ = server.Close()
+		}()
 
 		// Create a temp directory for backup.
 		backupDir := filepath.Join(t.TempDir(), "backup")
@@ -181,6 +189,45 @@ func TestRegisterCommand_Run(t *testing.T) {
 		}
 		if got.Socket != server.SocketPath {
 			t.Fatalf("unexpected socket: %s", got.Socket)
+		}
+	})
+
+	t.Run("JSONAlreadyExistsStatus", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = store.Close(context.Background())
+		}()
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			_ = server.Close()
+		}()
+
+		output := captureStdout(t, func() {
+			cmd := &main.RegisterCommand{}
+			err := cmd.Run(context.Background(), []string{"-json", "-socket", server.SocketPath, "-replica", "file://" + t.TempDir(), db.Path()})
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		var got main.RegisterResult
+		if err := json.Unmarshal([]byte(output), &got); err != nil {
+			t.Fatalf("failed to parse output: %v\n%s", err, output)
+		}
+		if got.Status != "already_registered" {
+			t.Fatalf("unexpected status: %s", got.Status)
 		}
 	})
 

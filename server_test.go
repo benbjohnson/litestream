@@ -411,7 +411,7 @@ func TestServer_HandleRegister(t *testing.T) {
 
 		var result litestream.RegisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "already_exists", result.Status)
+		require.Equal(t, "already_registered", result.Status)
 	})
 }
 
@@ -462,7 +462,7 @@ func TestServer_HandleUnregister(t *testing.T) {
 
 		var result litestream.UnregisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "not_registered", result.Status)
+		require.Equal(t, "already_unregistered", result.Status)
 		require.Zero(t, result.TXID)
 	})
 

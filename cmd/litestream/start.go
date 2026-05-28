@@ -9,7 +9,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -30,12 +29,7 @@ func (c *StartCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	if fs.NArg() == 0 {
-		os.Stderr.WriteString(`
-Note: 'litestream start' enables replication for a single database on a running daemon.
-To start the replication daemon, use 'litestream replicate' instead.
-Run 'litestream start -h' for usage details.
-`)
-		return fmt.Errorf("database path required")
+		return newUsageError("database path required", "litestream start /path/to/db")
 	}
 	if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")

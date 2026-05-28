@@ -7,6 +7,11 @@ status.
 The fields below are the stable output contract for CLI consumers. New fields
 may be added in future releases, so consumers should ignore unknown fields.
 
+Runtime commands use `status` values that name the completed state. When a
+command is already in its requested state, the status uses `already_<state>`,
+such as `already_registered`, `already_running`, `already_stopped`, or
+`already_unregistered`.
+
 ## `litestream databases -json`
 
 Outputs an array of databases loaded from the configuration file.
