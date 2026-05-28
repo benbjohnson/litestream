@@ -80,7 +80,14 @@ func main() {
 	internal.InitLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
-	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
+	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, errStop) {
+		os.Exit(1)
+	} else if errors.Is(err, flag.ErrHelp) {
+		for _, arg := range os.Args[1:] {
+			if arg == "-h" || arg == "-help" || arg == "--help" {
+				os.Exit(0)
+			}
+		}
 		os.Exit(1)
 	} else if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "Error: %s\n", err)
@@ -129,11 +136,11 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 
 	switch cmd {
 	case "databases":
-		return filterExplicitHelp(args, (&DatabasesCommand{}).Run(ctx, args))
+		return (&DatabasesCommand{}).Run(ctx, args)
 	case "replicate":
 		c := NewReplicateCommand()
 		if err := c.ParseFlags(ctx, args); err != nil {
-			return filterExplicitHelp(args, err)
+			return err
 		}
 
 		// Setup signal handler.
@@ -187,35 +194,35 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return err
 
 	case "start":
-		return filterExplicitHelp(args, (&StartCommand{}).Run(ctx, args))
+		return (&StartCommand{}).Run(ctx, args)
 	case "stop":
-		return filterExplicitHelp(args, (&StopCommand{}).Run(ctx, args))
+		return (&StopCommand{}).Run(ctx, args)
 	case "register":
-		return filterExplicitHelp(args, (&RegisterCommand{}).Run(ctx, args))
+		return (&RegisterCommand{}).Run(ctx, args)
 	case "unregister":
-		return filterExplicitHelp(args, (&UnregisterCommand{}).Run(ctx, args))
+		return (&UnregisterCommand{}).Run(ctx, args)
 	case "reset":
-		return filterExplicitHelp(args, (&ResetCommand{}).Run(ctx, args))
+		return (&ResetCommand{}).Run(ctx, args)
 	case "restore":
-		return filterExplicitHelp(args, (&RestoreCommand{}).Run(ctx, args))
+		return (&RestoreCommand{}).Run(ctx, args)
 	case "status":
-		return filterExplicitHelp(args, (&StatusCommand{}).Run(ctx, args))
+		return (&StatusCommand{}).Run(ctx, args)
 	case "sync":
-		return filterExplicitHelp(args, (&SyncCommand{}).Run(ctx, args))
+		return (&SyncCommand{}).Run(ctx, args)
 	case "list":
-		return filterExplicitHelp(args, (&ListCommand{}).Run(ctx, args))
+		return (&ListCommand{}).Run(ctx, args)
 	case "info":
-		return filterExplicitHelp(args, (&InfoCommand{}).Run(ctx, args))
+		return (&InfoCommand{}).Run(ctx, args)
 	case "version":
-		return filterExplicitHelp(args, (&VersionCommand{}).Run(ctx, args))
+		return (&VersionCommand{}).Run(ctx, args)
 	case "ltx":
-		return filterExplicitHelp(args, (&LTXCommand{}).Run(ctx, args))
+		return (&LTXCommand{}).Run(ctx, args)
 	case "wal":
 		// Deprecated: Keep for backward compatibility
 		fmt.Fprintln(os.Stderr, "Warning: 'wal' command is deprecated, please use 'ltx' instead")
-		return filterExplicitHelp(args, (&LTXCommand{}).Run(ctx, args))
+		return (&LTXCommand{}).Run(ctx, args)
 	default:
-		if cmd == "help" || cmd == "-h" || cmd == "--help" {
+		if cmd == "help" || cmd == "-h" || cmd == "-help" || cmd == "--help" {
 			m.Usage()
 			return nil
 		} else if cmd == "" || strings.HasPrefix(cmd, "-") {
@@ -224,23 +231,6 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 		return fmt.Errorf("litestream %s: unknown command", cmd)
 	}
-}
-
-func filterExplicitHelp(args []string, err error) error {
-	if errors.Is(err, flag.ErrHelp) && hasExplicitHelpFlag(args) {
-		return nil
-	}
-	return err
-}
-
-func hasExplicitHelpFlag(args []string) bool {
-	for _, arg := range args {
-		switch arg {
-		case "-h", "-help", "--help":
-			return true
-		}
-	}
-	return false
 }
 
 // Usage prints the help screen to STDOUT.
