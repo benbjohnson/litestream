@@ -93,18 +93,14 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = store.Close(context.Background())
-		}()
+		defer store.Close(context.Background())
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = server.Close()
-		}()
+		defer server.Close()
 
 		output := captureStdout(t, func() {
 			cmd := &main.UnregisterCommand{}
@@ -132,9 +128,7 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = store.Close(context.Background())
-		}()
+		defer store.Close(context.Background())
 
 		// Verify database is initially in store.
 		if len(store.DBs()) != 1 {
@@ -146,9 +140,7 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = server.Close()
-		}()
+		defer server.Close()
 
 		cmd := &main.UnregisterCommand{}
 		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, dbPath})
@@ -224,18 +216,14 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = store.Close(context.Background())
-		}()
+		defer store.Close(context.Background())
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = server.Close()
-		}()
+		defer server.Close()
 
 		output := captureStdout(t, func() {
 			cmd := &main.UnregisterCommand{}

@@ -71,18 +71,14 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = store.Close(context.Background())
-		}()
+		defer store.Close(context.Background())
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = server.Close()
-		}()
+		defer server.Close()
 
 		// Create a temporary database file.
 		db, sqldb := testingutil.MustOpenDBs(t)
@@ -113,18 +109,14 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = store.Close(context.Background())
-		}()
+		defer store.Close(context.Background())
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = server.Close()
-		}()
+		defer server.Close()
 
 		// Create a temp directory for backup.
 		backupDir := filepath.Join(t.TempDir(), "backup")
@@ -201,18 +193,14 @@ func TestRegisterCommand_Run(t *testing.T) {
 		if err := store.Open(context.Background()); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = store.Close(context.Background())
-		}()
+		defer store.Close(context.Background())
 
 		server := litestream.NewServer(store)
 		server.SocketPath = testSocketPath(t)
 		if err := server.Start(); err != nil {
 			t.Fatal(err)
 		}
-		defer func() {
-			_ = server.Close()
-		}()
+		defer server.Close()
 
 		output := captureStdout(t, func() {
 			cmd := &main.RegisterCommand{}
