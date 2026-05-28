@@ -2,6 +2,7 @@ package main_test
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -59,6 +60,29 @@ func TestUnregisterCommand_Run(t *testing.T) {
 		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock", "/tmp/test.db"})
 		if err == nil {
 			t.Error("expected error for socket connection failure")
+		}
+	})
+
+	t.Run("DryRunDoesNotConnect", func(t *testing.T) {
+		output := captureStdout(t, func() {
+			cmd := &main.UnregisterCommand{}
+			err := cmd.Run(context.Background(), []string{"-dry-run", "-socket", "/nonexistent/socket.sock", "/tmp/test.db"})
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+			}
+		})
+
+		for _, substr := range []string{
+			"Dry run: unregister request preview",
+			"database: /tmp/test.db",
+			"socket: /nonexistent/socket.sock",
+			"replicas: daemon-managed replica for this database",
+			"final sync: daemon close will sync the database and replica before the command completes",
+			"No unregister request was sent.",
+		} {
+			if !strings.Contains(output, substr) {
+				t.Fatalf("output missing %q:\n%s", substr, output)
+			}
 		}
 	})
 
