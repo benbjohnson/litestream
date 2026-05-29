@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net"
 	"net/http"
-	"os"
 	"time"
 
 	"github.com/benbjohnson/litestream"
@@ -24,7 +23,7 @@ func (c *MonitorCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-monitor", flag.ContinueOnError)
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	dbFilter := fs.String("db", "", "filter to specific database path")
-	rawOutput := fs.Bool("raw", false, "output raw NDJSON without formatting")
+	jsonOutput := fs.Bool("json", false, "output raw NDJSON without formatting")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -46,7 +45,7 @@ func (c *MonitorCommand) Run(ctx context.Context, args []string) error {
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("failed to connect to control socket: %w", err)
+		return fmt.Errorf("failed to connect to control socket: %w\nTry: ensure litestream replicate is running with a configured socket: block (see https://litestream.io/reference/config/#socket)", err)
 	}
 	defer resp.Body.Close()
 
@@ -62,15 +61,14 @@ func (c *MonitorCommand) Run(ctx context.Context, args []string) error {
 			continue
 		}
 
-		if *rawOutput {
+		if *jsonOutput {
 			fmt.Println(line)
 			continue
 		}
 
 		var event litestream.StatusEvent
 		if err := json.Unmarshal([]byte(line), &event); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: failed to parse event: %v\n", err)
-			continue
+			return fmt.Errorf("failed to parse event: %w", err)
 		}
 
 		c.printEvent(&event, *dbFilter)
@@ -145,6 +143,13 @@ Monitor replication status in real-time.
 Connects to the litestream control socket and streams replication events
 as they occur. Events are emitted when LTX files are uploaded to replicas.
 
+The control socket is disabled by default. Enable it in the config used by
+litestream replicate:
+
+  socket:
+    enabled: true
+    path: /var/run/litestream.sock
+
 Options:
   -socket PATH
       Path to control socket (default: /var/run/litestream.sock).
@@ -152,17 +157,17 @@ Options:
   -db PATH
       Filter events to a specific database path.
 
-  -raw
+  -json
       Output raw NDJSON without formatting.
 
 Examples:
-  # Monitor all databases
-  litestream monitor
+  # Monitor all databases.
+  $ litestream monitor
 
-  # Monitor specific database
-  litestream monitor -db /data/app.db
+  # Monitor a specific database.
+  $ litestream monitor -db /data/app.db
 
-  # Output raw NDJSON (for piping to other tools)
-  litestream monitor -raw | jq .
+  # Stream NDJSON for piping to other tools.
+  $ litestream monitor -json | jq .
 `[1:])
 }
