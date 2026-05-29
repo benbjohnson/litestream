@@ -564,5 +564,12 @@ Arguments:
 	    Restores the database from the replica if it doesn't exist.
 	    On first start with no backup, proceeds normally.
 
+Runtime control commands require the daemon control socket. This includes
+start, stop, sync, register, unregister, info, and list. Enable it in the config:
+
+	socket:
+	  enabled: true
+	  path: /tmp/litestream.sock
+
 `[1:], DefaultConfigPath())
 }

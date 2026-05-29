@@ -41,7 +41,7 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 		filterPath = fs.Arg(0)
 	}
 
-	var statuses []DBStatus
+	statuses := make([]DBStatus, 0, len(config.DBs))
 
 	for _, dbConfig := range config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
@@ -158,7 +158,7 @@ Output columns:
   local txid    Latest local transaction ID
   wal size      Current WAL file size
 
-Note: To see replica TXID and sync status, use the MCP tools or check logs
+Note: To see replica TXID and sync status, inspect daemon diagnostics or logs
 while the replication daemon is running.
 
 Examples:

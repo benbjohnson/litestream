@@ -28,7 +28,10 @@ func (c *UnregisterCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	if fs.NArg() == 0 {
-		return fmt.Errorf("database path required")
+		return &usageError{
+			message: "database path required",
+			hint:    "litestream unregister /path/to/db",
+		}
 	}
 	if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")

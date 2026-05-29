@@ -43,7 +43,10 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := fs.Parse(args); err != nil {
 		return err
 	} else if fs.NArg() == 0 || fs.Arg(0) == "" {
-		return fmt.Errorf("database path or replica URL required")
+		return &usageError{
+			message: "database path or replica URL required",
+			hint:    "litestream restore -o /path/to/db s3://bucket/prefix",
+		}
 	} else if fs.NArg() > 1 {
 		return fmt.Errorf("too many arguments")
 	}
@@ -296,7 +299,10 @@ func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
 // loadFromURL creates a replica & updates the restore options from a replica URL.
 func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	if opt.OutputPath == "" {
-		return nil, fmt.Errorf("-o is required when restoring from a replica URL. Try: litestream restore -o /path/to/db %s", replicaURL)
+		return nil, &usageError{
+			message: "-o is required when restoring from a replica URL",
+			hint:    fmt.Sprintf("litestream restore -o /path/to/db %s", replicaURL),
+		}
 	}
 
 	// Exit successfully if the output file already exists.

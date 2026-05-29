@@ -119,4 +119,23 @@ func TestStatusCommand_Run(t *testing.T) {
 			t.Fatalf("unexpected wal size: %s", got[0].WALSize)
 		}
 	})
+
+	t.Run("EmptyJSONOutput", func(t *testing.T) {
+		dir := t.TempDir()
+		configPath := filepath.Join(dir, "litestream.yml")
+		if err := os.WriteFile(configPath, []byte("dbs: []\n"), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		output := captureStdout(t, func() {
+			cmd := &main.StatusCommand{}
+			if err := cmd.Run(context.Background(), []string{"-config", configPath, "-json"}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		if output != "[]\n" {
+			t.Fatalf("unexpected output: %q", output)
+		}
+	})
 }

@@ -33,7 +33,7 @@ func (c *DatabasesCommand) Run(_ context.Context, args []string) (err error) {
 		return err
 	}
 
-	var databases []DatabaseInfo
+	databases := make([]DatabaseInfo, 0, len(config.DBs))
 	for _, dbConfig := range config.DBs {
 		db, err := NewDBFromConfig(dbConfig)
 		if err != nil {

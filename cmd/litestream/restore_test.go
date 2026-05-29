@@ -73,7 +73,7 @@ func TestRestoreCommand_RunMissingOutputPathForReplicaURL(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for missing output path")
 	}
-	if err.Error() != "-o is required when restoring from a replica URL. Try: litestream restore -o /path/to/db s3://bucket/prefix" {
+	if err.Error() != "-o is required when restoring from a replica URL" {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
