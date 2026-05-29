@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 )
 
@@ -11,6 +12,9 @@ func TestMonitorCommand_Run(t *testing.T) {
 		err := cmd.Run(context.Background(), []string{"-socket", "/nonexistent/socket.sock"})
 		if err == nil {
 			t.Error("expected error for nonexistent socket")
+		}
+		if !strings.Contains(err.Error(), "Try: ensure litestream replicate is running with a configured socket: block") {
+			t.Fatalf("expected socket hint, got %q", err.Error())
 		}
 	})
 
@@ -22,7 +26,7 @@ func TestMonitorCommand_Run(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel() // Cancel immediately so we don't wait for connection
 
-		err := cmd.Run(ctx, []string{"-socket", "/tmp/test.sock", "-db", "/path/to/db", "-raw"})
+		err := cmd.Run(ctx, []string{"-socket", "/tmp/test.sock", "-db", "/path/to/db", "-json"})
 		// Error expected due to cancelled context or connection failure
 		if err == nil {
 			t.Error("expected error")
