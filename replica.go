@@ -195,6 +195,13 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
 		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
 			result.limited = true
+			// Uploads succeeded, so record sync health; otherwise a
+			// sustained backlog reads as unhealthy while progressing.
+			r.db.RecordSuccessfulSync()
+			r.Logger().Debug("replica sync limited",
+				"synced_files", syncedFileN,
+				"db_txid", dpos.TXID.String(),
+				"replica_txid", r.Pos().TXID.String())
 			return result, nil
 		}
 		if err := ctx.Err(); err != nil {
