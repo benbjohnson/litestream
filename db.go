@@ -141,7 +141,9 @@ type DB struct {
 	MonitorInterval time.Duration
 
 	// Maximum WAL bytes to process in a single sync executor run.
-	// Set to zero to process all committed WAL frames in one run.
+	// The limit is checked at commit boundaries so a single transaction
+	// larger than this may exceed it. Set to zero to process all
+	// committed WAL frames in one run.
 	MaxSyncWALBytes int64
 
 	// The timeout to wait for EBUSY from SQLite.
@@ -2774,8 +2776,13 @@ func (db *DB) monitor() {
 			}
 		}
 
-		// Sync the database to the shadow WAL.
-		if _, err := db.syncOnce(db.ctx, db.MaxSyncWALBytes); err != nil && !errors.Is(err, context.Canceled) {
+		// Sync the database to the shadow WAL. Sync() loops over bounded
+		// chunks, releasing the executor lock between each so checkpoints
+		// and snapshots can interleave, but always catches up to the WAL
+		// end so checkpointIfNeeded() runs. A single bounded chunk per
+		// tick would cap drain throughput and starve the TruncatePageN
+		// emergency checkpoint while behind, growing the WAL unbounded.
+		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
