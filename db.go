@@ -819,8 +819,13 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
 
-	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		return contextCause(ctx, err)
+	// Acquire without honoring caller cancellation: the cleanup below
+	// (read lock release, handle closes, state reset) must always run or
+	// the DB is left half-closed with its read lock held. Semaphore
+	// acquisition fails immediately on an already-done context even when
+	// the semaphore is free.
+	if err := db.execSem.Acquire(context.WithoutCancel(ctx), 1); err != nil {
+		return err
 	}
 	defer db.execSem.Release(1)
 
