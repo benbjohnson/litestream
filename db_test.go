@@ -633,7 +633,7 @@ func TestDB_SnapshotExcludesUnsyncedWALFrames(t *testing.T) {
 	}
 }
 
-func TestDB_SnapshotSkipsExistingTXID(t *testing.T) {
+func TestDB_SnapshotAlwaysWrites(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
@@ -652,6 +652,9 @@ func TestDB_SnapshotSkipsExistingTXID(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Snapshot is a primitive that always writes, even at the same
+	// position, so -force-snapshot can re-upload a suspect snapshot.
+	// Duplicate skipping belongs to callers like Store.CompactDB.
 	info0, err := db.Snapshot(t.Context())
 	if err != nil {
 		t.Fatal(err)
@@ -664,7 +667,7 @@ func TestDB_SnapshotSkipsExistingTXID(t *testing.T) {
 	if got, want := ltx.FormatFilename(info1.MinTXID, info1.MaxTXID), ltx.FormatFilename(info0.MinTXID, info0.MaxTXID); got != want {
 		t.Fatalf("Filename=%s, want %s", got, want)
 	}
-	if got, want := client.writeCount(), 1; got != want {
+	if got, want := client.writeCount(), 2; got != want {
 		t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
 	}
 }
