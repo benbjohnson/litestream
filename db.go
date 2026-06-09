@@ -1401,9 +1401,19 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.TruncatePageN > 0 && origWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)) {
+		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
 		db.Logger.Info("forcing truncate checkpoint",
 			"wal_size", origWALSize,
-			"threshold", calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)))
+			"threshold", truncateThreshold)
+
+		if err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
+			if !isSQLiteBusyError(err) {
+				return err
+			}
+		} else if exec.state.lastSyncedWALOffset < truncateThreshold {
+			return nil
+		}
+
 		return db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
 	}
 
@@ -1491,6 +1501,13 @@ func calcWALSize(pageSize uint32, pageN uint32) int64 {
 	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
 }
 
+const bumpLitestreamSeqSQL = `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
+
+func (db *DB) bumpLitestreamSeq(ctx context.Context) error {
+	_, err := db.db.ExecContext(ctx, bumpLitestreamSeqSQL)
+	return err
+}
+
 // ensureWALExists checks that the real WAL exists and has a header.
 func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	// Exit early if WAL header exists.
@@ -1499,8 +1516,7 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	}
 
 	// Otherwise create transaction that updates the internal litestream table.
-	_, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
-	return err
+	return db.bumpLitestreamSeq(ctx)
 }
 
 // checkDatabaseBehindReplica detects when a database has been restored to an
@@ -1628,6 +1644,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
+	info.prevCommit = dec.Header().Commit
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
@@ -1813,6 +1830,7 @@ type syncInfo struct {
 	offset              int64 // end of the previous LTX read
 	salt1               uint32
 	salt2               uint32
+	prevCommit          uint32
 	snapshotting        bool   // if true, a full snapshot is required
 	reason              string // reason for snapshot
 	clearSyncedToWALEnd bool
@@ -1869,14 +1887,6 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 		return
 	}
 
-	db.mu.Lock()
-	db.syncState = exec.state
-	if notify && exec.synced {
-		close(db.notify)
-		db.notify = make(chan struct{})
-	}
-	db.mu.Unlock()
-
 	// Only publish the position if this executor advanced it. Republishing
 	// the snapshot taken at executor start would clobber concurrent cache
 	// invalidation (e.g. ResetLocalState) with a stale position.
@@ -1893,6 +1903,14 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 		db.maxLTXFileInfos.m[0] = &info
 		db.maxLTXFileInfos.Unlock()
 	}
+
+	db.mu.Lock()
+	db.syncState = exec.state
+	if notify && exec.synced {
+		close(db.notify)
+		db.notify = make(chan struct{})
+	}
+	db.mu.Unlock()
 }
 
 func (exec *syncExecutor) applySyncResult(result syncResult) {
@@ -2001,6 +2019,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	if walCommit > 0 {
 		commit = walCommit
 	}
+	if !info.snapshotting {
+		if pgno, ok := missingGrowthPage(info.prevCommit, commit, uint32(db.pageSize), pageMap); ok {
+			db.Logger.Info("missing WAL growth page, reading from database",
+				"txid", txID.String(),
+				"pgno", pgno,
+				"prev_commit", info.prevCommit,
+				"commit", commit)
+		}
+	}
 
 	var sz int64
 	if maxOffset > 0 {
@@ -2091,7 +2118,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = false
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromWAL(ctx, enc, walFile, pageMap); err != nil {
+		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
 			return result, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
@@ -2218,39 +2245,85 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, prevCommit, commit uint32, pageMap map[uint32]int64) error {
+	checkContext := func() error {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
+			return nil
+		}
+	}
+	if err := checkContext(); err != nil {
+		return err
+	}
+
 	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
 		pgnos = append(pgnos, pgno)
 	}
+	lockPgno := ltx.LockPgno(uint32(db.pageSize))
+	if commit > prevCommit {
+		for pgno := prevCommit + 1; pgno <= commit; pgno++ {
+			if err := checkContext(); err != nil {
+				return err
+			}
+			if pgno == lockPgno {
+				continue
+			}
+			if _, ok := pageMap[pgno]; ok {
+				continue
+			}
+			pgnos = append(pgnos, pgno)
+		}
+	}
 	slices.Sort(pgnos)
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		default:
+		if err := checkContext(); err != nil {
+			return err
+		}
+		if offset, ok := pageMap[pgno]; ok {
+			db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
+
+			if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
+				return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
+			} else if n != len(data) {
+				return fmt.Errorf("short read page %d @ %d", pgno, offset)
+			}
+		} else {
+			offset := int64(pgno-1) * int64(db.pageSize)
+			db.Logger.Log(ctx, internal.LevelTrace, "encode page from database", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walgrowth")
+
+			if _, err := db.f.ReadAt(data, offset); err != nil {
+				return fmt.Errorf("read database page %d: %w", pgno, err)
+			}
 		}
 
-		offset := pageMap[pgno]
-
-		db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
-
-		// Read source page using page map.
-		if n, err := walFile.ReadAt(data, offset+WALFrameHeaderSize); err != nil {
-			return fmt.Errorf("read page %d @ %d: %w", pgno, offset, err)
-		} else if n != len(data) {
-			return fmt.Errorf("short read page %d @ %d", pgno, offset)
-		}
-
-		// Write page to LTX encoder.
 		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 			return fmt.Errorf("encode ltx frame (pgno=%d): %w", pgno, err)
 		}
 	}
 	return nil
+}
+
+func missingGrowthPage(prevCommit, commit, pageSize uint32, pageMap map[uint32]int64) (uint32, bool) {
+	if commit <= prevCommit {
+		return 0, false
+	}
+
+	lockPgno := ltx.LockPgno(pageSize)
+	for pgno := prevCommit + 1; pgno <= commit; pgno++ {
+		if pgno == lockPgno {
+			continue
+		}
+		if _, ok := pageMap[pgno]; !ok {
+			return pgno, true
+		}
+	}
+	return 0, false
 }
 
 // Checkpoint performs a checkpoint on the WAL file.
@@ -2309,8 +2382,16 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	// Try getting a checkpoint lock, will fail during snapshots.
+	// Try getting a checkpoint lock, will fail during snapshots. Skipping
+	// is safe (the next sync retries) but must be observable: a snapshot
+	// that never drains its reader would otherwise disable checkpoints
+	// silently and the WAL would grow without explanation.
 	if !db.chkMu.TryLock() {
+		level := slog.LevelDebug
+		if mode == CheckpointModeTruncate {
+			level = slog.LevelInfo
+		}
+		db.Logger.Log(ctx, level, "checkpoint skipped, snapshot in progress", "mode", mode)
 		return nil
 	}
 	defer db.chkMu.Unlock()
@@ -2338,6 +2419,35 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	}
 	exec.applySyncResult(result)
 
+	var barrierTx *sql.Tx
+	if mode == CheckpointModePassive {
+		barrierTx, err = db.db.BeginTx(ctx, nil)
+		if err != nil {
+			return fmt.Errorf("begin passive checkpoint barrier: %w", err)
+		}
+		defer func() {
+			if barrierTx != nil {
+				_ = rollback(barrierTx)
+			}
+		}()
+
+		if _, err := barrierTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+			return fmt.Errorf("_litestream_lock: %w", err)
+		}
+
+		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		if err != nil {
+			return fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
+		}
+		exec.applySyncResult(result)
+	}
+
+	frameSize := int64(db.pageSize + WALFrameHeaderSize)
+	preCheckpointFrameN := 0
+	if exec.state.lastSyncedWALOffset > WALHeaderSize {
+		preCheckpointFrameN = int((exec.state.lastSyncedWALOffset - WALHeaderSize) / frameSize)
+	}
+
 	// Execute checkpoint and immediately issue a write to the WAL to ensure
 	// a new page is written.
 	db.setSyncDiagPhase(diagPhaseCheckpointExec,
@@ -2345,10 +2455,20 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	if err := db.execCheckpoint(ctx, mode); err != nil {
+	checkpointRow, err := db.execCheckpoint(ctx, mode)
+	if err != nil {
 		return err
-	} else if _, err = db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`); err != nil {
-		return err
+	}
+
+	if barrierTx != nil {
+		if err = rollback(barrierTx); err != nil {
+			return fmt.Errorf("rollback passive checkpoint barrier: %w", err)
+		}
+		barrierTx = nil
+	}
+
+	if err = db.bumpLitestreamSeq(ctx); err != nil {
+		return fmt.Errorf("bump litestream seq: %w", err)
 	}
 
 	// If WAL hasn't been restarted, exit.
@@ -2357,9 +2477,36 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	if other, err := readWALHeader(db.WALPath()); err != nil {
+	other, err := readWALHeader(db.WALPath())
+	if err != nil {
 		return err
 	} else if bytes.Equal(hdr, other) {
+		exec.state.syncedSinceCheckpoint = false
+		return nil
+	}
+
+	if mode == CheckpointModePassive {
+		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		if err != nil {
+			return fmt.Errorf("cannot copy wal after passive checkpoint: %w", err)
+		}
+		exec.applySyncResult(result)
+		exec.state.syncedSinceCheckpoint = false
+		return nil
+	}
+
+	// A successful TRUNCATE checkpoint always reports zero frames because
+	// the WAL is reset before the counters are read, so the comparison
+	// below can never prove that no commits landed between the sealed
+	// sync and the checkpoint taking the writer lock. Those commits are
+	// backfilled and truncated unseen, so TRUNCATE must take the boundary
+	// snapshot unconditionally.
+	if mode != CheckpointModeTruncate && checkpointRow[1] <= preCheckpointFrameN {
+		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+		if err != nil {
+			return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
+		}
+		exec.applySyncResult(result)
 		exec.state.syncedSinceCheckpoint = false
 		return nil
 	}
@@ -2390,9 +2537,16 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+	snapshotInfo := syncInfo{
+		offset:       WALHeaderSize,
+		salt1:        binary.BigEndian.Uint32(other[16:]),
+		salt2:        binary.BigEndian.Uint32(other[20:]),
+		snapshotting: true,
+		reason:       "checkpoint boundary snapshot",
+	}
+	result, err = db.sync(ctx, true, exec, snapshotInfo, 0)
 	if err != nil {
-		return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
+		return fmt.Errorf("cannot snapshot after checkpoint: %w", err)
 	}
 	exec.applySyncResult(result)
 
@@ -2407,10 +2561,10 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	return nil
 }
 
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (row [3]int, err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
-		return nil
+		return row, nil
 	}
 
 	// Track checkpoint metrics.
@@ -2427,7 +2581,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// Ensure the read lock has been removed before issuing a checkpoint.
 	// We defer the re-acquire to ensure it occurs even on an early return.
 	if err := db.releaseReadLock(); err != nil {
-		return fmt.Errorf("release read lock: %w", err)
+		return row, fmt.Errorf("release read lock: %w", err)
 	}
 	defer func() { _ = db.acquireReadLock(ctx) }()
 
@@ -2439,54 +2593,120 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 	// See: https://www.sqlite.org/pragma.html#pragma_wal_checkpoint
 	rawsql := `PRAGMA wal_checkpoint(` + mode + `);`
 
-	var row [3]int
 	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return err
+		return row, err
 	}
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(ctx); err != nil {
-		return fmt.Errorf("reacquire read lock: %w", err)
+		return row, fmt.Errorf("reacquire read lock: %w", err)
 	}
 
-	return nil
+	return row, nil
+}
+
+type snapshotReadPosition struct {
+	pos          ltx.Pos
+	pageSize     int
+	walEndOffset int64
+	db           *DB
+}
+
+func (p *snapshotReadPosition) close() {
+	if p.db != nil {
+		p.db.chkMu.RUnlock()
+		p.db = nil
+	}
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	if err := db.lockExec(ctx); err != nil {
+	pos, err := db.snapshotPosition(ctx)
+	if err != nil {
 		return ltx.Pos{}, nil, err
 	}
+
+	r, err := db.snapshotReader(ctx, pos)
+	if err != nil {
+		pos.close()
+		return pos.pos, nil, err
+	}
+	return pos.pos, r, nil
+}
+
+func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, error) {
+	if err := db.lockExec(ctx); err != nil {
+		return nil, err
+	}
+	defer db.execSem.Release(1)
+
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
-	db.execSem.Release(1)
 
 	if pageSize == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
-		return ltx.Pos{}, nil, &DBNotReadyError{Reason: "page size not initialized"}
+		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
 	if err != nil {
-		return pos, nil, fmt.Errorf("pos: %w", err)
+		return nil, fmt.Errorf("pos: %w", err)
 	}
 
-	db.Logger.Debug("snapshot", "txid", pos.TXID.String())
+	walEndOffset, err := db.snapshotWALEndOffset(ctx, pos)
+	if err != nil {
+		return nil, err
+	}
+	if walEndOffset < WALHeaderSize {
+		walEndOffset = WALHeaderSize
+	}
 
-	// Prevent internal checkpoints during sync.
 	db.chkMu.RLock()
-	defer db.chkMu.RUnlock()
+	return &snapshotReadPosition{
+		pos:          pos,
+		pageSize:     pageSize,
+		walEndOffset: walEndOffset,
+		db:           db,
+	}, nil
+}
+
+func (db *DB) snapshotWALEndOffset(ctx context.Context, pos ltx.Pos) (int64, error) {
+	if db.syncState.lastSyncedWALOffset > 0 {
+		return db.syncState.lastSyncedWALOffset, nil
+	}
+	if pos.TXID == 0 {
+		return WALHeaderSize, nil
+	}
+
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	f, err := os.Open(ltxPath)
+	if err != nil {
+		return 0, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+	}
+	defer func() { _ = f.Close() }()
+
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		return 0, NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+	}
+	return dec.Header().WALOffset + dec.Header().WALSize, nil
+}
+
+func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.Reader, error) {
+	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
 
 	// TODO(ltx): Read database size from database header.
 
 	fi, err := db.f.Stat()
 	if err != nil {
-		return pos, nil, err
+		return nil, err
 	}
-	commit := uint32(fi.Size() / int64(pageSize))
+	commit := uint32(fi.Size() / int64(pos.pageSize))
 
 	// Execute encoding in a separate goroutine so the caller can initialize before reading.
 	pr, pw := io.Pipe()
 	go func() {
+		defer pos.close()
+
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
 			pw.CloseWithError(err)
@@ -2501,25 +2721,33 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		}
 
 		// Build a mapping of changed page numbers and their latest content.
-		pageMap, maxOffset, walCommit, err := rd.PageMap(ctx)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("page map: %w", err))
-			return
+		maxBytes := pos.walEndOffset - WALHeaderSize
+		pageMap := make(map[uint32]int64)
+		var maxOffset int64
+		var walCommit uint32
+		if maxBytes > 0 {
+			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+			if err != nil {
+				pw.CloseWithError(fmt.Errorf("page map: %w", err))
+				return
+			}
 		}
 		if walCommit > 0 {
 			commit = walCommit
 		}
 
-		var sz int64
-		if maxOffset > 0 {
-			sz = maxOffset - rd.Offset()
+		walOffset, walSize := snapshotHeaderWALRange(pos.walEndOffset, maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
+		if maxOffset > pos.walEndOffset {
+			pw.CloseWithError(fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset))
+			return
 		}
 
 		db.Logger.Debug("encode snapshot header",
-			"txid", pos.TXID.String(),
+			"txid", pos.pos.TXID.String(),
 			"commit", commit,
-			"walOffset", rd.Offset(),
-			"walSize", sz,
+			"walOffset", walOffset,
+			"walSize", walSize,
+			"walEndOffset", pos.walEndOffset,
 			"salt1", rd.salt1,
 			"salt2", rd.salt2)
 
@@ -2531,13 +2759,13 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,
-			PageSize:  uint32(pageSize),
+			PageSize:  uint32(pos.pageSize),
 			Commit:    commit,
 			MinTXID:   1,
-			MaxTXID:   pos.TXID,
+			MaxTXID:   pos.pos.TXID,
 			Timestamp: time.Now().UnixMilli(),
-			WALOffset: rd.Offset(),
-			WALSize:   sz,
+			WALOffset: walOffset,
+			WALSize:   walSize,
 			WALSalt1:  rd.salt1,
 			WALSalt2:  rd.salt2,
 		}); err != nil {
@@ -2557,7 +2785,21 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
 		_ = pw.Close()
 	}()
 
-	return pos, pr, nil
+	return pr, nil
+}
+
+func snapshotHeaderWALRange(walEndOffset, maxOffset, frameSize int64) (offset, size int64) {
+	if maxOffset <= WALHeaderSize || frameSize <= 0 {
+		return WALHeaderSize, 0
+	}
+	offset = maxOffset - frameSize
+	if offset < WALHeaderSize {
+		offset = WALHeaderSize
+	}
+	if maxOffset > walEndOffset {
+		maxOffset = walEndOffset
+	}
+	return offset, maxOffset - offset
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
@@ -2582,14 +2824,27 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	return info, nil
 }
 
-// SnapshotDB writes a snapshot to the replica for the current position of the database.
+// Snapshot writes a snapshot to the replica for the current database position.
+// It always writes, even when a snapshot already exists at the current
+// position, so operators can force a re-upload (replicate -force-snapshot).
+// Callers that want to skip duplicates check first, as Store.CompactDB does.
 func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
-	pos, r, err := db.SnapshotReader(ctx)
+	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
 		return nil, err
 	}
-	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
+
+	r, err := db.snapshotReader(ctx, pos)
 	if err != nil {
+		pos.close()
+		return nil, err
+	}
+
+	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.pos.TXID, r)
+	if err != nil {
+		if closer, ok := r.(io.Closer); ok {
+			_ = closer.Close()
+		}
 		return info, err
 	}
 

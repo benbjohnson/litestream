@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/crc64"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,27 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
 )
+
+type snapshotCountingClient struct {
+	litestream.ReplicaClient
+	mu sync.Mutex
+	n  int
+}
+
+func (c *snapshotCountingClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level == litestream.SnapshotLevel {
+		c.mu.Lock()
+		c.n++
+		c.mu.Unlock()
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func (c *snapshotCountingClient) writeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
 
 func TestDB_Path(t *testing.T) {
 	db := testingutil.NewDB(t, "/tmp/db")
@@ -547,6 +569,106 @@ func TestDB_Snapshot(t *testing.T) {
 		t.Fatal(err)
 	} else if got, want := h.Sum64(), chksum0; got != want {
 		t.Fatal("snapshot checksum mismatch")
+	}
+}
+
+func TestDB_SnapshotExcludesUnsyncedWALFrames(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (2);`); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.MaxTXID != pos.TXID {
+		t.Fatalf("snapshot txid=%s, want %s", info.MaxTXID, pos.TXID)
+	}
+
+	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, pos.TXID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	restorePath := filepath.Join(t.TempDir(), "snapshot.db")
+	f, err := os.Create(restorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ltx.NewDecoder(rc).DecodeDatabaseTo(f); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := testingutil.MustOpenSQLDB(t, restorePath)
+	defer testingutil.MustCloseSQLDB(t, restored)
+
+	var count int
+	if err := restored.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM t;`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("restored row count=%d, want 1", count)
+	}
+}
+
+func TestDB_SnapshotAlwaysWrites(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	client := &snapshotCountingClient{ReplicaClient: db.Replica.Client}
+	db.Replica.Client = client
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot is a primitive that always writes, even at the same
+	// position, so -force-snapshot can re-upload a suspect snapshot.
+	// Duplicate skipping belongs to callers like Store.CompactDB.
+	info0, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info1, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := ltx.FormatFilename(info1.MinTXID, info1.MaxTXID), ltx.FormatFilename(info0.MinTXID, info0.MaxTXID); got != want {
+		t.Fatalf("Filename=%s, want %s", got, want)
+	}
+	if got, want := client.writeCount(), 2; got != want {
+		t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
 	}
 }
 
