@@ -354,17 +354,19 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 		}
 
-		waitCh := notify
-		if pos, err := r.db.Pos(); err == nil && pos.TXID > r.Pos().TXID {
-			ch := make(chan struct{})
-			close(ch)
-			waitCh = ch
+		pos, err := r.db.Pos()
+		if err != nil {
+			return
 		}
 
-		select {
-		case <-ctx.Done():
+		if pos.TXID <= r.Pos().TXID {
+			select {
+			case <-ctx.Done():
+				return
+			case <-notify:
+			}
+		} else if ctx.Err() != nil {
 			return
-		case <-waitCh:
 		}
 
 		// Fetch new notify channel before replicating data.
