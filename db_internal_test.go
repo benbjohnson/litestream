@@ -2416,16 +2416,53 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify a snapshot L0 was created during checkpoint.
+	// Verify a snapshot L0 was created during checkpoint. A TRUNCATE
+	// checkpoint reports zero frame counts, so it cannot prove that no
+	// commits landed between the pre-checkpoint sync and the checkpoint;
+	// it must take the boundary snapshot unconditionally. An incremental
+	// (non-snapshot) L0 here would silently drop those commits.
 	l0AfterEntries, _ := os.ReadDir(l0Dir)
-	newL0Count := 0
+	newL0Count, newSnapshotCount := 0, 0
 	for _, entry := range l0AfterEntries {
-		if !l0BeforeNames[entry.Name()] {
-			newL0Count++
+		if l0BeforeNames[entry.Name()] {
+			continue
+		}
+		newL0Count++
+
+		f, err := os.Open(filepath.Join(l0Dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			f.Close()
+			t.Fatalf("decode header %s: %v", entry.Name(), err)
+		}
+		hdr := dec.Header()
+		pageCount := 0
+		pageData := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				f.Close()
+				t.Fatalf("decode page %s: %v", entry.Name(), err)
+			}
+			pageCount++
+		}
+		f.Close()
+
+		// A boundary snapshot contains every page up to the commit.
+		if uint32(pageCount) == hdr.Commit {
+			newSnapshotCount++
 		}
 	}
 	if newL0Count == 0 {
 		t.Fatal("expected checkpoint to create at least one new L0 file")
+	}
+	if newSnapshotCount == 0 {
+		t.Fatal("expected TRUNCATE checkpoint to create a boundary snapshot L0")
 	}
 }
 

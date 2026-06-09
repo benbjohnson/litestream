@@ -2382,8 +2382,16 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	// Try getting a checkpoint lock, will fail during snapshots.
+	// Try getting a checkpoint lock, will fail during snapshots. Skipping
+	// is safe (the next sync retries) but must be observable: a snapshot
+	// that never drains its reader would otherwise disable checkpoints
+	// silently and the WAL would grow without explanation.
 	if !db.chkMu.TryLock() {
+		level := slog.LevelDebug
+		if mode == CheckpointModeTruncate {
+			level = slog.LevelInfo
+		}
+		db.Logger.Log(ctx, level, "checkpoint skipped, snapshot in progress", "mode", mode)
 		return nil
 	}
 	defer db.chkMu.Unlock()
@@ -2487,7 +2495,13 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		return nil
 	}
 
-	if checkpointRow[1] <= preCheckpointFrameN {
+	// A successful TRUNCATE checkpoint always reports zero frames because
+	// the WAL is reset before the counters are read, so the comparison
+	// below can never prove that no commits landed between the sealed
+	// sync and the checkpoint taking the writer lock. Those commits are
+	// backfilled and truncated unseen, so TRUNCATE must take the boundary
+	// snapshot unconditionally.
+	if mode != CheckpointModeTruncate && checkpointRow[1] <= preCheckpointFrameN {
 		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
 		if err != nil {
 			return fmt.Errorf("cannot copy wal after checkpoint: %w", err)
@@ -2811,18 +2825,13 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 }
 
 // Snapshot writes a snapshot to the replica for the current database position.
+// It always writes, even when a snapshot already exists at the current
+// position, so operators can force a re-upload (replicate -force-snapshot).
+// Callers that want to skip duplicates check first, as Store.CompactDB does.
 func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
 		return nil, err
-	}
-	if info, ok, err := db.existingSnapshotInfo(ctx, pos.pos.TXID); err != nil {
-		pos.close()
-		return nil, err
-	} else if ok {
-		pos.close()
-		db.Logger.Debug("snapshot already exists", "txid", pos.pos.TXID.String(), "snapshot", info.MaxTXID.String())
-		return info, nil
 	}
 
 	r, err := db.snapshotReader(ctx, pos)
@@ -2844,17 +2853,6 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	db.maxLTXFileInfos.Unlock()
 
 	return info, nil
-}
-
-func (db *DB) existingSnapshotInfo(ctx context.Context, txID ltx.TXID) (*ltx.FileInfo, bool, error) {
-	info, err := db.MaxLTXFileInfo(ctx, SnapshotLevel)
-	if err != nil {
-		return nil, false, err
-	}
-	if info.MaxTXID == 0 || info.MaxTXID < txID {
-		return nil, false, nil
-	}
-	return &info, true, nil
 }
 
 // EnforceSnapshotRetention enforces retention of the snapshot level in the database by timestamp.
