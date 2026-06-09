@@ -21,6 +21,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -64,7 +65,7 @@ const (
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
 	mu        sync.RWMutex
-	execMu    sync.Mutex
+	execSem   *semaphore.Weighted
 	path      string        // part to database
 	metaPath  string        // Path to the database metadata.
 	db        *sql.DB       // target database
@@ -269,6 +270,8 @@ type diagState struct {
 	checkpointMode      string
 	reason              string
 	err                 string
+	executorWaiterCount int
+	executorWaitStarted time.Time
 }
 
 // SyncDiagnostic reports the latest DB sync/checkpoint activity.
@@ -287,6 +290,16 @@ type SyncDiagnostic struct {
 	CheckpointMode      string     `json:"checkpoint_mode,omitempty"`
 	Reason              string     `json:"reason,omitempty"`
 	Error               string     `json:"error,omitempty"`
+	ExecutorWaiterCount int        `json:"executor_waiter_count,omitempty"`
+	ExecutorWaitStarted *time.Time `json:"executor_wait_started_at,omitempty"`
+	ExecutorWaitSeconds float64    `json:"executor_wait_seconds,omitempty"`
+}
+
+func contextCause(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return err
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -296,6 +309,7 @@ func NewDB(path string) *DB {
 	db := &DB{
 		path:     path,
 		metaPath: filepath.Join(dir, "."+file+MetaDirSuffix),
+		execSem:  semaphore.NewWeighted(1),
 		notify:   make(chan struct{}),
 
 		MinCheckpointPageN:   DefaultMinCheckpointPageN,
@@ -386,6 +400,12 @@ func (db *DB) SyncDiagnostic() SyncDiagnostic {
 		CheckpointMode:      db.syncDiag.checkpointMode,
 		Reason:              db.syncDiag.reason,
 		Error:               db.syncDiag.err,
+		ExecutorWaiterCount: db.syncDiag.executorWaiterCount,
+	}
+	if !db.syncDiag.executorWaitStarted.IsZero() {
+		startedAt := db.syncDiag.executorWaitStarted
+		diag.ExecutorWaitStarted = &startedAt
+		diag.ExecutorWaitSeconds = time.Since(db.syncDiag.executorWaitStarted).Seconds()
 	}
 	if !db.syncDiag.startedAt.IsZero() {
 		startedAt := db.syncDiag.startedAt
@@ -448,6 +468,27 @@ func (db *DB) finishSyncDiag(err error) {
 	db.syncDiag.updatedAt = time.Now()
 	if err != nil {
 		db.syncDiag.err = err.Error()
+	}
+}
+
+func (db *DB) beginSyncExecutorWait() {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Now()
+	}
+	db.syncDiag.executorWaiterCount++
+}
+
+func (db *DB) finishSyncExecutorWait() {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.executorWaiterCount == 0 {
+		return
+	}
+	db.syncDiag.executorWaiterCount--
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Time{}
 	}
 }
 
@@ -778,8 +819,15 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.cancel()
 	db.wg.Wait()
 
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	// Acquire without honoring caller cancellation: the cleanup below
+	// (read lock release, handle closes, state reset) must always run or
+	// the DB is left half-closed with its read lock held. Semaphore
+	// acquisition fails immediately on an already-done context even when
+	// the semaphore is free.
+	if err := db.execSem.Acquire(context.WithoutCancel(ctx), 1); err != nil {
+		return err
+	}
+	defer db.execSem.Release(1)
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
@@ -1191,33 +1239,22 @@ func (db *DB) syncOnce(ctx context.Context, maxSyncWALBytes int64) (syncResult, 
 	if err := db.lockExec(ctx); err != nil {
 		return syncResult{}, err
 	}
-	defer db.execMu.Unlock()
+	defer db.execSem.Release(1)
 
 	return db.syncLocked(ctx, maxSyncWALBytes)
 }
 
 func (db *DB) lockExec(ctx context.Context) error {
-	if db.execMu.TryLock() {
+	if db.execSem.TryAcquire(1) {
 		return nil
 	}
+	db.beginSyncExecutorWait()
+	defer db.finishSyncExecutorWait()
 
-	ticker := time.NewTicker(10 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			err := context.Cause(ctx)
-			if err == nil {
-				err = ctx.Err()
-			}
-			return fmt.Errorf("wait for db sync executor: %w", err)
-		case <-ticker.C:
-			if db.execMu.TryLock() {
-				return nil
-			}
-		}
+	if err := db.execSem.Acquire(ctx, 1); err != nil {
+		return fmt.Errorf("wait for db sync executor: %w", contextCause(ctx, err))
 	}
+	return nil
 }
 
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
@@ -2218,8 +2255,10 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 
 // Checkpoint performs a checkpoint on the WAL file.
 func (db *DB) Checkpoint(ctx context.Context, mode string) (err error) {
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	if err := db.lockExec(ctx); err != nil {
+		return err
+	}
+	defer db.execSem.Release(1)
 	db.beginSyncDiag(diagOpCheckpoint)
 	defer func() { db.finishSyncDiag(err) }()
 
@@ -2416,10 +2455,12 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (err error) {
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
-	db.execMu.Lock()
+	if err := db.lockExec(ctx); err != nil {
+		return ltx.Pos{}, nil, err
+	}
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
-	db.execMu.Unlock()
+	db.execSem.Release(1)
 
 	if pageSize == 0 {
 		db.Logger.Debug("page size not initialized yet", "pageSize", 0)
@@ -2831,8 +2872,10 @@ func (db *DB) monitor() {
 //
 // If dst is set, the database file is copied to that location before checksum.
 func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
-	db.execMu.Lock()
-	defer db.execMu.Unlock()
+	if err := db.execSem.Acquire(ctx, 1); err != nil {
+		return 0, ltx.Pos{}, contextCause(ctx, err)
+	}
+	defer db.execSem.Release(1)
 
 	exec, err := db.newSyncExecutor(ctx)
 	if err != nil {
