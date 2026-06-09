@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -3880,5 +3881,220 @@ func TestSyncRestoreIntegrity_WithCheckpoints(t *testing.T) {
 	}
 	if count != 30*20 {
 		t.Fatalf("row count=%d, want %d", count, 30*20)
+	}
+}
+
+// TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints verifies that a
+// snapshot's content matches its advertised position while checkpoints and
+// writes run concurrently. The position capture and chkMu read lock must be
+// atomic with respect to checkpoints: if a checkpoint can run between them,
+// the snapshot reads post-position pages from the database file while its
+// header still claims the earlier transaction — the #1164 corruption class.
+func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE kv (id INTEGER PRIMARY KEY, v INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO kv VALUES (1, 0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// valueAt records which kv value was current at each synced position so
+	// snapshots can be checked against the state their header advertises.
+	var valueMu sync.Mutex
+	valueAt := map[ltx.TXID]int64{}
+	recordPos := func(v int64) error {
+		pos, err := db.Pos()
+		if err != nil {
+			return err
+		}
+		valueMu.Lock()
+		valueAt[pos.TXID] = v
+		valueMu.Unlock()
+		return nil
+	}
+	if err := recordPos(0); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for v := int64(1); ; v++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := sqldb.Exec(`UPDATE kv SET v = ? WHERE id = 1`, v); err != nil {
+				errCh <- err
+				return
+			}
+			if err := db.Sync(ctx); err != nil {
+				errCh <- err
+				return
+			}
+			if err := recordPos(v); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// TRUNCATE resets the WAL so subsequent snapshots must read
+			// cold pages from the database file — the path that exposes
+			// a checkpoint racing the position capture.
+			if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil && !isSQLiteBusyError(err) {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	for i := 0; i < 15; i++ {
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+
+		pos, r, err := db.SnapshotReader(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dec := ltx.NewDecoder(r)
+		if err := dec.DecodeHeader(); err != nil {
+			t.Fatal(err)
+		}
+		hdr := dec.Header()
+		if hdr.MaxTXID != pos.TXID {
+			t.Fatalf("snapshot header txid=%s, want advertised position %s", hdr.MaxTXID, pos.TXID)
+		}
+
+		restorePath := filepath.Join(t.TempDir(), fmt.Sprintf("restore-%d.db", i))
+		rf, err := os.Create(restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pageData := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rf.WriteAt(pageData, int64(phdr.Pgno-1)*int64(hdr.PageSize)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := dec.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rf.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if closer, ok := r.(io.Closer); ok {
+			_ = closer.Close()
+		}
+
+		restoredDB, err := sql.Open("sqlite", restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var integrity string
+		if err := restoredDB.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+			t.Fatal(err)
+		}
+		var got int64
+		if err := restoredDB.QueryRow(`SELECT v FROM kv WHERE id = 1`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		restoredDB.Close()
+		if integrity != "ok" {
+			t.Fatalf("snapshot %d integrity check failed: %s", i, integrity)
+		}
+
+		// Find the kv value recorded at the greatest synced position at or
+		// before the snapshot position. Skip if recording lags behind the
+		// snapshot position; intermediate unmapped TXIDs (checkpoint
+		// bookkeeping) never change kv.
+		valueMu.Lock()
+		var want int64
+		var bestTXID, maxTXID ltx.TXID
+		for txid, val := range valueAt {
+			if txid > maxTXID {
+				maxTXID = txid
+			}
+			if txid <= pos.TXID && txid >= bestTXID {
+				bestTXID, want = txid, val
+			}
+		}
+		valueMu.Unlock()
+		if pos.TXID > maxTXID {
+			continue
+		}
+		if got != want {
+			t.Fatalf("snapshot at txid %s contains v=%d, want %d (recorded at txid %s): content inconsistent with advertised position",
+				pos.TXID, got, want, bestTXID)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
 }
