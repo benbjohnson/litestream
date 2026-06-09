@@ -186,10 +186,10 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		err := db.lockExec(ctx)
+		done <- err
 		if err == nil {
 			db.execSem.Release(1)
 		}
-		done <- err
 	}()
 
 	deadline := time.After(100 * time.Millisecond)
@@ -232,9 +232,18 @@ func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
 			t.Fatalf("lockExec returned error: %v", err)
 		}
 	case <-hogAcquired:
-		<-hogDone
-		err := <-done
-		t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		// The hog legitimately acquires right after the queued waiter
+		// releases, so only fail if the waiter had not already succeeded.
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("lockExec returned error: %v", err)
+			}
+		default:
+			<-hogDone
+			err := <-done
+			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}
 	case <-ctx.Done():
 		err := <-done
 		t.Fatalf("lockExec timed out waiting behind later lock attempt: %v", err)
@@ -283,10 +292,10 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		err := r.lockSync(ctx)
+		done <- err
 		if err == nil {
 			r.syncSem.Release(1)
 		}
-		done <- err
 	}()
 
 	time.Sleep(5 * time.Millisecond)
@@ -313,9 +322,18 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 			t.Fatalf("lockSync returned error: %v", err)
 		}
 	case <-hogAcquired:
-		<-hogDone
-		err := <-done
-		t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		// The hog legitimately acquires right after the queued waiter
+		// releases, so only fail if the waiter had not already succeeded.
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("lockSync returned error: %v", err)
+			}
+		default:
+			<-hogDone
+			err := <-done
+			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}
 	case <-ctx.Done():
 		err := <-done
 		t.Fatalf("lockSync timed out waiting behind later lock attempt: %v", err)
@@ -386,8 +404,8 @@ func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
 	if got, want := r.Pos().TXID, dpos.TXID-1; got != want {
 		t.Fatalf("replica txid=%s, want %s", got, want)
 	}
-	if !db.LastSuccessfulSyncAt().IsZero() {
-		t.Fatal("limited replica sync should not record full sync success")
+	if db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("limited replica sync with successful uploads should record sync health")
 	}
 
 	result, err = r.syncOnce(context.Background(), 10)
@@ -3152,5 +3170,61 @@ func TestReplicaMonitor_RecoversFromPositionError(t *testing.T) {
 			t.Fatal("replication did not resume after auto-recovery")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDB_CloseWithCanceledContextStillCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A canceled context may fail the final sync, but cleanup (read lock
+	// release, handle closes, state reset) must always run.
+	_ = db.Close(ctx)
+
+	db.mu.Lock()
+	opened, sqlDB, f, rtx := db.opened, db.db, db.f, db.rtx
+	db.mu.Unlock()
+
+	if opened {
+		t.Fatal("db still marked open after Close with canceled context")
+	}
+	if sqlDB != nil {
+		t.Fatal("sql handle not released after Close with canceled context")
+	}
+	if f != nil {
+		t.Fatal("file handle not released after Close with canceled context")
+	}
+	if rtx != nil {
+		t.Fatal("read lock not released after Close with canceled context")
 	}
 }
