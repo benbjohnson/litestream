@@ -354,15 +354,15 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 		}
 
-		pos, err := r.db.Pos()
-		if err != nil {
-			return
-		}
-
-		if pos.TXID <= r.Pos().TXID {
+		// If the position is unavailable, skip the wait so Sync() surfaces
+		// the error to the backoff & auto-recovery handling below.
+		if pos, err := r.db.Pos(); err == nil && pos.TXID <= r.Pos().TXID {
+			// Wait for new data, but still sync on an interval so idle
+			// databases continue recording sync health for heartbeats.
 			select {
 			case <-ctx.Done():
 				return
+			case <-ticker.C:
 			case <-notify:
 			}
 		} else if ctx.Err() != nil {

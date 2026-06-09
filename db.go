@@ -207,6 +207,7 @@ type syncState struct {
 type syncExecutor struct {
 	state      syncState
 	pos        ltx.Pos
+	posChanged bool
 	l0FileInfo *ltx.FileInfo
 	synced     bool
 }
@@ -1769,10 +1770,15 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 	}
 	db.mu.Unlock()
 
-	db.pos.Lock()
-	pos := exec.pos
-	db.pos.value = &pos
-	db.pos.Unlock()
+	// Only publish the position if this executor advanced it. Republishing
+	// the snapshot taken at executor start would clobber concurrent cache
+	// invalidation (e.g. ResetLocalState) with a stale position.
+	if exec.posChanged {
+		db.pos.Lock()
+		pos := exec.pos
+		db.pos.value = &pos
+		db.pos.Unlock()
+	}
 
 	if exec.l0FileInfo != nil {
 		db.maxLTXFileInfos.Lock()
@@ -1787,6 +1793,7 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 	exec.state.syncedToWALEnd = result.syncedToWALEnd
 	if result.pos != nil {
 		exec.pos = *result.pos
+		exec.posChanged = true
 	}
 	if result.l0FileInfo != nil {
 		info := *result.l0FileInfo

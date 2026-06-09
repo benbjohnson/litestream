@@ -2443,3 +2443,194 @@ func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testin
 		t.Fatal("syncedToWALEnd=true after apply, want false")
 	}
 }
+
+func TestApplySyncExecutor_PreservesInvalidatedPosCache(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot an executor that performs no sync work, then invalidate the
+	// position cache as ResetLocalState would while the executor is in flight.
+	exec, err := db.newSyncExecutor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+
+	db.applySyncExecutor(exec, true)
+
+	db.pos.Lock()
+	value := db.pos.value
+	db.pos.Unlock()
+	if value != nil {
+		t.Fatalf("pos cache republished by no-op executor: got %v, want invalidated", *value)
+	}
+}
+
+func TestReplicaMonitor_IdleRecordsSyncHealth(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.SyncInterval = 10 * time.Millisecond
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for db.LastSuccessfulSyncAt().IsZero() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for initial replica sync")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// With no further writes, the monitor must keep recording sync health
+	// on its interval so heartbeat monitoring does not go stale.
+	first := db.LastSuccessfulSyncAt()
+	for !db.LastSuccessfulSyncAt().After(first) {
+		if time.Now().After(deadline) {
+			t.Fatal("idle database stopped recording successful syncs")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestReplicaMonitor_RecoversFromPositionError(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.SyncInterval = 10 * time.Millisecond
+	db.Replica.AutoRecoverEnabled = true
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for db.LastSuccessfulSyncAt().IsZero() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for initial replica sync")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Corrupt the newest L0 file and invalidate the cache so db.Pos() fails.
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(db.LTXPath(0, pos.TXID, pos.TXID), []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+	if _, err := db.Pos(); err == nil {
+		t.Fatal("expected position error after corrupting newest LTX file")
+	}
+	first := db.LastSuccessfulSyncAt()
+
+	// The monitor must survive the position error and auto-recover by
+	// resetting local state, after which syncs succeed again.
+	for {
+		if err := db.Sync(ctx); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("db.Sync never recovered; replica monitor likely exited on position error")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	for !db.LastSuccessfulSyncAt().After(first) {
+		if time.Now().After(deadline) {
+			t.Fatal("replication did not resume after auto-recovery")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
