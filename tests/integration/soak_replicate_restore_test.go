@@ -38,10 +38,12 @@ func TestSoakReplicateRestore(t *testing.T) {
 	RequireBinaries(t)
 	RequireDocker(t)
 
-	duration := parseSoakDuration(t, 5*time.Minute)
+	// An explicit SOAK_DURATION wins over the -short default.
+	defaultDuration := 5 * time.Minute
 	if testing.Short() {
-		duration = 1 * time.Minute
+		defaultDuration = 1 * time.Minute
 	}
+	duration := parseSoakDuration(t, defaultDuration)
 	restoreInterval := 30 * time.Second
 	writeRate := 100
 
@@ -109,6 +111,11 @@ func TestSoakReplicateRestore(t *testing.T) {
 	// Wait for initial sync
 	time.Sleep(3 * time.Second)
 
+	// Register before cancel so the deferred cancel stops the writer
+	// before wg.Wait runs, even on t.Fatalf paths.
+	var wg sync.WaitGroup
+	defer wg.Wait()
+
 	ctx, cancel := context.WithTimeout(context.Background(), duration)
 	defer cancel()
 
@@ -120,7 +127,6 @@ func TestSoakReplicateRestore(t *testing.T) {
 	)
 
 	// Writer goroutine: ~writeRate rows/sec
-	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -160,9 +166,10 @@ func TestSoakReplicateRestore(t *testing.T) {
 
 	// Periodic restore+integrity check loop
 	var (
-		restoreCount    int
-		corruptionCount int
-		restoreErrors   []string
+		restoreCount     int
+		corruptionCount  int
+		restoreErrors    []string
+		lastRestoredRows int
 	)
 
 	restoreTicker := time.NewTicker(restoreInterval)
@@ -186,9 +193,11 @@ loop:
 			t.Logf("[%v] Restore cycle #%d (source rows: %d, writes: %d, write errors: %d)",
 				elapsed.Round(time.Second), restoreCount, sourceRows, totalWrites.Load(), writeErrs.Load())
 
-			// Stop litestream for clean restore
+			// Stop litestream for clean restore. A failed stop usually
+			// means the process died mid-soak, which is itself a failure.
 			if err := db.StopLitestream(); err != nil {
-				t.Logf("  Warning: stop litestream: %v", err)
+				restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: stop litestream: %v", restoreCount, err))
+				t.Errorf("  STOP LITESTREAM FAILED: %v", err)
 			}
 			time.Sleep(1 * time.Second)
 
@@ -219,10 +228,26 @@ loop:
 					restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: CORRUPTION: %s", restoreCount, result))
 					t.Errorf("  CORRUPTION DETECTED: %s", result)
 				} else {
-					// Verify row count is reasonable (restored may lag behind source)
+					// The restore may lag behind the source, but row count
+					// must never be zero with data written nor shrink
+					// between cycles — either means lost data that passes
+					// integrity_check.
 					var restoredRows int
-					restoredDB.QueryRow("SELECT COUNT(*) FROM resources").Scan(&restoredRows)
-					t.Logf("  OK: integrity=ok, restored_rows=%d", restoredRows)
+					if err := restoredDB.QueryRow("SELECT COUNT(*) FROM resources").Scan(&restoredRows); err != nil {
+						restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: count restored rows: %v", restoreCount, err))
+						t.Errorf("  COUNT RESTORED ROWS FAILED: %v", err)
+					} else {
+						if restoredRows == 0 && sourceRows > 0 {
+							restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: restored 0 rows, source has %d", restoreCount, sourceRows))
+							t.Errorf("  EMPTY RESTORE: source has %d rows", sourceRows)
+						}
+						if restoredRows < lastRestoredRows {
+							restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: restored rows shrank %d -> %d", restoreCount, lastRestoredRows, restoredRows))
+							t.Errorf("  RESTORED ROWS SHRANK: %d -> %d", lastRestoredRows, restoredRows)
+						}
+						lastRestoredRows = restoredRows
+						t.Logf("  OK: integrity=ok, restored_rows=%d", restoredRows)
+					}
 				}
 				restoredDB.Close()
 			}
@@ -274,11 +299,32 @@ loop:
 		t.Fatalf("FAILED: %d corruption(s) detected in %d restore cycles", corruptionCount, restoreCount)
 	}
 
-	if stats.p99 > 500*time.Millisecond {
-		t.Errorf("P99 write latency %v exceeds 500ms threshold", stats.p99)
+	// The test exists to prove restores work; a failed restore, open, or
+	// verification is a failure even when no corruption was detected.
+	if len(restoreErrors) > 0 {
+		t.Fatalf("FAILED: %d restore error(s) in %d restore cycles", len(restoreErrors), restoreCount)
+	}
+
+	if totalWrites.Load() == 0 {
+		t.Fatal("FAILED: no writes succeeded; soak applied no load")
+	}
+
+	if threshold := parseSoakP99Threshold(t, 500*time.Millisecond); stats.p99 > threshold {
+		t.Errorf("P99 write latency %v exceeds %v threshold", stats.p99, threshold)
 	}
 
 	t.Log("PASSED: no corruption detected")
+}
+
+func parseSoakP99Threshold(t *testing.T, defaultThreshold time.Duration) time.Duration {
+	t.Helper()
+	if v := os.Getenv("SOAK_P99_THRESHOLD"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+		t.Logf("Warning: invalid SOAK_P99_THRESHOLD %q, using default %v", v, defaultThreshold)
+	}
+	return defaultThreshold
 }
 
 func writeReplicateRestoreConfig(t *testing.T, dbPath, s3URL, endpoint string) string {
