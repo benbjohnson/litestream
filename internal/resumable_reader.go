@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/superfly/ltx"
 )
@@ -63,9 +64,21 @@ func NewResumableReader(ctx context.Context, client LTXFileOpener, level int, mi
 
 const resumableReaderMaxRetries = 3
 
+// resumableReaderBackoff is the base delay between retry attempts, doubling
+// per attempt. Zero-delay retries land every attempt inside the same provider
+// throttle window (e.g. Tigris 408 load shedding), guaranteeing exhaustion.
+const resumableReaderBackoff = 250 * time.Millisecond
+
 func (r *ResumableReader) Read(p []byte) (int, error) {
 	var lastErr error
 	for attempt := 0; attempt <= resumableReaderMaxRetries; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-r.ctx.Done():
+				return 0, r.ctx.Err()
+			case <-time.After(resumableReaderBackoff << (attempt - 1)):
+			}
+		}
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (rc is nil after a retry).
 		if r.rc == nil {
