@@ -2138,3 +2138,25 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
 		}
 	}
 }
+
+// TestTransportRetryer_RetriesProviderThrottleResponses covers S3-compatible
+// providers that load-shed with HTTP 408 / api error "RequestCanceled"
+// (observed from Tigris during soak testing). The SDK defaults treat neither
+// as retryable, so restores failed after effectively zero patience.
+func TestTransportRetryer_RetriesProviderThrottleResponses(t *testing.T) {
+	retryer := newTransportRetryer()
+
+	status408 := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusRequestTimeout}}, Err: fmt.Errorf("request timeout")}
+	if !retryer.IsErrorRetryable(status408) {
+		t.Fatal("HTTP 408 must be retryable for S3-compatible providers")
+	}
+
+	canceledCode := &smithy.GenericAPIError{Code: "RequestCanceled", Message: "Request is canceled."}
+	if !retryer.IsErrorRetryable(canceledCode) {
+		t.Fatal(`api error code "RequestCanceled" (server-side load shed) must be retryable`)
+	}
+
+	if retryer.IsErrorRetryable(fmt.Errorf("wrapped: %w", context.Canceled)) {
+		t.Fatal("genuine client-side context cancellation must NOT be retryable")
+	}
+}
