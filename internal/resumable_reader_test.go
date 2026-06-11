@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/superfly/ltx"
 )
@@ -309,4 +310,58 @@ func (r *errorAfterN) Read(p []byte) (int, error) {
 	n := copy(p, r.data[r.pos:r.pos+len(p)])
 	r.pos += n
 	return n, nil
+}
+
+func TestResumableReader_BackoffBetweenReopens(t *testing.T) {
+	// Burst-retrying a throttling provider (e.g. Tigris load-shedding with
+	// 408 RequestCanceled) lands every reopen attempt inside the same
+	// throttle window. Reopens must back off between attempts.
+	data := []byte("hello world")
+	var callTimes []time.Time
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			callTimes = append(callTimes, time.Now())
+			if len(callTimes) <= 2 {
+				return nil, fmt.Errorf("operation error S3: GetObject, api error RequestCanceled: Request is canceled.")
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:])), nil
+		},
+	}
+
+	r := NewResumableReader(context.Background(), client, 2, 1, 2, int64(len(data)), nil, slog.Default())
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	if len(callTimes) != 3 {
+		t.Fatalf("expected 3 OpenLTXFile calls, got %d", len(callTimes))
+	}
+	for i := 1; i < len(callTimes); i++ {
+		if gap := callTimes[i].Sub(callTimes[i-1]); gap < 100*time.Millisecond {
+			t.Fatalf("reopen attempt %d fired %v after attempt %d; want >= 100ms backoff", i+1, gap, i)
+		}
+	}
+}
+
+func TestResumableReader_ContextCancelAbortsBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			cancel()
+			return nil, fmt.Errorf("connection reset")
+		},
+	}
+
+	r := NewResumableReader(ctx, client, 2, 1, 2, 11, nil, slog.Default())
+	start := time.Now()
+	_, err := io.ReadAll(r)
+	if err == nil {
+		t.Fatal("expected error after context cancellation")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("read blocked %v after cancellation; backoff must abort on ctx.Done", elapsed)
+	}
 }
