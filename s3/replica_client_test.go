@@ -2084,3 +2084,57 @@ func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 		})
 	}
 }
+
+// TestTransportRetryer_SurvivesSustainedFailures reproduces the soak finding where
+// sustained S3 transport flaps (e.g. Tigris returning unexpected EOF) exhausted the
+// SDK retryer's client-side token bucket ("retry quota exceeded, 0 available,
+// 5 requested") and Litestream stopped retrying exactly when retries mattered.
+// The bucket only refills on success, so 100+ consecutive failures starve it.
+func TestTransportRetryer_SurvivesSustainedFailures(t *testing.T) {
+	retryer := newTransportRetryer()
+
+	if got := retryer.MaxAttempts(); got != transportRetryMaxAttempts {
+		t.Fatalf("MaxAttempts() = %d, want %d", got, transportRetryMaxAttempts)
+	}
+
+	ctx := context.Background()
+	for i := 0; i < 200; i++ {
+		release, err := retryer.GetRetryToken(ctx, io.ErrUnexpectedEOF)
+		if err != nil {
+			t.Fatalf("retry token denied after %d consecutive transport failures: %v", i, err)
+		}
+		if err := release(io.ErrUnexpectedEOF); err != nil {
+			t.Fatalf("release after failure %d: %v", i, err)
+		}
+	}
+}
+
+// TestReplicaClient_RetryerSurvivesSustainedFailures verifies the configured S3
+// client actually carries the starvation-proof retryer (guards the config wiring,
+// not just the constructor).
+func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = "http://localhost:1"
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	retryer := client.s3.Options().Retryer
+	for i := 0; i < 200; i++ {
+		release, err := retryer.GetRetryToken(ctx, io.ErrUnexpectedEOF)
+		if err != nil {
+			t.Fatalf("configured client denied retry token after %d consecutive failures: %v", i, err)
+		}
+		if err := release(io.ErrUnexpectedEOF); err != nil {
+			t.Fatalf("release after failure %d: %v", i, err)
+		}
+	}
+}
