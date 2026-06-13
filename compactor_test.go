@@ -119,6 +119,35 @@ func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
 	}
 }
 
+func TestCompactor_CompactResumesRemoteSourceAfterDisconnect(t *testing.T) {
+	client := newDisconnectingCompactionClient(t.TempDir(), 16)
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+
+	info, err := compactor.Compact(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Level != 1 {
+		t.Errorf("Level=%d, want 1", info.Level)
+	}
+	if info.MinTXID != 1 || info.MaxTXID != 1 {
+		t.Errorf("TXID range=%d-%d, want 1-1", info.MinTXID, info.MaxTXID)
+	}
+
+	var resumed bool
+	for _, offset := range client.openOffsets[1:] {
+		if offset > 0 {
+			resumed = true
+			break
+		}
+	}
+	if !resumed {
+		t.Fatalf("OpenLTXFile offsets=%v, want reopen at non-zero offset", client.openOffsets)
+	}
+}
+
 func TestCompactor_MaxLTXFileInfo(t *testing.T) {
 	t.Run("WithFiles", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
@@ -649,6 +678,58 @@ func (c *earlyReturnCompactionClient) WriteLTXFile(ctx context.Context, level in
 		return nil, fmt.Errorf("early write failure")
 	}
 	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+type disconnectingCompactionClient struct {
+	litestream.ReplicaClient
+	dropAfter   int64
+	dropped     bool
+	openOffsets []int64
+}
+
+func newDisconnectingCompactionClient(path string, dropAfter int64) *disconnectingCompactionClient {
+	return &disconnectingCompactionClient{
+		ReplicaClient: file.NewReplicaClient(path),
+		dropAfter:     dropAfter,
+	}
+}
+
+func (c *disconnectingCompactionClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.openOffsets = append(c.openOffsets, offset)
+
+	rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	if !c.dropped && offset == 0 {
+		c.dropped = true
+		return &disconnectingReadCloser{ReadCloser: rc, remaining: c.dropAfter}, nil
+	}
+	return rc, nil
+}
+
+type disconnectingReadCloser struct {
+	io.ReadCloser
+	remaining int64
+}
+
+func (r *disconnectingReadCloser) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+
+	n, err := r.ReadCloser.Read(p)
+	r.remaining -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	if r.remaining <= 0 {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func countCompactorPipeWriters() int {
