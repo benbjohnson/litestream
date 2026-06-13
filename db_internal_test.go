@@ -719,7 +719,7 @@ func TestDB_Verify_WALOffsetAtHeader(t *testing.T) {
 
 	// Now call verify - before the fix, this would fail with:
 	// "prev WAL offset is less than the header size: -4088"
-	info, err := db.verify(context.Background())
+	info, err := db.verify(context.Background(), &db.syncState)
 	if err != nil {
 		t.Fatalf("verify() returned error: %v", err)
 	}
@@ -841,7 +841,7 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	db.invalidatePosCache()
 
 	// Call verify - should succeed but indicate snapshotting due to salt mismatch
-	info, err := db.verify(context.Background())
+	info, err := db.verify(context.Background(), &db.syncState)
 	if err != nil {
 		t.Fatalf("verify() returned error: %v", err)
 	}
@@ -998,7 +998,7 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	t.Logf("After pre-checkpoint sync: TXID=%d", pos2.TXID)
 
 	// Call verify() BEFORE checkpoint to confirm snapshotting=false
-	info1, err := db.verify(ctx)
+	info1, err := db.verify(ctx, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1022,7 +1022,7 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 	// - Old LTX has WALOffset+WALSize pointing to old (larger) WAL
 	// - New WAL is truncated (smaller)
 	// - Line 973: info.offset > fi.Size() → "wal truncated" → snapshotting=true
-	info2, err := db.verify(ctx)
+	info2, err := db.verify(ctx, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1090,7 +1090,7 @@ func TestDB_MultipleCheckpointsWithWrites(t *testing.T) {
 		}
 
 		// Check if this was a snapshot
-		info, err := db.verify(ctx)
+		info, err := db.verify(ctx, &db.syncState)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1813,7 +1813,7 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 
 	// TRUNCATE checkpoint should create a full snapshot L0 to ensure
 	// complete page coverage across the checkpoint boundary.
-	if err := db.checkpoint(ctx, CheckpointModeTruncate); err != nil {
+	if err := db.checkpoint(ctx, CheckpointModeTruncate, &db.syncState); err != nil {
 		t.Fatal(err)
 	}
 
@@ -2187,11 +2187,11 @@ func TestApplySyncResult(t *testing.T) {
 		db.mu.Lock()
 		defer db.mu.Unlock()
 
-		db.applySyncResult(syncResult{newWALSize: 12345, syncedToWALEnd: true})
-		if got := db.lastSyncedWALOffset; got != 12345 {
+		db.applySyncResult(&db.syncState, syncResult{newWALSize: 12345, syncedToWALEnd: true})
+		if got := db.syncState.lastSyncedWALOffset; got != 12345 {
 			t.Fatalf("lastSyncedWALOffset=%d, want 12345", got)
 		}
-		if !db.syncedToWALEnd {
+		if !db.syncState.syncedToWALEnd {
 			t.Fatal("syncedToWALEnd=false, want true")
 		}
 	})
@@ -2201,7 +2201,7 @@ func TestApplySyncResult(t *testing.T) {
 		defer db.mu.Unlock()
 
 		pos := ltx.Pos{TXID: 42}
-		db.applySyncResult(syncResult{pos: &pos})
+		db.applySyncResult(&db.syncState, syncResult{pos: &pos})
 
 		db.pos.Lock()
 		got := db.pos.value
@@ -2220,7 +2220,7 @@ func TestApplySyncResult(t *testing.T) {
 		db.pos.value = &existing
 		db.pos.Unlock()
 
-		db.applySyncResult(syncResult{})
+		db.applySyncResult(&db.syncState, syncResult{})
 
 		db.pos.Lock()
 		got := db.pos.value
@@ -2235,7 +2235,7 @@ func TestApplySyncResult(t *testing.T) {
 		defer db.mu.Unlock()
 
 		info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
-		db.applySyncResult(syncResult{l0FileInfo: info})
+		db.applySyncResult(&db.syncState, syncResult{l0FileInfo: info})
 
 		db.maxLTXFileInfos.Lock()
 		got := db.maxLTXFileInfos.m[0]
@@ -2292,8 +2292,8 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
-	oldWALOffset := db.lastSyncedWALOffset
-	oldSyncedToWALEnd := db.syncedToWALEnd
+	oldWALOffset := db.syncState.lastSyncedWALOffset
+	oldSyncedToWALEnd := db.syncState.syncedToWALEnd
 
 	db.pos.Lock()
 	if db.pos.value == nil {
@@ -2310,7 +2310,7 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatal("cached l0 file info is nil after initial sync")
 	}
 
-	result, err := db.verifyAndSync(ctx, false)
+	result, err := db.verifyAndSync(ctx, false, &db.syncState)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2327,11 +2327,11 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatalf("result.l0FileInfo=%v, want MaxTXID > %d", result.l0FileInfo, oldL0.MaxTXID)
 	}
 
-	if db.lastSyncedWALOffset != oldWALOffset {
-		t.Fatalf("lastSyncedWALOffset mutated early: got %d, want %d", db.lastSyncedWALOffset, oldWALOffset)
+	if db.syncState.lastSyncedWALOffset != oldWALOffset {
+		t.Fatalf("lastSyncedWALOffset mutated early: got %d, want %d", db.syncState.lastSyncedWALOffset, oldWALOffset)
 	}
-	if db.syncedToWALEnd != oldSyncedToWALEnd {
-		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncedToWALEnd, oldSyncedToWALEnd)
+	if db.syncState.syncedToWALEnd != oldSyncedToWALEnd {
+		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncState.syncedToWALEnd, oldSyncedToWALEnd)
 	}
 
 	db.pos.Lock()
@@ -2348,13 +2348,13 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatalf("cached l0 file info mutated early: got %v, want MaxTXID=%d", gotL0BeforeApply, oldL0.MaxTXID)
 	}
 
-	db.applySyncResult(result)
+	db.applySyncResult(&db.syncState, result)
 
-	if db.lastSyncedWALOffset != result.newWALSize {
-		t.Fatalf("lastSyncedWALOffset=%d, want %d", db.lastSyncedWALOffset, result.newWALSize)
+	if db.syncState.lastSyncedWALOffset != result.newWALSize {
+		t.Fatalf("lastSyncedWALOffset=%d, want %d", db.syncState.lastSyncedWALOffset, result.newWALSize)
 	}
-	if db.syncedToWALEnd != result.syncedToWALEnd {
-		t.Fatalf("syncedToWALEnd=%t, want %t", db.syncedToWALEnd, result.syncedToWALEnd)
+	if db.syncState.syncedToWALEnd != result.syncedToWALEnd {
+		t.Fatalf("syncedToWALEnd=%t, want %t", db.syncState.syncedToWALEnd, result.syncedToWALEnd)
 	}
 
 	db.pos.Lock()
@@ -2369,5 +2369,268 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 	db.maxLTXFileInfos.Unlock()
 	if gotL0AfterApply == nil || gotL0AfterApply.MaxTXID != result.l0FileInfo.MaxTXID {
 		t.Fatalf("cached l0 file info=%v, want MaxTXID=%d", gotL0AfterApply, result.l0FileInfo.MaxTXID)
+	}
+}
+
+func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	if !db.syncState.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd=false, want true after sync")
+	}
+	oldSyncedToWALEnd := db.syncState.syncedToWALEnd
+
+	if err := os.Truncate(db.WALPath(), WALHeaderSize); err != nil {
+		t.Fatal(err)
+	}
+
+	result, err := db.verifyAndSync(ctx, false, &db.syncState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.synced {
+		t.Fatal("verifyAndSync reported a sync, want no sync after truncation without new writes")
+	}
+	if result.syncedToWALEnd {
+		t.Fatal("result.syncedToWALEnd=true, want false")
+	}
+	if db.syncState.syncedToWALEnd != oldSyncedToWALEnd {
+		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncState.syncedToWALEnd, oldSyncedToWALEnd)
+	}
+
+	db.applySyncResult(&db.syncState, result)
+
+	if db.syncState.syncedToWALEnd {
+		t.Fatal("syncedToWALEnd=true after apply, want false")
+	}
+}
+
+func TestApplySyncExecutor_PreservesInvalidatedPosCache(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot an executor that performs no sync work, then invalidate the
+	// position cache as ResetLocalState would while the executor is in flight.
+	exec, err := db.newSyncExecutor(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+
+	db.applySyncExecutor(exec, true)
+
+	db.pos.Lock()
+	value := db.pos.value
+	db.pos.Unlock()
+	if value != nil {
+		t.Fatalf("pos cache republished by no-op executor: got %v, want invalidated", *value)
+	}
+}
+
+func TestReplicaMonitor_IdleRecordsSyncHealth(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.SyncInterval = 10 * time.Millisecond
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for db.LastSuccessfulSyncAt().IsZero() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for initial replica sync")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// With no further writes, the monitor must keep recording sync health
+	// on its interval so heartbeat monitoring does not go stale.
+	first := db.LastSuccessfulSyncAt()
+	for !db.LastSuccessfulSyncAt().After(first) {
+		if time.Now().After(deadline) {
+			t.Fatal("idle database stopped recording successful syncs")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestReplicaMonitor_RecoversFromPositionError(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.SyncInterval = 10 * time.Millisecond
+	db.Replica.AutoRecoverEnabled = true
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = db.Close(context.Background())
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'before')`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(10 * time.Second)
+	for db.LastSuccessfulSyncAt().IsZero() {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting for initial replica sync")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Corrupt the newest L0 file and invalidate the cache so db.Pos() fails.
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(db.LTXPath(0, pos.TXID, pos.TXID), []byte("corrupt"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db.invalidatePosCache()
+	if _, err := db.Pos(); err == nil {
+		t.Fatal("expected position error after corrupting newest LTX file")
+	}
+	first := db.LastSuccessfulSyncAt()
+
+	// The monitor must survive the position error and auto-recover by
+	// resetting local state, after which syncs succeed again.
+	for {
+		if err := db.Sync(ctx); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("db.Sync never recovered; replica monitor likely exited on position error")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	for !db.LastSuccessfulSyncAt().After(first) {
+		if time.Now().After(deadline) {
+			t.Fatal("replication did not resume after auto-recovery")
+		}
+		time.Sleep(time.Millisecond)
 	}
 }
