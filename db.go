@@ -2491,9 +2491,11 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	defer itr.Close()
 
 	var deleted []*ltx.FileInfo
+	var snapshots []*ltx.FileInfo
 	var lastInfo *ltx.FileInfo
 	for itr.Next() {
 		info := itr.Item()
+		snapshots = append(snapshots, info)
 		lastInfo = info
 
 		// If this snapshot is before the retention timestamp, mark it for deletion.
@@ -2501,17 +2503,23 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 			deleted = append(deleted, info)
 			continue
 		}
-
-		// Track the lowest snapshot TXID so we can enforce retention in lower levels.
-		// This is only tracked for snapshots not marked for deletion.
-		if minSnapshotTXID == 0 || info.MaxTXID < minSnapshotTXID {
-			minSnapshotTXID = info.MaxTXID
-		}
 	}
 
 	// If this is the snapshot level, we need to ensure that at least one snapshot exists.
 	if len(deleted) > 0 && deleted[len(deleted)-1] == lastInfo {
 		deleted = deleted[:len(deleted)-1]
+	}
+
+	for i, info := range snapshots {
+		if slices.Contains(deleted, info) {
+			continue
+		}
+		if i > 0 {
+			minSnapshotTXID = snapshots[i-1].MaxTXID
+		} else {
+			minSnapshotTXID = info.MaxTXID
+		}
+		break
 	}
 
 	// Remove files marked for deletion from remote storage (unless retention disabled).
