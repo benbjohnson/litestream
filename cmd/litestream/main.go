@@ -541,7 +541,11 @@ func (c *Config) Validate() error {
 				Value: *db.Lease.Heartbeat,
 			}
 		}
-		if db.Lease.TTL != nil && db.Lease.Heartbeat != nil && *db.Lease.Heartbeat >= *db.Lease.TTL {
+		leaseTTL := s3.DefaultLeaseTTL
+		if db.Lease.TTL != nil {
+			leaseTTL = *db.Lease.TTL
+		}
+		if db.Lease.Heartbeat != nil && *db.Lease.Heartbeat >= leaseTTL {
 			return &ConfigValidationError{
 				Err:   ErrInvalidLeaseHeartbeat,
 				Field: fmt.Sprintf("dbs[%s].lease.heartbeat", dbIdentifier),

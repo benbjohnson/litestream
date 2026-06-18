@@ -2,8 +2,12 @@ package main_test
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	main "github.com/benbjohnson/litestream/cmd/litestream"
@@ -295,5 +299,61 @@ func TestReplicateCommand_Run_LeaseRequiresSupportedReplica(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), `replica type "file" does not support distributed leasing`) {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestReplicateCommand_Run_ReleasesLeaseAfterStartupError(t *testing.T) {
+	var deleteN atomic.Int32
+	const etag = `"etag-1"`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		case http.MethodPut:
+			_, _ = io.Copy(io.Discard, r.Body)
+			r.Body.Close()
+			w.Header().Set("ETag", etag)
+			w.WriteHeader(http.StatusOK)
+		case http.MethodDelete:
+			deleteN.Add(1)
+			if got := r.Header.Get("If-Match"); got != etag {
+				t.Errorf("If-Match=%q, want %q", got, etag)
+			}
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			t.Errorf("unexpected method: %s", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+		}
+	}))
+	defer server.Close()
+
+	cmd := main.NewReplicateCommand()
+	cmd.Config = main.DefaultConfig()
+	cmd.Config.Addr = "localhost"
+	cmd.Config.DBs = []*main.DBConfig{{
+		Path:  t.TempDir() + "/test.db",
+		Lease: main.LeaseConfig{Required: true},
+		Replica: &main.ReplicaConfig{
+			Path: "test-path",
+			Type: "s3",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket:          "test-bucket",
+				Region:          "us-east-1",
+				Endpoint:        server.URL,
+				AccessKeyID:     "test-access-key",
+				SecretAccessKey: "test-secret-key",
+			},
+		},
+	}}
+
+	err := cmd.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "must specify port for bind address") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got, want := deleteN.Load(), int32(1); got != want {
+		t.Fatalf("DeleteObject calls=%d, want %d", got, want)
 	}
 }
