@@ -19,7 +19,7 @@ type StatusCommand struct{}
 // Run executes the command.
 func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-status", flag.ContinueOnError)
-	configPath, noExpandEnv := registerConfigFlag(fs)
+	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -27,10 +27,7 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	if *configPath == "" {
-		*configPath = DefaultConfigPath()
-	}
-	config, err := ReadConfigFile(*configPath, !*noExpandEnv)
+	config, err := ReadConfig(*configPath, *stdin, !*noExpandEnv)
 	if err != nil {
 		return err
 	}
@@ -146,6 +143,9 @@ Arguments:
 	-json
 	    Output raw JSON instead of human-readable text.
 
+	-stdin
+	    Read configuration from standard input.
+
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
@@ -166,6 +166,7 @@ Examples:
 	$ litestream status
 	$ litestream status /path/to/db
 	$ litestream status -json
+	$ cat /path/to/litestream.yml | litestream status -stdin
 
 `[1:],
 		DefaultConfigPath(),
