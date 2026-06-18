@@ -71,7 +71,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 	onceFlag := fs.Bool("once", false, "replicate once and exit")
 	forceSnapshotFlag := fs.Bool("force-snapshot", false, "force snapshot when replicating once")
 	enforceRetentionFlag := fs.Bool("enforce-retention", false, "enforce retention of old snapshots when replicating once")
-	configPath, noExpandEnv := registerConfigFlag(fs)
+	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -81,10 +81,10 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 	switch fs.NArg() {
 	case 0:
 		// No arguments provided, use config file
-		if *configPath == "" {
+		if *configPath == "" && !*stdin {
 			*configPath = DefaultConfigPath()
 		}
-		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
+		if c.Config, err = ReadConfig(*configPath, *stdin, !*noExpandEnv); err != nil {
 			return err
 		}
 		// Override log level if CLI flag provided (takes precedence over env var)
@@ -107,6 +107,9 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		// Database path and replica URLs provided via CLI
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
+		}
+		if *stdin {
+			return fmt.Errorf("cannot specify a replica URL and the -stdin flag")
 		}
 
 		// Initialize config with defaults when using command-line arguments
@@ -556,6 +559,9 @@ Arguments:
 	-log-level LEVEL
 	    Sets the log level. Overrides the config file setting.
 	    Valid values: trace, debug, info, warn, error
+
+	-stdin
+	    Read configuration from standard input.
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
