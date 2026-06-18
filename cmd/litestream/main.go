@@ -500,6 +500,12 @@ func (c *Config) Validate() error {
 		if db.Watch && db.Dir == "" {
 			return fmt.Errorf("database config #%d: 'watch' can only be enabled with a directory", idx+1)
 		}
+		if db.MetaDir != nil && db.Dir == "" {
+			return fmt.Errorf("database config #%d: 'meta-dir' can only be used with a directory", idx+1)
+		}
+		if db.MetaPath != nil && db.MetaDir != nil {
+			return fmt.Errorf("database config #%d: cannot specify both 'meta-path' and 'meta-dir'", idx+1)
+		}
 
 		// Use path or dir for identifying the config in error messages
 		dbIdentifier := db.Path
@@ -704,6 +710,7 @@ type DBConfig struct {
 	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
 	Snapshot           SnapshotConfig `yaml:"snapshot"`
 	MetaPath           *string        `yaml:"meta-path"`
+	MetaDir            *string        `yaml:"meta-dir"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
@@ -718,6 +725,10 @@ type DBConfig struct {
 
 // NewDBFromConfig instantiates a DB based on a configuration.
 func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
+	if dbc.MetaDir != nil {
+		return nil, fmt.Errorf("'meta-dir' can only be used with a directory")
+	}
+
 	configPath, err := expand(dbc.Path)
 	if err != nil {
 		return nil, err
@@ -788,6 +799,9 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 	if dbc.Pattern == "" {
 		return nil, fmt.Errorf("pattern is required for directory replication")
 	}
+	if dbc.MetaPath != nil && dbc.MetaDir != nil {
+		return nil, fmt.Errorf("cannot specify both 'meta-path' and 'meta-dir'")
+	}
 
 	dirPath, err := expand(dbc.Dir)
 	if err != nil {
@@ -847,13 +861,23 @@ func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream
 	// Ensure every database discovered beneath a directory receives a unique
 	// metadata path. Without this, all databases share the same meta-path and
 	// clobber each other's replication state.
-	if dbc.MetaPath != nil {
+	switch {
+	case dbc.MetaDir != nil:
+		baseMetaDir, err := expand(*dbc.MetaDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand meta dir for %s: %w", dbPath, err)
+		}
+		metaPathCopy := deriveMetaPathFromDirectoryRoot(baseMetaDir, relPath)
+		dbConfigCopy.MetaPath = &metaPathCopy
+		dbConfigCopy.MetaDir = nil
+	case dbc.MetaPath != nil:
 		baseMetaPath, err := expand(*dbc.MetaPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to expand meta path for %s: %w", dbPath, err)
 		}
 		metaPathCopy := deriveMetaPathForDirectoryEntry(baseMetaPath, relPath)
 		dbConfigCopy.MetaPath = &metaPathCopy
+		dbConfigCopy.MetaDir = nil
 	}
 
 	// Deep copy replica config and make path unique per database.
@@ -942,6 +966,14 @@ func deriveMetaPathForDirectoryEntry(basePath, relPath string) string {
 
 	metaDirName := "." + relFile + litestream.MetaDirSuffix
 	return filepath.Join(basePath, relDir, metaDirName)
+}
+
+func deriveMetaPathFromDirectoryRoot(basePath, relPath string) string {
+	relPath = filepath.Clean(relPath)
+	if relPath == "." || relPath == "" {
+		return basePath
+	}
+	return filepath.Join(basePath, relPath+litestream.MetaDirSuffix)
 }
 
 // appendRelativePathToURL appends relPath to the URL's path component, ensuring
