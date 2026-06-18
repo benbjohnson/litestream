@@ -128,6 +128,21 @@ func (c *ReplicaClient) SetLogger(logger *slog.Logger) {
 	c.logger = logger.WithGroup(ReplicaClientType)
 }
 
+func (c *ReplicaClient) NewLeaser(ctx context.Context) (*Leaser, error) {
+	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+
+	leaser := NewLeaser()
+	leaser.Bucket = c.Bucket
+	leaser.Path = c.Path
+	leaser.SetClient(c.s3)
+	if c.logger != nil {
+		leaser.SetLogger(c.logger)
+	}
+	return leaser, nil
+}
+
 // NewReplicaClientFromURL creates a new ReplicaClient from URL components.
 // This is used by the replica client factory registration.
 func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, userinfo *url.Userinfo) (litestream.ReplicaClient, error) {
