@@ -144,6 +144,29 @@ func TestNewLeaseEntry_S3(t *testing.T) {
 	}
 }
 
+func TestNewLeaseEntry_HeartbeatNotLessThanDefaultTTL(t *testing.T) {
+	client := litestreams3.NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "test-path"
+	client.Region = "us-east-1"
+	client.Endpoint = "http://127.0.0.1:1"
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+
+	db := litestream.NewDB("/tmp/test.db")
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	heartbeat := 30 * time.Second
+
+	_, err := newLeaseEntry(context.Background(), db, LeaseConfig{
+		Required:  true,
+		Heartbeat: &heartbeat,
+	})
+	if !errors.Is(err, ErrInvalidLeaseHeartbeat) {
+		t.Fatalf("newLeaseEntry() error=%v, want %v", err, ErrInvalidLeaseHeartbeat)
+	}
+}
+
 func TestNewLeaseEntry_UnsupportedReplica(t *testing.T) {
 	db := litestream.NewDB("/tmp/test.db")
 	db.Replica = litestream.NewReplicaWithClient(db, file.NewReplicaClient(t.TempDir()))

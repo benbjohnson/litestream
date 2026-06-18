@@ -1605,6 +1605,19 @@ dbs:
 			err: main.ErrInvalidLeaseHeartbeat,
 		},
 		{
+			name: "HeartbeatNotLessThanDefaultTTL",
+			yaml: `
+dbs:
+  - path: /tmp/test.db
+    lease:
+      required: true
+      heartbeat: 30s
+    replica:
+      url: file:///tmp/replica
+`,
+			err: main.ErrInvalidLeaseHeartbeat,
+		},
+		{
 			name: "NegativeAcquireTimeout",
 			yaml: `
 dbs:

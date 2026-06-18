@@ -83,6 +83,13 @@ func newLeaseEntry(ctx context.Context, db *litestream.DB, config LeaseConfig) (
 	if config.Heartbeat != nil {
 		heartbeat = *config.Heartbeat
 	}
+	if heartbeat >= ttl {
+		return leaseEntry{}, &ConfigValidationError{
+			Err:   ErrInvalidLeaseHeartbeat,
+			Field: fmt.Sprintf("dbs[%s].lease.heartbeat", db.Path()),
+			Value: heartbeat,
+		}
+	}
 
 	var acquireTimeout time.Duration
 	if config.AcquireTimeout != nil {
