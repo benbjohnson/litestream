@@ -276,3 +276,24 @@ func TestReplicateCommand_ParseFlags_LogLevel(t *testing.T) {
 		}
 	})
 }
+
+func TestReplicateCommand_Run_LeaseRequiresSupportedReplica(t *testing.T) {
+	cmd := main.NewReplicateCommand()
+	cmd.Config = main.DefaultConfig()
+	cmd.Config.DBs = []*main.DBConfig{{
+		Path:  "/tmp/test.db",
+		Lease: main.LeaseConfig{Required: true},
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: t.TempDir(),
+		},
+	}}
+
+	err := cmd.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), `replica type "file" does not support distributed leasing`) {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}

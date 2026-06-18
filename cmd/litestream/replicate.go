@@ -32,6 +32,7 @@ import (
 type ReplicateCommand struct {
 	cmd    *exec.Cmd  // subcommand
 	execCh chan error // subcommand error channel
+	cancel context.CancelFunc
 
 	// One-shot replication flags
 	once             bool // replicate once and exit
@@ -51,6 +52,8 @@ type ReplicateCommand struct {
 
 	// Directory monitors for dynamic database discovery.
 	directoryMonitors []*DirectoryMonitor
+
+	leaseManager *leaseManager
 
 	// Done channel for interrupt handling during shutdown. When closed,
 	// the shutdown sync retry loop exits and any in-flight sync is cancelled.
@@ -273,9 +276,17 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	// Display version information.
 	slog.Info("litestream", "version", Version, "level", c.Config.Logging.Level)
 
+	runCtx, cancel := context.WithCancel(ctx)
+	c.cancel = cancel
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
+
 	// Start MCP server if enabled
 	if c.Config.MCPAddr != "" {
-		c.MCP, err = NewMCP(ctx, c.Config.ConfigPath)
+		c.MCP, err = NewMCP(runCtx, c.Config.ConfigPath)
 		if err != nil {
 			return err
 		}
@@ -297,6 +308,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	var dbs []*litestream.DB
+	var leaseRequests []leaseRequest
 	var watchables []struct {
 		config *DBConfig
 		dbs    []*litestream.DB
@@ -309,6 +321,9 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 				return err
 			}
 			dbs = append(dbs, dirDbs...)
+			for _, db := range dirDbs {
+				leaseRequests = append(leaseRequests, leaseRequest{db: db, config: dbConfig.Lease})
+			}
 			slog.Info("found databases in directory", "dir", dbConfig.Dir, "count", len(dirDbs), "watch", dbConfig.Watch)
 			if dbConfig.Watch {
 				watchables = append(watchables, struct {
@@ -323,6 +338,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 				return err
 			}
 			dbs = append(dbs, db)
+			leaseRequests = append(leaseRequests, leaseRequest{db: db, config: dbConfig.Lease})
 		}
 	}
 
@@ -382,7 +398,21 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		}
 	}
 
-	if err := c.Store.Open(ctx); err != nil {
+	c.leaseManager, err = newLeaseManagerFromRequests(runCtx, leaseRequests, func(err error) {
+		cancel()
+		c.notifyExec(err)
+	})
+	if err != nil {
+		return err
+	}
+	if err := c.leaseManager.Open(runCtx); err != nil {
+		return err
+	}
+
+	if err := c.Store.Open(runCtx); err != nil {
+		if closeErr := c.leaseManager.Close(context.Background()); closeErr != nil {
+			return fmt.Errorf("cannot open store: %w; release leases: %v", err, closeErr)
+		}
 		return fmt.Errorf("cannot open store: %w", err)
 	}
 
@@ -404,13 +434,16 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	}
 
 	for _, entry := range watchables {
-		monitor, err := NewDirectoryMonitor(ctx, c.Store, entry.config, entry.dbs)
+		monitor, err := NewDirectoryMonitor(runCtx, c.Store, entry.config, entry.dbs)
 		if err != nil {
 			for _, m := range c.directoryMonitors {
 				m.Close()
 			}
-			if closeErr := c.Store.Close(ctx); closeErr != nil {
+			if closeErr := c.Store.Close(runCtx); closeErr != nil {
 				slog.Error("failed to close store after monitor failure", "error", closeErr)
+			}
+			if closeErr := c.leaseManager.Close(context.Background()); closeErr != nil {
+				slog.Error("failed to release leases after monitor failure", "error", closeErr)
 			}
 			return fmt.Errorf("start directory monitor for %s: %w", entry.config.Dir, err)
 		}
@@ -467,17 +500,17 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 			return fmt.Errorf("cannot parse exec command: %w", err)
 		}
 
-		c.cmd = exec.CommandContext(ctx, execArgs[0], execArgs[1:]...)
+		c.cmd = exec.CommandContext(runCtx, execArgs[0], execArgs[1:]...)
 		c.cmd.Env = os.Environ()
 		c.cmd.Stdout = os.Stdout
 		c.cmd.Stderr = os.Stderr
 		if err := c.cmd.Start(); err != nil {
 			return fmt.Errorf("cannot start exec command: %w", err)
 		}
-		go func() { c.execCh <- c.cmd.Wait() }()
+		go func() { c.notifyExec(c.cmd.Wait()) }()
 	} else if c.once {
 		// Run one-shot replication in a goroutine so the caller can wait on execCh.
-		go c.runOnce(ctx)
+		go c.runOnce(runCtx)
 	}
 
 	return nil
@@ -487,7 +520,7 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 // It syncs all databases, optionally takes snapshots, and enforces retention.
 func (c *ReplicateCommand) runOnce(ctx context.Context) {
 	var err error
-	defer func() { c.execCh <- err }()
+	defer func() { c.notifyExec(err) }()
 
 	for _, db := range c.Store.DBs() {
 		slog.Info("syncing database", "path", db.Path())
@@ -544,6 +577,14 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 			err = errors.Join(err, fmt.Errorf("close store: %w", e))
 		}
 	}
+	if c.cancel != nil {
+		c.cancel()
+	}
+	if c.leaseManager != nil {
+		if e := c.leaseManager.Close(ctx); e != nil {
+			err = errors.Join(err, fmt.Errorf("release leases: %w", e))
+		}
+	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
 		if e := c.MCP.Close(); e != nil {
 			err = errors.Join(err, fmt.Errorf("close MCP server: %w", e))
@@ -556,6 +597,13 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 // When the channel is closed, the shutdown sync retry loop exits.
 func (c *ReplicateCommand) SetDone(done <-chan struct{}) {
 	c.done = done
+}
+
+func (c *ReplicateCommand) notifyExec(err error) {
+	select {
+	case c.execCh <- err:
+	default:
+	}
 }
 
 // restoreIfNeeded restores a database from its replica if the database doesn't
