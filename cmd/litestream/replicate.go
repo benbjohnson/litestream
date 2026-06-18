@@ -184,8 +184,21 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 	runCtx, cancel := context.WithCancel(ctx)
 	c.cancel = cancel
+	var leaseOpen, storeOpen bool
 	defer func() {
 		if err != nil {
+			if storeOpen && c.Store != nil {
+				if closeErr := c.Store.Close(runCtx); closeErr != nil {
+					slog.Error("failed to close store after startup failure", "error", closeErr)
+					err = fmt.Errorf("%w; close store: %v", err, closeErr)
+				}
+			}
+			if leaseOpen && c.leaseManager != nil {
+				if closeErr := c.leaseManager.Close(context.Background()); closeErr != nil {
+					slog.Error("failed to release leases after startup failure", "error", closeErr)
+					err = fmt.Errorf("%w; release leases: %v", err, closeErr)
+				}
+			}
 			cancel()
 		}
 	}()
@@ -314,13 +327,12 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	if err := c.leaseManager.Open(runCtx); err != nil {
 		return err
 	}
+	leaseOpen = true
 
 	if err := c.Store.Open(runCtx); err != nil {
-		if closeErr := c.leaseManager.Close(context.Background()); closeErr != nil {
-			return fmt.Errorf("cannot open store: %w; release leases: %v", err, closeErr)
-		}
 		return fmt.Errorf("cannot open store: %w", err)
 	}
+	storeOpen = true
 
 	if !c.Store.RetentionEnabled {
 		slog.Warn("retention disabled; cloud provider lifecycle policies must handle retention",
@@ -344,12 +356,6 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		if err != nil {
 			for _, m := range c.directoryMonitors {
 				m.Close()
-			}
-			if closeErr := c.Store.Close(runCtx); closeErr != nil {
-				slog.Error("failed to close store after monitor failure", "error", closeErr)
-			}
-			if closeErr := c.leaseManager.Close(context.Background()); closeErr != nil {
-				slog.Error("failed to release leases after monitor failure", "error", closeErr)
 			}
 			return fmt.Errorf("start directory monitor for %s: %w", entry.config.Dir, err)
 		}
