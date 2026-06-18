@@ -608,6 +608,19 @@ func ReadConfigFile(filename string, expandEnv bool) (Config, error) {
 	return ParseConfig(f, expandEnv)
 }
 
+func ReadConfig(configPath string, fromStdin, expandEnv bool) (Config, error) {
+	if fromStdin {
+		if configPath != "" {
+			return DefaultConfig(), fmt.Errorf("cannot specify both -config and -stdin flags")
+		}
+		return ParseConfig(os.Stdin, expandEnv)
+	}
+	if configPath == "" {
+		configPath = DefaultConfigPath()
+	}
+	return ReadConfigFile(configPath, expandEnv)
+}
+
 // ParseConfig unmarshals config from a reader.
 // If expandEnv is true then environment variables are expanded in the config.
 func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
@@ -2037,8 +2050,9 @@ func DefaultConfigPath() string {
 	return defaultConfigPath
 }
 
-func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
+func registerConfigFlag(fs *flag.FlagSet) (configPath *string, stdin *bool, noExpandEnv *bool) {
 	return fs.String("config", "", "config path"),
+		fs.Bool("stdin", false, "read config from stdin"),
 		fs.Bool("no-expand-env", false, "do not expand env vars in config")
 }
 

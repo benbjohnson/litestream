@@ -17,7 +17,7 @@ type ResetCommand struct{}
 // Run executes the command.
 func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-reset", flag.ContinueOnError)
-	configPath, noExpandEnv := registerConfigFlag(fs)
+	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false, "print local state that would be removed without deleting")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -45,8 +45,8 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// Load configuration to find the database (if config exists)
 	var dbConfig *DBConfig
-	if *configPath != "" {
-		config, configErr := ReadConfigFile(*configPath, !*noExpandEnv)
+	if *configPath != "" || *stdin {
+		config, configErr := ReadConfig(*configPath, *stdin, !*noExpandEnv)
 		if configErr != nil {
 			return fmt.Errorf("cannot read config: %w", configErr)
 		}
@@ -169,6 +169,9 @@ Arguments:
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
 
+	-stdin
+	    Read configuration from standard input.
+
 	-dry-run
 	    Print the local LTX files that would be removed without deleting them.
 
@@ -182,6 +185,9 @@ Examples:
 
 	# Reset using a specific configuration file
 	litestream reset -config /etc/litestream.yml /path/to/database.db
+
+	# Reset using configuration from standard input
+	cat /etc/litestream.yml | litestream reset -stdin /path/to/database.db
 
 `[1:],
 		DefaultConfigPath(),
