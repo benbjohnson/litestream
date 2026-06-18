@@ -10,6 +10,11 @@
 
 # dbs:
 #  - path: /path/to/primary/db            # Database to replicate from
+#    lease:                               # Optional S3 distributed lease
+#      required: true                     # Hold lease before replicating
+#      ttl: 60s
+#      heartbeat: 15s
+#      acquire-timeout: 0s                # 0 waits forever
 #    replica:
 #      path: /path/to/replica             # File-based replication
 #      url:  s3://my.bucket.com/db        # S3-based replication
