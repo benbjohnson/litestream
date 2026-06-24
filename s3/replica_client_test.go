@@ -1736,8 +1736,16 @@ func TestReplicaClient_StorageClassHeader(t *testing.T) {
 
 	headers := make(chan http.Header, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		defer func() { _ = r.Body.Close() }()
-		_, _ = io.Copy(io.Discard, r.Body)
+		defer func() {
+			if err := r.Body.Close(); err != nil {
+				t.Errorf("close request body: %v", err)
+			}
+		}()
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("copy request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 
 		if r.Method == http.MethodPut {
 			select {
