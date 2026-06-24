@@ -867,7 +867,7 @@ func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream
 		if err != nil {
 			return nil, fmt.Errorf("failed to expand meta dir for %s: %w", dbPath, err)
 		}
-		metaPathCopy := deriveMetaPathFromDirectoryRoot(baseMetaDir, relPath)
+		metaPathCopy := filepath.Join(baseMetaDir, relPath+litestream.MetaDirSuffix)
 		dbConfigCopy.MetaPath = &metaPathCopy
 		dbConfigCopy.MetaDir = nil
 	case dbc.MetaPath != nil:
@@ -966,14 +966,6 @@ func deriveMetaPathForDirectoryEntry(basePath, relPath string) string {
 
 	metaDirName := "." + relFile + litestream.MetaDirSuffix
 	return filepath.Join(basePath, relDir, metaDirName)
-}
-
-func deriveMetaPathFromDirectoryRoot(basePath, relPath string) string {
-	relPath = filepath.Clean(relPath)
-	if relPath == "." || relPath == "" {
-		return basePath
-	}
-	return filepath.Join(basePath, relPath+litestream.MetaDirSuffix)
 }
 
 // appendRelativePathToURL appends relPath to the URL's path component, ensuring
