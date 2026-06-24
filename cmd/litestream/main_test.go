@@ -177,6 +177,32 @@ dbs:
 			t.Fatalf("Replica.URL=%v, want %v", got, want)
 		}
 	})
+
+	t.Run("DirectoryMetaDir", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - dir: /path/to/dbs
+    pattern: "*.db"
+    recursive: true
+    meta-dir: /path/to/litestream-state
+    replica:
+      url: file:///path/to/replicas
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.DBs[0].MetaDir == nil {
+			t.Fatal("expected MetaDir to be set")
+		}
+		if got, want := *config.DBs[0].MetaDir, "/path/to/litestream-state"; got != want {
+			t.Fatalf("DB.MetaDir=%v, want %v", got, want)
+		}
+	})
 }
 
 func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
@@ -216,6 +242,30 @@ func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
 	}
 	if config.MetaPath == nil || *config.MetaPath != expectedMetaPath {
 		t.Fatalf("config MetaPath not updated: got %v, want %s", config.MetaPath, expectedMetaPath)
+	}
+}
+
+func TestNewDBFromConfig_MetaDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "db.sqlite")
+	metaDir := filepath.Join(tmpDir, "litestream-state")
+	replicaPath := filepath.Join(tmpDir, "replica")
+
+	config := &main.DBConfig{
+		Path:    dbPath,
+		MetaDir: &metaDir,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: replicaPath,
+		},
+	}
+
+	_, err := main.NewDBFromConfig(config)
+	if err == nil {
+		t.Fatal("expected error when meta-dir is used without dir")
+	}
+	if !strings.Contains(err.Error(), "'meta-dir' can only be used with a directory") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
@@ -1913,6 +1963,49 @@ func TestDBConfigValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("meta-dir with path configuration", func(t *testing.T) {
+		metaDir := "/path/to/meta"
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Path:    "/path/to/db.sqlite",
+					MetaDir: &metaDir,
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when meta-dir is used without dir")
+		}
+		if !strings.Contains(err.Error(), "'meta-dir' can only be used with a directory") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("meta-path and meta-dir specified", func(t *testing.T) {
+		metaPath := "/path/to/meta"
+		metaDir := "/path/to/meta-dir"
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Dir:      "/path/to/dir",
+					Pattern:  "*.db",
+					MetaPath: &metaPath,
+					MetaDir:  &metaDir,
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when both meta-path and meta-dir are specified")
+		}
+		if !strings.Contains(err.Error(), "cannot specify both 'meta-path' and 'meta-dir'") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
 	t.Run("valid path configuration", func(t *testing.T) {
 		config := main.DefaultConfig()
 		config.DBs = []*main.DBConfig{
@@ -2262,6 +2355,73 @@ func TestNewDBsFromDirectoryConfig_ReplicasArrayURL(t *testing.T) {
 	}
 }
 
+func TestNewDBsFromDirectoryConfig_MetaDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	metaDir := filepath.Join(t.TempDir(), "litestream-state")
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "tenant-a", "data.metadata"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "tenant-b", "nested", "data.metadata"))
+
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.metadata",
+		Recursive: true,
+		MetaDir:   &metaDir,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedMetaPaths := map[string]string{
+		filepath.Join(tmpDir, "tenant-a", "data.metadata"):           filepath.Join(metaDir, "tenant-a", "data.metadata"+litestream.MetaDirSuffix),
+		filepath.Join(tmpDir, "tenant-b", "nested", "data.metadata"): filepath.Join(metaDir, "tenant-b", "nested", "data.metadata"+litestream.MetaDirSuffix),
+	}
+
+	for _, db := range dbs {
+		expectedMetaPath, ok := expectedMetaPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+		if db.MetaPath() != expectedMetaPath {
+			t.Errorf("database %s: expected meta path %s, got %s", db.Path(), expectedMetaPath, db.MetaPath())
+		}
+	}
+}
+
+func TestNewDBsFromDirectoryConfig_MetaDirAndMetaPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	metaDir := filepath.Join(t.TempDir(), "litestream-state")
+	metaPath := filepath.Join(t.TempDir(), "litestream-meta")
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "data.db"))
+
+	config := &main.DBConfig{
+		Dir:      tmpDir,
+		Pattern:  "*.db",
+		MetaDir:  &metaDir,
+		MetaPath: &metaPath,
+		Replica:  &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	_, err := main.NewDBsFromDirectoryConfig(config)
+	if err == nil {
+		t.Fatal("expected error when both meta-dir and meta-path are specified")
+	}
+	if !strings.Contains(err.Error(), "cannot specify both 'meta-path' and 'meta-dir'") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestNewDBsFromDirectoryConfig_SpecialCharacters verifies that special characters
 // in database filenames are handled correctly in replica paths.
 func TestNewDBsFromDirectoryConfig_SpecialCharacters(t *testing.T) {
@@ -2513,6 +2673,59 @@ func TestDirectoryMonitor_RecursiveDetectsNestedDatabases(t *testing.T) {
 	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), deepDB) }) {
 		t.Fatalf("expected nested database %s to be detected", deepDB)
 	}
+}
+
+func TestDirectoryMonitor_MetaDir(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	metaDir := filepath.Join(t.TempDir(), "litestream-state")
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	config := &main.DBConfig{
+		Dir:       rootDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		Watch:     true,
+		MetaDir:   &metaDir,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(nil, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Fatalf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, nil)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	dbPath := filepath.Join(rootDir, "tenant-a", "data.db")
+	createSQLiteDB(t, dbPath)
+
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), dbPath) }) {
+		t.Fatalf("expected database %s to be detected", dbPath)
+	}
+
+	for _, db := range store.DBs() {
+		if db.Path() != dbPath {
+			continue
+		}
+		expectedMetaPath := filepath.Join(metaDir, "tenant-a", "data.db"+litestream.MetaDirSuffix)
+		if db.MetaPath() != expectedMetaPath {
+			t.Fatalf("MetaPath=%s, want %s", db.MetaPath(), expectedMetaPath)
+		}
+		return
+	}
+	t.Fatalf("database %s not found", dbPath)
 }
 
 // createSQLiteDB creates a minimal SQLite database file for testing
