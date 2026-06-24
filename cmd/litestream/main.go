@@ -1108,6 +1108,7 @@ type ReplicaSettings struct {
 	SignPayload       *bool     `yaml:"sign-payload"`
 	RequireContentMD5 *bool     `yaml:"require-content-md5"`
 	SkipVerify        bool      `yaml:"skip-verify"`
+	StorageClass      string    `yaml:"storage-class"`
 	PartSize          *ByteSize `yaml:"part-size"`
 	Concurrency       *int      `yaml:"concurrency"`
 
@@ -1206,6 +1207,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
+	}
+	if rs.StorageClass == "" {
+		rs.StorageClass = src.StorageClass
 	}
 
 	// S3 SSE settings
@@ -1421,6 +1425,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
+	storageClass := c.StorageClass
 	signSetting := newBoolSetting(true)
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
@@ -1444,6 +1449,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		usignPayloadSet       bool
 		urequireContentMD5    bool
 		urequireContentMD5Set bool
+		ustorageClass         string
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1497,6 +1503,11 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
 		}
+		if v := query.Get("storageClass"); v != "" {
+			ustorageClass = v
+		} else if v := query.Get("storage-class"); v != "" {
+			ustorageClass = v
+		}
 
 		// Only apply URL parts to field that have not been overridden.
 		if configPath == "" {
@@ -1510,6 +1521,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 		if endpoint == "" {
 			endpoint = uendpoint
+		}
+		if storageClass == "" {
+			storageClass = ustorageClass
 		}
 		if !forcePathStyle {
 			forcePathStyle = uforcePathStyle
@@ -1572,6 +1586,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	client.StorageClass = storageClass
 
 	client.SignPayload = signSetting.value
 	client.RequireContentMD5 = requireSetting.value

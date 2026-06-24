@@ -321,6 +321,7 @@ Parameters with an alias accept both camelCase and hyphenated forms
 | `requireContentMD5` | `require-content-md5` | Require Content-MD5 header | `true` |
 | `concurrency` | | Multipart upload concurrency | `5` |
 | `partSize` | `part-size` | Multipart upload part size | `5MB` |
+| `storageClass` | `storage-class` | Storage class for uploaded objects | None |
 | `sseCustomerAlgorithm` | `sse-customer-algorithm` | SSE-C encryption algorithm | None |
 | `sseCustomerKey` | `sse-customer-key` | SSE-C encryption key | None |
 | `sseCustomerKeyMD5` | `sse-customer-key-md5` | SSE-C key MD5 checksum | None |

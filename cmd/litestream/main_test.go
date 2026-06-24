@@ -2752,7 +2752,7 @@ func createSQLiteDB(t *testing.T, path string) {
 func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 	t.Run("URLWithEndpointQuery", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-west-2&forcePathStyle=true&skipVerify=true",
+			URL: "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-west-2&forcePathStyle=true&skipVerify=true&storage-class=ONEZONE_IA",
 		}
 
 		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
@@ -2777,6 +2777,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if !client.SkipVerify {
 			t.Error("expected SkipVerify to be true")
+		}
+		if client.StorageClass != "ONEZONE_IA" {
+			t.Errorf("expected storage class 'ONEZONE_IA', got %q", client.StorageClass)
 		}
 	})
 
@@ -2807,10 +2810,11 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 	t.Run("ConfigOverridesQuery", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://mybucket/path?endpoint=from-query&region=us-east-1",
+			URL: "s3://mybucket/path?endpoint=from-query&region=us-east-1&storage-class=ONEZONE_IA",
 			ReplicaSettings: main.ReplicaSettings{
-				Endpoint: "from-config",
-				Region:   "us-west-1",
+				Endpoint:     "from-config",
+				Region:       "us-west-1",
+				StorageClass: "GLACIER_IR",
 			},
 		}
 
@@ -2825,6 +2829,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if client.Region != "us-west-1" {
 			t.Errorf("expected region from config 'us-west-1', got %q", client.Region)
+		}
+		if client.StorageClass != "GLACIER_IR" {
+			t.Errorf("expected storage class from config 'GLACIER_IR', got %q", client.StorageClass)
 		}
 	})
 
@@ -3199,6 +3206,7 @@ access-key-id: GLOBAL_S3_KEY
 secret-access-key: GLOBAL_S3_SECRET
 region: global-region
 endpoint: global.endpoint.com
+storage-class: GLACIER_IR
 account-name: global-abs-account
 account-key: global-abs-key
 host: global.sftp.host
@@ -3245,6 +3253,9 @@ dbs:
 		}
 		if got, want := s3Replica.Endpoint, "global.endpoint.com"; got != want {
 			t.Errorf("s3Replica.Endpoint=%v, want %v", got, want)
+		}
+		if got, want := s3Replica.StorageClass, "GLACIER_IR"; got != want {
+			t.Errorf("s3Replica.StorageClass=%v, want %v", got, want)
 		}
 		if s3Replica.SyncInterval == nil || *s3Replica.SyncInterval != expectedSyncInterval {
 			t.Errorf("s3Replica.SyncInterval=%v, want %v", s3Replica.SyncInterval, expectedSyncInterval)
