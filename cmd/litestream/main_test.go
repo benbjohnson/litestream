@@ -290,8 +290,12 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 				Bucket: "bucket",
 			},
 		}
-		if got, want := c.ReplicaType(), "s3"; got != want {
-			t.Fatalf("ReplicaType=%s, want %s", got, want)
+		_, err := main.NewReplicaFromConfig(c, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if got, want := err.Error(), "cannot specify url & path for s3 replica"; got != want {
+			t.Fatalf("error=%q, want %q", got, want)
 		}
 	})
 

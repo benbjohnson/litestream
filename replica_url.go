@@ -54,7 +54,7 @@ func NewReplicaClientFromURL(rawURL string) (ReplicaClient, error) {
 // ReplicaTypeFromURL returns the replica type from a URL string.
 // Returns empty string if the URL is invalid or has no scheme.
 func ReplicaTypeFromURL(rawURL string) string {
-	if !strings.Contains(rawURL, "://") {
+	if !IsURL(rawURL) {
 		return ""
 	}
 	scheme, _, _, _ := ParseReplicaURL(rawURL)
