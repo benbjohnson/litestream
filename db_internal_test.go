@@ -1854,6 +1854,7 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	db := NewDB(dbPath)
 	db.MonitorInterval = 0
 	db.CheckpointInterval = 0
+	db.BusyTimeout = 5 * time.Second
 	db.MinCheckpointPageN = 1000000
 	db.Replica = NewReplica(db)
 	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
@@ -1872,6 +1873,7 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer sqldb.Close()
+	sqldb.SetMaxOpenConns(1)
 
 	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
 		t.Fatal(err)
@@ -1939,6 +1941,7 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 					started = true
 				}
 				i++
+				time.Sleep(time.Millisecond)
 			}
 		}
 	}()
