@@ -467,6 +467,7 @@ func TestReplicaTypeFromURL(t *testing.T) {
 		{"webdavs://host/path", "webdav"},
 		{"nats://host/bucket", "nats"},
 		{"oss://bucket/path", "oss"},
+		{"rook-ceph-rgw:8080", ""},
 		{"", ""},
 		{"invalid", ""},
 	}
