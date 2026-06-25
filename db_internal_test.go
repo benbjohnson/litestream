@@ -984,6 +984,27 @@ func (f *enospcLTXStagingFile) Close() error {
 	return nil
 }
 
+func isLTXStagingPath(name string) bool {
+	return strings.HasSuffix(name, ".tmp") && strings.Contains(name, string(filepath.Separator)+"ltx"+string(filepath.Separator)+"0"+string(filepath.Separator))
+}
+
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
 func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -1027,7 +1048,7 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 
 			origOpenLTXFile := openLTXFile
 			openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
-				if strings.HasSuffix(name, ".tmp") && strings.Contains(name, string(filepath.Separator)+"ltx"+string(filepath.Separator)+"0"+string(filepath.Separator)) {
+				if isLTXStagingPath(name) {
 					return &enospcLTXStagingFile{failOp: tt.failOp}, nil
 				}
 				return origOpenLTXFile(name, flag, perm)
@@ -1058,8 +1079,144 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 			if !strings.Contains(err.Error(), "staging") || !strings.Contains(err.Error(), "disk full") {
 				t.Fatalf("error message %q should identify disk-full staging failure", err.Error())
 			}
+			if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 1 {
+				t.Fatalf("litestream_disk_full=%v, want 1", got)
+			}
 		})
 	}
+}
+
+func TestDB_MonitorRetriesAndRecoversFromLTXStagingDiskFull(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	replicaDir := t.TempDir()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: replicaDir}
+	db.Replica.SyncInterval = 5 * time.Millisecond
+
+	var logs lockedLogBuffer
+	db.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('initial snapshot')`); err != nil {
+		t.Fatal(err)
+	}
+
+	var stagingAttempts atomic.Int64
+	var diskFull atomic.Bool
+	diskFull.Store(true)
+
+	origOpenLTXFile := openLTXFile
+	openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if isLTXStagingPath(name) {
+			stagingAttempts.Add(1)
+			if diskFull.Load() {
+				return &enospcLTXStagingFile{failOp: "write"}, nil
+			}
+		}
+		return origOpenLTXFile(name, flag, perm)
+	}
+
+	done := make(chan struct{})
+	db.MonitorInterval = 5 * time.Millisecond
+	go func() {
+		defer close(done)
+		db.monitor()
+	}()
+
+	defer func() {
+		db.cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("monitor did not stop")
+		}
+		openLTXFile = origOpenLTXFile
+		if err := sqldb.Close(); err != nil {
+			t.Errorf("close sql db: %v", err)
+		}
+		if err := db.Close(context.Background()); err != nil {
+			t.Errorf("close db: %v", err)
+		}
+	}()
+
+	waitFor := func(name string, fn func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if fn() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", name)
+	}
+
+	waitFor("disk-full signal", func() bool {
+		s := logs.String()
+		return stagingAttempts.Load() >= 1 &&
+			testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())) == 1 &&
+			strings.Contains(s, "disk full while staging LTX file") &&
+			strings.Contains(s, "replication paused, will resume automatically when space is freed")
+	})
+
+	s := logs.String()
+	if strings.Contains(s, `msg="sync error"`) {
+		t.Fatalf("disk-full staging error should not use generic sync error log: %s", s)
+	}
+	if !strings.Contains(s, ".tmp") {
+		t.Fatalf("disk-full log should include staging path: %s", s)
+	}
+
+	diskFull.Store(false)
+
+	remoteLTXCount := func() int {
+		entries, err := os.ReadDir(filepath.Join(replicaDir, "l0"))
+		if os.IsNotExist(err) {
+			return 0
+		} else if err != nil {
+			t.Fatalf("read replica ltx dir: %v", err)
+		}
+		return len(entries)
+	}
+
+	waitFor("automatic recovery", func() bool {
+		pos, err := db.Pos()
+		return stagingAttempts.Load() >= 2 &&
+			err == nil &&
+			pos.TXID >= 1 &&
+			remoteLTXCount() >= 1 &&
+			testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())) == 0
+	})
+
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('after recovery')`); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor("continued monitor sync after recovery", func() bool {
+		pos, err := db.Pos()
+		return stagingAttempts.Load() >= 3 &&
+			err == nil &&
+			pos.TXID >= 2 &&
+			remoteLTXCount() >= 2
+	})
 }
 
 // TestDB_Checkpoint_ErrorMetrics verifies that checkpoint error counter is incremented on failure.
