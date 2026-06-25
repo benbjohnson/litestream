@@ -34,6 +34,7 @@ var (
 	ErrChecksumMismatch = errors.New("invalid replica, checksum mismatch")
 	ErrLTXCorrupted     = errors.New("ltx file corrupted")
 	ErrLTXMissing       = errors.New("ltx file missing")
+	ErrDiskFull         = errors.New("disk full")
 )
 
 // LTXError provides detailed context for LTX file errors with recovery hints.
@@ -55,6 +56,31 @@ func (e *LTXError) Error() string {
 }
 
 func (e *LTXError) Unwrap() error { return e.Err }
+
+type LTXStagingDiskFullError struct {
+	Op      string
+	Path    string
+	Level   int
+	MinTXID uint64
+	MaxTXID uint64
+	Err     error
+}
+
+func (e *LTXStagingDiskFullError) Error() string {
+	msg := e.Op + " ltx staging file"
+	if e.Path != "" {
+		msg += " " + e.Path
+	}
+	msg += ": disk full"
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
+}
+
+func (e *LTXStagingDiskFullError) Unwrap() error { return e.Err }
+
+func (e *LTXStagingDiskFullError) Is(target error) bool { return target == ErrDiskFull }
 
 // IsAutoRecoverable reports whether the underlying error indicates local state
 // corruption that can be fixed by resetting and re-downloading from remote.

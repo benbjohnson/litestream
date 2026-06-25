@@ -1488,11 +1488,35 @@ func isDiskFullError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrDiskFull) {
+		return true
+	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "no space left on device") ||
 		strings.Contains(errStr, "disk quota exceeded") ||
 		strings.Contains(errStr, "enospc") ||
 		strings.Contains(errStr, "edquot")
+}
+
+type ltxStagingFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
+var openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+	return os.OpenFile(name, flag, perm)
+}
+
+func newLTXStagingDiskFullError(op, path string, level int, minTXID, maxTXID ltx.TXID, err error) *LTXStagingDiskFullError {
+	return &LTXStagingDiskFullError{
+		Op:      op,
+		Path:    path,
+		Level:   level,
+		MinTXID: uint64(minTXID),
+		MaxTXID: uint64(maxTXID),
+		Err:     err,
+	}
 }
 
 // walFileSize returns the size of the WAL file in bytes.
@@ -2057,8 +2081,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		return result, err
 	}
 
-	ltxFile, err := os.OpenFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	ltxFile, err := openLTXFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
+		if isDiskFullError(err) {
+			return result, newLTXStagingDiskFullError("open", tmpFilename, 0, txID, txID, err)
+		}
 		return result, fmt.Errorf("open temp ltx file: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpFilename) }()
@@ -2093,6 +2120,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		WALSalt1:  rd.salt1,
 		WALSalt2:  rd.salt2,
 	}); err != nil {
+		if isDiskFullError(err) {
+			return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+		}
 		return result, fmt.Errorf("encode ltx header: %w", err)
 	}
 
@@ -2107,6 +2137,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.reason = info.reason
 			})
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+			if isDiskFullError(err) {
+				return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+			}
 			return result, fmt.Errorf("write ltx from db: %w", err)
 		}
 	} else {
@@ -2118,6 +2151,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.reason = info.reason
 			})
 		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
+			if isDiskFullError(err) {
+				return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+			}
 			return result, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
@@ -2128,6 +2164,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		s.walSize = sz
 	})
 	if err := enc.Close(); err != nil {
+		if isDiskFullError(err) {
+			return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+		}
 		return result, fmt.Errorf("close ltx encoder: %w", err)
 	}
 
@@ -2137,9 +2176,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		s.walSize = sz
 	})
 	if err := ltxFile.Sync(); err != nil {
+		if isDiskFullError(err) {
+			return result, newLTXStagingDiskFullError("sync", tmpFilename, 0, txID, txID, err)
+		}
 		return result, fmt.Errorf("sync ltx file: %w", err)
 	}
 	if err := ltxFile.Close(); err != nil {
+		if isDiskFullError(err) {
+			return result, newLTXStagingDiskFullError("close", tmpFilename, 0, txID, txID, err)
+		}
 		return result, fmt.Errorf("close ltx file: %w", err)
 	}
 
@@ -3082,6 +3127,18 @@ func (db *DB) monitor() {
 		// tick would cap drain throughput and starve the TruncatePageN
 		// emergency checkpoint while behind, growing the WAL unbounded.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+			var diskFullErr *LTXStagingDiskFullError
+			if errors.As(err, &diskFullErr) {
+				db.Logger.Error("sync stopped: disk full while staging ltx file",
+					"error", err,
+					"path", diskFullErr.Path,
+					"level", diskFullErr.Level,
+					"min_txid", diskFullErr.MinTXID,
+					"max_txid", diskFullErr.MaxTXID,
+					"hint", "free disk space and restart litestream")
+				return
+			}
+
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
