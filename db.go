@@ -107,6 +107,7 @@ type DB struct {
 	syncNCounter                prometheus.Counter
 	syncErrorNCounter           prometheus.Counter
 	syncSecondsCounter          prometheus.Counter
+	diskFullGauge               prometheus.Gauge
 	checkpointNCounterVec       *prometheus.CounterVec
 	checkpointErrorNCounterVec  *prometheus.CounterVec
 	checkpointSecondsCounterVec *prometheus.CounterVec
@@ -326,6 +327,7 @@ func NewDB(path string) *DB {
 	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
 	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
 	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
+	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
 	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
@@ -1257,6 +1259,14 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		db.syncNCounter.Inc()
 		if err != nil {
 			db.syncErrorNCounter.Inc()
+			var diskFullErr *LTXStagingDiskFullError
+			if errors.As(err, &diskFullErr) {
+				db.diskFullGauge.Set(1)
+			} else {
+				db.diskFullGauge.Set(0)
+			}
+		} else {
+			db.diskFullGauge.Set(0)
 		}
 		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
 	}()
@@ -3127,18 +3137,6 @@ func (db *DB) monitor() {
 		// tick would cap drain throughput and starve the TruncatePageN
 		// emergency checkpoint while behind, growing the WAL unbounded.
 		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
-			var diskFullErr *LTXStagingDiskFullError
-			if errors.As(err, &diskFullErr) {
-				db.Logger.Error("sync stopped: disk full while staging ltx file",
-					"error", err,
-					"path", diskFullErr.Path,
-					"level", diskFullErr.Level,
-					"min_txid", diskFullErr.MinTXID,
-					"max_txid", diskFullErr.MaxTXID,
-					"hint", "free disk space and restart litestream")
-				return
-			}
-
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
@@ -3151,13 +3149,28 @@ func (db *DB) monitor() {
 				}
 			}
 
-			// Log with rate limiting to avoid log spam during persistent errors.
-			if time.Since(lastLogTime) >= SyncErrorLogInterval {
-				db.Logger.Error("sync error",
-					"error", err,
-					"consecutive_errors", consecutiveErrs,
-					"backoff", backoff)
-				lastLogTime = time.Now()
+			var diskFullErr *LTXStagingDiskFullError
+			if errors.As(err, &diskFullErr) {
+				if time.Since(lastLogTime) >= SyncErrorLogInterval {
+					db.Logger.Error(fmt.Sprintf("disk full while staging LTX file %s: replication paused, will resume automatically when space is freed", diskFullErr.Path),
+						"error", err,
+						"path", diskFullErr.Path,
+						"level", diskFullErr.Level,
+						"min_txid", diskFullErr.MinTXID,
+						"max_txid", diskFullErr.MaxTXID,
+						"consecutive_errors", consecutiveErrs,
+						"backoff", backoff)
+					lastLogTime = time.Now()
+				}
+			} else {
+				// Log with rate limiting to avoid log spam during persistent errors.
+				if time.Since(lastLogTime) >= SyncErrorLogInterval {
+					db.Logger.Error("sync error",
+						"error", err,
+						"consecutive_errors", consecutiveErrs,
+						"backoff", backoff)
+					lastLogTime = time.Now()
+				}
 			}
 
 			// Try to clean up stale temp files after persistent disk errors.
@@ -3322,6 +3335,11 @@ var (
 	syncSecondsCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "litestream_sync_seconds",
 		Help: "Time spent syncing shadow WAL, in seconds",
+	}, []string{"db"})
+
+	diskFullGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_disk_full",
+		Help: "Whether replication is paused because the local disk is full",
 	}, []string{"db"})
 
 	checkpointNCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
