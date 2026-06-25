@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -958,6 +959,106 @@ func TestDB_Sync_ErrorMetrics(t *testing.T) {
 	syncErrorValue := testutil.ToFloat64(syncErrorNCounterVec.WithLabelValues(db.Path()))
 	if syncErrorValue <= baselineErrors {
 		t.Fatalf("litestream_sync_error_count=%v, want > %v", syncErrorValue, baselineErrors)
+	}
+}
+
+type enospcLTXStagingFile struct {
+	failOp string
+}
+
+func (f *enospcLTXStagingFile) Write(p []byte) (int, error) {
+	if f.failOp == "write" {
+		return 0, syscall.ENOSPC
+	}
+	return len(p), nil
+}
+
+func (f *enospcLTXStagingFile) Sync() error {
+	if f.failOp == "sync" {
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+func (f *enospcLTXStagingFile) Close() error {
+	return nil
+}
+
+func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
+	tests := []struct {
+		name   string
+		failOp string
+	}{
+		{name: "Write", failOp: "write"},
+		{name: "Sync", failOp: "sync"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "db")
+
+			db := NewDB(dbPath)
+			db.MonitorInterval = 0
+			db.ShutdownSyncTimeout = 0
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close(context.Background()) }()
+
+			sqldb, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+
+			if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('initial snapshot')`); err != nil {
+				t.Fatal(err)
+			}
+
+			origOpenLTXFile := openLTXFile
+			openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+				if strings.HasSuffix(name, ".tmp") && strings.Contains(name, string(filepath.Separator)+"ltx"+string(filepath.Separator)+"0"+string(filepath.Separator)) {
+					return &enospcLTXStagingFile{failOp: tt.failOp}, nil
+				}
+				return origOpenLTXFile(name, flag, perm)
+			}
+			defer func() { openLTXFile = origOpenLTXFile }()
+
+			err = db.Sync(context.Background())
+			if err == nil {
+				t.Fatal("expected disk full error")
+			}
+
+			var diskFullErr *LTXStagingDiskFullError
+			if !errors.As(err, &diskFullErr) {
+				t.Fatalf("expected *LTXStagingDiskFullError, got %T: %v", err, err)
+			}
+			if !errors.Is(err, ErrDiskFull) {
+				t.Fatalf("expected ErrDiskFull, got %v", err)
+			}
+			if !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("expected ENOSPC in error chain, got %v", err)
+			}
+			if diskFullErr.Path == "" {
+				t.Fatal("expected staging path")
+			}
+			if diskFullErr.Level != 0 || diskFullErr.MinTXID != 1 || diskFullErr.MaxTXID != 1 {
+				t.Fatalf("unexpected LTX identity: level=%d min=%d max=%d", diskFullErr.Level, diskFullErr.MinTXID, diskFullErr.MaxTXID)
+			}
+			if !strings.Contains(err.Error(), "staging") || !strings.Contains(err.Error(), "disk full") {
+				t.Fatalf("error message %q should identify disk-full staging failure", err.Error())
+			}
+		})
 	}
 }
 
