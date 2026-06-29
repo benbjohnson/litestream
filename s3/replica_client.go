@@ -23,6 +23,8 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/aws/ratelimit"
+	"github.com/aws/aws-sdk-go-v2/aws/retry"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -382,10 +384,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
-		// Use adaptive retry mode for better resilience with 24 hour timeout
-		// This matches Azure's approach for long-running operations
-		config.WithRetryMode(aws.RetryModeAdaptive),
-		config.WithRetryMaxAttempts(10), // Increase retry attempts for resilience
+		config.WithRetryer(newTransportRetryer),
 	}
 
 	// Add HTTP client with proper timeout
@@ -554,10 +553,42 @@ func (c *ReplicaClient) validateSSEConfig() error {
 	return nil
 }
 
+// transportRetryMaxAttempts caps total attempts per operation; exponential
+// backoff between attempts still bounds request rate during outages.
+const transportRetryMaxAttempts = 10
+
+// newTransportRetryer returns a retryer that keeps retrying through sustained
+// object-store transport flaps. The SDK's default token bucket (and the
+// adaptive mode previously configured here) only refills retry quota on
+// successful responses, so a sustained provider flap drains it to zero and
+// every subsequent operation fails fast ("retry quota exceeded, 0 available")
+// precisely when retrying matters most for a replication tool.
+func newTransportRetryer() aws.Retryer {
+	return retry.NewStandard(func(o *retry.StandardOptions) {
+		o.MaxAttempts = transportRetryMaxAttempts
+		o.RateLimiter = ratelimit.None
+		// S3-compatible providers (observed: Tigris) load-shed with HTTP 408
+		// and api error code "RequestCanceled", neither of which the SDK
+		// classifies as retryable by default. Genuine client-side context
+		// cancellation stays non-retryable via the standard retryer's
+		// canceled-context check, which runs before these.
+		o.Retryables = append(o.Retryables,
+			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{
+				http.StatusRequestTimeout: {},
+			}},
+			retry.RetryableErrorCode{Codes: map[string]struct{}{
+				"RequestCanceled": {},
+			}},
+		)
+	})
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	// Build a config with credentials but no region
-	configOpts := []func(*config.LoadOptions) error{}
+	configOpts := []func(*config.LoadOptions) error{
+		config.WithRetryer(newTransportRetryer),
+	}
 
 	// Add static credentials if provided
 	if c.AccessKeyID != "" && c.SecretAccessKey != "" {
