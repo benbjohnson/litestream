@@ -567,6 +567,19 @@ func newTransportRetryer() aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
 		o.MaxAttempts = transportRetryMaxAttempts
 		o.RateLimiter = ratelimit.None
+		// S3-compatible providers (observed: Tigris) load-shed with HTTP 408
+		// and api error code "RequestCanceled", neither of which the SDK
+		// classifies as retryable by default. Genuine client-side context
+		// cancellation stays non-retryable via the standard retryer's
+		// canceled-context check, which runs before these.
+		o.Retryables = append(o.Retryables,
+			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{
+				http.StatusRequestTimeout: {},
+			}},
+			retry.RetryableErrorCode{Codes: map[string]struct{}{
+				"RequestCanceled": {},
+			}},
+		)
 	})
 }
 
