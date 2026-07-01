@@ -96,6 +96,7 @@ type ReplicaClient struct {
 	SkipVerify        bool
 	SignPayload       bool
 	RequireContentMD5 bool
+	StorageClass      string
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -148,6 +149,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		concurrency    int
 		concurrencySet bool
 		partSize       int64
+		storageClass   string
 	)
 
 	// Parse host for bucket and region
@@ -199,6 +201,11 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
 			partSize = n
 		}
+	}
+	if v := query.Get("storageClass"); v != "" {
+		storageClass = v
+	} else if v := query.Get("storage-class"); v != "" {
+		storageClass = v
 	}
 
 	// Ensure bucket is set
@@ -287,6 +294,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	if partSize > 0 {
 		client.PartSize = partSize
 	}
+	client.StorageClass = storageClass
 
 	// Parse SSE-C parameters from query string
 	if v := query.Get("sseCustomerAlgorithm"); v != "" {
@@ -704,6 +712,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		Key:      aws.String(key),
 		Body:     rc,
 		Metadata: metadata,
+	}
+	if c.StorageClass != "" {
+		input.StorageClass = types.StorageClass(c.StorageClass)
 	}
 
 	// Add SSE-C parameters if configured

@@ -1731,6 +1731,65 @@ func TestReplicaClient_SSE_KMS_Headers(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_StorageClassHeader(t *testing.T) {
+	data := mustLTX(t)
+
+	headers := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if err := r.Body.Close(); err != nil {
+				t.Errorf("close request body: %v", err)
+			}
+		}()
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("copy request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		if r.Method == http.MethodPut {
+			select {
+			case headers <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+	client.StorageClass = "ONEZONE_IA"
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-headers:
+		if got, want := hdr.Get("x-amz-storage-class"), "ONEZONE_IA"; got != want {
+			t.Errorf("storage class header = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for PUT request")
+	}
+}
+
 // TestReplicaClient_NoSSE_Headers tests that no SSE headers are sent when SSE is not configured
 func TestReplicaClient_NoSSE_Headers(t *testing.T) {
 	data := mustLTX(t)
@@ -1945,6 +2004,7 @@ func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
 		wantSkipVerify     bool
 		wantConcurrency    int
 		wantPartSize       int64
+		wantStorageClass   string
 	}{
 		{
 			name:               "forcePathStyle_camelCase",
@@ -1987,12 +2047,23 @@ func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
 			wantPartSize: 10485760,
 		},
 		{
+			name:             "storage-class_hyphenated",
+			url:              "s3://mybucket/path?storage-class=ONEZONE_IA",
+			wantStorageClass: "ONEZONE_IA",
+		},
+		{
+			name:             "storageClass_camelCase",
+			url:              "s3://mybucket/path?storageClass=GLACIER_IR",
+			wantStorageClass: "GLACIER_IR",
+		},
+		{
 			name:               "all_params_combined",
-			url:                "s3://mybucket/path?force-path-style=true&skip-verify=true&concurrency=4&part-size=8388608",
+			url:                "s3://mybucket/path?force-path-style=true&skip-verify=true&concurrency=4&part-size=8388608&storage-class=ONEZONE_IA",
 			wantForcePathStyle: true,
 			wantSkipVerify:     true,
 			wantConcurrency:    4,
 			wantPartSize:       8388608,
+			wantStorageClass:   "ONEZONE_IA",
 		},
 	}
 
@@ -2015,6 +2086,9 @@ func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
 			}
 			if c.PartSize != tt.wantPartSize {
 				t.Errorf("PartSize = %d, want %d", c.PartSize, tt.wantPartSize)
+			}
+			if c.StorageClass != tt.wantStorageClass {
+				t.Errorf("StorageClass = %q, want %q", c.StorageClass, tt.wantStorageClass)
 			}
 		})
 	}
