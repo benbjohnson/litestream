@@ -2516,8 +2516,6 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		}
 		if i > 0 {
 			minSnapshotTXID = snapshots[i-1].MaxTXID
-		} else {
-			minSnapshotTXID = info.MaxTXID
 		}
 		break
 	}

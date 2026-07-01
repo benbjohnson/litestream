@@ -622,6 +622,23 @@ func TestDB_EnforceRetention(t *testing.T) {
 	}
 }
 
+func TestDB_EnforceSnapshotRetention_ReturnsZeroWithoutPriorSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-time.Hour))
+
+	minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := minSnapshotTXID, ltx.TXID(0); got != want {
+		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
+	}
+}
+
 func TestDB_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
