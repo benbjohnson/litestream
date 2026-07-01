@@ -281,6 +281,24 @@ func TestNewFileReplicaFromConfig(t *testing.T) {
 }
 
 func TestNewS3ReplicaFromConfig(t *testing.T) {
+	t.Run("ExplicitTypeWithEndpointLikeURL", func(t *testing.T) {
+		c := &main.ReplicaConfig{
+			Type: "s3",
+			URL:  "rook-ceph-rgw:8080",
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket: "bucket",
+			},
+		}
+		_, err := main.NewReplicaFromConfig(c, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if got, want := err.Error(), "cannot specify url & path for s3 replica"; got != want {
+			t.Fatalf("error=%q, want %q", got, want)
+		}
+	})
+
 	t.Run("URL", func(t *testing.T) {
 		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo/bar"}, nil)
 		if err != nil {
