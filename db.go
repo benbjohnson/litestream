@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -293,13 +294,6 @@ type SyncDiagnostic struct {
 	ExecutorWaiterCount int        `json:"executor_waiter_count,omitempty"`
 	ExecutorWaitStarted *time.Time `json:"executor_wait_started_at,omitempty"`
 	ExecutorWaitSeconds float64    `json:"executor_wait_seconds,omitempty"`
-}
-
-func contextCause(ctx context.Context, err error) error {
-	if cause := context.Cause(ctx); cause != nil {
-		return cause
-	}
-	return err
 }
 
 // NewDB returns a new instance of DB for a given path.
@@ -1252,7 +1246,7 @@ func (db *DB) lockExec(ctx context.Context) error {
 	defer db.finishSyncExecutorWait()
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("wait for db sync executor: %w", contextCause(ctx, err))
+		return fmt.Errorf("wait for db sync executor: %w", cmp.Or(context.Cause(ctx), err))
 	}
 	return nil
 }
@@ -2889,8 +2883,8 @@ func (db *DB) monitor() {
 //
 // If dst is set, the database file is copied to that location before checksum.
 func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
-	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		return 0, ltx.Pos{}, contextCause(ctx, err)
+	if err := db.lockExec(ctx); err != nil {
+		return 0, ltx.Pos{}, err
 	}
 	defer db.execSem.Release(1)
 

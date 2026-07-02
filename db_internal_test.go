@@ -117,12 +117,31 @@ func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
 	mustAcquireSemaphore(db.execSem)
 	defer db.execSem.Release(1)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 
-	err := db.Sync(ctx)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("err=%v, want context deadline exceeded", err)
+	done := make(chan error, 1)
+	go func() { done <- db.Sync(ctx) }()
+
+	// Cancel only once the sync is observably queued on the executor so the
+	// error always comes from the semaphore wait, not an earlier ctx check.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for db.SyncDiagnostic().ExecutorWaiterCount != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("sync returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("sync diagnostic did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+	cancel()
+
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
 	}
 	if !strings.Contains(err.Error(), "wait for db sync executor") {
 		t.Fatalf("err=%q, want sync executor context", err)
@@ -298,7 +317,20 @@ func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
 		}
 	}()
 
-	time.Sleep(5 * time.Millisecond)
+	// Wait until the waiter is observably queued so the hog cannot jump
+	// ahead of it in the semaphore FIFO.
+	waitDeadline := time.After(5 * time.Second)
+	waitTicker := time.NewTicker(time.Millisecond)
+	defer waitTicker.Stop()
+	for r.syncWaiters.Load() != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("lockSync returned before queueing on semaphore: %v", err)
+		case <-waitDeadline:
+			t.Fatal("lockSync did not report queued waiter")
+		case <-waitTicker.C:
+		}
+	}
 
 	hogReady := make(chan struct{})
 	hogAcquired := make(chan struct{})
