@@ -102,6 +102,9 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 	acquireCtx, stopAcquireSignalWatch := contextWithSignal(ctx, sigCh)
 	lease, err := acquireLease(acquireCtx, leaser, config.acquireTimeout, config.retryInterval)
 	if sig, ok := stopAcquireSignalWatch(); ok {
+		if releaseErr := releaseLease(leaser, lease); releaseErr != nil {
+			return fmt.Errorf("signal received while acquiring lease: %s; release lease: %v", sig, releaseErr)
+		}
 		return fmt.Errorf("signal received while acquiring lease: %s", sig)
 	}
 	if err != nil {

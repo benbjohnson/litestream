@@ -186,6 +186,46 @@ func TestMain_Run_KillsCommandWhenRenewFails(t *testing.T) {
 	}
 }
 
+func TestMain_Run_ReleasesLeaseWhenSignalArrivesAfterAcquire(t *testing.T) {
+	leaser := newTestLeaser()
+	process := newTestProcess()
+	signals := make(chan os.Signal, 1)
+
+	leaser.acquireFunc = func(ctx context.Context) (*litestream.Lease, error) {
+		signals <- os.Interrupt
+		select {
+		case <-ctx.Done():
+		case <-time.After(time.Second):
+			t.Fatal("timed out waiting for signal cancellation")
+		}
+		return &litestream.Lease{
+			Generation: 1,
+			ExpiresAt:  time.Now().Add(time.Minute),
+			Owner:      "test",
+			ETag:       "etag-1",
+		}, nil
+	}
+
+	m := newTestMain(leaser, process)
+	m.signals = signals
+
+	err := m.Run(context.Background(), []string{
+		"-url", "s3://bucket/path",
+		"-ttl", "50ms",
+		"-heartbeat", "10ms",
+		"litestream", "replicate",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if got := leaser.releaseN.Load(); got != 1 {
+		t.Fatalf("ReleaseLease() calls=%d, want 1", got)
+	}
+	if got := process.startN.Load(); got != 0 {
+		t.Fatalf("Start() calls=%d, want 0", got)
+	}
+}
+
 func TestMain_Run_ForwardsSignal(t *testing.T) {
 	leaser := newTestLeaser()
 	process := newTestProcess()
@@ -287,6 +327,7 @@ type testProcess struct {
 	once    sync.Once
 
 	startErr error
+	startN   atomic.Int32
 	killN    atomic.Int32
 	signalN  atomic.Int32
 }
@@ -299,6 +340,7 @@ func newTestProcess() *testProcess {
 }
 
 func (p *testProcess) Start() error {
+	p.startN.Add(1)
 	if p.startErr != nil {
 		return p.startErr
 	}
