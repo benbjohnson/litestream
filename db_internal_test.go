@@ -3930,7 +3930,7 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ctx := context.Background()
+	ctx := t.Context()
 	if err := db.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -3993,14 +3993,17 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 			// TRUNCATE resets the WAL so subsequent snapshots must read
 			// cold pages from the database file — the path that exposes
 			// a checkpoint racing the position capture.
-			if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil && !isSQLiteBusyError(err) {
-				errCh <- err
-				return
+			if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+				if !isSQLiteBusyError(err) {
+					errCh <- err
+					return
+				}
+				time.Sleep(time.Millisecond)
 			}
 		}
 	}()
 
-	for i := 0; i < 15; i++ {
+	for i := range 15 {
 		select {
 		case err := <-errCh:
 			t.Fatal(err)
