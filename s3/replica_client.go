@@ -131,6 +131,7 @@ func (c *ReplicaClient) SetLogger(logger *slog.Logger) {
 	c.logger = logger.WithGroup(ReplicaClientType)
 }
 
+// NewLeaser returns an initialized leaser for the replica client's bucket and path.
 func (c *ReplicaClient) NewLeaser(ctx context.Context) (*Leaser, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
