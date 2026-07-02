@@ -1236,6 +1236,9 @@ func (f *enospcLTXStagingFile) Sync() error {
 }
 
 func (f *enospcLTXStagingFile) Close() error {
+	if f.failOp == "close" {
+		return syscall.ENOSPC
+	}
 	return nil
 }
 
@@ -1265,8 +1268,10 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 		name   string
 		failOp string
 	}{
+		{name: "Open", failOp: "open"},
 		{name: "Write", failOp: "write"},
 		{name: "Sync", failOp: "sync"},
+		{name: "Close", failOp: "close"},
 	}
 
 	for _, tt := range tests {
@@ -1301,14 +1306,15 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			origOpenLTXFile := openLTXFile
-			openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+			db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
 				if isLTXStagingPath(name) {
+					if tt.failOp == "open" {
+						return nil, syscall.ENOSPC
+					}
 					return &enospcLTXStagingFile{failOp: tt.failOp}, nil
 				}
-				return origOpenLTXFile(name, flag, perm)
+				return defaultOpenLTXFile(name, flag, perm)
 			}
-			defer func() { openLTXFile = origOpenLTXFile }()
 
 			err = db.Sync(context.Background())
 			if err == nil {
@@ -1328,8 +1334,11 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 			if diskFullErr.Path == "" {
 				t.Fatal("expected staging path")
 			}
-			if diskFullErr.Level != 0 || diskFullErr.MinTXID != 1 || diskFullErr.MaxTXID != 1 {
-				t.Fatalf("unexpected LTX identity: level=%d min=%d max=%d", diskFullErr.Level, diskFullErr.MinTXID, diskFullErr.MaxTXID)
+			if diskFullErr.Op != tt.failOp {
+				t.Fatalf("op=%q, want %q", diskFullErr.Op, tt.failOp)
+			}
+			if diskFullErr.MinTXID != 1 || diskFullErr.MaxTXID != 1 {
+				t.Fatalf("unexpected LTX identity: min=%d max=%d", diskFullErr.MinTXID, diskFullErr.MaxTXID)
 			}
 			if !strings.Contains(err.Error(), "staging") || !strings.Contains(err.Error(), "disk full") {
 				t.Fatalf("error message %q should identify disk-full staging failure", err.Error())
@@ -1338,6 +1347,66 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 				t.Fatalf("litestream_disk_full=%v, want 1", got)
 			}
 		})
+	}
+}
+
+func TestDB_DiskFullGaugeResetsOnOtherSyncErrors(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if isLTXStagingPath(name) {
+			return nil, syscall.ENOSPC
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
+	if err := db.Sync(context.Background()); err == nil {
+		t.Fatal("expected disk full error")
+	}
+	if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 1 {
+		t.Fatalf("litestream_disk_full=%v, want 1", got)
+	}
+
+	db.openLTXFile = defaultOpenLTXFile
+	if err := os.Remove(db.WALPath()); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Sync(context.Background())
+	if err == nil {
+		t.Fatal("expected error from sync with missing WAL")
+	}
+	if errors.Is(err, ErrDiskFull) {
+		t.Fatalf("expected non-disk-full error, got %v", err)
+	}
+	if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 0 {
+		t.Fatalf("litestream_disk_full=%v, want 0 after a non-disk-full error", got)
 	}
 }
 
@@ -1378,15 +1447,14 @@ func TestDB_MonitorRetriesAndRecoversFromLTXStagingDiskFull(t *testing.T) {
 	var diskFull atomic.Bool
 	diskFull.Store(true)
 
-	origOpenLTXFile := openLTXFile
-	openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
 		if isLTXStagingPath(name) {
 			stagingAttempts.Add(1)
 			if diskFull.Load() {
 				return &enospcLTXStagingFile{failOp: "write"}, nil
 			}
 		}
-		return origOpenLTXFile(name, flag, perm)
+		return defaultOpenLTXFile(name, flag, perm)
 	}
 
 	done := make(chan struct{})
@@ -1403,7 +1471,7 @@ func TestDB_MonitorRetriesAndRecoversFromLTXStagingDiskFull(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Error("monitor did not stop")
 		}
-		openLTXFile = origOpenLTXFile
+		db.openLTXFile = defaultOpenLTXFile
 		if err := sqldb.Close(); err != nil {
 			t.Errorf("close sql db: %v", err)
 		}
@@ -1428,8 +1496,7 @@ func TestDB_MonitorRetriesAndRecoversFromLTXStagingDiskFull(t *testing.T) {
 		s := logs.String()
 		return stagingAttempts.Load() >= 1 &&
 			testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())) == 1 &&
-			strings.Contains(s, "disk full while staging LTX file") &&
-			strings.Contains(s, "replication paused, will resume automatically when space is freed")
+			strings.Contains(s, "disk full while staging ltx file, replication paused until space is freed")
 	})
 
 	s := logs.String()
