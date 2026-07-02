@@ -60,10 +60,19 @@ func (e *LTXError) Unwrap() error { return e.Err }
 type LTXStagingDiskFullError struct {
 	Op      string
 	Path    string
-	Level   int
 	MinTXID uint64
 	MaxTXID uint64
 	Err     error
+}
+
+func newLTXStagingDiskFullError(op, path string, minTXID, maxTXID ltx.TXID, err error) *LTXStagingDiskFullError {
+	return &LTXStagingDiskFullError{
+		Op:      op,
+		Path:    path,
+		MinTXID: uint64(minTXID),
+		MaxTXID: uint64(maxTXID),
+		Err:     err,
+	}
 }
 
 func (e *LTXStagingDiskFullError) Error() string {

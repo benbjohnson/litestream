@@ -94,6 +94,10 @@ type DB struct {
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
 
+	// openLTXFile opens LTX staging files; overridable in tests to
+	// inject filesystem errors such as ENOSPC.
+	openLTXFile func(name string, flag int, perm os.FileMode) (ltxStagingFile, error)
+
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
@@ -319,6 +323,7 @@ func NewDB(path string) *DB {
 		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.openLTXFile = defaultOpenLTXFile
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
 	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
@@ -1259,12 +1264,9 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		db.syncNCounter.Inc()
 		if err != nil {
 			db.syncErrorNCounter.Inc()
-			var diskFullErr *LTXStagingDiskFullError
-			if errors.As(err, &diskFullErr) {
-				db.diskFullGauge.Set(1)
-			} else {
-				db.diskFullGauge.Set(0)
-			}
+		}
+		if err != nil && errors.Is(err, ErrDiskFull) {
+			db.diskFullGauge.Set(1)
 		} else {
 			db.diskFullGauge.Set(0)
 		}
@@ -1514,19 +1516,8 @@ type ltxStagingFile interface {
 	Close() error
 }
 
-var openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+func defaultOpenLTXFile(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
 	return os.OpenFile(name, flag, perm)
-}
-
-func newLTXStagingDiskFullError(op, path string, level int, minTXID, maxTXID ltx.TXID, err error) *LTXStagingDiskFullError {
-	return &LTXStagingDiskFullError{
-		Op:      op,
-		Path:    path,
-		Level:   level,
-		MinTXID: uint64(minTXID),
-		MaxTXID: uint64(maxTXID),
-		Err:     err,
-	}
 }
 
 // walFileSize returns the size of the WAL file in bytes.
@@ -2088,13 +2079,16 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 
 	tmpFilename := filename + ".tmp"
 	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
+		if isDiskFullError(err) {
+			return result, newLTXStagingDiskFullError("mkdir", tmpFilename, txID, txID, err)
+		}
 		return result, err
 	}
 
-	ltxFile, err := openLTXFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	ltxFile, err := db.openLTXFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("open", tmpFilename, 0, txID, txID, err)
+			return result, newLTXStagingDiskFullError("open", tmpFilename, txID, txID, err)
 		}
 		return result, fmt.Errorf("open temp ltx file: %w", err)
 	}
@@ -2131,7 +2125,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		WALSalt2:  rd.salt2,
 	}); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+			return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
 		}
 		return result, fmt.Errorf("encode ltx header: %w", err)
 	}
@@ -2148,7 +2142,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			})
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
-				return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+				return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
 			}
 			return result, fmt.Errorf("write ltx from db: %w", err)
 		}
@@ -2162,7 +2156,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			})
 		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
-				return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+				return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
 			}
 			return result, fmt.Errorf("write ltx from wal: %w", err)
 		}
@@ -2175,7 +2169,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	})
 	if err := enc.Close(); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("write", tmpFilename, 0, txID, txID, err)
+			return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
 		}
 		return result, fmt.Errorf("close ltx encoder: %w", err)
 	}
@@ -2187,13 +2181,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	})
 	if err := ltxFile.Sync(); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("sync", tmpFilename, 0, txID, txID, err)
+			return result, newLTXStagingDiskFullError("sync", tmpFilename, txID, txID, err)
 		}
 		return result, fmt.Errorf("sync ltx file: %w", err)
 	}
 	if err := ltxFile.Close(); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("close", tmpFilename, 0, txID, txID, err)
+			return result, newLTXStagingDiskFullError("close", tmpFilename, txID, txID, err)
 		}
 		return result, fmt.Errorf("close ltx file: %w", err)
 	}
@@ -3149,28 +3143,27 @@ func (db *DB) monitor() {
 				}
 			}
 
-			var diskFullErr *LTXStagingDiskFullError
-			if errors.As(err, &diskFullErr) {
-				if time.Since(lastLogTime) >= SyncErrorLogInterval {
-					db.Logger.Error(fmt.Sprintf("disk full while staging LTX file %s: replication paused, will resume automatically when space is freed", diskFullErr.Path),
+			// Log with rate limiting to avoid log spam during persistent errors.
+			if time.Since(lastLogTime) >= SyncErrorLogInterval {
+				var diskFullErr *LTXStagingDiskFullError
+				if errors.As(err, &diskFullErr) {
+					// Recovery is automatic but can lag up to max_backoff
+					// behind space being freed.
+					db.Logger.Error("disk full while staging ltx file, replication paused until space is freed",
 						"error", err,
 						"path", diskFullErr.Path,
-						"level", diskFullErr.Level,
 						"min_txid", diskFullErr.MinTXID,
 						"max_txid", diskFullErr.MaxTXID,
 						"consecutive_errors", consecutiveErrs,
-						"backoff", backoff)
-					lastLogTime = time.Now()
-				}
-			} else {
-				// Log with rate limiting to avoid log spam during persistent errors.
-				if time.Since(lastLogTime) >= SyncErrorLogInterval {
+						"backoff", backoff,
+						"max_backoff", DefaultSyncBackoffMax)
+				} else {
 					db.Logger.Error("sync error",
 						"error", err,
 						"consecutive_errors", consecutiveErrs,
 						"backoff", backoff)
-					lastLogTime = time.Now()
 				}
+				lastLogTime = time.Now()
 			}
 
 			// Try to clean up stale temp files after persistent disk errors.
