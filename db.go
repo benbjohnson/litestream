@@ -1396,18 +1396,23 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.exceedsTruncateThreshold(origWALSize) {
 		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
-		db.Logger.Info("forcing truncate checkpoint",
-			"wal_size", origWALSize,
-			"threshold", truncateThreshold)
 
+		// Try a PASSIVE checkpoint first: if it restarts the WAL, the
+		// blocking TRUNCATE and its mandatory boundary snapshot are skipped.
 		if err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
 			if !isSQLiteBusyError(err) {
 				return err
 			}
 		} else if exec.state.lastSyncedWALOffset < truncateThreshold {
+			db.Logger.Info("wal restarted by passive checkpoint, skipping truncate checkpoint",
+				"wal_size", origWALSize,
+				"threshold", truncateThreshold)
 			return nil
 		}
 
+		db.Logger.Info("forcing truncate checkpoint",
+			"wal_size", origWALSize,
+			"threshold", truncateThreshold)
 		return db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
 	}
 
@@ -2022,7 +2027,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 	if !info.snapshotting {
 		if pgno, ok := missingGrowthPage(info.prevCommit, commit, uint32(db.pageSize), pageMap); ok {
-			db.Logger.Info("missing WAL growth page, reading from database",
+			db.Logger.Debug("missing WAL growth page, reading from database",
 				"txid", txID.String(),
 				"pgno", pgno,
 				"prev_commit", info.prevCommit,
@@ -2661,6 +2666,11 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 		walEndOffset = WALHeaderSize
 	}
 
+	// Acquire the checkpoint read lock while the executor semaphore is still
+	// held (the deferred release runs after this function returns). Every
+	// checkpoint takes chkMu under execSem, so this handoff guarantees no
+	// checkpoint can run between capturing pos and locking chkMu — the
+	// snapshot always matches the advertised position.
 	db.chkMu.RLock()
 	return &snapshotReadPosition{
 		pos:          pos,
@@ -2670,6 +2680,9 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 	}, nil
 }
 
+// snapshotWALEndOffset returns the WAL offset a snapshot may read up to for
+// the given position. db.syncState is read without db.mu because every writer
+// mutates it while holding execSem, which the caller also holds.
 func (db *DB) snapshotWALEndOffset(ctx context.Context, pos ltx.Pos) (int64, error) {
 	if db.syncState.lastSyncedWALOffset > 0 {
 		return db.syncState.lastSyncedWALOffset, nil
@@ -2793,13 +2806,8 @@ func snapshotHeaderWALRange(walEndOffset, maxOffset, frameSize int64) (offset, s
 	if maxOffset <= WALHeaderSize || frameSize <= 0 {
 		return WALHeaderSize, 0
 	}
-	offset = maxOffset - frameSize
-	if offset < WALHeaderSize {
-		offset = WALHeaderSize
-	}
-	if maxOffset > walEndOffset {
-		maxOffset = walEndOffset
-	}
+	offset = max(maxOffset-frameSize, WALHeaderSize)
+	maxOffset = min(maxOffset, walEndOffset)
 	return offset, maxOffset - offset
 }
 
