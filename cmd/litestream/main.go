@@ -55,9 +55,6 @@ var (
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
 	ErrInvalidHeartbeatURL             = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
 	ErrInvalidHeartbeatInterval        = errors.New("heartbeat interval must be at least 1 minute")
-	ErrInvalidLeaseTTL                 = errors.New("lease ttl must be greater than 0")
-	ErrInvalidLeaseHeartbeat           = errors.New("lease heartbeat must be greater than 0 and less than ttl")
-	ErrInvalidLeaseAcquireTimeout      = errors.New("lease acquire timeout must be >= 0")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
@@ -503,9 +500,6 @@ func (c *Config) Validate() error {
 		if db.Watch && db.Dir == "" {
 			return fmt.Errorf("database config #%d: 'watch' can only be enabled with a directory", idx+1)
 		}
-		if db.Watch && db.Lease.Required {
-			return fmt.Errorf("database config #%d: lease.required cannot be used with watch", idx+1)
-		}
 
 		// Use path or dir for identifying the config in error messages
 		dbIdentifier := db.Path
@@ -525,38 +519,6 @@ func (c *Config) Validate() error {
 				Err:   ErrInvalidSnapshotRetention,
 				Field: fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
 				Value: *db.Snapshot.Retention,
-			}
-		}
-		if db.Lease.TTL != nil && *db.Lease.TTL <= 0 {
-			return &ConfigValidationError{
-				Err:   ErrInvalidLeaseTTL,
-				Field: fmt.Sprintf("dbs[%s].lease.ttl", dbIdentifier),
-				Value: *db.Lease.TTL,
-			}
-		}
-		if db.Lease.Heartbeat != nil && *db.Lease.Heartbeat <= 0 {
-			return &ConfigValidationError{
-				Err:   ErrInvalidLeaseHeartbeat,
-				Field: fmt.Sprintf("dbs[%s].lease.heartbeat", dbIdentifier),
-				Value: *db.Lease.Heartbeat,
-			}
-		}
-		leaseTTL := s3.DefaultLeaseTTL
-		if db.Lease.TTL != nil {
-			leaseTTL = *db.Lease.TTL
-		}
-		if db.Lease.Heartbeat != nil && *db.Lease.Heartbeat >= leaseTTL {
-			return &ConfigValidationError{
-				Err:   ErrInvalidLeaseHeartbeat,
-				Field: fmt.Sprintf("dbs[%s].lease.heartbeat", dbIdentifier),
-				Value: *db.Lease.Heartbeat,
-			}
-		}
-		if db.Lease.AcquireTimeout != nil && *db.Lease.AcquireTimeout < 0 {
-			return &ConfigValidationError{
-				Err:   ErrInvalidLeaseAcquireTimeout,
-				Field: fmt.Sprintf("dbs[%s].lease.acquire-timeout", dbIdentifier),
-				Value: *db.Lease.AcquireTimeout,
 			}
 		}
 
@@ -741,7 +703,6 @@ type DBConfig struct {
 	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
 	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
 	Snapshot           SnapshotConfig `yaml:"snapshot"`
-	Lease              LeaseConfig    `yaml:"lease"`
 	MetaPath           *string        `yaml:"meta-path"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
@@ -753,13 +714,6 @@ type DBConfig struct {
 
 	Replica  *ReplicaConfig   `yaml:"replica"`
 	Replicas []*ReplicaConfig `yaml:"replicas"` // Deprecated
-}
-
-type LeaseConfig struct {
-	Required       bool           `yaml:"required"`
-	TTL            *time.Duration `yaml:"ttl"`
-	Heartbeat      *time.Duration `yaml:"heartbeat"`
-	AcquireTimeout *time.Duration `yaml:"acquire-timeout"`
 }
 
 // NewDBFromConfig instantiates a DB based on a configuration.
