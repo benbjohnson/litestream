@@ -596,7 +596,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	retentionTime := time.Now().Add(-150 * time.Millisecond)
 	if minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), retentionTime); err != nil {
 		t.Fatal(err)
-	} else if got, want := minSnapshotTXID, ltx.TXID(4); got != want {
+	} else if got, want := minSnapshotTXID, ltx.TXID(3); got != want {
 		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
 	}
 
@@ -619,6 +619,23 @@ func TestDB_EnforceRetention(t *testing.T) {
 	// Should have fewer snapshots than before
 	if afterCount >= beforeCount {
 		t.Fatalf("expected fewer snapshots after retention, before=%d after=%d", beforeCount, afterCount)
+	}
+}
+
+func TestDB_EnforceSnapshotRetention_ReturnsZeroWithoutPriorSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-time.Hour))
+
+	minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := minSnapshotTXID, ltx.TXID(0); got != want {
+		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
 	}
 }
 
@@ -679,6 +696,62 @@ func TestDB_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 	afterCount := countFiles()
 	if afterCount != beforeCount {
 		t.Fatalf("expected %d remote snapshots (no remote deletion), got %d", beforeCount, afterCount)
+	}
+}
+
+func TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer testingutil.MustCloseDB(t, db)
+
+	oldTime := time.Now().Add(-2 * time.Hour)
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, oldTime)
+	createTestLTXFileWithTimestamp(t, client, 1, 6, 10, oldTime.Add(time.Minute))
+
+	plan, err := litestream.CalcRestorePlan(ctx, client, 10, time.Time{}, db.Logger)
+	if err != nil {
+		t.Fatalf("calc restore plan: %v", err)
+	}
+
+	var plannedInfo *ltx.FileInfo
+	for _, info := range plan {
+		if info.Level == 1 && info.MinTXID == 6 && info.MaxTXID == 10 {
+			plannedInfo = info
+			break
+		}
+	}
+	if plannedInfo == nil {
+		t.Fatalf("restore plan does not include L1 6-10: %#v", plan)
+	}
+
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 11, time.Now())
+	createTestLTXFileWithTimestamp(t, client, 1, 11, 11, time.Now())
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Hour},
+	})
+	store.SnapshotRetention = time.Hour
+
+	if err := store.EnforceSnapshotRetention(ctx, db); err != nil {
+		t.Fatalf("enforce snapshot retention: %v", err)
+	}
+
+	rc, err := client.OpenLTXFile(ctx, plannedInfo.Level, plannedInfo.MinTXID, plannedInfo.MaxTXID, 0, 0)
+	if err != nil {
+		t.Fatalf("planned LTX file was deleted by retention: level=%d min=%s max=%s: %v", plannedInfo.Level, plannedInfo.MinTXID, plannedInfo.MaxTXID, err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("close planned LTX file: %v", err)
 	}
 }
 
