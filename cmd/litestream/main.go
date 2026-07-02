@@ -1450,6 +1450,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		urequireContentMD5    bool
 		urequireContentMD5Set bool
 		ustorageClass         string
+		upartSize             int64
+		upartSizeSet          bool
+		uconcurrency          int64
+		uconcurrencySet       bool
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1507,6 +1511,18 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			ustorageClass = v
 		} else if v := query.Get("storage-class"); v != "" {
 			ustorageClass = v
+		}
+		if v, ok, err := litestream.IntQueryValue(query, "partSize", "part-size"); err != nil {
+			return nil, err
+		} else if ok {
+			upartSize = v
+			upartSizeSet = true
+		}
+		if v, ok, err := litestream.IntQueryValue(query, "concurrency"); err != nil {
+			return nil, err
+		} else if ok {
+			uconcurrency = v
+			uconcurrencySet = true
 		}
 
 		// Only apply URL parts to field that have not been overridden.
@@ -1595,7 +1611,13 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		client.Concurrency = s3.DefaultR2Concurrency
 	}
 
-	// Apply upload configuration if specified.
+	// Apply upload configuration from URL query, then config overrides.
+	if upartSizeSet {
+		client.PartSize = upartSize
+	}
+	if uconcurrencySet {
+		client.Concurrency = int(uconcurrency)
+	}
 	if c.PartSize != nil {
 		client.PartSize = int64(*c.PartSize)
 	}

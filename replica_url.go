@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -205,6 +206,25 @@ func BoolQueryValue(query url.Values, keys ...string) (value bool, ok bool) {
 		}
 	}
 	return false, false
+}
+
+// IntQueryValue returns a positive integer value from URL query parameters.
+// It checks keys in order and returns the value and whether it was set.
+// Returns an error if a present value is not a positive integer.
+func IntQueryValue(query url.Values, keys ...string) (value int64, ok bool, err error) {
+	if query == nil {
+		return 0, false, nil
+	}
+	for _, key := range keys {
+		if raw := query.Get(key); raw != "" {
+			n, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || n <= 0 {
+				return 0, false, fmt.Errorf("invalid value for query parameter %q: %q (must be a positive integer)", key, raw)
+			}
+			return n, true, nil
+		}
+	}
+	return 0, false, nil
 }
 
 // IsHetznerEndpoint returns true if the endpoint is Hetzner object storage service.

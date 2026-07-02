@@ -574,6 +574,119 @@ func TestBoolQueryValue(t *testing.T) {
 	})
 }
 
+func TestIntQueryValue(t *testing.T) {
+	t.Run("Key present", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{"1048576"}
+		value, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue with present key should be ok")
+		}
+		if value != 1048576 {
+			t.Errorf("IntQueryValue = %d, want 1048576", value)
+		}
+	})
+
+	t.Run("Missing key", func(t *testing.T) {
+		query := make(map[string][]string)
+		value, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if ok {
+			t.Error("IntQueryValue with missing key should not be ok")
+		}
+		if value != 0 {
+			t.Errorf("IntQueryValue = %d, want 0", value)
+		}
+	})
+
+	t.Run("Alias order", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key1"] = []string{"100"}
+		query["key2"] = []string{"200"}
+		value, ok, err := litestream.IntQueryValue(query, "key1", "key2")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue should find first key")
+		}
+		if value != 100 {
+			t.Errorf("IntQueryValue = %d, want 100 (first key wins)", value)
+		}
+	})
+
+	t.Run("Second key used when first absent", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key2"] = []string{"200"}
+		value, ok, err := litestream.IntQueryValue(query, "key1", "key2")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue should find second key")
+		}
+		if value != 200 {
+			t.Errorf("IntQueryValue = %d, want 200", value)
+		}
+	})
+
+	t.Run("Nil query", func(t *testing.T) {
+		value, ok, err := litestream.IntQueryValue(nil, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if ok {
+			t.Error("IntQueryValue with nil query should not be ok")
+		}
+		if value != 0 {
+			t.Errorf("IntQueryValue = %d, want 0", value)
+		}
+	})
+
+	t.Run("Empty value not set", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{""}
+		_, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if ok {
+			t.Error("IntQueryValue with empty value should not be ok")
+		}
+	})
+
+	t.Run("Invalid values return error", func(t *testing.T) {
+		for _, v := range []string{"abc", "0", "-5"} {
+			query := make(map[string][]string)
+			query["key"] = []string{v}
+			_, _, err := litestream.IntQueryValue(query, "key")
+			if err == nil {
+				t.Errorf("IntQueryValue with %q should return error", v)
+			}
+		}
+	})
+
+	t.Run("Large value", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{"10737418240"}
+		value, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue with large value should be ok")
+		}
+		if value != 10737418240 {
+			t.Errorf("IntQueryValue = %d, want 10737418240", value)
+		}
+	})
+}
+
 func TestIsTigrisEndpoint(t *testing.T) {
 	tests := []struct {
 		endpoint string

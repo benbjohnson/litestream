@@ -2094,6 +2094,38 @@ func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
 	}
 }
 
+func TestNewReplicaClientFromURL_InvalidUploadParams(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "part-size_non_numeric",
+			url:  "s3://mybucket/path?part-size=abc",
+		},
+		{
+			name: "part-size_zero",
+			url:  "s3://mybucket/path?part-size=0",
+		},
+		{
+			name: "concurrency_negative",
+			url:  "s3://mybucket/path?concurrency=-1",
+		},
+		{
+			name: "concurrency_non_numeric",
+			url:  "s3://mybucket/path?concurrency=abc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := litestream.NewReplicaClientFromURL(tt.url); err == nil {
+				t.Fatalf("NewReplicaClientFromURL(%q) expected error, got nil", tt.url)
+			}
+		})
+	}
+}
+
 func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 	tests := []struct {
 		name               string
