@@ -9,7 +9,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -45,6 +45,9 @@ func TestSoakReplicateRestore(t *testing.T) {
 	}
 	duration := parseSoakDuration(t, defaultDuration)
 	restoreInterval := 30 * time.Second
+	if testing.Short() {
+		restoreInterval = 15 * time.Second
+	}
 	writeRate := 100
 
 	t.Logf("================================================")
@@ -108,15 +111,29 @@ func TestSoakReplicateRestore(t *testing.T) {
 	}
 	t.Logf("Litestream running (PID: %d)", db.LitestreamPID)
 
-	// Wait for initial sync
-	time.Sleep(3 * time.Second)
+	// Wait until the replica is restorable rather than sleeping a fixed time.
+	initialSyncDeadline := time.Now().Add(30 * time.Second)
+	for {
+		probePath := filepath.Join(db.TempDir, "restore-probe.db")
+		err := db.Restore(probePath)
+		os.Remove(probePath)
+		os.Remove(probePath + "-wal")
+		os.Remove(probePath + "-shm")
+		if err == nil {
+			break
+		}
+		if time.Now().After(initialSyncDeadline) {
+			t.Fatalf("replica not restorable after initial sync window: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 
 	// Register before cancel so the deferred cancel stops the writer
 	// before wg.Wait runs, even on t.Fatalf paths.
 	var wg sync.WaitGroup
 	defer wg.Wait()
 
-	ctx, cancel := context.WithTimeout(context.Background(), duration)
+	ctx, cancel := context.WithTimeout(t.Context(), duration)
 	defer cancel()
 
 	// Performance tracking
@@ -170,6 +187,7 @@ func TestSoakReplicateRestore(t *testing.T) {
 		corruptionCount  int
 		restoreErrors    []string
 		lastRestoredRows int
+		prevSourceRows   int
 	)
 
 	restoreTicker := time.NewTicker(restoreInterval)
@@ -188,18 +206,22 @@ loop:
 		case <-restoreTicker.C:
 			restoreCount++
 			elapsed := time.Since(startTime)
-			sourceRows := countRowsSafe(sqlDB)
+			sourceRows, err := countRows(sqlDB)
+			if err != nil {
+				restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: count source rows: %v", restoreCount, err))
+				t.Errorf("  COUNT SOURCE ROWS FAILED: %v", err)
+			}
 
 			t.Logf("[%v] Restore cycle #%d (source rows: %d, writes: %d, write errors: %d)",
 				elapsed.Round(time.Second), restoreCount, sourceRows, totalWrites.Load(), writeErrs.Load())
 
 			// Stop litestream for clean restore. A failed stop usually
 			// means the process died mid-soak, which is itself a failure.
+			// StopLitestream waits for the process to exit.
 			if err := db.StopLitestream(); err != nil {
 				restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: stop litestream: %v", restoreCount, err))
 				t.Errorf("  STOP LITESTREAM FAILED: %v", err)
 			}
-			time.Sleep(1 * time.Second)
 
 			// Restore to new path
 			restoredPath := filepath.Join(db.TempDir, fmt.Sprintf("restored-%d.db", restoreCount))
@@ -245,6 +267,13 @@ loop:
 							restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: restored rows shrank %d -> %d", restoreCount, lastRestoredRows, restoredRows))
 							t.Errorf("  RESTORED ROWS SHRANK: %d -> %d", lastRestoredRows, restoredRows)
 						}
+						// The restore must contain at least everything the
+						// source held a full cycle ago: bigger lag means
+						// silent data loss that still passes integrity_check.
+						if restoredRows < prevSourceRows {
+							restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: restored rows %d behind source count %d from previous cycle", restoreCount, restoredRows, prevSourceRows))
+							t.Errorf("  RESTORE LAGGED A FULL CYCLE: restored=%d, source at previous cycle=%d", restoredRows, prevSourceRows)
+						}
 						lastRestoredRows = restoredRows
 						t.Logf("  OK: integrity=ok, restored_rows=%d", restoredRows)
 					}
@@ -257,11 +286,11 @@ loop:
 			os.Remove(restoredPath + "-wal")
 			os.Remove(restoredPath + "-shm")
 
-			// Restart litestream
+			// Restart litestream. The helper waits for startup internally.
 			if err := db.StartLitestreamWithConfig(configPath); err != nil {
 				t.Fatalf("restart litestream: %v", err)
 			}
-			time.Sleep(2 * time.Second)
+			prevSourceRows = sourceRows
 		}
 	}
 
@@ -303,6 +332,10 @@ loop:
 	// verification is a failure even when no corruption was detected.
 	if len(restoreErrors) > 0 {
 		t.Fatalf("FAILED: %d restore error(s) in %d restore cycles", len(restoreErrors), restoreCount)
+	}
+
+	if restoreCount == 0 {
+		t.Fatalf("FAILED: no restore cycles ran; duration %v must exceed the %v restore interval", duration, restoreInterval)
 	}
 
 	if totalWrites.Load() == 0 {
@@ -352,6 +385,8 @@ dbs:
 	return configPath
 }
 
+// parseSoakDuration reads SOAK_DURATION; unlike GetTestDuration, an explicit
+// env value wins over the -short default so CI can pin exact soak lengths.
 func parseSoakDuration(t *testing.T, defaultDuration time.Duration) time.Duration {
 	t.Helper()
 	if v := os.Getenv("SOAK_DURATION"); v != "" {
@@ -366,10 +401,10 @@ func parseSoakDuration(t *testing.T, defaultDuration time.Duration) time.Duratio
 	return defaultDuration
 }
 
-func countRowsSafe(db *sql.DB) int {
+func countRows(db *sql.DB) (int, error) {
 	var count int
-	db.QueryRow("SELECT COUNT(*) FROM resources").Scan(&count)
-	return count
+	err := db.QueryRow("SELECT COUNT(*) FROM resources").Scan(&count)
+	return count, err
 }
 
 type latencyTracker struct {
@@ -395,19 +430,12 @@ func (lt *latencyTracker) stats() latencyStats {
 		return latencyStats{}
 	}
 
-	sorted := make([]time.Duration, len(lt.samples))
-	copy(sorted, lt.samples)
-	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	sorted := slices.Clone(lt.samples)
+	slices.Sort(sorted)
 
 	percentile := func(p float64) time.Duration {
 		idx := int(math.Ceil(p/100*float64(len(sorted)))) - 1
-		if idx < 0 {
-			idx = 0
-		}
-		if idx >= len(sorted) {
-			idx = len(sorted) - 1
-		}
-		return sorted[idx]
+		return sorted[max(0, min(idx, len(sorted)-1))]
 	}
 
 	return latencyStats{
