@@ -1265,7 +1265,11 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		exec.state.syncedSinceCheckpoint = true
 	}
 
-	if !result.limited || result.syncedToWALEnd {
+	// Checkpoint checks normally wait until the WAL is fully synced, but the
+	// emergency truncate threshold must be honored even mid catch-up:
+	// sustained writes could otherwise keep every chunk limited and defer the
+	// truncate checkpoint indefinitely, growing the WAL without bound.
+	if !result.limited || result.syncedToWALEnd || db.exceedsTruncateThreshold(result.origWALSize) {
 		db.setSyncDiagPhase(diagPhaseCheckpointIfNeeded, func(s *diagState) {
 			s.txID = exec.pos.TXID
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
@@ -1363,7 +1367,7 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
-	if db.TruncatePageN > 0 && origWALSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)) {
+	if db.exceedsTruncateThreshold(origWALSize) {
 		db.Logger.Info("forcing truncate checkpoint",
 			"wal_size", origWALSize,
 			"threshold", calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN)))
@@ -1411,6 +1415,13 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	}
 
 	return nil
+}
+
+// exceedsTruncateThreshold returns true once walSize has grown past the
+// emergency truncate checkpoint threshold.
+func (db *DB) exceedsTruncateThreshold(walSize int64) bool {
+	return db.TruncatePageN > 0 && db.pageSize != 0 &&
+		walSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
 }
 
 // isSQLiteBusyError returns true if the error is an SQLITE_BUSY error.

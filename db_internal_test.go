@@ -234,7 +234,7 @@ func TestDB_SyncChunksWALAtCommitBoundary(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	for i := 0; i < 20; i++ {
+	for range 20 {
 		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
 			t.Fatal(err)
 		}
@@ -260,6 +260,87 @@ func TestDB_SyncChunksWALAtCommitBoundary(t *testing.T) {
 	db.mu.RUnlock()
 	if !syncedToWALEnd {
 		t.Fatal("expected public Sync to finish remaining WAL chunks")
+	}
+}
+
+func TestDB_SyncTruncateCheckpointFiresDuringChunkedCatchUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync fully with the truncate threshold disabled so the last synced WAL
+	// offset ends up past the threshold without a checkpoint having run.
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	db.MaxSyncWALBytes = int64(WALFrameHeaderSize + 4096)
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	for range 20 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before, err := os.Stat(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A single bounded chunk leaves pending WAL frames, but the truncate
+	// threshold has been exceeded so the checkpoint must fire anyway.
+	result, err := db.syncOnce(t.Context(), db.MaxSyncWALBytes)
+	if err != nil {
+		t.Fatal(err)
+	} else if !result.limited {
+		t.Fatal("expected sync to stop at WAL byte limit")
+	}
+
+	after, err := os.Stat(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() >= before.Size() {
+		t.Fatalf("expected truncate checkpoint to shrink WAL during catch-up: before=%d after=%d", before.Size(), after.Size())
 	}
 }
 

@@ -256,10 +256,30 @@ func TestWALReader(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		ctx, cancel := context.WithCancel(context.Background())
+		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 		if _, _, err := r.ReadFrame(ctx, make([]byte, 4096)); !errors.Is(err, context.Canceled) {
 			t.Fatalf("unexpected error: %#v", err)
+		}
+	})
+
+	t.Run("ErrContextCanceledWithOffset", func(t *testing.T) {
+		b, err := os.ReadFile("testdata/wal-reader/ok/wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		offset := int64(litestream.WALHeaderSize + litestream.WALFrameHeaderSize + 4096)
+		_, err = litestream.NewWALReaderWithOffset(ctx, bytes.NewReader(b), offset, 0, 0, slog.Default())
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("unexpected error: %#v", err)
+		}
+		var pfmError *litestream.PrevFrameMismatchError
+		if errors.As(err, &pfmError) {
+			t.Fatal("context cancellation must not be reported as a prev frame mismatch")
 		}
 	})
 }

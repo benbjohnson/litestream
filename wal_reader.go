@@ -65,9 +65,13 @@ func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, s
 	}
 	r.frameN = int((offset - WALHeaderSize) / frameSize)
 
-	// Read previous page to load checksum.
+	// Read previous page to load checksum. Context errors are returned as-is
+	// so callers don't mistake a cancellation for a frame mismatch.
 	r.frameN--
 	if _, _, err := r.readFrame(ctx, make([]byte, r.pageSize), false); err != nil {
+		if ctx.Err() != nil {
+			return nil, context.Cause(ctx)
+		}
 		return nil, &PrevFrameMismatchError{Err: err}
 	}
 
