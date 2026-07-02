@@ -680,38 +680,156 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and stores it in S3 metadata to preserve original creation time.
+// Objects smaller than the part size are written with a single PutObject call
+// to avoid the multipart upload manager's 5 MiB part buffers (issue #1327).
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
 
-	// Use TeeReader to peek at LTX header while preserving data for upload
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(r, &buf)
-
-	// Extract timestamp from LTX header
-	hdr, _, err := ltx.PeekHeader(teeReader)
-	if err != nil {
-		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
-	}
-	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
-
-	// Combine buffered data with rest of reader
-	rc := internal.NewReadCounter(io.MultiReader(&buf, r))
-
 	filename := ltx.FormatFilename(minTXID, maxTXID)
 	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
 
-	// Store timestamp in S3 metadata for accurate timestamp retrieval
-	metadata := map[string]string{
-		MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
+	partSize := int64(manager.DefaultUploadPartSize)
+	if c.PartSize > 0 {
+		partSize = c.PartSize
 	}
 
+	// The uploader rejects part sizes below the SDK minimum on every upload.
+	// Fail identically here so the single-put path cannot mask the
+	// misconfiguration for small objects.
+	if partSize < manager.MinUploadPartSize {
+		return nil, fmt.Errorf("s3: upload to %s: part size must be at least %d bytes", key, manager.MinUploadPartSize)
+	}
+
+	size, timestamp, etag, err := c.uploadLTX(ctx, key, r, partSize)
+	if err != nil {
+		return nil, err
+	}
+
+	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
+	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(size))
+
+	// ETag indicates successful upload
+	if etag == nil {
+		return nil, fmt.Errorf("s3: upload failed: no ETag returned")
+	}
+
+	return &ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Size:      size,
+		CreatedAt: timestamp,
+	}, nil
+}
+
+// uploadLTX uploads LTX data from r to key, choosing between a single
+// PutObject and the multipart uploader based on the object size.
+func (c *ReplicaClient) uploadLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
+	// The L0 replication path passes the local LTX file, so the size is
+	// known up front and the body stays seekable for SDK retries.
+	if rs, ok := r.(io.ReadSeeker); ok {
+		if start, err := rs.Seek(0, io.SeekCurrent); err == nil {
+			return c.uploadSizedLTX(ctx, key, rs, start, partSize)
+		}
+		// Reader does not support seeking (e.g. piped file descriptor);
+		// nothing has been consumed, so treat it as an unsized stream.
+	}
+	return c.uploadStreamedLTX(ctx, key, r, partSize)
+}
+
+// uploadSizedLTX uploads from a seekable reader whose size is known.
+func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.ReadSeeker, start, partSize int64) (int64, time.Time, *string, error) {
+	end, err := rs.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: size ltx file %s: %w", key, err)
+	}
+	size := end - start
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
+	}
+
+	// Extract timestamp from LTX header, then rewind so the upload sees the
+	// full file.
+	hdr, _, err := ltx.PeekHeader(rs)
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+	if _, err := rs.Seek(start, io.SeekStart); err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: rewind ltx file %s: %w", key, err)
+	}
+
+	input := c.putObjectInput(key, timestamp)
+	input.Body = rs
+
+	if size < partSize {
+		input.ContentLength = aws.Int64(size)
+		out, err := c.s3.PutObject(ctx, input)
+		if err != nil {
+			return 0, time.Time{}, nil, fmt.Errorf("s3: put object %s: %w", key, err)
+		}
+		return size, timestamp, out.ETag, nil
+	}
+
+	// At or above the part size the uploader splits the seekable body into
+	// section readers without copying it into part buffers.
+	out, err := c.uploader.Upload(ctx, input)
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
+	}
+	return size, timestamp, out.ETag, nil
+}
+
+// uploadStreamedLTX uploads from a reader of unknown size, buffering up to
+// the part size to determine whether the object fits in a single PutObject.
+func (c *ReplicaClient) uploadStreamedLTX(ctx context.Context, key string, r io.Reader, partSize int64) (int64, time.Time, *string, error) {
+	// Use TeeReader to peek at LTX header while preserving data for upload
+	var buf bytes.Buffer
+	hdr, _, err := ltx.PeekHeader(io.TeeReader(r, &buf))
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
+	}
+	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
+
+	if _, err := io.CopyN(&buf, r, partSize-int64(buf.Len())); err != nil && !errors.Is(err, io.EOF) {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: buffer ltx stream %s: %w", key, err)
+	}
+
+	input := c.putObjectInput(key, timestamp)
+
+	// Reaching EOF before the part size means the whole object is buffered.
+	if size := int64(buf.Len()); size < partSize {
+		input.Body = bytes.NewReader(buf.Bytes())
+		input.ContentLength = aws.Int64(size)
+		out, err := c.s3.PutObject(ctx, input)
+		if err != nil {
+			return 0, time.Time{}, nil, fmt.Errorf("s3: put object %s: %w", key, err)
+		}
+		return size, timestamp, out.ETag, nil
+	}
+
+	// Combine buffered prefix with rest of reader so nothing is re-read.
+	rc := internal.NewReadCounter(io.MultiReader(bytes.NewReader(buf.Bytes()), r))
+	input.Body = rc
+	out, err := c.uploader.Upload(ctx, input)
+	if err != nil {
+		return 0, time.Time{}, nil, fmt.Errorf("s3: upload to %s: %w", key, err)
+	}
+	return rc.N(), timestamp, out.ETag, nil
+}
+
+// putObjectInput returns a PutObjectInput populated with the client's write
+// parameters so the single-put and multipart paths stay in parity.
+func (c *ReplicaClient) putObjectInput(key string, timestamp time.Time) *s3.PutObjectInput {
 	input := &s3.PutObjectInput{
-		Bucket:   aws.String(c.Bucket),
-		Key:      aws.String(key),
-		Body:     rc,
-		Metadata: metadata,
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+		// Store timestamp in S3 metadata for accurate timestamp retrieval
+		Metadata: map[string]string{
+			MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
+		},
 	}
 	if c.StorageClass != "" {
 		input.StorageClass = types.StorageClass(c.StorageClass)
@@ -730,29 +848,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		input.SSEKMSKeyId = aws.String(c.SSEKMSKeyID)
 	}
 
-	out, err := c.uploader.Upload(ctx, input)
-	if err != nil {
-		return nil, fmt.Errorf("s3: upload to %s: %w", key, err)
-	}
-
-	// Build file info from the uploaded file
-	info := &ltx.FileInfo{
-		Level:     level,
-		MinTXID:   minTXID,
-		MaxTXID:   maxTXID,
-		Size:      rc.N(),
-		CreatedAt: timestamp,
-	}
-
-	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "PUT").Add(float64(rc.N()))
-
-	// ETag indicates successful upload
-	if out.ETag == nil {
-		return nil, fmt.Errorf("s3: upload failed: no ETag returned")
-	}
-
-	return info, nil
+	return input
 }
 
 func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
