@@ -2250,16 +2250,10 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 }
 
 func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, prevCommit, commit uint32, pageMap map[uint32]int64) error {
-	checkContext := func() error {
-		select {
-		case <-ctx.Done():
-			return context.Cause(ctx)
-		default:
-			return nil
-		}
-	}
-	if err := checkContext(); err != nil {
-		return err
+	select {
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	default:
 	}
 
 	// Create an ordered list of page numbers since the LTX encoder requires it.
@@ -2270,8 +2264,10 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	if commit > prevCommit {
 		for pgno := prevCommit + 1; pgno <= commit; pgno++ {
-			if err := checkContext(); err != nil {
-				return err
+			select {
+			case <-ctx.Done():
+				return context.Cause(ctx)
+			default:
 			}
 			if pgno == lockPgno {
 				continue
@@ -2286,8 +2282,10 @@ func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os
 
 	data := make([]byte, db.pageSize)
 	for _, pgno := range pgnos {
-		if err := checkContext(); err != nil {
-			return err
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		default:
 		}
 		if offset, ok := pageMap[pgno]; ok {
 			db.Logger.Log(ctx, internal.LevelTrace, "encode page from wal", "txid", enc.Header().MinTXID, "offset", offset, "pgno", pgno, "type", "walonly")
