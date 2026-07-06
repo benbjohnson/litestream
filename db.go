@@ -465,27 +465,6 @@ func (db *DB) finishSyncDiag(err error) {
 	}
 }
 
-func (db *DB) beginSyncExecutorWait() {
-	db.syncDiag.Lock()
-	defer db.syncDiag.Unlock()
-	if db.syncDiag.executorWaiterCount == 0 {
-		db.syncDiag.executorWaitStarted = time.Now()
-	}
-	db.syncDiag.executorWaiterCount++
-}
-
-func (db *DB) finishSyncExecutorWait() {
-	db.syncDiag.Lock()
-	defer db.syncDiag.Unlock()
-	if db.syncDiag.executorWaiterCount == 0 {
-		return
-	}
-	db.syncDiag.executorWaiterCount--
-	if db.syncDiag.executorWaiterCount == 0 {
-		db.syncDiag.executorWaitStarted = time.Time{}
-	}
-}
-
 // IsOpen returns true if the database has been opened.
 func (db *DB) IsOpen() bool {
 	db.mu.RLock()
@@ -1242,8 +1221,22 @@ func (db *DB) lockExec(ctx context.Context) error {
 	if db.execSem.TryAcquire(1) {
 		return nil
 	}
-	db.beginSyncExecutorWait()
-	defer db.finishSyncExecutorWait()
+	db.syncDiag.Lock()
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Now()
+	}
+	db.syncDiag.executorWaiterCount++
+	db.syncDiag.Unlock()
+	defer func() {
+		db.syncDiag.Lock()
+		if db.syncDiag.executorWaiterCount > 0 {
+			db.syncDiag.executorWaiterCount--
+			if db.syncDiag.executorWaiterCount == 0 {
+				db.syncDiag.executorWaitStarted = time.Time{}
+			}
+		}
+		db.syncDiag.Unlock()
+	}()
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
 		return fmt.Errorf("wait for db sync executor: %w", cmp.Or(context.Cause(ctx), err))
