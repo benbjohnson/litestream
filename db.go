@@ -1507,10 +1507,8 @@ func calcWALSize(pageSize uint32, pageN uint32) int64 {
 	return int64(WALHeaderSize) + (int64(WALFrameHeaderSize+pageSize) * int64(pageN))
 }
 
-const bumpLitestreamSeqSQL = `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`
-
 func (db *DB) bumpLitestreamSeq(ctx context.Context) error {
-	_, err := db.db.ExecContext(ctx, bumpLitestreamSeqSQL)
+	_, err := db.db.ExecContext(ctx, `INSERT INTO _litestream_seq (id, seq) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET seq = seq + 1`)
 	return err
 }
 
