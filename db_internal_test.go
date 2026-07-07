@@ -542,7 +542,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
