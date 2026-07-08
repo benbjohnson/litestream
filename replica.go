@@ -699,6 +699,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
 		return err
 	}
+	if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
+		return fmt.Errorf("sync restore output dir: %w", err)
+	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
 		if err := checkIntegrity(ctx, opt.OutputPath, opt.IntegrityCheck); err != nil {
@@ -1085,6 +1088,9 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	// Rename to final path.
 	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
 		return fmt.Errorf("rename to output path: %w", err)
+	}
+	if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
+		return fmt.Errorf("sync restore output dir: %w", err)
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
@@ -1671,15 +1677,10 @@ func WriteTXIDFile(outputPath string, txid ltx.TXID) error {
 		return fmt.Errorf("rename txid file: %w", err)
 	}
 
-	dir, err := os.Open(filepath.Dir(txidPath))
-	if err != nil {
-		return fmt.Errorf("open txid dir for sync: %w", err)
-	}
-	if err := dir.Sync(); err != nil {
-		_ = dir.Close()
+	if err := internal.FsyncDir(filepath.Dir(txidPath)); err != nil {
 		return fmt.Errorf("sync txid dir: %w", err)
 	}
-	return dir.Close()
+	return nil
 }
 
 // ReadTXIDFile reads the TXID from a sidecar file at <outputPath>-txid.

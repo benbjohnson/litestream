@@ -2018,6 +2018,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		db.invalidatePosCache()
 		return result, fmt.Errorf("rename ltx file: %w", err)
 	}
+	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
+		db.maxLTXFileInfos.Lock()
+		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
+		db.maxLTXFileInfos.Unlock()
+		db.invalidatePosCache()
+		return result, fmt.Errorf("sync ltx dir: %w", err)
+	}
 
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
