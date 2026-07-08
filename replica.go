@@ -1,7 +1,6 @@
 package litestream
 
 import (
-	"cmp"
 	"context"
 	"crypto/rand"
 	"database/sql"
@@ -40,7 +39,7 @@ type Replica struct {
 	pos ltx.Pos // current replicated position
 
 	syncSem     *semaphore.Weighted
-	syncWaiters atomic.Int64 // goroutines queued on syncSem
+	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -231,7 +230,7 @@ func (r *Replica) lockSync(ctx context.Context) error {
 	r.syncWaiters.Add(1)
 	defer r.syncWaiters.Add(-1)
 	if err := r.syncSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("wait for replica sync: %w", cmp.Or(context.Cause(ctx), err))
+		return fmt.Errorf("wait for replica sync: %w", context.Cause(ctx))
 	}
 	return nil
 }
