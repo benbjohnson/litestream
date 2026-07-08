@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -35,10 +36,14 @@ import (
 	"github.com/benbjohnson/litestream/webdav"
 )
 
-// Build information.
-var (
-	Version = "(development build)"
-)
+// Version is set via -ldflags "-X main.Version=..." on release and Makefile
+// builds; otherwise it is resolved from embedded VCS build info at startup.
+var Version = defaultVersion
+
+func init() {
+	bi, _ := debug.ReadBuildInfo()
+	Version = resolveVersion(Version, bi)
+}
 
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
