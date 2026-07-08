@@ -2,7 +2,6 @@ package litestream
 
 import (
 	"bytes"
-	"cmp"
 	"context"
 	"database/sql"
 	"encoding/binary"
@@ -462,6 +461,24 @@ func (db *DB) finishSyncDiag(err error) {
 	db.syncDiag.updatedAt = time.Now()
 	if err != nil {
 		db.syncDiag.err = err.Error()
+	}
+}
+
+func (db *DB) beginSyncExecutorWait() {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Now()
+	}
+	db.syncDiag.executorWaiterCount++
+}
+
+func (db *DB) finishSyncExecutorWait() {
+	db.syncDiag.Lock()
+	defer db.syncDiag.Unlock()
+	db.syncDiag.executorWaiterCount--
+	if db.syncDiag.executorWaiterCount == 0 {
+		db.syncDiag.executorWaitStarted = time.Time{}
 	}
 }
 
@@ -1221,25 +1238,11 @@ func (db *DB) lockExec(ctx context.Context) error {
 	if db.execSem.TryAcquire(1) {
 		return nil
 	}
-	db.syncDiag.Lock()
-	if db.syncDiag.executorWaiterCount == 0 {
-		db.syncDiag.executorWaitStarted = time.Now()
-	}
-	db.syncDiag.executorWaiterCount++
-	db.syncDiag.Unlock()
-	defer func() {
-		db.syncDiag.Lock()
-		if db.syncDiag.executorWaiterCount > 0 {
-			db.syncDiag.executorWaiterCount--
-			if db.syncDiag.executorWaiterCount == 0 {
-				db.syncDiag.executorWaitStarted = time.Time{}
-			}
-		}
-		db.syncDiag.Unlock()
-	}()
+	db.beginSyncExecutorWait()
+	defer db.finishSyncExecutorWait()
 
 	if err := db.execSem.Acquire(ctx, 1); err != nil {
-		return fmt.Errorf("wait for db sync executor: %w", cmp.Or(context.Cause(ctx), err))
+		return fmt.Errorf("wait for db sync executor: %w", context.Cause(ctx))
 	}
 	return nil
 }
