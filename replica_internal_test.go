@@ -315,6 +315,50 @@ func mustBuildIncrementalLTX(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize,
 	return buf.Bytes()
 }
 
+// mustBuildSnapshotLTX encodes an LTX file containing the given pages
+// numbered sequentially from pgno 1 with commit set to the page count.
+func mustBuildSnapshotLTX(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize uint32, pages [][]byte) []byte {
+	tb.Helper()
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    uint32(len(pages)),
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		tb.Fatal(err)
+	}
+	for i, page := range pages {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(i + 1)}, page); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		tb.Fatal(err)
+	}
+
+	return buf.Bytes()
+}
+
+// newSQLiteHeaderPage returns a page containing a minimal SQLite file header.
+func newSQLiteHeaderPage(pageSize uint32) []byte {
+	page := make([]byte, pageSize)
+	copy(page, "SQLite format 3\x00")
+	binary.BigEndian.PutUint16(page[16:18], uint16(pageSize))
+	page[18], page[19] = 0x01, 0x01
+	return page
+}
+
 func mustCreateWritableDBFile(tb testing.TB) *os.File {
 	tb.Helper()
 
@@ -419,39 +463,11 @@ func TestApplyLTXFile_TruncatesAfterWrite(t *testing.T) {
 
 	info := &ltx.FileInfo{Level: 0, MinTXID: 10, MaxTXID: 10}
 
-	var buf bytes.Buffer
-	enc, err := ltx.NewEncoder(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hdr := ltx.Header{
-		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
-		PageSize:  pageSize,
-		Commit:    2,
-		MinTXID:   info.MinTXID,
-		MaxTXID:   info.MaxTXID,
-		Timestamp: time.Now().UnixMilli(),
-	}
-	if err := enc.EncodeHeader(hdr); err != nil {
-		t.Fatal(err)
-	}
-	page1 := make([]byte, pageSize)
-	copy(page1, []byte("SQLite format 3\000"))
-	page1[18], page1[19] = 0x01, 0x01
-	binary.BigEndian.PutUint16(page1[16:18], pageSize)
-	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, page1); err != nil {
-		t.Fatal(err)
-	}
 	page2 := bytes.Repeat([]byte{0xAB}, pageSize)
-	if err := enc.EncodePage(ltx.PageHeader{Pgno: 2}, page2); err != nil {
-		t.Fatal(err)
-	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	ltxData := buf.Bytes()
+	ltxData := mustBuildSnapshotLTX(t, info.MinTXID, info.MaxTXID, pageSize, [][]byte{
+		newSQLiteHeaderPage(pageSize),
+		page2,
+	})
 	client := &followTestReplicaClient{}
 	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(ltxData)), nil
@@ -489,40 +505,12 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 
 	info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
 
-	var buf bytes.Buffer
-	enc, err := ltx.NewEncoder(&buf)
-	if err != nil {
-		t.Fatal(err)
-	}
-	hdr := ltx.Header{
-		Version:   ltx.Version,
-		Flags:     ltx.HeaderFlagNoChecksum,
-		PageSize:  pageSize,
-		Commit:    numPages,
-		MinTXID:   info.MinTXID,
-		MaxTXID:   info.MaxTXID,
-		Timestamp: time.Now().UnixMilli(),
-	}
-	if err := enc.EncodeHeader(hdr); err != nil {
-		t.Fatal(err)
-	}
-
 	pages := make([][]byte, numPages)
-	for i := uint32(0); i < numPages; i++ {
+	for i := range pages {
 		pages[i] = bytes.Repeat([]byte{byte(0x10 + i)}, pageSize)
-		if i == 0 {
-			copy(pages[i], []byte("SQLite format 3\000"))
-			pages[i][18], pages[i][19] = 0x01, 0x01
-		}
-		if err := enc.EncodePage(ltx.PageHeader{Pgno: i + 1}, pages[i]); err != nil {
-			t.Fatal(err)
-		}
 	}
-	if err := enc.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	ltxData := buf.Bytes()
+	pages[0] = newSQLiteHeaderPage(pageSize)
+	ltxData := mustBuildSnapshotLTX(t, info.MinTXID, info.MaxTXID, pageSize, pages)
 	client := &followTestReplicaClient{}
 	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
 		return io.NopCloser(bytes.NewReader(ltxData)), nil
