@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -1265,7 +1266,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		if err != nil {
 			db.syncErrorNCounter.Inc()
 		}
-		if err != nil && errors.Is(err, ErrDiskFull) {
+		if isDiskFullError(err) {
 			db.diskFullGauge.Set(1)
 		} else {
 			db.diskFullGauge.Set(0)
@@ -1500,12 +1501,14 @@ func isDiskFullError(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, ErrDiskFull) {
+	if errors.Is(err, ErrDiskFull) || errors.Is(err, syscall.ENOSPC) {
 		return true
 	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "no space left on device") ||
 		strings.Contains(errStr, "disk quota exceeded") ||
+		strings.Contains(errStr, "not enough space on the disk") ||
+		strings.Contains(errStr, "database or disk is full") ||
 		strings.Contains(errStr, "enospc") ||
 		strings.Contains(errStr, "edquot")
 }
@@ -2080,7 +2083,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	tmpFilename := filename + ".tmp"
 	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("mkdir", tmpFilename, txID, txID, err)
+			return result, NewLTXError("stage-mkdir", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, err
 	}
@@ -2088,7 +2091,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	ltxFile, err := db.openLTXFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("open", tmpFilename, txID, txID, err)
+			return result, NewLTXError("stage-open", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("open temp ltx file: %w", err)
 	}
@@ -2125,7 +2128,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		WALSalt2:  rd.salt2,
 	}); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
+			return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("encode ltx header: %w", err)
 	}
@@ -2142,7 +2145,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			})
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
-				return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
+				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
 			return result, fmt.Errorf("write ltx from db: %w", err)
 		}
@@ -2156,7 +2159,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			})
 		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
-				return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
+				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
 			return result, fmt.Errorf("write ltx from wal: %w", err)
 		}
@@ -2169,7 +2172,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	})
 	if err := enc.Close(); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("write", tmpFilename, txID, txID, err)
+			return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("close ltx encoder: %w", err)
 	}
@@ -2181,13 +2184,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	})
 	if err := ltxFile.Sync(); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("sync", tmpFilename, txID, txID, err)
+			return result, NewLTXError("stage-sync", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("sync ltx file: %w", err)
 	}
 	if err := ltxFile.Close(); err != nil {
 		if isDiskFullError(err) {
-			return result, newLTXStagingDiskFullError("close", tmpFilename, txID, txID, err)
+			return result, NewLTXError("stage-close", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 		}
 		return result, fmt.Errorf("close ltx file: %w", err)
 	}
@@ -3145,15 +3148,14 @@ func (db *DB) monitor() {
 
 			// Log with rate limiting to avoid log spam during persistent errors.
 			if time.Since(lastLogTime) >= SyncErrorLogInterval {
-				var diskFullErr *LTXStagingDiskFullError
-				if errors.As(err, &diskFullErr) {
+				var ltxErr *LTXError
+				if errors.Is(err, ErrDiskFull) && errors.As(err, &ltxErr) {
 					// Recovery is automatic but can lag up to max_backoff
 					// behind space being freed.
 					db.Logger.Error("disk full while staging ltx file, replication paused until space is freed",
 						"error", err,
-						"path", diskFullErr.Path,
-						"min_txid", diskFullErr.MinTXID,
-						"max_txid", diskFullErr.MaxTXID,
+						"path", ltxErr.Path,
+						"txid", ltx.TXID(ltxErr.MaxTXID).String(),
 						"consecutive_errors", consecutiveErrs,
 						"backoff", backoff,
 						"max_backoff", DefaultSyncBackoffMax)
