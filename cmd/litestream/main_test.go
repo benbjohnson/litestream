@@ -1001,6 +1001,91 @@ dbs:
 	})
 }
 
+// TestReplicaConfig_MaxSyncLTXFiles tests that max-sync-ltx-files is parsed
+// from YAML and applied to the replica.
+func TestReplicaConfig_MaxSyncLTXFiles(t *testing.T) {
+	t.Run("Specified", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+      max-sync-ltx-files: 32
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatal("expected one database")
+		}
+		if config.DBs[0].Replica == nil {
+			t.Fatal("expected replica to be set")
+		}
+		if config.DBs[0].Replica.MaxSyncLTXFiles == nil {
+			t.Fatal("expected max-sync-ltx-files to be set")
+		}
+		if *config.DBs[0].Replica.MaxSyncLTXFiles != 32 {
+			t.Errorf("expected max-sync-ltx-files of 32, got %v", *config.DBs[0].Replica.MaxSyncLTXFiles)
+		}
+
+		r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := r.MaxSyncLTXFiles, 32; got != want {
+			t.Errorf("Replica.MaxSyncLTXFiles=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("NotSpecified", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.DBs[0].Replica.MaxSyncLTXFiles != nil {
+			t.Errorf("expected max-sync-ltx-files to be nil when not specified, got %v", *config.DBs[0].Replica.MaxSyncLTXFiles)
+		}
+
+		r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := r.MaxSyncLTXFiles, litestream.DefaultMaxSyncLTXFiles; got != want {
+			t.Errorf("Replica.MaxSyncLTXFiles=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("GlobalDefault", func(t *testing.T) {
+		yaml := `
+max-sync-ltx-files: 16
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.DBs[0].Replica.MaxSyncLTXFiles == nil {
+			t.Fatal("expected max-sync-ltx-files to be inherited from global settings")
+		}
+		if *config.DBs[0].Replica.MaxSyncLTXFiles != 16 {
+			t.Errorf("expected max-sync-ltx-files of 16, got %v", *config.DBs[0].Replica.MaxSyncLTXFiles)
+		}
+	})
+}
+
 // TestConfig_Validate_CompactionLevels tests validation of compaction level intervals
 func TestConfig_Validate_CompactionLevels(t *testing.T) {
 	t.Run("ValidLevels", func(t *testing.T) {

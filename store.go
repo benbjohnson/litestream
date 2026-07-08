@@ -405,8 +405,8 @@ type SyncDBResult struct {
 // SyncDB forces an immediate sync for a database. If wait is true, blocks
 // until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
-// The timeout is best-effort: the database's sync executor lock wait is
-// context-aware, but the replica sync lock wait is not.
+// Lock waits are context-aware: the timeout is honored while waiting for
+// the database sync executor and the replica sync lock.
 func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
 	db := s.FindDB(path)
 	if db == nil {

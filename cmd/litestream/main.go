@@ -1097,6 +1097,10 @@ type ReplicaSettings struct {
 	SyncInterval       *time.Duration `yaml:"sync-interval"`
 	ValidationInterval *time.Duration `yaml:"validation-interval"`
 
+	// Maximum L0 files to upload in a single monitor sync run.
+	// Set to zero to process all pending L0 files in one run.
+	MaxSyncLTXFiles *int `yaml:"max-sync-ltx-files"`
+
 	// If true, automatically reset local state when LTX errors are detected.
 	// This allows recovery from corrupted/missing LTX files by forcing a fresh sync.
 	// Disabled by default to prevent silent data loss scenarios.
@@ -1177,6 +1181,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.ValidationInterval == nil && src.ValidationInterval != nil {
 		rs.ValidationInterval = src.ValidationInterval
+	}
+	if rs.MaxSyncLTXFiles == nil && src.MaxSyncLTXFiles != nil {
+		rs.MaxSyncLTXFiles = src.MaxSyncLTXFiles
 	}
 
 	// Recovery settings
@@ -1338,6 +1345,9 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	r := litestream.NewReplica(db)
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
+	}
+	if v := c.MaxSyncLTXFiles; v != nil {
+		r.MaxSyncLTXFiles = *v
 	}
 	if v := c.AutoRecover; v != nil {
 		r.AutoRecoverEnabled = *v
