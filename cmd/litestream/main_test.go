@@ -1671,6 +1671,86 @@ dbs:
 	})
 }
 
+// TestDBConfig_MaxSyncWALBytes tests that the max-sync-wal-bytes configuration
+// field is properly parsed from YAML and applied to the DB instance.
+func TestDBConfig_MaxSyncWALBytes(t *testing.T) {
+	t.Run("Specified", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /tmp/test.db
+    max-sync-wal-bytes: 16777216
+    replica:
+      url: file:///tmp/replica
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatal("expected one database config")
+		}
+
+		dbc := config.DBs[0]
+		if dbc.MaxSyncWALBytes == nil {
+			t.Fatal("expected max-sync-wal-bytes to be set")
+		}
+		if got, want := *dbc.MaxSyncWALBytes, int64(16777216); got != want {
+			t.Errorf("MaxSyncWALBytes = %d, want %d", got, want)
+		}
+
+		// Test that the value is properly applied to the DB
+		db, err := main.NewDBFromConfig(dbc)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got, want := db.MaxSyncWALBytes, int64(16777216); got != want {
+			t.Errorf("db.MaxSyncWALBytes = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("NotSpecified_UsesDefault", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatal("expected one database config")
+		}
+
+		dbc := config.DBs[0]
+		if dbc.MaxSyncWALBytes != nil {
+			t.Errorf("expected MaxSyncWALBytes to be nil when not specified, got %v", *dbc.MaxSyncWALBytes)
+		}
+
+		// Test that the DB uses the default value
+		db, err := main.NewDBFromConfig(dbc)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got, want := db.MaxSyncWALBytes, int64(litestream.DefaultMaxSyncWALBytes); got != want {
+			t.Errorf("db.MaxSyncWALBytes = %d, want default %d", got, want)
+		}
+	})
+}
+
 func TestFindSQLiteDatabases(t *testing.T) {
 	// Create a temporary directory using t.TempDir() - automatically cleaned up
 	tmpDir := t.TempDir()
