@@ -57,40 +57,6 @@ func (e *LTXError) Error() string {
 
 func (e *LTXError) Unwrap() error { return e.Err }
 
-type LTXStagingDiskFullError struct {
-	Op      string
-	Path    string
-	MinTXID uint64
-	MaxTXID uint64
-	Err     error
-}
-
-func newLTXStagingDiskFullError(op, path string, minTXID, maxTXID ltx.TXID, err error) *LTXStagingDiskFullError {
-	return &LTXStagingDiskFullError{
-		Op:      op,
-		Path:    path,
-		MinTXID: uint64(minTXID),
-		MaxTXID: uint64(maxTXID),
-		Err:     err,
-	}
-}
-
-func (e *LTXStagingDiskFullError) Error() string {
-	msg := e.Op + " ltx staging file"
-	if e.Path != "" {
-		msg += " " + e.Path
-	}
-	msg += ": disk full"
-	if e.Err != nil {
-		msg += ": " + e.Err.Error()
-	}
-	return msg
-}
-
-func (e *LTXStagingDiskFullError) Unwrap() error { return e.Err }
-
-func (e *LTXStagingDiskFullError) Is(target error) bool { return target == ErrDiskFull }
-
 // IsAutoRecoverable reports whether the underlying error indicates local state
 // corruption that can be fixed by resetting and re-downloading from remote.
 // Returns false for transient OS errors (EMFILE, EIO, EACCES) that should be

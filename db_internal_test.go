@@ -1321,9 +1321,9 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 				t.Fatal("expected disk full error")
 			}
 
-			var diskFullErr *LTXStagingDiskFullError
-			if !errors.As(err, &diskFullErr) {
-				t.Fatalf("expected *LTXStagingDiskFullError, got %T: %v", err, err)
+			var ltxErr *LTXError
+			if !errors.As(err, &ltxErr) {
+				t.Fatalf("expected *LTXError, got %T: %v", err, err)
 			}
 			if !errors.Is(err, ErrDiskFull) {
 				t.Fatalf("expected ErrDiskFull, got %v", err)
@@ -1331,16 +1331,16 @@ func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
 			if !errors.Is(err, syscall.ENOSPC) {
 				t.Fatalf("expected ENOSPC in error chain, got %v", err)
 			}
-			if diskFullErr.Path == "" {
+			if ltxErr.Path == "" {
 				t.Fatal("expected staging path")
 			}
-			if diskFullErr.Op != tt.failOp {
-				t.Fatalf("op=%q, want %q", diskFullErr.Op, tt.failOp)
+			if want := "stage-" + tt.failOp; ltxErr.Op != want {
+				t.Fatalf("op=%q, want %q", ltxErr.Op, want)
 			}
-			if diskFullErr.MinTXID != 1 || diskFullErr.MaxTXID != 1 {
-				t.Fatalf("unexpected LTX identity: min=%d max=%d", diskFullErr.MinTXID, diskFullErr.MaxTXID)
+			if ltxErr.MinTXID != 1 || ltxErr.MaxTXID != 1 {
+				t.Fatalf("unexpected LTX identity: min=%d max=%d", ltxErr.MinTXID, ltxErr.MaxTXID)
 			}
-			if !strings.Contains(err.Error(), "staging") || !strings.Contains(err.Error(), "disk full") {
+			if !strings.Contains(err.Error(), "stage-"+tt.failOp) || !strings.Contains(err.Error(), "disk full") {
 				t.Fatalf("error message %q should identify disk-full staging failure", err.Error())
 			}
 			if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 1 {
@@ -2199,6 +2199,26 @@ func TestIsDiskFullError(t *testing.T) {
 		{
 			name:     "wrapped disk full error",
 			err:      fmt.Errorf("sync failed: %w", errors.New("no space left on device")),
+			expected: true,
+		},
+		{
+			name:     "typed ErrDiskFull",
+			err:      fmt.Errorf("stage ltx: %w", ErrDiskFull),
+			expected: true,
+		},
+		{
+			name:     "typed syscall.ENOSPC",
+			err:      fmt.Errorf("write: %w", syscall.ENOSPC),
+			expected: true,
+		},
+		{
+			name:     "not enough space on the disk (windows)",
+			err:      errors.New("write file: There is not enough space on the disk."),
+			expected: true,
+		},
+		{
+			name:     "database or disk is full (sqlite)",
+			err:      errors.New("database or disk is full (13)"),
 			expected: true,
 		},
 	}
