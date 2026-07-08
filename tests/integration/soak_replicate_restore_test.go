@@ -183,11 +183,12 @@ func TestSoakReplicateRestore(t *testing.T) {
 
 	// Periodic restore+integrity check loop
 	var (
-		restoreCount     int
-		corruptionCount  int
-		restoreErrors    []string
-		lastRestoredRows int
-		prevSourceRows   int
+		restoreCount         int
+		corruptionCount      int
+		restoreErrors        []string
+		lastRestoredRows     int
+		prevSourceRows       int
+		firstCycleSourceRows int
 	)
 
 	restoreTicker := time.NewTicker(restoreInterval)
@@ -205,11 +206,15 @@ loop:
 			break loop
 		case <-restoreTicker.C:
 			restoreCount++
+			cycleErrsBefore := len(restoreErrors)
 			elapsed := time.Since(startTime)
 			sourceRows, err := countRows(sqlDB)
 			if err != nil {
 				restoreErrors = append(restoreErrors, fmt.Sprintf("cycle %d: count source rows: %v", restoreCount, err))
 				t.Errorf("  COUNT SOURCE ROWS FAILED: %v", err)
+			}
+			if restoreCount == 1 {
+				firstCycleSourceRows = sourceRows
 			}
 
 			t.Logf("[%v] Restore cycle #%d (source rows: %d, writes: %d, write errors: %d)",
@@ -281,10 +286,18 @@ loop:
 				restoredDB.Close()
 			}
 
-			// Clean up restored DB
-			os.Remove(restoredPath)
-			os.Remove(restoredPath + "-wal")
-			os.Remove(restoredPath + "-shm")
+			// Clean up restored DB, but keep the files for any cycle that
+			// recorded an error or corruption: they live in db.TempDir,
+			// which the nightly workflow uploads for post-mortem when
+			// SOAK_KEEP_TEMP is set. Healthy restores are removed to bound
+			// disk use over long soaks.
+			if len(restoreErrors) > cycleErrsBefore {
+				t.Logf("  keeping restored DB for post-mortem: %s", restoredPath)
+			} else {
+				os.Remove(restoredPath)
+				os.Remove(restoredPath + "-wal")
+				os.Remove(restoredPath + "-shm")
+			}
 
 			// Restart litestream. The helper waits for startup internally.
 			if err := db.StartLitestreamWithConfig(configPath); err != nil {
@@ -342,6 +355,20 @@ loop:
 		t.Fatal("FAILED: no writes succeeded; soak applied no load")
 	}
 
+	// Write-path liveness: a writer that dies mid-soak leaves counts flat,
+	// so the shrink/lag checks above pass trivially.
+	if attempts := totalWrites.Load() + writeErrs.Load(); writeErrs.Load()*100 > attempts {
+		t.Fatalf("FAILED: %d write error(s) in %d attempts exceeds 1%% threshold", writeErrs.Load(), attempts)
+	}
+
+	finalSourceRows, err := countRows(sqlDB)
+	if err != nil {
+		t.Fatalf("count final source rows: %v", err)
+	}
+	if finalSourceRows <= firstCycleSourceRows {
+		t.Fatalf("FAILED: source rows did not grow after first restore cycle (first=%d, final=%d); write path died mid-soak", firstCycleSourceRows, finalSourceRows)
+	}
+
 	if threshold := parseSoakP99Threshold(t, 500*time.Millisecond); stats.p99 > threshold {
 		t.Errorf("P99 write latency %v exceeds %v threshold", stats.p99, threshold)
 	}
@@ -352,10 +379,11 @@ loop:
 func parseSoakP99Threshold(t *testing.T, defaultThreshold time.Duration) time.Duration {
 	t.Helper()
 	if v := os.Getenv("SOAK_P99_THRESHOLD"); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
+		d, err := time.ParseDuration(v)
+		if err != nil {
+			t.Fatalf("invalid SOAK_P99_THRESHOLD %q: %v", v, err)
 		}
-		t.Logf("Warning: invalid SOAK_P99_THRESHOLD %q, using default %v", v, defaultThreshold)
+		return d
 	}
 	return defaultThreshold
 }
@@ -396,7 +424,7 @@ func parseSoakDuration(t *testing.T, defaultDuration time.Duration) time.Duratio
 		if mins, err := strconv.Atoi(v); err == nil {
 			return time.Duration(mins) * time.Minute
 		}
-		t.Logf("Warning: invalid SOAK_DURATION %q, using default %v", v, defaultDuration)
+		t.Fatalf("invalid SOAK_DURATION %q: must be a duration (e.g. 30m) or whole minutes", v)
 	}
 	return defaultDuration
 }
