@@ -3059,6 +3059,139 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			t.Error("expected explicit SignPayload=false to override R2 default")
 		}
 	})
+
+	t.Run("URLWithUploadParams", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?part-size=10485760&concurrency=4",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 10485760 {
+			t.Errorf("expected PartSize 10485760, got %d", client.PartSize)
+		}
+		if client.Concurrency != 4 {
+			t.Errorf("expected Concurrency 4, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("URLWithUploadParamsCamelCase", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?partSize=8388608",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 8388608 {
+			t.Errorf("expected PartSize 8388608, got %d", client.PartSize)
+		}
+
+		config = &main.ReplicaConfig{
+			URL: "s3://mybucket/path?partSize=8388608&part-size=1048576",
+		}
+
+		client, err = main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 8388608 {
+			t.Errorf("expected camelCase partSize to win, got %d", client.PartSize)
+		}
+	})
+
+	t.Run("ConfigOverridesQueryUploadParams", func(t *testing.T) {
+		partSize := main.ByteSize(5 * 1024 * 1024)
+		concurrency := 8
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?part-size=1048576&concurrency=2",
+			ReplicaSettings: main.ReplicaSettings{
+				PartSize:    &partSize,
+				Concurrency: &concurrency,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != int64(5*1024*1024) {
+			t.Errorf("expected config PartSize %d to override query, got %d", int64(5*1024*1024), client.PartSize)
+		}
+		if client.Concurrency != 8 {
+			t.Errorf("expected config Concurrency 8 to override query, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("InvalidUploadParams", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			url   string
+			param string
+		}{
+			{"part-size_non_numeric", "s3://mybucket/path?part-size=abc", "part-size"},
+			{"part-size_zero", "s3://mybucket/path?part-size=0", "part-size"},
+			{"part-size_negative", "s3://mybucket/path?part-size=-1", "part-size"},
+			{"concurrency_non_numeric", "s3://mybucket/path?concurrency=abc", "concurrency"},
+			{"concurrency_zero", "s3://mybucket/path?concurrency=0", "concurrency"},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: tt.url}, nil)
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tt.url)
+				}
+				if !strings.Contains(err.Error(), tt.param) {
+					t.Errorf("expected error to name parameter %q, got %q", tt.param, err.Error())
+				}
+			})
+		}
+	})
+
+	t.Run("R2QueryConcurrencyOverride", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://bucket/db?endpoint=https://accountid.r2.cloudflarestorage.com&concurrency=5",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Concurrency != 5 {
+			t.Errorf("expected query concurrency 5 to override R2 default, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("UploadParamsParity", func(t *testing.T) {
+		url := "s3://mybucket/path?endpoint=http://localhost:9000&part-size=8388608&concurrency=4"
+
+		urlClient, err := litestream.NewReplicaClientFromURL(url)
+		if err != nil {
+			t.Fatalf("URL factory error: %v", err)
+		}
+		uc := urlClient.(*s3.ReplicaClient)
+
+		cc, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: url}, nil)
+		if err != nil {
+			t.Fatalf("Config factory error: %v", err)
+		}
+
+		if uc.PartSize != cc.PartSize {
+			t.Errorf("PartSize: URL=%d, Config=%d", uc.PartSize, cc.PartSize)
+		}
+		if uc.Concurrency != cc.Concurrency {
+			t.Errorf("Concurrency: URL=%d, Config=%d", uc.Concurrency, cc.Concurrency)
+		}
+	})
 }
 
 func TestGlobalDefaults(t *testing.T) {

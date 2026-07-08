@@ -17,7 +17,6 @@ import (
 	"path"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -187,20 +186,16 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		requireMD5 = v
 		requireMD5Set = true
 	}
-	if v := query.Get("concurrency"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			concurrency = n
-			concurrencySet = true
-		}
+	if v, ok, err := litestream.IntQueryValue(query, "concurrency"); err != nil {
+		return nil, err
+	} else if ok {
+		concurrency = int(v)
+		concurrencySet = true
 	}
-	if v := query.Get("partSize"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			partSize = n
-		}
-	} else if v := query.Get("part-size"); v != "" {
-		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
-			partSize = n
-		}
+	if v, ok, err := litestream.IntQueryValue(query, "partSize", "part-size"); err != nil {
+		return nil, err
+	} else if ok {
+		partSize = v
 	}
 	if v := query.Get("storageClass"); v != "" {
 		storageClass = v
