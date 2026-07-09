@@ -53,8 +53,8 @@ type Replica struct {
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
 
-	// Maximum L0 files to upload in a single monitor sync run.
-	// Set to zero to process all pending L0 files in one run.
+	// Maximum L0 files to upload in a single monitor sync batch.
+	// Set to zero to process all pending L0 files in one batch.
 	MaxSyncLTXFiles int
 
 	// If true, replica monitors database for changes automatically.
@@ -142,8 +142,18 @@ func (r *Replica) Stop(hard bool) (err error) {
 // Sync copies new WAL frames from the shadow WAL to the replica client.
 // Only one Sync can run at a time to prevent concurrent uploads of the same file.
 func (r *Replica) Sync(ctx context.Context) (err error) {
-	_, err = r.syncOnce(ctx, 0)
-	return err
+	return r.sync(ctx, 0)
+}
+
+func (r *Replica) sync(ctx context.Context, maxSyncLTXFiles int) error {
+	for {
+		result, err := r.syncOnce(ctx, maxSyncLTXFiles)
+		if err != nil {
+			return err
+		} else if !result.limited {
+			return nil
+		}
+	}
 }
 
 type replicaSyncResult struct {
@@ -427,7 +437,7 @@ func (r *Replica) monitor(ctx context.Context) {
 		notify = r.db.Notify()
 
 		// Synchronize the shadow wal into the replication directory.
-		if _, err := r.syncOnce(ctx, r.MaxSyncLTXFiles); err != nil {
+		if err := r.sync(ctx, r.MaxSyncLTXFiles); err != nil {
 			if errors.Is(err, errReplicaWaitForData) {
 				continue
 			}
