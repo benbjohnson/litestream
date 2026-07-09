@@ -31,6 +31,14 @@ type testReplicaClient struct {
 	dir string
 }
 
+type earlyReturnSnapshotClient struct {
+	*testReplicaClient
+}
+
+func (c *earlyReturnSnapshotClient) WriteLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
+}
+
 func (c *testReplicaClient) Init(_ context.Context) error { return nil }
 
 func (c *testReplicaClient) SetLogger(_ *slog.Logger) {}
@@ -4197,6 +4205,57 @@ func TestSyncRestoreIntegrity_WithCheckpoints(t *testing.T) {
 	}
 }
 
+func TestDB_SnapshotClosesReaderWhenReplicaReturnsEarly(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &earlyReturnSnapshotClient{testReplicaClient: &testReplicaClient{dir: t.TempDir()}}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if db.chkMu.TryLock() {
+			db.chkMu.Unlock()
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatal("checkpoint lock remains held after Snapshot returns")
+		case <-ticker.C:
+		}
+	}
+}
+
 // TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints verifies that a
 // snapshot's content matches its advertised position while checkpoints and
 // writes run concurrently. The position capture and chkMu read lock must be
@@ -4361,8 +4420,8 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 		if err := rf.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if closer, ok := r.(io.Closer); ok {
-			_ = closer.Close()
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
 		}
 
 		restoredDB, err := sql.Open("sqlite", restorePath)
