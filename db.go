@@ -195,6 +195,8 @@ type DB struct {
 // syncState holds mutable sync-tracking fields extracted from DB.
 // These fields are threaded through sync/checkpoint methods via pointer.
 type syncState struct {
+	truncatePassiveFailed bool
+
 	// syncedSinceCheckpoint tracks whether any data has been synced since
 	// the last checkpoint. Used to prevent time-based checkpoints from
 	// triggering when there are no actual database changes, which would
@@ -1406,31 +1408,45 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	if db.pageSize == 0 {
 		return nil
 	}
+	if !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
+		exec.state.truncatePassiveFailed = false
+	}
 
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.exceedsTruncateThreshold(origWALSize) {
 		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
 
-		// Try a PASSIVE checkpoint first: if it restarts the WAL and brings
-		// the synced offset below the threshold, the blocking TRUNCATE and
-		// its mandatory boundary snapshot are skipped.
-		if restarted, err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
-			if !isSQLiteBusyError(err) {
-				return err
+		if !exec.state.truncatePassiveFailed {
+			// Try a PASSIVE checkpoint first: if it restarts the WAL and brings
+			// the synced offset below the threshold, the blocking TRUNCATE and
+			// its mandatory boundary snapshot are skipped.
+			if restarted, err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
+				if !isSQLiteBusyError(err) {
+					return err
+				}
+				exec.state.truncatePassiveFailed = true
+				db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+			} else if restarted {
+				exec.state.truncatePassiveFailed = false
+				if !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
+					db.Logger.Info("wal restarted by passive checkpoint, skipping truncate checkpoint",
+						"wal_size", origWALSize,
+						"threshold", truncateThreshold)
+					return nil
+				}
+			} else {
+				exec.state.truncatePassiveFailed = true
 			}
-			db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
-		} else if restarted && !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
-			db.Logger.Info("wal restarted by passive checkpoint, skipping truncate checkpoint",
-				"wal_size", origWALSize,
-				"threshold", truncateThreshold)
-			return nil
 		}
 
 		db.Logger.Info("forcing truncate checkpoint",
 			"wal_size", origWALSize,
 			"threshold", truncateThreshold)
-		_, err := db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
+		restarted, err := db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
+		if restarted || !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
+			exec.state.truncatePassiveFailed = false
+		}
 		return err
 	}
 
