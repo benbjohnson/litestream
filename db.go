@@ -2677,20 +2677,28 @@ type snapshotReadPosition struct {
 	pageSize     int
 	walEndOffset int64
 	db           *DB
+	closeOnce    sync.Once
 }
 
 func (p *snapshotReadPosition) close() {
-	if p.db != nil {
-		p.db.chkMu.RUnlock()
-		p.db = nil
-	}
+	p.closeOnce.Do(func() { p.db.chkMu.RUnlock() })
+}
+
+type snapshotReadCloser struct {
+	*io.PipeReader
+	pos *snapshotReadPosition
+}
+
+func (r *snapshotReadCloser) Close() error {
+	defer r.pos.close()
+	return r.PipeReader.Close()
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
-// Internal checkpoints are disabled until the reader is fully drained or
-// closed (it implements io.Closer). An abandoned reader blocks checkpoints
-// for the life of the process.
-func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+// Internal checkpoints remain disabled until the reader reaches EOF or is
+// closed. Callers must close readers they do not fully consume; abandoning a
+// reader blocks checkpoints indefinitely.
+func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
 		return ltx.Pos{}, nil, err
@@ -2784,7 +2792,7 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 	return dec.Header().WALOffset + dec.Header().WALSize, nil
 }
 
-func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.Reader, error) {
+func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.ReadCloser, error) {
 	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
 
 	// TODO(ltx): Read database size from database header.
@@ -2878,7 +2886,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		_ = pw.Close()
 	}()
 
-	return pr, nil
+	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
@@ -2920,12 +2928,10 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = r.Close() }()
 
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
-		if closer, ok := r.(io.Closer); ok {
-			_ = closer.Close()
-		}
 		return info, err
 	}
 
