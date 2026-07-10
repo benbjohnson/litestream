@@ -2645,13 +2645,21 @@ type snapshotReadPosition struct {
 	pageSize     int
 	walEndOffset int64
 	db           *DB
+	closeOnce    sync.Once
 }
 
 func (p *snapshotReadPosition) close() {
-	if p.db != nil {
-		p.db.chkMu.RUnlock()
-		p.db = nil
-	}
+	p.closeOnce.Do(func() { p.db.chkMu.RUnlock() })
+}
+
+type snapshotReadCloser struct {
+	*io.PipeReader
+	pos *snapshotReadPosition
+}
+
+func (r *snapshotReadCloser) Close() error {
+	defer r.pos.close()
+	return r.PipeReader.Close()
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
@@ -2846,7 +2854,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		_ = pw.Close()
 	}()
 
-	return pr, nil
+	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
