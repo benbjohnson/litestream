@@ -1888,6 +1888,7 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Token = c.Token
 
 	// Set TLS options
+	client.TLS = c.TLS
 	client.RootCAs = c.RootCAs
 	client.ClientCert = c.ClientCert
 	client.ClientKey = c.ClientKey

@@ -1,9 +1,16 @@
 package nats
 
 import (
+	"crypto/x509"
+	"encoding/pem"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
+	natsgo "github.com/nats-io/nats.go"
 	"github.com/superfly/ltx"
 )
 
@@ -12,6 +19,116 @@ func TestReplicaClient_Type(t *testing.T) {
 	if got, want := client.Type(), "nats"; got != want {
 		t.Fatalf("Type()=%s, want %s", got, want)
 	}
+}
+
+func TestReplicaClient_options_TLS(t *testing.T) {
+	t.Run("Disabled", func(t *testing.T) {
+		options := applyOptions(t, NewReplicaClient().options())
+		if options.Secure {
+			t.Fatal("Secure=true, want false")
+		}
+	})
+
+	t.Run("Explicit", func(t *testing.T) {
+		client := NewReplicaClient()
+		client.TLS = true
+
+		options := applyOptions(t, client.options())
+		if !options.Secure {
+			t.Fatal("Secure=false, want true")
+		}
+	})
+
+	t.Run("RootCAs", func(t *testing.T) {
+		rootCAPath, _, _ := writeTLSFiles(t)
+		client := NewReplicaClient()
+		client.RootCAs = []string{rootCAPath}
+
+		options := applyOptions(t, client.options())
+		if !options.Secure {
+			t.Fatal("Secure=false, want true")
+		}
+		if options.RootCAsCB == nil {
+			t.Fatal("RootCAsCB=nil")
+		}
+		pool, err := options.RootCAsCB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rootPEM, err := os.ReadFile(rootCAPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := x509.NewCertPool()
+		if !want.AppendCertsFromPEM(rootPEM) {
+			t.Fatal("append root CA")
+		}
+		if !pool.Equal(want) {
+			t.Fatal("unexpected root CAs")
+		}
+	})
+
+	t.Run("ClientCertificate", func(t *testing.T) {
+		_, certPath, keyPath := writeTLSFiles(t)
+		client := NewReplicaClient()
+		client.ClientCert = certPath
+		client.ClientKey = keyPath
+
+		options := applyOptions(t, client.options())
+		if !options.Secure {
+			t.Fatal("Secure=false, want true")
+		}
+		if options.TLSCertCB == nil {
+			t.Fatal("TLSCertCB=nil")
+		}
+		cert, err := options.TLSCertCB()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := len(cert.Certificate), 1; got != want {
+			t.Fatalf("Certificates=%d, want %d", got, want)
+		}
+	})
+}
+
+func applyOptions(t *testing.T, options []natsgo.Option) natsgo.Options {
+	t.Helper()
+
+	config := natsgo.GetDefaultOptions()
+	for _, option := range options {
+		if err := option(&config); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return config
+}
+
+func writeTLSFiles(t *testing.T) (rootCAPath, certPath, keyPath string) {
+	t.Helper()
+
+	server := httptest.NewTLSServer(http.NotFoundHandler())
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "cert.pem")
+	keyPath = filepath.Join(dir, "key.pem")
+	rootCAPath = certPath
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+	if err := os.WriteFile(certPath, certPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	keyDER, err := x509.MarshalPKCS8PrivateKey(server.TLS.Certificates[0].PrivateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER})
+	if err := os.WriteFile(keyPath, keyPEM, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	return rootCAPath, certPath, keyPath
 }
 
 func TestReplicaClient_ltxPath(t *testing.T) {
