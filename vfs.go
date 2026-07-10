@@ -2566,6 +2566,14 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		return nil
 	}
 
+	// In write mode the local writer is authoritative: a polled commit at or
+	// below the local commit is the writer's own older upload (raced with sync),
+	// not a truncation. Replacing here would purge fresh pages and regress
+	// f.commit.
+	if f.writeEnabled && newCommit <= f.commit {
+		replaceIndex = false
+	}
+
 	// Apply updates and invalidate cache entries for updated pages
 	invalidateN := 0
 	target := f.index
