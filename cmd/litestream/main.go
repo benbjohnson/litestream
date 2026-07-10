@@ -1543,6 +1543,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Detect S3-compatible provider endpoints for applying appropriate defaults.
 	// These providers require specific settings to work correctly with AWS SDK v2.
+	isHetzner := litestream.IsHetznerEndpoint(endpoint)
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
 	if !isTigris && !endpointWasSet && litestream.IsTigrisEndpoint(c.Endpoint) {
 		isTigris = true
@@ -1565,7 +1566,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
