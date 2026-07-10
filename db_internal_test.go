@@ -4239,21 +4239,10 @@ func TestDB_SnapshotClosesReaderWhenReplicaReturnsEarly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	deadline := time.NewTimer(time.Second)
-	defer deadline.Stop()
-	ticker := time.NewTicker(time.Millisecond)
-	defer ticker.Stop()
-	for {
-		if db.chkMu.TryLock() {
-			db.chkMu.Unlock()
-			return
-		}
-		select {
-		case <-deadline.C:
-			t.Fatal("checkpoint lock remains held after Snapshot returns")
-		case <-ticker.C:
-		}
+	if !db.chkMu.TryLock() {
+		t.Fatal("checkpoint lock remains held after Snapshot returns")
 	}
+	db.chkMu.Unlock()
 }
 
 // TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints verifies that a
