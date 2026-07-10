@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -13,7 +14,22 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/mock"
 )
+
+func TestStore_Open_InitError(t *testing.T) {
+	want := errors.New("init error")
+	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error { return want },
+	})
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("Open() error = %v, want %v", err, want)
+	}
+}
 
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
