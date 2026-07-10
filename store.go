@@ -178,8 +178,14 @@ func (s *Store) Open(ctx context.Context) error {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				return db.Open()
 			}
+
+			if db.Replica != nil && db.Replica.Client != nil {
+				if err := db.Replica.Client.Init(ctx); err != nil {
+					return fmt.Errorf("initialize replica client for %q: %w", db.Path(), err)
+				}
+			}
+			return db.Open()
 		})
 	}
 	if err := g.Wait(); err != nil {

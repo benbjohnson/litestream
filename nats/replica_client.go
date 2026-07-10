@@ -130,12 +130,14 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.nc != nil {
+	if c.objectStore != nil {
 		return nil
 	}
 
-	if err := c.connect(ctx); err != nil {
-		return fmt.Errorf("nats: failed to connect: %w", err)
+	if c.nc == nil {
+		if err := c.connect(ctx); err != nil {
+			return fmt.Errorf("nats: failed to connect: %w", err)
+		}
 	}
 
 	if err := c.initObjectStore(ctx); err != nil {
