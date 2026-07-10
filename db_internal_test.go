@@ -971,6 +971,45 @@ func TestDB_CheckpointTruncateSkipsRepeatedPassiveWithoutProgress(t *testing.T) 
 	}
 }
 
+func TestDB_ExceedsTruncateThreshold(t *testing.T) {
+	const pageSize = 4096
+
+	tests := []struct {
+		name          string
+		truncatePageN int
+		walSize       int64
+		want          bool
+	}{
+		{
+			name:          "configured threshold",
+			truncatePageN: 2,
+			walSize:       calcWALSize(pageSize, 2),
+			want:          true,
+		},
+		{
+			name:          "zero below default threshold",
+			truncatePageN: 0,
+			walSize:       calcWALSize(pageSize, DefaultTruncatePageN) - 1,
+			want:          false,
+		},
+		{
+			name:          "zero at default threshold",
+			truncatePageN: 0,
+			walSize:       calcWALSize(pageSize, DefaultTruncatePageN),
+			want:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &DB{pageSize: pageSize, TruncatePageN: tt.truncatePageN}
+			if got := db.exceedsTruncateThreshold(tt.walSize); got != tt.want {
+				t.Fatalf("exceedsTruncateThreshold(%d)=%t, want %t", tt.walSize, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
 	if err != nil {
