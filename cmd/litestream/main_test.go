@@ -464,6 +464,49 @@ dbs:
 	}
 }
 
+func TestNewNATSReplicaFromConfig_TLSOverridesGlobalDefault(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+tls: true
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: false
+  - path: /tmp/db-inherits
+    replica:
+      type: nats
+      bucket: bucket
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "ExplicitFalse", index: 0, want: false},
+		{name: "InheritedTrue", index: 1, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, err := main.NewReplicaFromConfig(config.DBs[test.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, ok := r.Client.(*nats.ReplicaClient)
+			if !ok {
+				t.Fatal("unexpected replica type")
+			}
+			if client.TLS != test.want {
+				t.Fatalf("TLS=%v, want %v", client.TLS, test.want)
+			}
+		})
+	}
+}
+
 func TestNewSFTPReplicaFromConfig(t *testing.T) {
 	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnK0+GdwOelXlAXdqLx/qvS7WHMr3rH7zW2+0DtmK5r"
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{
