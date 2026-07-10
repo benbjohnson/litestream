@@ -6,7 +6,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/superfly/ltx"
@@ -262,6 +267,52 @@ func TestResumableReader(t *testing.T) {
 			t.Fatalf("reopen offset = %d, want 7", reopenOffset)
 		}
 	})
+}
+
+func TestResumableReader_BoundsConnectionsAcrossPartialReads(t *testing.T) {
+	data := []byte("0123456789abcdef")
+	var connectionN atomic.Int64
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		offset, err := strconv.Atoi(r.URL.Query().Get("offset"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)-offset))
+		_, _ = w.Write(data[offset : offset+1])
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connectionN.Add(1)
+		}
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+
+	client := server.Client()
+	opener := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("%s?offset=%d", server.URL, offset), nil)
+			if err != nil {
+				return nil, err
+			}
+			resp, err := client.Do(req)
+			if err != nil {
+				return nil, err
+			}
+			return resp.Body, nil
+		},
+	}
+
+	r := newTestResumableReader(opener, int64(len(data)), data)
+	_, err := io.ReadAll(r)
+	if err == nil {
+		t.Error("ReadAll() error=nil, want retry limit error")
+	}
+	if got, max := connectionN.Load(), int64(resumableReaderMaxRetries+1); got > max {
+		t.Errorf("connections=%d, want at most %d", got, max)
+	}
 }
 
 // newTestResumableReader creates a resumableReader for testing. The initial
