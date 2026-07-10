@@ -2173,6 +2173,12 @@ func (f *VFSFile) FileSize() (size int64, err error) {
 			size = v
 		}
 	}
+	// Honor the committed page count: after a sync clears f.dirty the synced
+	// pages live only in the cache (not the index), so without this the size
+	// would shrink below page 1's header and SQLite would report SQLITE_CORRUPT.
+	if v := int64(f.commit) * int64(pageSize); v > size {
+		size = v
+	}
 	f.mu.Unlock()
 
 	f.logger.Debug("file size", "size", size)
