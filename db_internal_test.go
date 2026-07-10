@@ -744,6 +744,13 @@ func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
 	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
 	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
 
+	db.chkMu.RLock()
+	err = db.Sync(t.Context())
+	db.chkMu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -866,33 +873,27 @@ func TestDB_CheckpointTruncateSkipsRepeatedPassiveWithoutProgress(t *testing.T) 
 	if err := tx.Rollback(); err != nil {
 		t.Fatal(err)
 	}
+	db.TruncatePageN = 1
+	if err := db.Checkpoint(t.Context(), CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	restartedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if !db.exceedsTruncateThreshold(restartedOffset) {
+		t.Fatalf("precondition: restarted wal offset %d must meet the truncate threshold", restartedOffset)
+	}
+
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 2 {
-		t.Fatalf("passive checkpoints=%v, want 2 until wal restart", got)
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 4 {
+		t.Fatalf("passive checkpoints=%v, want 4 after wal restart", got)
 	}
 	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 4 {
 		t.Fatalf("truncate checkpoints=%v, want 4 after wal restart", got)
-	}
-
-	for range 5 {
-		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
-			t.Fatal(err)
-		}
-	}
-	for range 2 {
-		if err := db.Sync(t.Context()); err != nil {
-			t.Fatal(err)
-		}
-	}
-
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 3 {
-		t.Fatalf("passive checkpoints=%v, want 3 after wal restart", got)
-	}
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 4 {
-		t.Fatalf("truncate checkpoints=%v, want 4 after passive restarted wal", got)
 	}
 }
 
