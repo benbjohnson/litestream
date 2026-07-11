@@ -176,6 +176,15 @@ type DB struct {
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
+
+	// Test seam: when non-nil, called with the freshly-built incremental WAL
+	// page map in sync() so tests can simulate an incomplete WAL view (the
+	// #1198 condition). Never set in production.
+	corruptPageMapForTest func(pageMap map[uint32]int64, prevCommit, commit uint32)
+
+	// Test seam: when true, skips the missing-newly-allocated-page guard so a
+	// test can reproduce the pre-fix corruption. Never set in production.
+	disableMissingPageGuardForTest bool
 }
 
 // syncState holds mutable sync-tracking fields extracted from DB.
@@ -1522,6 +1531,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
 	info.salt1 = dec.Header().WALSalt1
 	info.salt2 = dec.Header().WALSalt2
+	info.prevCommit = dec.Header().Commit
 
 	// If LTX WAL offset is larger than real WAL then the WAL has been truncated.
 	if fi, err := os.Stat(db.WALPath()); err != nil {
@@ -1710,6 +1720,7 @@ type syncInfo struct {
 	snapshotting        bool   // if true, a full snapshot is required
 	reason              string // reason for snapshot
 	clearSyncedToWALEnd bool
+	prevCommit          uint32 // commit (page count) of the previous LTX, 0 if unknown
 }
 
 type syncResult struct {
@@ -1802,6 +1813,25 @@ func (exec *syncExecutor) applySyncResult(result syncResult) {
 	exec.synced = exec.synced || result.synced
 }
 
+// missingNewlyAllocatedPage reports whether the page map is missing any page
+// in the range (prevCommit, commit] that the database grew into. Those pages
+// are newly allocated by this transaction and therefore must be present in the
+// WAL view; an absent one means the incremental sync captured an incomplete
+// view of the transaction (see #1198) and a snapshot must be taken instead so
+// the replica does not gain a silently-corrupt increment (see #1199). The lock
+// page never carries data and is skipped.
+func missingNewlyAllocatedPage(pageMap map[uint32]int64, prevCommit, commit, lockPgno uint32) (uint32, bool) {
+	for pgno := prevCommit + 1; pgno <= commit; pgno++ {
+		if pgno == lockPgno {
+			continue
+		}
+		if _, ok := pageMap[pgno]; !ok {
+			return pgno, true
+		}
+	}
+	return 0, false
+}
+
 // sync copies pending bytes from the real WAL to LTX.
 // Returns synced=true if an LTX file was created (i.e., there were new pages to sync).
 func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, info syncInfo) (result syncResult, err error) {
@@ -1891,6 +1921,10 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		commit = walCommit
 	}
 
+	if db.corruptPageMapForTest != nil && !info.snapshotting {
+		db.corruptPageMapForTest(pageMap, info.prevCommit, commit)
+	}
+
 	var sz int64
 	if maxOffset > 0 {
 		sz = maxOffset - info.offset
@@ -1913,6 +1947,49 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	if !info.snapshotting && sz == 0 {
 		db.Logger.Log(ctx, internal.LevelTrace, "sync: skip", "reason", "no new wal pages")
 		return result, nil
+	}
+
+	// Guard against writing an incremental LTX that grows the database past
+	// pages it does not contain. When commit increases, the newly allocated
+	// pages (prevCommit+1 .. commit) exist nowhere but this transaction, so
+	// every one of them MUST be present in the page map. If any is absent the
+	// WAL view is incomplete (e.g. frames skipped after a concurrent
+	// checkpoint, see #1198): the incremental encoder does not enforce page
+	// contiguity, so such a file replicates and compacts without error and
+	// only fails later when restore re-encodes it as a snapshot with
+	// "nonsequential page numbers in snapshot transaction" (see #1199).
+	// Fall back to a full snapshot, which is always self-consistent, rather
+	// than persisting a silently-corrupt increment.
+	if !db.disableMissingPageGuardForTest && !info.snapshotting && info.prevCommit != 0 && commit > info.prevCommit {
+		if pgno, ok := missingNewlyAllocatedPage(pageMap, info.prevCommit, commit, ltx.LockPgno(uint32(db.pageSize))); ok {
+			db.Logger.Warn("incremental sync missing newly-allocated page; forcing snapshot",
+				"pgno", pgno, "prevCommit", info.prevCommit, "commit", commit)
+			info.snapshotting = true
+			info.reason = "incremental wal view missing newly-allocated pages"
+
+			// Re-read from the start of the WAL so the snapshot captures the
+			// latest version of every page changed anywhere in the WAL, not
+			// just this partial view from info.offset. writeLTXFromDB reads any
+			// page absent from pageMap out of the main db file, but with
+			// litestream-owned checkpointing the main file does not yet contain
+			// pages changed in earlier un-checkpointed WAL frames; reusing the
+			// partial map would read those stale. This mirrors verify()'s other
+			// snapshot paths, which reset the offset to the WAL header.
+			info.offset = WALHeaderSize
+			if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
+				return result, fmt.Errorf("new wal reader, snapshot fallback: %w", err)
+			}
+			if pageMap, maxOffset, walCommit, err = rd.PageMap(ctx); err != nil {
+				return result, fmt.Errorf("page map, snapshot fallback: %w", err)
+			}
+			if walCommit > 0 {
+				commit = walCommit
+			}
+			sz = 0
+			if maxOffset > 0 {
+				sz = maxOffset - info.offset
+			}
+		}
 	}
 
 	tmpFilename := filename + ".tmp"

@@ -2637,3 +2637,271 @@ func TestReplicaMonitor_RecoversFromPositionError(t *testing.T) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+// TestMissingNewlyAllocatedPage covers the guard that prevents litestream from
+// writing an incremental LTX that grows the database past pages it does not
+// contain. See #1198 (incomplete WAL view after a concurrent checkpoint) and
+// #1199 (the resulting "nonsequential page numbers in snapshot transaction"
+// failure surfaced only at restore time).
+func TestMissingNewlyAllocatedPage(t *testing.T) {
+	const lockPgno = uint32(0) // 0 = no lock page in range for these cases
+
+	t.Run("AllNewPagesPresent", func(t *testing.T) {
+		pm := map[uint32]int64{7: 0, 8: 0, 9: 0}
+		if pgno, ok := missingNewlyAllocatedPage(pm, 6, 9, lockPgno); ok {
+			t.Fatalf("expected no missing page, got pgno=%d", pgno)
+		}
+	})
+
+	t.Run("GapInNewPages", func(t *testing.T) {
+		// Grew 6 -> 9 but only captured page 9 (the production shape: 28251,28281).
+		pm := map[uint32]int64{9: 0}
+		pgno, ok := missingNewlyAllocatedPage(pm, 6, 9, lockPgno)
+		if !ok {
+			t.Fatal("expected a missing newly-allocated page, got none")
+		}
+		if pgno != 7 {
+			t.Fatalf("expected first missing pgno=7, got %d", pgno)
+		}
+	})
+
+	t.Run("SparseLowPagesAllowed", func(t *testing.T) {
+		// Pages at/below prevCommit may be sparse (they exist in earlier LTX);
+		// only the grown range must be complete.
+		pm := map[uint32]int64{7: 0} // prevCommit=6, commit=7: only new page present
+		if pgno, ok := missingNewlyAllocatedPage(pm, 6, 7, lockPgno); ok {
+			t.Fatalf("expected no missing page for sparse low pages, got pgno=%d", pgno)
+		}
+	})
+
+	t.Run("NoGrowth", func(t *testing.T) {
+		// commit == prevCommit: loop body never runs, nothing required.
+		if pgno, ok := missingNewlyAllocatedPage(map[uint32]int64{}, 6, 6, lockPgno); ok {
+			t.Fatalf("expected no missing page when DB did not grow, got pgno=%d", pgno)
+		}
+	})
+
+	t.Run("LockPageSkipped", func(t *testing.T) {
+		// The lock page never carries data and must not be required.
+		pm := map[uint32]int64{6: 0, 8: 0} // 7 is the lock page, absent on purpose
+		if pgno, ok := missingNewlyAllocatedPage(pm, 5, 8, 7); ok {
+			t.Fatalf("expected lock page to be skipped, got missing pgno=%d", pgno)
+		}
+	})
+}
+
+// TestDB_Verify_PrevCommitFromLTXHeader verifies the wiring the missing-page
+// guard depends on: verify() reports prevCommit equal to the Commit recorded in
+// the previous LTX header. Without this, the guard in sync() could never fire.
+func TestDB_Verify_PrevCommitFromLTXHeader(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close(context.Background())
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 40; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, make([]byte, 3000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(db.LTXPath(0, pos.TXID, pos.TXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	wantCommit := dec.Header().Commit
+	if wantCommit == 0 {
+		t.Fatal("previous LTX header Commit is 0; test setup did not grow the db")
+	}
+
+	info, err := db.verify(ctx, &db.syncState)
+	if err != nil {
+		t.Fatalf("verify() returned error: %v", err)
+	}
+	if info.prevCommit != wantCommit {
+		t.Fatalf("info.prevCommit=%d, want %d (from previous LTX header)", info.prevCommit, wantCommit)
+	}
+}
+
+// TestDB_RestoreSurvivesIncompleteWALView is the end-to-end regression for the
+// production outage (#1198/#1199).
+//
+// HONESTY NOTE: this does NOT trigger the #1198 race naturally. It injects the
+// *symptom* — an incremental sync whose WAL page map is missing a newly-
+// allocated page — via the corruptPageMapForTest seam, then drives a real
+// Replica.Restore and asserts the guard's effect. The natural reproducer
+// (concurrent writer + TRUNCATE checkpoint) does not produce the gap, because
+// the existing post-checkpoint-snapshot logic already covers that path; the
+// only natural occurrence on record is the production incident. So this proves
+// the guard converts the corruption into a clean restore, NOT that #1198 fires
+// on its own. The subtests discriminate: with the guard disabled the injected
+// gap makes restore fail with the production error; with it enabled, restore
+// succeeds with integrity_check=ok and every row present.
+func TestDB_RestoreSurvivesIncompleteWALView(t *testing.T) {
+	run := func(t *testing.T, disableGuard bool) (restoreErr error, integrity string, rows int) {
+		dir := t.TempDir()
+		dbPath := filepath.Join(dir, "db")
+
+		db := NewDB(dbPath)
+		db.MonitorInterval = 0
+		db.CheckpointInterval = 0
+		db.MinCheckpointPageN = 1000000
+		db.Replica = NewReplica(db)
+		db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+		db.Replica.MonitorEnabled = false
+		db.disableMissingPageGuardForTest = disableGuard
+
+		// Drop exactly one newly-allocated page from the first growing
+		// incremental sync's WAL view — the #1198 incomplete-view condition.
+		// With the guard disabled this gap reaches the replica (pre-fix
+		// corruption); with the guard enabled it forces a snapshot (the fix).
+		var injected bool
+		db.corruptPageMapForTest = func(pageMap map[uint32]int64, prevCommit, commit uint32) {
+			if injected || commit <= prevCommit {
+				return
+			}
+			lockPgno := ltx.LockPgno(uint32(db.pageSize))
+			for pgno := prevCommit + 1; pgno <= commit; pgno++ {
+				if pgno == lockPgno {
+					continue
+				}
+				if _, ok := pageMap[pgno]; ok {
+					delete(pageMap, pgno)
+					injected = true
+					return
+				}
+			}
+		}
+
+		if err := db.Open(); err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close(context.Background())
+
+		sqldb, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer sqldb.Close()
+		if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx := context.Background()
+		if err := db.Sync(ctx); err != nil { // initial snapshot
+			t.Fatal(err)
+		}
+		// Grow the DB so the next sync is a growing incremental.
+		for i := 0; i < 200; i++ {
+			if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, i, make([]byte, 4000)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.Sync(ctx); err != nil { // guard/injection happens here
+			t.Fatal(err)
+		}
+		if !injected {
+			t.Fatal("page-map injection never fired; test did not exercise the condition")
+		}
+		// A couple more growth+sync rounds for good measure.
+		for round := 0; round < 2; round++ {
+			for i := 0; i < 100; i++ {
+				if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, 1000+round*1000+i, make([]byte, 4000)); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatalf("replica sync: %v", err)
+		}
+		var liveCount int
+		if err := sqldb.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&liveCount); err != nil {
+			t.Fatal(err)
+		}
+
+		restorePath := filepath.Join(t.TempDir(), "restored.db")
+		restoreErr = db.Replica.Restore(ctx, RestoreOptions{OutputPath: restorePath})
+		if restoreErr != nil {
+			return restoreErr, "", 0
+		}
+
+		restored, err := sql.Open("sqlite", restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer restored.Close()
+		if err := restored.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+			t.Fatal(err)
+		}
+		if err := restored.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		if rows != liveCount {
+			t.Fatalf("restored row count=%d, want %d", rows, liveCount)
+		}
+		return nil, integrity, rows
+	}
+
+	t.Run("WithoutGuard_RestoreFails", func(t *testing.T) {
+		restoreErr, _, _ := run(t, true)
+		if restoreErr == nil {
+			t.Fatal("expected restore to fail without the guard, but it succeeded")
+		}
+		if !strings.Contains(restoreErr.Error(), "nonsequential page numbers") {
+			t.Fatalf("expected 'nonsequential page numbers' error, got: %v", restoreErr)
+		}
+		t.Logf("without guard, restore failed as expected: %v", restoreErr)
+	})
+
+	t.Run("WithGuard_RestoreSucceeds", func(t *testing.T) {
+		restoreErr, integrity, rows := run(t, false)
+		if restoreErr != nil {
+			t.Fatalf("restore failed with guard active: %v", restoreErr)
+		}
+		if integrity != "ok" {
+			t.Fatalf("restored db failed integrity_check: %q", integrity)
+		}
+		t.Logf("with guard, restore ok: integrity_check=ok, rows=%d", rows)
+	})
+}
