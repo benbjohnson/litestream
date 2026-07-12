@@ -5,18 +5,30 @@ Description=Litestream
 Restart=always
 ExecStart=/usr/bin/litestream replicate
 
-# Security hardening (conservative subset).
+# Security hardening.
 #
-# These directives need no per-deployment tuning and do not change how the
-# daemon reaches its databases, so they are safe to enable everywhere. Options
-# that depend on where your database lives or on capabilities (User=,
-# ProtectSystem=strict, ReadWritePaths=, CapabilityBoundingSet=, PrivateTmp,
-# ...) are intentionally left out of this baseline.
+# Litestream needs read/write access to each replicated SQLite database, its
+# -wal/-shm files, and a ".<db>-litestream" sidecar directory created alongside
+# them. Directives that depend on those deployment-specific paths (User=,
+# ProtectHome=, ProtectSystem=strict, ReadWritePaths=) are left commented below.
+# Options unknown to older systemd are ignored with a warning, so this file is
+# safe to ship across distributions.
 NoNewPrivileges=true
 ProtectSystem=full
+# For stronger isolation, run as the database owner and/or confine writes to
+# just the database directories:
+#User=litestream
+#Group=litestream
+#ProtectSystem=strict
+#ReadWritePaths=/var/lib/myapp
+#ProtectHome=true
 ProtectProc=invisible
 ProcSubset=pid
 PrivateDevices=true
+# PrivateTmp gives the service its own /tmp. If you enabled the (off-by-default)
+# control socket at a /tmp path, move it under /run instead or drop this line,
+# otherwise external `litestream` CLI clients cannot reach it.
+PrivateTmp=true
 ProtectClock=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -25,10 +37,24 @@ ProtectControlGroups=true
 ProtectHostname=true
 RestrictNamespaces=true
 LockPersonality=true
+MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RemoveIPC=true
+# Litestream needs no capabilities when it runs as the database owner (User=
+# above). In the default root deployment the file-access caps below let it reach
+# a database owned by another user; without them replication fails with
+# "permission denied". Reduce to an empty set once you set User=.
+CapabilityBoundingSet=CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH CAP_CHOWN CAP_FOWNER
+AmbientCapabilities=
+# Replication uses TCP (S3/GCS/ABS/SFTP); AF_UNIX covers the IPC socket and name
+# resolution. Use PrivateNetwork=true if you only replicate to local files.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
