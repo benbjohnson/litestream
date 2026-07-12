@@ -5,5 +5,30 @@ Description=Litestream
 Restart=always
 ExecStart=/usr/bin/litestream replicate
 
+# Security hardening (conservative subset).
+#
+# These directives need no per-deployment tuning and do not change how the
+# daemon reaches its databases, so they are safe to enable everywhere. Options
+# that depend on where your database lives or on capabilities (User=,
+# ProtectSystem=strict, ReadWritePaths=, CapabilityBoundingSet=, PrivateTmp,
+# ...) are intentionally left out of this baseline.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectProc=invisible
+ProcSubset=pid
+PrivateDevices=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+SystemCallArchitectures=native
+
 [Install]
 WantedBy=multi-user.target
