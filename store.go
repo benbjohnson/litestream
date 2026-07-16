@@ -762,6 +762,14 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 
 	// Shortcut if this is a snapshot since we are not pulling from a previous level.
 	if dstLevel == SnapshotLevel {
+		pos, err := db.Pos()
+		if err != nil {
+			return nil, fmt.Errorf("fetch db position: %w", err)
+		}
+		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
+			return nil, ErrNoCompaction
+		}
+
 		info, err := db.Snapshot(ctx)
 		if err != nil {
 			return info, err

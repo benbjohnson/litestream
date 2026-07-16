@@ -546,7 +546,7 @@ func TestDB_WriteLTXFromWALHonorsCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err = db.writeLTXFromWAL(ctx, enc, walFile, map[uint32]int64{1: 0})
+	err = db.writeLTXFromWAL(ctx, enc, walFile, 0, 1, map[uint32]int64{1: 0})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v, want context canceled", err)
 	}
@@ -674,11 +674,6 @@ func TestDB_SyncTruncateCheckpointFiresDuringChunkedCatchUp(t *testing.T) {
 		}
 	}
 
-	before, err := os.Stat(db.WALPath())
-	if err != nil {
-		t.Fatal(err)
-	}
-
 	// A single bounded chunk leaves pending WAL frames, but the truncate
 	// threshold has been exceeded so the checkpoint must fire anyway.
 	result, err := db.syncOnce(t.Context(), db.MaxSyncWALBytes)
@@ -688,12 +683,159 @@ func TestDB_SyncTruncateCheckpointFiresDuringChunkedCatchUp(t *testing.T) {
 		t.Fatal("expected sync to stop at WAL byte limit")
 	}
 
-	after, err := os.Stat(db.WALPath())
+	db.mu.RLock()
+	syncedOffsetAfter := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if db.exceedsTruncateThreshold(syncedOffsetAfter) {
+		t.Fatalf("expected checkpoint during catch-up to restart the wal: offset=%d", syncedOffsetAfter)
+	}
+}
+
+func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if after.Size() >= before.Size() {
-		t.Fatalf("expected truncate checkpoint to shrink WAL during catch-up: before=%d after=%d", before.Size(), after.Size())
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
+	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got == 0 {
+		t.Fatal("expected a passive checkpoint attempt before truncate")
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 0 {
+		t.Fatalf("truncate checkpoints=%v, want 0 after passive restarted the wal", got)
+	}
+
+	db.mu.RLock()
+	restartedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if db.exceedsTruncateThreshold(restartedOffset) {
+		t.Fatalf("expected passive checkpoint to restart the wal: offset=%d", restartedOffset)
+	}
+}
+
+func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.BusyTimeout = 50 * time.Millisecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold a read transaction so neither checkpoint mode can restart the WAL.
+	tx, err := sqldb.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got == 0 {
+		t.Fatal("expected fall-through to a truncate checkpoint attempt when passive cannot restart the wal")
+	}
+
+	db.mu.RLock()
+	blockedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if !db.exceedsTruncateThreshold(blockedOffset) {
+		t.Fatalf("expected wal to remain unrestarted while reader is open: offset=%d", blockedOffset)
 	}
 }
 
@@ -1109,7 +1251,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -2200,6 +2342,151 @@ func TestDB_WriteLTXFromWAL_PageGrowthCoverage(t *testing.T) {
 	}
 }
 
+func TestDB_WriteLTXFromWAL_FillsMissingGrowthPagesFromDB(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	walPath := filepath.Join(dir, "db-wal")
+
+	const pageSize = 1024
+
+	dbFile, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbFile.Close()
+
+	for pgno := 1; pgno <= 5; pgno++ {
+		page := bytes.Repeat([]byte{byte(pgno)}, pageSize)
+		if _, err := dbFile.WriteAt(page, int64(pgno-1)*pageSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	frameSize := int64(WALFrameHeaderSize + pageSize)
+	pageMap := map[uint32]int64{
+		3: 0,
+		5: frameSize,
+	}
+	for _, pgno := range []uint32{3, 5} {
+		offset := pageMap[pgno] + WALFrameHeaderSize
+		page := bytes.Repeat([]byte{byte(pgno + 10)}, pageSize)
+		if _, err := walFile.WriteAt(page, offset); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db := NewDB(dbPath)
+	db.pageSize = pageSize
+	db.f = dbFile
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    5,
+		MinTXID:   2,
+		MaxTXID:   2,
+		Timestamp: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.writeLTXFromWAL(t.Context(), enc, walFile, 2, 5, pageMap); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := ltx.NewDecoder(bytes.NewReader(buf.Bytes()))
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+
+	var pgnos []uint32
+	got := make(map[uint32][]byte)
+	pageBuf := make([]byte, pageSize)
+	for {
+		var phdr ltx.PageHeader
+		if err := dec.DecodePage(&phdr, pageBuf); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		pgnos = append(pgnos, phdr.Pgno)
+		got[phdr.Pgno] = append([]byte(nil), pageBuf...)
+	}
+
+	wantPgnos := []uint32{3, 4, 5}
+	if len(pgnos) != len(wantPgnos) {
+		t.Fatalf("page numbers mismatch: got=%v want=%v", pgnos, wantPgnos)
+	}
+	for i := range wantPgnos {
+		if pgnos[i] != wantPgnos[i] {
+			t.Fatalf("page numbers mismatch: got=%v want=%v", pgnos, wantPgnos)
+		}
+	}
+	if !bytes.Equal(got[3], bytes.Repeat([]byte{13}, pageSize)) {
+		t.Fatal("expected page 3 to come from WAL")
+	}
+	if !bytes.Equal(got[4], bytes.Repeat([]byte{4}, pageSize)) {
+		t.Fatal("expected page 4 to come from database")
+	}
+	if !bytes.Equal(got[5], bytes.Repeat([]byte{15}, pageSize)) {
+		t.Fatal("expected page 5 to come from WAL")
+	}
+
+	snapshot := new(bytes.Buffer)
+	snapshotEnc, err := ltx.NewEncoder(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotEnc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    2,
+		MinTXID:   1,
+		MaxTXID:   1,
+		Timestamp: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pgno := range []uint32{1, 2} {
+		page := bytes.Repeat([]byte{byte(pgno)}, pageSize)
+		if err := snapshotEnc.EncodePage(ltx.PageHeader{Pgno: uint32(pgno)}, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := snapshotEnc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	compacted := new(bytes.Buffer)
+	c, err := ltx.NewCompactor(compacted, []io.Reader{
+		bytes.NewReader(snapshot.Bytes()),
+		bytes.NewReader(buf.Bytes()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	if err := c.Compact(context.Background()); err != nil {
+		t.Fatalf("compaction failed: %v", err)
+	}
+}
+
 // TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint verifies that compaction
 // produces valid snapshots after a cycle of: grow DB, sync, checkpoint, grow
 // more, sync. If the zero-fill bug existed, compaction would fail with
@@ -2384,16 +2671,53 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify a snapshot L0 was created during checkpoint.
+	// Verify a snapshot L0 was created during checkpoint. A TRUNCATE
+	// checkpoint reports zero frame counts, so it cannot prove that no
+	// commits landed between the pre-checkpoint sync and the checkpoint;
+	// it must take the boundary snapshot unconditionally. An incremental
+	// (non-snapshot) L0 here would silently drop those commits.
 	l0AfterEntries, _ := os.ReadDir(l0Dir)
-	newL0Count := 0
+	newL0Count, newSnapshotCount := 0, 0
 	for _, entry := range l0AfterEntries {
-		if !l0BeforeNames[entry.Name()] {
-			newL0Count++
+		if l0BeforeNames[entry.Name()] {
+			continue
+		}
+		newL0Count++
+
+		f, err := os.Open(filepath.Join(l0Dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			f.Close()
+			t.Fatalf("decode header %s: %v", entry.Name(), err)
+		}
+		hdr := dec.Header()
+		pageCount := 0
+		pageData := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				f.Close()
+				t.Fatalf("decode page %s: %v", entry.Name(), err)
+			}
+			pageCount++
+		}
+		f.Close()
+
+		// A boundary snapshot contains every page up to the commit.
+		if uint32(pageCount) == hdr.Commit {
+			newSnapshotCount++
 		}
 	}
 	if newL0Count == 0 {
 		t.Fatal("expected checkpoint to create at least one new L0 file")
+	}
+	if newSnapshotCount == 0 {
+		t.Fatal("expected TRUNCATE checkpoint to create a boundary snapshot L0")
 	}
 }
 
@@ -2520,10 +2844,18 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	case err := <-writerDone:
 		t.Fatalf("writer exited before starting: %v", err)
 	}
-	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
-		cancelWriter()
-		<-writerDone
-		t.Fatal(err)
+	checkpointDeadline := time.Now().Add(5 * time.Second)
+	for {
+		err := db.Checkpoint(ctx, CheckpointModeTruncate)
+		if err == nil {
+			break
+		}
+		if !isSQLiteBusyError(err) || time.Now().After(checkpointDeadline) {
+			cancelWriter()
+			<-writerDone
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancelWriter()
 	if err := <-writerDone; err != nil {
@@ -2642,6 +2974,55 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	}
 
 	t.Logf("all %d pages present across L0 files (commit=%d)", len(allPages), maxCommit)
+
+	replicaDir := t.TempDir()
+	replicaL0Dir := filepath.Join(replicaDir, "l0")
+	if err := os.Mkdir(replicaL0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l0Entries, err := os.ReadDir(db.LTXLevelDir(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range l0Entries {
+		srcPath := filepath.Join(db.LTXLevelDir(0), entry.Name())
+		dstPath := filepath.Join(replicaL0Dir, entry.Name())
+
+		src, err := os.Open(srcPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			_ = src.Close()
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			_ = src.Close()
+			_ = dst.Close()
+			t.Fatal(err)
+		}
+		if err := src.Close(); err != nil {
+			_ = dst.Close()
+			t.Fatal(err)
+		}
+		if err := dst.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	restorePath := filepath.Join(dir, "restored.db")
+	restoreDB := NewDB(restorePath)
+	restoreReplica := NewReplica(restoreDB)
+	restoreReplica.Client = &testReplicaClient{dir: replicaDir}
+
+	restoreOpt := NewRestoreOptions()
+	restoreOpt.OutputPath = restorePath
+	restoreOpt.IntegrityCheck = IntegrityCheckFull
+
+	if err := restoreReplica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatalf("restore from local ltx chain: %v", err)
+	}
 }
 
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
