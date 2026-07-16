@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -17,6 +18,32 @@ func TestMain(m *testing.M) {
 		os.Exit(runMCPTestCommand())
 	}
 	os.Exit(m.Run())
+}
+
+func mcpTestExecutableName(goos string) string {
+	if goos == "windows" {
+		return "litestream.exe"
+	}
+	return "litestream"
+}
+
+func TestMCPTestExecutableName(t *testing.T) {
+	tests := []struct {
+		goos     string
+		expected string
+	}{
+		{goos: "linux", expected: "litestream"},
+		{goos: "darwin", expected: "litestream"},
+		{goos: "windows", expected: "litestream.exe"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.goos, func(t *testing.T) {
+			if got := mcpTestExecutableName(tt.goos); got != tt.expected {
+				t.Fatalf("unexpected executable name: %q", got)
+			}
+		})
+	}
 }
 
 func TestMCPToolsOmitEmptyConfig(t *testing.T) {
@@ -183,8 +210,15 @@ func useMCPTestCommand(t *testing.T) string {
 		t.Fatal(err)
 	}
 	dir := t.TempDir()
-	if err := os.Symlink(executable, filepath.Join(dir, "litestream")); err != nil {
-		t.Fatal(err)
+	commandPath := filepath.Join(dir, mcpTestExecutableName(runtime.GOOS))
+	var linkErr error
+	if runtime.GOOS == "windows" {
+		linkErr = os.Link(executable, commandPath)
+	} else {
+		linkErr = os.Symlink(executable, commandPath)
+	}
+	if linkErr != nil {
+		t.Fatal(linkErr)
 	}
 	argsPath := filepath.Join(dir, "args")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
