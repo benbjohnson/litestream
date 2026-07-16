@@ -11,6 +11,9 @@ import (
 )
 
 func TestMCPServerInitializeVersion(t *testing.T) {
+	const version = "v1.2.3-handshake-test"
+	setVersion(t, version)
+
 	server, err := NewMCP(t.Context(), "")
 	if err != nil {
 		t.Fatal(err)
@@ -41,12 +44,14 @@ func TestMCPServerInitializeVersion(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if got, want := result.Result.ServerInfo.Version, Version; got != want {
+	if got, want := result.Result.ServerInfo.Version, version; got != want {
 		t.Fatalf("server version=%q, want %q", got, want)
 	}
 }
 
 func TestVersionTool(t *testing.T) {
+	const version = "v1.2.3-instance-test"
+	setVersion(t, version)
 	t.Setenv("PATH", t.TempDir())
 
 	_, handler := VersionTool()
@@ -64,7 +69,15 @@ func TestVersionTool(t *testing.T) {
 	if !ok {
 		t.Fatalf("content type=%T, want mcp.TextContent", result.Content[0])
 	}
-	if got, want := content.Text, Version+"\n"; got != want {
+	if got, want := content.Text, version+"\n"; got != want {
 		t.Fatalf("version=%q, want %q", got, want)
 	}
+}
+
+func setVersion(t *testing.T, version string) {
+	t.Helper()
+
+	previous := Version
+	Version = version
+	t.Cleanup(func() { Version = previous })
 }
