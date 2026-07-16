@@ -164,20 +164,61 @@ func TestRestoreToolConditionalBehavior(t *testing.T) {
 		}
 	})
 
-	t.Run("replica does not exist", func(t *testing.T) {
-		outputPath := filepath.Join(t.TempDir(), "restored.sqlite")
-		text := callMCPToolText(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
-			"path":              "file://" + filepath.Join(t.TempDir(), "replica"),
-			"output":            outputPath,
-			"if_replica_exists": true,
+	for _, tt := range []struct {
+		name      string
+		timestamp string
+	}{
+		{name: "replica does not exist"},
+		{name: "replica does not exist at timestamp", timestamp: "2026-07-16T12:00:00Z"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			outputPath := filepath.Join(t.TempDir(), "restored.sqlite")
+			text := callMCPToolText(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
+				"path":              "file://" + filepath.Join(t.TempDir(), "replica"),
+				"output":            outputPath,
+				"timestamp":         tt.timestamp,
+				"if_replica_exists": true,
+			})
+			if text != "no matching backups found, skipping\n" {
+				t.Fatalf("unexpected result: %q", text)
+			}
+			if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+				t.Fatalf("output exists after skipped restore: %v", err)
+			}
 		})
-		if text != "no matching backups found, skipping\n" {
-			t.Fatalf("unexpected result: %q", text)
-		}
-		if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
-			t.Fatalf("output exists after skipped restore: %v", err)
-		}
-	})
+	}
+}
+
+func TestMCPReplicaURLSchemes(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "s3", url: "s3://bucket/path"},
+		{name: "gs", url: "gs://bucket/path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r, err := loadMCPReplica(tt.url, filepath.Join(t.TempDir(), "missing.yml"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Client.Type(); got != tt.name {
+				t.Fatalf("replica type=%q, want %q", got, tt.name)
+			}
+
+			opt := litestream.NewRestoreOptions()
+			opt.OutputPath = filepath.Join(t.TempDir(), "restored.sqlite")
+			r, err = loadMCPRestoreReplica(tt.url, filepath.Join(t.TempDir(), "missing.yml"), &opt)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Client.Type(); got != tt.name {
+				t.Fatalf("restore replica type=%q, want %q", got, tt.name)
+			}
+		})
+	}
 }
 
 func TestRestoreToolRejectsInvalidOptions(t *testing.T) {

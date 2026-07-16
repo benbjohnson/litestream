@@ -193,11 +193,12 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 			opt.Parallelism = parallelism
 		}
 
-		r, err := loadMCPRestoreReplica(ctx, path, req.GetString("config", configPath), &opt)
+		r, err := loadMCPRestoreReplica(path, req.GetString("config", configPath), &opt)
 		if err != nil {
 			return mcpToolError(err)
 		}
 
+		ifReplicaExists := req.GetBool("if_replica_exists", false)
 		if req.GetBool("if_db_not_exists", false) {
 			if _, err := os.Stat(opt.OutputPath); err == nil {
 				return mcp.NewToolResultText("database already exists, skipping\n"), nil
@@ -205,7 +206,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 				return mcpToolError(fmt.Errorf("access output path: %w", err))
 			}
 		}
-		if litestream.IsURL(path) {
+		if litestream.IsURL(path) && !ifReplicaExists {
 			if _, err := r.CalcRestoreTarget(ctx, opt); err != nil {
 				return mcpToolError(err)
 			}
@@ -218,7 +219,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 		txID := cmd.restoreTXID(ctx, r, opt)
 		start := time.Now()
-		if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) && req.GetBool("if_replica_exists", false) {
+		if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) && ifReplicaExists {
 			return mcp.NewToolResultText("no matching backups found, skipping\n"), nil
 		} else if errors.Is(err, litestream.ErrTxNotAvailable) {
 			return mcpToolError(fmt.Errorf("no matching backup files available"))
@@ -379,7 +380,7 @@ func formatMCPDatabases(dbs []*litestream.DB) (string, error) {
 	return output.String(), nil
 }
 
-func loadMCPRestoreReplica(ctx context.Context, path, configPath string, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+func loadMCPRestoreReplica(path, configPath string, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	if litestream.IsURL(path) {
 		if opt.OutputPath == "" {
 			return nil, fmt.Errorf("output is required when restoring from a replica URL")
