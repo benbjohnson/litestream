@@ -1,10 +1,16 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -36,8 +42,27 @@ func TestMCPServerTools(t *testing.T) {
 	if initializeResult == nil {
 		t.Fatal("initialize result is nil")
 	}
+	if initializeResult.ServerInfo == nil {
+		t.Fatal("server info is nil")
+	}
+	if got, want := initializeResult.ServerInfo.Name, "Litestream MCP Server"; got != want {
+		t.Fatalf("server name=%q, want %q", got, want)
+	}
 	if got := initializeResult.ServerInfo.Version; got != version {
 		t.Fatalf("server version=%q, want %q", got, version)
+	}
+	if initializeResult.Capabilities == nil {
+		t.Fatal("server capabilities are nil")
+	}
+	capabilities := jsonObject(t, initializeResult.Capabilities)
+	if _, ok := capabilities["logging"]; !ok {
+		t.Error("logging capability is missing")
+	}
+	if initializeResult.Capabilities.Tools == nil {
+		t.Fatal("tools capability is nil")
+	}
+	if initializeResult.Capabilities.Tools.ListChanged {
+		t.Error("tools listChanged=true, want false")
 	}
 
 	result, err := session.ListTools(t.Context(), nil)
@@ -48,20 +73,29 @@ func TestMCPServerTools(t *testing.T) {
 	tests := map[string]struct {
 		readOnly    bool
 		destructive bool
-		properties  []string
+		properties  map[string]string
 		required    []string
 	}{
-		"litestream_databases": {readOnly: true, properties: []string{"config"}},
-		"litestream_info":      {readOnly: true, properties: []string{"config"}},
+		"litestream_databases": {readOnly: true, properties: map[string]string{"config": "string"}},
+		"litestream_info":      {readOnly: true, properties: map[string]string{"config": "string"}},
 		"litestream_restore": {
 			destructive: true,
-			properties:  []string{"config", "if_db_not_exists", "if_replica_exists", "o", "parallelism", "path", "timestamp", "txid"},
-			required:    []string{"path"},
+			properties: map[string]string{
+				"config":            "string",
+				"if_db_not_exists":  "boolean",
+				"if_replica_exists": "boolean",
+				"o":                 "string",
+				"parallelism":       "string",
+				"path":              "string",
+				"timestamp":         "string",
+				"txid":              "string",
+			},
+			required: []string{"path"},
 		},
-		"litestream_ltx":     {readOnly: true, properties: []string{"config", "path"}, required: []string{"path"}},
+		"litestream_ltx":     {readOnly: true, properties: map[string]string{"config": "string", "path": "string"}, required: []string{"path"}},
 		"litestream_version": {readOnly: true},
-		"litestream_status":  {readOnly: true, properties: []string{"config", "path"}},
-		"litestream_reset":   {destructive: true, properties: []string{"config", "path"}, required: []string{"path"}},
+		"litestream_status":  {readOnly: true, properties: map[string]string{"config": "string", "path": "string"}},
+		"litestream_reset":   {destructive: true, properties: map[string]string{"config": "string", "path": "string"}, required: []string{"path"}},
 	}
 
 	if got, want := len(result.Tools), len(tests); got != want {
@@ -95,13 +129,16 @@ func TestMCPServerTools(t *testing.T) {
 
 		inputSchema := jsonObject(t, tool.InputSchema)
 		properties := schemaProperties(t, inputSchema)
-		if got := sortedMapKeys(properties); !reflect.DeepEqual(got, test.properties) {
-			t.Errorf("%s input properties=%v, want %v", tool.Name, got, test.properties)
+		if got, want := sortedMapKeys(properties), sortedMapKeys(test.properties); !reflect.DeepEqual(got, want) {
+			t.Errorf("%s input properties=%v, want %v", tool.Name, got, want)
 		}
 		for name, property := range properties {
 			propertyObject := jsonObject(t, property)
 			if propertyObject["description"] == "" {
 				t.Errorf("%s input property %s has no description", tool.Name, name)
+			}
+			if got, want := propertyObject["type"], test.properties[name]; got != want {
+				t.Errorf("%s input property %s type=%v, want %s", tool.Name, name, got, want)
 			}
 		}
 		if got := schemaRequired(inputSchema); !reflect.DeepEqual(got, test.required) {
@@ -115,6 +152,11 @@ func TestMCPServerTools(t *testing.T) {
 		}
 		if property := jsonObject(t, outputProperties["text"]); property["description"] == "" {
 			t.Errorf("%s output property text has no description", tool.Name)
+		} else if got := property["type"]; got != "string" {
+			t.Errorf("%s output property text type=%v, want string", tool.Name, got)
+		}
+		if got, want := schemaRequired(outputSchema), []string{"text"}; !reflect.DeepEqual(got, want) {
+			t.Errorf("%s required output properties=%v, want %v", tool.Name, got, want)
 		}
 	}
 
@@ -133,6 +175,163 @@ func TestMCPServerTools(t *testing.T) {
 	}
 	if got, want := textContent(t, callResult), version+"\n"; got != want {
 		t.Fatalf("version text content=%q, want %q", got, want)
+	}
+}
+
+func TestMCPToolBehavior(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+
+	setVersion(t, "v1.2.3-mcp-test")
+	installFakeLitestream(t)
+
+	server, err := NewMCP(t.Context(), "/default/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: httpServer.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		arguments map[string]any
+		want      string
+	}{
+		{
+			name:      "litestream_databases",
+			arguments: map[string]any{"config": ""},
+			want:      "<databases><-config><>\n",
+		},
+		{
+			name: "litestream_restore",
+			arguments: map[string]any{
+				"path":              "/data/db",
+				"o":                 "",
+				"config":            "",
+				"txid":              "",
+				"timestamp":         "",
+				"parallelism":       "",
+				"if_db_not_exists":  false,
+				"if_replica_exists": true,
+			},
+			want: "<restore><-o><><-txid><><-timestamp><><-parallelism><><-if-db-not-exists><false><-if-replica-exists><true></data/db>\n",
+		},
+		{
+			name:      "litestream_ltx",
+			arguments: map[string]any{"path": "/data/db", "config": ""},
+			want:      "<ltx></data/db>\n",
+		},
+		{
+			name:      "litestream_status",
+			arguments: map[string]any{"config": "", "path": ""},
+			want:      "<status><-config><><>\n",
+		},
+		{
+			name:      "litestream_reset",
+			arguments: map[string]any{"path": "/data/db", "config": ""},
+			want:      "<reset><-config><></data/db>\n",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: test.name, Arguments: test.arguments})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.IsError {
+				t.Fatalf("tool error: %#v", result.Content)
+			}
+			if got := textContent(t, result); got != test.want {
+				t.Fatalf("text content=%q, want %q", got, test.want)
+			}
+			if got, want := result.StructuredContent, map[string]any{"text": test.want}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("structured content=%v, want %v", got, want)
+			}
+		})
+	}
+
+	t.Setenv("LITESTREAM_TEST_DATABASES_TABLE", "1")
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "litestream_info",
+		Arguments: map[string]any{"config": "/custom/litestream.yml"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("info tool error: %#v", result.Content)
+	}
+	for _, want := range []string{
+		"Litestream test-version",
+		"Current Config Path:\n/custom/litestream.yml",
+		"Database: /data/db",
+		"<ltx><-config></custom/litestream.yml></data/db>",
+	} {
+		if got := textContent(t, result); !strings.Contains(got, want) {
+			t.Errorf("info text content does not contain %q: %q", want, got)
+		}
+	}
+
+	t.Setenv("LITESTREAM_TEST_FAIL", "ltx")
+	result, err = session.CallTool(t.Context(), &mcp.CallToolParams{
+		Name:      "litestream_info",
+		Arguments: map[string]any{"config": "/custom/litestream.yml"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatal("info tool succeeded, want error")
+	}
+	for _, want := range []string{"get LTX files for /data/db", "failure from ltx"} {
+		if got := textContent(t, result); !strings.Contains(got, want) {
+			t.Errorf("info error does not contain %q: %q", want, got)
+		}
+	}
+}
+
+func TestMCPToolContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+
+	installFakeLitestream(t)
+	_, handler := LTXTool("/default/litestream.yml")
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	result, _, err := handler(ctx, nil, ltxInput{Path: "/data/db"})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error=%v, want context canceled", err)
+	}
+	if result != nil {
+		t.Fatalf("result=%v, want nil", result)
+	}
+}
+
+func TestMCPRecoveryMiddleware(t *testing.T) {
+	handler := recoveryMiddleware(func(context.Context, string, mcp.Request) (mcp.Result, error) {
+		panic("test panic")
+	})
+
+	result, err := handler(t.Context(), "tools/call", nil)
+	if result != nil {
+		t.Fatalf("result=%v, want nil", result)
+	}
+	if err == nil || !strings.Contains(err.Error(), "panic recovered in tools/call handler: test panic") {
+		t.Fatalf("error=%v, want recovered panic", err)
 	}
 }
 
@@ -177,7 +376,7 @@ func schemaRequired(schema map[string]any) []string {
 	return required
 }
 
-func sortedMapKeys(values map[string]any) []string {
+func sortedMapKeys[V any](values map[string]V) []string {
 	if len(values) == 0 {
 		return nil
 	}
@@ -187,6 +386,36 @@ func sortedMapKeys(values map[string]any) []string {
 	}
 	slices.Sort(keys)
 	return keys
+}
+
+func installFakeLitestream(t *testing.T) {
+	t.Helper()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "litestream")
+	script := `#!/bin/sh
+if [ "$LITESTREAM_TEST_FAIL" = "$1" ]; then
+	printf 'failure from %s\n' "$1" >&2
+	exit 1
+fi
+if [ "$1" = "version" ]; then
+	printf 'Litestream test-version\n'
+	exit 0
+fi
+if [ "$1" = "databases" ] && [ "$LITESTREAM_TEST_DATABASES_TABLE" = "1" ]; then
+	printf 'path replica\n'
+	printf '/data/db s3://bucket/db\n'
+	exit 0
+fi
+for argument in "$@"; do
+	printf '<%s>' "$argument"
+done
+printf '\n'
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 func textContent(t *testing.T, result *mcp.CallToolResult) string {
