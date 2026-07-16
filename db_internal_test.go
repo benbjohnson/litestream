@@ -18,6 +18,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -103,6 +104,358 @@ func (c *testReplicaClient) DeleteLTXFiles(_ context.Context, infos []*ltx.FileI
 
 func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
+}
+
+func mustAcquireSemaphore(s *semaphore.Weighted) {
+	if err := s.Acquire(context.Background(), 1); err != nil {
+		panic(err)
+	}
+}
+
+func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	mustAcquireSemaphore(db.execSem)
+	defer db.execSem.Release(1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Sync(ctx) }()
+
+	// Cancel only once the sync is observably queued on the executor so the
+	// error always comes from the semaphore wait, not an earlier ctx check.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for db.SyncDiagnostic().ExecutorWaiterCount != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("sync returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("sync diagnostic did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+	cancel()
+
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+	if !strings.Contains(err.Error(), "wait for db sync executor") {
+		t.Fatalf("err=%q, want sync executor context", err)
+	}
+}
+
+func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	mustAcquireSemaphore(db.execSem)
+	defer db.execSem.Release(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Sync(ctx) }()
+
+	deadline := time.After(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	var diag SyncDiagnostic
+	for {
+		diag = db.SyncDiagnostic()
+		if diag.ExecutorWaiterCount == 1 {
+			break
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("sync returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("sync diagnostic did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+
+	if diag.ExecutorWaitStarted == nil {
+		t.Fatal("expected executor wait start time")
+	}
+	if diag.ExecutorWaitSeconds <= 0 {
+		t.Fatalf("executor_wait_seconds=%f, want positive", diag.ExecutorWaitSeconds)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+	if got := db.SyncDiagnostic().ExecutorWaiterCount; got != 0 {
+		t.Fatalf("executor_waiter_count=%d, want 0", got)
+	}
+}
+
+func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	mustAcquireSemaphore(db.execSem)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := db.lockExec(ctx)
+		done <- err
+		if err == nil {
+			db.execSem.Release(1)
+		}
+	}()
+
+	deadline := time.After(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if db.SyncDiagnostic().ExecutorWaiterCount == 1 {
+			break
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("lockExec returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("lockExec did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+
+	hogReady := make(chan struct{})
+	hogAcquired := make(chan struct{})
+	hogDone := make(chan struct{})
+	go func() {
+		close(hogReady)
+		mustAcquireSemaphore(db.execSem)
+		close(hogAcquired)
+		time.Sleep(150 * time.Millisecond)
+		db.execSem.Release(1)
+		close(hogDone)
+	}()
+	<-hogReady
+	time.Sleep(5 * time.Millisecond)
+
+	db.execSem.Release(1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lockExec returned error: %v", err)
+		}
+	case <-hogAcquired:
+		// The hog legitimately acquires right after the queued waiter
+		// releases, so only fail if the waiter had not already succeeded.
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("lockExec returned error: %v", err)
+			}
+		default:
+			<-hogDone
+			err := <-done
+			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}
+	case <-ctx.Done():
+		err := <-done
+		t.Fatalf("lockExec timed out waiting behind later lock attempt: %v", err)
+	}
+}
+
+func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+
+	mustAcquireSemaphore(r.syncSem)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- r.Sync(ctx) }()
+
+	select {
+	case err := <-done:
+		r.syncSem.Release(1)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err=%v, want context deadline exceeded", err)
+		}
+		if !strings.Contains(err.Error(), "wait for replica sync") {
+			t.Fatalf("err=%q, want replica sync context", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		r.syncSem.Release(1)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("replica sync did not return after lock release")
+		}
+		t.Fatal("replica sync did not honor context while waiting for sync lock")
+	}
+}
+
+func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	mustAcquireSemaphore(r.syncSem)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := r.lockSync(ctx)
+		done <- err
+		if err == nil {
+			r.syncSem.Release(1)
+		}
+	}()
+
+	// Wait until the waiter is observably queued so the hog cannot jump
+	// ahead of it in the semaphore FIFO.
+	waitDeadline := time.After(5 * time.Second)
+	waitTicker := time.NewTicker(time.Millisecond)
+	defer waitTicker.Stop()
+	for r.syncWaiters.Load() != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("lockSync returned before queueing on semaphore: %v", err)
+		case <-waitDeadline:
+			t.Fatal("lockSync did not report queued waiter")
+		case <-waitTicker.C:
+		}
+	}
+
+	hogReady := make(chan struct{})
+	hogAcquired := make(chan struct{})
+	hogDone := make(chan struct{})
+	go func() {
+		close(hogReady)
+		mustAcquireSemaphore(r.syncSem)
+		close(hogAcquired)
+		time.Sleep(150 * time.Millisecond)
+		r.syncSem.Release(1)
+		close(hogDone)
+	}()
+	<-hogReady
+	time.Sleep(5 * time.Millisecond)
+
+	r.syncSem.Release(1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lockSync returned error: %v", err)
+		}
+	case <-hogAcquired:
+		// The hog legitimately acquires right after the queued waiter
+		// releases, so only fail if the waiter had not already succeeded.
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("lockSync returned error: %v", err)
+			}
+		default:
+			<-hogDone
+			err := <-done
+			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}
+	case <-ctx.Done():
+		err := <-done
+		t.Fatalf("lockSync timed out waiting behind later lock attempt: %v", err)
+	}
+}
+
+func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: t.TempDir()}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t DEFAULT VALUES;`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID < 2 {
+		t.Fatalf("db txid=%s, want at least 2", dpos.TXID)
+	}
+	r.SetPos(ltx.Pos{TXID: dpos.TXID - 2})
+
+	result, err := r.syncOnce(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("expected limited replica sync to upload one file")
+	}
+	if !result.limited {
+		t.Fatal("expected limited replica sync to stop before catching up")
+	}
+	if got, want := r.Pos().TXID, dpos.TXID-1; got != want {
+		t.Fatalf("replica txid=%s, want %s", got, want)
+	}
+	if db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("limited replica sync with successful uploads should record sync health")
+	}
+
+	result, err = r.syncOnce(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("expected final replica sync to upload remaining files")
+	}
+	if result.limited {
+		t.Fatal("expected final replica sync to catch up")
+	}
+	if got, want := r.Pos().TXID, dpos.TXID; got != want {
+		t.Fatalf("replica txid=%s, want %s", got, want)
+	}
+	if db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("full replica sync should record sync success")
+	}
 }
 
 func TestDB_SyncDiagnostic(t *testing.T) {
@@ -2849,5 +3202,61 @@ func TestReplicaMonitor_RecoversFromPositionError(t *testing.T) {
 			t.Fatal("replication did not resume after auto-recovery")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDB_CloseWithCanceledContextStillCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A canceled context may fail the final sync, but cleanup (read lock
+	// release, handle closes, state reset) must always run.
+	_ = db.Close(ctx)
+
+	db.mu.Lock()
+	opened, sqlDB, f, rtx := db.opened, db.db, db.f, db.rtx
+	db.mu.Unlock()
+
+	if opened {
+		t.Fatal("db still marked open after Close with canceled context")
+	}
+	if sqlDB != nil {
+		t.Fatal("sql handle not released after Close with canceled context")
+	}
+	if f != nil {
+		t.Fatal("file handle not released after Close with canceled context")
+	}
+	if rtx != nil {
+		t.Fatal("read lock not released after Close with canceled context")
 	}
 }

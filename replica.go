@@ -12,16 +12,19 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default replica settings.
 const (
-	DefaultSyncInterval = 1 * time.Second
+	DefaultSyncInterval    = 1 * time.Second
+	DefaultMaxSyncLTXFiles = 256
 )
 
 var errReplicaWaitForData = errors.New("no position, waiting for data")
@@ -35,7 +38,8 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
-	syncMu sync.Mutex // protects Sync() from concurrent calls
+	syncSem     *semaphore.Weighted
+	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -48,6 +52,10 @@ type Replica struct {
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
+
+	// Maximum L0 files to upload in a single monitor sync run.
+	// Set to zero to process all pending L0 files in one run.
+	MaxSyncLTXFiles int
 
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
@@ -62,11 +70,13 @@ type Replica struct {
 
 func NewReplica(db *DB) *Replica {
 	r := &Replica{
-		db:     db,
-		cancel: func() {},
+		db:      db,
+		syncSem: semaphore.NewWeighted(1),
+		cancel:  func() {},
 
-		SyncInterval:   DefaultSyncInterval,
-		MonitorEnabled: true,
+		SyncInterval:    DefaultSyncInterval,
+		MaxSyncLTXFiles: DefaultMaxSyncLTXFiles,
+		MonitorEnabled:  true,
 	}
 
 	return r
@@ -132,8 +142,20 @@ func (r *Replica) Stop(hard bool) (err error) {
 // Sync copies new WAL frames from the shadow WAL to the replica client.
 // Only one Sync can run at a time to prevent concurrent uploads of the same file.
 func (r *Replica) Sync(ctx context.Context) (err error) {
-	r.syncMu.Lock()
-	defer r.syncMu.Unlock()
+	_, err = r.syncOnce(ctx, 0)
+	return err
+}
+
+type replicaSyncResult struct {
+	synced  bool
+	limited bool
+}
+
+func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result replicaSyncResult, err error) {
+	if err := r.lockSync(ctx); err != nil {
+		return result, err
+	}
+	defer r.syncSem.Release(1)
 
 	// Clear last position if if an error occurs during sync.
 	defer func() {
@@ -144,11 +166,15 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		}
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return result, context.Cause(ctx)
+	}
+
 	// Calculate current replica position, if unknown.
 	if r.Pos().IsZero() {
 		pos, err := r.calcPos(ctx)
 		if err != nil {
-			return fmt.Errorf("calc pos: %w", err)
+			return result, fmt.Errorf("calc pos: %w", err)
 		}
 		r.SetPos(pos)
 	}
@@ -156,9 +182,9 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	// Find current position of database.
 	dpos, err := r.db.Pos()
 	if err != nil {
-		return fmt.Errorf("cannot determine current position: %w", err)
+		return result, fmt.Errorf("cannot determine current position: %w", err)
 	} else if dpos.IsZero() {
-		return errReplicaWaitForData
+		return result, errReplicaWaitForData
 	}
 
 	r.Logger().Info("replica sync",
@@ -168,16 +194,44 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		))
 
 	// Replicate all L0 LTX files since last replica position.
-	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
+			result.limited = true
+			// Uploads succeeded, so record sync health; otherwise a
+			// sustained backlog reads as unhealthy while progressing.
+			r.db.RecordSuccessfulSync()
+			r.Logger().Debug("replica sync limited",
+				"synced_files", syncedFileN,
+				"db_txid", dpos.TXID.String(),
+				"replica_txid", r.Pos().TXID.String())
+			return result, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return result, context.Cause(ctx)
+		}
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
-			return err
+			return result, err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
+		result.synced = true
+		syncedFileN++
 	}
 
 	// Record successful sync for heartbeat monitoring.
 	r.db.RecordSuccessfulSync()
 
+	return result, nil
+}
+
+func (r *Replica) lockSync(ctx context.Context) error {
+	if r.syncSem.TryAcquire(1) {
+		return nil
+	}
+	r.syncWaiters.Add(1)
+	defer r.syncWaiters.Add(-1)
+	if err := r.syncSem.Acquire(ctx, 1); err != nil {
+		return fmt.Errorf("wait for replica sync: %w", context.Cause(ctx))
+	}
 	return nil
 }
 
@@ -373,7 +427,7 @@ func (r *Replica) monitor(ctx context.Context) {
 		notify = r.db.Notify()
 
 		// Synchronize the shadow wal into the replication directory.
-		if err := r.Sync(ctx); err != nil {
+		if _, err := r.syncOnce(ctx, r.MaxSyncLTXFiles); err != nil {
 			if errors.Is(err, errReplicaWaitForData) {
 				continue
 			}
