@@ -716,6 +716,7 @@ type DBConfig struct {
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
+	MaxSyncWALBytes    *int64         `yaml:"max-sync-wal-bytes"`
 
 	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
 
@@ -760,6 +761,9 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.TruncatePageN != nil {
 		db.TruncatePageN = *dbc.TruncatePageN
+	}
+	if dbc.MaxSyncWALBytes != nil {
+		db.MaxSyncWALBytes = *dbc.MaxSyncWALBytes
 	}
 
 	// Instantiate and attach replica.

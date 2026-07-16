@@ -159,6 +159,220 @@ func TestDB_SyncDiagnostic(t *testing.T) {
 	}
 }
 
+func TestDB_WriteLTXFromWALHonorsCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	walPath := filepath.Join(dir, "db-wal")
+
+	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	db := NewDB(dbPath)
+	db.pageSize = 1024
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:  ltx.Version,
+		Flags:    ltx.HeaderFlagNoChecksum,
+		PageSize: 1024,
+		Commit:   1,
+		MinTXID:  1,
+		MaxTXID:  1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = db.writeLTXFromWAL(ctx, enc, walFile, map[uint32]int64{1: 0})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+}
+
+func TestDB_SyncChunksWALAtCommitBoundary(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.MaxSyncWALBytes = int64(WALFrameHeaderSize + 4096)
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 20 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := db.syncOnce(context.Background(), db.MaxSyncWALBytes)
+	if err != nil {
+		t.Fatal(err)
+	} else if !result.synced {
+		t.Fatal("expected sync to create an LTX file")
+	} else if !result.limited {
+		t.Fatal("expected sync to stop at WAL byte limit")
+	} else if result.syncedToWALEnd {
+		t.Fatal("expected first bounded sync to leave pending WAL frames")
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	syncedToWALEnd := db.syncState.syncedToWALEnd
+	db.mu.RUnlock()
+	if !syncedToWALEnd {
+		t.Fatal("expected public Sync to finish remaining WAL chunks")
+	}
+}
+
+func TestDB_SyncTruncateCheckpointFiresDuringChunkedCatchUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync fully with the truncate threshold disabled so the last synced WAL
+	// offset ends up past the threshold without a checkpoint having run.
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	db.MaxSyncWALBytes = int64(WALFrameHeaderSize + 4096)
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	for range 20 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	before, err := os.Stat(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// A single bounded chunk leaves pending WAL frames, but the truncate
+	// threshold has been exceeded so the checkpoint must fire anyway.
+	result, err := db.syncOnce(t.Context(), db.MaxSyncWALBytes)
+	if err != nil {
+		t.Fatal(err)
+	} else if !result.limited {
+		t.Fatal("expected sync to stop at WAL byte limit")
+	}
+
+	after, err := os.Stat(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Size() >= before.Size() {
+		t.Fatalf("expected truncate checkpoint to shrink WAL during catch-up: before=%d after=%d", before.Size(), after.Size())
+	}
+}
+
+func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
+	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewWALReader(bytes.NewReader(b), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !limited {
+		t.Fatal("expected page map to stop at limit")
+	}
+	if got, want := maxOffset, int64(8272); got != want {
+		t.Fatalf("maxOffset=%d, want %d", got, want)
+	}
+	if got, want := commit, uint32(2); got != want {
+		t.Fatalf("commit=%d, want %d", got, want)
+	}
+	if got, want := len(pageMap), 2; got != want {
+		t.Fatalf("len(pageMap)=%d, want %d", got, want)
+	}
+}
+
 // TestCalcWALSize ensures calcWALSize doesn't overflow with large page sizes.
 // Regression test for uint32 overflow bug where large page sizes (>=16KB)
 // caused incorrect WAL size calculations, triggering checkpoints too early.
