@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"net/http"
 	"os/exec"
-	"strconv"
 	"strings"
 	"time"
 
@@ -88,11 +87,10 @@ func DatabasesTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := []string{"databases"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+		config := req.GetString("config", configPath)
+		if config != "" {
+			args = append(args, "-config", config)
 		}
-		args = append(args, "-config", config)
 		cmd := exec.CommandContext(ctx, "litestream", args...)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -125,14 +123,13 @@ func InfoTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 		// Get databases info
 		args := []string{"databases"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
-		}
+		config := req.GetString("config", configPath)
 		summary.WriteString("Current Config Path:\n")
 		summary.WriteString(config + "\n\n")
 
-		args = append(args, "-config", config)
+		if config != "" {
+			args = append(args, "-config", config)
+		}
 		dbCmd := exec.CommandContext(ctx, "litestream", args...)
 		dbOutput, err := dbCmd.CombinedOutput()
 		if err != nil {
@@ -184,50 +181,51 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_restore",
 		mcp.WithDescription("Restore a database from a Litestream replica."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
-		mcp.WithString("o", mcp.Description("Output path for the restored database. Optional.")),
+		mcp.WithString("output", mcp.Description("Output path for the restored database. Optional.")),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
 		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
 		mcp.WithString("parallelism", mcp.Description("Number of WAL files to download in parallel. Optional.")),
-		mcp.WithBoolean("if_db_not_exists", mcp.Description("Return 0 if the database already exists. Optional.")),
-		mcp.WithBoolean("if_replica_exists", mcp.Description("Return 0 if no backups found. Optional.")),
+		mcp.WithBoolean("if_db_not_exists", mcp.Description("Skip restore if the database already exists. Optional.")),
+		mcp.WithBoolean("if_replica_exists", mcp.Description("Skip restore if no backups are found. Optional.")),
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := []string{"restore"}
-		if o, err := req.RequireString("o"); err == nil {
-			args = append(args, "-o", o)
+		outputPath := req.GetString("output", "")
+		if outputPath == "" {
+			outputPath = req.GetString("o", "")
+		}
+		if outputPath != "" {
+			args = append(args, "-o", outputPath)
 		}
 
 		// Get path first to determine if it's a replica URL
-		path, _ := req.RequireString("path")
+		path := req.GetString("path", "")
 
 		// Only add -config for database paths, not replica URLs
 		// The CLI rejects -config when restoring from a replica URL
 		if !isReplicaURL(path) {
-			config := configPath
-			if configVal, err := req.RequireString("config"); err == nil {
-				config = configVal
-			}
+			config := req.GetString("config", configPath)
 			if config != "" {
 				args = append(args, "-config", config)
 			}
 		}
 
-		if txid, err := req.RequireString("txid"); err == nil {
+		if txid := req.GetString("txid", ""); txid != "" {
 			args = append(args, "-txid", txid)
 		}
-		if timestamp, err := req.RequireString("timestamp"); err == nil {
+		if timestamp := req.GetString("timestamp", ""); timestamp != "" {
 			args = append(args, "-timestamp", timestamp)
 		}
-		if parallelism, err := req.RequireString("parallelism"); err == nil {
+		if parallelism := req.GetString("parallelism", ""); parallelism != "" {
 			args = append(args, "-parallelism", parallelism)
 		}
-		if ifDBNotExists, err := req.RequireBool("if_db_not_exists"); err == nil {
-			args = append(args, "-if-db-not-exists", strconv.FormatBool(ifDBNotExists))
+		if req.GetBool("if_db_not_exists", false) {
+			args = append(args, "-if-db-not-exists")
 		}
-		if ifReplicaExists, err := req.RequireBool("if_replica_exists"); err == nil {
-			args = append(args, "-if-replica-exists", strconv.FormatBool(ifReplicaExists))
+		if req.GetBool("if_replica_exists", false) {
+			args = append(args, "-if-replica-exists")
 		}
 		if path != "" {
 			args = append(args, path)
@@ -267,15 +265,12 @@ func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		args := []string{"ltx"}
 
 		// Get path first to determine if it's a replica URL
-		path, _ := req.RequireString("path")
+		path := req.GetString("path", "")
 
 		// Only add -config for database paths, not replica URLs
 		// The CLI rejects -config when using a replica URL
 		if !isReplicaURL(path) {
-			config := configPath
-			if configVal, err := req.RequireString("config"); err == nil {
-				config = configVal
-			}
+			config := req.GetString("config", configPath)
 			if config != "" {
 				args = append(args, "-config", config)
 			}
@@ -302,12 +297,11 @@ func StatusTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := []string{"status"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+		config := req.GetString("config", configPath)
+		if config != "" {
+			args = append(args, "-config", config)
 		}
-		args = append(args, "-config", config)
-		if path, err := req.RequireString("path"); err == nil {
+		if path := req.GetString("path", ""); path != "" {
 			args = append(args, path)
 		}
 		cmd := exec.CommandContext(ctx, "litestream", args...)
@@ -328,12 +322,11 @@ func ResetTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		args := []string{"reset"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+		config := req.GetString("config", configPath)
+		if config != "" {
+			args = append(args, "-config", config)
 		}
-		args = append(args, "-config", config)
-		if path, err := req.RequireString("path"); err == nil {
+		if path := req.GetString("path", ""); path != "" {
 			args = append(args, path)
 		}
 		cmd := exec.CommandContext(ctx, "litestream", args...)
