@@ -744,6 +744,13 @@ func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
 	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
 	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
 
+	db.chkMu.RLock()
+	err = db.Sync(t.Context())
+	db.chkMu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -763,7 +770,7 @@ func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
 	}
 }
 
-func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T) {
+func TestDB_CheckpointTruncateSkipsRepeatedPassiveWithoutProgress(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -823,14 +830,21 @@ func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T)
 		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
 	}
 
+	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
 	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
 
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got == 0 {
-		t.Fatal("expected fall-through to a truncate checkpoint attempt when passive cannot restart the wal")
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 1 {
+		t.Fatalf("passive checkpoints=%v, want 1 across repeated blocked syncs", got)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 2 {
+		t.Fatalf("truncate checkpoints=%v, want 2 across repeated blocked syncs", got)
 	}
 
 	db.mu.RLock()
@@ -838,6 +852,48 @@ func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T)
 	db.mu.RUnlock()
 	if !db.exceedsTruncateThreshold(blockedOffset) {
 		t.Fatalf("expected wal to remain unrestarted while reader is open: offset=%d", blockedOffset)
+	}
+
+	db.TruncatePageN = DefaultTruncatePageN
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	db.TruncatePageN = 2
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 2 {
+		t.Fatalf("passive checkpoints=%v, want 2 after threshold cleared", got)
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 3 {
+		t.Fatalf("truncate checkpoints=%v, want 3 after threshold cleared", got)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	db.TruncatePageN = 1
+	if err := db.Checkpoint(t.Context(), CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	restartedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if !db.exceedsTruncateThreshold(restartedOffset) {
+		t.Fatalf("precondition: restarted wal offset %d must meet the truncate threshold", restartedOffset)
+	}
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 4 {
+		t.Fatalf("passive checkpoints=%v, want 4 after wal restart", got)
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 4 {
+		t.Fatalf("truncate checkpoints=%v, want 4 after wal restart", got)
 	}
 }
 
