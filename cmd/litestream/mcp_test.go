@@ -345,7 +345,7 @@ func TestMCPServerBearerAuth(t *testing.T) {
 	}{
 		{name: "authorized", token: "secret", authorization: "Bearer secret", wantStatus: http.StatusOK},
 		{name: "missing token", token: "secret", wantStatus: http.StatusUnauthorized},
-		{name: "wrong token", token: "secret", authorization: "Bearer wrong", wantStatus: http.StatusUnauthorized},
+		{name: "wrong token", token: "secret", authorization: "Bearer wrongx", wantStatus: http.StatusUnauthorized},
 		{name: "wrong token length", token: "secret", authorization: "Bearer incorrect", wantStatus: http.StatusUnauthorized},
 		{name: "unset token", wantStatus: http.StatusOK},
 	}
