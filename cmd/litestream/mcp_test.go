@@ -11,6 +11,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 )
@@ -176,24 +177,40 @@ func TestRestoreToolIntegrityCheck(t *testing.T) {
 func TestRestorePlanTool(t *testing.T) {
 	t.Setenv("PATH", t.TempDir())
 	fixture := newMCPTestFixture(t)
-	timestamp := time.Now().Add(time.Hour).Format(time.RFC3339)
+	baseTime := time.Now().Add(-3 * time.Hour).UTC().Truncate(time.Second)
+	for txID := ltx.TXID(1); txID <= 3; txID++ {
+		path := litestream.LTXFilePath(fixture.replicaPath, 0, txID, txID)
+		if txID > 1 {
+			if err := os.WriteFile(path, []byte("ltx"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		createdAt := baseTime.Add(time.Duration(txID-1) * time.Hour)
+		if err := os.Chtimes(path, createdAt, createdAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	timestamp := baseTime.Add(90 * time.Minute).Format(time.RFC3339)
 
 	tests := []struct {
 		name          string
 		arguments     map[string]any
 		includeOutput bool
+		fileN         int
 	}{
 		{
 			name:          "database path with txid",
 			includeOutput: true,
+			fileN:         2,
 			arguments: map[string]any{
 				"path":   fixture.dbPath,
 				"config": fixture.configPath,
-				"txid":   "0000000000000001",
+				"txid":   "0000000000000002",
 			},
 		},
 		{
-			name: "replica URL with timestamp",
+			name:  "replica URL with timestamp",
+			fileN: 2,
 			arguments: map[string]any{
 				"path":      "file://" + fixture.replicaPath,
 				"config":    filepath.Join(t.TempDir(), "missing.yml"),
@@ -226,11 +243,11 @@ func TestRestorePlanTool(t *testing.T) {
 			if plan.Replica != "file" {
 				t.Fatalf("replica=%q, want file", plan.Replica)
 			}
-			if plan.MinTXID == "" || plan.MaxTXID == "" {
-				t.Fatalf("expected txid range: %#v", plan)
+			if plan.MinTXID != "0000000000000001" || plan.MaxTXID != "0000000000000002" {
+				t.Fatalf("txid range=%s-%s, want 0000000000000001-0000000000000002", plan.MinTXID, plan.MaxTXID)
 			}
-			if len(plan.Files) == 0 {
-				t.Fatal("expected restore plan files")
+			if len(plan.Files) != tt.fileN {
+				t.Fatalf("files=%d, want %d", len(plan.Files), tt.fileN)
 			}
 			for i, file := range plan.Files {
 				if file.Name == "" || file.MinTXID == "" || file.MaxTXID == "" {
