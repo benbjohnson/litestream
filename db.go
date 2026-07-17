@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -94,6 +95,10 @@ type DB struct {
 	fileInfo os.FileInfo // db info cached during init
 	dirInfo  os.FileInfo // parent dir info cached during init
 
+	// openLTXFile opens LTX staging files; overridable in tests to
+	// inject filesystem errors such as ENOSPC.
+	openLTXFile func(name string, flag int, perm os.FileMode) (ltxStagingFile, error)
+
 	ctx    context.Context
 	cancel func()
 	wg     sync.WaitGroup
@@ -107,6 +112,7 @@ type DB struct {
 	syncNCounter                prometheus.Counter
 	syncErrorNCounter           prometheus.Counter
 	syncSecondsCounter          prometheus.Counter
+	diskFullGauge               prometheus.Gauge
 	checkpointNCounterVec       *prometheus.CounterVec
 	checkpointErrorNCounterVec  *prometheus.CounterVec
 	checkpointSecondsCounterVec *prometheus.CounterVec
@@ -318,6 +324,7 @@ func NewDB(path string) *DB {
 		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.openLTXFile = defaultOpenLTXFile
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
 	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
@@ -326,6 +333,7 @@ func NewDB(path string) *DB {
 	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
 	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
 	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
+	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
 	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
 	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
@@ -1258,6 +1266,11 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		if err != nil {
 			db.syncErrorNCounter.Inc()
 		}
+		if isDiskFullError(err) {
+			db.diskFullGauge.Set(1)
+		} else {
+			db.diskFullGauge.Set(0)
+		}
 		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
 	}()
 
@@ -1488,11 +1501,26 @@ func isDiskFullError(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, ErrDiskFull) || errors.Is(err, syscall.ENOSPC) {
+		return true
+	}
 	errStr := strings.ToLower(err.Error())
 	return strings.Contains(errStr, "no space left on device") ||
 		strings.Contains(errStr, "disk quota exceeded") ||
+		strings.Contains(errStr, "not enough space on the disk") ||
+		strings.Contains(errStr, "database or disk is full") ||
 		strings.Contains(errStr, "enospc") ||
 		strings.Contains(errStr, "edquot")
+}
+
+type ltxStagingFile interface {
+	io.Writer
+	Sync() error
+	Close() error
+}
+
+func defaultOpenLTXFile(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+	return os.OpenFile(name, flag, perm)
 }
 
 // walFileSize returns the size of the WAL file in bytes.
@@ -2054,11 +2082,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 
 	tmpFilename := filename + ".tmp"
 	if err := internal.MkdirAll(filepath.Dir(tmpFilename), db.dirInfo); err != nil {
+		if isDiskFullError(err) {
+			return result, NewLTXError("stage-mkdir", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+		}
 		return result, err
 	}
 
-	ltxFile, err := os.OpenFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	ltxFile, err := db.openLTXFile(tmpFilename, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
 	if err != nil {
+		if isDiskFullError(err) {
+			return result, NewLTXError("stage-open", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+		}
 		return result, fmt.Errorf("open temp ltx file: %w", err)
 	}
 	defer func() { _ = os.Remove(tmpFilename) }()
@@ -2093,6 +2127,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		WALSalt1:  rd.salt1,
 		WALSalt2:  rd.salt2,
 	}); err != nil {
+		if isDiskFullError(err) {
+			return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+		}
 		return result, fmt.Errorf("encode ltx header: %w", err)
 	}
 
@@ -2107,6 +2144,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.reason = info.reason
 			})
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+			if isDiskFullError(err) {
+				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			}
 			return result, fmt.Errorf("write ltx from db: %w", err)
 		}
 	} else {
@@ -2118,6 +2158,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.reason = info.reason
 			})
 		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
+			if isDiskFullError(err) {
+				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+			}
 			return result, fmt.Errorf("write ltx from wal: %w", err)
 		}
 	}
@@ -2128,6 +2171,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		s.walSize = sz
 	})
 	if err := enc.Close(); err != nil {
+		if isDiskFullError(err) {
+			return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+		}
 		return result, fmt.Errorf("close ltx encoder: %w", err)
 	}
 
@@ -2137,9 +2183,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		s.walSize = sz
 	})
 	if err := ltxFile.Sync(); err != nil {
+		if isDiskFullError(err) {
+			return result, NewLTXError("stage-sync", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+		}
 		return result, fmt.Errorf("sync ltx file: %w", err)
 	}
 	if err := ltxFile.Close(); err != nil {
+		if isDiskFullError(err) {
+			return result, NewLTXError("stage-close", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
+		}
 		return result, fmt.Errorf("close ltx file: %w", err)
 	}
 
@@ -3096,10 +3148,23 @@ func (db *DB) monitor() {
 
 			// Log with rate limiting to avoid log spam during persistent errors.
 			if time.Since(lastLogTime) >= SyncErrorLogInterval {
-				db.Logger.Error("sync error",
-					"error", err,
-					"consecutive_errors", consecutiveErrs,
-					"backoff", backoff)
+				var ltxErr *LTXError
+				if errors.Is(err, ErrDiskFull) && errors.As(err, &ltxErr) {
+					// Recovery is automatic but can lag up to max_backoff
+					// behind space being freed.
+					db.Logger.Error("disk full while staging ltx file, replication paused until space is freed",
+						"error", err,
+						"path", ltxErr.Path,
+						"txid", ltx.TXID(ltxErr.MaxTXID).String(),
+						"consecutive_errors", consecutiveErrs,
+						"backoff", backoff,
+						"max_backoff", DefaultSyncBackoffMax)
+				} else {
+					db.Logger.Error("sync error",
+						"error", err,
+						"consecutive_errors", consecutiveErrs,
+						"backoff", backoff)
+				}
 				lastLogTime = time.Now()
 			}
 
@@ -3265,6 +3330,11 @@ var (
 	syncSecondsCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "litestream_sync_seconds",
 		Help: "Time spent syncing shadow WAL, in seconds",
+	}, []string{"db"})
+
+	diskFullGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_disk_full",
+		Help: "Whether replication is paused because the local disk is full",
 	}, []string{"db"})
 
 	checkpointNCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
