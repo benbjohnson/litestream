@@ -145,6 +145,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		return flag.ErrHelp
 	case cmd == "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
+	case cmd == "mcp":
+		return (&MCPCommand{}).Run(ctx, args)
 	case cmd == "replicate":
 		return m.runReplicate(ctx, args)
 
@@ -223,6 +225,7 @@ The commands are:
 	info         show daemon information
 	list         list all managed databases
 	ltx          list available LTX files for a database
+	mcp          runs the MCP server
 	register     register a database for replication
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
