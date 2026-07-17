@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"fmt"
@@ -70,10 +71,12 @@ func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
 	if token == "" {
 		return next
 	}
+	tokenHash := sha256.Sum256([]byte(token))
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, credential, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(credential), []byte(token)) != 1 {
+		credentialHash := sha256.Sum256([]byte(credential))
+		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(credentialHash[:], tokenHash[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return
