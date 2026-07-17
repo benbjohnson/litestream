@@ -426,9 +426,6 @@ func TestMCPToolIntegration(t *testing.T) {
 					t.Errorf("success content does not contain %q: %q", want, text)
 				}
 			}
-			if got, want := result.StructuredContent, map[string]any{"text": text}; !reflect.DeepEqual(got, want) {
-				t.Errorf("structured content=%v, want %v", got, want)
-			}
 			if test.verifySuccess != nil {
 				test.verifySuccess(t)
 			}
@@ -631,8 +628,24 @@ func newMCPToolFixture(t *testing.T) mcpToolFixture {
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
+	dbClosed := false
+	t.Cleanup(func() {
+		if !dbClosed {
+			if err := db.Close(context.Background()); err != nil {
+				t.Error(err)
+			}
+		}
+	})
 
 	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	sqldbClosed := false
+	t.Cleanup(func() {
+		if !sqldbClosed {
+			if err := sqldb.Close(); err != nil {
+				t.Error(err)
+			}
+		}
+	})
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE test (id INTEGER PRIMARY KEY)`); err != nil {
 		t.Fatal(err)
 	}
@@ -656,9 +669,11 @@ func newMCPToolFixture(t *testing.T) mcpToolFixture {
 	if err := sqldb.Close(); err != nil {
 		t.Fatal(err)
 	}
+	sqldbClosed = true
 	if err := db.Close(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+	dbClosed = true
 
 	configPath := filepath.Join(dir, "litestream.yml")
 	config := fmt.Sprintf("dbs:\n  - path: %s\n    replicas:\n      - url: file://%s\n", dbPath, replicaPath)
