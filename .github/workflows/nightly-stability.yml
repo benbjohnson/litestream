@@ -167,6 +167,52 @@ jobs:
           path: /tmp/litestream-minio-soak-*/
           retention-days: 14
 
+  replicate-restore-soak:
+    name: Replicate Restore Soak
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - name: Build binaries
+        run: |
+          go build -o bin/litestream ./cmd/litestream
+          go build -o bin/litestream-test ./cmd/litestream-test
+
+      - name: Determine duration
+        id: config
+        run: |
+          if [[ -n "${{ inputs.duration }}" ]]; then
+            echo "duration=${{ inputs.duration }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.event.schedule }}" == "0 3 * * 6" ]]; then
+            echo "duration=2h" >> $GITHUB_OUTPUT
+          else
+            echo "duration=30m" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run replicate restore soak test
+        run: |
+          go test -tags 'integration,soak,docker' \
+            -run 'TestSoakReplicateRestore' \
+            -v -timeout 170m \
+            ./tests/integration/
+        env:
+          SOAK_KEEP_TEMP: "1"
+          SOAK_AUTO_PURGE: "yes"
+          SOAK_DURATION: ${{ steps.config.outputs.duration }}
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: replicate-restore-soak-results
+          path: /tmp/litestream-replicate-restore-*/
+          retention-days: 14
+
   comprehensive-soak:
     name: Comprehensive Soak
     runs-on: ubuntu-latest
@@ -215,7 +261,7 @@ jobs:
   notify-on-failure:
     name: Notify on Failure
     runs-on: ubuntu-latest
-    needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, comprehensive-soak]
+    needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, replicate-restore-soak, comprehensive-soak]
     if: failure()
     steps:
       - name: Create or update failure issue

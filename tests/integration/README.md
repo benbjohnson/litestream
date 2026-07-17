@@ -61,6 +61,7 @@ Long-running soak tests live alongside the other integration tests and share the
 | --- | --- | --- | --- | --- |
 | `TestComprehensiveSoak` | `integration,soak` | 2h duration, 50 MB DB, 500 writes/s | File-backed end-to-end stress | Litestream binaries in `./bin` |
 | `TestMinIOSoak` | `integration,soak,docker` | 2h duration, 5 MB DB (short=2 m), 100 writes/s | S3-compatible replication via MinIO | Docker daemon, `docker` CLI |
+| `TestSoakReplicateRestore` | `integration,soak,docker` | 5m duration (short=1 m), 100 writes/s, restore every 30s | Issue #1164 repro: stop→restore→integrity_check cycles against MinIO | Docker daemon, `docker` CLI |
 | `TestOvernightS3Soak` | `integration,soak,aws` | 8h duration, 50 MB DB | Real S3 replication & restore | AWS credentials, `aws` CLI |
 
 All soak tests support `go test -test.short` to scale the default duration down to roughly two minutes for smoke verification.
@@ -439,6 +440,7 @@ Metrics reported during execution:
 |------|----------|--------------|---------------|
 | TestComprehensiveSoak | 2h | None | File-based replication with aggressive compaction |
 | TestMinIOSoak | 2h | Docker | S3-compatible storage via MinIO container |
+| TestSoakReplicateRestore | 5m | Docker | Issue #1164 repro: periodic stop→restore→integrity_check |
 | TestOvernightS3Soak | 8h | AWS credentials | Real S3 replication, overnight stability |
 
 ## Benefits Over Bash
