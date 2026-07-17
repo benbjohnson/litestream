@@ -166,6 +166,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			} else {
 				slog.Info("replication complete, litestream shutting down")
 			}
+		case err = <-c.mcpErrCh:
+			slog.Info("MCP server exited, litestream shutting down")
 		case sig := <-signalCh:
 			slog.Info("signal received, litestream shutting down", "signal", sig)
 
