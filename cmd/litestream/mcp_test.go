@@ -55,6 +55,44 @@ func TestMCPCommandStdioHelper(t *testing.T) {
 	}
 }
 
+func TestMCPCommandStdioContextCancellation(t *testing.T) {
+	stdin, stdinWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutReader, stdout, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousStdin, previousStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdin, stdout
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout = previousStdin, previousStdout
+		for _, file := range []*os.File{stdin, stdinWriter, stdoutReader, stdout} {
+			if err := file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				t.Error(err)
+			}
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- (&MCPCommand{}).Run(ctx, nil)
+	}()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stdio command did not stop after cancellation")
+	}
+}
+
 func TestMCPCommandHTTP(t *testing.T) {
 	listener := availableTCPListener(t)
 	addr := listener.Addr().String()
@@ -92,7 +130,9 @@ func TestMCPCommandEmbeddedHTTP(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	server.Start("127.0.0.1:0")
+	if err := server.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
 
 	session := connectMCPHTTP(t, "http://"+server.httpServer.Addr)
 	if err := session.Close(); err != nil {
@@ -100,6 +140,14 @@ func TestMCPCommandEmbeddedHTTP(t *testing.T) {
 	}
 	if err := server.Close(); err != nil {
 		t.Fatal(err)
+	}
+	select {
+	case err := <-server.errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("embedded HTTP server did not stop")
 	}
 }
 
@@ -136,6 +184,13 @@ func TestMCPCommandHTTPBindError(t *testing.T) {
 	err = (&MCPCommand{}).Run(t.Context(), []string{"--addr", listener.Addr().String()})
 	if err == nil || !strings.Contains(err.Error(), "listen for MCP HTTP server") {
 		t.Fatalf("error=%v, want listen error", err)
+	}
+
+	cmd := NewReplicateCommand()
+	cmd.Config.MCPAddr = listener.Addr().String()
+	err = cmd.Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "start MCP server: listen for MCP HTTP server") {
+		t.Fatalf("embedded error=%v, want listen error", err)
 	}
 }
 

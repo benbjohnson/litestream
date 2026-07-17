@@ -103,6 +103,7 @@ type MCPServer struct {
 	server     *mcp.Server
 	mux        *http.ServeMux
 	httpServer *http.Server
+	errCh      chan error
 	configPath string
 }
 
@@ -146,19 +147,17 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	return s, nil
 }
 
-func (s *MCPServer) Start(addr string) {
+func (s *MCPServer) Start(addr string) error {
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		slog.Error("MCP server error", "error", err)
-		return
+		return fmt.Errorf("listen for MCP HTTP server: %w", err)
 	}
 	s.httpServer = s.newHTTPServer(listener.Addr().String())
+	s.errCh = make(chan error, 1)
 	go func() {
-		slog.Info("Starting MCP Streamable HTTP server", "addr", listener.Addr().String())
-		if err := s.httpServer.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			slog.Error("MCP server error", "error", err)
-		}
+		s.errCh <- s.runHTTP(s.ctx, listener)
 	}()
+	return nil
 }
 
 func (s *MCPServer) RunStdio(ctx context.Context) error {
@@ -167,6 +166,10 @@ func (s *MCPServer) RunStdio(ctx context.Context) error {
 
 func (s *MCPServer) RunHTTP(ctx context.Context, listener net.Listener) error {
 	s.httpServer = s.newHTTPServer(listener.Addr().String())
+	return s.runHTTP(ctx, listener)
+}
+
+func (s *MCPServer) runHTTP(ctx context.Context, listener net.Listener) error {
 	errCh := make(chan error, 1)
 	go func() {
 		slog.Info("Starting MCP Streamable HTTP server", "addr", listener.Addr().String())
