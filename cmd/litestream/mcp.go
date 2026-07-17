@@ -21,6 +21,7 @@ import (
 type MCPServer struct {
 	ctx        context.Context
 	mux        *http.ServeMux
+	mcpServer  *mcp.Server
 	httpServer *http.Server
 	configPath string
 }
@@ -35,31 +36,31 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 		return nil, fmt.Errorf("configure MCP capabilities: %w", err)
 	}
 
-	mcpServer := mcp.NewServer(
+	s.mcpServer = mcp.NewServer(
 		&mcp.Implementation{Name: "Litestream MCP Server", Version: Version},
 		&mcp.ServerOptions{
 			Capabilities: capabilities,
 		},
 	)
-	mcpServer.AddReceivingMiddleware(recoveryMiddleware)
+	s.mcpServer.AddReceivingMiddleware(recoveryMiddleware)
 	infoTool, infoHandler := InfoTool(configPath)
-	mcp.AddTool(mcpServer, infoTool, infoHandler)
+	mcp.AddTool(s.mcpServer, infoTool, infoHandler)
 	databasesTool, databasesHandler := DatabasesTool(configPath)
-	mcp.AddTool(mcpServer, databasesTool, databasesHandler)
+	mcp.AddTool(s.mcpServer, databasesTool, databasesHandler)
 	restoreTool, restoreHandler := RestoreTool(configPath)
-	mcp.AddTool(mcpServer, restoreTool, restoreHandler)
+	mcp.AddTool(s.mcpServer, restoreTool, restoreHandler)
 	ltxTool, ltxHandler := LTXTool(configPath)
-	mcp.AddTool(mcpServer, ltxTool, ltxHandler)
+	mcp.AddTool(s.mcpServer, ltxTool, ltxHandler)
 	versionTool, versionHandler := VersionTool()
-	mcp.AddTool(mcpServer, versionTool, versionHandler)
+	mcp.AddTool(s.mcpServer, versionTool, versionHandler)
 	statusTool, statusHandler := StatusTool(configPath)
-	mcp.AddTool(mcpServer, statusTool, statusHandler)
+	mcp.AddTool(s.mcpServer, statusTool, statusHandler)
 	resetTool, resetHandler := ResetTool(configPath)
-	mcp.AddTool(mcpServer, resetTool, resetHandler)
+	mcp.AddTool(s.mcpServer, resetTool, resetHandler)
 
 	s.mux = http.NewServeMux()
 	s.mux.Handle("/", httplog.Logger(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
-		return mcpServer
+		return s.mcpServer
 	}, nil)))
 	return s, nil
 }

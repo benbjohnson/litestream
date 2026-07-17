@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -14,6 +15,10 @@ import (
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestMCPServerTools(t *testing.T) {
@@ -303,6 +308,165 @@ func TestMCPToolBehavior(t *testing.T) {
 	}
 }
 
+func TestMCPToolIntegration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+
+	const version = "v1.2.3-mcp-test"
+	setVersion(t, version)
+	installLitestreamTestCLI(t)
+	fixture := newMCPToolFixture(t)
+
+	server, err := NewMCP(t.Context(), fixture.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := connectMCPTestSession(t, server)
+
+	tests := []struct {
+		name             string
+		successArguments map[string]any
+		successContains  []string
+		verifySuccess    func(*testing.T)
+		errorArguments   map[string]any
+		errorContains    string
+	}{
+		{
+			name:             "litestream_databases",
+			successArguments: map[string]any{},
+			successContains:  []string{fixture.dbPath, "file"},
+			errorArguments:   map[string]any{"config": fixture.missingConfigPath},
+			errorContains:    fixture.missingConfigPath,
+		},
+		{
+			name:             "litestream_info",
+			successArguments: map[string]any{},
+			successContains:  []string{"=== Litestream Status Report ===", fixture.dbPath, fixture.txid},
+			errorArguments:   map[string]any{"config": fixture.missingConfigPath},
+			errorContains:    fixture.missingConfigPath,
+		},
+		{
+			name: "litestream_restore",
+			successArguments: map[string]any{
+				"path": fixture.replicaURL,
+				"o":    fixture.restorePath,
+			},
+			verifySuccess: func(t *testing.T) {
+				db := testingutil.MustOpenSQLDB(t, fixture.restorePath)
+				t.Cleanup(func() {
+					if err := db.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				var count int
+				if err := db.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM test`).Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != 1 {
+					t.Fatalf("restored row count=%d, want 1", count)
+				}
+			},
+			errorArguments: map[string]any{
+				"path": fixture.missingReplicaURL,
+				"o":    fixture.failedRestorePath,
+			},
+			errorContains: "no matching backup files available",
+		},
+		{
+			name:             "litestream_ltx",
+			successArguments: map[string]any{"path": fixture.replicaURL},
+			successContains:  []string{fixture.txid},
+			errorArguments:   map[string]any{"path": ""},
+			errorContains:    "database path or replica URL required",
+		},
+		{
+			name:             "litestream_version",
+			successArguments: map[string]any{},
+			successContains:  []string{version},
+			errorArguments:   map[string]any{"unexpected": true},
+			errorContains:    "unexpected",
+		},
+		{
+			name:             "litestream_status",
+			successArguments: map[string]any{},
+			successContains:  []string{fixture.dbPath, "ok"},
+			errorArguments:   map[string]any{"config": fixture.missingConfigPath},
+			errorContains:    fixture.missingConfigPath,
+		},
+		{
+			name:             "litestream_reset",
+			successArguments: map[string]any{"path": fixture.dbPath},
+			successContains:  []string{"Reset complete."},
+			verifySuccess: func(t *testing.T) {
+				if _, err := os.Stat(fixture.localLTXPath); !os.IsNotExist(err) {
+					t.Fatalf("local LTX file still exists after reset: %v", err)
+				}
+			},
+			errorArguments: map[string]any{"path": fixture.missingDBPath},
+			errorContains:  "database does not exist",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+				Name:      test.name,
+				Arguments: test.successArguments,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.IsError {
+				t.Fatalf("tool error: %s", textContent(t, result))
+			}
+			text := textContent(t, result)
+			for _, want := range test.successContains {
+				if !strings.Contains(text, want) {
+					t.Errorf("success content does not contain %q: %q", want, text)
+				}
+			}
+			if got, want := result.StructuredContent, map[string]any{"text": text}; !reflect.DeepEqual(got, want) {
+				t.Errorf("structured content=%v, want %v", got, want)
+			}
+			if test.verifySuccess != nil {
+				test.verifySuccess(t)
+			}
+
+			result, err = session.CallTool(t.Context(), &mcp.CallToolParams{
+				Name:      test.name,
+				Arguments: test.errorArguments,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError {
+				t.Fatalf("tool succeeded, want error: %s", textContent(t, result))
+			}
+			if got := textContent(t, result); !strings.Contains(got, test.errorContains) {
+				t.Fatalf("error content does not contain %q: %q", test.errorContains, got)
+			}
+		})
+	}
+}
+
+func TestMCPCLIProcess(t *testing.T) {
+	if os.Getenv("LITESTREAM_MCP_TEST_CLI") != "1" {
+		t.Skip("helper process only")
+	}
+
+	separator := slices.Index(os.Args, "--")
+	if separator == -1 {
+		fmt.Fprintln(os.Stderr, "missing command arguments")
+		os.Exit(2)
+	}
+	if err := NewMain().Run(context.Background(), os.Args[separator+1:]); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
 func TestMCPToolContextCancellation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
@@ -437,4 +601,126 @@ func setVersion(t *testing.T, version string) {
 	previous := Version
 	Version = version
 	t.Cleanup(func() { Version = previous })
+}
+
+type mcpToolFixture struct {
+	configPath        string
+	missingConfigPath string
+	dbPath            string
+	missingDBPath     string
+	replicaURL        string
+	missingReplicaURL string
+	restorePath       string
+	failedRestorePath string
+	localLTXPath      string
+	txid              string
+}
+
+func newMCPToolFixture(t *testing.T) mcpToolFixture {
+	t.Helper()
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db.sqlite")
+	replicaPath := filepath.Join(dir, "replica")
+
+	db := testingutil.NewDB(t, dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = litestream.NewReplicaWithClient(db, file.NewReplicaClient(replicaPath))
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE test (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO test DEFAULT VALUES`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncAndWait(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	localLTXPaths, err := filepath.Glob(filepath.Join(db.LTXDir(), "0", "*.ltx"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(localLTXPaths) == 0 {
+		t.Fatal("no local LTX files created")
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	configPath := filepath.Join(dir, "litestream.yml")
+	config := fmt.Sprintf("dbs:\n  - path: %s\n    replicas:\n      - url: file://%s\n", dbPath, replicaPath)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	return mcpToolFixture{
+		configPath:        configPath,
+		missingConfigPath: filepath.Join(dir, "missing.yml"),
+		dbPath:            dbPath,
+		missingDBPath:     filepath.Join(dir, "missing.db"),
+		replicaURL:        "file://" + replicaPath,
+		missingReplicaURL: "file://" + filepath.Join(dir, "missing-replica"),
+		restorePath:       filepath.Join(dir, "restored.sqlite"),
+		failedRestorePath: filepath.Join(dir, "failed.sqlite"),
+		localLTXPath:      localLTXPaths[0],
+		txid:              pos.TXID.String(),
+	}
+}
+
+func installLitestreamTestCLI(t *testing.T) {
+	t.Helper()
+
+	testBinary, err := filepath.Abs(os.Args[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "litestream")
+	script := "#!/bin/sh\nexec \"$LITESTREAM_MCP_TEST_BINARY\" -test.run=^TestMCPCLIProcess$ -- \"$@\"\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITESTREAM_MCP_TEST_BINARY", testBinary)
+	t.Setenv("LITESTREAM_MCP_TEST_CLI", "1")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func connectMCPTestSession(t *testing.T, server *MCPServer) *mcp.ClientSession {
+	t.Helper()
+
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.mcpServer.Connect(t.Context(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := serverSession.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+	clientSession, err := client.Connect(t.Context(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := clientSession.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return clientSession
 }
