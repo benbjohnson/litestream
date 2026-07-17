@@ -30,7 +30,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 
 	mcpServer := server.NewMCPServer(
 		"Litestream MCP Server",
-		"1.0.0",
+		Version,
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
 		server.WithLogging(),
@@ -243,16 +243,11 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 func VersionTool() (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_version",
-		mcp.WithDescription("Print the Litestream binary version."),
+		mcp.WithDescription("Print the running Litestream instance's version."),
 	)
 
-	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		cmd := exec.CommandContext(ctx, "litestream", "version")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
-		}
-		return mcp.NewToolResultText(string(output)), nil
+	return tool, func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText(Version + "\n"), nil
 	}
 }
 
