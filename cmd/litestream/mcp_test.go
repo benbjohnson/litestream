@@ -13,11 +13,18 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+type daemonToolCallResult struct {
+	result *mcp.CallToolResult
+	err    error
+}
 
 func TestMCPServerTools(t *testing.T) {
 	const version = "v1.2.3-mcp-test"
@@ -249,15 +256,7 @@ func TestMCPDaemonToolBehavior(t *testing.T) {
 		}
 	})
 
-	socketPath := mcpTestSocketPath(t)
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	daemonServer := httptest.NewUnstartedServer(handler)
-	daemonServer.Listener = listener
-	daemonServer.Start()
-	t.Cleanup(daemonServer.Close)
+	socketPath := startMCPDaemonTestServer(t, handler)
 
 	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
 	if err != nil {
@@ -369,6 +368,170 @@ func TestMCPDaemonToolsNoDaemon(t *testing.T) {
 			}
 			if got := textContent(t, result); !strings.Contains(got, "no Litestream daemon is running at socket "+socketPath) {
 				t.Fatalf("error=%q, want no-daemon message", got)
+			}
+		})
+	}
+
+	t.Run("stale socket", func(t *testing.T) {
+		staleSocketPath := mcpTestSocketPath(t)
+		listener, err := net.Listen("unix", staleSocketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener.(*net.UnixListener).SetUnlinkOnClose(false)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+			Name:      "litestream_list",
+			Arguments: map[string]any{"socket": staleSocketPath},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.IsError {
+			t.Fatal("tool succeeded, want error")
+		}
+		if got := textContent(t, result); !strings.Contains(got, "no Litestream daemon is running at socket "+staleSocketPath) {
+			t.Fatalf("error=%q, want no-daemon message", got)
+		}
+	})
+}
+
+func TestMCPDaemonToolContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	requestStarted := make(chan struct{})
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	})
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	_, toolHandler := DaemonInfoTool()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	timeout := 10
+	done := make(chan daemonToolCallResult, 1)
+	go func() {
+		result, _, err := toolHandler(ctx, nil, daemonInfoInput{Socket: &socketPath, Timeout: &timeout})
+		done <- daemonToolCallResult{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon request did not start")
+	}
+
+	select {
+	case call := <-done:
+		if !errors.Is(call.err, context.Canceled) {
+			t.Fatalf("error=%v, want context canceled", call.err)
+		}
+		if call.result != nil {
+			t.Fatalf("result=%v, want nil", call.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon tool did not return after context cancellation")
+	}
+}
+
+func TestMCPDaemonToolTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	requestStarted := make(chan struct{})
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	})
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	_, toolHandler := DaemonInfoTool()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	timeout := 1
+	done := make(chan daemonToolCallResult, 1)
+	go func() {
+		result, _, err := toolHandler(ctx, nil, daemonInfoInput{Socket: &socketPath, Timeout: &timeout})
+		done <- daemonToolCallResult{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon request did not start")
+	}
+
+	select {
+	case call := <-done:
+		if !errors.Is(call.err, context.DeadlineExceeded) {
+			t.Fatalf("error=%v, want deadline exceeded", call.err)
+		}
+		if !strings.Contains(call.err.Error(), "daemon request timed out after 1s") {
+			t.Fatalf("error=%v, want timeout message", call.err)
+		}
+		if call.result != nil {
+			t.Fatalf("result=%v, want nil", call.result)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("daemon tool exceeded its timeout")
+	}
+}
+
+func TestMCPDaemonToolReturnsDaemonError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		if _, err := io.WriteString(w, `{"error":"database is not running"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	})
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	_, toolHandler := DaemonSyncTool()
+	result, _, err := toolHandler(t.Context(), nil, daemonSyncInput{Path: "/data/db", Socket: &socketPath})
+	if err == nil || err.Error() != "sync failed: database is not running" {
+		t.Fatalf("error=%v, want daemon error", err)
+	}
+	if result != nil {
+		t.Fatalf("result=%v, want nil", result)
+	}
+}
+
+func TestNewDaemonClientTimeoutValidation(t *testing.T) {
+	type testCase struct {
+		name    string
+		timeout int
+		want    string
+	}
+	tests := []testCase{
+		{name: "zero", timeout: 0, want: "timeout must be greater than 0"},
+		{name: "negative", timeout: -1, want: "timeout must be greater than 0"},
+	}
+	if strconv.IntSize == 64 {
+		tests = append(tests, testCase{name: "duration overflow", timeout: int(maxDaemonTimeoutSeconds + 1), want: "timeout must be at most"})
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newDaemonClient(nil, &test.timeout, defaultDaemonReadTimeout)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+			if client != nil {
+				t.Fatalf("client=%v, want nil", client)
 			}
 		})
 	}
@@ -655,6 +818,21 @@ func mcpTestSocketPath(t *testing.T) string {
 		}
 	})
 	return path
+}
+
+func startMCPDaemonTestServer(t *testing.T, handler http.Handler) string {
+	t.Helper()
+
+	socketPath := mcpTestSocketPath(t)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return socketPath
 }
 
 func assertJSONEqual(t *testing.T, got, want []byte) {
