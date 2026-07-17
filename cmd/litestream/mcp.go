@@ -4,22 +4,100 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/MadAppGang/httplog"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 const mcpCatalogCacheTTL = 5 * time.Minute
+
+type MCPCommand struct {
+	listener net.Listener
+}
+
+func (c *MCPCommand) Run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("litestream-mcp", flag.ContinueOnError)
+	addr := fs.String("addr", "", "HTTP bind address")
+	configPath := fs.String("config", "", "config path")
+	fs.Usage = c.Usage
+	if err := fs.Parse(args); err != nil {
+		return err
+	} else if fs.NArg() > 0 {
+		return fmt.Errorf("too many arguments")
+	}
+	if *configPath == "" {
+		*configPath = DefaultConfigPath()
+	}
+
+	internal.InitLog(os.Stderr, "INFO", "text", false)
+
+	server, err := NewMCP(ctx, *configPath)
+	if err != nil {
+		return err
+	}
+
+	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	if *addr == "" {
+		err = server.RunStdio(runCtx)
+	} else {
+		listener := c.listener
+		if listener == nil {
+			listener, err = net.Listen("tcp", *addr)
+			if err != nil {
+				return fmt.Errorf("listen for MCP HTTP server: %w", err)
+			}
+		}
+		err = server.RunHTTP(runCtx, listener)
+	}
+	if errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func (c *MCPCommand) Usage() {
+	fmt.Printf(`
+The mcp command runs the Litestream MCP server without the replication daemon.
+
+Usage:
+
+	litestream mcp [arguments]
+
+Arguments:
+
+	-addr ADDR
+	    Serves MCP over Streamable HTTP at ADDR instead of stdio.
+
+	-config PATH
+	    Specifies the default configuration file used by MCP tools.
+	    Defaults to %s
+
+Examples:
+
+	$ litestream mcp
+	$ litestream mcp --config /path/to/litestream.yml
+	$ litestream mcp --addr 127.0.0.1:3001
+
+`[1:], DefaultConfigPath())
+}
 
 type MCPServer struct {
 	ctx        context.Context
@@ -102,6 +180,15 @@ func (s *MCPServer) Start(addr string) error {
 		close(s.httpDone)
 	}()
 	return nil
+}
+
+func (s *MCPServer) RunStdio(ctx context.Context) error {
+	return s.mcpServer.Run(ctx, &mcp.StdioTransport{})
+}
+
+func (s *MCPServer) RunHTTP(ctx context.Context, listener net.Listener) error {
+	s.httpServer = s.newHTTPServer(ctx, listener.Addr().String())
+	return s.runHTTP(ctx, listener)
 }
 
 func (s *MCPServer) runHTTP(ctx context.Context, listener net.Listener) error {
