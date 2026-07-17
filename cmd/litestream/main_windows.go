@@ -79,6 +79,15 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 
 	for {
 		select {
+		case err := <-c.mcpErrCh:
+			if err != nil {
+				slog.Error("MCP server exited", "error", err)
+			}
+			if closeErr := c.Close(s.ctx); closeErr != nil {
+				slog.Error("cannot close replication", "error", closeErr)
+			}
+			statusCh <- svc.Status{State: svc.StopPending}
+			return true, 3
 		case req := <-r:
 			switch req.Cmd {
 			case svc.Stop:

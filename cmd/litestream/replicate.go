@@ -40,7 +40,8 @@ type ReplicateCommand struct {
 	Config Config
 
 	// MCP server
-	MCP *MCPServer
+	MCP      *MCPServer
+	mcpErrCh <-chan error
 
 	// Server for IPC control commands.
 	Server *litestream.Server
@@ -185,7 +186,10 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		go c.MCP.Start(c.Config.MCPAddr)
+		if err := c.MCP.Start(c.Config.MCPAddr); err != nil {
+			return fmt.Errorf("start MCP server: %w", err)
+		}
+		c.mcpErrCh = c.MCP.errCh
 	}
 
 	// Setup databases.
@@ -455,7 +459,7 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
 		if err := c.MCP.Close(); err != nil {
-			slog.Error("error closing MCP server", "error", err)
+			return fmt.Errorf("close MCP server: %w", err)
 		}
 	}
 	return nil
