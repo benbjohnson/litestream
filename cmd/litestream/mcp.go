@@ -30,6 +30,7 @@ const (
 	defaultDaemonSocketPath   = "/var/run/litestream.sock"
 	defaultDaemonReadTimeout  = 10
 	defaultDaemonWriteTimeout = 30
+	maxDaemonTimeoutSeconds   = int64((1<<63 - 1) / time.Second)
 )
 
 const mcpCatalogCacheTTL = 5 * time.Minute
@@ -760,6 +761,9 @@ func newDaemonClient(socket *string, timeout *int, defaultTimeout int) (*daemonC
 	if timeoutSeconds <= 0 {
 		return nil, fmt.Errorf("timeout must be greater than 0")
 	}
+	if int64(timeoutSeconds) > maxDaemonTimeoutSeconds {
+		return nil, fmt.Errorf("timeout must be at most %d seconds", maxDaemonTimeoutSeconds)
+	}
 
 	return &daemonClient{socketPath: socketPath, timeoutSeconds: timeoutSeconds}, nil
 }
@@ -795,6 +799,9 @@ func (c *daemonClient) do(ctx context.Context, method, endpoint string, input, o
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("litestream daemon request timed out after %s at socket %s: %w", timeout, c.socketPath, err)
 		}
 		return daemonConnectionError(c.socketPath, err)
 	}
