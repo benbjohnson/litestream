@@ -283,7 +283,8 @@ type Config struct {
 	Logging internal.LoggingConfig `yaml:"logging"`
 
 	// MCP server options
-	MCPAddr string `yaml:"mcp-addr"`
+	MCPAddr      string `yaml:"mcp-addr"`
+	MCPAuthToken string `yaml:"mcp-auth-token"`
 
 	// Shutdown sync retry settings
 	ShutdownTimeout      time.Duration  `yaml:"-"`
