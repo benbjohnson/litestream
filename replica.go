@@ -187,7 +187,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		return result, errReplicaWaitForData
 	}
 
-	r.Logger().Info("replica sync",
+	r.Logger().Debug("replica sync",
 		slog.Group("txid",
 			slog.String("replica", r.Pos().TXID.String()),
 			slog.String("db", dpos.TXID.String()),
@@ -247,7 +247,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
-	r.Logger().Info("ltx file uploaded",
+	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
 		"minTXID", info.MinTXID,
 		"maxTXID", info.MaxTXID,
