@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -27,7 +28,7 @@ type MCPServer struct {
 	configPath string
 }
 
-func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
+func NewMCP(ctx context.Context, configPath, authToken string) (*MCPServer, error) {
 	s := &MCPServer{
 		ctx:        ctx,
 		configPath: configPath,
@@ -56,17 +57,18 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcp.AddTool(mcpServer, resetTool, resetHandler)
 
 	s.mux = http.NewServeMux()
-	s.mux.Handle("/", newMCPHandler(mcpServer))
+	s.mux.Handle("/", newMCPHandler(mcpServer, authToken))
 	return s, nil
 }
 
-func newMCPHandler(mcpServer *mcp.Server) http.Handler {
+func newMCPHandler(mcpServer *mcp.Server, authToken string) http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Stateless:                    true,
 		PropagateRequestCancellation: true,
 	})
+	handler = bearerAuthMiddleware(authToken, handler)
 	protection := http.NewCrossOriginProtection()
 	originHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Origin") != "" {
@@ -80,6 +82,22 @@ func newMCPHandler(mcpServer *mcp.Server) http.Handler {
 		handler.ServeHTTP(w, r)
 	})
 	return httplog.Logger(protection.Handler(originHandler))
+}
+
+func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, credential, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(credential), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *MCPServer) Start(addr string) {
