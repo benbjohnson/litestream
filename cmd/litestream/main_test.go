@@ -132,9 +132,11 @@ dbs:
 	t.Run("ExpandEnv", func(t *testing.T) {
 		os.Setenv("LITESTREAM_TEST_0129380", "/path/to/db")
 		os.Setenv("LITESTREAM_TEST_1872363", "s3://foo/bar")
+		t.Setenv("LITESTREAM_TEST_MCP_AUTH_TOKEN", "secret")
 
 		filename := filepath.Join(t.TempDir(), "litestream.yml")
 		if err := os.WriteFile(filename, []byte(`
+mcp-auth-token: ${LITESTREAM_TEST_MCP_AUTH_TOKEN}
 dbs:
   - path: $LITESTREAM_TEST_0129380
     replicas:
@@ -153,6 +155,8 @@ dbs:
 			t.Fatalf("Replica[0].URL=%v, want %v", got, want)
 		} else if got, want := config.DBs[0].Replicas[1].URL, ``; got != want {
 			t.Fatalf("Replica[1].URL=%v, want %v", got, want)
+		} else if got, want := config.MCPAuthToken, `secret`; got != want {
+			t.Fatalf("MCPAuthToken=%v, want %v", got, want)
 		}
 	})
 

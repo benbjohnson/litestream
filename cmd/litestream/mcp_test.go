@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -20,7 +21,7 @@ func TestMCPServerTools(t *testing.T) {
 	const version = "v1.2.3-mcp-test"
 	setVersion(t, version)
 
-	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -186,7 +187,7 @@ func TestMCPToolBehavior(t *testing.T) {
 	setVersion(t, "v1.2.3-mcp-test")
 	installFakeLitestream(t)
 
-	server, err := NewMCP(t.Context(), "/default/litestream.yml")
+	server, err := NewMCP(t.Context(), "/default/litestream.yml", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -332,6 +333,49 @@ func TestMCPRecoveryMiddleware(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "panic recovered in tools/call handler: test panic") {
 		t.Fatalf("error=%v, want recovered panic", err)
+	}
+}
+
+func TestMCPServerBearerAuth(t *testing.T) {
+	tests := []struct {
+		name          string
+		token         string
+		authorization string
+		wantStatus    int
+	}{
+		{name: "authorized", token: "secret", authorization: "Bearer secret", wantStatus: http.StatusOK},
+		{name: "missing token", token: "secret", wantStatus: http.StatusUnauthorized},
+		{name: "wrong token", token: "secret", authorization: "Bearer wrong", wantStatus: http.StatusUnauthorized},
+		{name: "unset token", wantStatus: http.StatusOK},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			server, err := NewMCP(t.Context(), "/etc/litestream.yml", test.token)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"v1.0.0"}}}`
+			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "application/json, text/event-stream")
+			if test.authorization != "" {
+				request.Header.Set("Authorization", test.authorization)
+			}
+			response := httptest.NewRecorder()
+
+			server.ServeHTTP(response, request)
+
+			if got := response.Code; got != test.wantStatus {
+				t.Fatalf("status=%d, want %d", got, test.wantStatus)
+			}
+			if test.wantStatus == http.StatusUnauthorized {
+				if got, want := response.Header().Get("WWW-Authenticate"), "Bearer"; got != want {
+					t.Fatalf("WWW-Authenticate=%q, want %q", got, want)
+				}
+			}
+		})
 	}
 }
 

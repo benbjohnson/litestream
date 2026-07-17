@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -25,7 +26,7 @@ type MCPServer struct {
 	configPath string
 }
 
-func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
+func NewMCP(ctx context.Context, configPath, authToken string) (*MCPServer, error) {
 	s := &MCPServer{
 		ctx:        ctx,
 		configPath: configPath,
@@ -58,10 +59,27 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcp.AddTool(mcpServer, resetTool, resetHandler)
 
 	s.mux = http.NewServeMux()
-	s.mux.Handle("/", httplog.Logger(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
-	}, nil)))
+	}, nil)
+	s.mux.Handle("/", httplog.Logger(bearerAuthMiddleware(authToken, handler)))
 	return s, nil
+}
+
+func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, credential, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare([]byte(credential), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *MCPServer) Start(addr string) {
