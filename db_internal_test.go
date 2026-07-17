@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -3639,5 +3640,452 @@ func TestDB_CloseWithCanceledContextStillCleansUp(t *testing.T) {
 	}
 	if rtx != nil {
 		t.Fatal("read lock not released after Close with canceled context")
+	}
+}
+
+// syncRestoreIntegrityConfig parameterizes runSyncRestoreIntegrity with the
+// pieces that differ between the sync/restore integrity test variants.
+type syncRestoreIntegrityConfig struct {
+	configure  func(db *DB)
+	schema     string
+	iterations int
+	insertRows func(t *testing.T, ctx context.Context, sqldb *sql.DB, iteration int)
+	afterSync  func(t *testing.T, ctx context.Context, sqldb *sql.DB, iteration int)
+	countQuery string
+	wantRows   int
+}
+
+// runSyncRestoreIntegrity opens a replicated database, runs insert/sync
+// iterations, closes everything, restores from the replica, and verifies
+// integrity and row count of the restored database.
+func runSyncRestoreIntegrity(t *testing.T, cfg syncRestoreIntegrityConfig) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	replicaDir := t.TempDir()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: replicaDir}
+	db.Replica.MonitorEnabled = false
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg.configure(db)
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close(context.Background()) })
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sqldb.Close() }()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(cfg.schema); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	for i := 0; i < cfg.iterations; i++ {
+		cfg.insertRows(t, ctx, sqldb, i)
+
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync iteration %d: %v", i, err)
+		}
+
+		if cfg.afterSync != nil {
+			cfg.afterSync(t, ctx, sqldb, i)
+		}
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("final sync: %v", err)
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatalf("close sqlite db: %v", err)
+	}
+	if err := db.Close(ctx); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	restorePath := filepath.Join(t.TempDir(), "restored.db")
+	restoreDB := NewDB(restorePath)
+	restoreDB.Replica = NewReplica(restoreDB)
+	restoreDB.Replica.Client = &testReplicaClient{dir: replicaDir}
+	restoreDB.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := restoreDB.Replica.Restore(ctx, RestoreOptions{OutputPath: restorePath}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	restoredDB, err := sql.Open("sqlite", restorePath)
+	if err != nil {
+		t.Fatalf("open restored db: %v", err)
+	}
+	defer func() { _ = restoredDB.Close() }()
+
+	rows, err := restoredDB.QueryContext(ctx, `PRAGMA integrity_check`)
+	if err != nil {
+		t.Fatalf("integrity check: %v", err)
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("integrity check returned no results")
+	}
+	if results[0] != "ok" {
+		t.Fatalf("integrity check failed on restored database: %v", results)
+	}
+
+	var count int
+	if err := restoredDB.QueryRowContext(ctx, cfg.countQuery).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != cfg.wantRows {
+		t.Fatalf("restored row count=%d, want %d", count, cfg.wantRows)
+	}
+}
+
+func TestSyncRestoreIntegrity(t *testing.T) {
+	runSyncRestoreIntegrity(t, syncRestoreIntegrityConfig{
+		configure: func(db *DB) {
+			db.MinCheckpointPageN = 50
+			db.CheckpointInterval = 100 * time.Millisecond
+		},
+		schema: `
+			CREATE TABLE IF NOT EXISTS data (
+				ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+				_uid TEXT NOT NULL,
+				_resource_version INTEGER NOT NULL,
+				_updated_at DATETIME NOT NULL,
+				name TEXT,
+				data_json BLOB,
+				is_active INTEGER,
+				UNIQUE (_uid, _resource_version)
+			);
+			CREATE INDEX IF NOT EXISTS data_uid_idx ON data (_uid);
+			CREATE INDEX IF NOT EXISTS data_name_idx ON data (name);
+		`,
+		iterations: 20,
+		insertRows: func(t *testing.T, ctx context.Context, sqldb *sql.DB, i int) {
+			t.Helper()
+			for j := 0; j < 10; j++ {
+				uid := fmt.Sprintf("uid-%d-%d", i, j)
+				_, err := sqldb.ExecContext(ctx,
+					`INSERT INTO data (_uid, _resource_version, _updated_at, name, data_json, is_active)
+					 VALUES (?, 1, datetime('now'), ?, ?, ?)`,
+					uid, fmt.Sprintf("item-%d-%d", i, j),
+					[]byte(fmt.Sprintf(`{"key":"k%d","value":%d}`, j, j)),
+					j%2,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+		countQuery: `SELECT COUNT(*) FROM data`,
+		wantRows:   20 * 10,
+	})
+}
+
+func TestSyncRestoreIntegrity_WithCheckpoints(t *testing.T) {
+	var checkpointN int
+	runSyncRestoreIntegrity(t, syncRestoreIntegrityConfig{
+		configure: func(db *DB) {
+			db.MinCheckpointPageN = 20
+			db.TruncatePageN = 200
+			db.CheckpointInterval = 50 * time.Millisecond
+		},
+		schema:     `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, extra BLOB)`,
+		iterations: 30,
+		insertRows: func(t *testing.T, ctx context.Context, sqldb *sql.DB, i int) {
+			t.Helper()
+			for j := 0; j < 20; j++ {
+				_, err := sqldb.ExecContext(ctx,
+					`INSERT INTO t (val, extra) VALUES (?, ?)`,
+					fmt.Sprintf("val-%d-%d", i, j),
+					bytes.Repeat([]byte{byte(i)}, 512),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+		afterSync: func(t *testing.T, ctx context.Context, sqldb *sql.DB, i int) {
+			t.Helper()
+			if i%5 != 4 {
+				return
+			}
+			if _, err := sqldb.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+				t.Logf("passive checkpoint %d: %v", i, err)
+				return
+			}
+			checkpointN++
+		},
+		countQuery: `SELECT COUNT(*) FROM t`,
+		wantRows:   30 * 20,
+	})
+	if checkpointN == 0 {
+		t.Fatal("no passive checkpoints succeeded; variant did not exercise the checkpoint path")
+	}
+}
+
+// TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints verifies that a
+// snapshot's content matches its advertised position while checkpoints and
+// writes run concurrently. The position capture and chkMu read lock must be
+// atomic with respect to checkpoints: if a checkpoint can run between them,
+// the snapshot reads post-position pages from the database file while its
+// header still claims the earlier transaction — the #1164 corruption class.
+func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE kv (id INTEGER PRIMARY KEY, v INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO kv VALUES (1, 0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := t.Context()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// valueAt records which kv value was current at each synced position so
+	// snapshots can be checked against the state their header advertises.
+	var valueMu sync.Mutex
+	valueAt := map[ltx.TXID]int64{}
+	recordPos := func(v int64) error {
+		pos, err := db.Pos()
+		if err != nil {
+			return err
+		}
+		valueMu.Lock()
+		valueAt[pos.TXID] = v
+		valueMu.Unlock()
+		return nil
+	}
+	if err := recordPos(0); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for v := int64(1); ; v++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := sqldb.Exec(`UPDATE kv SET v = ? WHERE id = 1`, v); err != nil {
+				errCh <- err
+				return
+			}
+			if err := db.Sync(ctx); err != nil {
+				errCh <- err
+				return
+			}
+			if err := recordPos(v); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// TRUNCATE resets the WAL so subsequent snapshots must read
+			// cold pages from the database file — the path that exposes
+			// a checkpoint racing the position capture.
+			if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+				if !isSQLiteBusyError(err) {
+					errCh <- err
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	var loMatchN, hiMatchN int
+	for i := range 15 {
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+
+		pos, r, err := db.SnapshotReader(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dec := ltx.NewDecoder(r)
+		if err := dec.DecodeHeader(); err != nil {
+			t.Fatal(err)
+		}
+		hdr := dec.Header()
+		if hdr.MaxTXID != pos.TXID {
+			t.Fatalf("snapshot header txid=%s, want advertised position %s", hdr.MaxTXID, pos.TXID)
+		}
+
+		restorePath := filepath.Join(t.TempDir(), fmt.Sprintf("restore-%d.db", i))
+		rf, err := os.Create(restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pageData := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rf.WriteAt(pageData, int64(phdr.Pgno-1)*int64(hdr.PageSize)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := dec.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rf.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if closer, ok := r.(io.Closer); ok {
+			_ = closer.Close()
+		}
+
+		restoredDB, err := sql.Open("sqlite", restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var integrity string
+		if err := restoredDB.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+			t.Fatal(err)
+		}
+		var got int64
+		if err := restoredDB.QueryRow(`SELECT v FROM kv WHERE id = 1`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		restoredDB.Close()
+		if integrity != "ok" {
+			t.Fatalf("snapshot %d integrity check failed: %s", i, integrity)
+		}
+
+		// The snapshot content must match the kv value recorded at a mapped
+		// TXID bracketing the snapshot position: the nearest at or before it,
+		// or the nearest after it. The writer records its commit under
+		// db.Pos() read after Sync returns, so a concurrent TRUNCATE boundary
+		// snapshot can mint the next TXID first and the commit lands under
+		// that later TXID while the commit's own TXID stays unmapped. Skip if
+		// recording lags behind the snapshot position entirely.
+		valueMu.Lock()
+		var wantLo, wantHi int64
+		var loTXID, hiTXID, maxTXID ltx.TXID
+		for txid, val := range valueAt {
+			if txid > maxTXID {
+				maxTXID = txid
+			}
+			if txid <= pos.TXID && txid >= loTXID {
+				loTXID, wantLo = txid, val
+			}
+			if txid > pos.TXID && (hiTXID == 0 || txid < hiTXID) {
+				hiTXID, wantHi = txid, val
+			}
+		}
+		valueMu.Unlock()
+		if pos.TXID > maxTXID {
+			continue
+		}
+		switch {
+		case loTXID != 0 && got == wantLo:
+			loMatchN++
+		case hiTXID != 0 && got == wantHi:
+			hiMatchN++
+		default:
+			t.Fatalf("snapshot at txid %s contains v=%d, want %d (recorded at txid %s) or %d (recorded at txid %s): content inconsistent with advertised position",
+				pos.TXID, got, wantLo, loTXID, wantHi, hiTXID)
+		}
+	}
+
+	// A hi-bracket match is ambiguous: it tolerates the rare recording race
+	// but is also what a snapshot with content ahead of its advertised
+	// position produces. The race is a narrow window while a chkMu handoff
+	// regression is systematic, so require at least one unambiguous match.
+	if loMatchN == 0 {
+		t.Fatalf("no snapshot matched the value recorded at or before its position (hi-bracket matches=%d): content may be ahead of advertised position", hiMatchN)
+	}
+
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
 }
