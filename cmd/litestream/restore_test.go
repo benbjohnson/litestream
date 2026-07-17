@@ -501,7 +501,7 @@ func TestRestoreCommand_RestoreReportsAdvancedTXID(t *testing.T) {
 			var err error
 			if mcp {
 				var output string
-				output, err = restoreMCP(ctx, path, litestream.NewReplicaWithClient(nil, client), litestream.RestoreOptions{OutputPath: path}, false, false)
+				output, err = restoreMCP(ctx, path, litestream.NewReplicaWithClient(nil, client), litestream.RestoreOptions{OutputPath: path}, "none", false, false)
 				if err == nil {
 					err = json.Unmarshal([]byte(output), &result)
 				}
