@@ -11,6 +11,15 @@ MACOSX_MIN_VERSION := 11.0
 DARWIN_LDFLAGS := -framework CoreFoundation -framework Security -lresolv -mmacosx-version-min=$(MACOSX_MIN_VERSION)
 LINUX_LDFLAGS := -lpthread -ldl -lm
 
+# Build metadata for -ldflags
+VERSION     := $(shell git describe --tags --always --dirty 2>/dev/null || echo "(development build)")
+LDFLAGS := -X 'main.Version=$(VERSION)'
+
+.PHONY: build
+build:
+	mkdir -p dist
+	go build -ldflags "$(LDFLAGS)" -o dist/litestream ./cmd/litestream
+
 .PHONY: vfs
 vfs:
 	mkdir -p dist
@@ -68,4 +77,4 @@ mcp-inspect:
 	fly mcp proxy -i --url http://localhost:8080/ --bearer-token=$(FLY_MCP_BEARER_TOKEN)
 
 
-.PHONY: default clean mcp-wrap mcp-inspect
+.PHONY: default clean build mcp-wrap mcp-inspect
