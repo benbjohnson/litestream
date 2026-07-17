@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -141,7 +142,154 @@ func TestRestoreToolRunWithoutLitestreamOnPATH(t *testing.T) {
 			if result.TXID == "" {
 				t.Fatal("expected restored txid")
 			}
+			if result.IntegrityCheck != "none" {
+				t.Fatalf("integrity check=%q, want none", result.IntegrityCheck)
+			}
 			assertRestoreCommandDB(t, outputPath)
+		})
+	}
+}
+
+func TestRestoreToolIntegrityCheck(t *testing.T) {
+	for _, mode := range []string{"quick", "full"} {
+		t.Run(mode, func(t *testing.T) {
+			fixture := newMCPTestFixture(t)
+			outputPath := filepath.Join(t.TempDir(), "restored.sqlite")
+			text := callMCPToolText(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
+				"path":            "file://" + fixture.replicaPath,
+				"output":          outputPath,
+				"integrity_check": mode,
+			})
+
+			var result RestoreResult
+			if err := json.Unmarshal([]byte(text), &result); err != nil {
+				t.Fatalf("decode result: %v\n%s", err, text)
+			}
+			if result.IntegrityCheck != mode {
+				t.Fatalf("integrity check=%q, want %q", result.IntegrityCheck, mode)
+			}
+			assertRestoreCommandDB(t, outputPath)
+		})
+	}
+}
+
+func TestRestorePlanTool(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	fixture := newMCPTestFixture(t)
+	timestamp := time.Now().Add(time.Hour).Format(time.RFC3339)
+
+	tests := []struct {
+		name          string
+		arguments     map[string]any
+		includeOutput bool
+	}{
+		{
+			name:          "database path with txid",
+			includeOutput: true,
+			arguments: map[string]any{
+				"path":   fixture.dbPath,
+				"config": fixture.configPath,
+				"txid":   "0000000000000001",
+			},
+		},
+		{
+			name: "replica URL with timestamp",
+			arguments: map[string]any{
+				"path":      "file://" + fixture.replicaPath,
+				"config":    filepath.Join(t.TempDir(), "missing.yml"),
+				"timestamp": timestamp,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			outputPath := filepath.Join(t.TempDir(), "restored.sqlite")
+			if tt.includeOutput {
+				tt.arguments["output"] = outputPath
+			}
+			text := callMCPToolText(t, handlerFromMCPTool(RestorePlanTool("")), tt.arguments)
+			wantSource := tt.arguments["path"].(string)
+
+			var plan RestorePlan
+			if err := json.Unmarshal([]byte(text), &plan); err != nil {
+				t.Fatalf("decode result: %v\n%s", err, text)
+			}
+			if plan.Source != wantSource {
+				t.Fatalf("source=%q, want %q", plan.Source, wantSource)
+			}
+			if tt.includeOutput && plan.TargetPath != outputPath {
+				t.Fatalf("target path=%q, want %q", plan.TargetPath, outputPath)
+			} else if !tt.includeOutput && plan.TargetPath != "" {
+				t.Fatalf("target path=%q, want empty", plan.TargetPath)
+			}
+			if plan.Replica != "file" {
+				t.Fatalf("replica=%q, want file", plan.Replica)
+			}
+			if plan.MinTXID == "" || plan.MaxTXID == "" {
+				t.Fatalf("expected txid range: %#v", plan)
+			}
+			if len(plan.Files) == 0 {
+				t.Fatal("expected restore plan files")
+			}
+			for i, file := range plan.Files {
+				if file.Name == "" || file.MinTXID == "" || file.MaxTXID == "" {
+					t.Fatalf("incomplete plan file at index %d: %#v", i, file)
+				}
+				if i > 0 && file.MaxTXID <= plan.Files[i-1].MaxTXID {
+					t.Fatalf("restore plan is out of order at indexes %d and %d", i-1, i)
+				}
+			}
+			if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+				t.Fatalf("restore plan created output: %v", err)
+			}
+		})
+	}
+}
+
+func TestRestorePlanToolRejectsInvalidOptions(t *testing.T) {
+	tests := []struct {
+		name      string
+		arguments map[string]any
+		contains  string
+	}{
+		{
+			name: "txid",
+			arguments: map[string]any{
+				"path": "file:///tmp/replica",
+				"txid": "bad",
+			},
+			contains: "invalid txid",
+		},
+		{
+			name: "timestamp",
+			arguments: map[string]any{
+				"path":      "file:///tmp/replica",
+				"timestamp": "bad",
+			},
+			contains: "invalid timestamp",
+		},
+		{
+			name: "txid and timestamp",
+			arguments: map[string]any{
+				"path":      "file:///tmp/replica",
+				"txid":      "0000000000000001",
+				"timestamp": "2026-07-17T12:00:00Z",
+			},
+			contains: "cannot specify both txid and timestamp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := callMCPToolResult(t, handlerFromMCPTool(RestorePlanTool("")), tt.arguments)
+			if !result.IsError {
+				t.Fatal("expected tool error")
+			}
+			text := mcpToolResultText(t, result)
+			if !strings.Contains(text, tt.contains) {
+				t.Fatalf("error does not contain %q: %s", tt.contains, text)
+			}
 		})
 	}
 }
@@ -251,6 +399,14 @@ func TestRestoreToolRejectsInvalidOptions(t *testing.T) {
 			},
 			contains: "invalid parallelism",
 		},
+		{
+			name: "integrity check",
+			arguments: map[string]any{
+				"path":            "file:///tmp/replica",
+				"integrity_check": "invalid",
+			},
+			contains: "invalid integrity_check",
+		},
 	}
 
 	for _, tt := range tests {
@@ -306,6 +462,24 @@ func TestRestoreToolSchema(t *testing.T) {
 	}
 	if _, ok := tool.InputSchema.Properties["o"]; ok {
 		t.Fatal("did not expect o property")
+	}
+	if _, ok := tool.InputSchema.Properties["integrity_check"]; !ok {
+		t.Fatal("expected integrity_check property")
+	}
+}
+
+func TestRestorePlanToolSchema(t *testing.T) {
+	tool, _ := RestorePlanTool("")
+	if tool.Annotations.ReadOnlyHint == nil || !*tool.Annotations.ReadOnlyHint {
+		t.Fatal("expected read-only hint")
+	}
+	if tool.Annotations.DestructiveHint == nil || *tool.Annotations.DestructiveHint {
+		t.Fatal("expected non-destructive hint")
+	}
+	for _, name := range []string{"path", "output", "config", "txid", "timestamp"} {
+		if _, ok := tool.InputSchema.Properties[name]; !ok {
+			t.Fatalf("expected %s property", name)
+		}
 	}
 }
 

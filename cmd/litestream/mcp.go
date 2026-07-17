@@ -46,6 +46,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcpServer.AddTool(InfoTool(configPath))
 	mcpServer.AddTool(DatabasesTool(configPath))
 	mcpServer.AddTool(RestoreTool(configPath))
+	mcpServer.AddTool(RestorePlanTool(configPath))
 	mcpServer.AddTool(LTXTool(configPath))
 	mcpServer.AddTool(VersionTool())
 	mcpServer.AddTool(StatusTool(configPath))
@@ -156,6 +157,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
 		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
 		mcp.WithString("parallelism", mcp.Description("Number of WAL files to download in parallel. Optional.")),
+		mcp.WithString("integrity_check", mcp.Description("Post-restore integrity check mode. Optional."), mcp.Enum("none", "quick", "full"), mcp.DefaultString("none")),
 		mcp.WithBoolean("if_db_not_exists", mcp.Description("Skip restore if the database already exists. Optional.")),
 		mcp.WithBoolean("if_replica_exists", mcp.Description("Skip restore if no backups are found. Optional.")),
 	)
@@ -171,19 +173,9 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if opt.OutputPath == "" {
 			opt.OutputPath = req.GetString("o", "")
 		}
-		if value := req.GetString("txid", ""); value != "" {
-			txID, err := ltx.ParseTXID(value)
-			if err != nil {
-				return mcpToolError(fmt.Errorf("invalid txid: %w", err))
-			}
-			opt.TXID = txID
-		}
-		if value := req.GetString("timestamp", ""); value != "" {
-			timestamp, err := time.Parse(time.RFC3339, value)
-			if err != nil {
-				return mcpToolError(fmt.Errorf("invalid timestamp: %w", err))
-			}
-			opt.Timestamp = timestamp
+		var err error
+		if opt.TXID, opt.Timestamp, err = parseMCPRestoreTarget(req); err != nil {
+			return mcpToolError(err)
 		}
 		if value := req.GetString("parallelism", ""); value != "" {
 			parallelism, err := strconv.Atoi(value)
@@ -191,6 +183,10 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 				return mcpToolError(fmt.Errorf("invalid parallelism: %w", err))
 			}
 			opt.Parallelism = parallelism
+		}
+		integrityCheck := req.GetString("integrity_check", "none")
+		if opt.IntegrityCheck, err = parseMCPIntegrityCheck(integrityCheck); err != nil {
+			return mcpToolError(err)
 		}
 
 		r, err := loadMCPRestoreReplica(path, req.GetString("config", configPath), &opt)
@@ -232,8 +228,52 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 			Replica:        r.Client.Type(),
 			TXID:           txID,
 			DurationMS:     time.Since(start).Milliseconds(),
-			IntegrityCheck: "none",
+			IntegrityCheck: integrityCheck,
 		}, "", "  ")
+		if err != nil {
+			return mcpToolError(fmt.Errorf("format response: %w", err))
+		}
+		return mcp.NewToolResultText(string(output) + "\n"), nil
+	}
+}
+
+func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
+	tool := mcp.NewTool("litestream_restore_plan",
+		mcp.WithDescription("Preview the ordered snapshot and LTX files for a restore without writing a database."),
+		mcp.WithReadOnlyHintAnnotation(true),
+		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
+		mcp.WithString("output", mcp.Description("Target database path to include in the plan. Optional.")),
+		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional, ignored for replica URLs.")),
+		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
+		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
+	)
+
+	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		path := req.GetString("path", "")
+		if path == "" {
+			return mcpToolError(fmt.Errorf("database path or replica URL required"))
+		}
+
+		opt := litestream.NewRestoreOptions()
+		opt.OutputPath = req.GetString("output", "")
+		var err error
+		if opt.TXID, opt.Timestamp, err = parseMCPRestoreTarget(req); err != nil {
+			return mcpToolError(err)
+		}
+
+		r, err := loadMCPReplica(path, req.GetString("config", configPath))
+		if err != nil {
+			return mcpToolError(err)
+		}
+		plan, err := (&RestoreCommand{}).dryRunPlan(ctx, path, r, opt)
+		if errors.Is(err, litestream.ErrTxNotAvailable) {
+			return mcpToolError(fmt.Errorf("no matching backup files available"))
+		} else if err != nil {
+			return mcpToolError(err)
+		}
+
+		output, err := json.MarshalIndent(plan, "", "  ")
 		if err != nil {
 			return mcpToolError(fmt.Errorf("format response: %w", err))
 		}
@@ -410,6 +450,41 @@ func loadMCPRestoreReplica(path, configPath string, opt *litestream.RestoreOptio
 		opt.OutputPath = db.Path()
 	}
 	return db.Replica, nil
+}
+
+func parseMCPRestoreTarget(req mcp.CallToolRequest) (ltx.TXID, time.Time, error) {
+	var txID ltx.TXID
+	if value := req.GetString("txid", ""); value != "" {
+		var err error
+		if txID, err = ltx.ParseTXID(value); err != nil {
+			return 0, time.Time{}, fmt.Errorf("invalid txid: %w", err)
+		}
+	}
+
+	var timestamp time.Time
+	if value := req.GetString("timestamp", ""); value != "" {
+		var err error
+		if timestamp, err = time.Parse(time.RFC3339, value); err != nil {
+			return 0, time.Time{}, fmt.Errorf("invalid timestamp: %w", err)
+		}
+	}
+	if txID != 0 && !timestamp.IsZero() {
+		return 0, time.Time{}, fmt.Errorf("cannot specify both txid and timestamp")
+	}
+	return txID, timestamp, nil
+}
+
+func parseMCPIntegrityCheck(value string) (litestream.IntegrityCheckMode, error) {
+	switch value {
+	case "none":
+		return litestream.IntegrityCheckNone, nil
+	case "quick":
+		return litestream.IntegrityCheckQuick, nil
+	case "full":
+		return litestream.IntegrityCheckFull, nil
+	default:
+		return litestream.IntegrityCheckNone, fmt.Errorf("invalid integrity_check: %s", value)
+	}
 }
 
 func loadMCPReplica(path, configPath string) (*litestream.Replica, error) {
