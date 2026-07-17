@@ -224,6 +224,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err := os.Rename(tmpFilename, filename); err != nil {
 		return nil, err
 	}
+	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
+		return nil, err
+	}
 
 	// Set file ModTime to preserve original timestamp
 	if err := os.Chtimes(filename, timestamp, timestamp); err != nil {
