@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -399,7 +400,7 @@ func TestMCPToolIntegration(t *testing.T) {
 			successArguments: map[string]any{"path": fixture.dbPath},
 			successContains:  []string{"Reset complete."},
 			verifySuccess: func(t *testing.T) {
-				if _, err := os.Stat(fixture.localLTXPath); !os.IsNotExist(err) {
+				if _, err := os.Stat(fixture.localLTXPath); !errors.Is(err, fs.ErrNotExist) {
 					t.Fatalf("local LTX file still exists after reset: %v", err)
 				}
 			},
