@@ -75,8 +75,9 @@ func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, credential, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		credential = strings.TrimLeft(credential, " ")
 		credentialHash := sha256.Sum256([]byte(credential))
-		if !ok || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(credentialHash[:], tokenHash[:]) != 1 {
+		if !ok || credential == "" || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(credentialHash[:], tokenHash[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
 			return

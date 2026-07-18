@@ -344,7 +344,11 @@ func TestMCPServerBearerAuth(t *testing.T) {
 		wantStatus    int
 	}{
 		{name: "authorized", token: "secret", authorization: "Bearer secret", wantStatus: http.StatusOK},
+		{name: "case-insensitive scheme", token: "secret", authorization: "bEaReR secret", wantStatus: http.StatusOK},
+		{name: "authorized with multiple spaces", token: "secret", authorization: "Bearer  secret", wantStatus: http.StatusOK},
 		{name: "missing token", token: "secret", wantStatus: http.StatusUnauthorized},
+		{name: "missing credential", token: "secret", authorization: "Bearer", wantStatus: http.StatusUnauthorized},
+		{name: "incorrect scheme", token: "secret", authorization: "Basic secret", wantStatus: http.StatusUnauthorized},
 		{name: "wrong token", token: "secret", authorization: "Bearer wrongx", wantStatus: http.StatusUnauthorized},
 		{name: "wrong token length", token: "secret", authorization: "Bearer incorrect", wantStatus: http.StatusUnauthorized},
 		{name: "unset token", wantStatus: http.StatusOK},
@@ -357,13 +361,7 @@ func TestMCPServerBearerAuth(t *testing.T) {
 				t.Fatal(err)
 			}
 
-			body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"v1.0.0"}}}`
-			request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
-			request.Header.Set("Content-Type", "application/json")
-			request.Header.Set("Accept", "application/json, text/event-stream")
-			if test.authorization != "" {
-				request.Header.Set("Authorization", test.authorization)
-			}
+			request := newMCPInitializeRequest(test.authorization)
 			response := httptest.NewRecorder()
 
 			server.ServeHTTP(response, request)
@@ -378,6 +376,75 @@ func TestMCPServerBearerAuth(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMCPServerBearerAuthConfig(t *testing.T) {
+	const envName = "LITESTREAM_TEST_MCP_AUTH_TOKEN_MISSING"
+	oldEnv, envSet := os.LookupEnv(envName)
+	if err := os.Unsetenv(envName); err != nil {
+		t.Fatal(err)
+	}
+	if envSet {
+		t.Cleanup(func() {
+			if err := os.Setenv(envName, oldEnv); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+
+	tests := []struct {
+		name       string
+		config     string
+		wantErr    error
+		wantStatus int
+	}{
+		{name: "token absent", wantStatus: http.StatusOK},
+		{name: "token configured", config: "mcp-auth-token: secret\n", wantStatus: http.StatusUnauthorized},
+		{name: "token environment missing", config: "mcp-auth-token: ${" + envName + "}\n", wantErr: ErrInvalidMCPAuthToken},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			config, err := ParseConfig(strings.NewReader(test.config), true)
+			if test.wantErr != nil {
+				if !errors.Is(err, test.wantErr) {
+					t.Fatalf("error=%v, want %v", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			authToken := ""
+			if config.MCPAuthToken != nil {
+				authToken = *config.MCPAuthToken
+			}
+			server, err := NewMCP(t.Context(), "/etc/litestream.yml", authToken)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			request := newMCPInitializeRequest("")
+			response := httptest.NewRecorder()
+			server.ServeHTTP(response, request)
+
+			if got := response.Code; got != test.wantStatus {
+				t.Fatalf("status=%d, want %d", got, test.wantStatus)
+			}
+		})
+	}
+}
+
+func newMCPInitializeRequest(authorization string) *http.Request {
+	body := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"test-client","version":"v1.0.0"}}}`
+	request := httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	if authorization != "" {
+		request.Header.Set("Authorization", authorization)
+	}
+	return request
 }
 
 func jsonObject(t *testing.T, value any) map[string]any {
