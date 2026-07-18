@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -266,10 +267,8 @@ func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
-		plan, err := (&RestoreCommand{}).dryRunPlan(ctx, path, r, opt)
-		if errors.Is(err, litestream.ErrTxNotAvailable) {
-			return mcpToolError(fmt.Errorf("no matching backup files available"))
-		} else if err != nil {
+		plan, err := calcMCPRestorePlan(ctx, path, r, opt)
+		if err != nil {
 			return mcpToolError(err)
 		}
 
@@ -279,6 +278,19 @@ func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		}
 		return mcp.NewToolResultText(string(output) + "\n"), nil
 	}
+}
+
+func calcMCPRestorePlan(ctx context.Context, path string, r *litestream.Replica, opt litestream.RestoreOptions) (plan RestorePlan, err error) {
+	defer func() {
+		if closer, ok := r.Client.(io.Closer); ok {
+			err = errors.Join(err, closer.Close())
+		}
+	}()
+	plan, err = (&RestoreCommand{}).dryRunPlan(ctx, path, r, opt)
+	if errors.Is(err, litestream.ErrTxNotAvailable) {
+		err = fmt.Errorf("no matching backup files available")
+	}
+	return plan, err
 }
 
 func VersionTool() (mcp.Tool, server.ToolHandlerFunc) {

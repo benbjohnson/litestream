@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +18,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/file"
 )
 
 func TestMCPReadToolsRunWithoutLitestreamOnPATH(t *testing.T) {
@@ -152,24 +157,91 @@ func TestRestoreToolRunWithoutLitestreamOnPATH(t *testing.T) {
 }
 
 func TestRestoreToolIntegrityCheck(t *testing.T) {
+	fixture := newMCPTestFixture(t)
+	corruptMCPTestFixture(t, fixture)
+
+	t.Run("none", func(t *testing.T) {
+		outputPath := filepath.Join(t.TempDir(), "restored.sqlite")
+		text := callMCPToolText(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
+			"path":            "file://" + fixture.replicaPath,
+			"output":          outputPath,
+			"integrity_check": "none",
+		})
+
+		var result RestoreResult
+		if err := json.Unmarshal([]byte(text), &result); err != nil {
+			t.Fatalf("decode result: %v\n%s", err, text)
+		}
+		if result.IntegrityCheck != "none" {
+			t.Fatalf("integrity check=%q, want none", result.IntegrityCheck)
+		}
+		if _, err := os.Stat(outputPath); err != nil {
+			t.Fatalf("stat restored database: %v", err)
+		}
+	})
+
 	for _, mode := range []string{"quick", "full"} {
 		t.Run(mode, func(t *testing.T) {
-			fixture := newMCPTestFixture(t)
 			outputPath := filepath.Join(t.TempDir(), "restored.sqlite")
-			text := callMCPToolText(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
+			result := callMCPToolResult(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
 				"path":            "file://" + fixture.replicaPath,
 				"output":          outputPath,
 				"integrity_check": mode,
 			})
+			if !result.IsError {
+				t.Fatal("expected tool error")
+			}
+			if text := mcpToolResultText(t, result); !strings.Contains(text, "post-restore integrity check") {
+				t.Fatalf("unexpected error: %s", text)
+			}
+			for _, path := range []string{outputPath, outputPath + "-shm", outputPath + "-wal"} {
+				if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("failed restore output exists at %q: %v", path, err)
+				}
+			}
+		})
+	}
+}
 
-			var result RestoreResult
-			if err := json.Unmarshal([]byte(text), &result); err != nil {
-				t.Fatalf("decode result: %v\n%s", err, text)
+func TestCalcMCPRestorePlanClosesReplicaClient(t *testing.T) {
+	fixture := newMCPTestFixture(t)
+	closeErr := errors.New("close replica client")
+
+	for _, tt := range []struct {
+		name       string
+		replicaDir string
+		closeErr   error
+		wantErr    []error
+		contains   string
+	}{
+		{name: "success", replicaDir: fixture.replicaPath},
+		{name: "close error", replicaDir: fixture.replicaPath, closeErr: closeErr, wantErr: []error{closeErr}},
+		{name: "plan error", replicaDir: t.TempDir(), contains: "no matching backup files available"},
+		{name: "plan and close error", replicaDir: t.TempDir(), closeErr: closeErr, wantErr: []error{closeErr}, contains: "no matching backup files available"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &mcpCloseTrackingReplicaClient{
+				ReplicaClient: file.NewReplicaClient(tt.replicaDir),
+				err:           tt.closeErr,
 			}
-			if result.IntegrityCheck != mode {
-				t.Fatalf("integrity check=%q, want %q", result.IntegrityCheck, mode)
+			replica := litestream.NewReplicaWithClient(nil, client)
+			_, err := calcMCPRestorePlan(t.Context(), "file://"+tt.replicaDir, replica, litestream.NewRestoreOptions())
+			if client.closeN != 1 {
+				t.Fatalf("close count=%d, want 1", client.closeN)
 			}
-			assertRestoreCommandDB(t, outputPath)
+			if len(tt.wantErr) == 0 && tt.contains == "" && err != nil {
+				t.Fatal(err)
+			}
+			for _, wantErr := range tt.wantErr {
+				if !errors.Is(err, wantErr) {
+					t.Fatalf("error=%v, want %v", err, wantErr)
+				}
+			}
+			if tt.contains != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.contains) {
+					t.Fatalf("error=%v, want text %q", err, tt.contains)
+				}
+			}
 		})
 	}
 }
@@ -257,7 +329,7 @@ func TestRestorePlanTool(t *testing.T) {
 					t.Fatalf("restore plan is out of order at indexes %d and %d", i-1, i)
 				}
 			}
-			if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+			if _, err := os.Stat(outputPath); !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("restore plan created output: %v", err)
 			}
 		})
@@ -506,6 +578,17 @@ type mcpTestFixture struct {
 	configPath  string
 }
 
+type mcpCloseTrackingReplicaClient struct {
+	litestream.ReplicaClient
+	err    error
+	closeN int
+}
+
+func (c *mcpCloseTrackingReplicaClient) Close() error {
+	c.closeN++
+	return c.err
+}
+
 func newMCPTestFixture(t *testing.T) mcpTestFixture {
 	t.Helper()
 
@@ -520,6 +603,60 @@ func newMCPTestFixture(t *testing.T) mcpTestFixture {
 		dbPath:      dbPath,
 		replicaPath: replicaPath,
 		configPath:  configPath,
+	}
+}
+
+func corruptMCPTestFixture(t *testing.T, fixture mcpTestFixture) {
+	t.Helper()
+
+	dbPath := filepath.Join(filepath.Dir(fixture.replicaPath), "db.sqlite")
+	data, err := os.ReadFile(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(data) < 100 {
+		t.Fatalf("database is too small: %d bytes", len(data))
+	}
+
+	pageSize := int(binary.BigEndian.Uint16(data[16:18]))
+	if pageSize == 1 {
+		pageSize = 65536
+	}
+	if pageSize == 0 || len(data)%pageSize != 0 || len(data) <= pageSize {
+		t.Fatalf("invalid test database size=%d page_size=%d", len(data), pageSize)
+	}
+	for i := pageSize; i < len(data); i++ {
+		data[i] = 0xde
+	}
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  uint32(pageSize),
+		Commit:    uint32(len(data) / pageSize),
+		MinTXID:   1,
+		MaxTXID:   1,
+		Timestamp: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for offset := 0; offset < len(data); offset += pageSize {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(offset/pageSize + 1)}, data[offset:offset+pageSize]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	path := litestream.LTXFilePath(fixture.replicaPath, 0, 1, 1)
+	if err := os.WriteFile(path, buf.Bytes(), 0600); err != nil {
+		t.Fatal(err)
 	}
 }
 

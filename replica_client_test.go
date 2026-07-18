@@ -199,6 +199,39 @@ func TestReplicaClient_OpenLTXFile(t *testing.T) {
 	})
 }
 
+func TestReplicaClient_Close(t *testing.T) {
+	RunWithReplicaClient(t, "Reconnect", func(t *testing.T, c litestream.ReplicaClient) {
+		if c.Type() != "nats" && c.Type() != "sftp" {
+			t.Skip("replica client does not retain a connection")
+		}
+
+		closer, ok := c.(io.Closer)
+		if !ok {
+			t.Fatalf("client type %q does not implement io.Closer", c.Type())
+		}
+		t.Cleanup(func() {
+			if err := closer.Close(); err != nil {
+				t.Errorf("close replica client: %v", err)
+			}
+		})
+
+		for i := 0; i < 2; i++ {
+			itr, err := c.LTXFiles(t.Context(), 0, 0, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for itr.Next() {
+			}
+			if err := errors.Join(itr.Err(), itr.Close()); err != nil {
+				t.Fatal(err)
+			}
+			if err := closer.Close(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	})
+}
+
 func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 	RunWithReplicaClient(t, "OK", func(t *testing.T, c litestream.ReplicaClient) {
 		t.Helper()
@@ -534,6 +567,29 @@ func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
 			t.Errorf("Expected warning not found")
 		}
 	})
+}
+
+func TestReplicaClient_SFTP_Close(t *testing.T) {
+	privateKey := mustParseTestSFTPHostKey(t)
+	addr := testingutil.MockSFTPServer(t, privateKey)
+
+	c := testingutil.NewSFTPReplicaClient(t)
+	c.User = "foo"
+	c.Host = addr
+	c.HostKey = string(ssh.MarshalAuthorizedKey(privateKey.PublicKey()))
+
+	closer, ok := any(c).(io.Closer)
+	if !ok {
+		t.Fatal("SFTP client does not implement io.Closer")
+	}
+	for i := 0; i < 2; i++ {
+		if err := c.Init(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := closer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
 }
 
 func TestReplicaClient_SFTP_WriteLTXFileAtomic(t *testing.T) {
