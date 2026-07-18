@@ -32,6 +32,7 @@ const ReplicaClientType = "gs"
 const MetadataKeyTimestamp = "litestream-timestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Google Cloud Storage.
 type ReplicaClient struct {
@@ -89,6 +90,20 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	c.bkt = c.client.Bucket(c.Bucket)
 
 	return nil
+}
+
+// Close closes the Google Cloud Storage client.
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.client == nil {
+		return nil
+	}
+	err := c.client.Close()
+	c.client = nil
+	c.bkt = nil
+	return err
 }
 
 // DeleteAll deletes all LTX files.
