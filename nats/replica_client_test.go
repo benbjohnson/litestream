@@ -1,10 +1,13 @@
 package nats
 
 import (
+	"bufio"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -27,12 +30,56 @@ func TestReplicaClient_Type(t *testing.T) {
 func TestReplicaClient_LTXFiles_InitError(t *testing.T) {
 	client := NewReplicaClient()
 	client.BucketName = "missing-bucket"
-	client.nc = &natsgo.Conn{}
+	client.nc = openTestNATSConn(t)
 	client.js = &objectStoreErrorJetStream{err: jetstream.ErrBucketNotFound}
 
 	if _, err := client.LTXFiles(t.Context(), 0, 0, false); !errors.Is(err, jetstream.ErrBucketNotFound) {
 		t.Fatalf("LTXFiles() error = %v, want %v", err, jetstream.ErrBucketNotFound)
 	}
+}
+
+func openTestNATSConn(t *testing.T) *natsgo.Conn {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		if _, err := io.WriteString(conn, "INFO {}\r\n"); err != nil {
+			return
+		}
+		reader := bufio.NewReader(conn)
+		if _, err := reader.ReadString('\n'); err != nil {
+			return
+		}
+		if _, err := reader.ReadString('\n'); err != nil {
+			return
+		}
+		if _, err := io.WriteString(conn, "PONG\r\n"); err != nil {
+			return
+		}
+		for {
+			if _, err := reader.ReadByte(); err != nil {
+				return
+			}
+		}
+	}()
+
+	nc, err := natsgo.Connect("nats://"+listener.Addr().String(), natsgo.NoReconnect(), natsgo.Timeout(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(nc.Close)
+	return nc
 }
 
 func TestReplicaClient_options_TLS(t *testing.T) {
@@ -143,6 +190,53 @@ func writeTLSFiles(t *testing.T) (rootCAPath, certPath, keyPath string) {
 	}
 
 	return rootCAPath, certPath, keyPath
+}
+
+func TestReplicaClient_InitCancellation(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+
+	accepted := make(chan net.Conn, 1)
+	acceptErr := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			acceptErr <- err
+			return
+		}
+		accepted <- conn
+	}()
+
+	client := NewReplicaClient()
+	client.URL = "nats://" + listener.Addr().String()
+	client.BucketName = "test"
+	client.Timeout = time.Minute
+	ctx, cancel := context.WithCancelCause(t.Context())
+	errCh := make(chan error, 1)
+	go func() { errCh <- client.Init(ctx) }()
+
+	select {
+	case conn := <-accepted:
+		t.Cleanup(func() { _ = conn.Close() })
+	case err := <-acceptErr:
+		t.Fatal(err)
+	case <-time.After(time.Second):
+		t.Fatal("NATS client did not connect")
+	}
+
+	cancelErr := errors.New("request canceled")
+	cancel(cancelErr)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, cancelErr) {
+			t.Fatalf("error=%v, want %v", err, cancelErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("NATS initialization did not stop after cancellation")
+	}
 }
 
 func TestReplicaClient_ltxPath(t *testing.T) {

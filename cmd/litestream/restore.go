@@ -263,6 +263,25 @@ func (c *RestoreCommand) restore(ctx context.Context, r *litestream.Replica, opt
 	return result, nil
 }
 
+func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt *litestream.RestoreOptions) (string, error) {
+	if opt.TXID != 0 {
+		return opt.TXID.String(), nil
+	}
+	if opt.Follow {
+		return "", nil
+	}
+	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
+	if err != nil {
+		return "", err
+	}
+	if len(infos) == 0 {
+		return "", litestream.ErrTxNotAvailable
+	}
+	opt.TXID = infos[len(infos)-1].MaxTXID
+	opt.Timestamp = time.Time{}
+	return opt.TXID.String(), nil
+}
+
 func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
 	var removePaths []string
 	info, err := os.Stat(path)

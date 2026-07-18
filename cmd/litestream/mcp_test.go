@@ -1,8 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,8 +15,10 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestMCPReadToolsRunWithoutLitestreamOnPATH(t *testing.T) {
@@ -90,6 +97,28 @@ func TestMCPReadToolsRunWithoutLitestreamOnPATH(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestMCPConfigDoesNotChangeDefaultLogger(t *testing.T) {
+	fixture := newMCPTestFixture(t)
+	data, err := os.ReadFile(fixture.configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, []byte("logging:\n  level: DEBUG\n  type: json\n  stderr: true\n  source: true\n")...)
+	if err := os.WriteFile(fixture.configPath, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	previous := slog.Default()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	slog.SetDefault(logger)
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	callMCPToolText(t, handlerFromMCPTool(DatabasesTool(fixture.configPath)), nil)
+	if slog.Default() != logger {
+		t.Fatal("MCP config load changed the default logger")
 	}
 }
 
@@ -182,7 +211,7 @@ func TestRestoreToolConditionalBehavior(t *testing.T) {
 			if text != "no matching backups found, skipping\n" {
 				t.Fatalf("unexpected result: %q", text)
 			}
-			if _, err := os.Stat(outputPath); !os.IsNotExist(err) {
+			if _, err := os.Stat(outputPath); !errors.Is(err, fs.ErrNotExist) {
 				t.Fatalf("output exists after skipped restore: %v", err)
 			}
 		})
@@ -200,25 +229,93 @@ func TestMCPReplicaURLSchemes(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r, err := loadMCPReplica(tt.url, filepath.Join(t.TempDir(), "missing.yml"))
+			resources, err := loadMCPReplica(tt.url, filepath.Join(t.TempDir(), "missing.yml"))
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := r.Client.Type(); got != tt.name {
+			if got := resources.Replica.Client.Type(); got != tt.name {
 				t.Fatalf("replica type=%q, want %q", got, tt.name)
+			}
+			if err := resources.Close(); err != nil {
+				t.Fatal(err)
 			}
 
 			opt := litestream.NewRestoreOptions()
 			opt.OutputPath = filepath.Join(t.TempDir(), "restored.sqlite")
-			r, err = loadMCPRestoreReplica(tt.url, filepath.Join(t.TempDir(), "missing.yml"), &opt)
+			resources, err = loadMCPRestoreReplica(tt.url, filepath.Join(t.TempDir(), "missing.yml"), &opt)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if got := r.Client.Type(); got != tt.name {
+			if got := resources.Replica.Client.Type(); got != tt.name {
 				t.Fatalf("restore replica type=%q, want %q", got, tt.name)
+			}
+			if err := resources.Close(); err != nil {
+				t.Fatal(err)
 			}
 		})
 	}
+}
+
+func TestMCPRemoteReplicaLifecycle(t *testing.T) {
+	operationErr := errors.New("operation failed")
+	closeErr := errors.New("close failed")
+	client := &mcpClosingReplicaClient{closeErr: closeErr}
+	r := litestream.NewReplica(nil)
+	r.Client = client
+
+	err := closeMCPResources(operationErr, &mcpReplica{Replica: r})
+	if !errors.Is(err, operationErr) {
+		t.Fatalf("error does not include operation failure: %v", err)
+	}
+	if !errors.Is(err, closeErr) {
+		t.Fatalf("error does not include close failure: %v", err)
+	}
+	if client.closeN != 1 {
+		t.Fatalf("close count=%d, want 1", client.closeN)
+	}
+}
+
+func TestRestoreTXID(t *testing.T) {
+	t.Run("returns plan error", func(t *testing.T) {
+		planErr := errors.New("list failed")
+		client := &mock.ReplicaClient{
+			LTXFilesFunc: func(context.Context, int, ltx.TXID, bool) (ltx.FileIterator, error) {
+				return nil, planErr
+			},
+		}
+		r := litestream.NewReplica(nil)
+		r.Client = client
+		opt := litestream.NewRestoreOptions()
+
+		if _, err := (&RestoreCommand{}).restoreTXID(t.Context(), r, &opt); !errors.Is(err, planErr) {
+			t.Fatalf("error=%v, want %v", err, planErr)
+		}
+	})
+
+	t.Run("pins planned transaction", func(t *testing.T) {
+		fixture := newMCPTestFixture(t)
+		resources, err := loadMCPReplica("file://"+fixture.replicaPath, "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			if err := resources.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		opt := litestream.NewRestoreOptions()
+
+		txID, err := (&RestoreCommand{}).restoreTXID(t.Context(), resources.Replica, &opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if txID != "0000000000000001" {
+			t.Fatalf("txid=%q, want 0000000000000001", txID)
+		}
+		if opt.TXID != 1 {
+			t.Fatalf("option txid=%s, want 0000000000000001", opt.TXID)
+		}
+	})
 }
 
 func TestRestoreToolRejectsInvalidOptions(t *testing.T) {
@@ -281,21 +378,8 @@ func TestResetToolRunWithoutLitestreamOnPATH(t *testing.T) {
 	if !strings.Contains(text, "Reset complete") {
 		t.Fatalf("unexpected result: %q", text)
 	}
-	if _, err := os.Stat(ltxPath); !os.IsNotExist(err) {
+	if _, err := os.Stat(ltxPath); !errors.Is(err, fs.ErrNotExist) {
 		t.Fatalf("local ltx state still exists: %v", err)
-	}
-}
-
-func TestVersionToolRunWithoutLitestreamOnPATH(t *testing.T) {
-	const version = "v1.2.3-mcp-test"
-	previous := Version
-	Version = version
-	t.Cleanup(func() { Version = previous })
-	t.Setenv("PATH", t.TempDir())
-
-	text := callMCPToolText(t, handlerFromMCPTool(VersionTool()), nil)
-	if text != version+"\n" {
-		t.Fatalf("version=%q, want %q", text, version+"\n")
 	}
 }
 
@@ -313,6 +397,17 @@ type mcpTestFixture struct {
 	dbPath      string
 	replicaPath string
 	configPath  string
+}
+
+type mcpClosingReplicaClient struct {
+	mock.ReplicaClient
+	closeErr error
+	closeN   int
+}
+
+func (c *mcpClosingReplicaClient) Close() error {
+	c.closeN++
+	return c.closeErr
 }
 
 func newMCPTestFixture(t *testing.T) mcpTestFixture {
