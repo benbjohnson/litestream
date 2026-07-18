@@ -191,9 +191,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Gracefully close.
-		if e := c.Close(ctx); e != nil && err == nil {
-			err = e
-		}
+		err = errors.Join(err, c.Close(ctx))
 		slog.Info("litestream shut down")
 		return err
 
