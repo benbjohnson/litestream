@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -32,6 +33,7 @@ const (
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 type ReplicaClient struct {
 	mu     sync.Mutex
@@ -93,6 +95,14 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 	return err
 }
 
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.client = nil
+	return nil
+}
+
 // init initializes the connection and returns the WebDAV client.
 func (c *ReplicaClient) init(ctx context.Context) (_ *gowebdav.Client, err error) {
 	c.mu.Lock()
@@ -106,16 +116,18 @@ func (c *ReplicaClient) init(ctx context.Context) (_ *gowebdav.Client, err error
 		return nil, fmt.Errorf("webdav url required")
 	}
 
-	c.client = gowebdav.NewClient(c.URL, c.Username, c.Password)
-
-	c.client.SetTimeout(c.Timeout)
-
-	if err := c.client.Connect(); err != nil {
-		c.client = nil
+	client := gowebdav.NewClient(c.URL, c.Username, c.Password)
+	client.SetTimeout(c.Timeout)
+	client.SetInterceptor(func(_ string, req *http.Request) {
+		*req = *req.WithContext(ctx)
+	})
+	if err := client.Connect(); err != nil {
 		return nil, fmt.Errorf("webdav: cannot connect to server: %w", err)
 	}
+	client.SetInterceptor(nil)
 
-	return c.client, nil
+	c.client = client
+	return client, nil
 }
 
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {

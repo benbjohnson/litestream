@@ -77,6 +77,39 @@ func TestReplicaClient_Init_Idempotent(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_Close(t *testing.T) {
+	c := NewReplicaClient()
+	c.Bucket = "test-bucket"
+	c.AccessKeyID = "test-key"
+	c.AccessKeySecret = "test-secret"
+
+	if err := c.Init(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	transport := c.transport
+	if transport == nil {
+		t.Fatal("expected initialized transport")
+	}
+
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if c.client != nil || c.uploader != nil || c.transport != nil {
+		t.Fatal("expected client resources to be released")
+	}
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := c.Init(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	if c.transport == transport {
+		t.Fatal("expected a new transport after reinitialization")
+	}
+}
+
 func TestParseURL(t *testing.T) {
 	tests := []struct {
 		name       string

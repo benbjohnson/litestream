@@ -74,14 +74,16 @@ const DefaultR2Concurrency = 2
 type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.Client // s3 service
-	uploader *manager.Uploader
-	logger   *slog.Logger
+	mu        sync.Mutex
+	s3        *s3.Client // s3 service
+	uploader  *manager.Uploader
+	transport *http.Transport
+	logger    *slog.Logger
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -361,33 +363,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Create HTTP client with 24 hour timeout for long-running operations
-	httpClient := &http.Client{
-		Timeout: 24 * time.Hour,
-	}
-
-	// Always configure custom HTTP Transport with controlled keepalive settings
-	// to reduce idle CPU usage from default transport's aggressive keepalives.
-	// See: https://github.com/benbjohnson/litestream/issues/992
-	httpClient.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-	}
-
-	// Configure TLS to skip verification if requested
-	if c.SkipVerify {
-		httpClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
+	httpClient, transport := c.newHTTPClient()
+	defer func() {
+		if err != nil {
+			transport.CloseIdleConnections()
 		}
-	}
+	}()
 
 	// Build configuration options
 	configOpts := []func(*config.LoadOptions) error{
@@ -479,7 +460,43 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		})
 	}
 	c.uploader = manager.NewUploader(c.s3, uploaderOpts...)
+	c.transport = transport
 
+	return nil
+}
+
+func (c *ReplicaClient) newHTTPClient() (*http.Client, *http.Transport) {
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+	}
+	if c.SkipVerify {
+		transport.TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+	return &http.Client{Timeout: 24 * time.Hour, Transport: transport}, transport
+}
+
+// Close closes idle connections owned by the S3 client.
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.transport != nil {
+		c.transport.CloseIdleConnections()
+		c.transport = nil
+	}
+	c.s3 = nil
+	c.uploader = nil
 	return nil
 }
 
@@ -580,9 +597,13 @@ func newTransportRetryer() aws.Retryer {
 
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
+	httpClient, transport := c.newHTTPClient()
+	defer transport.CloseIdleConnections()
+
 	// Build a config with credentials but no region
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRetryer(newTransportRetryer),
+		config.WithHTTPClient(httpClient),
 	}
 
 	// Add static credentials if provided
