@@ -16,7 +16,7 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	if filepath.Base(os.Args[0]) == "litestream" && os.Getenv("LITESTREAM_MCP_TEST") == "1" {
+	if filepath.Base(os.Args[0]) == mcpTestExecutableName(runtime.GOOS) && os.Getenv("LITESTREAM_MCP_TEST") == "1" {
 		os.Exit(runMCPTestCommand())
 	}
 	os.Exit(m.Run())
