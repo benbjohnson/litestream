@@ -171,6 +171,11 @@ jobs:
       - run: go test -v ./sftp
       - run: go test -v ./cmd/litestream
 
+      - name: Compile command tests for 32-bit Linux ARM
+        run: |
+          GOOS=linux GOARCH=arm GOARM=6 go test -c -o /dev/null ./cmd/litestream
+          GOOS=linux GOARCH=arm GOARM=7 go test -c -o /dev/null ./cmd/litestream
+
 
   ltx-behavioral-gate:
     name: LTX Behavioral Gate (short)

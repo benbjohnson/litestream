@@ -521,7 +521,8 @@ func TestNewDaemonClientTimeoutValidation(t *testing.T) {
 		{name: "negative", timeout: -1, want: "timeout must be greater than 0"},
 	}
 	if strconv.IntSize == 64 {
-		tests = append(tests, testCase{name: "duration overflow", timeout: int(maxDaemonTimeoutSeconds + 1), want: "timeout must be at most"})
+		overflowTimeout := int64(maxDaemonTimeoutSeconds + 1)
+		tests = append(tests, testCase{name: "duration overflow", timeout: int(overflowTimeout), want: "timeout must be at most"})
 	}
 
 	for _, test := range tests {
