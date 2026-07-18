@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/url"
 	"os"
 	"sort"
@@ -34,7 +35,93 @@ const ReplicaClientType = "nats"
 const HeaderKeyTimestamp = "Litestream-Timestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
-var _ io.Closer = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
+
+type contextDialer struct {
+	mu          sync.Mutex
+	ctx         context.Context
+	dialer      net.Dialer
+	connections map[net.Conn]struct{}
+	active      bool
+	stop        func() bool
+	done        chan struct{}
+	err         error
+}
+
+func newContextDialer(ctx context.Context, timeout time.Duration) *contextDialer {
+	d := &contextDialer{
+		ctx:         ctx,
+		dialer:      net.Dialer{Timeout: timeout},
+		connections: make(map[net.Conn]struct{}),
+		active:      true,
+		done:        make(chan struct{}),
+	}
+	d.stop = context.AfterFunc(ctx, d.cancel)
+	return d
+}
+
+func (d *contextDialer) Dial(network, address string) (net.Conn, error) {
+	d.mu.Lock()
+	ctx := d.ctx
+	d.mu.Unlock()
+
+	conn, err := d.dialer.DialContext(ctx, network, address)
+	if err != nil {
+		if context.Cause(ctx) != nil {
+			return nil, context.Cause(ctx)
+		}
+		return nil, err
+	}
+
+	d.mu.Lock()
+	if !d.active {
+		cause := context.Cause(d.ctx)
+		d.mu.Unlock()
+		if cause != nil {
+			return nil, errors.Join(cause, conn.Close())
+		}
+		return conn, nil
+	}
+	if cause := context.Cause(d.ctx); cause != nil {
+		d.mu.Unlock()
+		return nil, errors.Join(cause, conn.Close())
+	}
+	d.connections[conn] = struct{}{}
+	d.mu.Unlock()
+	return conn, nil
+}
+
+func (d *contextDialer) cancel() {
+	d.mu.Lock()
+	connections := d.connections
+	d.connections = nil
+	d.active = false
+	d.mu.Unlock()
+
+	var err error
+	for conn := range connections {
+		err = errors.Join(err, conn.Close())
+	}
+	d.mu.Lock()
+	d.err = err
+	d.mu.Unlock()
+	close(d.done)
+}
+
+func (d *contextDialer) release() error {
+	if d.stop() {
+		d.mu.Lock()
+		d.ctx = context.Background()
+		d.connections = nil
+		d.active = false
+		d.mu.Unlock()
+		return nil
+	}
+	<-d.done
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.err
+}
 
 // ReplicaClient is a client for writing LTX files to NATS JetStream Object Store.
 type ReplicaClient struct {
@@ -140,14 +227,15 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 	}
 
 	if err := c.initObjectStore(ctx); err != nil {
-		return fmt.Errorf("nats: failed to initialize object store: %w", err)
+		return errors.Join(fmt.Errorf("nats: failed to initialize object store: %w", err), c.close())
 	}
 
 	return nil
 }
 
 // connect establishes a connection to NATS server with proper configuration.
-func (c *ReplicaClient) connect(_ context.Context) error {
+func (c *ReplicaClient) connect(ctx context.Context) error {
+	dialer := newContextDialer(ctx, c.Timeout)
 	opts := []nats.Option{
 		nats.MaxReconnects(c.MaxReconnects),
 		nats.ReconnectWait(c.ReconnectWait),
@@ -156,6 +244,7 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 		nats.PingInterval(c.PingInterval),
 		nats.MaxPingsOutstanding(c.MaxPingsOut),
 		nats.ReconnectBufSize(c.ReconnectBufSize),
+		nats.SetCustomDialer(dialer),
 	}
 
 	// Authentication options
@@ -185,17 +274,25 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 		opts = append(opts, nats.RootCAs(c.RootCAs...))
 	}
 
-	// Note: NATS Connect doesn't directly support context cancellation during connection
-	// The context parameter is preserved for potential future use
-
 	url := c.URL
 	if url == "" {
 		url = nats.DefaultURL
 	}
 
 	nc, err := nats.Connect(url, opts...)
+	dialErr := dialer.release()
+	if cause := context.Cause(ctx); cause != nil {
+		if nc != nil {
+			nc.Close()
+		}
+		return errors.Join(cause, dialErr)
+	}
 	if err != nil {
-		return fmt.Errorf("failed to connect to NATS server: %w", err)
+		return errors.Join(fmt.Errorf("failed to connect to NATS server: %w", err), dialErr)
+	}
+	if dialErr != nil {
+		nc.Close()
+		return dialErr
 	}
 
 	js, err := jetstream.New(nc)
@@ -230,7 +327,10 @@ func (c *ReplicaClient) initObjectStore(ctx context.Context) error {
 func (c *ReplicaClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	return c.close()
+}
 
+func (c *ReplicaClient) close() error {
 	if c.nc != nil {
 		c.nc.Close()
 		c.nc = nil

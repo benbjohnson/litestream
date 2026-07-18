@@ -35,7 +35,7 @@ const (
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
-var _ io.Closer = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files over SFTP.
 type ReplicaClient struct {
@@ -136,6 +136,7 @@ func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 		User:            c.User,
 		HostKeyCallback: hostkey,
 		BannerCallback:  ssh.BannerDisplayStderr(),
+		Timeout:         c.DialTimeout,
 	}
 	if c.Password != "" {
 		config.Auth = append(config.Auth, ssh.Password(c.Password))
@@ -160,10 +161,39 @@ func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 		host = net.JoinHostPort(c.Host, "22")
 	}
 
-	// Connect via SSH.
-	if c.sshClient, err = ssh.Dial("tcp", host, config); err != nil {
+	conn, err := (&net.Dialer{Timeout: c.DialTimeout}).DialContext(ctx, "tcp", host)
+	if err != nil {
+		if context.Cause(ctx) != nil {
+			return nil, context.Cause(ctx)
+		}
 		return nil, err
 	}
+	var cancelCloseErr error
+	cancelCloseDone := make(chan struct{})
+	stopCancelClose := context.AfterFunc(ctx, func() {
+		cancelCloseErr = conn.Close()
+		close(cancelCloseDone)
+	})
+	waitForCancellation := func() error {
+		if !stopCancelClose() {
+			<-cancelCloseDone
+		}
+		if cause := context.Cause(ctx); cause != nil {
+			return errors.Join(cause, cancelCloseErr)
+		}
+		return nil
+	}
+	if c.DialTimeout > 0 {
+		if err := conn.SetDeadline(time.Now().Add(c.DialTimeout)); err != nil {
+			return nil, errors.Join(err, waitForCancellation(), conn.Close())
+		}
+	}
+
+	sshConn, chans, reqs, err := ssh.NewClientConn(conn, host, config)
+	if err != nil {
+		return nil, errors.Join(err, waitForCancellation(), conn.Close())
+	}
+	sshClient := ssh.NewClient(sshConn, chans, reqs)
 
 	// Wrap connection with an SFTP client.
 	// Configure options based on client settings
@@ -172,15 +202,23 @@ func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 		opts = append(opts, sftp.UseConcurrentWrites(true))
 	}
 
-	if c.sftpClient, err = sftp.NewClient(c.sshClient, opts...); err != nil {
-		closeErr := c.sshClient.Close()
-		c.sshClient = nil
-		return nil, errors.Join(err, closeErr)
+	sftpClient, err := sftp.NewClient(sshClient, opts...)
+	if err != nil {
+		return nil, errors.Join(err, waitForCancellation(), sshClient.Close())
+	}
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		return nil, errors.Join(err, waitForCancellation(), sftpClient.Close(), sshClient.Close())
+	}
+	if err := waitForCancellation(); err != nil {
+		return nil, errors.Join(err, sftpClient.Close(), sshClient.Close())
 	}
 
-	return c.sftpClient, nil
+	c.sshClient = sshClient
+	c.sftpClient = sftpClient
+	return sftpClient, nil
 }
 
+// Close closes the SFTP and SSH connections.
 func (c *ReplicaClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()

@@ -205,9 +205,9 @@ func TestReplicaClient_Close(t *testing.T) {
 			t.Skip("replica client does not retain a connection")
 		}
 
-		closer, ok := c.(io.Closer)
+		closer, ok := c.(litestream.ReplicaClientCloser)
 		if !ok {
-			t.Fatalf("client type %q does not implement io.Closer", c.Type())
+			t.Fatalf("client type %q does not implement ReplicaClientCloser", c.Type())
 		}
 		t.Cleanup(func() {
 			if err := closer.Close(); err != nil {
@@ -578,9 +578,9 @@ func TestReplicaClient_SFTP_Close(t *testing.T) {
 	c.Host = addr
 	c.HostKey = string(ssh.MarshalAuthorizedKey(privateKey.PublicKey()))
 
-	closer, ok := any(c).(io.Closer)
+	closer, ok := any(c).(litestream.ReplicaClientCloser)
 	if !ok {
-		t.Fatal("SFTP client does not implement io.Closer")
+		t.Fatal("SFTP client does not implement ReplicaClientCloser")
 	}
 	for i := 0; i < 2; i++ {
 		if err := c.Init(t.Context()); err != nil {

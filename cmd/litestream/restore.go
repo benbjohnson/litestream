@@ -140,7 +140,16 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	txid := c.restoreTXID(ctx, r, opt)
+	txid, err := c.restoreTXID(ctx, r, &opt)
+	if errors.Is(err, litestream.ErrTxNotAvailable) {
+		if *ifReplicaExists {
+			slog.Info("no matching backups found")
+			return nil
+		}
+		return fmt.Errorf("no matching backup files available")
+	} else if err != nil {
+		return err
+	}
 	start := time.Now()
 	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
@@ -251,18 +260,23 @@ func (c *RestoreCommand) printDryRunPlan(plan RestorePlan) {
 	}
 }
 
-func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) string {
+func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt *litestream.RestoreOptions) (string, error) {
 	if opt.TXID != 0 {
-		return opt.TXID.String()
+		return opt.TXID.String(), nil
 	}
 	if opt.Follow {
-		return ""
+		return "", nil
 	}
 	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
-	if err != nil || len(infos) == 0 {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return infos[len(infos)-1].MaxTXID.String()
+	if len(infos) == 0 {
+		return "", litestream.ErrTxNotAvailable
+	}
+	opt.TXID = infos[len(infos)-1].MaxTXID
+	opt.Timestamp = time.Time{}
+	return opt.TXID.String(), nil
 }
 
 func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {

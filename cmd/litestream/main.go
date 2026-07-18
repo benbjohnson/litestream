@@ -599,18 +599,36 @@ func OpenConfigFile(filename string) (io.ReadCloser, error) {
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
 // If expandEnv is true then environment variables are expanded in the config.
 func ReadConfigFile(filename string, expandEnv bool) (Config, error) {
+	config, err := readConfigFile(filename, expandEnv)
+	if err != nil {
+		return config, err
+	}
+	initConfigLog(config)
+	return config, nil
+}
+
+func readConfigFile(filename string, expandEnv bool) (_ Config, err error) {
 	f, err := OpenConfigFile(filename)
 	if err != nil {
 		return DefaultConfig(), err
 	}
-	defer f.Close()
+	defer func() { err = errors.Join(err, f.Close()) }()
 
-	return ParseConfig(f, expandEnv)
+	return parseConfig(f, expandEnv)
 }
 
 // ParseConfig unmarshals config from a reader.
 // If expandEnv is true then environment variables are expanded in the config.
 func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
+	config, err := parseConfig(r, expandEnv)
+	if err != nil {
+		return config, err
+	}
+	initConfigLog(config)
+	return config, nil
+}
+
+func parseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	config := DefaultConfig()
 
 	// Read configuration.
@@ -683,17 +701,19 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		return config, err
 	}
 
-	// Configure logging.
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		config.Logging.Level = v
+	}
+
+	return config, nil
+}
+
+func initConfigLog(config Config) {
 	logOutput := os.Stdout
 	if config.Logging.Stderr {
 		logOutput = os.Stderr
 	}
-	if v := os.Getenv("LOG_LEVEL"); v != "" {
-		config.Logging.Level = v
-	}
 	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
-
-	return config, nil
 }
 
 // CompactionLevelConfig the configuration for a single level of compaction.
