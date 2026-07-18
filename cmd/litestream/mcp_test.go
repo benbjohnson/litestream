@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -14,11 +15,18 @@ import (
 	"reflect"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+type daemonToolCallResult struct {
+	result *mcp.CallToolResult
+	err    error
+}
 
 func TestMCPServerTools(t *testing.T) {
 	const version = "v1.2.3-mcp-test"
@@ -100,6 +108,33 @@ func TestMCPServerTools(t *testing.T) {
 		"litestream_version": {readOnly: true},
 		"litestream_status":  {readOnly: true, properties: map[string]string{"config": "string", "path": "string"}},
 		"litestream_reset":   {destructive: true, properties: map[string]string{"config": "string", "path": "string"}, required: []string{"path"}},
+		"litestream_list":    {readOnly: true, properties: map[string]string{"socket": "string", "timeout": "integer"}},
+		"litestream_sync": {
+			destructive: true,
+			properties:  map[string]string{"path": "string", "socket": "string", "timeout": "integer", "wait": "boolean"},
+			required:    []string{"path"},
+		},
+		"litestream_daemon_info": {readOnly: true, properties: map[string]string{"socket": "string", "timeout": "integer"}},
+		"litestream_start": {
+			destructive: true,
+			properties:  map[string]string{"path": "string", "socket": "string", "timeout": "integer"},
+			required:    []string{"path"},
+		},
+		"litestream_stop": {
+			destructive: true,
+			properties:  map[string]string{"path": "string", "socket": "string", "timeout": "integer"},
+			required:    []string{"path"},
+		},
+		"litestream_register": {
+			destructive: true,
+			properties:  map[string]string{"path": "string", "replica_url": "string", "socket": "string", "timeout": "integer"},
+			required:    []string{"path", "replica_url"},
+		},
+		"litestream_unregister": {
+			destructive: true,
+			properties:  map[string]string{"path": "string", "socket": "string", "timeout": "integer"},
+			required:    []string{"path"},
+		},
 	}
 
 	if got, want := len(result.Tools), len(tests); got != want {
@@ -215,6 +250,328 @@ func TestMCPServerTools(t *testing.T) {
 	}
 	if got, want := textContent(t, callResult), version+"\n"; got != want {
 		t.Fatalf("version text content=%q, want %q", got, want)
+	}
+}
+
+func TestMCPDaemonToolBehavior(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	type capturedRequest struct {
+		method string
+		path   string
+		body   []byte
+	}
+
+	responses := map[string]string{
+		"/list":       `{"databases":[{"path":"/data/db","status":"replicating"}]}`,
+		"/sync":       `{"status":"synced","path":"/data/db","txid":12,"replicated_txid":12}`,
+		"/info":       `{"version":"v1.2.3","pid":123,"uptime_seconds":60,"started_at":"2026-07-17T12:00:00Z","database_count":1}`,
+		"/start":      `{"status":"started","path":"/data/db","txid":12}`,
+		"/stop":       `{"status":"stopped","path":"/data/db","txid":12}`,
+		"/register":   `{"status":"registered","path":"/data/new.db"}`,
+		"/unregister": `{"status":"unregistered","path":"/data/db","txid":12}`,
+	}
+	requests := make(chan capturedRequest, len(responses))
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("read request body: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		requests <- capturedRequest{method: r.Method, path: r.URL.Path, body: body}
+
+		response, ok := responses[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if _, err := io.WriteString(w, response); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	})
+
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: httpServer.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	tests := []struct {
+		name      string
+		method    string
+		path      string
+		arguments map[string]any
+		body      string
+	}{
+		{name: "litestream_list", method: http.MethodGet, path: "/list", arguments: map[string]any{"socket": socketPath, "timeout": 5}},
+		{name: "litestream_sync", method: http.MethodPost, path: "/sync", arguments: map[string]any{"path": "/data/db", "wait": true, "socket": socketPath, "timeout": 5}, body: `{"path":"/data/db","wait":true,"timeout":5}`},
+		{name: "litestream_daemon_info", method: http.MethodGet, path: "/info", arguments: map[string]any{"socket": socketPath, "timeout": 5}},
+		{name: "litestream_start", method: http.MethodPost, path: "/start", arguments: map[string]any{"path": "/data/db", "socket": socketPath, "timeout": 5}, body: `{"path":"/data/db","timeout":5}`},
+		{name: "litestream_stop", method: http.MethodPost, path: "/stop", arguments: map[string]any{"path": "/data/db", "socket": socketPath, "timeout": 5}, body: `{"path":"/data/db","timeout":5}`},
+		{name: "litestream_register", method: http.MethodPost, path: "/register", arguments: map[string]any{"path": "/data/new.db", "replica_url": "file:///backup/db", "socket": socketPath, "timeout": 5}, body: `{"path":"/data/new.db","replica_url":"file:///backup/db"}`},
+		{name: "litestream_unregister", method: http.MethodPost, path: "/unregister", arguments: map[string]any{"path": "/data/db", "socket": socketPath, "timeout": 5}, body: `{"path":"/data/db","timeout":5}`},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: test.name, Arguments: test.arguments})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.IsError {
+				t.Fatalf("tool error: %#v", result.Content)
+			}
+
+			request := <-requests
+			if request.method != test.method {
+				t.Errorf("request method=%q, want %q", request.method, test.method)
+			}
+			if request.path != test.path {
+				t.Errorf("request path=%q, want %q", request.path, test.path)
+			}
+			assertJSONEqual(t, request.body, []byte(test.body))
+
+			text := textContent(t, result)
+			assertJSONEqual(t, []byte(text), []byte(responses[test.path]))
+			if got, want := result.StructuredContent, map[string]any{"text": text}; !reflect.DeepEqual(got, want) {
+				t.Fatalf("structured content=%v, want %v", got, want)
+			}
+		})
+	}
+}
+
+func TestMCPDaemonToolsNoDaemon(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: httpServer.URL}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	socketPath := mcpTestSocketPath(t)
+	tests := []struct {
+		name      string
+		arguments map[string]any
+	}{
+		{name: "litestream_list", arguments: map[string]any{"socket": socketPath}},
+		{name: "litestream_sync", arguments: map[string]any{"path": "/data/db", "socket": socketPath}},
+		{name: "litestream_daemon_info", arguments: map[string]any{"socket": socketPath}},
+		{name: "litestream_start", arguments: map[string]any{"path": "/data/db", "socket": socketPath}},
+		{name: "litestream_stop", arguments: map[string]any{"path": "/data/db", "socket": socketPath}},
+		{name: "litestream_register", arguments: map[string]any{"path": "/data/db", "replica_url": "file:///backup/db", "socket": socketPath}},
+		{name: "litestream_unregister", arguments: map[string]any{"path": "/data/db", "socket": socketPath}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: test.name, Arguments: test.arguments})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !result.IsError {
+				t.Fatal("tool succeeded, want error")
+			}
+			if got := textContent(t, result); !strings.Contains(got, "no Litestream daemon is running at socket "+socketPath) {
+				t.Fatalf("error=%q, want no-daemon message", got)
+			}
+		})
+	}
+
+	t.Run("stale socket", func(t *testing.T) {
+		staleSocketPath := mcpTestSocketPath(t)
+		listener, err := net.Listen("unix", staleSocketPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		listener.(*net.UnixListener).SetUnlinkOnClose(false)
+		if err := listener.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		result, err := session.CallTool(t.Context(), &mcp.CallToolParams{
+			Name:      "litestream_list",
+			Arguments: map[string]any{"socket": staleSocketPath},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !result.IsError {
+			t.Fatal("tool succeeded, want error")
+		}
+		if got := textContent(t, result); !strings.Contains(got, "no Litestream daemon is running at socket "+staleSocketPath) {
+			t.Fatalf("error=%q, want no-daemon message", got)
+		}
+	})
+}
+
+func TestMCPDaemonToolContextCancellation(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	requestStarted := make(chan struct{})
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	})
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	_, toolHandler := DaemonInfoTool()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	timeout := 10
+	done := make(chan daemonToolCallResult, 1)
+	go func() {
+		result, _, err := toolHandler(ctx, nil, daemonInfoInput{Socket: &socketPath, Timeout: &timeout})
+		done <- daemonToolCallResult{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+		cancel()
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon request did not start")
+	}
+
+	select {
+	case call := <-done:
+		if !errors.Is(call.err, context.Canceled) {
+			t.Fatalf("error=%v, want context canceled", call.err)
+		}
+		if call.result != nil {
+			t.Fatalf("result=%v, want nil", call.result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon tool did not return after context cancellation")
+	}
+}
+
+func TestMCPDaemonToolTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	requestStarted := make(chan struct{})
+	handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		<-r.Context().Done()
+	})
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	_, toolHandler := DaemonInfoTool()
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	timeout := 1
+	done := make(chan daemonToolCallResult, 1)
+	go func() {
+		result, _, err := toolHandler(ctx, nil, daemonInfoInput{Socket: &socketPath, Timeout: &timeout})
+		done <- daemonToolCallResult{result: result, err: err}
+	}()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("daemon request did not start")
+	}
+
+	select {
+	case call := <-done:
+		if !errors.Is(call.err, context.DeadlineExceeded) {
+			t.Fatalf("error=%v, want deadline exceeded", call.err)
+		}
+		if !strings.Contains(call.err.Error(), "daemon request timed out after 1s") {
+			t.Fatalf("error=%v, want timeout message", call.err)
+		}
+		if call.result != nil {
+			t.Fatalf("result=%v, want nil", call.result)
+		}
+	case <-time.After(2 * time.Second):
+		cancel()
+		t.Fatal("daemon tool exceeded its timeout")
+	}
+}
+
+func TestMCPDaemonToolReturnsDaemonError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires Unix sockets")
+	}
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		if _, err := io.WriteString(w, `{"error":"database is not running"}`); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	})
+	socketPath := startMCPDaemonTestServer(t, handler)
+
+	_, toolHandler := DaemonSyncTool()
+	result, _, err := toolHandler(t.Context(), nil, daemonSyncInput{Path: "/data/db", Socket: &socketPath})
+	if err == nil || err.Error() != "sync failed: database is not running" {
+		t.Fatalf("error=%v, want daemon error", err)
+	}
+	if result != nil {
+		t.Fatalf("result=%v, want nil", result)
+	}
+}
+
+func TestNewDaemonClientTimeoutValidation(t *testing.T) {
+	type testCase struct {
+		name    string
+		timeout int
+		want    string
+	}
+	tests := []testCase{
+		{name: "zero", timeout: 0, want: "timeout must be greater than 0"},
+		{name: "negative", timeout: -1, want: "timeout must be greater than 0"},
+	}
+	if strconv.IntSize == 64 {
+		overflowTimeout := int64(maxDaemonTimeoutSeconds + 1)
+		tests = append(tests, testCase{name: "duration overflow", timeout: int(overflowTimeout), want: "timeout must be at most"})
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client, err := newDaemonClient(nil, &test.timeout, defaultDaemonReadTimeout)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("error=%v, want %q", err, test.want)
+			}
+			if client != nil {
+				t.Fatalf("client=%v, want nil", client)
+			}
+		})
 	}
 }
 
@@ -538,4 +895,63 @@ func setVersion(t *testing.T, version string) {
 	previous := Version
 	Version = version
 	t.Cleanup(func() { Version = previous })
+}
+
+func mcpTestSocketPath(t *testing.T) string {
+	t.Helper()
+
+	file, err := os.CreateTemp("/tmp", "ls-mcp-*.sock")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			t.Error(err)
+		}
+	})
+	return path
+}
+
+func startMCPDaemonTestServer(t *testing.T, handler http.Handler) string {
+	t.Helper()
+
+	socketPath := mcpTestSocketPath(t)
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	server := httptest.NewUnstartedServer(handler)
+	server.Listener = listener
+	server.Start()
+	t.Cleanup(server.Close)
+	return socketPath
+}
+
+func assertJSONEqual(t *testing.T, got, want []byte) {
+	t.Helper()
+
+	if len(got) == 0 || len(want) == 0 {
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("JSON=%q, want %q", got, want)
+		}
+		return
+	}
+
+	var gotValue, wantValue any
+	if err := json.Unmarshal(got, &gotValue); err != nil {
+		t.Fatalf("unmarshal JSON %q: %v", got, err)
+	}
+	if err := json.Unmarshal(want, &wantValue); err != nil {
+		t.Fatalf("unmarshal expected JSON %q: %v", want, err)
+	}
+	if !reflect.DeepEqual(gotValue, wantValue) {
+		t.Fatalf("JSON=%v, want %v", gotValue, wantValue)
+	}
 }
