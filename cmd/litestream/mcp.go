@@ -1,14 +1,15 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os/exec"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -94,7 +95,7 @@ type databasesInput struct {
 }
 
 type databasesOutput struct {
-	Text string `json:"text" jsonschema:"Databases and replicas from the Litestream config file."`
+	Databases []DatabaseInfo `json:"databases" jsonschema:"Databases and replicas from the Litestream config file."`
 }
 
 func DatabasesTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[databasesInput, databasesOutput]) {
@@ -106,19 +107,18 @@ func DatabasesTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[databasesIn
 	}
 
 	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input databasesInput) (*mcp.CallToolResult, databasesOutput, error) {
-		args := []string{"databases"}
+		args := []string{"databases", "-json"}
 		config := configPath
 		if input.Config != nil {
 			config = *input.Config
 		}
 		args = append(args, "-config", config)
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		databases, err := runJSONCommand[[]DatabaseInfo](ctx, args...)
 		if err != nil {
-			return nil, databasesOutput{}, commandError(output, err)
+			return nil, databasesOutput{}, err
 		}
-		text := string(output)
-		return textResult(text), databasesOutput{Text: text}, nil
+		text := fmt.Sprintf("Found %s.", countNoun(len(databases), "configured database", "configured databases"))
+		return textResult(text), databasesOutput{Databases: databases}, nil
 	}
 }
 
@@ -126,8 +126,15 @@ type infoInput struct {
 	Config *string `json:"config,omitempty" jsonschema:"Path to the Litestream config file. Optional."`
 }
 
+type infoDatabaseOutput struct {
+	DatabaseInfo
+	LTXFiles []LTXFileInfo `json:"ltx_files" jsonschema:"LTX files for the database."`
+}
+
 type infoOutput struct {
-	Text string `json:"text" jsonschema:"Comprehensive Litestream status report."`
+	Version   string               `json:"version" jsonschema:"Running Litestream instance version."`
+	Config    string               `json:"config" jsonschema:"Path to the Litestream config file."`
+	Databases []infoDatabaseOutput `json:"databases" jsonschema:"Configured databases and their LTX files."`
 }
 
 func InfoTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[infoInput, infoOutput]) {
@@ -139,69 +146,46 @@ func InfoTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[infoInput, infoO
 	}
 
 	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input infoInput) (*mcp.CallToolResult, infoOutput, error) {
-		var summary strings.Builder
-		summary.WriteString("=== Litestream Status Report ===\n\n")
-
-		versionCmd := exec.CommandContext(ctx, "litestream", "version")
-		versionOutput, err := versionCmd.CombinedOutput()
-		if err != nil {
-			return nil, infoOutput{}, fmt.Errorf("get version info: %w", commandError(versionOutput, err))
-		}
-		summary.WriteString("Version Information:\n")
-		summary.WriteString(string(versionOutput))
-		summary.WriteString("\n")
-
-		args := []string{"databases"}
 		config := configPath
 		if input.Config != nil {
 			config = *input.Config
 		}
-		summary.WriteString("Current Config Path:\n")
-		summary.WriteString(config + "\n\n")
+		if config == "" {
+			config = DefaultConfigPath()
+		}
 
-		args = append(args, "-config", config)
-		dbCmd := exec.CommandContext(ctx, "litestream", args...)
-		dbOutput, err := dbCmd.CombinedOutput()
+		databases, err := runJSONCommand[[]DatabaseInfo](ctx, "databases", "-json", "-config", config)
 		if err != nil {
-			return nil, infoOutput{}, fmt.Errorf("get databases info: %w", commandError(dbOutput, err))
+			return nil, infoOutput{}, fmt.Errorf("get databases info: %w", err)
 		}
 
-		summary.WriteString("Databases:\n")
-		summary.WriteString(string(dbOutput))
-		summary.WriteString("\n")
-
-		scanner := bufio.NewScanner(strings.NewReader(string(dbOutput)))
-		scanner.Scan()
-		var dbPaths []string
-		for scanner.Scan() {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) > 0 {
-				dbPaths = append(dbPaths, fields[0])
-			}
+		output := infoOutput{
+			Version:   Version,
+			Config:    config,
+			Databases: make([]infoDatabaseOutput, 0, len(databases)),
 		}
-		if err := scanner.Err(); err != nil {
-			return nil, infoOutput{}, fmt.Errorf("scan databases info: %w", err)
-		}
-
-		summary.WriteString("LTX Files:\n")
-		for _, dbPath := range dbPaths {
-			ltxArgs := []string{"ltx"}
+		ltxFileCount := 0
+		for _, database := range databases {
+			ltxArgs := []string{"ltx", "-json"}
 			if config != "" {
 				ltxArgs = append(ltxArgs, "-config", config)
 			}
-			ltxArgs = append(ltxArgs, dbPath)
-			ltxCmd := exec.CommandContext(ctx, "litestream", ltxArgs...)
-			ltxOutput, err := ltxCmd.CombinedOutput()
+			ltxArgs = append(ltxArgs, database.Path)
+			files, err := runJSONCommand[[]LTXFileInfo](ctx, ltxArgs...)
 			if err != nil {
-				return nil, infoOutput{}, fmt.Errorf("get LTX files for %s: %w", dbPath, commandError(ltxOutput, err))
+				return nil, infoOutput{}, fmt.Errorf("get LTX files for %s: %w", database.Path, err)
 			}
-			summary.WriteString("Database: " + dbPath + "\n")
-			summary.WriteString(string(ltxOutput))
-			summary.WriteString("\n")
+			ltxFileCount += len(files)
+			output.Databases = append(output.Databases, infoDatabaseOutput{
+				DatabaseInfo: database,
+				LTXFiles:     files,
+			})
 		}
 
-		text := summary.String()
-		return textResult(text), infoOutput{Text: text}, nil
+		text := fmt.Sprintf("Litestream %s has %s and %s.", Version,
+			countNoun(len(databases), "configured database", "configured databases"),
+			countNoun(ltxFileCount, "LTX file", "LTX files"))
+		return textResult(text), output, nil
 	}
 }
 
@@ -217,7 +201,9 @@ type restoreInput struct {
 }
 
 type restoreOutput struct {
-	Text string `json:"text" jsonschema:"Restore command output."`
+	Status RestoreStatus  `json:"status" jsonschema:"Restore command outcome."`
+	Reason RestoreReason  `json:"reason,omitempty" jsonschema:"Stable reason when the restore was skipped."`
+	Result *RestoreResult `json:"result,omitempty" jsonschema:"Restore details when a database was restored."`
 }
 
 func RestoreTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[restoreInput, restoreOutput]) {
@@ -229,7 +215,7 @@ func RestoreTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[restoreInput,
 	}
 
 	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input restoreInput) (*mcp.CallToolResult, restoreOutput, error) {
-		args := []string{"restore"}
+		args := []string{"restore", "-json"}
 		if input.Output != nil {
 			args = append(args, "-o", *input.Output)
 		}
@@ -254,28 +240,51 @@ func RestoreTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[restoreInput,
 			args = append(args, "-parallelism", *input.Parallelism)
 		}
 		if input.IfDBNotExists != nil {
-			args = append(args, "-if-db-not-exists", strconv.FormatBool(*input.IfDBNotExists))
+			args = append(args, fmt.Sprintf("-if-db-not-exists=%t", *input.IfDBNotExists))
 		}
 		if input.IfReplicaExists != nil {
-			args = append(args, "-if-replica-exists", strconv.FormatBool(*input.IfReplicaExists))
+			args = append(args, fmt.Sprintf("-if-replica-exists=%t", *input.IfReplicaExists))
 		}
 		if input.Path != "" {
 			args = append(args, input.Path)
 		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		output, err := runJSONCommand[RestoreOutput](ctx, args...)
 		if err != nil {
-			return nil, restoreOutput{}, commandError(output, err)
+			return nil, restoreOutput{}, err
 		}
-		text := string(output)
-		return textResult(text), restoreOutput{Text: text}, nil
+		switch output.Status {
+		case RestoreStatusRestored:
+			if output.RestoreResult == nil {
+				return nil, restoreOutput{}, fmt.Errorf("restore JSON output missing result")
+			}
+			text := fmt.Sprintf("Restored %s using the %s replica", output.DBPath, output.Replica)
+			if output.TXID != "" {
+				text += " at TXID " + output.TXID
+			}
+			return textResult(text + "."), restoreOutput{Status: output.Status, Result: output.RestoreResult}, nil
+		case RestoreStatusSkipped:
+			switch output.Reason {
+			case RestoreReasonDatabaseExists:
+				path := input.Path
+				if input.Output != nil && *input.Output != "" {
+					path = *input.Output
+				}
+				return textResult(fmt.Sprintf("Restore skipped because the database already exists at %s.", path)), restoreOutput{Status: output.Status, Reason: output.Reason}, nil
+			case RestoreReasonNoMatchingBackups:
+				return textResult(fmt.Sprintf("Restore skipped for %s because no matching backups were found.", input.Path)), restoreOutput{Status: output.Status, Reason: output.Reason}, nil
+			default:
+				return nil, restoreOutput{}, fmt.Errorf("unknown restore skip reason %q", output.Reason)
+			}
+		default:
+			return nil, restoreOutput{}, fmt.Errorf("unknown restore status %q", output.Status)
+		}
 	}
 }
 
 type versionInput struct{}
 
 type versionOutput struct {
-	Text string `json:"text" jsonschema:"Running Litestream instance version."`
+	Version string `json:"version" jsonschema:"Running Litestream instance version."`
 }
 
 func VersionTool() (*mcp.Tool, mcp.ToolHandlerFor[versionInput, versionOutput]) {
@@ -286,8 +295,7 @@ func VersionTool() (*mcp.Tool, mcp.ToolHandlerFor[versionInput, versionOutput]) 
 	}
 
 	return tool, func(context.Context, *mcp.CallToolRequest, versionInput) (*mcp.CallToolResult, versionOutput, error) {
-		text := Version + "\n"
-		return textResult(text), versionOutput{Text: text}, nil
+		return textResult(fmt.Sprintf("Litestream %s.", Version)), versionOutput{Version: Version}, nil
 	}
 }
 
@@ -297,7 +305,7 @@ type ltxInput struct {
 }
 
 type ltxOutput struct {
-	Text string `json:"text" jsonschema:"LTX files for the database or replica URL."`
+	Files []LTXFileInfo `json:"files" jsonschema:"LTX files for the database or replica URL."`
 }
 
 func LTXTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[ltxInput, ltxOutput]) {
@@ -309,7 +317,7 @@ func LTXTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[ltxInput, ltxOutp
 	}
 
 	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input ltxInput) (*mcp.CallToolResult, ltxOutput, error) {
-		args := []string{"ltx"}
+		args := []string{"ltx", "-json"}
 
 		if !isReplicaURL(input.Path) {
 			config := configPath
@@ -324,13 +332,12 @@ func LTXTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[ltxInput, ltxOutp
 		if input.Path != "" {
 			args = append(args, input.Path)
 		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		files, err := runJSONCommand[[]LTXFileInfo](ctx, args...)
 		if err != nil {
-			return nil, ltxOutput{}, commandError(output, err)
+			return nil, ltxOutput{}, err
 		}
-		text := string(output)
-		return textResult(text), ltxOutput{Text: text}, nil
+		text := fmt.Sprintf("Found %s for %s.", countNoun(len(files), "LTX file", "LTX files"), input.Path)
+		return textResult(text), ltxOutput{Files: files}, nil
 	}
 }
 
@@ -340,7 +347,7 @@ type statusInput struct {
 }
 
 type statusOutput struct {
-	Text string `json:"text" jsonschema:"Litestream replication status."`
+	Databases []DBStatus `json:"databases" jsonschema:"Replication status for configured databases."`
 }
 
 func StatusTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[statusInput, statusOutput]) {
@@ -352,7 +359,7 @@ func StatusTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[statusInput, s
 	}
 
 	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input statusInput) (*mcp.CallToolResult, statusOutput, error) {
-		args := []string{"status"}
+		args := []string{"status", "-json"}
 		config := configPath
 		if input.Config != nil {
 			config = *input.Config
@@ -361,13 +368,12 @@ func StatusTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[statusInput, s
 		if input.Path != nil {
 			args = append(args, *input.Path)
 		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		statuses, err := runJSONCommand[[]DBStatus](ctx, args...)
 		if err != nil {
-			return nil, statusOutput{}, commandError(output, err)
+			return nil, statusOutput{}, err
 		}
-		text := string(output)
-		return textResult(text), statusOutput{Text: text}, nil
+		text := fmt.Sprintf("Reported replication status for %s.", countNoun(len(statuses), "database", "databases"))
+		return textResult(text), statusOutput{Databases: statuses}, nil
 	}
 }
 
@@ -377,7 +383,8 @@ type resetInput struct {
 }
 
 type resetOutput struct {
-	Text string `json:"text" jsonschema:"Reset command output."`
+	Path   string `json:"path" jsonschema:"Database path passed to the reset command."`
+	Status string `json:"status" jsonschema:"Reset command outcome."`
 }
 
 func ResetTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[resetInput, resetOutput]) {
@@ -398,13 +405,12 @@ func ResetTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[resetInput, res
 		if input.Path != "" {
 			args = append(args, input.Path)
 		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		_, _, err := runCommand(ctx, args...)
 		if err != nil {
-			return nil, resetOutput{}, commandError(output, err)
+			return nil, resetOutput{}, err
 		}
-		text := string(output)
-		return textResult(text), resetOutput{Text: text}, nil
+		text := fmt.Sprintf("Reset command completed for %s.", input.Path)
+		return textResult(text), resetOutput{Path: input.Path, Status: "completed"}, nil
 	}
 }
 
@@ -412,11 +418,45 @@ func textResult(text string) *mcp.CallToolResult {
 	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: text}}}
 }
 
-func commandError(output []byte, err error) error {
-	if message := strings.TrimSpace(string(output)); message != "" {
+func runJSONCommand[Output any](ctx context.Context, args ...string) (Output, error) {
+	var output Output
+	stdout, _, err := runCommand(ctx, args...)
+	if err != nil {
+		return output, err
+	}
+	if err := json.Unmarshal(stdout, &output); err != nil {
+		return output, fmt.Errorf("decode %s JSON output: %w", args[0], err)
+	}
+	return output, nil
+}
+
+func runCommand(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	cmd := exec.CommandContext(ctx, "litestream", args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = errors.Join(cause, err)
+		}
+		return nil, nil, commandError(stdout.Bytes(), stderr.Bytes(), err)
+	}
+	return stdout.Bytes(), stderr.Bytes(), nil
+}
+
+func commandError(stdout, stderr []byte, err error) error {
+	message := strings.TrimSpace(strings.Join([]string{string(stderr), string(stdout)}, "\n"))
+	if message != "" {
 		return fmt.Errorf("%s: %w", message, err)
 	}
 	return err
+}
+
+func countNoun(count int, singular, plural string) string {
+	if count == 1 {
+		return fmt.Sprintf("1 %s", singular)
+	}
+	return fmt.Sprintf("%d %s", count, plural)
 }
 
 func boolPointer(value bool) *bool {
