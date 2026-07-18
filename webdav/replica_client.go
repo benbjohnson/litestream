@@ -33,6 +33,7 @@ const (
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 type ReplicaClient struct {
 	mu     sync.Mutex
@@ -92,6 +93,14 @@ func (c *ReplicaClient) Type() string {
 func (c *ReplicaClient) Init(ctx context.Context) error {
 	_, err := c.init(ctx)
 	return err
+}
+
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.client = nil
+	return nil
 }
 
 // init initializes the connection and returns the WebDAV client.
