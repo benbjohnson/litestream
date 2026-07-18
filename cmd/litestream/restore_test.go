@@ -115,9 +115,18 @@ func TestRestoreCommand_RunJSONOutput(t *testing.T) {
 		}
 	})
 
-	var got RestoreResult
+	var got RestoreOutput
 	if err := json.Unmarshal([]byte(output), &got); err != nil {
 		t.Fatalf("failed to parse output: %v\n%s", err, output)
+	}
+	if got.Status != RestoreStatusRestored {
+		t.Fatalf("unexpected status: %s", got.Status)
+	}
+	if got.Reason != "" {
+		t.Fatalf("unexpected reason: %s", got.Reason)
+	}
+	if got.RestoreResult == nil {
+		t.Fatal("expected restore result")
 	}
 	if got.DBPath != restorePath {
 		t.Fatalf("unexpected db path: %s", got.DBPath)
@@ -136,6 +145,57 @@ func TestRestoreCommand_RunJSONOutput(t *testing.T) {
 	}
 	if _, err := os.Stat(restorePath); err != nil {
 		t.Fatalf("expected restored database: %v", err)
+	}
+}
+
+func TestRestoreCommand_RunJSONSkipOutput(t *testing.T) {
+	tests := []struct {
+		name       string
+		args       func(*testing.T) []string
+		wantReason RestoreReason
+	}{
+		{
+			name: "DatabaseExists",
+			args: func(t *testing.T) []string {
+				restorePath := filepath.Join(t.TempDir(), "db")
+				if err := os.WriteFile(restorePath, []byte("existing"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return []string{"-json", "-if-db-not-exists", "-o", restorePath, "file://" + t.TempDir()}
+			},
+			wantReason: RestoreReasonDatabaseExists,
+		},
+		{
+			name: "NoMatchingBackups",
+			args: func(t *testing.T) []string {
+				return []string{"-json", "-if-replica-exists", "-o", filepath.Join(t.TempDir(), "db"), "file://" + t.TempDir()}
+			},
+			wantReason: RestoreReasonNoMatchingBackups,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			output := captureLTXCommandStdout(t, func() {
+				if err := (&RestoreCommand{}).Run(t.Context(), tt.args(t)); err != nil {
+					t.Fatal(err)
+				}
+			})
+
+			var got RestoreOutput
+			if err := json.Unmarshal([]byte(output), &got); err != nil {
+				t.Fatalf("failed to parse output: %v\n%s", err, output)
+			}
+			if got.Status != RestoreStatusSkipped {
+				t.Fatalf("status=%q, want %q", got.Status, RestoreStatusSkipped)
+			}
+			if got.Reason != tt.wantReason {
+				t.Fatalf("reason=%q, want %q", got.Reason, tt.wantReason)
+			}
+			if got.RestoreResult != nil {
+				t.Fatalf("result=%v, want nil", got.RestoreResult)
+			}
+		})
 	}
 }
 
