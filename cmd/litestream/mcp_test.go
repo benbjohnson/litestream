@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
+	"maps"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -61,8 +65,8 @@ func TestMCPServerTools(t *testing.T) {
 		t.Fatal("server capabilities are nil")
 	}
 	capabilities := jsonObject(t, initializeResult.Capabilities)
-	if _, ok := capabilities["logging"]; !ok {
-		t.Error("logging capability is missing")
+	if _, ok := capabilities["logging"]; ok {
+		t.Error("logging capability is present")
 	}
 	if initializeResult.Capabilities.Tools == nil {
 		t.Fatal("tools capability is nil")
@@ -135,7 +139,7 @@ func TestMCPServerTools(t *testing.T) {
 
 		inputSchema := jsonObject(t, tool.InputSchema)
 		properties := schemaProperties(t, inputSchema)
-		if got, want := sortedMapKeys(properties), sortedMapKeys(test.properties); !reflect.DeepEqual(got, want) {
+		if got, want := slices.Sorted(maps.Keys(properties)), slices.Sorted(maps.Keys(test.properties)); !reflect.DeepEqual(got, want) {
 			t.Errorf("%s input properties=%v, want %v", tool.Name, got, want)
 		}
 		for name, property := range properties {
@@ -153,7 +157,7 @@ func TestMCPServerTools(t *testing.T) {
 
 		outputSchema := jsonObject(t, tool.OutputSchema)
 		outputProperties := schemaProperties(t, outputSchema)
-		if got := sortedMapKeys(outputProperties); !reflect.DeepEqual(got, []string{"text"}) {
+		if got := slices.Sorted(maps.Keys(outputProperties)); !reflect.DeepEqual(got, []string{"text"}) {
 			t.Errorf("%s output properties=%v, want [text]", tool.Name, got)
 		}
 		if property := jsonObject(t, outputProperties["text"]); property["description"] == "" {
@@ -163,6 +167,42 @@ func TestMCPServerTools(t *testing.T) {
 		}
 		if got, want := schemaRequired(outputSchema), []string{"text"}; !reflect.DeepEqual(got, want) {
 			t.Errorf("%s required output properties=%v, want %v", tool.Name, got, want)
+		}
+	}
+
+	rawResponse, _ := postMCPRequest(t, httpServer.URL, "tools/list", "2026-07-28", map[string]any{
+		"_meta": map[string]any{
+			mcp.MetaKeyProtocolVersion:    "2026-07-28",
+			mcp.MetaKeyClientInfo:         map[string]any{"name": "test-client", "version": "v1.0.0"},
+			mcp.MetaKeyClientCapabilities: map[string]any{},
+		},
+	})
+	rawResult, ok := rawResponse["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw tools/list result=%T, want map[string]any", rawResponse["result"])
+	}
+	if got := rawResult["resultType"]; got != "complete" {
+		t.Fatalf("raw tools/list resultType=%v, want complete", got)
+	}
+	rawTools, ok := rawResult["tools"].([]any)
+	if !ok {
+		t.Fatalf("raw tools/list tools=%T, want []any", rawResult["tools"])
+	}
+	for _, value := range rawTools {
+		tool, ok := value.(map[string]any)
+		if !ok {
+			t.Fatalf("raw tool=%T, want map[string]any", value)
+		}
+		if tool["name"] != "litestream_restore" && tool["name"] != "litestream_reset" {
+			continue
+		}
+		annotations, ok := tool["annotations"].(map[string]any)
+		if !ok {
+			t.Errorf("%s raw annotations=%T, want map[string]any", tool["name"], tool["annotations"])
+			continue
+		}
+		if got, ok := annotations["readOnlyHint"]; !ok || got != false {
+			t.Errorf("%s raw readOnlyHint=%v, want explicit false", tool["name"], got)
 		}
 	}
 
@@ -181,6 +221,27 @@ func TestMCPServerTools(t *testing.T) {
 	}
 	if got, want := textContent(t, callResult), version+"\n"; got != want {
 		t.Fatalf("version text content=%q, want %q", got, want)
+	}
+}
+
+func TestMCPServerAbandonedSession(t *testing.T) {
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	response, header := postMCPRequest(t, httpServer.URL, "initialize", "", map[string]any{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "test-client", "version": "v1.0.0"},
+	})
+	if _, ok := response["result"].(map[string]any); !ok {
+		t.Fatalf("initialize result=%T, want map[string]any", response["result"])
+	}
+	if got := header.Get("Mcp-Session-Id"); got != "" {
+		t.Fatalf("abandoned session ID=%q, want empty", got)
 	}
 }
 
@@ -538,18 +599,6 @@ func schemaRequired(schema map[string]any) []string {
 	return required
 }
 
-func sortedMapKeys[V any](values map[string]V) []string {
-	if len(values) == 0 {
-		return nil
-	}
-	keys := make([]string, 0, len(values))
-	for key := range values {
-		keys = append(keys, key)
-	}
-	slices.Sort(keys)
-	return keys
-}
-
 func installFakeLitestream(t *testing.T) {
 	t.Helper()
 
@@ -578,6 +627,58 @@ printf '\n'
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func postMCPRequest(t *testing.T, endpoint, method, protocolVersion string, params map[string]any) (map[string]any, http.Header) {
+	t.Helper()
+
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  method,
+		"params":  params,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	if protocolVersion != "" {
+		request.Header.Set("Mcp-Protocol-Version", protocolVersion)
+		request.Header.Set("Mcp-Method", method)
+	}
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("MCP response status=%d, want %d: %s", response.StatusCode, http.StatusOK, data)
+	}
+
+	payload := bytes.TrimSpace(data)
+	for line := range bytes.Lines(data) {
+		if value, ok := bytes.CutPrefix(line, []byte("data: ")); ok {
+			payload = bytes.TrimSpace(value)
+			break
+		}
+	}
+	var object map[string]any
+	if err := json.Unmarshal(payload, &object); err != nil {
+		t.Fatalf("decode MCP response %q: %v", data, err)
+	}
+	if rpcError := object["error"]; rpcError != nil {
+		t.Fatalf("MCP response error=%v", rpcError)
+	}
+	return object, response.Header
 }
 
 func textContent(t *testing.T, result *mcp.CallToolResult) string {
