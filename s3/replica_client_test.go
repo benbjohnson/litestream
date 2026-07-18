@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -87,6 +88,57 @@ func TestIsNotExists(t *testing.T) {
 	}
 	if !isNotExists(wrappedErr) {
 		t.Error("isNotExists should return true for wrapped NoSuchKey error")
+	}
+}
+
+func TestReplicaClient_findBucketRegionClosesTransport(t *testing.T) {
+	idle := make(chan struct{}, 1)
+	closed := make(chan struct{}, 1)
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/xml")
+		_, _ = io.WriteString(w, `<LocationConstraint xmlns="http://s3.amazonaws.com/doc/2006-03-01/">us-west-2</LocationConstraint>`)
+	}))
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		switch state {
+		case http.StateIdle:
+			select {
+			case idle <- struct{}{}:
+			default:
+			}
+		case http.StateClosed:
+			select {
+			case closed <- struct{}{}:
+			default:
+			}
+		}
+	}
+	server.Start()
+	t.Cleanup(server.Close)
+
+	c := NewReplicaClient()
+	c.Bucket = "test-bucket"
+	c.Endpoint = server.URL
+	c.ForcePathStyle = true
+	c.AccessKeyID = "test-key"
+	c.SecretAccessKey = "test-secret"
+
+	region, err := c.findBucketRegion(t.Context(), c.Bucket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := region, "us-west-2"; got != want {
+		t.Fatalf("region=%q, want %q", got, want)
+	}
+
+	select {
+	case <-idle:
+	default:
+		t.Fatal("expected region lookup connection to become idle")
+	}
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		t.Fatal("region lookup transport did not close its idle connection")
 	}
 }
 
