@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -30,15 +29,10 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 		ctx:        ctx,
 		configPath: configPath,
 	}
-	capabilities := &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}
-	if err := json.Unmarshal([]byte(`{"logging":{}}`), capabilities); err != nil {
-		return nil, fmt.Errorf("configure MCP capabilities: %w", err)
-	}
-
 	mcpServer := mcp.NewServer(
 		&mcp.Implementation{Name: "Litestream MCP Server", Version: Version},
 		&mcp.ServerOptions{
-			Capabilities: capabilities,
+			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 		},
 	)
 	mcpServer.AddReceivingMiddleware(recoveryMiddleware)
@@ -60,7 +54,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	s.mux = http.NewServeMux()
 	s.mux.Handle("/", httplog.Logger(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
-	}, nil)))
+	}, &mcp.StreamableHTTPOptions{Stateless: true})))
 	return s, nil
 }
 
