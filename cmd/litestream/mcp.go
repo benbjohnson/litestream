@@ -3,24 +3,136 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"os"
 	"os/exec"
+	"os/signal"
 	"slices"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/MadAppGang/httplog"
 	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/benbjohnson/litestream/internal"
 )
+
+// MCPCommand represents a command that runs the MCP server.
+type MCPCommand struct {
+	listener net.Listener
+}
+
+// Run executes the command.
+func (c *MCPCommand) Run(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("litestream-mcp", flag.ContinueOnError)
+	addr := fs.String("addr", "", "HTTP bind address")
+	configPath := fs.String("config", "", "config path")
+	fs.Usage = c.Usage
+	if err := fs.Parse(args); err != nil {
+		return err
+	} else if fs.NArg() > 0 {
+		return fmt.Errorf("too many arguments")
+	}
+	if *configPath == "" {
+		*configPath = DefaultConfigPath()
+	}
+
+	internal.InitLog(os.Stderr, "INFO", "text", false)
+
+	server, err := NewMCP(ctx, *configPath)
+	if err != nil {
+		return err
+	}
+
+	return runMCPTransport(ctx, func(runCtx context.Context) error {
+		if *addr == "" {
+			err = server.RunStdio(runCtx)
+		} else {
+			listener := c.listener
+			if listener == nil {
+				listener, err = net.Listen("tcp", *addr)
+				if err != nil {
+					return fmt.Errorf("listen for MCP HTTP server: %w", err)
+				}
+			}
+			err = server.RunHTTP(runCtx, listener)
+		}
+		return err
+	})
+}
+
+// Usage prints the help screen to STDOUT.
+func (c *MCPCommand) Usage() {
+	fmt.Printf(`
+The mcp command runs the Litestream MCP server without the replication daemon.
+
+Usage:
+
+	litestream mcp [arguments]
+
+Arguments:
+
+	-addr ADDR
+	    Serves MCP over Streamable HTTP at ADDR instead of stdio.
+
+	-config PATH
+	    Specifies the default configuration file used by MCP tools.
+	    Defaults to %s
+
+Examples:
+
+	$ litestream mcp
+	$ litestream mcp --config /path/to/litestream.yml
+	$ litestream mcp --addr 127.0.0.1:3001
+
+`[1:], DefaultConfigPath())
+}
+
+func runMCPTransport(ctx context.Context, run func(context.Context) error) error {
+	runCtx, stop := mcpSignalContext(ctx)
+	defer stop()
+	err := run(runCtx)
+	cause := context.Cause(runCtx)
+	if cause != nil && errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func mcpSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-signalCh:
+			signal.Stop(signalCh)
+			cancel(fmt.Errorf("%s signal received", sig))
+		case <-ctx.Done():
+			signal.Stop(signalCh)
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(signalCh)
+		cancel(context.Canceled)
+	}
+}
 
 type MCPServer struct {
 	ctx        context.Context
+	server     *mcp.Server
 	mux        *http.ServeMux
 	httpServer *http.Server
+	httpCancel context.CancelFunc
+	errCh      chan error
 	configPath string
 }
 
@@ -50,6 +162,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcp.AddTool(mcpServer, statusTool, statusHandler)
 	resetTool, resetHandler := ResetTool(configPath)
 	mcp.AddTool(mcpServer, resetTool, resetHandler)
+	s.server = mcpServer
 
 	s.mux = http.NewServeMux()
 	s.mux.Handle("/", httplog.Logger(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
@@ -58,18 +171,71 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	return s, nil
 }
 
-func (s *MCPServer) Start(addr string) {
-	s.httpServer = &http.Server{
-		Addr:              addr,
-		Handler:           s.mux,
+func (s *MCPServer) Start(addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for MCP HTTP server: %w", err)
+	}
+	s.httpServer = s.newHTTPServer(s.ctx, listener.Addr().String())
+	s.errCh = make(chan error, 1)
+	go func() {
+		s.errCh <- s.runHTTP(s.ctx, listener)
+	}()
+	return nil
+}
+
+func (s *MCPServer) RunStdio(ctx context.Context) error {
+	return s.server.Run(ctx, &mcp.StdioTransport{})
+}
+
+func (s *MCPServer) RunHTTP(ctx context.Context, listener net.Listener) error {
+	s.httpServer = s.newHTTPServer(ctx, listener.Addr().String())
+	return s.runHTTP(ctx, listener)
+}
+
+func (s *MCPServer) runHTTP(ctx context.Context, listener net.Listener) error {
+	defer s.httpCancel()
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("Starting MCP Streamable HTTP server", "addr", listener.Addr().String())
+		errCh <- s.httpServer.Serve(listener)
+	}()
+
+	select {
+	case <-ctx.Done():
+		if err := s.Close(); err != nil {
+			shutdownErr := fmt.Errorf("close MCP HTTP server: %w", err)
+			if err := s.httpServer.Close(); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("force close MCP HTTP server: %w", err))
+			}
+			if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("serve MCP HTTP server: %w", err))
+			}
+			return shutdownErr
+		}
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve MCP HTTP server: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve MCP HTTP server: %w", err)
+		}
+		return nil
+	}
+}
+
+func (s *MCPServer) newHTTPServer(ctx context.Context, addr string) *http.Server {
+	httpCtx, cancel := context.WithCancel(ctx)
+	s.httpCancel = cancel
+	return &http.Server{
+		Addr:    addr,
+		Handler: s.mux,
+		BaseContext: func(net.Listener) context.Context {
+			return httpCtx
+		},
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	go func() {
-		slog.Info("Starting MCP Streamable HTTP server", "addr", addr)
-		if err := s.httpServer.ListenAndServe(); err != nil {
-			slog.Error("MCP server error", "error", err)
-		}
-	}()
 }
 
 func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +244,13 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Close attempts to gracefully shutdown the server.
 func (s *MCPServer) Close() error {
-	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	if s.httpServer == nil {
+		return nil
+	}
+	if s.httpCancel != nil {
+		s.httpCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), 10*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
 }

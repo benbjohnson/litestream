@@ -1,24 +1,275 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"flag"
+	"fmt"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestMCPCommandStdio(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPCommandStdioHelper$")
+	cmd.Env = append(os.Environ(), "LITESTREAM_TEST_MCP_STDIO=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+	session, err := client.Connect(t.Context(), &mcp.CommandTransport{Command: cmd}, nil)
+	if err != nil {
+		t.Fatalf("connect: %v\nstderr:\n%s", err, stderr.String())
+	}
+
+	result, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(result.Tools), 7; got != want {
+		t.Fatalf("tool count=%d, want %d", got, want)
+	}
+	if err := session.Close(); err != nil {
+		t.Fatalf("close session: %v\nstderr:\n%s", err, stderr.String())
+	}
+}
+
+func TestMCPCommandStdioHelper(t *testing.T) {
+	if os.Getenv("LITESTREAM_TEST_MCP_STDIO") != "1" {
+		t.Skip("helper process only")
+	}
+	if err := NewMain().Run(context.Background(), []string{"mcp", "--config", "/test/litestream.yml"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMCPCommandStdioContextCancellation(t *testing.T) {
+	stdin, stdinWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdoutReader, stdout, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	previousStdin, previousStdout := os.Stdin, os.Stdout
+	os.Stdin, os.Stdout = stdin, stdout
+	t.Cleanup(func() {
+		os.Stdin, os.Stdout = previousStdin, previousStdout
+		for _, file := range []*os.File{stdin, stdinWriter, stdoutReader, stdout} {
+			if err := file.Close(); err != nil && !errors.Is(err, os.ErrClosed) {
+				t.Error(err)
+			}
+		}
+	})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- (&MCPCommand{}).Run(ctx, nil)
+	}()
+	cancel()
+
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("stdio command did not stop after cancellation")
+	}
+}
+
+func TestMCPCommandHTTP(t *testing.T) {
+	listener := availableTCPListener(t)
+	addr := listener.Addr().String()
+	ctx, cancel := context.WithCancel(t.Context())
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- (&MCPCommand{listener: listener}).Run(ctx, []string{"--addr", addr, "--config", "/test/litestream.yml"})
+	}()
+
+	session := connectMCPHTTP(t, "http://"+addr)
+	result, err := session.ListTools(t.Context(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(result.Tools), 7; got != want {
+		t.Fatalf("tool count=%d, want %d", got, want)
+	}
+	cancel()
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatalf("run: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("HTTP command did not stop after cancellation")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMCPCommandEmbeddedHTTP(t *testing.T) {
+	server, err := NewMCP(t.Context(), "/test/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+
+	session := connectMCPHTTP(t, "http://"+server.httpServer.Addr)
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-server.errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("embedded HTTP server did not stop")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMCPCommandSecondSignal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX process signals")
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPCommandSecondSignalHelper$")
+	cmd.Env = append(os.Environ(), "LITESTREAM_TEST_MCP_SECOND_SIGNAL=1")
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var waitErr error
+	waitDone := make(chan struct{})
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-waitDone:
+		default:
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				t.Error(err)
+			}
+			<-waitDone
+		}
+	})
+
+	scanner := bufio.NewScanner(stderr)
+	if !scanner.Scan() || scanner.Text() != "ready" {
+		t.Fatalf("ready line=%q, error=%v", scanner.Text(), scanner.Err())
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if !scanner.Scan() || scanner.Text() != "canceled" {
+		t.Fatalf("canceled line=%q, error=%v", scanner.Text(), scanner.Err())
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-waitDone:
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			t.Fatalf("wait error=%v, want exit error", waitErr)
+		}
+		status, ok := exitErr.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
+			t.Fatalf("wait status=%v, want SIGTERM", exitErr.Sys())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second signal did not terminate MCP command")
+	}
+}
+
+func TestMCPCommandSecondSignalHelper(t *testing.T) {
+	if os.Getenv("LITESTREAM_TEST_MCP_SECOND_SIGNAL") != "1" {
+		t.Skip("helper process only")
+	}
+	err := runMCPTransport(context.Background(), func(ctx context.Context) error {
+		fmt.Fprintln(os.Stderr, "ready")
+		<-ctx.Done()
+		fmt.Fprintln(os.Stderr, "canceled")
+		select {}
+	})
+	t.Fatalf("run returned: %v", err)
+}
+
+func TestMCPCommandFlagsAndUsage(t *testing.T) {
+	if err := (&MCPCommand{}).Run(t.Context(), []string{"unexpected"}); err == nil || err.Error() != "too many arguments" {
+		t.Fatalf("error=%v, want too many arguments", err)
+	}
+
+	output := captureMCPStdout(t, func() {
+		if err := (&MCPCommand{}).Run(t.Context(), []string{"-help"}); !errors.Is(err, flag.ErrHelp) {
+			t.Fatalf("error=%v, want flag.ErrHelp", err)
+		}
+		(&MCPCommand{}).Usage()
+		(&Main{}).Usage()
+	})
+	for _, want := range []string{"litestream mcp", "-addr ADDR", "MCP server", "mcp          runs the MCP server"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("usage missing %q:\n%s", want, output)
+		}
+	}
+}
+
+func TestMCPCommandHTTPBindError(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := listener.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	err = (&MCPCommand{}).Run(t.Context(), []string{"--addr", listener.Addr().String()})
+	if err == nil || !strings.Contains(err.Error(), "listen for MCP HTTP server") {
+		t.Fatalf("error=%v, want listen error", err)
+	}
+
+	cmd := NewReplicateCommand()
+	cmd.Config.MCPAddr = listener.Addr().String()
+	err = cmd.Run(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "start MCP server: listen for MCP HTTP server") {
+		t.Fatalf("embedded error=%v, want listen error", err)
+	}
+}
 
 func TestMCPServerTools(t *testing.T) {
 	const version = "v1.2.3-mcp-test"
@@ -538,4 +789,57 @@ func setVersion(t *testing.T, version string) {
 	previous := Version
 	Version = version
 	t.Cleanup(func() { Version = previous })
+}
+
+func availableTCPListener(t *testing.T) net.Listener {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return listener
+}
+
+func connectMCPHTTP(t *testing.T, endpoint string) *mcp.ClientSession {
+	t.Helper()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+		session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: endpoint}, nil)
+		if err == nil {
+			return session
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("connect to %s: %v", endpoint, err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func captureMCPStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	stdout := os.Stdout
+	reader, writer, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writer
+	t.Cleanup(func() { os.Stdout = stdout })
+
+	fn()
+
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := reader.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return string(output)
 }
