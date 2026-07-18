@@ -3,6 +3,7 @@ package webdav_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -33,6 +34,45 @@ func TestReplicaClient_Init_RequiresURL(t *testing.T) {
 		t.Fatal("expected error when URL is empty")
 	} else if got, want := err.Error(), "webdav url required"; got != want {
 		t.Fatalf("error=%v, want %v", got, want)
+	}
+}
+
+func TestReplicaClient_InitCancellation(t *testing.T) {
+	requestStarted := make(chan struct{}, 1)
+	handlerDone := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestStarted <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-handlerDone:
+		}
+	}))
+	t.Cleanup(func() {
+		close(handlerDone)
+		server.Close()
+	})
+
+	c := newTestReplicaClient(server.URL)
+	c.Timeout = time.Minute
+	ctx, cancel := context.WithCancelCause(t.Context())
+	errCh := make(chan error, 1)
+	go func() { errCh <- c.Init(ctx) }()
+
+	select {
+	case <-requestStarted:
+	case <-time.After(time.Second):
+		t.Fatal("WebDAV client did not connect")
+	}
+
+	cancelErr := errors.New("request canceled")
+	cancel(cancelErr)
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, cancelErr) {
+			t.Fatalf("error=%v, want %v", err, cancelErr)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("WebDAV initialization did not stop after cancellation")
 	}
 }
 
