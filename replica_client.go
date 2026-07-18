@@ -50,6 +50,11 @@ type ReplicaClient interface {
 	SetLogger(logger *slog.Logger)
 }
 
+// ReplicaClientCloser releases resources owned by a replica client.
+type ReplicaClientCloser interface {
+	Close() error
+}
+
 // FindLTXFiles returns a list of files that match filter.
 // The useMetadata parameter is passed through to LTXFiles to control whether accurate timestamps
 // are fetched from metadata. When true (timestamp-based restore), accurate timestamps are required.
