@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"os/exec"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -155,6 +155,9 @@ func InfoTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[infoInput, infoO
 		if input.Config != nil {
 			config = *input.Config
 		}
+		if config == "" {
+			config = DefaultConfigPath()
+		}
 
 		databases, err := runJSONCommand[[]DatabaseInfo](ctx, "databases", "-json", "-config", config)
 		if err != nil {
@@ -203,7 +206,8 @@ type restoreInput struct {
 }
 
 type restoreOutput struct {
-	Status string         `json:"status" jsonschema:"Restore command outcome."`
+	Status RestoreStatus  `json:"status" jsonschema:"Restore command outcome."`
+	Reason RestoreReason  `json:"reason,omitempty" jsonschema:"Stable reason when the restore was skipped."`
 	Result *RestoreResult `json:"result,omitempty" jsonschema:"Restore details when a database was restored."`
 }
 
@@ -241,33 +245,44 @@ func RestoreTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[restoreInput,
 			args = append(args, "-parallelism", *input.Parallelism)
 		}
 		if input.IfDBNotExists != nil {
-			args = append(args, "-if-db-not-exists", strconv.FormatBool(*input.IfDBNotExists))
+			args = append(args, fmt.Sprintf("-if-db-not-exists=%t", *input.IfDBNotExists))
 		}
 		if input.IfReplicaExists != nil {
-			args = append(args, "-if-replica-exists", strconv.FormatBool(*input.IfReplicaExists))
+			args = append(args, fmt.Sprintf("-if-replica-exists=%t", *input.IfReplicaExists))
 		}
 		if input.Path != "" {
 			args = append(args, input.Path)
 		}
-		stdout, _, err := runCommand(ctx, args...)
+		output, err := runJSONCommand[RestoreOutput](ctx, args...)
 		if err != nil {
 			return nil, restoreOutput{}, err
 		}
-		if len(bytes.TrimSpace(stdout)) == 0 {
-			output := restoreOutput{Status: "skipped"}
-			return textResult(fmt.Sprintf("Restore skipped for %s.", input.Path)), output, nil
+		switch output.Status {
+		case RestoreStatusRestored:
+			if output.RestoreResult == nil {
+				return nil, restoreOutput{}, fmt.Errorf("restore JSON output missing result")
+			}
+			text := fmt.Sprintf("Restored %s using the %s replica", output.DBPath, output.Replica)
+			if output.TXID != "" {
+				text += " at TXID " + output.TXID
+			}
+			return textResult(text + "."), restoreOutput{Status: output.Status, Result: output.RestoreResult}, nil
+		case RestoreStatusSkipped:
+			switch output.Reason {
+			case RestoreReasonDatabaseExists:
+				path := input.Path
+				if input.Output != nil && *input.Output != "" {
+					path = *input.Output
+				}
+				return textResult(fmt.Sprintf("Restore skipped because the database already exists at %s.", path)), restoreOutput{Status: output.Status, Reason: output.Reason}, nil
+			case RestoreReasonNoMatchingBackups:
+				return textResult(fmt.Sprintf("Restore skipped for %s because no matching backups were found.", input.Path)), restoreOutput{Status: output.Status, Reason: output.Reason}, nil
+			default:
+				return nil, restoreOutput{}, fmt.Errorf("unknown restore skip reason %q", output.Reason)
+			}
+		default:
+			return nil, restoreOutput{}, fmt.Errorf("unknown restore status %q", output.Status)
 		}
-
-		var result RestoreResult
-		if err := json.Unmarshal(stdout, &result); err != nil {
-			return nil, restoreOutput{}, fmt.Errorf("decode restore JSON output: %w", err)
-		}
-		text := fmt.Sprintf("Restored %s using the %s replica", result.DBPath, result.Replica)
-		if result.TXID != "" {
-			text += " at TXID " + result.TXID
-		}
-		text += "."
-		return textResult(text), restoreOutput{Status: "restored", Result: &result}, nil
 	}
 }
 
@@ -426,6 +441,9 @@ func runCommand(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
+		if cause := context.Cause(ctx); cause != nil {
+			err = errors.Join(cause, err)
+		}
 		return nil, nil, commandError(stdout.Bytes(), stderr.Bytes(), err)
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil

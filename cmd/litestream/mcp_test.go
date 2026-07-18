@@ -4,14 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -103,7 +107,7 @@ func TestMCPServerTools(t *testing.T) {
 				"txid":              "string",
 			},
 			required:         []string{"path"},
-			outputProperties: []string{"result", "status"},
+			outputProperties: []string{"reason", "result", "status"},
 			outputRequired:   []string{"status"},
 		},
 		"litestream_ltx": {
@@ -279,7 +283,7 @@ func TestMCPToolBehavior(t *testing.T) {
 					"integrity_check": "none",
 				},
 			},
-			wantArgs: "<restore><-json><-o><><-txid><><-timestamp><><-parallelism><><-if-db-not-exists><false><-if-replica-exists><true></data/db>\n",
+			wantArgs: "<restore><-json><-o><><-txid><><-timestamp><><-parallelism><><-if-db-not-exists=false><-if-replica-exists=true></data/db>\n",
 		},
 		{
 			name:      "litestream_ltx",
@@ -411,22 +415,102 @@ func TestMCPToolBehavior(t *testing.T) {
 	}
 
 	t.Setenv("LITESTREAM_TEST_FAIL", "")
-	t.Setenv("LITESTREAM_TEST_SKIP", "restore")
+	t.Setenv("LITESTREAM_CONFIG", "/effective/litestream.yml")
+	if err := os.WriteFile(argsPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	result, err = session.CallTool(t.Context(), &mcp.CallToolParams{
-		Name:      "litestream_restore",
-		Arguments: map[string]any{"path": "/data/db"},
+		Name:      "litestream_info",
+		Arguments: map[string]any{"config": ""},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if result.IsError {
-		t.Fatalf("skipped restore tool error: %#v", result.Content)
+		t.Fatalf("info tool error: %#v", result.Content)
 	}
-	if got, want := textContent(t, result), "Restore skipped for /data/db."; got != want {
-		t.Fatalf("skipped restore text content=%q, want %q", got, want)
+	if got, want := result.StructuredContent.(map[string]any)["config"], "/effective/litestream.yml"; got != want {
+		t.Fatalf("info config=%v, want %q", got, want)
 	}
-	if got, want := result.StructuredContent, map[string]any{"status": "skipped"}; !reflect.DeepEqual(got, want) {
-		t.Fatalf("skipped restore structured content=%v, want %v", got, want)
+	args, err = os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantArgs = "<databases><-json><-config></effective/litestream.yml>\n<ltx><-json><-config></effective/litestream.yml></data/db>\n"
+	if got := string(args); got != wantArgs {
+		t.Fatalf("info command arguments=%q, want %q", got, wantArgs)
+	}
+}
+
+func TestMCPRestoreSkipReasons(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+
+	installRestoreLitestream(t)
+	_, handler := RestoreTool("")
+	trueValue := true
+	tests := []struct {
+		name       string
+		input      func(*testing.T) restoreInput
+		wantReason RestoreReason
+		wantText   func(restoreInput) string
+	}{
+		{
+			name: "DatabaseExists",
+			input: func(t *testing.T) restoreInput {
+				outputPath := filepath.Join(t.TempDir(), "db")
+				if err := os.WriteFile(outputPath, []byte("existing"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				return restoreInput{
+					Path:          "file://" + t.TempDir(),
+					Output:        &outputPath,
+					IfDBNotExists: &trueValue,
+				}
+			},
+			wantReason: RestoreReasonDatabaseExists,
+			wantText: func(input restoreInput) string {
+				return fmt.Sprintf("Restore skipped because the database already exists at %s.", *input.Output)
+			},
+		},
+		{
+			name: "NoMatchingBackups",
+			input: func(t *testing.T) restoreInput {
+				outputPath := filepath.Join(t.TempDir(), "db")
+				return restoreInput{
+					Path:            "file://" + t.TempDir(),
+					Output:          &outputPath,
+					IfReplicaExists: &trueValue,
+				}
+			},
+			wantReason: RestoreReasonNoMatchingBackups,
+			wantText: func(input restoreInput) string {
+				return fmt.Sprintf("Restore skipped for %s because no matching backups were found.", input.Path)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			input := tt.input(t)
+			result, output, err := handler(t.Context(), nil, input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := textContent(t, result), tt.wantText(input); got != want {
+				t.Fatalf("text content=%q, want %q", got, want)
+			}
+			if output.Status != RestoreStatusSkipped {
+				t.Fatalf("status=%q, want %q", output.Status, RestoreStatusSkipped)
+			}
+			if output.Reason != tt.wantReason {
+				t.Fatalf("reason=%q, want %q", output.Reason, tt.wantReason)
+			}
+			if output.Result != nil {
+				t.Fatalf("result=%v, want nil", output.Result)
+			}
+		})
 	}
 }
 
@@ -445,6 +529,51 @@ func TestMCPToolContextCancellation(t *testing.T) {
 	}
 	if result != nil {
 		t.Fatalf("result=%v, want nil", result)
+	}
+}
+
+func TestMCPToolContextCancellationAfterStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+
+	installFakeLitestream(t)
+	readyPath := filepath.Join(t.TempDir(), "ready")
+	t.Setenv("LITESTREAM_TEST_BLOCK", "ltx")
+	t.Setenv("LITESTREAM_TEST_READY_FILE", readyPath)
+	_, handler := LTXTool("/default/litestream.yml")
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+
+	type response struct {
+		result *mcp.CallToolResult
+		err    error
+	}
+	responseCh := make(chan response, 1)
+	go func() {
+		result, _, err := handler(ctx, nil, ltxInput{Path: "/data/db"})
+		responseCh <- response{result: result, err: err}
+	}()
+
+	waitForPath(t, readyPath)
+	cancel()
+
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case response := <-responseCh:
+		if !errors.Is(response.err, context.Canceled) {
+			t.Fatalf("error=%v, want context canceled", response.err)
+		}
+		var exitErr *exec.ExitError
+		if !errors.As(response.err, &exitErr) {
+			t.Fatalf("error=%v, want process exit error", response.err)
+		}
+		if response.result != nil {
+			t.Fatalf("result=%v, want nil", response.result)
+		}
+	case <-timer.C:
+		t.Fatal("timed out waiting for canceled tool call")
 	}
 }
 
@@ -532,15 +661,16 @@ if [ "$LITESTREAM_TEST_FAIL" = "$1" ]; then
 	printf 'failure from %s\n' "$1" >&2
 	exit 1
 fi
-if [ "$LITESTREAM_TEST_SKIP" = "$1" ]; then
-	exit 0
+if [ "$LITESTREAM_TEST_BLOCK" = "$1" ]; then
+	: > "$LITESTREAM_TEST_READY_FILE"
+	exec sleep 60
 fi
 case "$1" in
   databases)
     printf '[{"path":"/data/db","replica":"s3"}]\n'
     ;;
   restore)
-    printf '{"db_path":"/restore/db","replica":"file","txid":"0000000000000004","duration_ms":125,"integrity_check":"none"}\n'
+	printf '{"status":"restored","db_path":"/restore/db","replica":"file","txid":"0000000000000004","duration_ms":125,"integrity_check":"none"}\n'
     ;;
   ltx)
     printf '[{"level":0,"min_txid":"0000000000000001","max_txid":"0000000000000004","size":8192,"timestamp":"2026-04-24T12:00:00Z"}]\n'
@@ -559,6 +689,65 @@ esac
 	t.Setenv("LITESTREAM_TEST_ARGS_FILE", argsPath)
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return argsPath
+}
+
+func installRestoreLitestream(t *testing.T) {
+	t.Helper()
+
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "litestream")
+	script := `#!/bin/sh
+LITESTREAM_TEST_MCP_RESTORE=1 exec "$LITESTREAM_TEST_BINARY" -test.run=^TestMCPRestoreCommandHarness$ -- "$@"
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITESTREAM_TEST_BINARY", testBinary)
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func TestMCPRestoreCommandHarness(t *testing.T) {
+	if os.Getenv("LITESTREAM_TEST_MCP_RESTORE") != "1" {
+		t.Skip("helper process only")
+	}
+
+	separator := slices.Index(os.Args, "--")
+	if separator == -1 {
+		os.Exit(2)
+	}
+	if err := NewMain().Run(context.Background(), os.Args[separator+1:]); err != nil {
+		if _, writeErr := fmt.Fprintln(os.Stderr, err); writeErr != nil {
+			os.Exit(2)
+		}
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func waitForPath(t *testing.T, path string) {
+	t.Helper()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		if _, err := os.Stat(path); err == nil {
+			return
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			t.Fatal(err)
+		}
+
+		select {
+		case <-ticker.C:
+		case <-timer.C:
+			t.Fatalf("timed out waiting for %s", path)
+		}
+	}
 }
 
 func textContent(t *testing.T, result *mcp.CallToolResult) string {
