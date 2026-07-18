@@ -275,6 +275,49 @@ func TestMCPRemoteReplicaLifecycle(t *testing.T) {
 	}
 }
 
+func TestMCPReplicaClientCloseContract(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{name: "abs", url: "abs://account@container/path"},
+		{name: "file", url: "file:///tmp/replica"},
+		{name: "gs", url: "gs://bucket/path"},
+		{name: "nats", url: "nats://localhost/bucket"},
+		{name: "oss", url: "oss://bucket/path"},
+		{name: "s3", url: "s3://bucket/path"},
+		{name: "sftp", url: "sftp://user@localhost/path"},
+		{name: "webdav", url: "webdav://localhost/path"},
+		{name: "webdavs", url: "webdavs://localhost/path"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			closer, ok := client.(litestream.ReplicaClientCloser)
+			if !ok {
+				t.Fatalf("%s replica client does not implement cleanup contract", client.Type())
+			}
+			if err := closer.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestMCPReplicaClientCloseContractViolation(t *testing.T) {
+	r := litestream.NewReplica(nil)
+	r.Client = &mock.ReplicaClient{}
+
+	err := closeMCPReplica(r)
+	if !errors.Is(err, errMCPReplicaClientNotClosable) {
+		t.Fatalf("error=%v, want %v", err, errMCPReplicaClientNotClosable)
+	}
+}
+
 func TestRestoreTXID(t *testing.T) {
 	t.Run("returns plan error", func(t *testing.T) {
 		planErr := errors.New("list failed")
