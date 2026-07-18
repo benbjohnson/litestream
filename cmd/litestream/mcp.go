@@ -27,10 +27,12 @@ import (
 
 const mcpCatalogCacheTTL = 5 * time.Minute
 
+// MCPCommand represents a command that runs the MCP server.
 type MCPCommand struct {
 	listener net.Listener
 }
 
+// Run executes the command.
 func (c *MCPCommand) Run(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("litestream-mcp", flag.ContinueOnError)
 	addr := fs.String("addr", "", "HTTP bind address")
@@ -52,27 +54,24 @@ func (c *MCPCommand) Run(ctx context.Context, args []string) error {
 		return err
 	}
 
-	runCtx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	if *addr == "" {
-		err = server.RunStdio(runCtx)
-	} else {
-		listener := c.listener
-		if listener == nil {
-			listener, err = net.Listen("tcp", *addr)
-			if err != nil {
-				return fmt.Errorf("listen for MCP HTTP server: %w", err)
+	return runMCPTransport(ctx, func(runCtx context.Context) error {
+		if *addr == "" {
+			err = server.RunStdio(runCtx)
+		} else {
+			listener := c.listener
+			if listener == nil {
+				listener, err = net.Listen("tcp", *addr)
+				if err != nil {
+					return fmt.Errorf("listen for MCP HTTP server: %w", err)
+				}
 			}
+			err = server.RunHTTP(runCtx, listener)
 		}
-		err = server.RunHTTP(runCtx, listener)
-	}
-	if errors.Is(err, context.Canceled) {
-		return nil
-	}
-	return err
+		return err
+	})
 }
 
+// Usage prints the help screen to STDOUT.
 func (c *MCPCommand) Usage() {
 	fmt.Printf(`
 The mcp command runs the Litestream MCP server without the replication daemon.
@@ -97,6 +96,36 @@ Examples:
 	$ litestream mcp --addr 127.0.0.1:3001
 
 `[1:], DefaultConfigPath())
+}
+
+func runMCPTransport(ctx context.Context, run func(context.Context) error) error {
+	runCtx, stop := mcpSignalContext(ctx)
+	defer stop()
+	err := run(runCtx)
+	cause := context.Cause(runCtx)
+	if cause != nil && errors.Is(err, context.Canceled) {
+		return nil
+	}
+	return err
+}
+
+func mcpSignalContext(parent context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancelCause(parent)
+	signalCh := make(chan os.Signal, 1)
+	signal.Notify(signalCh, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		select {
+		case sig := <-signalCh:
+			signal.Stop(signalCh)
+			cancel(fmt.Errorf("%s signal received", sig))
+		case <-ctx.Done():
+			signal.Stop(signalCh)
+		}
+	}()
+	return ctx, func() {
+		signal.Stop(signalCh)
+		cancel(context.Canceled)
+	}
 }
 
 type MCPServer struct {
