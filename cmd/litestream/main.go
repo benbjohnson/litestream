@@ -55,6 +55,7 @@ var (
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
 	ErrInvalidHeartbeatURL             = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
 	ErrInvalidHeartbeatInterval        = errors.New("heartbeat interval must be at least 1 minute")
+	ErrInvalidMCPAuthToken             = errors.New("mcp auth token must not be empty")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
@@ -308,8 +309,8 @@ type Config struct {
 	Logging internal.LoggingConfig `yaml:"logging"`
 
 	// MCP server options
-	MCPAddr      string `yaml:"mcp-addr"`
-	MCPAuthToken string `yaml:"mcp-auth-token"`
+	MCPAddr      string  `yaml:"mcp-addr"`
+	MCPAuthToken *string `yaml:"mcp-auth-token"`
 
 	// Shutdown sync retry settings
 	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
@@ -413,6 +414,13 @@ func DefaultConfig() Config {
 
 // Validate returns an error if config contains invalid settings.
 func (c *Config) Validate() error {
+	if c.MCPAuthToken != nil && *c.MCPAuthToken == "" {
+		return &ConfigValidationError{
+			Err:   ErrInvalidMCPAuthToken,
+			Field: "mcp-auth-token",
+		}
+	}
+
 	// Validate snapshot intervals
 	if c.Snapshot.Interval != nil && *c.Snapshot.Interval <= 0 {
 		return &ConfigValidationError{
@@ -636,6 +644,11 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if err := yaml.Unmarshal(buf, &raw); err != nil {
 		return config, err
 	}
+	var rawValues map[string]any
+	if err := yaml.Unmarshal(buf, &rawValues); err != nil {
+		return config, err
+	}
+	_, mcpAuthTokenSet := rawValues["mcp-auth-token"]
 	globalSnapshotIntervalSet := raw.Snapshot != nil && raw.Snapshot.Interval != nil
 	globalSnapshotRetentionSet := raw.Snapshot != nil && raw.Snapshot.Retention != nil
 
@@ -647,6 +660,9 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 
 	if err := yaml.Unmarshal(buf, &config); err != nil {
 		return config, err
+	}
+	if mcpAuthTokenSet && config.MCPAuthToken == nil {
+		config.MCPAuthToken = new(string)
 	}
 
 	// Restore defaults if they were overwritten with nil by empty YAML sections

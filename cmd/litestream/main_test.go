@@ -155,7 +155,9 @@ dbs:
 			t.Fatalf("Replica[0].URL=%v, want %v", got, want)
 		} else if got, want := config.DBs[0].Replicas[1].URL, ``; got != want {
 			t.Fatalf("Replica[1].URL=%v, want %v", got, want)
-		} else if got, want := config.MCPAuthToken, `secret`; got != want {
+		} else if config.MCPAuthToken == nil {
+			t.Fatal("MCPAuthToken is nil")
+		} else if got, want := *config.MCPAuthToken, `secret`; got != want {
 			t.Fatalf("MCPAuthToken=%v, want %v", got, want)
 		}
 	})
