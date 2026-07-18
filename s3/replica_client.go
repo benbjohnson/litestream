@@ -74,14 +74,16 @@ const DefaultR2Concurrency = 2
 type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.Client // s3 service
-	uploader *manager.Uploader
-	logger   *slog.Logger
+	mu        sync.Mutex
+	s3        *s3.Client // s3 service
+	uploader  *manager.Uploader
+	transport *http.Transport
+	logger    *slog.Logger
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -369,7 +371,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Always configure custom HTTP Transport with controlled keepalive settings
 	// to reduce idle CPU usage from default transport's aggressive keepalives.
 	// See: https://github.com/benbjohnson/litestream/issues/992
-	httpClient.Transport = &http.Transport{
+	transport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
 			Timeout:   30 * time.Second,
@@ -381,10 +383,16 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
 	}
+	defer func() {
+		if err != nil {
+			transport.CloseIdleConnections()
+		}
+	}()
+	httpClient.Transport = transport
 
 	// Configure TLS to skip verification if requested
 	if c.SkipVerify {
-		httpClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
+		transport.TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
 		}
 	}
@@ -479,7 +487,22 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		})
 	}
 	c.uploader = manager.NewUploader(c.s3, uploaderOpts...)
+	c.transport = transport
 
+	return nil
+}
+
+// Close closes idle connections owned by the S3 client.
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.transport != nil {
+		c.transport.CloseIdleConnections()
+		c.transport = nil
+	}
+	c.s3 = nil
+	c.uploader = nil
 	return nil
 }
 
