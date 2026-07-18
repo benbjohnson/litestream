@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -30,7 +31,7 @@ const (
 	defaultDaemonSocketPath   = "/var/run/litestream.sock"
 	defaultDaemonReadTimeout  = 10
 	defaultDaemonWriteTimeout = 30
-	maxDaemonTimeoutSeconds   = int64((1<<63 - 1) / time.Second)
+	maxDaemonTimeoutSeconds   = int64(math.MaxInt64 / time.Second)
 )
 
 type MCPServer struct {
