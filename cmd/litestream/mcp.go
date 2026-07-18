@@ -202,14 +202,15 @@ func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 			return mcpToolError(err)
 		}
 
-		r, err := loadMCPReplica(path, req.GetString("config", configPath))
+		resources, err := loadMCPReplica(path, req.GetString("config", configPath))
 		if err != nil {
 			return mcpToolError(err)
 		}
-		plan, err := (&RestoreCommand{}).dryRunPlan(ctx, path, r, opt)
-		if errors.Is(err, litestream.ErrTxNotAvailable) {
-			return mcpToolError(fmt.Errorf("no matching backup files available"))
-		} else if err != nil {
+		plan, opErr := (&RestoreCommand{}).dryRunPlan(ctx, path, resources.Replica, opt)
+		if errors.Is(opErr, litestream.ErrTxNotAvailable) {
+			opErr = fmt.Errorf("no matching backup files available")
+		}
+		if err := closeMCPResources(opErr, resources); err != nil {
 			return mcpToolError(err)
 		}
 
