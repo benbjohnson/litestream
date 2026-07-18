@@ -1,13 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -16,6 +19,7 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -110,18 +114,17 @@ func TestMCPCommandHTTP(t *testing.T) {
 	if got, want := len(result.Tools), 7; got != want {
 		t.Fatalf("tool count=%d, want %d", got, want)
 	}
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
-	}
-
 	cancel()
 	select {
 	case err := <-errCh:
 		if err != nil {
 			t.Fatalf("run: %v", err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("HTTP command did not stop after cancellation")
+	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -135,9 +138,6 @@ func TestMCPCommandEmbeddedHTTP(t *testing.T) {
 	}
 
 	session := connectMCPHTTP(t, "http://"+server.httpServer.Addr)
-	if err := session.Close(); err != nil {
-		t.Fatal(err)
-	}
 	if err := server.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -146,9 +146,85 @@ func TestMCPCommandEmbeddedHTTP(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-	case <-time.After(5 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("embedded HTTP server did not stop")
 	}
+	if err := session.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMCPCommandSecondSignal(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires POSIX process signals")
+	}
+
+	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPCommandSecondSignalHelper$")
+	cmd.Env = append(os.Environ(), "LITESTREAM_TEST_MCP_SECOND_SIGNAL=1")
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var waitErr error
+	waitDone := make(chan struct{})
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-waitDone:
+		default:
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				t.Error(err)
+			}
+			<-waitDone
+		}
+	})
+
+	scanner := bufio.NewScanner(stderr)
+	if !scanner.Scan() || scanner.Text() != "ready" {
+		t.Fatalf("ready line=%q, error=%v", scanner.Text(), scanner.Err())
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	if !scanner.Scan() || scanner.Text() != "canceled" {
+		t.Fatalf("canceled line=%q, error=%v", scanner.Text(), scanner.Err())
+	}
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-waitDone:
+		var exitErr *exec.ExitError
+		if !errors.As(waitErr, &exitErr) {
+			t.Fatalf("wait error=%v, want exit error", waitErr)
+		}
+		status, ok := exitErr.Sys().(syscall.WaitStatus)
+		if !ok || !status.Signaled() || status.Signal() != syscall.SIGTERM {
+			t.Fatalf("wait status=%v, want SIGTERM", exitErr.Sys())
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("second signal did not terminate MCP command")
+	}
+}
+
+func TestMCPCommandSecondSignalHelper(t *testing.T) {
+	if os.Getenv("LITESTREAM_TEST_MCP_SECOND_SIGNAL") != "1" {
+		t.Skip("helper process only")
+	}
+	err := runMCPTransport(context.Background(), func(ctx context.Context) error {
+		fmt.Fprintln(os.Stderr, "ready")
+		<-ctx.Done()
+		fmt.Fprintln(os.Stderr, "canceled")
+		select {}
+	})
+	t.Fatalf("run returned: %v", err)
 }
 
 func TestMCPCommandFlagsAndUsage(t *testing.T) {
@@ -633,7 +709,13 @@ func connectMCPHTTP(t *testing.T, endpoint string) *mcp.ClientSession {
 	deadline := time.Now().Add(5 * time.Second)
 	for {
 		client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
-		session, err := client.Connect(t.Context(), &mcp.StreamableClientTransport{Endpoint: endpoint}, nil)
+		transport := &mcp.StreamableClientTransport{
+			Endpoint: endpoint,
+			HTTPClient: &http.Client{
+				Transport: mcpTestRoundTripper{},
+			},
+		}
+		session, err := client.Connect(t.Context(), transport, nil)
 		if err == nil {
 			return session
 		}
@@ -642,6 +724,20 @@ func connectMCPHTTP(t *testing.T, endpoint string) *mcp.ClientSession {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+type mcpTestRoundTripper struct{}
+
+func (mcpTestRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Method == http.MethodDelete {
+		return &http.Response{
+			StatusCode: http.StatusNoContent,
+			Header:     make(http.Header),
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	}
+	return http.DefaultTransport.RoundTrip(req)
 }
 
 func captureMCPStdout(t *testing.T, fn func()) string {
