@@ -181,7 +181,11 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 
 	// Start MCP server if enabled
 	if c.Config.MCPAddr != "" {
-		c.MCP, err = NewMCP(ctx, c.Config.ConfigPath, c.Config.MCPAuthToken)
+		authToken := ""
+		if c.Config.MCPAuthToken != nil {
+			authToken = *c.Config.MCPAuthToken
+		}
+		c.MCP, err = NewMCP(ctx, c.Config.ConfigPath, authToken)
 		if err != nil {
 			return err
 		}
