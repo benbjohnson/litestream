@@ -181,7 +181,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_restore",
 		mcp.WithDescription("Restore a database from a Litestream replica."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
-		mcp.WithString("output", mcp.Description("Output path for the restored database. Optional.")),
+		mcp.WithString("output", mcp.Description("Output path for the restored database. Required for replica URLs; optional for configured databases, where it defaults to the database path.")),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
 		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
@@ -191,6 +191,11 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		path, err := req.RequireString("path")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
 		args := []string{"restore"}
 		outputPath := req.GetString("output", "")
 		if outputPath == "" {
@@ -199,9 +204,6 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if outputPath != "" {
 			args = append(args, "-o", outputPath)
 		}
-
-		// Get path first to determine if it's a replica URL
-		path := req.GetString("path", "")
 
 		// Only add -config for database paths, not replica URLs
 		// The CLI rejects -config when restoring from a replica URL
@@ -262,10 +264,12 @@ func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"ltx"}
+		path, err := req.RequireString("path")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
-		// Get path first to determine if it's a replica URL
-		path := req.GetString("path", "")
+		args := []string{"ltx"}
 
 		// Only add -config for database paths, not replica URLs
 		// The CLI rejects -config when using a replica URL
@@ -321,12 +325,17 @@ func ResetTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		path, err := req.RequireString("path")
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
 		args := []string{"reset"}
 		config := req.GetString("config", configPath)
 		if config != "" {
 			args = append(args, "-config", config)
 		}
-		if path := req.GetString("path", ""); path != "" {
+		if path != "" {
 			args = append(args, path)
 		}
 		cmd := exec.CommandContext(ctx, "litestream", args...)

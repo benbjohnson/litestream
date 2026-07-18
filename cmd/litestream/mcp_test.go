@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -130,14 +132,22 @@ func TestRestoreToolArguments(t *testing.T) {
 			}, "\x1f"),
 		},
 		{
-			name:       "default values",
+			name:       "configured database path defaults output",
 			configPath: "/default.yml",
 			arguments: map[string]any{
-				"path":              "/tmp/db",
-				"if_db_not_exists":  false,
-				"if_replica_exists": false,
+				"path": "/tmp/db",
 			},
 			invocation: "restore\x1f-config\x1f/default.yml\x1f/tmp/db",
+		},
+		{
+			name:       "replica URL requires output",
+			configPath: "/default.yml",
+			arguments: map[string]any{
+				"path":   "s3://bucket/db",
+				"output": "/tmp/restored.db",
+				"config": "/custom.yml",
+			},
+			invocation: "restore\x1f-o\x1f/tmp/restored.db\x1fs3://bucket/db",
 		},
 		{
 			name: "legacy output alias",
@@ -172,6 +182,7 @@ func TestRestoreToolSchema(t *testing.T) {
 	descriptions := map[string]string{
 		"if_db_not_exists":  "Skip restore if the database already exists. Optional.",
 		"if_replica_exists": "Skip restore if no backups are found. Optional.",
+		"output":            "Output path for the restored database. Required for replica URLs; optional for configured databases, where it defaults to the database path.",
 	}
 	for name, expected := range descriptions {
 		property, ok := tool.InputSchema.Properties[name].(map[string]any)
@@ -180,6 +191,43 @@ func TestRestoreToolSchema(t *testing.T) {
 		}
 		if got := property["description"]; got != expected {
 			t.Fatalf("unexpected %s description: %q", name, got)
+		}
+	}
+}
+
+func TestMCPToolsRequirePath(t *testing.T) {
+	tools := []struct {
+		name    string
+		handler server.ToolHandlerFunc
+	}{
+		{name: "restore", handler: handlerFromTool(RestoreTool(""))},
+		{name: "ltx", handler: handlerFromTool(LTXTool(""))},
+		{name: "reset", handler: handlerFromTool(ResetTool(""))},
+	}
+	tests := []struct {
+		name      string
+		arguments map[string]any
+		error     string
+	}{
+		{
+			name:      "missing",
+			arguments: map[string]any{},
+			error:     `required argument "path" not found`,
+		},
+		{
+			name:      "wrong type",
+			arguments: map[string]any{"path": true},
+			error:     `argument "path" is not a string`,
+		},
+	}
+
+	for _, tool := range tools {
+		for _, tt := range tests {
+			t.Run(tool.name+"/"+tt.name, func(t *testing.T) {
+				argsPath := useMCPTestCommand(t)
+				callMCPToolError(t, tool.handler, tt.arguments, tt.error)
+				assertNoMCPInvocations(t, argsPath)
+			})
 		}
 	}
 }
@@ -199,6 +247,30 @@ func callMCPTool(t *testing.T, handler server.ToolHandlerFunc, arguments map[str
 	}
 	if result.IsError {
 		t.Fatalf("unexpected tool error: %#v", result.Content)
+	}
+}
+
+func callMCPToolError(t *testing.T, handler server.ToolHandlerFunc, arguments map[string]any, expected string) {
+	t.Helper()
+
+	result, err := handler(context.Background(), mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Arguments: arguments},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatalf("expected tool error: %#v", result.Content)
+	}
+	if len(result.Content) != 1 {
+		t.Fatalf("unexpected tool error content: %#v", result.Content)
+	}
+	content, ok := result.Content[0].(mcp.TextContent)
+	if !ok {
+		t.Fatalf("unexpected tool error content: %#v", result.Content)
+	}
+	if content.Text != expected {
+		t.Fatalf("unexpected tool error: %q", content.Text)
 	}
 }
 
@@ -259,5 +331,13 @@ func assertMCPInvocations(t *testing.T, argsPath string, expected []string) {
 	actual := strings.Split(strings.TrimSpace(string(b)), "\n")
 	if got, want := strings.Join(actual, "\n"), strings.Join(expected, "\n"); got != want {
 		t.Fatalf("unexpected invocations:\n%s\n\nexpected:\n%s", got, want)
+	}
+}
+
+func assertNoMCPInvocations(t *testing.T, argsPath string) {
+	t.Helper()
+
+	if _, err := os.Stat(argsPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected no invocation, stat error: %v", err)
 	}
 }
