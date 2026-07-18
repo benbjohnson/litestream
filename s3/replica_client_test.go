@@ -132,7 +132,7 @@ func TestReplicaClient_findBucketRegionClosesTransport(t *testing.T) {
 
 	select {
 	case <-idle:
-	default:
+	case <-time.After(time.Second):
 		t.Fatal("expected region lookup connection to become idle")
 	}
 	select {
