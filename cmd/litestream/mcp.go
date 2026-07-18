@@ -314,6 +314,8 @@ type mcpCloser interface {
 	Close() error
 }
 
+var errMCPReplicaClientNotClosable = errors.New("replica client does not implement cleanup contract")
+
 func closeMCPResources(opErr error, resources mcpCloser) error {
 	return errors.Join(opErr, resources.Close())
 }
@@ -331,7 +333,7 @@ func closeMCPReplica(r *litestream.Replica) error {
 	}
 	closer, ok := r.Client.(litestream.ReplicaClientCloser)
 	if !ok {
-		return nil
+		return fmt.Errorf("close %s replica: %w", r.Client.Type(), errMCPReplicaClientNotClosable)
 	}
 	if err := closer.Close(); err != nil {
 		return fmt.Errorf("close %s replica: %w", r.Client.Type(), err)
