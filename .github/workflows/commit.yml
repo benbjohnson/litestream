@@ -176,7 +176,6 @@ jobs:
           GOOS=linux GOARCH=arm GOARM=6 go test -c -o /dev/null ./cmd/litestream
           GOOS=linux GOARCH=arm GOARM=7 go test -c -o /dev/null ./cmd/litestream
 
-
   ltx-behavioral-gate:
     name: LTX Behavioral Gate (short)
     runs-on: ubuntu-latest
