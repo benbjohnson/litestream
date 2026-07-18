@@ -41,6 +41,7 @@ const ReplicaClientType = "abs"
 const MetadataKeyTimestamp = "litestreamtimestamp"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Azure Blob Storage.
 type ReplicaClient struct {
@@ -200,6 +201,14 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	}
 
 	c.client = client
+	return nil
+}
+
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.client = nil
 	return nil
 }
 
