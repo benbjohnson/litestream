@@ -1399,3 +1399,6 @@ func TestVFSFile_Hydration_PersistentResumeOnReopen(t *testing.T) {
 		t.Fatalf("expected hydration file modtime unchanged on reopen resume")
 	}
 }
+
+func (c *mockReplicaClient) SetLogger(*slog.Logger)     {}
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
