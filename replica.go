@@ -642,8 +642,20 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 				if latestSnapshot.MinTXID > txid {
 					return fmt.Errorf("cannot resume follow mode: saved TXID %s is behind the earliest snapshot (min TXID %s); replica history has been pruned -- delete %s and %s-txid to re-restore", txid, latestSnapshot.MinTXID, opt.OutputPath, opt.OutputPath)
 				}
-				if txid > latestSnapshot.MaxTXID {
-					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of latest snapshot (max TXID %s); delete %s and %s-txid to re-restore", txid, latestSnapshot.MaxTXID, opt.OutputPath, opt.OutputPath)
+
+				// A follow file legitimately runs ahead of the latest snapshot, so bound the check by the newest TXID across all levels.
+				var maxTXID ltx.TXID
+				for level := 0; level <= SnapshotLevel; level++ {
+					info, infoErr := r.MaxLTXFileInfo(ctx, level)
+					if infoErr != nil {
+						return fmt.Errorf("cannot validate saved TXID for crash recovery: %w", infoErr)
+					}
+					if info.MaxTXID > maxTXID {
+						maxTXID = info.MaxTXID
+					}
+				}
+				if txid > maxTXID {
+					return fmt.Errorf("cannot resume follow mode: saved TXID %s is ahead of the replica's latest TXID %s; delete %s and %s-txid to re-restore", txid, maxTXID, opt.OutputPath, opt.OutputPath)
 				}
 			}
 
