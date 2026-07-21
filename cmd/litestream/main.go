@@ -1153,7 +1153,7 @@ type ReplicaSettings struct {
 	NKey          string         `yaml:"nkey"`
 	Username      string         `yaml:"username"`
 	Token         string         `yaml:"token"`
-	TLS           bool           `yaml:"tls"`
+	TLS           *bool          `yaml:"tls"`
 	RootCAs       []string       `yaml:"root-cas"`
 	ClientCert    string         `yaml:"client-cert"`
 	ClientKey     string         `yaml:"client-key"`
@@ -1284,7 +1284,7 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	if rs.Token == "" {
 		rs.Token = src.Token
 	}
-	if !rs.TLS {
+	if rs.TLS == nil {
 		rs.TLS = src.TLS
 	}
 	if len(rs.RootCAs) == 0 {
@@ -1902,6 +1902,9 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Token = c.Token
 
 	// Set TLS options
+	if c.TLS != nil {
+		client.TLS = *c.TLS
+	}
 	client.RootCAs = c.RootCAs
 	client.ClientCert = c.ClientCert
 	client.ClientKey = c.ClientKey
