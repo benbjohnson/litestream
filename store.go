@@ -169,20 +169,43 @@ func (s *Store) Open(ctx context.Context) error {
 		return err
 	}
 
-	g, ctx := errgroup.WithContext(ctx)
-	g.SetLimit(50)
+	initGroup, initCtx := errgroup.WithContext(ctx)
+	initGroup.SetLimit(50)
 	for _, db := range s.dbs {
 		db := db
-		g.Go(func() error {
+		initGroup.Go(func() error {
 			select {
-			case <-ctx.Done():
-				return ctx.Err()
+			case <-initCtx.Done():
+				return initCtx.Err()
 			default:
-				return db.Open()
 			}
+
+			if db.Replica != nil && db.Replica.Client != nil {
+				if err := db.Replica.Client.Init(initCtx); err != nil {
+					return fmt.Errorf("initialize replica client for %q: %w", db.Path(), err)
+				}
+			}
+			return nil
 		})
 	}
-	if err := g.Wait(); err != nil {
+	if err := initGroup.Wait(); err != nil {
+		return err
+	}
+
+	openGroup, openCtx := errgroup.WithContext(ctx)
+	openGroup.SetLimit(50)
+	for _, db := range s.dbs {
+		db := db
+		openGroup.Go(func() error {
+			select {
+			case <-openCtx.Done():
+				return openCtx.Err()
+			default:
+			}
+			return db.Open()
+		})
+	}
+	if err := openGroup.Wait(); err != nil {
 		return err
 	}
 

@@ -1,9 +1,13 @@
 package nats
 
 import (
+	"context"
+	"errors"
 	"testing"
 	"time"
 
+	natsgo "github.com/nats-io/nats.go"
+	"github.com/nats-io/nats.go/jetstream"
 	"github.com/superfly/ltx"
 )
 
@@ -11,6 +15,17 @@ func TestReplicaClient_Type(t *testing.T) {
 	client := NewReplicaClient()
 	if got, want := client.Type(), "nats"; got != want {
 		t.Fatalf("Type()=%s, want %s", got, want)
+	}
+}
+
+func TestReplicaClient_LTXFiles_InitError(t *testing.T) {
+	client := NewReplicaClient()
+	client.BucketName = "missing-bucket"
+	client.nc = &natsgo.Conn{}
+	client.js = &objectStoreErrorJetStream{err: jetstream.ErrBucketNotFound}
+
+	if _, err := client.LTXFiles(t.Context(), 0, 0, false); !errors.Is(err, jetstream.ErrBucketNotFound) {
+		t.Fatalf("LTXFiles() error = %v, want %v", err, jetstream.ErrBucketNotFound)
 	}
 }
 
@@ -193,6 +208,15 @@ type mockOtherError struct{}
 
 func (e *mockOtherError) Error() string {
 	return "some other error"
+}
+
+type objectStoreErrorJetStream struct {
+	jetstream.JetStream
+	err error
+}
+
+func (js *objectStoreErrorJetStream) ObjectStore(context.Context, string) (jetstream.ObjectStore, error) {
+	return nil, js.err
 }
 
 func TestReplicaClientDefaults(t *testing.T) {
