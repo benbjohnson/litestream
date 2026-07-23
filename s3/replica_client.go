@@ -652,7 +652,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	if c.ManifestEnabled && !useMetadata {
 		m, err := c.readManifest(ctx)
 		if err != nil {
-			slog.Debug("manifest: read failed, falling back to LIST", "error", err)
+			c.logger.Debug("manifest: read failed, falling back to LIST", "error", err)
 		} else if m != nil {
 			return newManifestIterator(m.EntriesForLevel(level, seek)), nil
 		}
