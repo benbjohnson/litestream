@@ -1659,11 +1659,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		client.SSEKMSKeyID = c.SSEKMSKeyID
 	}
 
-	// Mark as configured so stale manifest cleanup runs when disabled.
-	// This ensures cleanup even when the manifest key is removed from config entirely.
-	client.ManifestConfigured = true
-	if c.Manifest != nil && *c.Manifest {
-		client.ManifestWriteEnabled = true
+	if c.Manifest != nil {
+		client.ManifestConfigured = true
+		client.ManifestWriteEnabled = *c.Manifest
 	}
 
 	return client, nil

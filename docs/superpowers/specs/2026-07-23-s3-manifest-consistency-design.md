@@ -10,19 +10,21 @@ Before any manifest-aware S3 mutation, the client acquires distributed ownership
 
 The client holds `manifestMu` while it owns the distributed lease so its local cache cannot change concurrently. The persistent generation detects whether another client acquired ownership since this client last published. Consecutive uncontended mutations can reuse the validated cache; a generation gap, restart, failed mutation, or uncertain storage outcome clears the cache and requires a direct LIST rebuild.
 
-After acquiring ownership, the client atomically overwrites `manifest.json` with a syntactically valid manifest whose version is intentionally unsupported. Existing manifest-aware readers reject the unsupported version and use authoritative LIST operations. Readers predating manifest support ignore the object because it is not an LTX filename. This invalidation lifecycle applies when any manifest mode is active, including `ManifestEnabled` without manifest writing.
+After acquiring ownership, the client atomically overwrites `manifest.json` with a syntactically valid unsupported-version sentinel containing the ownership generation and a mutation token. The client retains the sentinel ETag. Existing manifest-aware readers reject the unsupported version and use authoritative LIST operations. Readers predating manifest support ignore the object because it is not an LTX filename. This invalidation lifecycle applies when any manifest mode is active, including `ManifestEnabled` without manifest writing.
 
 If invalidation fails, the operation returns before changing LTX objects. A writer without trusted cache state rebuilds directly from S3 LIST results for every LTX level using `newFileIterator`, which cannot recursively consult the manifest.
 
-After a successful LTX write or deletion, a manifest writer renews ownership, updates the cache, and publishes a valid manifest. If publication fails, the writer clears the cache and leaves LIST fallback active. If an LTX upload, deletion, `DeleteAll`, or storage response is uncertain after invalidation, the writer clears the cache. A later owner rebuilds from LIST before publishing another valid manifest.
+After a successful LTX write or deletion, a manifest writer renews ownership, updates the cache, and publishes a valid manifest with `If-Match` against the sentinel ETag. Precondition failure maps to lost ownership, clears the cache, and returns an error without replacing newer manifest state. A definite final PUT failure leaves the sentinel active. An ambiguous final PUT may have committed the fenced valid manifest, which is complete and safe for readers. Other final publication errors remain nonfatal after the LTX mutation succeeds.
+
+If an LTX upload, deletion, `DeleteAll`, or storage response is uncertain after invalidation, the writer clears the cache. A later owner rebuilds from LIST before publishing another valid manifest.
 
 `DeleteAll` skips the ownership object while deleting replica data, then releases ownership. This prevents the operation from removing the lock that serializes it.
 
 ## Disabling Manifests
 
-Clients created from configuration retain `ManifestConfigured` so they can remove a manifest when the setting is disabled or removed. Cleanup occurs before the LTX mutation. A failed cleanup returns an error without mutating LTX objects, leaves cleanup incomplete, and is retried on the next operation. Successful cleanup is remembered to avoid repeated DELETE calls.
+Configuration participates in manifest behavior only when the `manifest` key is present. `manifest: true` enables maintenance. `manifest: false` sets `ManifestConfigured` for one-time cleanup before the next LTX mutation. A failed cleanup returns an error without mutating LTX objects and is retried on the next operation. Successful cleanup is remembered to avoid repeated DELETE calls.
 
-Programmatically constructed clients with `ManifestConfigured == false` do not perform cleanup.
+An absent key leaves `ManifestConfigured` false, so the client does not acquire manifest ownership or perform cleanup. To disable an enabled manifest, configure explicit false, allow one mutation to complete cleanup, then remove the key. Programmatically constructed clients with `ManifestConfigured == false` follow the same no-cleanup behavior.
 
 ## Interface Compatibility
 
@@ -39,6 +41,8 @@ A stateful test S3 HTTP transport stores objects across client instances, counts
 - Bootstrapping a valid manifest from an existing populated replica and reusing validated cache state for uncontended mutations.
 - Deterministic two-client write/write and write/delete interleavings that require distributed serialization.
 - Ownership acquisition failure, renewal failure, lost ownership, expired-lease takeover, and `DeleteAll` lock preservation.
+- Mutation-specific sentinels, conditional final publication, ownership loss during a paused final PUT, and fail-after-apply final PUT outcomes.
+- Absent, explicit-false, and true manifest configuration and mutation behavior.
 - Reader LIST fallback while the unsupported-version sentinel exists.
 - Interruption after invalidation and after an LTX object upload but before valid manifest publication.
 - LTX upload failure, manifest GET failure, rebuild LIST failure, valid-manifest PUT failure, and partial batch deletion failure.

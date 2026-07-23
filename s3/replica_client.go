@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
@@ -788,7 +789,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	manifestReady := false
 	if manifestMutationEnabled {
-		manifestReady, err = c.prepareManifestMutation(ctx, true, mutation.Generation())
+		manifestReady, err = c.prepareManifestMutation(ctx, true, mutation)
 		if err != nil {
 			return nil, err
 		}
@@ -834,7 +835,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	if manifestReady {
 		c.manifest.AddFile(info)
-		c.publishManifest(ctx, mutation.Generation())
+		if err := c.publishManifest(ctx, mutation); err != nil {
+			return nil, err
+		}
 	}
 
 	return info, nil
@@ -1184,7 +1187,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 	manifestReady := false
 	if manifestMutationEnabled {
 		var err error
-		manifestReady, err = c.prepareManifestMutation(ctx, true, mutation.Generation())
+		manifestReady, err = c.prepareManifestMutation(ctx, true, mutation)
 		if err != nil {
 			return err
 		}
@@ -1257,7 +1260,9 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 	}
 	if manifestReady {
 		c.manifest.RemoveFiles(a)
-		c.publishManifest(ctx, mutation.Generation())
+		if err := c.publishManifest(ctx, mutation); err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -1290,7 +1295,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (retErr error) {
 				retErr = errors.Join(retErr, err)
 			}
 		}()
-		if _, err := c.prepareManifestMutation(ctx, false, mutation.Generation()); err != nil {
+		if _, err := c.prepareManifestMutation(ctx, false, mutation); err != nil {
 			return err
 		}
 	}
@@ -1399,11 +1404,11 @@ func (c *ReplicaClient) readManifest(ctx context.Context) (*Manifest, error) {
 	return &m, nil
 }
 
-func (c *ReplicaClient) writeManifest(ctx context.Context, m *Manifest) error {
+func (c *ReplicaClient) writeManifest(ctx context.Context, m *Manifest, ifMatch string) (string, error) {
 	key := c.manifestKey()
 	data, err := json.Marshal(m)
 	if err != nil {
-		return fmt.Errorf("s3: encode manifest: %w", err)
+		return "", fmt.Errorf("s3: encode manifest: %w", err)
 	}
 
 	input := &s3.PutObjectInput{
@@ -1411,6 +1416,9 @@ func (c *ReplicaClient) writeManifest(ctx context.Context, m *Manifest) error {
 		Key:         aws.String(key),
 		Body:        bytes.NewReader(data),
 		ContentType: aws.String("application/json"),
+	}
+	if ifMatch != "" {
+		input.IfMatch = aws.String(ifMatch)
 	}
 	if c.SSECustomerKey != "" {
 		input.SSECustomerAlgorithm = aws.String(c.SSECustomerAlgorithm)
@@ -1422,20 +1430,29 @@ func (c *ReplicaClient) writeManifest(ctx context.Context, m *Manifest) error {
 		input.SSEKMSKeyId = aws.String(c.SSEKMSKeyID)
 	}
 
-	_, err = c.s3.PutObject(ctx, input)
+	out, err := c.s3.PutObject(ctx, input)
 	if err != nil {
-		return fmt.Errorf("s3: put manifest %s: %w", key, err)
+		return "", fmt.Errorf("s3: put manifest %s: %w", key, err)
 	}
-	return nil
+	if out == nil {
+		return "", nil
+	}
+	return aws.ToString(out.ETag), nil
 }
 
-func (c *ReplicaClient) writeManifestInvalidation(ctx context.Context) error {
+func (c *ReplicaClient) writeManifestInvalidation(ctx context.Context, generation int64, token string) (string, error) {
 	manifest := NewManifest()
 	manifest.Version = manifestInvalidVersion
-	if err := c.writeManifest(ctx, manifest); err != nil {
-		return fmt.Errorf("s3: invalidate manifest: %w", err)
+	manifest.Generation = generation
+	manifest.Token = token
+	etag, err := c.writeManifest(ctx, manifest, "")
+	if err != nil {
+		return "", fmt.Errorf("s3: invalidate manifest: %w", err)
 	}
-	return nil
+	if etag == "" {
+		return "", fmt.Errorf("s3: invalidate manifest: etag required")
+	}
+	return etag, nil
 }
 
 func (c *ReplicaClient) rebuildManifest(ctx context.Context) (*Manifest, error) {
@@ -1456,11 +1473,13 @@ func (c *ReplicaClient) rebuildManifest(ctx context.Context) (*Manifest, error) 
 	return manifest, nil
 }
 
-func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild bool, generation int64) (bool, error) {
+func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild bool, mutation *manifestMutation) (bool, error) {
 	if c.ManifestEnabled && !c.ManifestWriteEnabled {
-		if err := c.writeManifestInvalidation(ctx); err != nil {
+		etag, err := c.writeManifestInvalidation(ctx, mutation.Generation(), mutation.Token())
+		if err != nil {
 			return false, err
 		}
+		mutation.SetSentinelETag(etag)
 		c.clearManifestCache()
 		return false, nil
 	}
@@ -1476,12 +1495,14 @@ func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild boo
 		return false, nil
 	}
 
-	if c.manifest != nil && c.manifestGeneration+1 != generation {
+	if c.manifest != nil && c.manifestGeneration+1 != mutation.Generation() {
 		c.clearManifestCache()
 	}
-	if err := c.writeManifestInvalidation(ctx); err != nil {
+	etag, err := c.writeManifestInvalidation(ctx, mutation.Generation(), mutation.Token())
+	if err != nil {
 		return false, err
 	}
+	mutation.SetSentinelETag(etag)
 	if !rebuild || c.manifest != nil {
 		return c.manifest != nil, nil
 	}
@@ -1508,14 +1529,23 @@ func (c *ReplicaClient) deleteManifest(ctx context.Context) error {
 	return nil
 }
 
-func (c *ReplicaClient) publishManifest(ctx context.Context, generation int64) bool {
-	if err := c.writeManifest(ctx, c.manifest); err != nil {
-		c.logger.Debug("manifest: failed to write", "error", err)
+func (c *ReplicaClient) publishManifest(ctx context.Context, mutation *manifestMutation) error {
+	sentinelETag := mutation.SentinelETag()
+	if sentinelETag == "" {
 		c.clearManifestCache()
-		return false
+		return fmt.Errorf("s3: publish manifest: sentinel etag required")
 	}
-	c.manifestGeneration = generation
-	return true
+	_, err := c.writeManifest(ctx, c.manifest, sentinelETag)
+	if err != nil {
+		c.clearManifestCache()
+		if isPreconditionFailed(err) {
+			return fmt.Errorf("s3: publish manifest: %w", litestream.ErrLeaseNotHeld)
+		}
+		c.logger.Debug("manifest: failed to write", "error", err)
+		return nil
+	}
+	c.manifestGeneration = mutation.Generation()
+	return nil
 }
 
 func (c *ReplicaClient) clearManifestCache() {
@@ -1526,11 +1556,13 @@ func (c *ReplicaClient) clearManifestCache() {
 type manifestMutation struct {
 	leaser *Leaser
 
-	mu     sync.Mutex
-	lease  *litestream.Lease
-	err    error
-	cancel context.CancelFunc
-	done   chan struct{}
+	mu           sync.Mutex
+	lease        *litestream.Lease
+	token        string
+	sentinelETag string
+	err          error
+	cancel       context.CancelFunc
+	done         chan struct{}
 }
 
 func (c *ReplicaClient) beginManifestMutation(ctx context.Context) (*manifestMutation, context.Context, error) {
@@ -1551,6 +1583,10 @@ func (c *ReplicaClient) beginManifestMutation(ctx context.Context) (*manifestMut
 	}
 	leaser.Owner = c.manifestOwner
 
+	token, err := newManifestMutationToken()
+	if err != nil {
+		return nil, ctx, err
+	}
 	lease, err := acquireManifestLease(ctx, leaser)
 	if err != nil {
 		return nil, ctx, fmt.Errorf("s3: acquire manifest ownership: %w", err)
@@ -1560,11 +1596,20 @@ func (c *ReplicaClient) beginManifestMutation(ctx context.Context) (*manifestMut
 	mutation := &manifestMutation{
 		leaser: leaser,
 		lease:  lease,
+		token:  token,
 		cancel: cancel,
 		done:   make(chan struct{}),
 	}
 	go mutation.renewLoop(mutationCtx)
 	return mutation, mutationCtx, nil
+}
+
+func newManifestMutationToken() (string, error) {
+	var data [16]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return "", fmt.Errorf("s3: generate manifest mutation token: %w", err)
+	}
+	return base64.RawURLEncoding.EncodeToString(data[:]), nil
 }
 
 func acquireManifestLease(ctx context.Context, leaser *Leaser) (*litestream.Lease, error) {
@@ -1625,6 +1670,24 @@ func (m *manifestMutation) Generation() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.lease.Generation
+}
+
+func (m *manifestMutation) Token() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.token
+}
+
+func (m *manifestMutation) SetSentinelETag(etag string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sentinelETag = etag
+}
+
+func (m *manifestMutation) SentinelETag() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.sentinelETag
 }
 
 func (m *manifestMutation) Key() string {
