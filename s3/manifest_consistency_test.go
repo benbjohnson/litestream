@@ -521,6 +521,127 @@ func mustManifestTestLTX(t *testing.T, minTXID, maxTXID ltx.TXID) []byte {
 	return buf.Bytes()
 }
 
+func assertManifestEntries(t *testing.T, manifest *Manifest, level int, want [][2]ltx.TXID) {
+	t.Helper()
+	assertFileRanges(t, manifest.EntriesForLevel(level, 0), want)
+}
+
+func assertFileRanges(t *testing.T, infos []*ltx.FileInfo, want [][2]ltx.TXID) {
+	t.Helper()
+	if len(infos) != len(want) {
+		t.Fatalf("file count = %d, want %d: %#v", len(infos), len(want), infos)
+	}
+	for i, info := range infos {
+		if got := [2]ltx.TXID{info.MinTXID, info.MaxTXID}; got != want[i] {
+			t.Fatalf("file %d range = %v, want %v", i, got, want[i])
+		}
+	}
+}
+
+func mustCollectLTXFiles(t *testing.T, client *ReplicaClient, level int) []*ltx.FileInfo {
+	t.Helper()
+	itr, err := client.LTXFiles(context.Background(), level, 0, false)
+	if err != nil {
+		t.Fatalf("list LTX files: %v", err)
+	}
+	defer func() {
+		if err := itr.Close(); err != nil {
+			t.Fatalf("close LTX iterator: %v", err)
+		}
+	}()
+
+	var infos []*ltx.FileInfo
+	for itr.Next() {
+		infos = append(infos, itr.Item())
+	}
+	if err := itr.Err(); err != nil {
+		t.Fatalf("iterate LTX files: %v", err)
+	}
+	return infos
+}
+
+func TestReplicaClient_ManifestBootstrapExistingReplica(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.putLTX(t, "db", 1, 1, 5)
+
+	client := store.newClient("db")
+	client.ManifestWriteEnabled = true
+	if _, err := client.WriteLTXFile(context.Background(), 0, 6, 6, bytes.NewReader(mustManifestTestLTX(t, 6, 6))); err != nil {
+		t.Fatal(err)
+	}
+
+	manifest := store.manifest(t, "db")
+	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{1, 1}, {6, 6}})
+	assertManifestEntries(t, manifest, 1, [][2]ltx.TXID{{1, 5}})
+}
+
+func TestReplicaClient_ManifestInvalidationForcesListFallback(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+
+	writer.manifestMu.Lock()
+	ready, err := writer.prepareManifestMutation(context.Background(), true)
+	writer.manifestMu.Unlock()
+	if err != nil || !ready {
+		t.Fatalf("prepare manifest mutation: ready=%v err=%v", ready, err)
+	}
+
+	listCount := store.operationCount("ListObjectsV2")
+	reader := store.newClient("db")
+	reader.ManifestEnabled = true
+	infos := mustCollectLTXFiles(t, reader, 0)
+	assertFileRanges(t, infos, [][2]ltx.TXID{{1, 1}})
+	if got := store.operationCount("ListObjectsV2"); got <= listCount {
+		t.Fatal("expected LIST fallback for invalid manifest")
+	}
+}
+
+func TestReplicaClient_ManifestInvalidationPrecedesUpload(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.failNext("PutObject", nil)
+	store.failNext("PutObject", errors.New("upload unavailable"))
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err == nil {
+		t.Fatal("expected upload error")
+	}
+	if store.hasLTX("db", 0, 1, 1) {
+		t.Fatal("LTX file exists after failed upload")
+	}
+	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+	}
+}
+
+func TestReplicaClient_ManifestPublishFailureLeavesInvalidManifest(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.failNext("PutObject", nil)
+	store.failNext("PutObject", nil)
+	store.failNext("PutObject", errors.New("manifest unavailable"))
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+	}
+
+	listCount := store.operationCount("ListObjectsV2")
+	reader := store.newClient("db")
+	reader.ManifestEnabled = true
+	infos := mustCollectLTXFiles(t, reader, 0)
+	assertFileRanges(t, infos, [][2]ltx.TXID{{1, 1}})
+	if got := store.operationCount("ListObjectsV2"); got <= listCount {
+		t.Fatal("expected LIST fallback for invalid manifest")
+	}
+}
+
 func TestManifestConsistencyStore(t *testing.T) {
 	store := newManifestTestStore(t)
 	store.putLTX(t, "seed", 0, 1, 1)

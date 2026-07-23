@@ -55,6 +55,8 @@ const ReplicaClientType = "s3"
 // MetadataKeyTimestamp is the metadata key for storing LTX file timestamps in S3.
 const MetadataKeyTimestamp = "litestream-timestamp"
 
+const manifestInvalidVersion = 0
+
 // MaxKeys is the number of keys S3 can operate on per batch.
 const MaxKeys = 1000
 
@@ -758,8 +760,25 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("s3: upload to %s: part size must be at least %d bytes", key, manager.MinUploadPartSize)
 	}
 
+	manifestConfigured := c.ManifestWriteEnabled || c.ManifestConfigured
+	if manifestConfigured {
+		c.manifestMu.Lock()
+		defer c.manifestMu.Unlock()
+	}
+
+	manifestReady := false
+	if manifestConfigured {
+		var err error
+		if manifestReady, err = c.prepareManifestMutation(ctx, true); err != nil {
+			return nil, err
+		}
+	}
+
 	size, timestamp, etag, err := c.uploadLTX(ctx, key, r, partSize)
 	if err != nil {
+		if manifestConfigured {
+			c.manifest = nil
+		}
 		return nil, err
 	}
 
@@ -768,6 +787,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	// ETag indicates successful upload
 	if etag == nil {
+		if manifestConfigured {
+			c.manifest = nil
+		}
 		return nil, fmt.Errorf("s3: upload failed: no ETag returned")
 	}
 
@@ -779,7 +801,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		CreatedAt: timestamp,
 	}
 
-	c.updateManifestAfterWrite(ctx, info)
+	if manifestReady {
+		c.manifest.AddFile(info)
+		c.publishManifest(ctx)
+	}
 
 	return info, nil
 }
@@ -1426,6 +1451,74 @@ func (c *ReplicaClient) writeManifest(ctx context.Context, m *Manifest) error {
 	return nil
 }
 
+func (c *ReplicaClient) writeManifestInvalidation(ctx context.Context) error {
+	manifest := NewManifest()
+	manifest.Version = manifestInvalidVersion
+	if err := c.writeManifest(ctx, manifest); err != nil {
+		return fmt.Errorf("s3: invalidate manifest: %w", err)
+	}
+	return nil
+}
+
+func (c *ReplicaClient) rebuildManifest(ctx context.Context) (*Manifest, error) {
+	manifest := NewManifest()
+	for level := 0; level <= litestream.SnapshotLevel; level++ {
+		itr := newFileIterator(ctx, c, level, 0, false)
+		for itr.Next() {
+			manifest.AddFile(itr.Item())
+		}
+		if err := itr.Err(); err != nil {
+			_ = itr.Close()
+			return nil, fmt.Errorf("s3: rebuild manifest level %d: %w", level, err)
+		}
+		if err := itr.Close(); err != nil {
+			return nil, fmt.Errorf("s3: close manifest rebuild iterator: %w", err)
+		}
+	}
+	return manifest, nil
+}
+
+func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild bool) (bool, error) {
+	if !c.ManifestWriteEnabled {
+		if !c.ManifestConfigured || c.manifestCleanupAttempted {
+			return false, nil
+		}
+		if err := c.deleteManifest(ctx); err != nil {
+			return false, err
+		}
+		c.manifestCleanupAttempted = true
+		return false, nil
+	}
+
+	if err := c.writeManifestInvalidation(ctx); err != nil {
+		return false, err
+	}
+	if !rebuild || c.manifest != nil {
+		return c.manifest != nil, nil
+	}
+
+	manifest, err := c.rebuildManifest(ctx)
+	if err != nil {
+		c.logger.Debug("manifest rebuild failed; leaving LIST fallback enabled", "error", err)
+		c.manifest = nil
+		return false, nil
+	}
+	c.manifest = manifest
+	return true, nil
+}
+
+func (c *ReplicaClient) deleteManifest(ctx context.Context) error {
+	key := c.manifestKey()
+	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.Bucket),
+		Key:    aws.String(key),
+	})
+	if err != nil && !isNotExists(err) {
+		return fmt.Errorf("s3: delete manifest %s: %w", key, err)
+	}
+	return nil
+}
+
 func (c *ReplicaClient) loadManifest(ctx context.Context) error {
 	if c.manifest != nil {
 		return nil
@@ -1440,25 +1533,6 @@ func (c *ReplicaClient) loadManifest(ctx context.Context) error {
 	}
 	c.manifest = m
 	return nil
-}
-
-func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.FileInfo) {
-	if !c.ManifestWriteEnabled {
-		c.cleanupStaleManifest(ctx)
-		return
-	}
-
-	c.manifestMu.Lock()
-	defer c.manifestMu.Unlock()
-
-	if err := c.loadManifest(ctx); err != nil {
-		slog.Debug("manifest: failed to load, skipping update", "error", err)
-		return
-	}
-
-	c.manifest.AddFile(info)
-
-	c.writeManifestOrInvalidate(ctx)
 }
 
 func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*ltx.FileInfo) {
@@ -1477,23 +1551,13 @@ func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*
 
 	c.manifest.RemoveFiles(infos)
 
-	c.writeManifestOrInvalidate(ctx)
+	c.publishManifest(ctx)
 }
 
-// writeManifestOrInvalidate writes the in-memory manifest to S3. On failure,
-// it clears the cache and deletes the S3 manifest so readers fall back to LIST.
-// Must be called with manifestMu held.
-func (c *ReplicaClient) writeManifestOrInvalidate(ctx context.Context) {
+func (c *ReplicaClient) publishManifest(ctx context.Context) {
 	if err := c.writeManifest(ctx, c.manifest); err != nil {
-		slog.Debug("manifest: failed to write", "error", err)
+		c.logger.Debug("manifest: failed to write", "error", err)
 		c.manifest = nil
-		key := c.manifestKey()
-		if _, delErr := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(c.Bucket),
-			Key:    aws.String(key),
-		}); delErr != nil && !isNotExists(delErr) {
-			slog.Debug("manifest: failed to delete after write failure", "error", delErr)
-		}
 	}
 }
 
@@ -1517,12 +1581,7 @@ func (c *ReplicaClient) cleanupStaleManifest(ctx context.Context) {
 	}
 	c.manifestCleanupAttempted = true
 
-	key := c.manifestKey()
-	_, err := c.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket: aws.String(c.Bucket),
-		Key:    aws.String(key),
-	})
-	if err != nil && !isNotExists(err) {
+	if err := c.deleteManifest(ctx); err != nil {
 		slog.Debug("manifest: failed to delete stale manifest", "error", err)
 	}
 }
