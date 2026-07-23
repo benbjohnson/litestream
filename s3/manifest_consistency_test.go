@@ -28,6 +28,8 @@ import (
 	awss3 "github.com/aws/aws-sdk-go-v2/service/s3"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 )
 
 const manifestTestBucket = "test-bucket"
@@ -35,21 +37,44 @@ const manifestTestBucket = "test-bucket"
 var manifestTestLastModified = time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 
 type manifestTestStore struct {
-	t              *testing.T
-	mu             sync.Mutex
-	objects        map[string][]byte
-	failures       map[string][]error
-	deleteFailures [][]manifestTestDeleteError
-	operations     map[string]int
+	t                 *testing.T
+	mu                sync.Mutex
+	objects           map[string][]byte
+	failures          map[string][]error
+	afterFailures     map[string][]error
+	keyedFailures     map[string][]error
+	keyedAfterFailure map[string][]error
+	deleteFailures    [][]manifestTestDeleteError
+	operations        map[string]int
+	keyOperations     map[string]int
+	pauses            []*manifestTestPause
+	events            chan manifestTestEvent
+}
+
+type manifestTestPause struct {
+	operation string
+	key       string
+	entered   chan struct{}
+	resume    chan struct{}
+}
+
+type manifestTestEvent struct {
+	operation string
+	key       string
 }
 
 func newManifestTestStore(t *testing.T) *manifestTestStore {
 	t.Helper()
 	return &manifestTestStore{
-		t:          t,
-		objects:    make(map[string][]byte),
-		failures:   make(map[string][]error),
-		operations: make(map[string]int),
+		t:                 t,
+		objects:           make(map[string][]byte),
+		failures:          make(map[string][]error),
+		afterFailures:     make(map[string][]error),
+		keyedFailures:     make(map[string][]error),
+		keyedAfterFailure: make(map[string][]error),
+		operations:        make(map[string]int),
+		keyOperations:     make(map[string]int),
+		events:            make(chan manifestTestEvent, 100),
 	}
 }
 
@@ -99,6 +124,26 @@ func (s *manifestTestStore) failNext(operation string, err error) {
 	s.failures[operation] = append(s.failures[operation], err)
 }
 
+func (s *manifestTestStore) failNextAfterApply(operation string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.afterFailures[operation] = append(s.afterFailures[operation], err)
+}
+
+func (s *manifestTestStore) failNextForKey(operation, key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	failureKey := operation + "\x00" + key
+	s.keyedFailures[failureKey] = append(s.keyedFailures[failureKey], err)
+}
+
+func (s *manifestTestStore) failNextAfterApplyForKey(operation, key string, err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	failureKey := operation + "\x00" + key
+	s.keyedAfterFailure[failureKey] = append(s.keyedAfterFailure[failureKey], err)
+}
+
 func (s *manifestTestStore) failNextDeleteObjects(failures ...manifestTestDeleteError) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -109,6 +154,35 @@ func (s *manifestTestStore) operationCount(operation string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.operations[operation]
+}
+
+func (s *manifestTestStore) operationCountForKey(operation, key string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.keyOperations[operation+"\x00"+key]
+}
+
+func (s *manifestTestStore) pauseNext(operation, key string) (<-chan struct{}, chan<- struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pause := &manifestTestPause{
+		operation: operation,
+		key:       key,
+		entered:   make(chan struct{}),
+		resume:    make(chan struct{}),
+	}
+	s.pauses = append(s.pauses, pause)
+	return pause.entered, pause.resume
+}
+
+func (s *manifestTestStore) drainEvents() {
+	for {
+		select {
+		case <-s.events:
+		default:
+			return
+		}
+	}
 }
 
 func (s *manifestTestStore) putObject(key string, data []byte) {
@@ -170,33 +244,80 @@ func (s *manifestTestStore) do(r *http.Request) (*http.Response, error) {
 	if operation == "" {
 		return nil, fmt.Errorf("unsupported S3 request: %s %s", r.Method, r.URL.String())
 	}
+	key, _ := manifestTestObjectKey(r.URL)
 
 	s.mu.Lock()
 	s.operations[operation]++
+	failureKey := operation + "\x00" + key
+	s.keyOperations[failureKey]++
 	var failure error
-	if failures := s.failures[operation]; len(failures) != 0 {
+	if failures := s.keyedFailures[failureKey]; len(failures) != 0 {
+		failure = failures[0]
+		s.keyedFailures[failureKey] = failures[1:]
+	} else if failures := s.failures[operation]; len(failures) != 0 {
 		failure = failures[0]
 		s.failures[operation] = failures[1:]
 	}
+	var afterFailure error
+	if failures := s.keyedAfterFailure[failureKey]; len(failures) != 0 {
+		afterFailure = failures[0]
+		s.keyedAfterFailure[failureKey] = failures[1:]
+	} else if failures := s.afterFailures[operation]; len(failures) != 0 {
+		afterFailure = failures[0]
+		s.afterFailures[operation] = failures[1:]
+	}
+	var pause *manifestTestPause
+	for i, candidate := range s.pauses {
+		if candidate.operation == operation && candidate.key == key {
+			pause = candidate
+			s.pauses = append(s.pauses[:i], s.pauses[i+1:]...)
+			break
+		}
+	}
 	s.mu.Unlock()
+
+	select {
+	case s.events <- manifestTestEvent{operation: operation, key: key}:
+	default:
+	}
 	if failure != nil {
 		return nil, failure
 	}
+	if pause != nil {
+		close(pause.entered)
+		select {
+		case <-pause.resume:
+		case <-r.Context().Done():
+			return nil, r.Context().Err()
+		}
+	}
 
+	var response *http.Response
+	var err error
 	switch operation {
 	case "GetObject":
-		return s.getObjectResponse(r)
+		response, err = s.getObjectResponse(r)
 	case "PutObject":
-		return s.putObjectResponse(r)
+		response, err = s.putObjectResponse(r)
 	case "DeleteObject":
-		return s.deleteObjectResponse(r)
+		response, err = s.deleteObjectResponse(r)
 	case "DeleteObjects":
-		return s.deleteObjectsResponse(r)
+		response, err = s.deleteObjectsResponse(r)
 	case "ListObjectsV2":
-		return s.listObjectsV2Response(r)
+		response, err = s.listObjectsV2Response(r)
 	default:
 		return nil, fmt.Errorf("unsupported S3 operation: %s", operation)
 	}
+	if err != nil {
+		return nil, err
+	}
+	if afterFailure != nil {
+		if response != nil && response.Body != nil {
+			_ = response.Body.Close()
+		}
+		return nil, afterFailure
+	}
+	return response, nil
 }
 
 func manifestTestOperation(r *http.Request) string {
@@ -270,7 +391,18 @@ func (s *manifestTestStore) putObjectResponse(r *http.Request) (*http.Response, 
 		return nil, fmt.Errorf("close PutObject body: %w", err)
 	}
 
-	s.putObject(key, data)
+	s.mu.Lock()
+	current, exists := s.objects[key]
+	if r.Header.Get("If-None-Match") == "*" && exists {
+		s.mu.Unlock()
+		return manifestTestErrorResponse(http.StatusPreconditionFailed, "PreconditionFailed", "object already exists", key), nil
+	}
+	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && (!exists || manifestTestETag(current) != ifMatch) {
+		s.mu.Unlock()
+		return manifestTestErrorResponse(http.StatusPreconditionFailed, "PreconditionFailed", "etag does not match", key), nil
+	}
+	s.objects[key] = bytes.Clone(data)
+	s.mu.Unlock()
 	return manifestTestResponse(http.StatusOK, http.Header{"ETag": []string{manifestTestETag(data)}}, nil), nil
 }
 
@@ -280,6 +412,11 @@ func (s *manifestTestStore) deleteObjectResponse(r *http.Request) (*http.Respons
 		return nil, err
 	}
 	s.mu.Lock()
+	current, exists := s.objects[key]
+	if ifMatch := r.Header.Get("If-Match"); ifMatch != "" && (!exists || manifestTestETag(current) != ifMatch) {
+		s.mu.Unlock()
+		return manifestTestErrorResponse(http.StatusPreconditionFailed, "PreconditionFailed", "etag does not match", key), nil
+	}
 	delete(s.objects, key)
 	s.mu.Unlock()
 	return manifestTestResponse(http.StatusNoContent, nil, nil), nil
@@ -627,6 +764,28 @@ func TestReplicaClient_ManifestBootstrapExistingReplica(t *testing.T) {
 	assertManifestEntries(t, manifest, 1, [][2]ltx.TXID{{1, 5}})
 }
 
+func TestReplicaClient_ManifestWriterReusesCacheWhileOwnershipIsUncontended(t *testing.T) {
+	store := newManifestTestStore(t)
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	listCount := store.operationCount("ListObjectsV2")
+	if listCount == 0 {
+		t.Fatal("first mutation did not rebuild from LIST")
+	}
+
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.operationCount("ListObjectsV2"); got != listCount {
+		t.Fatalf("LIST count = %d, want %d after cache reuse", got, listCount)
+	}
+	assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+}
+
 func TestReplicaClient_ManifestInvalidationForcesListFallback(t *testing.T) {
 	store := newManifestTestStore(t)
 	store.putLTX(t, "db", 0, 1, 1)
@@ -634,7 +793,7 @@ func TestReplicaClient_ManifestInvalidationForcesListFallback(t *testing.T) {
 	writer.ManifestWriteEnabled = true
 
 	writer.manifestMu.Lock()
-	ready, err := writer.prepareManifestMutation(context.Background(), true)
+	ready, err := writer.prepareManifestMutation(context.Background(), true, 1)
 	writer.manifestMu.Unlock()
 	if err != nil || !ready {
 		t.Fatalf("prepare manifest mutation: ready=%v err=%v", ready, err)
@@ -661,8 +820,7 @@ func TestReplicaClient_ManifestMutationFailures(t *testing.T) {
 func testManifestUploadFailure(t *testing.T) {
 	store := newManifestTestStore(t)
 	store.putLTX(t, "db", 0, 1, 1)
-	store.failNext("PutObject", nil)
-	store.failNext("PutObject", errors.New("upload unavailable"))
+	store.failNextForKey("PutObject", "db/0000/0000000000000002-0000000000000002.ltx", errors.New("upload unavailable"))
 
 	writer := store.newClient("db")
 	writer.ManifestWriteEnabled = true
@@ -681,9 +839,8 @@ func testManifestUploadFailure(t *testing.T) {
 func testManifestPublishFailure(t *testing.T) {
 	store := newManifestTestStore(t)
 	store.putLTX(t, "db", 0, 1, 1)
-	store.failNext("PutObject", nil)
-	store.failNext("PutObject", nil)
-	store.failNext("PutObject", errors.New("manifest unavailable"))
+	store.failNextForKey("PutObject", "db/manifest.json", nil)
+	store.failNextForKey("PutObject", "db/manifest.json", errors.New("manifest unavailable"))
 
 	writer := store.newClient("db")
 	writer.ManifestWriteEnabled = true
@@ -732,9 +889,8 @@ func testManifestPartialDeleteFailure(t *testing.T) {
 
 func testManifestRestartRebuild(t *testing.T) {
 	store := newManifestTestStore(t)
-	store.failNext("PutObject", nil)
-	store.failNext("PutObject", nil)
-	store.failNext("PutObject", errors.New("manifest unavailable"))
+	store.failNextForKey("PutObject", "db/manifest.json", nil)
+	store.failNextForKey("PutObject", "db/manifest.json", errors.New("manifest unavailable"))
 
 	writer := store.newClient("db")
 	writer.ManifestWriteEnabled = true
@@ -832,6 +988,443 @@ func TestReplicaClient_ManifestDeleteLTXFilesPublishesSurvivors(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_ManifestEnabledWriteLTXFile(t *testing.T) {
+	t.Run("SuccessLeavesInvalidManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		if _, err := client.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+			t.Fatal(err)
+		}
+		if !store.hasLTX("db", 0, 2, 2) {
+			t.Fatal("written LTX file does not exist")
+		}
+		if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+			t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+		}
+		if client.manifest != nil {
+			t.Fatal("manifest cache retained after write")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+	})
+
+	t.Run("UploadFailureLeavesInvalidManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNextForKey("PutObject", "db/0000/0000000000000002-0000000000000002.ltx", errors.New("upload unavailable"))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		if _, err := client.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err == nil {
+			t.Fatal("expected upload error")
+		}
+		if store.hasLTX("db", 0, 2, 2) {
+			t.Fatal("failed upload created LTX file")
+		}
+		if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+			t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+	})
+
+	t.Run("InvalidationFailureBlocksMutation", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNextForKey("PutObject", "db/manifest.json", errors.New("invalidation unavailable"))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		if _, err := client.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err == nil {
+			t.Fatal("expected invalidation error")
+		}
+		if store.hasLTX("db", 0, 2, 2) {
+			t.Fatal("LTX mutation occurred before manifest invalidation")
+		}
+		manifest := store.manifest(t, "db")
+		if got := manifest.Version; got != ManifestVersion {
+			t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
+		}
+		assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{1, 1}})
+	})
+}
+
+func TestReplicaClient_ManifestConcurrentWritersPublishCompleteState(t *testing.T) {
+	store := newManifestTestStore(t)
+	writerA := store.newClient("db")
+	writerA.ManifestWriteEnabled = true
+	writerB := store.newClient("db")
+	writerB.ManifestWriteEnabled = true
+
+	keyA := "db/0000/0000000000000001-0000000000000001.ltx"
+	entered, resume := store.pauseNext("PutObject", keyA)
+	errA := make(chan error, 1)
+	go func() {
+		_, err := writerA.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1)))
+		errA <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for first writer upload")
+	}
+
+	store.drainEvents()
+	errB := make(chan error, 1)
+	go func() {
+		_, err := writerB.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2)))
+		errB <- err
+	}()
+
+	var earlyErrB error
+	writerBCompleted := false
+	wait := time.NewTimer(5 * time.Second)
+	defer wait.Stop()
+	for !writerBCompleted {
+		select {
+		case earlyErrB = <-errB:
+			writerBCompleted = true
+		case event := <-store.events:
+			if event.operation == "GetObject" && event.key == "db/.manifest/lock.json" {
+				writerBCompleted = true
+			}
+		case <-wait.C:
+			t.Fatal("timed out waiting for second writer contention")
+		}
+	}
+	close(resume)
+
+	if err := <-errA; err != nil {
+		t.Fatalf("first writer: %v", err)
+	}
+	if writerBCompleted && earlyErrB != nil {
+		t.Fatalf("second writer: %v", earlyErrB)
+	}
+	if earlyErrB == nil && !store.hasLTX("db", 0, 2, 2) {
+		if err := <-errB; err != nil {
+			t.Fatalf("second writer: %v", err)
+		}
+	}
+
+	manifest := store.manifest(t, "db")
+	if got := manifest.Version; got != ManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
+	}
+	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+}
+
+func TestReplicaClient_ManifestConcurrentWriteAndDeletePublishCompleteState(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	deleter := store.newClient("db")
+	deleter.ManifestWriteEnabled = true
+
+	writeKey := "db/0000/0000000000000002-0000000000000002.ltx"
+	entered, resume := store.pauseNext("PutObject", writeKey)
+	writeErr := make(chan error, 1)
+	go func() {
+		_, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2)))
+		writeErr <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for writer upload")
+	}
+
+	store.drainEvents()
+	deleteErr := make(chan error, 1)
+	go func() {
+		deleteErr <- deleter.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}})
+	}()
+
+	var earlyDeleteErr error
+	deleterCompleted := false
+	wait := time.NewTimer(5 * time.Second)
+	defer wait.Stop()
+	for !deleterCompleted {
+		select {
+		case earlyDeleteErr = <-deleteErr:
+			deleterCompleted = true
+		case event := <-store.events:
+			if event.operation == "GetObject" && event.key == "db/.manifest/lock.json" {
+				deleterCompleted = true
+			}
+		case <-wait.C:
+			t.Fatal("timed out waiting for deleter contention")
+		}
+	}
+	close(resume)
+
+	if err := <-writeErr; err != nil {
+		t.Fatalf("writer: %v", err)
+	}
+	if deleterCompleted && earlyDeleteErr != nil {
+		t.Fatalf("deleter: %v", earlyDeleteErr)
+	}
+	if store.hasLTX("db", 0, 1, 1) {
+		if err := <-deleteErr; err != nil {
+			t.Fatalf("deleter: %v", err)
+		}
+	}
+
+	manifest := store.manifest(t, "db")
+	if got := manifest.Version; got != ManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
+	}
+	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{2, 2}})
+}
+
+func TestReplicaClient_ManifestOwnershipAcquisitionFailureBlocksMutation(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+	store.failNext("GetObject", errors.New("ownership unavailable"))
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err == nil {
+		t.Fatal("expected ownership acquisition error")
+	}
+	if store.hasLTX("db", 0, 2, 2) {
+		t.Fatal("LTX mutation occurred without ownership")
+	}
+	manifest := store.manifest(t, "db")
+	if got := manifest.Version; got != ManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
+	}
+	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{1, 1}})
+}
+
+func TestReplicaClient_ManifestOwnershipRenewalFailureReturnsError(t *testing.T) {
+	store := newManifestTestStore(t)
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	writer.manifestLeaseTTL = 30 * time.Millisecond
+
+	key := "db/0000/0000000000000001-0000000000000001.ltx"
+	entered, _ := store.pauseNext("PutObject", key)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1)))
+		errCh <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LTX upload")
+	}
+
+	store.failNextForKey("PutObject", "db/.manifest/lock.json", errors.New("renewal unavailable"))
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("expected ownership renewal error")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for renewal failure")
+	}
+	if store.hasLTX("db", 0, 1, 1) {
+		t.Fatal("canceled upload persisted LTX object")
+	}
+	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+	}
+	assertManifestListFallback(t, store, "db", 0, nil)
+}
+
+func TestReplicaClient_ManifestOwnershipLossReturnsError(t *testing.T) {
+	store := newManifestTestStore(t)
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+
+	key := "db/0000/0000000000000001-0000000000000001.ltx"
+	entered, resume := store.pauseNext("PutObject", key)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1)))
+		errCh <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LTX upload")
+	}
+
+	lock := map[string]any{
+		"generation": 2,
+		"expires_at": time.Now().Add(time.Minute),
+		"owner":      "other-writer",
+	}
+	data, err := json.Marshal(lock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.putObject("db/.manifest/lock.json", data)
+	close(resume)
+	if err := <-errCh; !errors.Is(err, litestream.ErrLeaseNotHeld) {
+		t.Fatalf("error = %v, want ErrLeaseNotHeld", err)
+	}
+	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+	}
+	assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+}
+
+func TestReplicaClient_ManifestOwnershipRecoversExpiredLease(t *testing.T) {
+	store := newManifestTestStore(t)
+	expired := litestream.Lease{
+		Generation: 1,
+		ExpiresAt:  time.Now().Add(-time.Minute),
+		Owner:      "crashed-writer",
+	}
+	data, err := json.Marshal(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.putObject("db/.manifest/lock.json", data)
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+
+	var lease litestream.Lease
+	if err := json.Unmarshal(store.object(t, "db/.manifest/lock.json"), &lease); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := lease.Generation, int64(2); got != want {
+		t.Fatalf("lease generation = %d, want %d", got, want)
+	}
+	if !lease.IsExpired() {
+		t.Fatalf("released lease expires at %s", lease.ExpiresAt)
+	}
+	assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}})
+}
+
+func TestReplicaClient_ManifestDeleteAllPreservesOwnershipObject(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	expired := litestream.Lease{
+		Generation: 1,
+		ExpiresAt:  time.Now().Add(-time.Minute),
+		Owner:      "previous-writer",
+	}
+	data, err := json.Marshal(expired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.putObject("db/.manifest/lock.json", data)
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if err := writer.DeleteAll(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if store.hasLTX("db", 0, 1, 1) || store.hasObject("db/manifest.json") {
+		t.Fatal("DeleteAll left replica data")
+	}
+	if !store.hasObject("db/.manifest/lock.json") {
+		t.Fatal("DeleteAll removed its ownership object")
+	}
+	var lease litestream.Lease
+	if err := json.Unmarshal(store.object(t, "db/.manifest/lock.json"), &lease); err != nil {
+		t.Fatal(err)
+	}
+	if !lease.IsExpired() {
+		t.Fatalf("released lease expires at %s", lease.ExpiresAt)
+	}
+}
+
+func TestReplicaClient_ManifestAmbiguousPostCommitOutcomes(t *testing.T) {
+	t.Run("PutObject", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		key := "db/0000/0000000000000002-0000000000000002.ltx"
+		store.failNextAfterApplyForKey("PutObject", key, errors.New("response unavailable after put"))
+
+		writer := store.newClient("db")
+		writer.ManifestEnabled = true
+		if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err == nil {
+			t.Fatal("expected ambiguous upload error")
+		}
+		if !store.hasLTX("db", 0, 2, 2) {
+			t.Fatal("fail-after-apply PUT did not persist LTX object")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+
+		freshWriter := store.newClient("db")
+		freshWriter.ManifestWriteEnabled = true
+		if _, err := freshWriter.WriteLTXFile(context.Background(), 0, 3, 3, bytes.NewReader(mustManifestTestLTX(t, 3, 3))); err != nil {
+			t.Fatal(err)
+		}
+		assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}, {2, 2}, {3, 3}})
+	})
+
+	t.Run("DeleteObject", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNextAfterApplyForKey("DeleteObject", "db/manifest.json", errors.New("response unavailable after delete"))
+
+		writer := store.newClient("db")
+		writer.ManifestConfigured = true
+		if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err == nil {
+			t.Fatal("expected ambiguous manifest cleanup error")
+		}
+		if store.hasObject("db/manifest.json") {
+			t.Fatal("fail-after-apply DELETE left manifest object")
+		}
+		if store.hasLTX("db", 0, 2, 2) {
+			t.Fatal("LTX mutation occurred after ambiguous cleanup")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+
+		freshWriter := store.newClient("db")
+		freshWriter.ManifestWriteEnabled = true
+		if _, err := freshWriter.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+			t.Fatal(err)
+		}
+		assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+	})
+
+	t.Run("DeleteObjects", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putLTX(t, "db", 0, 2, 2)
+		manifest := manifestWithFile(0, 1, 1)
+		manifest.AddFile(manifestWithFile(0, 2, 2).EntriesForLevel(0, 0)[0])
+		store.putManifest(t, "db", manifest)
+		store.failNextAfterApply("DeleteObjects", errors.New("response unavailable after batch delete"))
+
+		writer := store.newClient("db")
+		writer.ManifestWriteEnabled = true
+		if err := writer.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); err == nil {
+			t.Fatal("expected ambiguous batch delete error")
+		}
+		if store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("fail-after-apply DeleteObjects left deleted LTX object")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{2, 2}})
+
+		freshWriter := store.newClient("db")
+		freshWriter.ManifestWriteEnabled = true
+		if _, err := freshWriter.WriteLTXFile(context.Background(), 0, 3, 3, bytes.NewReader(mustManifestTestLTX(t, 3, 3))); err != nil {
+			t.Fatal(err)
+		}
+		assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{2, 2}, {3, 3}})
+	})
+}
+
 func TestReplicaClient_ManifestEnabledDeleteLTXFiles(t *testing.T) {
 	t.Run("SuccessLeavesInvalidManifest", func(t *testing.T) {
 		store := newManifestTestStore(t)
@@ -888,7 +1481,7 @@ func TestReplicaClient_ManifestEnabledDeleteLTXFiles(t *testing.T) {
 		store := newManifestTestStore(t)
 		store.putLTX(t, "db", 0, 1, 1)
 		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
-		store.failNext("PutObject", errors.New("invalidation unavailable"))
+		store.failNextForKey("PutObject", "db/manifest.json", errors.New("invalidation unavailable"))
 
 		client := store.newClient("db")
 		client.ManifestEnabled = true
@@ -923,7 +1516,7 @@ func TestReplicaClient_ManifestEnabledDeleteAll(t *testing.T) {
 		if client.manifest != nil {
 			t.Fatal("manifest cache retained after DeleteAll")
 		}
-		if got := store.operationCount("PutObject"); got != 1 {
+		if got := store.operationCountForKey("PutObject", "db/manifest.json"); got != 1 {
 			t.Fatalf("manifest invalidations=%d, want 1", got)
 		}
 		assertManifestListFallback(t, store, "db", 0, nil)
@@ -958,7 +1551,7 @@ func TestReplicaClient_ManifestEnabledDeleteAll(t *testing.T) {
 		store := newManifestTestStore(t)
 		store.putLTX(t, "db", 0, 1, 1)
 		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
-		store.failNext("PutObject", errors.New("invalidation unavailable"))
+		store.failNextForKey("PutObject", "db/manifest.json", errors.New("invalidation unavailable"))
 
 		client := store.newClient("db")
 		client.ManifestEnabled = true
@@ -975,6 +1568,28 @@ func TestReplicaClient_ManifestEnabledDeleteAll(t *testing.T) {
 			t.Fatalf("delete operations=%d, want 0", got)
 		}
 	})
+}
+
+func TestReplicaClient_ManifestDisabledCleanupStopsOwnership(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putManifest(t, "db", NewManifest())
+	writer := store.newClient("db")
+	writer.ManifestConfigured = true
+
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+	ownershipPuts := store.operationCountForKey("PutObject", "db/.manifest/lock.json")
+	if ownershipPuts == 0 {
+		t.Fatal("cleanup mutation did not acquire ownership")
+	}
+
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.operationCountForKey("PutObject", "db/.manifest/lock.json"); got != ownershipPuts {
+		t.Fatalf("ownership PUT count = %d, want %d after cleanup", got, ownershipPuts)
+	}
 }
 
 func TestReplicaClient_ManifestDisabledCleanupDeletionRetries(t *testing.T) {

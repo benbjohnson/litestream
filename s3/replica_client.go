@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -55,7 +56,12 @@ const ReplicaClientType = "s3"
 // MetadataKeyTimestamp is the metadata key for storing LTX file timestamps in S3.
 const MetadataKeyTimestamp = "litestream-timestamp"
 
-const manifestInvalidVersion = 0
+const (
+	manifestInvalidVersion = 0
+	manifestLeasePath      = ".manifest"
+)
+
+var manifestOwnerCounter atomic.Uint64
 
 // MaxKeys is the number of keys S3 can operate on per batch.
 const MaxKeys = 1000
@@ -125,6 +131,9 @@ type ReplicaClient struct {
 	ManifestConfigured       bool // true when manifest setting was processed from config (enables cleanup)
 	manifestMu               sync.Mutex
 	manifest                 *Manifest
+	manifestGeneration       int64
+	manifestOwner            string
+	manifestLeaseTTL         time.Duration
 	manifestCleanupAttempted bool // tracks if we've tried to delete stale manifest when disabled
 }
 
@@ -705,7 +714,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 // WriteLTXFile writes an LTX file to the replica.
 // Extracts timestamp from LTX header and stores it in S3 metadata to preserve original creation time.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (info *ltx.FileInfo, retErr error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
@@ -755,15 +764,31 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		input.SSEKMSKeyId = aws.String(c.SSEKMSKeyID)
 	}
 
-	manifestConfigured := c.ManifestWriteEnabled || c.ManifestConfigured
-	if manifestConfigured {
+	manifestStateEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	if manifestStateEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
 	}
+	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
+
+	var mutation *manifestMutation
+	if manifestMutationEnabled {
+		mutation, ctx, err = c.beginManifestMutation(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultLeaseTTL)
+			defer cancel()
+			if err := mutation.Close(releaseCtx); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
+		}()
+	}
 
 	manifestReady := false
-	if manifestConfigured {
-		manifestReady, err = c.prepareManifestMutation(ctx, true)
+	if manifestMutationEnabled {
+		manifestReady, err = c.prepareManifestMutation(ctx, true, mutation.Generation())
 		if err != nil {
 			return nil, err
 		}
@@ -771,14 +796,18 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	out, err := c.uploader.Upload(ctx, input)
 	if err != nil {
-		if manifestConfigured {
-			c.manifest = nil
+		if manifestMutationEnabled {
+			c.clearManifestCache()
 		}
-		return nil, fmt.Errorf("s3: upload to %s: %w", key, err)
+		err = fmt.Errorf("s3: upload to %s: %w", key, err)
+		if mutation != nil {
+			err = errors.Join(mutation.Err(), err)
+		}
+		return nil, err
 	}
 
 	// Build file info from the uploaded file
-	info := &ltx.FileInfo{
+	info = &ltx.FileInfo{
 		Level:     level,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
@@ -791,15 +820,21 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	// ETag indicates successful upload
 	if out.ETag == nil {
-		if manifestConfigured {
-			c.manifest = nil
+		if manifestMutationEnabled {
+			c.clearManifestCache()
 		}
 		return nil, fmt.Errorf("s3: upload failed: no ETag returned")
 	}
 
+	if mutation != nil {
+		if err := mutation.Renew(ctx); err != nil {
+			c.clearManifestCache()
+			return nil, err
+		}
+	}
 	if manifestReady {
 		c.manifest.AddFile(info)
-		c.publishManifest(ctx)
+		c.publishManifest(ctx, mutation.Generation())
 	}
 
 	return info, nil
@@ -1104,7 +1139,7 @@ func encodeObjectIdentifier(v *types.ObjectIdentifier, value smithyxml.Value) er
 }
 
 // DeleteLTXFiles deletes one or more LTX files.
-func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error {
+func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (retErr error) {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
@@ -1123,16 +1158,33 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 	}
 
-	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
-	if manifestMutationEnabled {
+	manifestStateEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	if manifestStateEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
+	}
+	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
+
+	var mutation *manifestMutation
+	if manifestMutationEnabled {
+		var err error
+		mutation, ctx, err = c.beginManifestMutation(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultLeaseTTL)
+			defer cancel()
+			if err := mutation.Close(releaseCtx); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
+		}()
 	}
 
 	manifestReady := false
 	if manifestMutationEnabled {
 		var err error
-		manifestReady, err = c.prepareManifestMutation(ctx, true)
+		manifestReady, err = c.prepareManifestMutation(ctx, true, mutation.Generation())
 		if err != nil {
 			return err
 		}
@@ -1154,7 +1206,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 		if err != nil {
 			if manifestMutationEnabled {
-				c.manifest = nil
+				c.clearManifestCache()
 			}
 			return fmt.Errorf("s3: delete batch of %d objects: %w", n, err)
 		}
@@ -1189,7 +1241,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 
 		if err := deleteOutputError(out); err != nil {
 			if manifestMutationEnabled {
-				c.manifest = nil
+				c.clearManifestCache()
 			}
 			return err
 		}
@@ -1197,25 +1249,48 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		objIDs = objIDs[n:]
 	}
 
+	if mutation != nil {
+		if err := mutation.Renew(ctx); err != nil {
+			c.clearManifestCache()
+			return err
+		}
+	}
 	if manifestReady {
 		c.manifest.RemoveFiles(a)
-		c.publishManifest(ctx)
+		c.publishManifest(ctx, mutation.Generation())
 	}
 
 	return nil
 }
 
 // DeleteAll deletes all files.
-func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
+func (c *ReplicaClient) DeleteAll(ctx context.Context) (retErr error) {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
 
-	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
-	if manifestMutationEnabled {
+	manifestStateEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	if manifestStateEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
-		if _, err := c.prepareManifestMutation(ctx, false); err != nil {
+	}
+	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
+
+	var mutation *manifestMutation
+	if manifestMutationEnabled {
+		var err error
+		mutation, ctx, err = c.beginManifestMutation(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), DefaultLeaseTTL)
+			defer cancel()
+			if err := mutation.Close(releaseCtx); err != nil {
+				retErr = errors.Join(retErr, err)
+			}
+		}()
+		if _, err := c.prepareManifestMutation(ctx, false, mutation.Generation()); err != nil {
 			return err
 		}
 	}
@@ -1233,13 +1308,16 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			if manifestMutationEnabled {
-				c.manifest = nil
+				c.clearManifestCache()
 			}
 			return fmt.Errorf("s3: list objects page: %w", err)
 		}
 
 		// Collect object identifiers
 		for _, obj := range page.Contents {
+			if mutation != nil && aws.ToString(obj.Key) == mutation.Key() {
+				continue
+			}
 			objIDs = append(objIDs, types.ObjectIdentifier{Key: obj.Key})
 		}
 	}
@@ -1254,12 +1332,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		})
 		if err != nil {
 			if manifestMutationEnabled {
-				c.manifest = nil
+				c.clearManifestCache()
 			}
 			return fmt.Errorf("s3: delete all batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
 			if manifestMutationEnabled {
-				c.manifest = nil
+				c.clearManifestCache()
 			}
 			return err
 		}
@@ -1267,11 +1345,17 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		objIDs = objIDs[n:]
 	}
 
-	if manifestMutationEnabled {
-		c.manifest = nil
+	if mutation != nil {
+		if err := mutation.Renew(ctx); err != nil {
+			c.clearManifestCache()
+			return err
+		}
+	}
+	if manifestStateEnabled {
+		c.clearManifestCache()
 	} else {
 		c.manifestMu.Lock()
-		c.manifest = nil
+		c.clearManifestCache()
 		c.manifestMu.Unlock()
 	}
 	return nil
@@ -1372,12 +1456,12 @@ func (c *ReplicaClient) rebuildManifest(ctx context.Context) (*Manifest, error) 
 	return manifest, nil
 }
 
-func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild bool) (bool, error) {
+func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild bool, generation int64) (bool, error) {
 	if c.ManifestEnabled && !c.ManifestWriteEnabled {
 		if err := c.writeManifestInvalidation(ctx); err != nil {
 			return false, err
 		}
-		c.manifest = nil
+		c.clearManifestCache()
 		return false, nil
 	}
 
@@ -1392,6 +1476,9 @@ func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild boo
 		return false, nil
 	}
 
+	if c.manifest != nil && c.manifestGeneration+1 != generation {
+		c.clearManifestCache()
+	}
 	if err := c.writeManifestInvalidation(ctx); err != nil {
 		return false, err
 	}
@@ -1402,7 +1489,7 @@ func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild boo
 	manifest, err := c.rebuildManifest(ctx)
 	if err != nil {
 		c.logger.Debug("manifest rebuild failed; leaving LIST fallback enabled", "error", err)
-		c.manifest = nil
+		c.clearManifestCache()
 		return false, nil
 	}
 	c.manifest = manifest
@@ -1421,11 +1508,266 @@ func (c *ReplicaClient) deleteManifest(ctx context.Context) error {
 	return nil
 }
 
-func (c *ReplicaClient) publishManifest(ctx context.Context) {
+func (c *ReplicaClient) publishManifest(ctx context.Context, generation int64) bool {
 	if err := c.writeManifest(ctx, c.manifest); err != nil {
 		c.logger.Debug("manifest: failed to write", "error", err)
-		c.manifest = nil
+		c.clearManifestCache()
+		return false
 	}
+	c.manifestGeneration = generation
+	return true
+}
+
+func (c *ReplicaClient) clearManifestCache() {
+	c.manifest = nil
+	c.manifestGeneration = 0
+}
+
+type manifestMutation struct {
+	leaser *Leaser
+
+	mu     sync.Mutex
+	lease  *litestream.Lease
+	err    error
+	cancel context.CancelFunc
+	done   chan struct{}
+}
+
+func (c *ReplicaClient) beginManifestMutation(ctx context.Context) (*manifestMutation, context.Context, error) {
+	leaser := NewLeaser()
+	leaser.Bucket = c.Bucket
+	leaser.Path = path.Join(c.Path, manifestLeasePath)
+	if c.manifestLeaseTTL > 0 {
+		leaser.TTL = c.manifestLeaseTTL
+	}
+	leaser.SSECustomerAlgorithm = c.SSECustomerAlgorithm
+	leaser.SSECustomerKey = c.SSECustomerKey
+	leaser.SSECustomerKeyMD5 = c.SSECustomerKeyMD5
+	leaser.SSEKMSKeyID = c.SSEKMSKeyID
+	leaser.SetClient(c.s3)
+	leaser.SetLogger(c.logger)
+	if c.manifestOwner == "" {
+		c.manifestOwner = fmt.Sprintf("%s:manifest-%d", leaser.Owner, manifestOwnerCounter.Add(1))
+	}
+	leaser.Owner = c.manifestOwner
+
+	lease, err := acquireManifestLease(ctx, leaser)
+	if err != nil {
+		return nil, ctx, fmt.Errorf("s3: acquire manifest ownership: %w", err)
+	}
+
+	mutationCtx, cancel := context.WithCancel(ctx)
+	mutation := &manifestMutation{
+		leaser: leaser,
+		lease:  lease,
+		cancel: cancel,
+		done:   make(chan struct{}),
+	}
+	go mutation.renewLoop(mutationCtx)
+	return mutation, mutationCtx, nil
+}
+
+func acquireManifestLease(ctx context.Context, leaser *Leaser) (*litestream.Lease, error) {
+	for {
+		existing, etag, err := leaser.readLease(ctx)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+		if existing != nil && !existing.IsExpired() {
+			wait := time.Until(existing.ExpiresAt)
+			if wait > 50*time.Millisecond {
+				wait = 50 * time.Millisecond
+			}
+			if wait <= 0 {
+				continue
+			}
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return nil, ctx.Err()
+			case <-timer.C:
+				continue
+			}
+		}
+
+		generation := int64(1)
+		if existing != nil {
+			generation = existing.Generation + 1
+		}
+		lease := &litestream.Lease{
+			Generation: generation,
+			ExpiresAt:  time.Now().Add(leaser.TTL),
+			Owner:      leaser.Owner,
+		}
+		newETag, err := leaser.writeLease(ctx, lease, etag)
+		if err == nil {
+			if newETag == "" {
+				return nil, ErrLeaseETagRequired
+			}
+			lease.ETag = newETag
+			return lease, nil
+		}
+		var leaseExistsErr *litestream.LeaseExistsError
+		if errors.As(err, &leaseExistsErr) {
+			continue
+		}
+		current, currentETag, readErr := leaser.readLease(ctx)
+		if readErr == nil && current != nil && current.Generation == lease.Generation && current.Owner == lease.Owner && !current.IsExpired() {
+			current.ETag = currentETag
+			return current, nil
+		}
+		return nil, err
+	}
+}
+
+func (m *manifestMutation) Generation() int64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lease.Generation
+}
+
+func (m *manifestMutation) Key() string {
+	return m.leaser.lockKey()
+}
+
+func (m *manifestMutation) Err() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.err
+}
+
+func (m *manifestMutation) Renew(ctx context.Context) error {
+	if err := m.Err(); err != nil {
+		return err
+	}
+	if err := m.renew(ctx); err != nil {
+		m.fail(err)
+		return err
+	}
+	return nil
+}
+
+func (m *manifestMutation) Close(ctx context.Context) error {
+	m.cancel()
+	<-m.done
+
+	m.mu.Lock()
+	lease := *m.lease
+	renewErr := m.err
+	m.mu.Unlock()
+
+	releaseErr := releaseManifestLease(ctx, m.leaser, &lease)
+	if releaseErr != nil {
+		releaseErr = fmt.Errorf("s3: release manifest ownership: %w", releaseErr)
+	}
+	return errors.Join(renewErr, releaseErr)
+}
+
+func (m *manifestMutation) renewLoop(ctx context.Context) {
+	defer close(m.done)
+	interval := m.leaser.TTL / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if err := m.renew(ctx); err != nil {
+				if ctx.Err() != nil {
+					return
+				}
+				m.fail(err)
+				return
+			}
+		}
+	}
+}
+
+func (m *manifestMutation) renew(ctx context.Context) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	lease, err := renewManifestLease(ctx, m.leaser, m.lease)
+	if err != nil {
+		return fmt.Errorf("s3: renew manifest ownership: %w", err)
+	}
+	m.lease = lease
+	return nil
+}
+
+func (m *manifestMutation) fail(err error) {
+	m.mu.Lock()
+	if m.err == nil {
+		m.err = err
+	}
+	m.mu.Unlock()
+	m.cancel()
+}
+
+func renewManifestLease(ctx context.Context, leaser *Leaser, lease *litestream.Lease) (*litestream.Lease, error) {
+	renewed, err := leaser.RenewLease(ctx, lease)
+	if err == nil {
+		if renewed.ETag == "" {
+			return nil, ErrLeaseETagRequired
+		}
+		return renewed, nil
+	}
+	if ctx.Err() != nil {
+		return nil, err
+	}
+	current, etag, readErr := leaser.readLease(ctx)
+	if readErr == nil && current != nil {
+		if current.Generation != lease.Generation || current.Owner != lease.Owner {
+			return nil, litestream.ErrLeaseNotHeld
+		}
+		if !current.IsExpired() && etag != lease.ETag {
+			current.ETag = etag
+			return current, nil
+		}
+	}
+	return nil, err
+}
+
+func releaseManifestLease(ctx context.Context, leaser *Leaser, lease *litestream.Lease) error {
+	released := &litestream.Lease{
+		Generation: lease.Generation,
+		ExpiresAt:  time.Unix(0, 0).UTC(),
+		Owner:      lease.Owner,
+	}
+	_, err := leaser.writeLease(ctx, released, lease.ETag)
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return err
+	}
+	current, etag, readErr := leaser.readLease(ctx)
+	if readErr != nil || current == nil {
+		return err
+	}
+	if current.Generation != lease.Generation || current.Owner != lease.Owner {
+		return litestream.ErrLeaseNotHeld
+	}
+	if current.IsExpired() && etag != lease.ETag {
+		return nil
+	}
+	var leaseExistsErr *litestream.LeaseExistsError
+	if errors.As(err, &leaseExistsErr) && etag != lease.ETag {
+		_, retryErr := leaser.writeLease(ctx, released, etag)
+		if retryErr == nil {
+			return nil
+		}
+		if errors.As(retryErr, &leaseExistsErr) {
+			return litestream.ErrLeaseNotHeld
+		}
+		return retryErr
+	}
+	return err
 }
 
 // GenerationsV3 returns a list of v0.3.x generation IDs in the replica.

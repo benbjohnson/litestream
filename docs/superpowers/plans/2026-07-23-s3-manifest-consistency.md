@@ -4,7 +4,7 @@
 
 **Goal:** Make S3 manifests safe across existing replicas, restarts, crashes, partial mutations, manifest failures, and configuration changes without breaking the public `ReplicaClient` interface.
 
-**Architecture:** Every manifest-aware S3 mutation first publishes an unsupported-version sentinel that forces readers to use authoritative LIST operations. The writer serializes invalidation, the LTX mutation, and valid-manifest publication with `manifestMu`; it rebuilds missing in-memory state directly from LIST and leaves the sentinel active after any uncertain or failed mutation. Restore enables manifests through a private optional capability interface rather than changing every storage backend.
+**Architecture:** Every manifest-aware S3 mutation acquires a renewable conditional lease, then publishes an unsupported-version sentinel that forces readers to use authoritative LIST operations. `manifestMu` protects the client cache while distributed ownership serializes clients and processes. The persistent ownership generation permits validated cache reuse for consecutive uncontested mutations; missing or untrusted cache state is rebuilt directly from LIST. Restore uses a private optional manifest capability, leaving the backend interface unchanged.
 
 **Tech Stack:** Go, AWS SDK for Go v2, Smithy HTTP test transports, `log/slog`, standard `testing`, GitHub Actions.
 
@@ -456,7 +456,7 @@ git commit -m "refactor(s3): isolate manifest capability"
 
 Document these exact rules:
 
-- Writers always use LIST for authoritative state.
+- Persisted manifests are never writer authority; missing or untrusted cache state is rebuilt from LIST, while ownership generations permit validated cache reuse.
 - Before any LTX mutation, a manifest-enabled writer publishes an unsupported-version sentinel.
 - Readers reject that version and fall back to LIST.
 - Failure to publish the sentinel aborts the LTX mutation.

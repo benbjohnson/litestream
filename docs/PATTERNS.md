@@ -363,39 +363,42 @@ S3 LIST operations cost 5-10x more than GET. The manifest (`manifest.json`) repl
 ### Architecture
 
 ```text
-Writer (replicate/compact)  →  Uses LIST for authoritative state
+Writer (replicate/compact)  →  Acquires conditional ownership for the replica path
                                 Publishes an unsupported-version sentinel before LTX mutations
+                                Rebuilds missing or untrusted cache state from LIST
                                 Publishes a valid manifest after successful LTX mutations
 
 Reader (restore/follow)     →  Fetches manifest via GET
                                 Falls back to LIST when the manifest is missing, corrupt, or unsupported
 ```
 
-- **Writer authority**: Writers always use LIST for authoritative state and never read the manifest for their own operations.
-- **Mutation barrier**: Before any LTX mutation, a manifest-enabled writer publishes an unsupported-version sentinel. Readers reject that version and fall back to LIST.
-- **Strict invalidation**: Failure to publish the sentinel aborts the LTX mutation. Readers must not continue using a manifest that may become stale.
-- **Safe publication failure**: Failure to publish the final valid manifest leaves the sentinel in place and does not fail an already-successful LTX mutation. The writer clears uncertain cached state so LIST fallback remains active.
-- **Direct rebuild**: When the writer cache is missing, the writer rebuilds it directly from LIST across levels `0..SnapshotLevel`. A rebuild failure leaves the sentinel and LIST fallback active.
-- **Disable cleanup**: Disabling manifests removes stale manifest state before mutation. Cleanup errors abort the mutation and remain retryable on the next attempt.
-- **Reader optimization**: Read replicas enable manifest support to prefer manifest GET over LIST when a valid manifest is available.
+- **Distributed ownership**: Manifest-aware mutations acquire `PATH/.manifest/lock.json` with conditional writes. The lease is renewed during the mutation, checked again before publication, and released by conditionally writing an expired state that preserves its generation.
+- **Crash recovery**: A writer can conditionally take over an expired ownership object. Acquisition, renewal, release, and lost-ownership errors are returned because they can affect manifest correctness.
+- **Cache validation**: The persistent ownership generation lets one client reuse its cache when no other writer acquired ownership since its prior mutation. A generation gap, restart, failed mutation, or uncertain outcome clears the cache and requires a direct LIST rebuild across levels `0..SnapshotLevel`.
+- **Mutation barrier**: Before any LTX mutation, a manifest-aware client publishes an unsupported-version sentinel. This includes clients with only `ManifestEnabled` set. Readers reject the sentinel and use LIST.
+- **Strict invalidation**: Failure to publish the sentinel aborts the LTX mutation. Failure to publish the final valid manifest leaves LIST fallback active and does not fail an LTX mutation that already succeeded.
+- **Disable cleanup**: Disabling manifests removes stale manifest state before mutation. Cleanup errors abort the mutation and remain retryable.
+- **DeleteAll ownership**: `DeleteAll` excludes the ownership object from batch deletion, then releases it after deleting replica data.
+- **Reader optimization**: Readers prefer a valid manifest GET and use LIST when the manifest is missing, corrupt, or unsupported.
 
 ### Mutation Sequence
 
-1. Lock manifest mutation state.
-2. Publish the unsupported-version sentinel.
-3. Rebuild a missing writer cache directly from LIST across every level from `0` through `SnapshotLevel`.
-4. Perform the LTX write or delete.
-5. Update the writer cache and publish the final valid manifest.
+1. Lock the client cache and acquire distributed ownership.
+2. Validate the cache against the ownership generation.
+3. Publish the unsupported-version sentinel.
+4. Rebuild missing or untrusted cache state directly from LIST.
+5. Perform the LTX write or delete while renewing ownership.
+6. Renew ownership, update the cache, and publish the final valid manifest.
+7. Release ownership with a conditional expired-state write.
 
-Only the final publication is best-effort after the LTX mutation succeeds. Sentinel publication is a correctness requirement and must return an error before the mutation begins.
+The first mutation, recovery after uncertainty, and a mutation after another owner require LIST. Consecutive uncontended mutations by one client reuse the validated cache.
 
-### DON'T: Use the manifest as writer authority
+### DON'T: Use the persisted manifest as writer authority
 
 ```go
-func (c *ReplicaClient) LTXFiles(...) (ltx.FileIterator, error) {
-    // WRONG — writer operations must use LIST for authoritative state
-    m, _ := c.readManifest(ctx)
-    return newManifestIterator(m.EntriesForLevel(level, seek)), nil
+func (c *ReplicaClient) rebuildManifest(...) (*Manifest, error) {
+    // WRONG — cache recovery must read authoritative object state with LIST
+    return c.readManifest(ctx)
 }
 ```
 

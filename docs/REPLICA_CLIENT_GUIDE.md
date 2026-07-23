@@ -59,6 +59,8 @@ type manifestEnabler interface {
 
 The S3 client implements this capability so restore can enable manifest reads. Other backends do not need to implement it or provide a no-op method.
 
+S3 manifest-aware mutations use a conditional lease at `PATH/.manifest/lock.json`. The client renews ownership during the mutation and checks it before publishing a valid manifest. The ownership object retains a generation across releases, allowing one client to reuse a validated in-memory cache for consecutive uncontended mutations. A restart, generation gap, mutation failure, or uncertain storage outcome clears that cache; the next writer rebuilds from authoritative LIST results before publication. `DeleteAll` excludes the ownership object from batch deletion and releases it after deleting replica data. Readers use LIST when the manifest is missing, invalid, or unsupported.
+
 ## Implementation Checklist
 
 ### Required Features
