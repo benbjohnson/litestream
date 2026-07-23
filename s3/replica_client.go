@@ -1236,14 +1236,14 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 	}
 
-	manifestConfigured := c.ManifestWriteEnabled || c.ManifestConfigured
-	if manifestConfigured {
+	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	if manifestMutationEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
 	}
 
 	manifestReady := false
-	if manifestConfigured {
+	if manifestMutationEnabled {
 		var err error
 		manifestReady, err = c.prepareManifestMutation(ctx, true)
 		if err != nil {
@@ -1266,7 +1266,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		internal.OperationDurationHistogramVec.WithLabelValues(ReplicaClientType, "DELETE").Observe(duration.Seconds())
 
 		if err != nil {
-			if manifestConfigured {
+			if manifestMutationEnabled {
 				c.manifest = nil
 			}
 			return fmt.Errorf("s3: delete batch of %d objects: %w", n, err)
@@ -1301,7 +1301,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		}
 
 		if err := deleteOutputError(out); err != nil {
-			if manifestConfigured {
+			if manifestMutationEnabled {
 				c.manifest = nil
 			}
 			return err
@@ -1324,8 +1324,8 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 
-	manifestConfigured := c.ManifestWriteEnabled || c.ManifestConfigured
-	if manifestConfigured {
+	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	if manifestMutationEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
 		if _, err := c.prepareManifestMutation(ctx, false); err != nil {
@@ -1345,7 +1345,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
-			if manifestConfigured {
+			if manifestMutationEnabled {
 				c.manifest = nil
 			}
 			return fmt.Errorf("s3: list objects page: %w", err)
@@ -1366,12 +1366,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
-			if manifestConfigured {
+			if manifestMutationEnabled {
 				c.manifest = nil
 			}
 			return fmt.Errorf("s3: delete all batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
-			if manifestConfigured {
+			if manifestMutationEnabled {
 				c.manifest = nil
 			}
 			return err
@@ -1380,7 +1380,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		objIDs = objIDs[n:]
 	}
 
-	if manifestConfigured {
+	if manifestMutationEnabled {
 		c.manifest = nil
 	} else {
 		c.manifestMu.Lock()
@@ -1486,6 +1486,14 @@ func (c *ReplicaClient) rebuildManifest(ctx context.Context) (*Manifest, error) 
 }
 
 func (c *ReplicaClient) prepareManifestMutation(ctx context.Context, rebuild bool) (bool, error) {
+	if c.ManifestEnabled && !c.ManifestWriteEnabled {
+		if err := c.writeManifestInvalidation(ctx); err != nil {
+			return false, err
+		}
+		c.manifest = nil
+		return false, nil
+	}
+
 	if !c.ManifestWriteEnabled {
 		if !c.ManifestConfigured || c.manifestCleanupAttempted {
 			return false, nil
