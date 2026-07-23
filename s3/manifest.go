@@ -10,8 +10,10 @@ import (
 const ManifestVersion = 1
 
 type Manifest struct {
-	Version int                     `json:"version"`
-	Levels  map[int][]ManifestEntry `json:"levels"`
+	Version    int                     `json:"version"`
+	Generation int64                   `json:"generation,omitempty"`
+	Token      string                  `json:"token,omitempty"`
+	Levels     map[int][]ManifestEntry `json:"levels"`
 }
 
 type ManifestEntry struct {
