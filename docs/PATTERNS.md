@@ -358,60 +358,42 @@ _, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 
 ## Manifest Pattern (S3 LIST Reduction)
 
-S3 LIST operations cost 5-10x more than GET. The manifest (`manifest.json`) replaces per-poll LIST calls with a single GET for read replicas (restore, follow mode).
+S3 LIST operations cost 5-10x more than GET. The manifest (`manifest.json`) replaces per-poll LIST calls with a single GET for read replicas such as restore and follow mode.
 
 ### Architecture
 
 ```text
-Writer (replicate/compact)  →  Maintains manifest as side effect of mutations
-                                Always uses LIST for its own operations (correctness)
+Writer (replicate/compact)  →  Uses LIST for authoritative state
+                                Publishes an unsupported-version sentinel before LTX mutations
+                                Publishes a valid manifest after successful LTX mutations
 
 Reader (restore/follow)     →  Fetches manifest via GET
-                                Falls back to LIST when manifest is missing/corrupt
+                                Falls back to LIST when the manifest is missing, corrupt, or unsupported
 ```
 
-- **Writer independence**: The writer NEVER reads from the manifest for its own operations. It always uses LIST for correctness and writes the manifest as a side effect.
-- **Reader optimization**: Read replicas set `ManifestEnabled = true` to prefer manifest GET over LIST.
-- **Errors are non-fatal**: Manifest failures are DEBUG-logged. The reader falls back to LIST transparently.
+- **Writer authority**: Writers always use LIST for authoritative state and never read the manifest for their own operations.
+- **Mutation barrier**: Before any LTX mutation, a manifest-enabled writer publishes an unsupported-version sentinel. Readers reject that version and fall back to LIST.
+- **Strict invalidation**: Failure to publish the sentinel aborts the LTX mutation. Readers must not continue using a manifest that may become stale.
+- **Safe publication failure**: Failure to publish the final valid manifest leaves the sentinel in place and does not fail an already-successful LTX mutation. The writer clears uncertain cached state so LIST fallback remains active.
+- **Direct rebuild**: When the writer cache is missing, the writer rebuilds it directly from LIST across levels `0..SnapshotLevel`. A rebuild failure leaves the sentinel and LIST fallback active.
+- **Disable cleanup**: Disabling manifests removes stale manifest state before mutation. Cleanup errors abort the mutation and remain retryable on the next attempt.
+- **Reader optimization**: Read replicas enable manifest support to prefer manifest GET over LIST when a valid manifest is available.
 
-### DO: Keep manifest updates best-effort with LIST fallback
+### Mutation Sequence
 
-```go
-func (c *ReplicaClient) updateManifestAfterWrite(ctx context.Context, info *ltx.FileInfo) {
-    if !c.ManifestWriteEnabled {
-        return
-    }
-    c.manifestMu.Lock()
-    defer c.manifestMu.Unlock()
+1. Lock manifest mutation state.
+2. Publish the unsupported-version sentinel.
+3. Rebuild a missing writer cache directly from LIST across every level from `0` through `SnapshotLevel`.
+4. Perform the LTX write or delete.
+5. Update the writer cache and publish the final valid manifest.
 
-    if err := c.loadManifest(ctx); err != nil {
-        slog.Debug("manifest: failed to load, skipping update", "error", err)
-        return // Non-fatal — LIST still works
-    }
-    c.manifest.AddFile(info)
-    if err := c.writeManifest(ctx, c.manifest); err != nil {
-        slog.Debug("manifest: failed to write after upload", "error", err)
-        c.manifest = nil // Invalidate cache on failure
-    }
-}
-```
+Only the final publication is best-effort after the LTX mutation succeeds. Sentinel publication is a correctness requirement and must return an error before the mutation begins.
 
-### DON'T: Fail writes when manifest update fails
-
-```go
-func (c *ReplicaClient) WriteLTXFile(...) (*ltx.FileInfo, error) {
-    // ... upload LTX file ...
-    if err := c.writeManifest(ctx, m); err != nil {
-        return nil, err // WRONG — manifest failure should not block replication
-    }
-}
-```
-
-### DON'T: Have the writer read from its own manifest
+### DON'T: Use the manifest as writer authority
 
 ```go
 func (c *ReplicaClient) LTXFiles(...) (ltx.FileIterator, error) {
-    // WRONG — writer must always use LIST for correctness
+    // WRONG — writer operations must use LIST for authoritative state
     m, _ := c.readManifest(ctx)
     return newManifestIterator(m.EntriesForLevel(level, seek)), nil
 }
@@ -421,10 +403,10 @@ func (c *ReplicaClient) LTXFiles(...) (ltx.FileIterator, error) {
 
 | Scenario | Behavior |
 |----------|----------|
-| Old writer + new reader | No manifest.json → reader falls back to LIST |
-| New writer + old reader | manifest.json ignored (doesn't match LTX filename pattern) |
+| Old writer + new reader | No `manifest.json` → reader falls back to LIST |
+| New writer + old reader | `manifest.json` is ignored because it does not match the LTX filename pattern |
 | Corrupt manifest | JSON decode fails → reader falls back to LIST |
-| Unsupported version | Version mismatch → reader falls back to LIST |
+| Unsupported version or sentinel | Version mismatch → reader falls back to LIST |
 
 Reference: `s3/manifest.go`, `s3/replica_client.go`
 

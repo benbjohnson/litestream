@@ -22,6 +22,9 @@ type ReplicaClient interface {
     // Returns the type identifier (e.g., "s3", "gcs", "file")
     Type() string
 
+    // Initializes the backend connection and validates configuration
+    Init(ctx context.Context) error
+
     // Returns iterator of LTX files at given level
     // seek: Start from this TXID (0 = beginning)
     // useMetadata: When true, fetch accurate timestamps from backend metadata (required for PIT restore)
@@ -41,10 +44,20 @@ type ReplicaClient interface {
     // Deletes all files for this database
     DeleteAll(ctx context.Context) error
 
-    // Enables/disables manifest-based file listing (no-op for backends without manifest support)
-    SetManifestEnabled(enabled bool)
+    // Sets the logger used by the backend
+    SetLogger(logger *slog.Logger)
 }
 ```
+
+Manifest-based listing is not part of the backend-neutral `ReplicaClient` interface. Restore detects support through a private optional capability:
+
+```go
+type manifestEnabler interface {
+    SetManifestEnabled(bool)
+}
+```
+
+The S3 client implements this capability so restore can enable manifest reads. Other backends do not need to implement it or provide a no-op method.
 
 ## Implementation Checklist
 
