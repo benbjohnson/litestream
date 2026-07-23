@@ -115,7 +115,3 @@ func (itr *manifestIterator) Item() *ltx.FileInfo {
 }
 
 func (itr *manifestIterator) Err() error { return nil }
-
-func NewManifestIteratorForTest(items []*ltx.FileInfo) ltx.FileIterator {
-	return newManifestIterator(items)
-}
