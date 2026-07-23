@@ -14,6 +14,27 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
+type testManifestEnabler struct {
+	litestream.ReplicaClient
+	enabled bool
+}
+
+func (c *testManifestEnabler) SetManifestEnabled(enabled bool) { c.enabled = enabled }
+
+type nonManifestReplicaClient struct {
+	litestream.ReplicaClient
+}
+
+func TestEnableManifest(t *testing.T) {
+	capable := &testManifestEnabler{}
+	enableManifest(capable)
+	if !capable.enabled {
+		t.Fatal("manifest capability was not enabled")
+	}
+
+	enableManifest(&nonManifestReplicaClient{})
+}
+
 func TestRestoreCommand_FollowIntervalFlag(t *testing.T) {
 	tests := []struct {
 		name    string

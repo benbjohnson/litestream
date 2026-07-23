@@ -3226,6 +3226,42 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 	})
 }
 
+func TestNewS3ReplicaClientFromConfig_ManifestOptIn(t *testing.T) {
+	manifestFalse := false
+	manifestTrue := true
+	tests := []struct {
+		name         string
+		manifest     *bool
+		configured   bool
+		writeEnabled bool
+	}{
+		{name: "Absent"},
+		{name: "ExplicitFalse", manifest: &manifestFalse, configured: true},
+		{name: "True", manifest: &manifestTrue, configured: true, writeEnabled: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+				Path: "path",
+				ReplicaSettings: main.ReplicaSettings{
+					Bucket:   "bucket",
+					Manifest: tt.manifest,
+				},
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.ManifestConfigured; got != tt.configured {
+				t.Fatalf("ManifestConfigured = %v, want %v", got, tt.configured)
+			}
+			if got := client.ManifestWriteEnabled; got != tt.writeEnabled {
+				t.Fatalf("ManifestWriteEnabled = %v, want %v", got, tt.writeEnabled)
+			}
+		})
+	}
+}
+
 func TestGlobalDefaults(t *testing.T) {
 	// Test comprehensive global defaults functionality
 	t.Run("GlobalReplicaDefaults", func(t *testing.T) {
