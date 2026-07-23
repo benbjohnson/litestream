@@ -1,17 +1,42 @@
-package s3_test
+package s3
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/superfly/ltx"
-
-	"github.com/benbjohnson/litestream/s3"
 )
 
+func TestReplicaClient_ManifestFallbackUsesClientLogger(t *testing.T) {
+	store := newManifestTestStore(t)
+	client := store.newClient("replica")
+	client.ManifestEnabled = true
+
+	var buf bytes.Buffer
+	client.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	store.failNext("GetObject", errors.New("manifest unavailable"))
+
+	itr, err := client.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		t.Fatalf("LTXFiles() error: %v", err)
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+
+	if got := buf.String(); !strings.Contains(got, "s3.error=") || !strings.Contains(got, "manifest: read failed, falling back to LIST") {
+		t.Fatalf("manifest fallback log missing client logger group or message: %q", got)
+	}
+}
+
 func TestManifest_AddFile(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 3, MaxTXID: 3, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 200})
@@ -42,7 +67,7 @@ func TestManifest_AddFile(t *testing.T) {
 }
 
 func TestManifest_RemoveFiles(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2, Size: 200})
@@ -63,7 +88,7 @@ func TestManifest_RemoveFiles(t *testing.T) {
 }
 
 func TestManifest_AddFile_DeduplicatesOnRewrite(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 200})
@@ -78,7 +103,7 @@ func TestManifest_AddFile_DeduplicatesOnRewrite(t *testing.T) {
 }
 
 func TestManifest_RemoveFiles_CleansEmptyLevel(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100})
 	m.RemoveFiles([]*ltx.FileInfo{
@@ -92,7 +117,7 @@ func TestManifest_RemoveFiles_CleansEmptyLevel(t *testing.T) {
 }
 
 func TestManifest_EntriesForLevel(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2, Size: 200})
@@ -112,7 +137,7 @@ func TestManifest_EntriesForLevel(t *testing.T) {
 }
 
 func TestManifest_EntriesForLevel_SeekSkipsLowerMinTXID(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 5, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 6, MaxTXID: 10, Size: 200})
@@ -128,7 +153,7 @@ func TestManifest_EntriesForLevel_SeekSkipsLowerMinTXID(t *testing.T) {
 
 func TestManifest_JSON(t *testing.T) {
 	ts := time.Date(2024, 1, 15, 10, 30, 0, 0, time.UTC)
-	m := s3.NewManifest()
+	m := NewManifest()
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100, CreatedAt: ts})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 5, Size: 500, CreatedAt: ts})
 	m.AddFile(&ltx.FileInfo{Level: 1, MinTXID: 1, MaxTXID: 5, Size: 1000, CreatedAt: ts})
@@ -138,13 +163,13 @@ func TestManifest_JSON(t *testing.T) {
 		t.Fatalf("marshal: %v", err)
 	}
 
-	var decoded s3.Manifest
+	var decoded Manifest
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
 
-	if decoded.Version != s3.ManifestVersion {
-		t.Fatalf("expected version %d, got %d", s3.ManifestVersion, decoded.Version)
+	if decoded.Version != ManifestVersion {
+		t.Fatalf("expected version %d, got %d", ManifestVersion, decoded.Version)
 	}
 
 	l0 := decoded.Levels[0]
@@ -165,7 +190,7 @@ func TestManifest_JSON(t *testing.T) {
 }
 
 func TestManifest_EmptyLevels(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 
 	entries := m.EntriesForLevel(0, 0)
 	if entries != nil {
@@ -179,12 +204,12 @@ func TestManifest_EmptyLevels(t *testing.T) {
 }
 
 func TestManifestIterator(t *testing.T) {
-	m := s3.NewManifest()
+	m := NewManifest()
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1, Size: 100})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2, Size: 200})
 	m.AddFile(&ltx.FileInfo{Level: 0, MinTXID: 3, MaxTXID: 3, Size: 300})
 
-	itr := s3.NewManifestIteratorForTest(m.EntriesForLevel(0, 0))
+	itr := newManifestIterator(m.EntriesForLevel(0, 0))
 	defer itr.Close()
 
 	var items []*ltx.FileInfo
@@ -204,7 +229,7 @@ func TestManifestIterator(t *testing.T) {
 }
 
 func TestManifestIterator_Empty(t *testing.T) {
-	itr := s3.NewManifestIteratorForTest(nil)
+	itr := newManifestIterator(nil)
 	defer itr.Close()
 
 	if itr.Next() {
