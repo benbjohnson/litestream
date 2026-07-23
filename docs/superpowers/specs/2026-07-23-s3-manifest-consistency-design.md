@@ -6,15 +6,17 @@ Keep manifest-backed S3 reads correct across existing replicas, process crashes,
 
 ## Consistency Protocol
 
-Before any manifest-aware S3 mutation, the writer atomically overwrites `manifest.json` with a syntactically valid manifest whose version is intentionally unsupported. Existing manifest-aware readers reject the unsupported version and fall back to authoritative LIST operations. Readers predating manifest support ignore the object because it is not an LTX filename.
+Before any manifest-aware S3 mutation, the client acquires distributed ownership through conditional writes to `PATH/.manifest/lock.json`. The ownership object stores an owner, expiration, ETag, and persistent generation. The client renews the lease during the mutation, checks ownership before valid-manifest publication, and conditionally releases it by writing an expired state. An expired lease can be taken over after a crash. Acquisition, renewal, release, and lost-ownership errors are returned.
 
-The writer holds `manifestMu` from invalidation through the LTX mutation and manifest publication so concurrent writes and deletes cannot publish state out of order. If the invalidation write fails, the operation returns before changing LTX objects because a valid stale manifest may still be visible.
+The client holds `manifestMu` while it owns the distributed lease so its local cache cannot change concurrently. The persistent generation detects whether another client acquired ownership since this client last published. Consecutive uncontended mutations can reuse the validated cache; a generation gap, restart, failed mutation, or uncertain storage outcome clears the cache and requires a direct LIST rebuild.
 
-After invalidation, a writer without a trusted in-memory manifest rebuilds one directly from S3 LIST results for every LTX level. The rebuild uses `newFileIterator` rather than `LTXFiles` so it cannot recursively consult the manifest. This bootstraps existing replicas and recovers after restarts or partial failures.
+After acquiring ownership, the client atomically overwrites `manifest.json` with a syntactically valid manifest whose version is intentionally unsupported. Existing manifest-aware readers reject the unsupported version and use authoritative LIST operations. Readers predating manifest support ignore the object because it is not an LTX filename. This invalidation lifecycle applies when any manifest mode is active, including `ManifestEnabled` without manifest writing.
 
-After a successful LTX write or deletion, the writer updates the in-memory manifest and publishes a valid manifest. If publication fails, the writer clears the in-memory cache and leaves the unsupported-version sentinel in place. The LTX mutation remains successful because readers safely fall back to LIST and the failure affects only the optimization.
+If invalidation fails, the operation returns before changing LTX objects. A writer without trusted cache state rebuilds directly from S3 LIST results for every LTX level using `newFileIterator`, which cannot recursively consult the manifest.
 
-If an LTX upload, batch deletion, or `DeleteAll` operation fails after invalidation, the writer clears the in-memory cache and leaves the sentinel in place. A later successful mutation rebuilds from authoritative LIST state before publishing another valid manifest.
+After a successful LTX write or deletion, a manifest writer renews ownership, updates the cache, and publishes a valid manifest. If publication fails, the writer clears the cache and leaves LIST fallback active. If an LTX upload, deletion, `DeleteAll`, or storage response is uncertain after invalidation, the writer clears the cache. A later owner rebuilds from LIST before publishing another valid manifest.
+
+`DeleteAll` skips the ownership object while deleting replica data, then releases ownership. This prevents the operation from removing the lock that serializes it.
 
 ## Disabling Manifests
 
@@ -34,11 +36,13 @@ Manifest diagnostics use the client’s configured `c.logger` so backend groupin
 
 A stateful test S3 HTTP transport stores objects across client instances, counts operations, and can inject deterministic failures for LIST, GET, PUT, DELETE, and `DeleteObjects`. Tests cover:
 
-- Bootstrapping a valid manifest from an existing populated replica and adding the current mutation.
-- Recreating a client over the same object store to simulate restart recovery.
+- Bootstrapping a valid manifest from an existing populated replica and reusing validated cache state for uncontended mutations.
+- Deterministic two-client write/write and write/delete interleavings that require distributed serialization.
+- Ownership acquisition failure, renewal failure, lost ownership, expired-lease takeover, and `DeleteAll` lock preservation.
 - Reader LIST fallback while the unsupported-version sentinel exists.
 - Interruption after invalidation and after an LTX object upload but before valid manifest publication.
 - LTX upload failure, manifest GET failure, rebuild LIST failure, valid-manifest PUT failure, and partial batch deletion failure.
+- Fail-after-apply PUT, DELETE, and `DeleteObjects` outcomes followed by reader fallback and fresh-writer recovery.
 - `DeleteAll` success and failure behavior.
 - Stale-manifest cleanup failure blocking the mutation and a later successful retry.
 - Manifest fallback diagnostics reaching an injected client logger.
