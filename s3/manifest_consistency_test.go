@@ -832,6 +832,151 @@ func TestReplicaClient_ManifestDeleteLTXFilesPublishesSurvivors(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_ManifestEnabledDeleteLTXFiles(t *testing.T) {
+	t.Run("SuccessLeavesInvalidManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putLTX(t, "db", 0, 2, 2)
+		manifest := manifestWithFile(0, 1, 1)
+		manifest.AddFile(manifestWithFile(0, 2, 2).EntriesForLevel(0, 0)[0])
+		store.putManifest(t, "db", manifest)
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		client.manifest = manifest
+		if err := client.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); err != nil {
+			t.Fatal(err)
+		}
+		if store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("deleted LTX file still exists")
+		}
+		if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+			t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+		}
+		if client.manifest != nil {
+			t.Fatal("manifest cache retained after deletion")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{2, 2}})
+	})
+
+	t.Run("FailureLeavesInvalidManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		manifest := manifestWithFile(0, 1, 1)
+		store.putManifest(t, "db", manifest)
+		store.failNext("DeleteObjects", errors.New("delete unavailable"))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		client.manifest = manifest
+		if err := client.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); err == nil {
+			t.Fatal("expected delete error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("failed deletion removed LTX file")
+		}
+		if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+			t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+		}
+		if client.manifest != nil {
+			t.Fatal("manifest cache retained after failed deletion")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+	})
+
+	t.Run("InvalidationFailureBlocksMutation", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNext("PutObject", errors.New("invalidation unavailable"))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		if err := client.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); err == nil {
+			t.Fatal("expected invalidation error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("LTX mutation occurred before manifest invalidation")
+		}
+		if got := store.operationCount("DeleteObjects"); got != 0 {
+			t.Fatalf("delete operations=%d, want 0", got)
+		}
+	})
+}
+
+func TestReplicaClient_ManifestEnabledDeleteAll(t *testing.T) {
+	t.Run("SuccessRemovesManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		manifest := manifestWithFile(0, 1, 1)
+		store.putManifest(t, "db", manifest)
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		client.manifest = manifest
+		if err := client.DeleteAll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if store.hasLTX("db", 0, 1, 1) || store.hasObject("db/manifest.json") {
+			t.Fatal("DeleteAll left replica objects")
+		}
+		if client.manifest != nil {
+			t.Fatal("manifest cache retained after DeleteAll")
+		}
+		if got := store.operationCount("PutObject"); got != 1 {
+			t.Fatalf("manifest invalidations=%d, want 1", got)
+		}
+		assertManifestListFallback(t, store, "db", 0, nil)
+	})
+
+	t.Run("FailureLeavesInvalidManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		manifest := manifestWithFile(0, 1, 1)
+		store.putManifest(t, "db", manifest)
+		store.failNext("DeleteObjects", errors.New("delete unavailable"))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		client.manifest = manifest
+		if err := client.DeleteAll(context.Background()); err == nil {
+			t.Fatal("expected delete error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("failed DeleteAll removed LTX file")
+		}
+		if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+			t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+		}
+		if client.manifest != nil {
+			t.Fatal("manifest cache retained after failed DeleteAll")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+	})
+
+	t.Run("InvalidationFailureBlocksMutation", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNext("PutObject", errors.New("invalidation unavailable"))
+
+		client := store.newClient("db")
+		client.ManifestEnabled = true
+		if err := client.DeleteAll(context.Background()); err == nil {
+			t.Fatal("expected invalidation error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("DeleteAll mutated objects before manifest invalidation")
+		}
+		if got := store.operationCount("ListObjectsV2"); got != 0 {
+			t.Fatalf("list operations=%d, want 0", got)
+		}
+		if got := store.operationCount("DeleteObjects"); got != 0 {
+			t.Fatalf("delete operations=%d, want 0", got)
+		}
+	})
+}
+
 func TestReplicaClient_ManifestDisabledCleanupDeletionRetries(t *testing.T) {
 	t.Run("DeleteLTXFiles", func(t *testing.T) {
 		store := newManifestTestStore(t)
