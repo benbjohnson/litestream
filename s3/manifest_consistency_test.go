@@ -47,6 +47,7 @@ type manifestTestStore struct {
 	deleteFailures    [][]manifestTestDeleteError
 	operations        map[string]int
 	keyOperations     map[string]int
+	requestHeaders    map[string][]http.Header
 	pauses            []*manifestTestPause
 	events            chan manifestTestEvent
 }
@@ -74,6 +75,7 @@ func newManifestTestStore(t *testing.T) *manifestTestStore {
 		keyedAfterFailure: make(map[string][]error),
 		operations:        make(map[string]int),
 		keyOperations:     make(map[string]int),
+		requestHeaders:    make(map[string][]http.Header),
 		events:            make(chan manifestTestEvent, 100),
 	}
 }
@@ -160,6 +162,17 @@ func (s *manifestTestStore) operationCountForKey(operation, key string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.keyOperations[operation+"\x00"+key]
+}
+
+func (s *manifestTestStore) headersForKey(operation, key string) []http.Header {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	headers := s.requestHeaders[operation+"\x00"+key]
+	result := make([]http.Header, len(headers))
+	for i := range headers {
+		result[i] = headers[i].Clone()
+	}
+	return result
 }
 
 func (s *manifestTestStore) pauseNext(operation, key string) (<-chan struct{}, chan<- struct{}) {
@@ -250,6 +263,7 @@ func (s *manifestTestStore) do(r *http.Request) (*http.Response, error) {
 	s.operations[operation]++
 	failureKey := operation + "\x00" + key
 	s.keyOperations[failureKey]++
+	s.requestHeaders[failureKey] = append(s.requestHeaders[failureKey], r.Header.Clone())
 	var failure error
 	if failures := s.keyedFailures[failureKey]; len(failures) != 0 {
 		failure = failures[0]
@@ -311,8 +325,8 @@ func (s *manifestTestStore) do(r *http.Request) (*http.Response, error) {
 	if err != nil {
 		return nil, err
 	}
-	if afterFailure != nil {
-		if response != nil && response.Body != nil {
+	if afterFailure != nil && response.StatusCode >= 200 && response.StatusCode < 300 {
+		if response.Body != nil {
 			_ = response.Body.Close()
 		}
 		return nil, afterFailure
@@ -793,7 +807,10 @@ func TestReplicaClient_ManifestInvalidationForcesListFallback(t *testing.T) {
 	writer.ManifestWriteEnabled = true
 
 	writer.manifestMu.Lock()
-	ready, err := writer.prepareManifestMutation(context.Background(), true, 1)
+	ready, err := writer.prepareManifestMutation(context.Background(), true, &manifestMutation{
+		lease: &litestream.Lease{Generation: 1},
+		token: "test-mutation",
+	})
 	writer.manifestMu.Unlock()
 	if err != nil || !ready {
 		t.Fatalf("prepare manifest mutation: ready=%v err=%v", ready, err)
@@ -1182,6 +1199,147 @@ func TestReplicaClient_ManifestConcurrentWriteAndDeletePublishCompleteState(t *t
 	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{2, 2}})
 }
 
+func TestReplicaClient_ManifestInvalidationIsMutationSpecific(t *testing.T) {
+	store := newManifestTestStore(t)
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+
+	key := "db/0000/0000000000000001-0000000000000001.ltx"
+	entered, resume := store.pauseNext("PutObject", key)
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1)))
+		errCh <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for LTX upload")
+	}
+
+	var sentinel struct {
+		Version    int    `json:"version"`
+		Generation int64  `json:"generation"`
+		Token      string `json:"token"`
+	}
+	if err := json.Unmarshal(store.object(t, "db/manifest.json"), &sentinel); err != nil {
+		t.Fatal(err)
+	}
+	if sentinel.Version != manifestInvalidVersion {
+		t.Errorf("sentinel version = %d, want %d", sentinel.Version, manifestInvalidVersion)
+	}
+	if sentinel.Generation == 0 {
+		t.Error("sentinel generation is zero")
+	}
+	if sentinel.Token == "" {
+		t.Error("sentinel token is empty")
+	}
+
+	close(resume)
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReplicaClient_ManifestFinalPublicationIsFenced(t *testing.T) {
+	t.Run("OwnershipLost", func(t *testing.T) {
+		testManifestFinalPublicationIsFenced(t, false)
+	})
+	t.Run("FailAfterApplyOwnershipLost", func(t *testing.T) {
+		testManifestFinalPublicationIsFenced(t, true)
+	})
+}
+
+func testManifestFinalPublicationIsFenced(t *testing.T, failAfterApply bool) {
+	t.Helper()
+	store := newManifestTestStore(t)
+	writerA := store.newClient("db")
+	writerA.ManifestWriteEnabled = true
+	writerB := store.newClient("db")
+	writerB.ManifestWriteEnabled = true
+
+	ltxKey := "db/0000/0000000000000001-0000000000000001.ltx"
+	ltxEntered, ltxResume := store.pauseNext("PutObject", ltxKey)
+	errA := make(chan error, 1)
+	go func() {
+		_, err := writerA.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1)))
+		errA <- err
+	}()
+	select {
+	case <-ltxEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for old writer LTX upload")
+	}
+
+	finalEntered, finalResume := store.pauseNext("PutObject", "db/manifest.json")
+	if failAfterApply {
+		store.failNextAfterApplyForKey("PutObject", "db/manifest.json", errors.New("response unavailable after final manifest put"))
+	}
+	close(ltxResume)
+	select {
+	case <-finalEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for old writer final publication")
+	}
+
+	var lease litestream.Lease
+	if err := json.Unmarshal(store.object(t, "db/.manifest/lock.json"), &lease); err != nil {
+		t.Fatal(err)
+	}
+	lease.ExpiresAt = time.Now().Add(-time.Minute)
+	lease.Owner = "stolen-owner"
+	data, err := json.Marshal(&lease)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store.putObject("db/.manifest/lock.json", data)
+
+	if _, err := writerB.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatalf("new writer: %v", err)
+	}
+	assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+
+	close(finalResume)
+	select {
+	case err := <-errA:
+		if !errors.Is(err, litestream.ErrLeaseNotHeld) {
+			t.Fatalf("old writer error = %v, want ErrLeaseNotHeld", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for old writer")
+	}
+	assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+}
+
+func TestReplicaClient_ManifestFinalPublicationFailAfterApplyWithOwnership(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.failNextAfterApplyForKey("PutObject", "db/manifest.json", nil)
+	store.failNextAfterApplyForKey("PutObject", "db/manifest.json", errors.New("response unavailable after final manifest put"))
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+		t.Fatal(err)
+	}
+
+	headers := store.headersForKey("PutObject", "db/manifest.json")
+	if len(headers) != 2 {
+		t.Fatalf("manifest PUT count = %d, want 2", len(headers))
+	}
+	if got := headers[1].Get("If-Match"); got == "" {
+		t.Fatal("final manifest PUT is missing If-Match")
+	}
+	assertManifestEntries(t, store.manifest(t, "db"), 0, [][2]ltx.TXID{{1, 1}})
+
+	listCount := store.operationCount("ListObjectsV2")
+	reader := store.newClient("db")
+	reader.ManifestEnabled = true
+	assertFileRanges(t, mustCollectLTXFiles(t, reader, 0), [][2]ltx.TXID{{1, 1}})
+	if got := store.operationCount("ListObjectsV2"); got != listCount {
+		t.Fatal("reader used LIST for committed fenced manifest")
+	}
+}
+
 func TestReplicaClient_ManifestOwnershipAcquisitionFailureBlocksMutation(t *testing.T) {
 	store := newManifestTestStore(t)
 	store.putLTX(t, "db", 0, 1, 1)
@@ -1566,6 +1724,54 @@ func TestReplicaClient_ManifestEnabledDeleteAll(t *testing.T) {
 		}
 		if got := store.operationCount("DeleteObjects"); got != 0 {
 			t.Fatalf("delete operations=%d, want 0", got)
+		}
+	})
+}
+
+func TestReplicaClient_ManifestMutationOptIn(t *testing.T) {
+	t.Run("Absent", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		writer := store.newClient("db")
+		if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+			t.Fatal(err)
+		}
+		if got := store.operationCountForKey("PutObject", "db/.manifest/lock.json"); got != 0 {
+			t.Fatalf("ownership PUT count = %d, want 0", got)
+		}
+		if store.hasObject("db/manifest.json") {
+			t.Fatal("manifest object created without opt-in")
+		}
+	})
+
+	t.Run("ExplicitFalse", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putManifest(t, "db", NewManifest())
+		writer := store.newClient("db")
+		writer.ManifestConfigured = true
+		if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+			t.Fatal(err)
+		}
+		if got := store.operationCountForKey("PutObject", "db/.manifest/lock.json"); got == 0 {
+			t.Fatal("explicit false cleanup did not acquire ownership")
+		}
+		if store.hasObject("db/manifest.json") {
+			t.Fatal("explicit false cleanup left manifest")
+		}
+	})
+
+	t.Run("True", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		writer := store.newClient("db")
+		writer.ManifestConfigured = true
+		writer.ManifestWriteEnabled = true
+		if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
+			t.Fatal(err)
+		}
+		if got := store.operationCountForKey("PutObject", "db/.manifest/lock.json"); got == 0 {
+			t.Fatal("enabled manifest mutation did not acquire ownership")
+		}
+		if got := store.manifest(t, "db").Version; got != ManifestVersion {
+			t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
 		}
 	})
 }

@@ -4,14 +4,14 @@
 
 **Goal:** Make S3 manifests safe across existing replicas, restarts, crashes, partial mutations, manifest failures, and configuration changes without breaking the public `ReplicaClient` interface.
 
-**Architecture:** Every manifest-aware S3 mutation acquires a renewable conditional lease, then publishes an unsupported-version sentinel that forces readers to use authoritative LIST operations. `manifestMu` protects the client cache while distributed ownership serializes clients and processes. The persistent ownership generation permits validated cache reuse for consecutive uncontested mutations; missing or untrusted cache state is rebuilt directly from LIST. Restore uses a private optional manifest capability, leaving the backend interface unchanged.
+**Architecture:** Every manifest-aware S3 mutation acquires a renewable conditional lease, then publishes a mutation-specific unsupported-version sentinel that forces readers to use authoritative LIST operations. The final valid manifest uses `If-Match` against the sentinel ETag. `manifestMu` protects the client cache while distributed ownership serializes clients and processes. The persistent ownership generation permits validated cache reuse for consecutive uncontested mutations; missing or untrusted cache state is rebuilt directly from LIST. Restore uses a private optional manifest capability, leaving the backend interface unchanged.
 
 **Tech Stack:** Go, AWS SDK for Go v2, Smithy HTTP test transports, `log/slog`, standard `testing`, GitHub Actions.
 
 ## Global Constraints
 
 - Always return errors rather than logging and continuing when failure can affect correctness.
-- Final valid-manifest publication remains best-effort only because the unsupported-version sentinel guarantees LIST fallback.
+- Final valid-manifest publication uses `If-Match` against the mutation sentinel. Lost ownership returns an error; other PUT errors remain nonfatal after the LTX mutation succeeds.
 - Preserve current `LTXFiles` seek behavior: include files whose `MinTXID >= seek`.
 - Add no new runtime dependencies.
 - Match existing Litestream naming, logging, test, and error-wrapping conventions.
@@ -250,7 +250,7 @@ Add `deleteManifest(ctx) error` as the shared DELETE helper. It returns wrapped 
 
 - [ ] **Step 4: Serialize `WriteLTXFile` across the mutation lifecycle**
 
-When `ManifestWriteEnabled || ManifestConfigured`, lock `manifestMu` before preparing the mutation and hold it through upload and final publication. If preparation fails, return before uploader invocation. On upload or ETag failure, clear `c.manifest`. After success, add the file only when `manifestReady`, then call a renamed `publishManifest(ctx)` that debug-logs through `c.logger`, clears the cache on failure, and does not delete the sentinel.
+When manifest mutation or explicit cleanup is active, lock `manifestMu` before acquiring distributed ownership and hold it through upload and final publication. If preparation fails, return before uploader invocation. On upload or ETag failure, clear `c.manifest`. After success, add the file only when `manifestReady`, then publish with `If-Match` against the retained sentinel ETag. Lost ownership returns an error; other publication errors clear the cache and use `c.logger`.
 
 - [ ] **Step 5: Run bootstrap, sentinel, existing manifest, and race tests**
 
@@ -460,9 +460,9 @@ Document these exact rules:
 - Before any LTX mutation, a manifest-enabled writer publishes an unsupported-version sentinel.
 - Readers reject that version and fall back to LIST.
 - Failure to publish the sentinel aborts the LTX mutation.
-- Failure to publish the final valid manifest leaves the sentinel and does not fail an already-successful LTX mutation.
+- Final publication uses `If-Match` against the sentinel ETag. A definite failure leaves the sentinel; an ambiguous committed valid manifest remains safe.
 - Missing writer cache is rebuilt directly from LIST across levels `0..SnapshotLevel`.
-- Disabling manifests removes stale state before mutation and retries cleanup errors.
+- Explicit `manifest: false` removes stale state before mutation and retries cleanup errors; an absent key performs no manifest work.
 
 - [ ] **Step 2: Restore the backend-neutral interface guide**
 
