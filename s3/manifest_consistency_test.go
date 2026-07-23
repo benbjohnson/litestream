@@ -372,7 +372,7 @@ func (s *manifestTestStore) listObjectsV2Response(r *http.Request) (*http.Respon
 		if err != nil || parsed < 0 {
 			return nil, fmt.Errorf("invalid max-keys: %q", value)
 		}
-		maxKeys = parsed
+		maxKeys = max(parsed, 1)
 	}
 
 	start := 0
@@ -1203,5 +1203,29 @@ func TestManifestConsistencyStore(t *testing.T) {
 	}
 	if got := failedStore.operationCount("PutObject"); got != 1 {
 		t.Fatalf("failed PutObject count = %d, want 1", got)
+	}
+}
+
+func TestManifestConsistencyStoreListMaxKeysZero(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putObject("paged/a", []byte("a"))
+	store.putObject("paged/b", []byte("b"))
+
+	request, err := http.NewRequest(http.MethodGet, "https://example.com?prefix=paged%2F&max-keys=0&continuation-token=0", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := store.listObjectsV2Response(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+
+	var result manifestTestListResult
+	if err := xml.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := result.NextContinuationToken, "1"; got != want {
+		t.Fatalf("next continuation token = %q, want %q", got, want)
 	}
 }
