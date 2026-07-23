@@ -35,11 +35,12 @@ const manifestTestBucket = "test-bucket"
 var manifestTestLastModified = time.Date(2026, time.January, 2, 3, 4, 5, 0, time.UTC)
 
 type manifestTestStore struct {
-	t          *testing.T
-	mu         sync.Mutex
-	objects    map[string][]byte
-	failures   map[string][]error
-	operations map[string]int
+	t              *testing.T
+	mu             sync.Mutex
+	objects        map[string][]byte
+	failures       map[string][]error
+	deleteFailures [][]manifestTestDeleteError
+	operations     map[string]int
 }
 
 func newManifestTestStore(t *testing.T) *manifestTestStore {
@@ -96,6 +97,12 @@ func (s *manifestTestStore) failNext(operation string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.failures[operation] = append(s.failures[operation], err)
+}
+
+func (s *manifestTestStore) failNextDeleteObjects(failures ...manifestTestDeleteError) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleteFailures = append(s.deleteFailures, failures)
 }
 
 func (s *manifestTestStore) operationCount(operation string) int {
@@ -286,9 +293,16 @@ type manifestTestDeleteObject struct {
 	Key string `xml:"Key"`
 }
 
+type manifestTestDeleteError struct {
+	Key     string `xml:"Key"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
 type manifestTestDeleteResult struct {
 	XMLName xml.Name                   `xml:"http://s3.amazonaws.com/doc/2006-03-01/ DeleteResult"`
 	Deleted []manifestTestDeleteObject `xml:"Deleted"`
+	Errors  []manifestTestDeleteError  `xml:"Error"`
 }
 
 func (s *manifestTestStore) deleteObjectsResponse(r *http.Request) (*http.Response, error) {
@@ -306,12 +320,26 @@ func (s *manifestTestStore) deleteObjectsResponse(r *http.Request) (*http.Respon
 	}
 
 	s.mu.Lock()
+	var failures []manifestTestDeleteError
+	if len(s.deleteFailures) != 0 {
+		failures = s.deleteFailures[0]
+		s.deleteFailures = s.deleteFailures[1:]
+	}
+	failureByKey := make(map[string]manifestTestDeleteError, len(failures))
+	for _, failure := range failures {
+		failureByKey[failure.Key] = failure
+	}
+	result := manifestTestDeleteResult{}
 	for _, object := range request.Objects {
+		if failure, ok := failureByKey[object.Key]; ok {
+			result.Errors = append(result.Errors, failure)
+			continue
+		}
 		delete(s.objects, object.Key)
+		result.Deleted = append(result.Deleted, object)
 	}
 	s.mu.Unlock()
 
-	result := manifestTestDeleteResult{Deleted: request.Objects}
 	return manifestTestXMLResponse(http.StatusOK, result)
 }
 
@@ -521,6 +549,18 @@ func mustManifestTestLTX(t *testing.T, minTXID, maxTXID ltx.TXID) []byte {
 	return buf.Bytes()
 }
 
+func manifestWithFile(level int, minTXID, maxTXID ltx.TXID) *Manifest {
+	manifest := NewManifest()
+	manifest.AddFile(&ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Size:      1,
+		CreatedAt: manifestTestLastModified,
+	})
+	return manifest
+}
+
 func assertManifestEntries(t *testing.T, manifest *Manifest, level int, want [][2]ltx.TXID) {
 	t.Helper()
 	assertFileRanges(t, manifest.EntriesForLevel(level, 0), want)
@@ -558,6 +598,17 @@ func mustCollectLTXFiles(t *testing.T, client *ReplicaClient, level int) []*ltx.
 		t.Fatalf("iterate LTX files: %v", err)
 	}
 	return infos
+}
+
+func assertManifestListFallback(t *testing.T, store *manifestTestStore, path string, level int, want [][2]ltx.TXID) {
+	t.Helper()
+	listCount := store.operationCount("ListObjectsV2")
+	reader := store.newClient(path)
+	reader.ManifestEnabled = true
+	assertFileRanges(t, mustCollectLTXFiles(t, reader, level), want)
+	if got := store.operationCount("ListObjectsV2"); got <= listCount {
+		t.Fatal("expected LIST fallback for invalid or missing manifest")
+	}
 }
 
 func TestReplicaClient_ManifestBootstrapExistingReplica(t *testing.T) {
@@ -599,25 +650,87 @@ func TestReplicaClient_ManifestInvalidationForcesListFallback(t *testing.T) {
 	}
 }
 
-func TestReplicaClient_ManifestInvalidationPrecedesUpload(t *testing.T) {
+func TestReplicaClient_ManifestMutationFailures(t *testing.T) {
+	t.Run("UploadFailureLeavesInvalidManifest", testManifestUploadFailure)
+	t.Run("ManifestPutFailureLeavesInvalidManifest", testManifestPublishFailure)
+	t.Run("PartialDeleteLeavesInvalidManifest", testManifestPartialDeleteFailure)
+	t.Run("RestartRebuildsAfterInvalidManifest", testManifestRestartRebuild)
+	t.Run("RebuildListFailureLeavesInvalidManifest", testManifestRebuildFailure)
+}
+
+func testManifestUploadFailure(t *testing.T) {
 	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
 	store.failNext("PutObject", nil)
 	store.failNext("PutObject", errors.New("upload unavailable"))
 
 	writer := store.newClient("db")
 	writer.ManifestWriteEnabled = true
-	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err == nil {
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err == nil {
 		t.Fatal("expected upload error")
 	}
-	if store.hasLTX("db", 0, 1, 1) {
+	if store.hasLTX("db", 0, 2, 2) {
 		t.Fatal("LTX file exists after failed upload")
 	}
 	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
 		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
 	}
+	assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
 }
 
-func TestReplicaClient_ManifestPublishFailureLeavesInvalidManifest(t *testing.T) {
+func testManifestPublishFailure(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.failNext("PutObject", nil)
+	store.failNext("PutObject", nil)
+	store.failNext("PutObject", errors.New("manifest unavailable"))
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+	}
+	assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+}
+
+func testManifestPartialDeleteFailure(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.putLTX(t, "db", 0, 2, 2)
+	manifest := manifestWithFile(0, 1, 1)
+	manifest.AddFile(manifestWithFile(0, 2, 2).EntriesForLevel(0, 0)[0])
+	store.putManifest(t, "db", manifest)
+	store.failNextDeleteObjects(manifestTestDeleteError{
+		Key:     "db/0000/0000000000000002-0000000000000002.ltx",
+		Code:    "InternalError",
+		Message: "delete unavailable",
+	})
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	err := writer.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{
+		{Level: 0, MinTXID: 1, MaxTXID: 1},
+		{Level: 0, MinTXID: 2, MaxTXID: 2},
+	})
+	if err == nil {
+		t.Fatal("expected partial delete error")
+	}
+	if store.hasLTX("db", 0, 1, 1) {
+		t.Fatal("successfully deleted LTX file still exists")
+	}
+	if !store.hasLTX("db", 0, 2, 2) {
+		t.Fatal("failed LTX deletion removed object")
+	}
+	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+	}
+	assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{2, 2}})
+}
+
+func testManifestRestartRebuild(t *testing.T) {
 	store := newManifestTestStore(t)
 	store.failNext("PutObject", nil)
 	store.failNext("PutObject", nil)
@@ -628,18 +741,192 @@ func TestReplicaClient_ManifestPublishFailureLeavesInvalidManifest(t *testing.T)
 	if _, err := writer.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(mustManifestTestLTX(t, 1, 1))); err != nil {
 		t.Fatal(err)
 	}
+	assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+
+	restartedWriter := store.newClient("db")
+	restartedWriter.ManifestWriteEnabled = true
+	if _, err := restartedWriter.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	manifest := store.manifest(t, "db")
+	if got := manifest.Version; got != ManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
+	}
+	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+}
+
+func testManifestRebuildFailure(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.failNext("ListObjectsV2", errors.New("list unavailable"))
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
 	if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
 		t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
 	}
+	assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}, {2, 2}})
+}
+
+func TestReplicaClient_ManifestCleanupRetriesBeforeMutation(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+	writer := store.newClient("db")
+	writer.ManifestConfigured = true
+	store.failNext("DeleteObject", errors.New("cleanup unavailable"))
+
+	_, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2)))
+	if err == nil {
+		t.Fatal("expected cleanup error")
+	}
+	if store.hasLTX("db", 0, 2, 2) {
+		t.Fatal("LTX mutation occurred before stale manifest cleanup")
+	}
+	if !store.hasObject("db/manifest.json") {
+		t.Fatal("manifest removed after failed cleanup")
+	}
+
+	if _, err := writer.WriteLTXFile(context.Background(), 0, 2, 2, bytes.NewReader(mustManifestTestLTX(t, 2, 2))); err != nil {
+		t.Fatal(err)
+	}
+	if !store.hasLTX("db", 0, 2, 2) {
+		t.Fatal("expected retried mutation to succeed")
+	}
+	if store.hasObject("db/manifest.json") {
+		t.Fatal("stale manifest remains after successful cleanup")
+	}
+	if got := store.operationCount("DeleteObject"); got != 2 {
+		t.Fatalf("cleanup attempts=%d, want 2", got)
+	}
+}
+
+func TestReplicaClient_ManifestDeleteLTXFilesPublishesSurvivors(t *testing.T) {
+	store := newManifestTestStore(t)
+	store.putLTX(t, "db", 0, 1, 1)
+	store.putLTX(t, "db", 0, 2, 2)
+	manifest := manifestWithFile(0, 1, 1)
+	manifest.AddFile(manifestWithFile(0, 2, 2).EntriesForLevel(0, 0)[0])
+	store.putManifest(t, "db", manifest)
+
+	writer := store.newClient("db")
+	writer.ManifestWriteEnabled = true
+	if err := writer.DeleteLTXFiles(context.Background(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	manifest = store.manifest(t, "db")
+	if got := manifest.Version; got != ManifestVersion {
+		t.Fatalf("manifest version = %d, want %d", got, ManifestVersion)
+	}
+	assertManifestEntries(t, manifest, 0, [][2]ltx.TXID{{2, 2}})
 
 	listCount := store.operationCount("ListObjectsV2")
 	reader := store.newClient("db")
 	reader.ManifestEnabled = true
-	infos := mustCollectLTXFiles(t, reader, 0)
-	assertFileRanges(t, infos, [][2]ltx.TXID{{1, 1}})
-	if got := store.operationCount("ListObjectsV2"); got <= listCount {
-		t.Fatal("expected LIST fallback for invalid manifest")
+	assertFileRanges(t, mustCollectLTXFiles(t, reader, 0), [][2]ltx.TXID{{2, 2}})
+	if got := store.operationCount("ListObjectsV2"); got != listCount {
+		t.Fatal("valid manifest reader unexpectedly used LIST")
 	}
+}
+
+func TestReplicaClient_ManifestDisabledCleanupDeletionRetries(t *testing.T) {
+	t.Run("DeleteLTXFiles", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNext("DeleteObject", errors.New("cleanup unavailable"))
+
+		writer := store.newClient("db")
+		writer.ManifestConfigured = true
+		files := []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}
+		if err := writer.DeleteLTXFiles(context.Background(), files); err == nil {
+			t.Fatal("expected cleanup error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("LTX mutation occurred before stale manifest cleanup")
+		}
+		if err := writer.DeleteLTXFiles(context.Background(), files); err != nil {
+			t.Fatal(err)
+		}
+		if store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("expected retried deletion to succeed")
+		}
+		if got := store.operationCount("DeleteObject"); got != 2 {
+			t.Fatalf("cleanup attempts=%d, want 2", got)
+		}
+	})
+
+	t.Run("DeleteAll", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNext("DeleteObject", errors.New("cleanup unavailable"))
+
+		writer := store.newClient("db")
+		writer.ManifestConfigured = true
+		if err := writer.DeleteAll(context.Background()); err == nil {
+			t.Fatal("expected cleanup error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("DeleteAll mutated objects before stale manifest cleanup")
+		}
+		if err := writer.DeleteAll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if store.hasLTX("db", 0, 1, 1) || store.hasObject("db/manifest.json") {
+			t.Fatal("expected retried DeleteAll to succeed")
+		}
+		if got := store.operationCount("DeleteObject"); got != 2 {
+			t.Fatalf("cleanup attempts=%d, want 2", got)
+		}
+	})
+}
+
+func TestReplicaClient_ManifestDeleteAllLifecycle(t *testing.T) {
+	t.Run("SuccessRemovesSentinelAndObjects", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+
+		writer := store.newClient("db")
+		writer.ManifestWriteEnabled = true
+		if err := writer.DeleteAll(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if store.hasLTX("db", 0, 1, 1) || store.hasObject("db/manifest.json") {
+			t.Fatal("DeleteAll left replica objects")
+		}
+		if writer.manifest != nil {
+			t.Fatal("DeleteAll retained in-memory manifest")
+		}
+		assertManifestListFallback(t, store, "db", 0, nil)
+	})
+
+	t.Run("FailureLeavesInvalidManifest", func(t *testing.T) {
+		store := newManifestTestStore(t)
+		store.putLTX(t, "db", 0, 1, 1)
+		store.putManifest(t, "db", manifestWithFile(0, 1, 1))
+		store.failNext("DeleteObjects", errors.New("delete unavailable"))
+
+		writer := store.newClient("db")
+		writer.ManifestWriteEnabled = true
+		if err := writer.DeleteAll(context.Background()); err == nil {
+			t.Fatal("expected delete error")
+		}
+		if !store.hasLTX("db", 0, 1, 1) {
+			t.Fatal("failed DeleteAll removed LTX object")
+		}
+		if got := store.manifest(t, "db").Version; got != manifestInvalidVersion {
+			t.Fatalf("manifest version = %d, want %d", got, manifestInvalidVersion)
+		}
+		if writer.manifest != nil {
+			t.Fatal("failed DeleteAll retained in-memory manifest")
+		}
+		assertManifestListFallback(t, store, "db", 0, [][2]ltx.TXID{{1, 1}})
+	})
 }
 
 func TestManifestConsistencyStore(t *testing.T) {

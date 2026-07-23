@@ -1123,6 +1123,21 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 	}
 
+	manifestConfigured := c.ManifestWriteEnabled || c.ManifestConfigured
+	if manifestConfigured {
+		c.manifestMu.Lock()
+		defer c.manifestMu.Unlock()
+	}
+
+	manifestReady := false
+	if manifestConfigured {
+		var err error
+		manifestReady, err = c.prepareManifestMutation(ctx, true)
+		if err != nil {
+			return err
+		}
+	}
+
 	// Delete in batches
 	for len(objIDs) > 0 {
 		n := min(len(objIDs), MaxKeys)
@@ -1138,6 +1153,9 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		internal.OperationDurationHistogramVec.WithLabelValues(ReplicaClientType, "DELETE").Observe(duration.Seconds())
 
 		if err != nil {
+			if manifestConfigured {
+				c.manifest = nil
+			}
 			return fmt.Errorf("s3: delete batch of %d objects: %w", n, err)
 		}
 
@@ -1170,13 +1188,19 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		}
 
 		if err := deleteOutputError(out); err != nil {
+			if manifestConfigured {
+				c.manifest = nil
+			}
 			return err
 		}
 
 		objIDs = objIDs[n:]
 	}
 
-	c.updateManifestAfterDelete(ctx, a)
+	if manifestReady {
+		c.manifest.RemoveFiles(a)
+		c.publishManifest(ctx)
+	}
 
 	return nil
 }
@@ -1185,6 +1209,15 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	if err := c.Init(ctx); err != nil {
 		return err
+	}
+
+	manifestConfigured := c.ManifestWriteEnabled || c.ManifestConfigured
+	if manifestConfigured {
+		c.manifestMu.Lock()
+		defer c.manifestMu.Unlock()
+		if _, err := c.prepareManifestMutation(ctx, false); err != nil {
+			return err
+		}
 	}
 
 	var objIDs []types.ObjectIdentifier
@@ -1199,6 +1232,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	for paginator.HasMorePages() {
 		page, err := paginator.NextPage(ctx)
 		if err != nil {
+			if manifestConfigured {
+				c.manifest = nil
+			}
 			return fmt.Errorf("s3: list objects page: %w", err)
 		}
 
@@ -1217,18 +1253,27 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 			Delete: &types.Delete{Objects: objIDs[:n], Quiet: aws.Bool(true)},
 		})
 		if err != nil {
+			if manifestConfigured {
+				c.manifest = nil
+			}
 			return fmt.Errorf("s3: delete all batch of %d objects: %w", n, err)
 		} else if err := deleteOutputError(out); err != nil {
+			if manifestConfigured {
+				c.manifest = nil
+			}
 			return err
 		}
 
 		objIDs = objIDs[n:]
 	}
 
-	c.manifestMu.Lock()
-	c.manifest = nil
-	c.manifestMu.Unlock()
-
+	if manifestConfigured {
+		c.manifest = nil
+	} else {
+		c.manifestMu.Lock()
+		c.manifest = nil
+		c.manifestMu.Unlock()
+	}
 	return nil
 }
 
@@ -1368,70 +1413,10 @@ func (c *ReplicaClient) deleteManifest(ctx context.Context) error {
 	return nil
 }
 
-func (c *ReplicaClient) loadManifest(ctx context.Context) error {
-	if c.manifest != nil {
-		return nil
-	}
-
-	m, err := c.readManifest(ctx)
-	if err != nil {
-		return err
-	}
-	if m == nil {
-		m = NewManifest()
-	}
-	c.manifest = m
-	return nil
-}
-
-func (c *ReplicaClient) updateManifestAfterDelete(ctx context.Context, infos []*ltx.FileInfo) {
-	if !c.ManifestWriteEnabled {
-		c.cleanupStaleManifest(ctx)
-		return
-	}
-
-	c.manifestMu.Lock()
-	defer c.manifestMu.Unlock()
-
-	if err := c.loadManifest(ctx); err != nil {
-		slog.Debug("manifest: failed to load for delete, skipping update", "error", err)
-		return
-	}
-
-	c.manifest.RemoveFiles(infos)
-
-	c.publishManifest(ctx)
-}
-
 func (c *ReplicaClient) publishManifest(ctx context.Context) {
 	if err := c.writeManifest(ctx, c.manifest); err != nil {
 		c.logger.Debug("manifest: failed to write", "error", err)
 		c.manifest = nil
-	}
-}
-
-// cleanupStaleManifest deletes the manifest.json file if it exists when manifest
-// writing is disabled. This handles the case where a user disables manifests after
-// they were previously enabled. Only attempts cleanup once to avoid DELETE calls
-// on every mutation. Only runs for clients created from config (ManifestConfigured=true).
-func (c *ReplicaClient) cleanupStaleManifest(ctx context.Context) {
-	// Only run cleanup for clients created from config where manifest settings
-	// were explicitly processed. This prevents cleanup attempts for programmatic
-	// clients (tests) that never had manifests configured.
-	if !c.ManifestConfigured {
-		return
-	}
-
-	c.manifestMu.Lock()
-	defer c.manifestMu.Unlock()
-
-	if c.manifestCleanupAttempted {
-		return
-	}
-	c.manifestCleanupAttempted = true
-
-	if err := c.deleteManifest(ctx); err != nil {
-		slog.Debug("manifest: failed to delete stale manifest", "error", err)
 	}
 }
 
