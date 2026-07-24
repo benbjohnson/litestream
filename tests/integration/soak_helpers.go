@@ -140,12 +140,15 @@ func StartMinIOContainer(t *testing.T) (containerID string, endpoint string, vol
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
 		"minio/minio", "server", "/data", "--console-address", ":9001")
 
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		t.Fatalf("Failed to start MinIO container: %v\nOutput: %s", err, string(output))
+	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("Failed to start MinIO container: %v\nOutput: %s", err, combinedOutput(stdoutBuf, stderrBuf))
 	}
 
-	containerID = strings.TrimSpace(string(output))
+	containerID = strings.TrimSpace(stdoutBuf.String())
+	if containerID == "" {
+		t.Fatal("MinIO container returned an empty container ID")
+	}
 	endpoint = fmt.Sprintf("http://localhost:%s", minioPort)
 
 	// Wait for MinIO to be ready
@@ -153,7 +156,7 @@ func StartMinIOContainer(t *testing.T) (containerID string, endpoint string, vol
 
 	// Verify container is running
 	cmd = exec.Command("docker", "ps", "-q", "-f", "name="+containerName)
-	output, err = cmd.CombinedOutput()
+	output, err := cmd.CombinedOutput()
 	if err != nil || len(strings.TrimSpace(string(output))) == 0 {
 		t.Fatalf("MinIO container failed to start properly")
 	}
@@ -197,10 +200,7 @@ func CreateMinIOBucket(t *testing.T, containerID, bucket string) {
 	}
 
 	// Use mc (MinIO Client) via docker to create bucket
-	cmd := exec.Command("docker", "run", "--rm",
-		"--link", containerID+":minio",
-		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
-		"minio/mc", "mb", "minio/"+bucket)
+	cmd := minioClientCommand(containerID, "mb", "minio/"+bucket)
 
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 	if err := cmd.Run(); err != nil {
@@ -221,11 +221,18 @@ func CreateMinIOBucket(t *testing.T, containerID, bucket string) {
 	t.Logf("MinIO bucket '%s' ready", bucket)
 }
 
+func minioClientCommand(containerID string, args ...string) *exec.Cmd {
+	dockerArgs := []string{
+		"run", "--rm",
+		"--network", "container:" + containerID,
+		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000",
+		"minio/mc",
+	}
+	return exec.Command("docker", append(dockerArgs, args...)...)
+}
+
 func minioBucketExists(containerID, bucket string) bool {
-	cmd := exec.Command("docker", "run", "--rm",
-		"--link", containerID+":minio",
-		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
-		"minio/mc", "ls", "minio/"+bucket+"/")
+	cmd := minioClientCommand(containerID, "ls", "minio/"+bucket+"/")
 	_, _, _ = configureCmdIO(cmd)
 	if err := cmd.Run(); err != nil {
 		return false
@@ -234,10 +241,7 @@ func minioBucketExists(containerID, bucket string) bool {
 }
 
 func clearMinIOBucket(containerID, bucket string) error {
-	cmd := exec.Command("docker", "run", "--rm",
-		"--link", containerID+":minio",
-		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
-		"minio/mc", "rm", "--recursive", "--force", "minio/"+bucket)
+	cmd := minioClientCommand(containerID, "rm", "--recursive", "--force", "minio/"+bucket)
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 	if err := cmd.Run(); err != nil {
 		output := combinedOutput(stdoutBuf, stderrBuf)
@@ -267,10 +271,7 @@ func waitForMinIOBucket(containerID, bucket string, timeout time.Duration) error
 func CountMinIOObjects(t *testing.T, containerID, bucket string) int {
 	t.Helper()
 
-	cmd := exec.Command("docker", "run", "--rm",
-		"--link", containerID+":minio",
-		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
-		"minio/mc", "ls", "minio/"+bucket+"/", "--recursive")
+	cmd := minioClientCommand(containerID, "ls", "minio/"+bucket+"/", "--recursive")
 
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 	if err := cmd.Run(); err != nil {
