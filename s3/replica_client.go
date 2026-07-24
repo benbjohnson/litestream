@@ -831,6 +831,26 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			}
 		}
 
+		if litestream.IsGoogleCloudStorageEndpoint(c.Endpoint) {
+			if err := stack.Finalize.Insert(
+				middleware.FinalizeMiddlewareFunc(
+					"LitestreamGCSRemoveAcceptEncoding",
+					func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
+						out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
+					) {
+						if req, ok := in.Request.(*smithyhttp.Request); ok {
+							req.Header.Del("Accept-Encoding")
+						}
+						return next.HandleFinalize(ctx, in)
+					},
+				),
+				"Signing",
+				middleware.Before,
+			); err != nil {
+				return err
+			}
+		}
+
 		// Many S3-compatible providers (e.g. Filebase) do not support SigV4
 		// payload hashing. Switching to unsigned payload matches the behavior
 		// of the AWS SDK v1 client used in Litestream v0.3.x and restores

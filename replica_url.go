@@ -222,6 +222,11 @@ func IsTigrisEndpoint(endpoint string) bool {
 	return host == "fly.storage.tigris.dev" || host == "t3.storage.dev"
 }
 
+// IsGoogleCloudStorageEndpoint returns true if the endpoint is Google Cloud Storage.
+func IsGoogleCloudStorageEndpoint(endpoint string) bool {
+	return extractEndpointHost(endpoint) == "storage.googleapis.com"
+}
+
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
 func IsDigitalOceanEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)

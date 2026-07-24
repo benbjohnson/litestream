@@ -604,6 +604,32 @@ func TestIsTigrisEndpoint(t *testing.T) {
 	}
 }
 
+func TestIsGoogleCloudStorageEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"storage.googleapis.com", true},
+		{"STORAGE.GOOGLEAPIS.COM", true},
+		{"https://storage.googleapis.com", true},
+		{"http://storage.googleapis.com", true},
+		{"https://storage.googleapis.com/path", true},
+		{"https://storage.googleapis.com.example.com", false},
+		{"https://other.googleapis.com", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsGoogleCloudStorageEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsGoogleCloudStorageEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestRegionFromS3ARN(t *testing.T) {
 	tests := []struct {
 		arn      string
