@@ -506,12 +506,18 @@ func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
 		}
 	})
 	t.Run("IgnoreHostKey", func(t *testing.T) {
+		previousLogger := slog.Default()
+		t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+		var capturedMu sync.Mutex
 		var captured []string
 		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 				if a.Key == slog.MessageKey {
+					capturedMu.Lock()
 					captured = append(captured, a.Value.String())
+					capturedMu.Unlock()
 				}
 				return a
 			},
@@ -528,9 +534,12 @@ func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
 			t.Fatalf("SFTP connection failed: %v", err)
 		}
 
-		if !slices.ContainsFunc(captured, func(msg string) bool {
+		capturedMu.Lock()
+		foundWarning := slices.ContainsFunc(captured, func(msg string) bool {
 			return strings.Contains(msg, "sftp host key not verified")
-		}) {
+		})
+		capturedMu.Unlock()
+		if !foundWarning {
 			t.Errorf("Expected warning not found")
 		}
 	})

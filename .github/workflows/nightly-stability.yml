@@ -453,16 +453,34 @@ jobs:
                 run_id: runId,
                 attempt_number: runAttempt,
                 per_page: 100,
-              },
-              response => response.data.jobs
+              }
             );
 
+            if (!Array.isArray(jobs)) {
+              core.setFailed('Unable to classify nightly stability run: jobs response was not an array');
+              return;
+            }
+
+            const validJobs = jobs.filter(job => job && typeof job === 'object');
+            const malformedJobCount = jobs.length - validJobs.length;
             const failedConclusions = new Set(['failure', 'timed_out', 'action_required', 'cancelled', 'startup_failure']);
-            const failedJobs = jobs.filter(job => failedConclusions.has(job.conclusion || ''));
+            const failedJobs = validJobs.filter(job => failedConclusions.has(job.conclusion || ''));
 
             if (failedJobs.length === 0) {
+              const monitoredJobs = validJobs.filter(job => job.name !== 'Notify on Failure');
+              const unclassifiedJobs = monitoredJobs.filter(job => !job.conclusion);
+              if (malformedJobCount > 0 || unclassifiedJobs.length > 0 || monitoredJobs.length === 0) {
+                core.setFailed(
+                  `Unable to classify nightly stability run: ${malformedJobCount} malformed and ${unclassifiedJobs.length} incomplete job records`
+                );
+                return;
+              }
               console.log('No failed jobs found for this run');
               return;
+            }
+
+            if (malformedJobCount > 0) {
+              console.warn(`Ignoring ${malformedJobCount} malformed job records`);
             }
 
             const failures = [];
