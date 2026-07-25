@@ -234,6 +234,11 @@ func IsGoogleCloudStorageEndpoint(endpoint string) bool {
 	}
 
 	labels := strings.Split(host, ".")
+	if len(labels) == 3 && labels[1] == "googleapis" && labels[2] == "com" {
+		location, ok := strings.CutSuffix(labels[0], "-storage")
+		return ok && location != ""
+	}
+
 	return len(labels) == 5 &&
 		labels[0] == "storage" &&
 		labels[1] != "" &&
