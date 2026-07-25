@@ -176,11 +176,6 @@ func TestStore_Integration(t *testing.T) {
 	db.MonitorInterval = factor * 100 * time.Millisecond
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
-	defer testingutil.MustCloseSQLDB(t, sqldb)
 
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
@@ -192,6 +187,9 @@ func TestStore_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close(t.Context())
+
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
 
 	// Create initial table
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
