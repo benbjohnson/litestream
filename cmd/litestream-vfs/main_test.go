@@ -1039,6 +1039,7 @@ func TestVFS_SortingLargeResultSet(t *testing.T) {
 	}
 
 	seedSortedDataset(t, primary, 25000)
+	forceReplicaSync(t, db)
 	if err := db.Replica.Stop(false); err != nil {
 		t.Fatalf("stop replica: %v", err)
 	}
