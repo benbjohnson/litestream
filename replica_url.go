@@ -229,22 +229,27 @@ func IsGoogleCloudStorageEndpoint(endpoint string) bool {
 		host = u.Hostname()
 	}
 	host = strings.TrimSuffix(host, ".")
-	if host == "storage.googleapis.com" {
-		return true
-	}
 
 	labels := strings.Split(host, ".")
-	if len(labels) == 3 && labels[1] == "googleapis" && labels[2] == "com" {
-		location, ok := strings.CutSuffix(labels[0], "-storage")
-		return ok && location != ""
+	if len(labels) < 3 ||
+		labels[len(labels)-2] != "googleapis" ||
+		labels[len(labels)-1] != "com" {
+		return false
 	}
-
-	return len(labels) == 5 &&
-		labels[0] == "storage" &&
-		labels[1] != "" &&
-		labels[2] == "rep" &&
-		labels[3] == "googleapis" &&
-		labels[4] == "com"
+	for _, label := range labels {
+		if label == "" {
+			return false
+		}
+	}
+	if len(labels) > 3 && labels[len(labels)-3] == "storage" {
+		return false
+	}
+	for _, segment := range strings.Split(labels[0], "-") {
+		if segment == "storage" {
+			return true
+		}
+	}
+	return false
 }
 
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
