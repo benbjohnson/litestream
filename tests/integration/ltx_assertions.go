@@ -17,15 +17,16 @@ import (
 
 // LTXEvent represents a parsed log event related to LTX operations.
 type LTXEvent struct {
-	Time      time.Time
-	Type      string // "sync", "snapshot", "compaction", "checkpoint"
-	Level     int    // compaction level (-1 if N/A)
-	MinTXID   string
-	MaxTXID   string
-	Size      int64
-	IsSnap    bool   // true if sync created a snapshot-sized LTX
-	Reason    string // snapshot reason from log
-	PageCount int    // number of pages (estimated from size)
+	Time           time.Time
+	Type           string // "sync", "snapshot", "compaction", "checkpoint"
+	CheckpointMode string
+	Level          int // compaction level (-1 if N/A)
+	MinTXID        string
+	MaxTXID        string
+	Size           int64
+	IsSnap         bool   // true if sync created a snapshot-sized LTX
+	Reason         string // snapshot reason from log
+	PageCount      int    // number of pages (estimated from size)
 }
 
 // LTXBehaviorReport holds all behavioral metrics from a test run.
@@ -386,20 +387,23 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	expectedSnapshots := 0
 	checkpointWindow := 5 * time.Second
 
-	for _, chkTime := range report.CheckpointTimes {
-		for _, snapEv := range snapSyncEvents {
-			diff := snapEv.Time.Sub(chkTime)
-			if diff >= 0 && diff <= checkpointWindow {
-				if isExpectedSnapshot(snapEv.Reason) {
-					expectedSnapshots++
-					continue
-				}
-				t.Errorf("  [no-snap-on-checkpoint] Snapshot sync at %v occurred %v after checkpoint at %v (reason: %s)",
-					snapEv.Time.Format("15:04:05"), diff.Round(time.Millisecond),
-					chkTime.Format("15:04:05"), snapEv.Reason)
-				violations++
-			}
+	for _, snapEv := range snapSyncEvents {
+		checkpointEv, ok := precedingCheckpoint(report.Events, snapEv.Time, checkpointWindow)
+		if !ok {
+			continue
 		}
+
+		if isExpectedRecoverySnapshot(snapEv.Reason) ||
+			isExpectedTruncateBoundarySnapshot(checkpointEv, snapEv) {
+			expectedSnapshots++
+			continue
+		}
+
+		diff := snapEv.Time.Sub(checkpointEv.Time)
+		t.Errorf("  [no-snap-on-checkpoint] Snapshot sync at %v occurred %v after %s checkpoint at %v (reason: %s)",
+			snapEv.Time.Format("15:04:05"), diff.Round(time.Millisecond),
+			checkpointEv.CheckpointMode, checkpointEv.Time.Format("15:04:05"), snapEv.Reason)
+		violations++
 	}
 
 	if violations == 0 {
@@ -414,16 +418,39 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	}
 }
 
-// isExpectedSnapshot returns true if the snapshot reason indicates an
-// intentional recovery mechanism or checkpoint safety boundary rather than the
-// checkpoint-triggers-unwanted-snapshot bug. NOTE: "full or restart checkpoint
-// detected" is intentionally NOT in this list — that is the exact bug this
-// assertion catches.
-func isExpectedSnapshot(reason string) bool {
+func precedingCheckpoint(events []LTXEvent, snapshotTime time.Time, window time.Duration) (LTXEvent, bool) {
+	var checkpoint LTXEvent
+	var ok bool
+	for _, ev := range events {
+		if ev.Type != "checkpoint" {
+			continue
+		}
+
+		diff := snapshotTime.Sub(ev.Time)
+		if diff < 0 || diff > window {
+			continue
+		}
+		if !ok || !ev.Time.Before(checkpoint.Time) {
+			checkpoint, ok = ev, true
+		}
+	}
+	return checkpoint, ok
+}
+
+// isExpectedRecoverySnapshot returns true if the snapshot reason indicates an
+// intentional recovery mechanism rather than the checkpoint-triggers-unwanted-
+// snapshot bug.
+func isExpectedRecoverySnapshot(reason string) bool {
 	return strings.Contains(reason, "repair snapshot") ||
 		strings.Contains(reason, "compaction detected missing") ||
-		strings.Contains(reason, "wal header salt reset") ||
-		strings.Contains(reason, "checkpoint boundary snapshot")
+		strings.Contains(reason, "wal header salt reset")
+}
+
+// PR #1292 requires emergency TRUNCATE checkpoints to take a boundary snapshot;
+// issue #1198 tracks the remaining cost of those full L0 snapshots.
+func isExpectedTruncateBoundarySnapshot(checkpoint, snapshot LTXEvent) bool {
+	return strings.EqualFold(checkpoint.CheckpointMode, "TRUNCATE") &&
+		snapshot.Reason == "checkpoint boundary snapshot"
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
@@ -607,17 +634,27 @@ func parseCheckpoint(line string) (LTXEvent, bool) {
 		return LTXEvent{}, false
 	}
 
-	isCheckpoint := (strings.Contains(line, "msg=checkpoint") || strings.Contains(line, `msg="checkpoint"`)) &&
-		strings.Contains(line, "mode=")
+	isCheckpoint := strings.Contains(line, "msg=checkpoint") ||
+		strings.Contains(line, `msg="checkpoint"`) ||
+		strings.Contains(line, `"msg":"checkpoint"`)
 	if !isCheckpoint {
+		return LTXEvent{}, false
+	}
+
+	mode := extractField(line, "mode=")
+	if mode == "" {
+		mode = extractJSONField(line, "mode")
+	}
+	if mode == "" {
 		return LTXEvent{}, false
 	}
 
 	t, _ := parseLogTime(line)
 	return LTXEvent{
-		Time:  t,
-		Type:  "checkpoint",
-		Level: -1,
+		Time:           t,
+		Type:           "checkpoint",
+		Level:          -1,
+		CheckpointMode: mode,
 	}, true
 }
 
