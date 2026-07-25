@@ -224,7 +224,22 @@ func IsTigrisEndpoint(endpoint string) bool {
 
 // IsGoogleCloudStorageEndpoint returns true if the endpoint is Google Cloud Storage.
 func IsGoogleCloudStorageEndpoint(endpoint string) bool {
-	return extractEndpointHost(endpoint) == "storage.googleapis.com"
+	host := extractEndpointHost(endpoint)
+	if u, err := url.Parse("//" + host); err == nil {
+		host = u.Hostname()
+	}
+	host = strings.TrimSuffix(host, ".")
+	if host == "storage.googleapis.com" {
+		return true
+	}
+
+	labels := strings.Split(host, ".")
+	return len(labels) == 5 &&
+		labels[0] == "storage" &&
+		labels[1] != "" &&
+		labels[2] == "rep" &&
+		labels[3] == "googleapis" &&
+		labels[4] == "com"
 }
 
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.

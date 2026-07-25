@@ -269,8 +269,9 @@ replicas:
 ```
 
 Litestream automatically excludes `Accept-Encoding` from SigV4 signatures for
-the `storage.googleapis.com` endpoint because GCS does not include that header
-when validating signatures.
+the global `storage.googleapis.com` endpoint and regional
+`storage.LOCATION.rep.googleapis.com` endpoints because GCS does not include
+that header when validating signatures.
 
 ## Azure Blob Storage (ABS)
 
@@ -362,7 +363,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
 | Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
-| Google Cloud Storage | `storage.googleapis.com` | Excludes `Accept-Encoding` from SigV4 signatures |
+| Google Cloud Storage | `storage.googleapis.com`, `storage.*.rep.googleapis.com` | Excludes `Accept-Encoding` from SigV4 signatures |
 
 ## Troubleshooting
 
