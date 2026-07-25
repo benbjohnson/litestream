@@ -369,10 +369,10 @@ func AssertWALBounded(t *testing.T, walPath string, maxWALSizeMB float64, peakWA
 func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	t.Helper()
 
-	snapSyncEvents := make([]LTXEvent, 0)
-	for _, ev := range report.Events {
+	snapSyncIndexes := make([]int, 0)
+	for i, ev := range report.Events {
 		if ev.Type == "sync" && ev.IsSnap {
-			snapSyncEvents = append(snapSyncEvents, ev)
+			snapSyncIndexes = append(snapSyncIndexes, i)
 		}
 	}
 
@@ -390,7 +390,8 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 		}
 	}
 
-	for _, snapEv := range snapSyncEvents {
+	for _, snapshotIndex := range snapSyncIndexes {
+		snapEv := report.Events[snapshotIndex]
 		if snapEv.Time.IsZero() {
 			t.Errorf("  [no-snap-on-checkpoint] FAIL: snapshot sync has a missing or malformed timestamp (reason: %s)",
 				snapEv.Reason)
@@ -398,7 +399,7 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 			continue
 		}
 
-		checkpointEv, ok := precedingCheckpoint(report.Events, snapEv.Time, checkpointWindow)
+		checkpointEv, ok := precedingCheckpoint(report.Events[:snapshotIndex], snapEv.Time, checkpointWindow)
 		if !ok {
 			if snapEv.Reason == "checkpoint boundary snapshot" {
 				t.Errorf("  [no-snap-on-checkpoint] FAIL: checkpoint boundary snapshot at %v has no attributable preceding checkpoint",
@@ -426,7 +427,7 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 
 	if violations == 0 {
 		msg := fmt.Sprintf("no snapshot-on-checkpoint detected (%d checkpoints, %d snap-syncs checked",
-			len(report.CheckpointTimes), len(snapSyncEvents))
+			len(report.CheckpointTimes), len(snapSyncIndexes))
 		if expectedSnapshots > 0 {
 			msg += fmt.Sprintf(", %d expected snapshots", expectedSnapshots)
 		}
