@@ -257,6 +257,9 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
+	s.cancel()
+	s.wg.Wait()
+
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
@@ -272,10 +275,6 @@ func (s *Store) Close(ctx context.Context) (err error) {
 			}
 		}
 	}
-
-	// Cancel and wait for background tasks to complete.
-	s.cancel()
-	s.wg.Wait()
 
 	return err
 }
