@@ -241,8 +241,12 @@ func IsGoogleCloudStorageEndpoint(endpoint string) bool {
 			return false
 		}
 	}
-	if len(labels) > 3 && labels[len(labels)-3] == "storage" {
-		return false
+	if len(labels) > 3 {
+		for _, segment := range strings.Split(labels[1], "-") {
+			if segment == "storage" {
+				return false
+			}
+		}
 	}
 	for _, segment := range strings.Split(labels[0], "-") {
 		if segment == "storage" {
@@ -388,8 +392,14 @@ func extractEndpointHost(endpoint string) string {
 	}
 	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
 		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+			if u.User != nil {
+				return ""
+			}
 			return u.Host
 		}
+	}
+	if u, err := url.Parse("//" + endpoint); err == nil && u.User != nil {
+		return ""
 	}
 	return endpoint
 }

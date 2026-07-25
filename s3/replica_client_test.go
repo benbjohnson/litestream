@@ -1406,6 +1406,21 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 			wantAcceptEncodingSigned: true,
 		},
 		{
+			name:                     "GoogleCloudStorageUserinfo",
+			endpoint:                 "attacker@storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageRegionalVirtualHostedBase",
+			endpoint:                 "https://backup-storage.storage.me-central2.rep.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageLocationalVirtualHostedBase",
+			endpoint:                 "https://backup-storage.us-central1-storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
 			name:                     "UnrelatedGoogleAPI",
 			endpoint:                 "https://storageinsights.googleapis.com",
 			wantAcceptEncodingSigned: true,
