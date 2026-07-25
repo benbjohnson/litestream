@@ -18,6 +18,7 @@ import (
 // LTXEvent represents a parsed log event related to LTX operations.
 type LTXEvent struct {
 	Time           time.Time
+	Database       string
 	Type           string // "sync", "snapshot", "compaction", "checkpoint"
 	CheckpointMode string
 	Level          int // compaction level (-1 if N/A)
@@ -399,7 +400,7 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 			continue
 		}
 
-		checkpointEv, ok := precedingCheckpoint(report.Events[:snapshotIndex], snapEv.Time, checkpointWindow)
+		checkpointEv, ok := precedingCheckpoint(report.Events[:snapshotIndex], snapEv.Database, snapEv.Time, checkpointWindow)
 		if !ok {
 			if snapEv.Reason == "checkpoint boundary snapshot" {
 				t.Errorf("  [no-snap-on-checkpoint] FAIL: checkpoint boundary snapshot at %v has no attributable preceding checkpoint",
@@ -459,11 +460,11 @@ func isCheckpointMode(mode string) bool {
 	}
 }
 
-func precedingCheckpoint(events []LTXEvent, snapshotTime time.Time, window time.Duration) (LTXEvent, bool) {
+func precedingCheckpoint(events []LTXEvent, snapshotDatabase string, snapshotTime time.Time, window time.Duration) (LTXEvent, bool) {
 	var checkpoint LTXEvent
 	var ok bool
 	for _, ev := range events {
-		if ev.Type != "checkpoint" {
+		if ev.Type != "checkpoint" || snapshotDatabase == "" || ev.Database != snapshotDatabase {
 			continue
 		}
 
@@ -619,9 +620,10 @@ func parseSnapshotComplete(line string) (LTXEvent, bool) {
 
 	t, _ := parseLogTime(line)
 	ev := LTXEvent{
-		Time:  t,
-		Type:  "snapshot",
-		Level: 9,
+		Time:     t,
+		Database: parseLogDatabase(line),
+		Type:     "snapshot",
+		Level:    9,
 	}
 
 	if v := extractField(line, "txid="); v != "" {
@@ -641,8 +643,9 @@ func parseCompactionComplete(line string) (LTXEvent, bool) {
 
 	t, _ := parseLogTime(line)
 	ev := LTXEvent{
-		Time: t,
-		Type: "compaction",
+		Time:     t,
+		Database: parseLogDatabase(line),
+		Type:     "compaction",
 	}
 
 	// Extract compaction level — skip past msg= to avoid matching log level=INFO
@@ -690,6 +693,7 @@ func parseCheckpoint(line string) (LTXEvent, bool) {
 	t, _ := parseLogTime(line)
 	return LTXEvent{
 		Time:           t,
+		Database:       parseLogDatabase(line),
 		Type:           "checkpoint",
 		Level:          -1,
 		CheckpointMode: mode,
@@ -707,9 +711,10 @@ func parseSyncWithSnap(line string) (LTXEvent, bool) {
 
 	t, _ := parseLogTime(line)
 	ev := LTXEvent{
-		Time:  t,
-		Type:  "sync",
-		Level: 0,
+		Time:     t,
+		Database: parseLogDatabase(line),
+		Type:     "sync",
+		Level:    0,
 	}
 
 	// Check for snap field in both text and JSON formats
@@ -732,8 +737,9 @@ func parseLTXFileUploaded(line string) (LTXEvent, bool) {
 
 	t, _ := parseLogTime(line)
 	ev := LTXEvent{
-		Time: t,
-		Type: "upload",
+		Time:     t,
+		Database: parseLogDatabase(line),
+		Type:     "upload",
 	}
 
 	// Search for the replica level field AFTER the message text to avoid
@@ -762,6 +768,13 @@ func parseLTXFileUploaded(line string) (LTXEvent, bool) {
 	}
 
 	return ev, true
+}
+
+func parseLogDatabase(line string) string {
+	if database := extractField(line, "db="); database != "" {
+		return database
+	}
+	return extractJSONField(line, "db")
 }
 
 func extractField(line, prefix string) string {
