@@ -369,13 +369,6 @@ func AssertWALBounded(t *testing.T, walPath string, maxWALSizeMB float64, peakWA
 func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	t.Helper()
 
-	if len(report.CheckpointTimes) == 0 || report.SnapSyncCount == 0 {
-		t.Logf("  [no-snap-on-checkpoint] PASS: no checkpoint+snapshot overlap to check (checkpoints=%d, snap-syncs=%d)",
-			len(report.CheckpointTimes), report.SnapSyncCount)
-		return
-	}
-
-	// Build timeline: check if any snap-sync events coincide with checkpoint events
 	snapSyncEvents := make([]LTXEvent, 0)
 	for _, ev := range report.Events {
 		if ev.Type == "sync" && ev.IsSnap {
@@ -387,9 +380,34 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	expectedSnapshots := 0
 	checkpointWindow := 5 * time.Second
 
+	for _, ev := range report.Events {
+		if ev.Type != "checkpoint" {
+			continue
+		}
+		if reason := invalidCheckpointReason(ev); reason != "" {
+			t.Errorf("  [no-snap-on-checkpoint] FAIL: unclassifiable checkpoint: %s", reason)
+			violations++
+		}
+	}
+
 	for _, snapEv := range snapSyncEvents {
+		if snapEv.Time.IsZero() {
+			t.Errorf("  [no-snap-on-checkpoint] FAIL: snapshot sync has a missing or malformed timestamp (reason: %s)",
+				snapEv.Reason)
+			violations++
+			continue
+		}
+
 		checkpointEv, ok := precedingCheckpoint(report.Events, snapEv.Time, checkpointWindow)
 		if !ok {
+			if snapEv.Reason == "checkpoint boundary snapshot" {
+				t.Errorf("  [no-snap-on-checkpoint] FAIL: checkpoint boundary snapshot at %v has no attributable preceding checkpoint",
+					snapEv.Time.Format("15:04:05"))
+				violations++
+			}
+			continue
+		}
+		if invalidCheckpointReason(checkpointEv) != "" {
 			continue
 		}
 
@@ -415,6 +433,28 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 		t.Logf("  [no-snap-on-checkpoint] PASS: %s)", msg)
 	} else {
 		t.Errorf("  [no-snap-on-checkpoint] FAIL: %d snapshot-on-checkpoint violations detected", violations)
+	}
+}
+
+func invalidCheckpointReason(ev LTXEvent) string {
+	switch {
+	case ev.Time.IsZero() && ev.CheckpointMode == "":
+		return "missing or malformed timestamp and missing mode"
+	case ev.Time.IsZero():
+		return "missing or malformed timestamp"
+	case !isCheckpointMode(ev.CheckpointMode):
+		return fmt.Sprintf("invalid mode %q", ev.CheckpointMode)
+	default:
+		return ""
+	}
+}
+
+func isCheckpointMode(mode string) bool {
+	switch strings.ToUpper(mode) {
+	case "PASSIVE", "FULL", "RESTART", "TRUNCATE":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -644,9 +684,6 @@ func parseCheckpoint(line string) (LTXEvent, bool) {
 	mode := extractField(line, "mode=")
 	if mode == "" {
 		mode = extractJSONField(line, "mode")
-	}
-	if mode == "" {
-		return LTXEvent{}, false
 	}
 
 	t, _ := parseLogTime(line)
