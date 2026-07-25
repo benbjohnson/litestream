@@ -47,6 +47,14 @@ time=2026-07-25T01:00:03Z level=DEBUG msg=sync snap=true reason="checkpoint boun
 time=2026-07-25T01:00:03Z level=DEBUG msg=sync snap=true reason="checkpoint boundary snapshot"
 time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint mode=TRUNCATE
 `,
+		"checkpoint later in log for same database": `
+time=2026-07-25T01:00:03Z level=DEBUG msg=sync db=test.db snap=true reason="checkpoint boundary snapshot"
+time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint db=test.db mode=TRUNCATE
+`,
+		"checkpoint from another database": `
+time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint db=alpha.db mode=TRUNCATE
+time=2026-07-25T01:00:03Z level=DEBUG msg=sync db=beta.db snap=true reason="checkpoint boundary snapshot"
+`,
 	}
 
 	for name, logText := range tests {
@@ -69,14 +77,16 @@ func TestAssertNoSnapshotOnCheckpointAllowsStartupAndTruncateSnapshots(t *testin
 		},
 		{
 			Time:           mustParseLogTime(t, "time=2026-07-25T01:00:02Z"),
+			Database:       "test.db",
 			Type:           "checkpoint",
 			CheckpointMode: "TRUNCATE",
 		},
 		{
-			Time:   mustParseLogTime(t, "time=2026-07-25T01:00:03Z"),
-			Type:   "sync",
-			IsSnap: true,
-			Reason: "checkpoint boundary snapshot",
+			Time:     mustParseLogTime(t, "time=2026-07-25T01:00:03Z"),
+			Database: "test.db",
+			Type:     "sync",
+			IsSnap:   true,
+			Reason:   "checkpoint boundary snapshot",
 		},
 	}
 
