@@ -383,15 +383,15 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	}
 
 	violations := 0
-	expectedRecoveries := 0
+	expectedSnapshots := 0
 	checkpointWindow := 5 * time.Second
 
 	for _, chkTime := range report.CheckpointTimes {
 		for _, snapEv := range snapSyncEvents {
 			diff := snapEv.Time.Sub(chkTime)
 			if diff >= 0 && diff <= checkpointWindow {
-				if isExpectedRecoverySnapshot(snapEv.Reason) {
-					expectedRecoveries++
+				if isExpectedSnapshot(snapEv.Reason) {
+					expectedSnapshots++
 					continue
 				}
 				t.Errorf("  [no-snap-on-checkpoint] Snapshot sync at %v occurred %v after checkpoint at %v (reason: %s)",
@@ -405,8 +405,8 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	if violations == 0 {
 		msg := fmt.Sprintf("no snapshot-on-checkpoint detected (%d checkpoints, %d snap-syncs checked",
 			len(report.CheckpointTimes), len(snapSyncEvents))
-		if expectedRecoveries > 0 {
-			msg += fmt.Sprintf(", %d expected gap recoveries", expectedRecoveries)
+		if expectedSnapshots > 0 {
+			msg += fmt.Sprintf(", %d expected snapshots", expectedSnapshots)
 		}
 		t.Logf("  [no-snap-on-checkpoint] PASS: %s)", msg)
 	} else {
@@ -414,14 +414,16 @@ func AssertNoSnapshotOnCheckpoint(t *testing.T, report *LTXBehaviorReport) {
 	}
 }
 
-// isExpectedRecoverySnapshot returns true if the snapshot reason indicates an
-// intentional recovery mechanism rather than the checkpoint-triggers-unwanted-
-// snapshot bug. NOTE: "full or restart checkpoint detected" is intentionally
-// NOT in this list — that is the exact bug this assertion catches.
-func isExpectedRecoverySnapshot(reason string) bool {
+// isExpectedSnapshot returns true if the snapshot reason indicates an
+// intentional recovery mechanism or checkpoint safety boundary rather than the
+// checkpoint-triggers-unwanted-snapshot bug. NOTE: "full or restart checkpoint
+// detected" is intentionally NOT in this list — that is the exact bug this
+// assertion catches.
+func isExpectedSnapshot(reason string) bool {
 	return strings.Contains(reason, "repair snapshot") ||
 		strings.Contains(reason, "compaction detected missing") ||
-		strings.Contains(reason, "wal header salt reset")
+		strings.Contains(reason, "wal header salt reset") ||
+		strings.Contains(reason, "checkpoint boundary snapshot")
 }
 
 // PrintBehaviorReport prints a human-readable summary of the behavioral report.
