@@ -43,6 +43,10 @@ time=2026-07-25T01:00:03Z level=DEBUG msg=sync snap=true reason="checkpoint boun
 		"no preceding checkpoint": `
 time=2026-07-25T01:00:03Z level=DEBUG msg=sync snap=true reason="checkpoint boundary snapshot"
 `,
+		"checkpoint later in log": `
+time=2026-07-25T01:00:03Z level=DEBUG msg=sync snap=true reason="checkpoint boundary snapshot"
+time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint mode=TRUNCATE
+`,
 	}
 
 	for name, logText := range tests {
