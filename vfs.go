@@ -573,7 +573,7 @@ type Hydrator struct {
 	file       *os.File    // Local database file
 	complete   atomic.Bool // True when restore completes
 	txid       ltx.TXID    // TXID the hydrated file is at
-	applyMu    sync.Mutex
+	applyMu    sync.RWMutex
 	mu         sync.Mutex     // Protects hydration file writes
 	err        error          // Stores fatal hydration error
 	compactor  *ltx.Compactor // Tracks compaction progress during restore
@@ -830,6 +830,16 @@ func (h *Hydrator) ReadAt(p []byte, off int64) (int, error) {
 	}
 
 	return n, nil
+}
+
+func (h *Hydrator) tryReadAt(p []byte, off int64) (int, bool, error) {
+	if !h.applyMu.TryRLock() {
+		return 0, false, nil
+	}
+	defer h.applyMu.RUnlock()
+
+	n, err := h.ReadAt(p, off)
+	return n, true, err
 }
 
 // ApplyUpdates fetches updated pages and writes them to the hydration file.
@@ -1595,9 +1605,10 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 	}
 	f.mu.Unlock()
 
-	// If hydration complete, read from local file
 	if f.hydrator != nil && f.hydrator.Complete() {
-		return f.hydrator.ReadAt(p, off)
+		if n, ok, err := f.hydrator.tryReadAt(p, off); ok {
+			return n, err
+		}
 	}
 
 	// Check cache (cache is thread-safe)
