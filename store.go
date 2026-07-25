@@ -235,7 +235,6 @@ func (s *Store) Open(ctx context.Context) error {
 
 func (s *Store) Close(ctx context.Context) (err error) {
 	s.cancel()
-	s.wg.Wait()
 
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
@@ -253,7 +252,28 @@ func (s *Store) Close(ctx context.Context) (err error) {
 		}
 	}
 
+	if e := s.waitForMonitors(ctx); e != nil && err == nil {
+		err = e
+	}
+
 	return err
+}
+
+func (s *Store) waitForMonitors(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return context.Cause(ctx)
+	case <-s.done:
+		return ErrShutdownInterrupted
+	}
 }
 
 func (s *Store) DBs() []*DB {

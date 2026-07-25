@@ -79,6 +79,11 @@ type DB struct {
 	syncState syncState
 	syncDiag  diagState
 
+	snapshotReaders struct {
+		sync.Mutex
+		m map[*snapshotReadCloser]struct{}
+	}
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -326,6 +331,7 @@ func NewDB(path string) *DB {
 		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
+	db.snapshotReaders.m = make(map[*snapshotReadCloser]struct{})
 	db.openLTXFile = defaultOpenLTXFile
 
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
@@ -828,6 +834,8 @@ func (db *DB) Close(ctx context.Context) (err error) {
 		return err
 	}
 	defer db.execSem.Release(1)
+
+	db.closeSnapshotReaders()
 
 	// Perform a final db sync, if initialized.
 	if db.db != nil {
@@ -2686,12 +2694,15 @@ func (p *snapshotReadPosition) close() {
 
 type snapshotReadCloser struct {
 	*io.PipeReader
-	pos *snapshotReadPosition
+	done      chan struct{}
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (r *snapshotReadCloser) Close() error {
-	defer r.pos.close()
-	return r.PipeReader.Close()
+	r.closeOnce.Do(func() { r.closeErr = r.PipeReader.Close() })
+	<-r.done
+	return r.closeErr
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
@@ -2699,7 +2710,16 @@ func (r *snapshotReadCloser) Close() error {
 // closed. Callers must close readers they do not fully consume; abandoning a
 // reader blocks checkpoints indefinitely.
 func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
-	pos, err := db.snapshotPosition(ctx)
+	if err := db.lockExec(ctx); err != nil {
+		return ltx.Pos{}, nil, err
+	}
+	defer db.execSem.Release(1)
+
+	if !db.IsOpen() {
+		return ltx.Pos{}, nil, ErrDatabaseNotOpen
+	}
+
+	pos, err := db.snapshotPositionLocked()
 	if err != nil {
 		return ltx.Pos{}, nil, err
 	}
@@ -2712,12 +2732,7 @@ func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error
 	return pos.pos, r, nil
 }
 
-func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, error) {
-	if err := db.lockExec(ctx); err != nil {
-		return nil, err
-	}
-	defer db.execSem.Release(1)
-
+func (db *DB) snapshotPositionLocked() (*snapshotReadPosition, error) {
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
 
@@ -2792,7 +2807,7 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 	return dec.Header().WALOffset + dec.Header().WALSize, nil
 }
 
-func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.ReadCloser, error) {
+func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (*snapshotReadCloser, error) {
 	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
 
 	// TODO(ltx): Read database size from database header.
@@ -2805,8 +2820,14 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 
 	// Execute encoding in a separate goroutine so the caller can initialize before reading.
 	pr, pw := io.Pipe()
+	r := &snapshotReadCloser{PipeReader: pr, done: make(chan struct{})}
+	db.registerSnapshotReader(r)
 	go func() {
-		defer pos.close()
+		defer func() {
+			pos.close()
+			db.unregisterSnapshotReader(r)
+			close(r.done)
+		}()
 
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
@@ -2886,7 +2907,32 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		_ = pw.Close()
 	}()
 
-	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
+	return r, nil
+}
+
+func (db *DB) registerSnapshotReader(r *snapshotReadCloser) {
+	db.snapshotReaders.Lock()
+	defer db.snapshotReaders.Unlock()
+	db.snapshotReaders.m[r] = struct{}{}
+}
+
+func (db *DB) unregisterSnapshotReader(r *snapshotReadCloser) {
+	db.snapshotReaders.Lock()
+	defer db.snapshotReaders.Unlock()
+	delete(db.snapshotReaders.m, r)
+}
+
+func (db *DB) closeSnapshotReaders() {
+	db.snapshotReaders.Lock()
+	readers := make([]*snapshotReadCloser, 0, len(db.snapshotReaders.m))
+	for r := range db.snapshotReaders.m {
+		readers = append(readers, r)
+	}
+	db.snapshotReaders.Unlock()
+
+	for _, r := range readers {
+		_ = r.Close()
+	}
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
