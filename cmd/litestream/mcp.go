@@ -1,18 +1,27 @@
 package main
 
 import (
-	"bufio"
 	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"text/tabwriter"
 	"time"
 
 	"github.com/MadAppGang/httplog"
+	"github.com/dustin/go-humanize"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 )
 
 type MCPServer struct {
@@ -74,12 +83,6 @@ func (s *MCPServer) Close() error {
 	return s.httpServer.Shutdown(ctx)
 }
 
-// isReplicaURL returns true if the path looks like a replica URL (s3://, gs://, etc.)
-// rather than a local database path. The CLI rejects -config when using replica URLs.
-func isReplicaURL(path string) bool {
-	return strings.Contains(path, "://")
-}
-
 func DatabasesTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_databases",
 		mcp.WithDescription("List databases and their replicas as defined in the Litestream config file. The default path is /etc/litestream.yml but is not required."),
@@ -87,18 +90,15 @@ func DatabasesTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"databases"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
-		}
-		args = append(args, "-config", config)
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		resources, err := loadMCPDatabases(req.GetString("config", configPath))
 		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
+			return mcpToolError(err)
 		}
-		return mcp.NewToolResultText(string(output)), nil
+		output, opErr := formatMCPDatabases(resources.DBs)
+		if err := closeMCPResources(opErr, resources); err != nil {
+			return mcpToolError(err)
+		}
+		return mcp.NewToolResultText(output), nil
 	}
 }
 
@@ -109,74 +109,15 @@ func InfoTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		var summary strings.Builder
-		summary.WriteString("=== Litestream Status Report ===\n\n")
-
-		// Get version info
-		versionCmd := exec.CommandContext(ctx, "litestream", "version")
-		versionOutput, err := versionCmd.CombinedOutput()
+		resources, err := loadMCPDatabases(req.GetString("config", configPath))
 		if err != nil {
-			slog.Error("Failed to get version info", "error", err)
-			return mcp.NewToolResultError("Failed to get version info: " + err.Error()), nil
+			return mcpToolError(err)
 		}
-		summary.WriteString("Version Information:\n")
-		summary.WriteString(string(versionOutput))
-		summary.WriteString("\n")
-
-		// Get databases info
-		args := []string{"databases"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+		output, opErr := formatMCPInfo(ctx, resources.ConfigPath, resources.DBs)
+		if err := closeMCPResources(opErr, resources); err != nil {
+			return mcpToolError(err)
 		}
-		summary.WriteString("Current Config Path:\n")
-		summary.WriteString(config + "\n\n")
-
-		args = append(args, "-config", config)
-		dbCmd := exec.CommandContext(ctx, "litestream", args...)
-		dbOutput, err := dbCmd.CombinedOutput()
-		if err != nil {
-			slog.Error("Failed to get databases info", "error", err)
-			return mcp.NewToolResultError("Failed to get databases info: " + err.Error()), nil
-		}
-
-		summary.WriteString("Databases:\n")
-		summary.WriteString(string(dbOutput))
-		summary.WriteString("\n")
-
-		// Parse database paths from output
-		scanner := bufio.NewScanner(strings.NewReader(string(dbOutput)))
-		// Skip header line
-		scanner.Scan()
-		var dbPaths []string
-		for scanner.Scan() {
-			fields := strings.Fields(scanner.Text())
-			if len(fields) > 0 {
-				dbPaths = append(dbPaths, fields[0])
-			}
-		}
-
-		// Get LTX files info for each database
-		summary.WriteString("LTX Files:\n")
-		for _, dbPath := range dbPaths {
-			ltxArgs := []string{"ltx"}
-			if config != "" {
-				ltxArgs = append(ltxArgs, "-config", config)
-			}
-			ltxArgs = append(ltxArgs, dbPath)
-			ltxCmd := exec.CommandContext(ctx, "litestream", ltxArgs...)
-			ltxOutput, err := ltxCmd.CombinedOutput()
-			if err != nil {
-				summary.WriteString("Failed to get LTX files for " + dbPath + ": " + err.Error() + "\n")
-				summary.WriteString(string(ltxOutput))
-				continue
-			}
-			summary.WriteString("Database: " + dbPath + "\n")
-			summary.WriteString(string(ltxOutput))
-			summary.WriteString("\n")
-		}
-
-		return mcp.NewToolResultText(summary.String()), nil
+		return mcp.NewToolResultText(output), nil
 	}
 }
 
@@ -184,60 +125,59 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_restore",
 		mcp.WithDescription("Restore a database from a Litestream replica."),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
-		mcp.WithString("o", mcp.Description("Output path for the restored database. Optional.")),
+		mcp.WithString("output", mcp.Description("Output path for the restored database. Optional.")),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
 		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
 		mcp.WithString("parallelism", mcp.Description("Number of WAL files to download in parallel. Optional.")),
-		mcp.WithBoolean("if_db_not_exists", mcp.Description("Return 0 if the database already exists. Optional.")),
-		mcp.WithBoolean("if_replica_exists", mcp.Description("Return 0 if no backups found. Optional.")),
+		mcp.WithBoolean("if_db_not_exists", mcp.Description("Skip restore if the database already exists. Optional.")),
+		mcp.WithBoolean("if_replica_exists", mcp.Description("Skip restore if no backups are found. Optional.")),
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"restore"}
-		if o, err := req.RequireString("o"); err == nil {
-			args = append(args, "-o", o)
+		path := req.GetString("path", "")
+		if path == "" {
+			return mcpToolError(fmt.Errorf("database path or replica URL required"))
 		}
 
-		// Get path first to determine if it's a replica URL
-		path, _ := req.RequireString("path")
-
-		// Only add -config for database paths, not replica URLs
-		// The CLI rejects -config when restoring from a replica URL
-		if !isReplicaURL(path) {
-			config := configPath
-			if configVal, err := req.RequireString("config"); err == nil {
-				config = configVal
+		opt := litestream.NewRestoreOptions()
+		opt.OutputPath = req.GetString("output", "")
+		if opt.OutputPath == "" {
+			opt.OutputPath = req.GetString("o", "")
+		}
+		if value := req.GetString("txid", ""); value != "" {
+			txID, err := ltx.ParseTXID(value)
+			if err != nil {
+				return mcpToolError(fmt.Errorf("invalid txid: %w", err))
 			}
-			if config != "" {
-				args = append(args, "-config", config)
+			opt.TXID = txID
+		}
+		if value := req.GetString("timestamp", ""); value != "" {
+			timestamp, err := time.Parse(time.RFC3339, value)
+			if err != nil {
+				return mcpToolError(fmt.Errorf("invalid timestamp: %w", err))
 			}
+			opt.Timestamp = timestamp
+		}
+		if value := req.GetString("parallelism", ""); value != "" {
+			parallelism, err := strconv.Atoi(value)
+			if err != nil {
+				return mcpToolError(fmt.Errorf("invalid parallelism: %w", err))
+			}
+			opt.Parallelism = parallelism
 		}
 
-		if txid, err := req.RequireString("txid"); err == nil {
-			args = append(args, "-txid", txid)
-		}
-		if timestamp, err := req.RequireString("timestamp"); err == nil {
-			args = append(args, "-timestamp", timestamp)
-		}
-		if parallelism, err := req.RequireString("parallelism"); err == nil {
-			args = append(args, "-parallelism", parallelism)
-		}
-		if ifDBNotExists, err := req.RequireBool("if_db_not_exists"); err == nil {
-			args = append(args, "-if-db-not-exists", strconv.FormatBool(ifDBNotExists))
-		}
-		if ifReplicaExists, err := req.RequireBool("if_replica_exists"); err == nil {
-			args = append(args, "-if-replica-exists", strconv.FormatBool(ifReplicaExists))
-		}
-		if path != "" {
-			args = append(args, path)
-		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		resources, err := loadMCPRestoreReplica(path, req.GetString("config", configPath), &opt)
 		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
+			return mcpToolError(err)
 		}
-		return mcp.NewToolResultText(string(output)), nil
+
+		output, opErr := restoreMCP(ctx, path, resources.Replica, opt,
+			req.GetBool("if_db_not_exists", false), req.GetBool("if_replica_exists", false))
+		if err := closeMCPResources(opErr, resources); err != nil {
+			return mcpToolError(err)
+		}
+		return mcp.NewToolResultText(output), nil
 	}
 }
 
@@ -264,58 +204,48 @@ func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"ltx"}
-
-		// Get path first to determine if it's a replica URL
-		path, _ := req.RequireString("path")
-
-		// Only add -config for database paths, not replica URLs
-		// The CLI rejects -config when using a replica URL
-		if !isReplicaURL(path) {
-			config := configPath
-			if configVal, err := req.RequireString("config"); err == nil {
-				config = configVal
-			}
-			if config != "" {
-				args = append(args, "-config", config)
-			}
+		path := req.GetString("path", "")
+		if path == "" {
+			return mcpToolError(fmt.Errorf("database path or replica URL required"))
 		}
 
-		if path != "" {
-			args = append(args, path)
-		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		resources, err := loadMCPReplica(path, req.GetString("config", configPath))
 		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
+			return mcpToolError(err)
 		}
-		return mcp.NewToolResultText(string(output)), nil
+		files, opErr := listMCPLTXFiles(ctx, resources.Replica, 0)
+		var output string
+		if opErr == nil {
+			output, opErr = formatMCPLTXFiles(files)
+		}
+		if err := closeMCPResources(opErr, resources); err != nil {
+			return mcpToolError(err)
+		}
+		return mcp.NewToolResultText(output), nil
 	}
 }
 
 func StatusTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_status",
-		mcp.WithDescription("Display replication status including database path, status, local transaction ID, and WAL size."),
+		mcp.WithDescription("Display replication status including database path, status, local and remote transaction IDs, and WAL size."),
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 		mcp.WithString("path", mcp.Description("Filter to a specific database path. Optional.")),
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"status"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
-		}
-		args = append(args, "-config", config)
-		if path, err := req.RequireString("path"); err == nil {
-			args = append(args, path)
-		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		resources, err := loadMCPDatabases(req.GetString("config", configPath))
 		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
+			return mcpToolError(err)
 		}
-		return mcp.NewToolResultText(string(output)), nil
+		statuses, opErr := loadMCPStatuses(ctx, resources.DBs, req.GetString("path", ""))
+		var output string
+		if opErr == nil {
+			output, opErr = formatMCPStatuses(statuses)
+		}
+		if err := closeMCPResources(opErr, resources); err != nil {
+			return mcpToolError(err)
+		}
+		return mcp.NewToolResultText(output), nil
 	}
 }
 
@@ -327,20 +257,450 @@ func ResetTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	)
 
 	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		args := []string{"reset"}
-		config := configPath
-		if configVal, err := req.RequireString("config"); err == nil {
-			config = configVal
+		path := req.GetString("path", "")
+		if path == "" {
+			return mcpToolError(fmt.Errorf("database path required"))
 		}
-		args = append(args, "-config", config)
-		if path, err := req.RequireString("path"); err == nil {
-			args = append(args, path)
-		}
-		cmd := exec.CommandContext(ctx, "litestream", args...)
-		output, err := cmd.CombinedOutput()
+		db, resources, err := loadMCPResetDB(path, req.GetString("config", configPath))
 		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
+			return mcpToolError(err)
 		}
-		return mcp.NewToolResultText(string(output)), nil
+		opErr := db.ResetLocalState(ctx)
+		if opErr != nil {
+			opErr = fmt.Errorf("reset local state: %w", opErr)
+		}
+		if resources != nil {
+			opErr = closeMCPResources(opErr, resources)
+		}
+		if opErr != nil {
+			return mcpToolError(opErr)
+		}
+		return mcp.NewToolResultText("Reset complete for " + db.Path() + ".\n"), nil
 	}
+}
+
+type mcpDBStatus struct {
+	Database   string
+	Status     string
+	LocalTXID  string
+	RemoteTXID string
+	WALSize    string
+}
+
+type mcpDatabases struct {
+	ConfigPath string
+	DBs        []*litestream.DB
+}
+
+func (resources *mcpDatabases) Close() error {
+	var err error
+	for _, db := range resources.DBs {
+		if db.Replica == nil || db.Replica.Client == nil {
+			continue
+		}
+		if closeErr := closeMCPReplica(db.Replica); closeErr != nil {
+			err = errors.Join(err, fmt.Errorf("close replica for %s: %w", db.Path(), closeErr))
+		}
+	}
+	return err
+}
+
+type mcpReplica struct {
+	Replica   *litestream.Replica
+	Databases *mcpDatabases
+}
+
+type mcpCloser interface {
+	Close() error
+}
+
+var errMCPReplicaClientNotClosable = errors.New("replica client does not implement cleanup contract")
+
+func closeMCPResources(opErr error, resources mcpCloser) error {
+	return errors.Join(opErr, resources.Close())
+}
+
+func (resources *mcpReplica) Close() error {
+	if resources.Databases != nil {
+		return resources.Databases.Close()
+	}
+	return closeMCPReplica(resources.Replica)
+}
+
+func closeMCPReplica(r *litestream.Replica) error {
+	if r == nil || r.Client == nil {
+		return nil
+	}
+	closer, ok := r.Client.(litestream.ReplicaClientCloser)
+	if !ok {
+		return fmt.Errorf("close %s replica: %w", r.Client.Type(), errMCPReplicaClientNotClosable)
+	}
+	if err := closer.Close(); err != nil {
+		return fmt.Errorf("close %s replica: %w", r.Client.Type(), err)
+	}
+	return nil
+}
+
+func loadMCPDatabases(configPath string) (*mcpDatabases, error) {
+	if configPath == "" {
+		configPath = DefaultConfigPath()
+	}
+	config, err := readConfigFile(configPath, true)
+	if err != nil {
+		return nil, err
+	}
+
+	resources := &mcpDatabases{ConfigPath: configPath}
+	for _, dbConfig := range config.DBs {
+		if dbConfig.Dir != "" {
+			dirDBs, err := NewDBsFromDirectoryConfig(dbConfig)
+			if err != nil {
+				return nil, errors.Join(err, resources.Close())
+			}
+			resources.DBs = append(resources.DBs, dirDBs...)
+			continue
+		}
+		db, err := NewDBFromConfig(dbConfig)
+		if err != nil {
+			return nil, errors.Join(err, resources.Close())
+		}
+		resources.DBs = append(resources.DBs, db)
+	}
+	return resources, nil
+}
+
+func formatMCPDatabases(dbs []*litestream.DB) (string, error) {
+	var output strings.Builder
+	w := tabwriter.NewWriter(&output, 0, 8, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "path\treplica"); err != nil {
+		return "", err
+	}
+	for _, db := range dbs {
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", db.Path(), db.Replica.Client.Type()); err != nil {
+			return "", err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return "", err
+	}
+	return output.String(), nil
+}
+
+func formatMCPInfo(ctx context.Context, configPath string, dbs []*litestream.DB) (string, error) {
+	var summary strings.Builder
+	summary.WriteString("=== Litestream Status Report ===\n\n")
+	summary.WriteString("Version Information:\n")
+	summary.WriteString(Version)
+	summary.WriteString("\n\n")
+	summary.WriteString("Current Config Path:\n")
+	summary.WriteString(configPath + "\n\n")
+
+	dbOutput, err := formatMCPDatabases(dbs)
+	if err != nil {
+		return "", err
+	}
+	summary.WriteString("Databases:\n")
+	summary.WriteString(dbOutput)
+	summary.WriteString("\n")
+
+	summary.WriteString("LTX Files:\n")
+	for _, db := range dbs {
+		files, err := listMCPLTXFiles(ctx, db.Replica, 0)
+		if err != nil {
+			return "", fmt.Errorf("list ltx files for %s: %w", db.Path(), err)
+		}
+		ltxOutput, err := formatMCPLTXFiles(files)
+		if err != nil {
+			return "", err
+		}
+		summary.WriteString("Database: " + db.Path() + "\n")
+		summary.WriteString(ltxOutput)
+		summary.WriteString("\n")
+	}
+
+	return summary.String(), nil
+}
+
+func loadMCPRestoreReplica(path, configPath string, opt *litestream.RestoreOptions) (*mcpReplica, error) {
+	if litestream.IsURL(path) {
+		if opt.OutputPath == "" {
+			return nil, fmt.Errorf("output is required when restoring from a replica URL")
+		}
+		syncInterval := litestream.DefaultSyncInterval
+		r, err := NewReplicaFromConfig(&ReplicaConfig{
+			URL: path,
+			ReplicaSettings: ReplicaSettings{
+				SyncInterval: &syncInterval,
+			},
+		}, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &mcpReplica{Replica: r}, nil
+	}
+
+	resources, err := loadMCPDatabases(configPath)
+	if err != nil {
+		return nil, err
+	}
+	db, err := selectMCPDatabase(resources.DBs, path)
+	if err != nil {
+		return nil, errors.Join(err, resources.Close())
+	}
+	if opt.OutputPath == "" {
+		opt.OutputPath = db.Path()
+	}
+	return &mcpReplica{Replica: db.Replica, Databases: resources}, nil
+}
+
+func loadMCPReplica(path, configPath string) (*mcpReplica, error) {
+	if litestream.IsURL(path) {
+		r, err := NewReplicaFromConfig(&ReplicaConfig{URL: path}, nil)
+		if err != nil {
+			return nil, err
+		}
+		return &mcpReplica{Replica: r}, nil
+	}
+	resources, err := loadMCPDatabases(configPath)
+	if err != nil {
+		return nil, err
+	}
+	db, err := selectMCPDatabase(resources.DBs, path)
+	if err != nil {
+		return nil, errors.Join(err, resources.Close())
+	}
+	return &mcpReplica{Replica: db.Replica, Databases: resources}, nil
+}
+
+func restoreMCP(ctx context.Context, path string, r *litestream.Replica, opt litestream.RestoreOptions, ifDBNotExists, ifReplicaExists bool) (string, error) {
+	if ifDBNotExists {
+		if _, err := os.Stat(opt.OutputPath); err == nil {
+			return "database already exists, skipping\n", nil
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			return "", fmt.Errorf("access output path: %w", err)
+		}
+	}
+	if litestream.IsURL(path) && !ifReplicaExists {
+		if _, err := r.CalcRestoreTarget(ctx, opt); err != nil {
+			return "", err
+		}
+	}
+
+	cmd := &RestoreCommand{}
+	if err := cmd.prepareOutputPath(opt.OutputPath, false); err != nil {
+		return "", err
+	}
+
+	txID, err := cmd.restoreTXID(ctx, r, &opt)
+	if errors.Is(err, litestream.ErrTxNotAvailable) && ifReplicaExists {
+		return "no matching backups found, skipping\n", nil
+	} else if errors.Is(err, litestream.ErrTxNotAvailable) {
+		return "", fmt.Errorf("no matching backup files available")
+	} else if err != nil {
+		return "", err
+	}
+
+	start := time.Now()
+	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) && ifReplicaExists {
+		return "no matching backups found, skipping\n", nil
+	} else if errors.Is(err, litestream.ErrTxNotAvailable) {
+		return "", fmt.Errorf("no matching backup files available")
+	} else if err != nil {
+		return "", err
+	}
+
+	output, err := json.MarshalIndent(RestoreResult{
+		DBPath:         opt.OutputPath,
+		Replica:        r.Client.Type(),
+		TXID:           txID,
+		DurationMS:     time.Since(start).Milliseconds(),
+		IntegrityCheck: "none",
+	}, "", "  ")
+	if err != nil {
+		return "", fmt.Errorf("format response: %w", err)
+	}
+	return string(output) + "\n", nil
+}
+
+func selectMCPDatabase(dbs []*litestream.DB, path string) (*litestream.DB, error) {
+	expandedPath, err := expand(path)
+	if err != nil {
+		return nil, err
+	}
+	for _, db := range dbs {
+		if db.Path() == expandedPath {
+			return db, nil
+		}
+	}
+	return nil, fmt.Errorf("database not found in config: %s", expandedPath)
+}
+
+func listMCPLTXFiles(ctx context.Context, r *litestream.Replica, level int) ([]LTXFileInfo, error) {
+	itr, err := r.Client.LTXFiles(ctx, level, 0, false)
+	if err != nil {
+		return nil, err
+	}
+
+	var files []LTXFileInfo
+	for itr.Next() {
+		info := itr.Item()
+		files = append(files, LTXFileInfo{
+			Level:     info.Level,
+			MinTXID:   info.MinTXID.String(),
+			MaxTXID:   info.MaxTXID.String(),
+			Size:      info.Size,
+			Timestamp: info.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	if err := errors.Join(itr.Err(), itr.Close()); err != nil {
+		return nil, err
+	}
+	return files, nil
+}
+
+func formatMCPLTXFiles(files []LTXFileInfo) (string, error) {
+	var output strings.Builder
+	w := tabwriter.NewWriter(&output, 0, 8, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "level\tmin_txid\tmax_txid\tsize\tcreated"); err != nil {
+		return "", err
+	}
+	for _, file := range files {
+		if _, err := fmt.Fprintf(w, "%d\t%s\t%s\t%d\t%s\n",
+			file.Level,
+			file.MinTXID,
+			file.MaxTXID,
+			file.Size,
+			file.Timestamp,
+		); err != nil {
+			return "", err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return "", err
+	}
+	return output.String(), nil
+}
+
+func loadMCPStatuses(ctx context.Context, dbs []*litestream.DB, filterPath string) ([]mcpDBStatus, error) {
+	if filterPath != "" {
+		expandedPath, err := expand(filterPath)
+		if err != nil {
+			return nil, err
+		}
+		filterPath = expandedPath
+	}
+
+	statuses := make([]mcpDBStatus, 0, len(dbs))
+	for _, db := range dbs {
+		if filterPath != "" && db.Path() != filterPath {
+			continue
+		}
+		status, err := loadMCPStatus(ctx, db)
+		if err != nil {
+			return nil, fmt.Errorf("status for %s: %w", db.Path(), err)
+		}
+		statuses = append(statuses, status)
+	}
+	return statuses, nil
+}
+
+func loadMCPStatus(ctx context.Context, db *litestream.DB) (mcpDBStatus, error) {
+	status := mcpDBStatus{
+		Database:   db.Path(),
+		Status:     "unknown",
+		LocalTXID:  "-",
+		RemoteTXID: "-",
+		WALSize:    "0 B",
+	}
+
+	syncStatus, err := db.SyncStatus(ctx)
+	if err != nil {
+		return status, err
+	}
+	if syncStatus.LocalTXID > 0 {
+		status.LocalTXID = syncStatus.LocalTXID.String()
+	}
+	if syncStatus.RemoteTXID > 0 {
+		status.RemoteTXID = syncStatus.RemoteTXID.String()
+	}
+
+	if info, err := os.Stat(db.Path()); errors.Is(err, fs.ErrNotExist) {
+		status.Status = "no database"
+	} else if err != nil {
+		return status, fmt.Errorf("stat database: %w", err)
+	} else if info.IsDir() {
+		return status, fmt.Errorf("database path is a directory")
+	} else if syncStatus.InSync {
+		status.Status = "ok"
+	} else if syncStatus.LocalTXID == 0 {
+		status.Status = "not initialized"
+	} else if syncStatus.LocalTXID < syncStatus.RemoteTXID {
+		status.Status = "behind"
+	} else {
+		status.Status = "ahead"
+	}
+
+	if info, err := os.Stat(db.WALPath()); err == nil {
+		status.WALSize = humanize.Bytes(uint64(info.Size()))
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return status, fmt.Errorf("stat wal: %w", err)
+	}
+	return status, nil
+}
+
+func formatMCPStatuses(statuses []mcpDBStatus) (string, error) {
+	var output strings.Builder
+	w := tabwriter.NewWriter(&output, 0, 8, 2, ' ', 0)
+	if _, err := fmt.Fprintln(w, "database\tstatus\tlocal txid\tremote txid\twal size"); err != nil {
+		return "", err
+	}
+	for _, status := range statuses {
+		if _, err := fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n",
+			status.Database,
+			status.Status,
+			status.LocalTXID,
+			status.RemoteTXID,
+			status.WALSize,
+		); err != nil {
+			return "", err
+		}
+	}
+	if err := w.Flush(); err != nil {
+		return "", err
+	}
+	return output.String(), nil
+}
+
+func loadMCPResetDB(path, configPath string) (*litestream.DB, *mcpDatabases, error) {
+	dbPath, err := expand(path)
+	if err != nil {
+		return nil, nil, err
+	}
+	if info, err := os.Stat(dbPath); errors.Is(err, fs.ErrNotExist) {
+		return nil, nil, fmt.Errorf("database does not exist: %s", dbPath)
+	} else if err != nil {
+		return nil, nil, fmt.Errorf("access database: %w", err)
+	} else if info.IsDir() {
+		return nil, nil, fmt.Errorf("database path is a directory: %s", dbPath)
+	}
+
+	if configPath != "" {
+		resources, err := loadMCPDatabases(configPath)
+		if err != nil {
+			return nil, nil, fmt.Errorf("read config: %w", err)
+		}
+		for _, db := range resources.DBs {
+			if db.Path() == dbPath {
+				return db, resources, nil
+			}
+		}
+		if err := resources.Close(); err != nil {
+			return nil, nil, err
+		}
+	}
+	return litestream.NewDB(dbPath), nil, nil
+}
+
+func mcpToolError(err error) (*mcp.CallToolResult, error) {
+	return mcp.NewToolResultError(err.Error()), nil
 }

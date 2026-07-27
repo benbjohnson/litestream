@@ -26,6 +26,7 @@ func init() {
 const ReplicaClientType = "file"
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to disk.
@@ -73,6 +74,10 @@ func (c *ReplicaClient) Type() string {
 
 // Init is a no-op for file replica client as no initialization is required.
 func (c *ReplicaClient) Init(ctx context.Context) error {
+	return nil
+}
+
+func (c *ReplicaClient) Close() error {
 	return nil
 }
 
