@@ -59,7 +59,7 @@ const (
 //
 //  3. TruncatePageN (TRUNCATE): Blocking checkpoint at ~121k pages (~500MB).
 //     Emergency brake for runaway WAL growth. Can block writes while waiting
-//     for long-lived read transactions. Configurable/disableable.
+//     for long-lived read transactions. Configurable with a default backstop.
 //
 // The RESTART checkpoint mode was permanently removed due to production issues
 // with indefinite write blocking (issue #724). All checkpoints now use either
@@ -132,8 +132,7 @@ type DB struct {
 	//
 	// Uses TRUNCATE checkpoint mode (blocking). Prevents unbounded WAL growth
 	// from long-lived read transactions. Default: 121359 pages (~500MB with 4KB
-	// page size). Set to 0 to disable forced truncation (use with caution as
-	// WAL can grow unbounded if read transactions prevent checkpointing).
+	// page size). Set to 0 to retain the default emergency threshold.
 	TruncatePageN int
 
 	// Time between automatic checkpoints in the WAL. This is done to allow
@@ -1416,7 +1415,7 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.exceedsTruncateThreshold(origWALSize) {
-		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
+		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.effectiveTruncatePageN()))
 
 		if !exec.state.truncatePassiveFailed {
 			// Try a PASSIVE checkpoint first: if it restarts the WAL and brings
@@ -1497,8 +1496,16 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 // exceedsTruncateThreshold returns true once walSize has grown past the
 // emergency truncate checkpoint threshold.
 func (db *DB) exceedsTruncateThreshold(walSize int64) bool {
-	return db.TruncatePageN > 0 && db.pageSize != 0 &&
-		walSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
+	truncatePageN := db.effectiveTruncatePageN()
+	return truncatePageN > 0 && db.pageSize != 0 &&
+		walSize >= calcWALSize(uint32(db.pageSize), uint32(truncatePageN))
+}
+
+func (db *DB) effectiveTruncatePageN() int {
+	if db.TruncatePageN == 0 {
+		return DefaultTruncatePageN
+	}
+	return db.TruncatePageN
 }
 
 // isSQLiteBusyError returns true if the error is an SQLITE_BUSY error.
