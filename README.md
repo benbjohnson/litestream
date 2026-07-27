@@ -23,6 +23,15 @@ Contributing
 
 We welcome bug reports, fixes, and patches! Please see our [Contributing Guide](CONTRIBUTING.md) for details on how to contribute.
 
+Security
+--------
+
+Please do not open a public issue for security vulnerabilities. Report them
+privately through GitHub's [private vulnerability reporting](https://github.com/benbjohnson/litestream/security/advisories/new),
+which keeps the report visible only to you and the maintainers until a fix is
+released. See our [Security Policy](SECURITY.md) for what to include and what to
+expect.
+
 Acknowledgements
 ----------------
 
