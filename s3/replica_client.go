@@ -732,12 +732,12 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("s3: upload to %s: part size must be at least %d bytes", key, manager.MinUploadPartSize)
 	}
 
-	manifestStateEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	manifestStateEnabled := c.manifestStateEnabled()
 	if manifestStateEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
 	}
-	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
+	manifestMutationEnabled := c.manifestMutationEnabled()
 
 	var mutation *manifestMutation
 	if manifestMutationEnabled {
@@ -1273,12 +1273,12 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 	}
 
-	manifestStateEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	manifestStateEnabled := c.manifestStateEnabled()
 	if manifestStateEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
 	}
-	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
+	manifestMutationEnabled := c.manifestMutationEnabled()
 
 	var mutation *manifestMutation
 	if manifestMutationEnabled {
@@ -1386,12 +1386,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (retErr error) {
 		return err
 	}
 
-	manifestStateEnabled := c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+	manifestStateEnabled := c.manifestStateEnabled()
 	if manifestStateEnabled {
 		c.manifestMu.Lock()
 		defer c.manifestMu.Unlock()
 	}
-	manifestMutationEnabled := c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
+	manifestMutationEnabled := c.manifestMutationEnabled()
 
 	var mutation *manifestMutation
 	if manifestMutationEnabled {
@@ -1476,6 +1476,19 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (retErr error) {
 		c.manifestMu.Unlock()
 	}
 	return nil
+}
+
+// manifestStateEnabled reports whether any manifest capability is configured. Safe to
+// call without holding manifestMu (the flags are set at construction/config time).
+func (c *ReplicaClient) manifestStateEnabled() bool {
+	return c.ManifestWriteEnabled || c.ManifestConfigured || c.ManifestEnabled
+}
+
+// manifestMutationEnabled reports whether this call must maintain the manifest. It reads
+// manifestCleanupAttempted, which is mutated under manifestMu, so callers MUST hold
+// manifestMu when ManifestConfigured is true (which manifestStateEnabled guarantees).
+func (c *ReplicaClient) manifestMutationEnabled() bool {
+	return c.ManifestWriteEnabled || c.ManifestEnabled || (c.ManifestConfigured && !c.manifestCleanupAttempted)
 }
 
 func (c *ReplicaClient) manifestKey() string {

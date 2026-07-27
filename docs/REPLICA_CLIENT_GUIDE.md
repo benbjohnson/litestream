@@ -63,6 +63,16 @@ S3 manifest-aware mutations use a conditional lease at `PATH/.manifest/lock.json
 
 Manifest configuration is opt-in. An absent `manifest` key does not acquire ownership or perform cleanup. Explicit `manifest: false` removes stale manifest state before the next mutation. To disable an enabled manifest, set the key to false, allow one mutation to complete cleanup, then remove the key.
 
+### Manifest Limitations
+
+The sentinel and `If-Match` protocol is crash-safe for cooperative, manifest-aware clients on strongly consistent object storage. It is not an absolute reader snapshot: a reader that has already fetched a valid manifest holds a detached listing and may still receive `os.ErrNotExist` from `OpenLTXFile` if a writer deletes a referenced file before the reader opens it. This is the same time-of-check/time-of-use window as the LIST path.
+
+Only manifest-aware writers maintain the manifest. A writer without the manifest capability enabled, such as the `litestream-vfs` write path that builds its replica client with `NewReplicaClientFromURL` without enabling the manifest, mutates LTX files without invalidating an existing manifest and can leave readers trusting stale state. Do not run a non-manifest-aware writer against a replica whose manifest is enabled.
+
+The final manifest publication is fenced with `If-Match`, but the underlying LTX PUT and batch DELETE object operations are not server-side fenced. An expired lease owner whose object request is still in flight could theoretically commit after lease takeover; context cancellation reduces but does not eliminate this window.
+
+A manifest-reading follow poll performs one manifest GET per level queried. An active poll with contiguous L0 files performs one GET, while an idle or caught-up poll that scans levels 1–8 for gap-fill issues up to nine identical full-manifest GETs per tick.
+
 ## Implementation Checklist
 
 ### Required Features
