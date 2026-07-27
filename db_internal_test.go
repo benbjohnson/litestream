@@ -460,6 +460,80 @@ func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
 	}
 }
 
+func TestReplicaMonitor_DrainsLimitedBacklogWithoutWaitingForInterval(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: t.TempDir()}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	r.MaxSyncLTXFiles = 1
+	r.SyncInterval = time.Hour
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := sqldb.Exec(`INSERT INTO t DEFAULT VALUES;`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID <= ltx.TXID(r.MaxSyncLTXFiles) {
+		t.Fatalf("db txid=%s, want backlog larger than %d", dpos.TXID, r.MaxSyncLTXFiles)
+	}
+
+	r.MonitorEnabled = true
+	if err := r.Start(db.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := r.Pos().TXID; got == dpos.TXID {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("replica txid=%s, want %s before next sync interval", r.Pos().TXID, dpos.TXID)
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestDB_SyncDiagnostic(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 
