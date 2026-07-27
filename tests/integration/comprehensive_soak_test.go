@@ -247,8 +247,7 @@ func TestComprehensiveSoak(t *testing.T) {
 		}
 		t.Log("")
 		t.Log("Review the logs for details:")
-		logPath, _ := db.GetLitestreamLog()
-		t.Logf("  %s", logPath)
+		t.Logf("  %s", db.LitestreamLogPath())
 		t.Fail()
 	}
 

@@ -4651,3 +4651,441 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	default:
 	}
 }
+func TestDB_RestoreAfterCompactionWithConcurrentWrites(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	replicaDir := t.TempDir()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 100
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: replicaDir}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	for round := 0; round < 10; round++ {
+		for i := 0; i < 50; i++ {
+			blob := make([]byte, 2000)
+			if _, err := sqldb.Exec(`INSERT INTO t VALUES (?, ?)`, round*50+i+1, blob); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+
+		if round > 0 && round%2 == 0 {
+			if _, err := db.compactor.Compact(ctx, 1); err != nil && !errors.Is(err, ErrNoCompaction) {
+				t.Fatal(err)
+			}
+		}
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	pos, _ := db.Pos()
+	t.Logf("final position: txid=%d", pos.TXID)
+
+	dumpReplicaFiles := func() {
+		for level := 0; level <= 2; level++ {
+			itr, err := db.Replica.Client.LTXFiles(ctx, level, 0, false)
+			if err != nil {
+				t.Logf("  L%d: error listing: %v", level, err)
+				continue
+			}
+			for itr.Next() {
+				info := itr.Item()
+				f, err := db.Replica.Client.OpenLTXFile(ctx, level, info.MinTXID, info.MaxTXID, 0, 0)
+				if err != nil {
+					t.Logf("  L%d %s-%s: error opening: %v", level, info.MinTXID, info.MaxTXID, err)
+					continue
+				}
+				dec := ltx.NewDecoder(f)
+				if err := dec.DecodeHeader(); err != nil {
+					f.(io.Closer).Close()
+					t.Logf("  L%d %s-%s: error decoding header: %v", level, info.MinTXID, info.MaxTXID, err)
+					continue
+				}
+				hdr := dec.Header()
+				var pageCount int
+				data := make([]byte, hdr.PageSize)
+				for {
+					var phdr ltx.PageHeader
+					if err := dec.DecodePage(&phdr, data); err == io.EOF {
+						break
+					} else if err != nil {
+						break
+					}
+					pageCount++
+				}
+				f.(io.Closer).Close()
+				t.Logf("  L%d %s-%s: commit=%d pages=%d size=%d",
+					level, info.MinTXID, info.MaxTXID, hdr.Commit, pageCount, info.Size)
+			}
+			itr.Close()
+		}
+	}
+
+	restoredPath := filepath.Join(dir, "restored.db")
+	if err := db.Replica.Restore(ctx, RestoreOptions{OutputPath: restoredPath}); err != nil {
+		t.Log("RESTORE FAILED — dumping replica files:")
+		dumpReplicaFiles()
+
+		plan, planErr := CalcRestorePlan(ctx, db.Replica.Client, 0, time.Time{}, db.Logger)
+		if planErr != nil {
+			t.Logf("CalcRestorePlan error: %v", planErr)
+		} else {
+			t.Logf("Restore plan (%d files):", len(plan))
+			for _, info := range plan {
+				t.Logf("  L%d %s-%s commit=? size=%d", info.Level, info.MinTXID, info.MaxTXID, info.Size)
+			}
+		}
+
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	t.Log("Restore succeeded — verifying integrity")
+	restoredDB, err := sql.Open("sqlite", restoredPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restoredDB.Close()
+
+	var intResult string
+	if err := restoredDB.QueryRow("PRAGMA quick_check").Scan(&intResult); err != nil {
+		t.Fatalf("integrity check failed: %v", err)
+	}
+	if intResult != "ok" {
+		t.Fatalf("integrity check: %s", intResult)
+	}
+
+	var origCount, restoredCount int
+	sqldb.QueryRow("SELECT COUNT(*) FROM t").Scan(&origCount)
+	restoredDB.QueryRow("SELECT COUNT(*) FROM t").Scan(&restoredCount)
+	t.Logf("row count: original=%d restored=%d", origCount, restoredCount)
+}
+
+func TestCheckpointDoesNotTriggerSnapshot_SustainedWrites(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	sqldb.Close()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.MinCheckpointPageN = 5
+	db.TruncatePageN = 1000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 50; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t (data) VALUES (?)`, strings.Repeat("x", 1000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	db.syncState.syncedToWALEnd = false
+	db.mu.Unlock()
+
+	for i := 0; i < 50; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t (data) VALUES (?)`, strings.Repeat("y", 1000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	f, err := os.Open(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+
+	hdr := dec.Header()
+	if hdr.WALOffset == 0 || hdr.WALSize == 0 {
+		t.Fatalf("last LTX unexpectedly snapshot after passive checkpoint path: WALOffset=%d WALSize=%d", hdr.WALOffset, hdr.WALSize)
+	}
+
+	if hdr.Commit == 0 {
+		t.Fatal("last LTX has Commit=0")
+	}
+}
+
+func TestVerify_WALTruncation_SyncedToWALEnd_Incremental(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	sqldb.Close()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err = sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout=5000`); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 20; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t (data) VALUES (?)`, strings.Repeat("x", 500)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+
+	walPath := db.WALPath()
+	walFile, err := os.OpenFile(walPath, os.O_RDWR, 0)
+	if err != nil {
+		db.mu.Unlock()
+		t.Fatal(err)
+	}
+	hdrBuf := make([]byte, WALHeaderSize)
+	if _, err := walFile.ReadAt(hdrBuf, 0); err != nil {
+		walFile.Close()
+		db.mu.Unlock()
+		t.Fatal(err)
+	}
+	binary.BigEndian.PutUint32(hdrBuf[16:], binary.BigEndian.Uint32(hdrBuf[16:])+1)
+	if err := walFile.Truncate(WALHeaderSize); err != nil {
+		walFile.Close()
+		db.mu.Unlock()
+		t.Fatal(err)
+	}
+	if _, err := walFile.WriteAt(hdrBuf, 0); err != nil {
+		walFile.Close()
+		db.mu.Unlock()
+		t.Fatal(err)
+	}
+	walFile.Sync()
+	walFile.Close()
+
+	t.Run("SyncedToWALEnd=true does incremental", func(t *testing.T) {
+		db.syncState.syncedToWALEnd = true
+		info, err := db.verify(context.Background(), &db.syncState)
+		if err != nil {
+			db.mu.Unlock()
+			t.Fatal(err)
+		}
+		if info.snapshotting {
+			db.mu.Unlock()
+			t.Fatalf("expected incremental, got snapshot with reason=%q", info.reason)
+		}
+		if info.offset != WALHeaderSize {
+			db.mu.Unlock()
+			t.Fatalf("offset=%d, want %d", info.offset, WALHeaderSize)
+		}
+	})
+
+	t.Run("SyncedToWALEnd=false triggers snapshot", func(t *testing.T) {
+		db.syncState.syncedToWALEnd = false
+		info, err := db.verify(context.Background(), &db.syncState)
+		if err != nil {
+			db.mu.Unlock()
+			t.Fatal(err)
+		}
+		if !info.snapshotting {
+			db.mu.Unlock()
+			t.Fatal("expected snapshot when syncedToWALEnd=false after WAL truncation")
+		}
+		if info.reason != "wal truncated by another process" {
+			db.mu.Unlock()
+			t.Fatalf("reason=%q, want %q", info.reason, "wal truncated by another process")
+		}
+	})
+
+	db.mu.Unlock()
+}
+
+func TestSyncResult_SnapshotPageSequential(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 100; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t (data) VALUES (?)`, strings.Repeat("x", 4000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sqldb.Close()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.Lock()
+	pos, err := db.Pos()
+	if err != nil {
+		db.mu.Unlock()
+		t.Fatal(err)
+	}
+	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	db.mu.Unlock()
+
+	f, err := os.Open(ltxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+
+	lockPgno := ltx.LockPgno(dec.Header().PageSize)
+	var prevPgno uint32
+	var pageCount int
+	for {
+		var phdr ltx.PageHeader
+		data := make([]byte, dec.Header().PageSize)
+		if err := dec.DecodePage(&phdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatalf("decode page: %v", err)
+		}
+
+		pageCount++
+		if prevPgno > 0 {
+			expected := prevPgno + 1
+			if expected == lockPgno {
+				expected++
+			}
+			if phdr.Pgno != expected {
+				t.Fatalf("non-sequential page: prev=%d, got=%d, expected=%d (lock page=%d)",
+					prevPgno, phdr.Pgno, expected, lockPgno)
+			}
+		}
+		prevPgno = phdr.Pgno
+	}
+
+	if pageCount == 0 {
+		t.Fatal("snapshot LTX has no pages")
+	}
+	t.Logf("verified %d pages in snapshot LTX, all sequential", pageCount)
+}

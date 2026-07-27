@@ -79,6 +79,10 @@ func combinedOutput(stdoutBuf, stderrBuf *bytes.Buffer) string {
 	return strings.TrimSpace(sb.String())
 }
 
+func openLitestreamLogFile(tempDir string) (*os.File, error) {
+	return os.OpenFile(filepath.Join(tempDir, "litestream.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+}
+
 func SetupTestDB(t *testing.T, name string) *TestDB {
 	t.Helper()
 
@@ -231,8 +235,7 @@ func (db *TestDB) GenerateLoadWithOptions(ctx context.Context, writeRate int, du
 }
 
 func (db *TestDB) StartLitestream() error {
-	logPath := filepath.Join(db.TempDir, "litestream.log")
-	logFile, err := os.Create(logPath)
+	logFile, err := openLitestreamLogFile(db.TempDir)
 	if err != nil {
 		return fmt.Errorf("create log file: %w", err)
 	}
@@ -249,6 +252,9 @@ func (db *TestDB) StartLitestream() error {
 		logFile.Close()
 		return fmt.Errorf("start litestream: %w", err)
 	}
+	if err := logFile.Close(); err != nil {
+		return fmt.Errorf("close log file: %w", err)
+	}
 
 	db.LitestreamCmd = cmd
 	db.LitestreamPID = cmd.Process.Pid
@@ -264,8 +270,7 @@ func (db *TestDB) StartLitestream() error {
 }
 
 func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
-	logPath := filepath.Join(db.TempDir, "litestream.log")
-	logFile, err := os.Create(logPath)
+	logFile, err := openLitestreamLogFile(db.TempDir)
 	if err != nil {
 		return fmt.Errorf("create log file: %w", err)
 	}
@@ -282,6 +287,9 @@ func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
 		logFile.Close()
 		return fmt.Errorf("start litestream: %w", err)
 	}
+	if err := logFile.Close(); err != nil {
+		return fmt.Errorf("close log file: %w", err)
+	}
 
 	db.LitestreamCmd = cmd
 	db.LitestreamPID = cmd.Process.Pid
@@ -289,6 +297,13 @@ func (db *TestDB) StartLitestreamWithConfig(configPath string) error {
 	time.Sleep(2 * time.Second)
 
 	return nil
+}
+
+func (db *TestDB) RestartLitestreamWithConfig(configPath string) error {
+	if err := db.StopLitestream(); err != nil {
+		return err
+	}
+	return db.StartLitestreamWithConfig(configPath)
 }
 
 func (db *TestDB) StopLitestream() error {
@@ -408,6 +423,22 @@ func (db *TestDB) GetRowCount(table string) (int, error) {
 	return count, nil
 }
 
+func getRowCountFromPath(dbPath, table string) (int, error) {
+	sqlDB, err := sql.Open("sqlite3", dbPath)
+	if err != nil {
+		return 0, err
+	}
+	defer sqlDB.Close()
+
+	var count int
+	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
+	if err := sqlDB.QueryRow(query).Scan(&count); err != nil {
+		return 0, err
+	}
+
+	return count, nil
+}
+
 func (db *TestDB) GetDatabaseSize() (int64, error) {
 	info, err := os.Stat(db.Path)
 	if err != nil {
@@ -450,12 +481,15 @@ func (db *TestDB) WaitForReplicaFiles(minFiles int, timeout time.Duration) (int,
 }
 
 func (db *TestDB) GetLitestreamLog() (string, error) {
-	logPath := filepath.Join(db.TempDir, "litestream.log")
-	content, err := os.ReadFile(logPath)
+	content, err := os.ReadFile(db.LitestreamLogPath())
 	if err != nil {
 		return "", err
 	}
 	return string(content), nil
+}
+
+func (db *TestDB) LitestreamLogPath() string {
+	return filepath.Join(db.TempDir, "litestream.log")
 }
 
 func (db *TestDB) CheckForErrors() ([]string, error) {

@@ -4,7 +4,6 @@ package integration
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -298,8 +297,7 @@ func TestOvernightS3Soak(t *testing.T) {
 		}
 		t.Log("")
 		t.Log("Review the logs for details:")
-		logPath, _ := db.GetLitestreamLog()
-		t.Logf("  %s", logPath)
+		t.Logf("  %s", db.LitestreamLogPath())
 		t.Fail()
 	}
 
@@ -327,21 +325,4 @@ func logS3Metrics(t *testing.T, db *TestDB, s3URL string) {
 	if s3Size := GetS3StorageSize(t, s3URL); s3Size > 0 {
 		t.Logf("    Total storage: %.2f MB", float64(s3Size)/(1024*1024))
 	}
-}
-
-// getRowCountFromPath gets row count from a database file path
-func getRowCountFromPath(dbPath, table string) (int, error) {
-	db, err := sql.Open("sqlite3", dbPath)
-	if err != nil {
-		return 0, err
-	}
-	defer db.Close()
-
-	var count int
-	query := fmt.Sprintf("SELECT COUNT(*) FROM %s", table)
-	if err := db.QueryRow(query).Scan(&count); err != nil {
-		return 0, err
-	}
-
-	return count, nil
 }
