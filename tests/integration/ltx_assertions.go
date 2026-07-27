@@ -444,6 +444,8 @@ func invalidCheckpointReason(ev LTXEvent) string {
 		return "missing or malformed timestamp and missing mode"
 	case ev.Time.IsZero():
 		return "missing or malformed timestamp"
+	case ev.Database == "":
+		return "missing database"
 	case !isCheckpointMode(ev.CheckpointMode):
 		return fmt.Sprintf("invalid mode %q", ev.CheckpointMode)
 	default:

@@ -55,6 +55,16 @@ time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint db=test.db mode=TRUNCATE
 time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint db=alpha.db mode=TRUNCATE
 time=2026-07-25T01:00:03Z level=DEBUG msg=sync db=beta.db snap=true reason="checkpoint boundary snapshot"
 `,
+		"missing checkpoint database launders older truncate": `
+time=2026-07-25T01:00:00Z level=DEBUG msg=checkpoint db=beta.db mode=TRUNCATE
+time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint mode=PASSIVE
+time=2026-07-25T01:00:03Z level=DEBUG msg=sync db=beta.db snap=true reason="checkpoint boundary snapshot"
+`,
+		"empty checkpoint database launders older truncate": `
+time=2026-07-25T01:00:00Z level=DEBUG msg=checkpoint db=beta.db mode=TRUNCATE
+time=2026-07-25T01:00:02Z level=DEBUG msg=checkpoint db="" mode=PASSIVE
+time=2026-07-25T01:00:03Z level=DEBUG msg=sync db=beta.db snap=true reason="checkpoint boundary snapshot"
+`,
 	}
 
 	for name, logText := range tests {
