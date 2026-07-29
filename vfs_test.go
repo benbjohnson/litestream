@@ -1416,6 +1416,48 @@ func TestHydrator_ApplyUpdates_WholeFile(t *testing.T) {
 	}
 }
 
+func TestHydrator_ApplyUpdates_WholeFileTXIDMismatch(t *testing.T) {
+	object := buildLTXFixtureWithPages(t, 3, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'x')
+	for _, tt := range []struct {
+		name    string
+		minTXID ltx.TXID
+		maxTXID ltx.TXID
+	}{
+		{name: "min", minTXID: 2, maxTXID: 3},
+		{name: "max", minTXID: 3, maxTXID: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newMockReplicaClient()
+			info := *object.info
+			info.MinTXID = tt.minTXID
+			info.MaxTXID = tt.maxTXID
+			client.data[client.key(&info)] = object.data
+
+			index, err := FetchPageIndex(t.Context(), client, &info)
+			if err != nil {
+				t.Fatalf("fetch page index: %v", err)
+			}
+
+			h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+			if err := h.Init(); err != nil {
+				t.Fatalf("init: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := h.Close(); err != nil {
+					t.Errorf("close: %v", err)
+				}
+			})
+
+			err = h.applyUpdateSet(t.Context(), index, []*ltx.FileInfo{&info})
+			want := fmt.Sprintf("ltx transaction range %s-%s does not match requested %s-%s",
+				object.info.MinTXID, object.info.MaxTXID, info.MinTXID, info.MaxTXID)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("apply error=%v", err)
+			}
+		})
+	}
+}
+
 func TestHydrator_ApplyUpdates_WholeFileTruncatedTail(t *testing.T) {
 	fixture := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'g')
 	baseClient := newMockReplicaClient()

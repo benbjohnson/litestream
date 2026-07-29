@@ -687,7 +687,7 @@ func (h *Hydrator) SetComplete() {
 	h.complete.Store(true)
 }
 
-// Disable temporarily disables hydrated reads (used during time travel).
+// Disable disables hydrated reads during time travel or permanently after an apply failure.
 func (h *Hydrator) Disable() {
 	h.complete.Store(false)
 }
@@ -864,16 +864,6 @@ func (h *Hydrator) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-func (h *Hydrator) tryReadAt(p []byte, off int64) (int, bool, error) {
-	if !h.applyMu.TryRLock() {
-		return 0, false, nil
-	}
-	defer h.applyMu.RUnlock()
-
-	n, err := h.ReadAt(p, off)
-	return n, true, err
-}
-
 // ApplyUpdates fetches updated pages and writes them to the hydration file.
 func (h *Hydrator) ApplyUpdates(ctx context.Context, updates map[uint32]ltx.PageIndexElem) error {
 	return h.applyUpdateSet(ctx, updates, nil)
@@ -944,6 +934,9 @@ func (h *Hydrator) applyWholeLTX(ctx context.Context, key hydrationLTXKey, group
 		return fmt.Errorf("decode header: %w", err)
 	}
 	hdr := dec.Header()
+	if hdr.MinTXID != info.MinTXID || hdr.MaxTXID != info.MaxTXID {
+		return fmt.Errorf("ltx transaction range %s-%s does not match requested %s-%s", hdr.MinTXID, hdr.MaxTXID, info.MinTXID, info.MaxTXID)
+	}
 	if hdr.PageSize != h.pageSize {
 		return fmt.Errorf("ltx page size %d does not match hydration page size %d", hdr.PageSize, h.pageSize)
 	}
@@ -1733,13 +1726,13 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 	hydrator := f.hydrator
-	hydrationCurrent := len(f.pending) == 0 && !f.pendingReplace
+	hydrationReadLocked := len(f.pending) == 0 && !f.pendingReplace &&
+		hydrator != nil && hydrator.Complete() && hydrator.applyMu.TryRLock()
 	f.mu.Unlock()
 
-	if hydrationCurrent && hydrator != nil && hydrator.Complete() {
-		if n, ok, err := hydrator.tryReadAt(p, off); ok {
-			return n, err
-		}
+	if hydrationReadLocked {
+		defer hydrator.applyMu.RUnlock()
+		return hydrator.ReadAt(p, off)
 	}
 
 	// Check cache (cache is thread-safe)
