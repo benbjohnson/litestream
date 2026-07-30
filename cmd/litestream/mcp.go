@@ -63,13 +63,13 @@ func NewMCP(ctx context.Context, configPath, authToken string) (*MCPServer, erro
 }
 
 func newMCPHandler(mcpServer *mcp.Server, authToken string) http.Handler {
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+	transportHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Stateless:                    true,
 		PropagateRequestCancellation: true,
 	})
-	handler = bearerAuthMiddleware(authToken, handler)
+	authHandler := bearerAuthMiddleware(authToken, transportHandler)
 	protection := http.NewCrossOriginProtection()
 	originHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Origin") != "" {
@@ -80,7 +80,7 @@ func newMCPHandler(mcpServer *mcp.Server, authToken string) http.Handler {
 				return
 			}
 		}
-		handler.ServeHTTP(w, r)
+		authHandler.ServeHTTP(w, r)
 	})
 	return httplog.Logger(protection.Handler(originHandler))
 }
