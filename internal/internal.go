@@ -96,6 +96,19 @@ func CreateFile(filename string, fi os.FileInfo) (*os.File, error) {
 
 // MkdirAll is a copy of os.MkdirAll() except that it attempts to set the
 // mode/uid/gid to match fi for each created directory.
+// FsyncDir syncs a directory so a preceding rename within it is durable.
+func FsyncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
+}
+
 func MkdirAll(path string, fi os.FileInfo) error {
 	uid, gid := Fileinfo(fi)
 
