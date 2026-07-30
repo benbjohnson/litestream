@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -13,7 +14,67 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/mock"
 )
+
+func TestStore_Open_InitError(t *testing.T) {
+	want := errors.New("init error")
+	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error { return want },
+	})
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("Open() error = %v, want %v", err, want)
+	}
+}
+
+func TestStore_Open_InitErrorDoesNotOpenDBs(t *testing.T) {
+	want := errors.New("init error")
+	initStarted := make(chan struct{})
+	allowFailure := make(chan struct{})
+
+	db0 := litestream.NewDB(filepath.Join(t.TempDir(), "db0"))
+	db0.MonitorInterval = 0
+	db0.Replica = litestream.NewReplicaWithClient(db0, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error {
+			close(initStarted)
+			<-allowFailure
+			return nil
+		},
+	})
+	t.Cleanup(func() {
+		if db0.IsOpen() {
+			if err := db0.Close(context.Background()); err != nil {
+				t.Errorf("close db0: %v", err)
+			}
+		}
+	})
+
+	db1 := litestream.NewDB(filepath.Join(t.TempDir(), "db1"))
+	db1.MonitorInterval = 0
+	db1.Replica = litestream.NewReplicaWithClient(db1, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error {
+			<-initStarted
+			close(allowFailure)
+			return want
+		},
+	})
+
+	store := litestream.NewStore([]*litestream.DB{db0, db1}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("Open() error = %v, want %v", err, want)
+	}
+	if db0.IsOpen() {
+		t.Fatal("db0 opened before all replica clients initialized")
+	}
+	if db1.IsOpen() {
+		t.Fatal("db1 opened before all replica clients initialized")
+	}
+}
 
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
