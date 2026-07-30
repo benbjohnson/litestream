@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define LITESTREAM_MIN_SQLITE_VERSION_NUMBER 3031000
+
 /* sqlite3vfs already called SQLITE_EXTENSION_INIT1 */
 extern const sqlite3_api_routines *sqlite3_api;
 
@@ -31,6 +33,13 @@ static void litestream_auto_extension(sqlite3* db, const char** pzErrMsg, const 
 int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
   int rc = SQLITE_OK;
   SQLITE_EXTENSION_INIT2(pApi);
+
+  if (sqlite3_libversion_number() < LITESTREAM_MIN_SQLITE_VERSION_NUMBER) {
+    if (pzErrMsg != NULL) {
+      *pzErrMsg = sqlite3_mprintf("litestream VFS requires SQLite 3.31.0 or later (found %s)", sqlite3_libversion());
+    }
+    return SQLITE_ERROR;
+  }
 
   /* Call into Go to register the VFS and check for errors. */
   char* err = LitestreamVFSRegister();
