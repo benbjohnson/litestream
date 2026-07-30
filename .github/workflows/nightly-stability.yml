@@ -264,6 +264,8 @@ jobs:
     needs: [race-detector-sweep, ltx-behavioral-soak, ltx-snapshot-regression, minio-soak, replicate-restore-soak, comprehensive-soak]
     if: failure()
     steps:
+      - uses: actions/checkout@v4
+
       - name: Create or update failure issue
         uses: actions/github-script@v7
         env:
@@ -272,6 +274,9 @@ jobs:
           script: |
             const fs = require('fs');
             const crypto = require('crypto');
+            const { classifyJobs } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/nightly-stability-jobs`
+            );
 
             const owner = context.repo.owner;
             const repo = context.repo.repo;
@@ -453,12 +458,10 @@ jobs:
                 run_id: runId,
                 attempt_number: runAttempt,
                 per_page: 100,
-              },
-              response => response.data.jobs
+              }
             );
 
-            const failedConclusions = new Set(['failure', 'timed_out', 'action_required', 'cancelled', 'startup_failure']);
-            const failedJobs = jobs.filter(job => failedConclusions.has(job.conclusion || ''));
+            const failedJobs = classifyJobs(jobs);
 
             if (failedJobs.length === 0) {
               console.log('No failed jobs found for this run');
@@ -467,40 +470,38 @@ jobs:
 
             const failures = [];
             for (const job of failedJobs) {
-              const failedSteps = (job.steps || [])
-                .filter(step => step.conclusion === 'failure')
-                .map(step => step.name);
+              let logText = job.classificationError;
+              if (!job.classificationError) {
+                try {
+                  const response = await fetch(
+                    `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${job.id}/logs`,
+                    {
+                      headers: {
+                        Accept: 'application/vnd.github+json',
+                        Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                        'X-GitHub-Api-Version': '2022-11-28',
+                      },
+                    }
+                  );
 
-              let logText = '';
-              try {
-                const response = await fetch(
-                  `https://api.github.com/repos/${owner}/${repo}/actions/jobs/${job.id}/logs`,
-                  {
-                    headers: {
-                      Accept: 'application/vnd.github+json',
-                      Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
-                      'X-GitHub-Api-Version': '2022-11-28',
-                    },
+                  if (!response.ok) {
+                    throw new Error(`Unable to fetch logs (${response.status})`);
                   }
-                );
 
-                if (!response.ok) {
-                  throw new Error(`Unable to fetch logs (${response.status})`);
+                  logText = await response.text();
+                } catch (error) {
+                  logText = `Log download failed: ${error.message}`;
                 }
-
-                logText = await response.text();
-              } catch (error) {
-                logText = `Log download failed: ${error.message}`;
               }
 
               const snippets = extractFailureSnippets(logText);
-              const primarySource = snippets[0] || failedSteps[0] || `${job.name} failed`;
+              const primarySource = snippets[0] || job.failedSteps[0] || job.classificationError || `${job.name} failed`;
               const primarySignature = summarizeSnippet(primarySource, job.name);
 
               failures.push({
                 name: job.name,
-                url: job.html_url || job.url,
-                failedSteps,
+                url: job.url || runUrl,
+                failedSteps: job.failedSteps,
                 snippets: snippets.length > 0 ? snippets : [sanitizeSnippet(primarySource)],
                 primarySignature,
                 fingerprintKey: `${job.name}:${normalizeForFingerprint(primarySignature)}`,
