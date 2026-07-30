@@ -165,17 +165,17 @@ func TestMCPServerTools(t *testing.T) {
 		}
 	}
 
-	rawResponse, _ := postMCPRequest(t, httpServer.URL, "tools/list", "2026-07-28", map[string]any{
-		"_meta": map[string]any{
-			mcp.MetaKeyProtocolVersion:    "2026-07-28",
-			mcp.MetaKeyClientInfo:         map[string]any{"name": "test-client", "version": "v1.0.0"},
-			mcp.MetaKeyClientCapabilities: map[string]any{},
-		},
-	})
+	meta := map[string]any{
+		mcp.MetaKeyProtocolVersion:    "2026-07-28",
+		mcp.MetaKeyClientInfo:         map[string]any{"name": "test-client", "version": "v1.0.0"},
+		mcp.MetaKeyClientCapabilities: map[string]any{},
+	}
+	rawResponse, _ := postMCPRequest(t, httpServer.URL, "tools/list", "2026-07-28", map[string]any{"_meta": meta})
 	rawResult, ok := rawResponse["result"].(map[string]any)
 	if !ok {
 		t.Fatalf("raw tools/list result=%T, want map[string]any", rawResponse["result"])
 	}
+	assertMCPResultCaching(t, rawResult)
 	if got := rawResult["resultType"]; got != "complete" {
 		t.Fatalf("raw tools/list resultType=%v, want complete", got)
 	}
@@ -201,6 +201,13 @@ func TestMCPServerTools(t *testing.T) {
 		}
 	}
 
+	discoverResponse, _ := postMCPRequest(t, httpServer.URL, "server/discover", "2026-07-28", map[string]any{"_meta": meta})
+	discoverResult, ok := discoverResponse["result"].(map[string]any)
+	if !ok {
+		t.Fatalf("raw server/discover result=%T, want map[string]any", discoverResponse["result"])
+	}
+	assertMCPResultCaching(t, discoverResult)
+
 	callResult, err := session.CallTool(t.Context(), &mcp.CallToolParams{
 		Name:      "litestream_version",
 		Arguments: map[string]any{},
@@ -216,6 +223,17 @@ func TestMCPServerTools(t *testing.T) {
 	}
 	if got, want := textContent(t, callResult), version+"\n"; got != want {
 		t.Fatalf("version text content=%q, want %q", got, want)
+	}
+}
+
+func assertMCPResultCaching(t *testing.T, result map[string]any) {
+	t.Helper()
+
+	if got, want := result["ttlMs"], float64(mcpCatalogCacheTTL/time.Millisecond); got != want {
+		t.Errorf("ttlMs=%v, want %v", got, want)
+	}
+	if got, want := result["cacheScope"], "public"; got != want {
+		t.Errorf("cacheScope=%v, want %q", got, want)
 	}
 }
 

@@ -17,6 +17,8 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+const mcpCatalogCacheTTL = 5 * time.Minute
+
 type MCPServer struct {
 	ctx        context.Context
 	mux        *http.ServeMux
@@ -35,7 +37,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 		},
 	)
-	mcpServer.AddReceivingMiddleware(recoveryMiddleware)
+	mcpServer.AddReceivingMiddleware(recoveryMiddleware, cacheableResultMiddleware)
 	infoTool, infoHandler := InfoTool(configPath)
 	mcp.AddTool(mcpServer, infoTool, infoHandler)
 	databasesTool, databasesHandler := DatabasesTool(configPath)
@@ -456,5 +458,21 @@ func recoveryMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
 			}
 		}()
 		return next(ctx, method, request)
+	}
+}
+
+func cacheableResultMiddleware(next mcp.MethodHandler) mcp.MethodHandler {
+	return func(ctx context.Context, method string, request mcp.Request) (mcp.Result, error) {
+		result, err := next(ctx, method, request)
+		if err != nil {
+			return result, err
+		}
+		switch result := result.(type) {
+		case *mcp.ListToolsResult:
+			result.TTLMs = int(mcpCatalogCacheTTL / time.Millisecond)
+		case *mcp.DiscoverResult:
+			result.TTLMs = int(mcpCatalogCacheTTL / time.Millisecond)
+		}
+		return result, nil
 	}
 }
