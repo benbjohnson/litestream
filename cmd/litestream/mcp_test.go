@@ -239,6 +239,54 @@ func TestMCPServerAbandonedSession(t *testing.T) {
 	}
 }
 
+func TestMCPServerCrossOriginProtection(t *testing.T) {
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	httpServer := httptest.NewServer(server)
+	t.Cleanup(httpServer.Close)
+
+	params := map[string]any{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]any{},
+		"clientInfo":      map[string]any{"name": "test-client", "version": "v1.0.0"},
+	}
+	if response, _ := postMCPRequest(t, httpServer.URL, "initialize", "", params); response["result"] == nil {
+		t.Fatal("request without Origin failed")
+	}
+
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "initialize",
+		"params":  params,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, httpServer.URL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Origin", "https://example.com")
+
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := response.StatusCode, http.StatusForbidden; got != want {
+		t.Fatalf("foreign Origin status=%d, want %d: %s", got, want, data)
+	}
+}
+
 func TestMCPToolBehavior(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX shell")
