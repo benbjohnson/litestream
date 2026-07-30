@@ -259,7 +259,7 @@ func TestMCPServerAbandonedSession(t *testing.T) {
 }
 
 func TestMCPServerCrossOriginProtection(t *testing.T) {
-	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -324,11 +324,42 @@ func TestMCPServerCrossOriginProtection(t *testing.T) {
 	}
 }
 
+func TestMCPServerCrossOriginProtectionPrecedesBearerAuth(t *testing.T) {
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name          string
+		authorization string
+	}{
+		{name: "without credential"},
+		{name: "with correct credential", authorization: "Bearer secret"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request := newMCPInitializeRequest(test.authorization)
+			request.Header.Set("Origin", "https://attacker.example")
+			response := httptest.NewRecorder()
+
+			server.ServeHTTP(response, request)
+
+			if got, want := response.Code, http.StatusForbidden; got != want {
+				t.Fatalf("status=%d, want %d", got, want)
+			}
+			if got := response.Header().Get("WWW-Authenticate"); got != "" {
+				t.Fatalf("WWW-Authenticate=%q, want empty", got)
+			}
+		})
+	}
+}
+
 func TestMCPServerRequestCancellation(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerCanceled := make(chan error, 1)
 
-	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml", "")
 	if err != nil {
 		t.Fatal(err)
 	}
