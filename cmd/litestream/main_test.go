@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -421,6 +423,87 @@ func TestNewGSReplicaFromConfig(t *testing.T) {
 		t.Fatalf("Bucket=%s, want %s", got, want)
 	} else if got, want := client.Path, "bar"; got != want {
 		t.Fatalf("Path=%s, want %s", got, want)
+	}
+}
+
+func TestNewNATSReplicaFromConfig_TLS(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: true
+      root-cas: [ca.pem]
+      client-cert: client.pem
+      client-key: client-key.pem
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, ok := r.Client.(*nats.ReplicaClient)
+	if !ok {
+		t.Fatal("unexpected replica type")
+	}
+	if !client.TLS {
+		t.Fatal("TLS=false, want true")
+	}
+	if got, want := client.RootCAs, []string{"ca.pem"}; !slices.Equal(got, want) {
+		t.Fatalf("RootCAs=%v, want %v", got, want)
+	}
+	if got, want := client.ClientCert, "client.pem"; got != want {
+		t.Fatalf("ClientCert=%q, want %q", got, want)
+	}
+	if got, want := client.ClientKey, "client-key.pem"; got != want {
+		t.Fatalf("ClientKey=%q, want %q", got, want)
+	}
+}
+
+func TestNewNATSReplicaFromConfig_TLSOverridesGlobalDefault(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+tls: true
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: false
+  - path: /tmp/db-inherits
+    replica:
+      type: nats
+      bucket: bucket
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "ExplicitFalse", index: 0, want: false},
+		{name: "InheritedTrue", index: 1, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, err := main.NewReplicaFromConfig(config.DBs[test.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, ok := r.Client.(*nats.ReplicaClient)
+			if !ok {
+				t.Fatal("unexpected replica type")
+			}
+			if client.TLS != test.want {
+				t.Fatalf("TLS=%v, want %v", client.TLS, test.want)
+			}
+		})
 	}
 }
 
