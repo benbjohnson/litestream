@@ -52,12 +52,19 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcp.AddTool(mcpServer, resetTool, resetHandler)
 
 	s.mux = http.NewServeMux()
+	s.mux.Handle("/", newMCPHandler(mcpServer))
+	return s, nil
+}
+
+func newMCPHandler(mcpServer *mcp.Server) http.Handler {
 	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
-	}, &mcp.StreamableHTTPOptions{Stateless: true})
+	}, &mcp.StreamableHTTPOptions{
+		Stateless:                    true,
+		PropagateRequestCancellation: true,
+	})
 	protection := http.NewCrossOriginProtection()
-	s.mux.Handle("/", httplog.Logger(protection.Handler(handler)))
-	return s, nil
+	return httplog.Logger(protection.Handler(handler))
 }
 
 func (s *MCPServer) Start(addr string) {

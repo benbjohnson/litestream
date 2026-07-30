@@ -16,6 +16,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -284,6 +285,95 @@ func TestMCPServerCrossOriginProtection(t *testing.T) {
 	}
 	if got, want := response.StatusCode, http.StatusForbidden; got != want {
 		t.Fatalf("foreign Origin status=%d, want %d: %s", got, want, data)
+	}
+}
+
+func TestMCPServerRequestCancellation(t *testing.T) {
+	handlerStarted := make(chan struct{})
+	handlerCanceled := make(chan error, 1)
+
+	mcpServer := mcp.NewServer(
+		&mcp.Implementation{Name: "test-server", Version: "v1.0.0"},
+		&mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}},
+	)
+	mcp.AddTool(mcpServer, &mcp.Tool{Name: "wait"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+		close(handlerStarted)
+		<-ctx.Done()
+		handlerCanceled <- context.Cause(ctx)
+		return nil, nil, context.Cause(ctx)
+	})
+
+	httpServer := httptest.NewServer(newMCPHandler(mcpServer))
+	t.Cleanup(httpServer.Close)
+
+	body, err := json.Marshal(map[string]any{
+		"jsonrpc": "2.0",
+		"id":      1,
+		"method":  "tools/call",
+		"params": map[string]any{
+			"name":      "wait",
+			"arguments": map[string]any{},
+			"_meta": map[string]any{
+				mcp.MetaKeyProtocolVersion:    "2026-07-28",
+				mcp.MetaKeyClientInfo:         map[string]any{"name": "test-client", "version": "v1.0.0"},
+				mcp.MetaKeyClientCapabilities: map[string]any{},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testCtx, cancelTest := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancelTest()
+	requestCtx, cancelRequest := context.WithCancel(testCtx)
+	defer cancelRequest()
+
+	request, err := http.NewRequestWithContext(requestCtx, http.MethodPost, httpServer.URL, bytes.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("Accept", "application/json, text/event-stream")
+	request.Header.Set("Mcp-Protocol-Version", "2026-07-28")
+	request.Header.Set("Mcp-Method", "tools/call")
+	request.Header.Set("Mcp-Name", "wait")
+
+	requestDone := make(chan error, 1)
+	go func() {
+		response, err := http.DefaultClient.Do(request)
+		if err != nil {
+			requestDone <- err
+			return
+		}
+		_, readErr := io.Copy(io.Discard, response.Body)
+		closeErr := response.Body.Close()
+		requestDone <- errors.Join(readErr, closeErr)
+	}()
+
+	select {
+	case <-handlerStarted:
+	case <-testCtx.Done():
+		t.Fatalf("handler did not start: %v", context.Cause(testCtx))
+	}
+	cancelRequest()
+
+	select {
+	case err := <-handlerCanceled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("handler cancellation=%v, want context canceled", err)
+		}
+	case <-testCtx.Done():
+		t.Fatalf("handler context was not canceled: %v", context.Cause(testCtx))
+	}
+
+	select {
+	case err := <-requestDone:
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("request error=%v, want context canceled", err)
+		}
+	case <-testCtx.Done():
+		t.Fatalf("request did not finish: %v", context.Cause(testCtx))
 	}
 }
 
