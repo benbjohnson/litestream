@@ -22,6 +22,7 @@ const mcpCatalogCacheTTL = 5 * time.Minute
 type MCPServer struct {
 	ctx        context.Context
 	mux        *http.ServeMux
+	mcpServer  *mcp.Server
 	httpServer *http.Server
 	configPath string
 }
@@ -37,6 +38,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 			Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}},
 		},
 	)
+	s.mcpServer = mcpServer
 	mcpServer.AddReceivingMiddleware(recoveryMiddleware, cacheableResultMiddleware)
 	infoTool, infoHandler := InfoTool(configPath)
 	mcp.AddTool(mcpServer, infoTool, infoHandler)
@@ -66,7 +68,18 @@ func newMCPHandler(mcpServer *mcp.Server) http.Handler {
 		PropagateRequestCancellation: true,
 	})
 	protection := http.NewCrossOriginProtection()
-	return httplog.Logger(protection.Handler(handler))
+	originHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Origin") != "" {
+			checkRequest := r.Clone(r.Context())
+			checkRequest.Method = http.MethodPost
+			if err := protection.Check(checkRequest); err != nil {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+		}
+		handler.ServeHTTP(w, r)
+	})
+	return httplog.Logger(protection.Handler(originHandler))
 }
 
 func (s *MCPServer) Start(addr string) {
