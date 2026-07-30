@@ -271,10 +271,6 @@ func TestMCPServerCrossOriginProtection(t *testing.T) {
 		"capabilities":    map[string]any{},
 		"clientInfo":      map[string]any{"name": "test-client", "version": "v1.0.0"},
 	}
-	if response, _ := postMCPRequest(t, httpServer.URL, "initialize", "", params); response["result"] == nil {
-		t.Fatal("request without Origin failed")
-	}
-
 	body, err := json.Marshal(map[string]any{
 		"jsonrpc": "2.0",
 		"id":      1,
@@ -284,25 +280,47 @@ func TestMCPServerCrossOriginProtection(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	request, err := http.NewRequestWithContext(t.Context(), http.MethodPost, httpServer.URL, bytes.NewReader(body))
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "application/json, text/event-stream")
-	request.Header.Set("Origin", "https://example.com")
 
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name       string
+		method     string
+		origin     string
+		wantStatus int
+	}{
+		{name: "POST without Origin", method: http.MethodPost, wantStatus: http.StatusOK},
+		{name: "GET without Origin", method: http.MethodGet, wantStatus: http.StatusMethodNotAllowed},
+		{name: "HEAD without Origin", method: http.MethodHead, wantStatus: http.StatusMethodNotAllowed},
+		{name: "OPTIONS without Origin", method: http.MethodOptions, wantStatus: http.StatusMethodNotAllowed},
+		{name: "POST with foreign Origin", method: http.MethodPost, origin: "https://example.com", wantStatus: http.StatusForbidden},
+		{name: "GET with foreign Origin", method: http.MethodGet, origin: "https://example.com", wantStatus: http.StatusForbidden},
+		{name: "HEAD with foreign Origin", method: http.MethodHead, origin: "https://example.com", wantStatus: http.StatusForbidden},
+		{name: "OPTIONS with foreign Origin", method: http.MethodOptions, origin: "https://example.com", wantStatus: http.StatusForbidden},
 	}
-	data, readErr := io.ReadAll(response.Body)
-	closeErr := response.Body.Close()
-	if err := errors.Join(readErr, closeErr); err != nil {
-		t.Fatal(err)
-	}
-	if got, want := response.StatusCode, http.StatusForbidden; got != want {
-		t.Fatalf("foreign Origin status=%d, want %d: %s", got, want, data)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			request, err := http.NewRequestWithContext(t.Context(), test.method, httpServer.URL, bytes.NewReader(body))
+			if err != nil {
+				t.Fatal(err)
+			}
+			request.Header.Set("Content-Type", "application/json")
+			request.Header.Set("Accept", "application/json, text/event-stream")
+			if test.origin != "" {
+				request.Header.Set("Origin", test.origin)
+			}
+
+			response, err := http.DefaultClient.Do(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, readErr := io.ReadAll(response.Body)
+			closeErr := response.Body.Close()
+			if err := errors.Join(readErr, closeErr); err != nil {
+				t.Fatal(err)
+			}
+			if got := response.StatusCode; got != test.wantStatus {
+				t.Fatalf("status=%d, want %d: %s", got, test.wantStatus, data)
+			}
+		})
 	}
 }
 
@@ -310,18 +328,18 @@ func TestMCPServerRequestCancellation(t *testing.T) {
 	handlerStarted := make(chan struct{})
 	handlerCanceled := make(chan error, 1)
 
-	mcpServer := mcp.NewServer(
-		&mcp.Implementation{Name: "test-server", Version: "v1.0.0"},
-		&mcp.ServerOptions{Capabilities: &mcp.ServerCapabilities{Tools: &mcp.ToolCapabilities{}}},
-	)
-	mcp.AddTool(mcpServer, &mcp.Tool{Name: "wait"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
+	server, err := NewMCP(t.Context(), "/etc/litestream.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mcp.AddTool(server.mcpServer, &mcp.Tool{Name: "wait"}, func(ctx context.Context, _ *mcp.CallToolRequest, _ map[string]any) (*mcp.CallToolResult, map[string]any, error) {
 		close(handlerStarted)
 		<-ctx.Done()
 		handlerCanceled <- context.Cause(ctx)
 		return nil, nil, context.Cause(ctx)
 	})
 
-	httpServer := httptest.NewServer(newMCPHandler(mcpServer))
+	httpServer := httptest.NewServer(server)
 	t.Cleanup(httpServer.Close)
 
 	body, err := json.Marshal(map[string]any{
