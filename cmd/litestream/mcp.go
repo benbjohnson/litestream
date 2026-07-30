@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -27,7 +29,7 @@ type MCPServer struct {
 	configPath string
 }
 
-func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
+func NewMCP(ctx context.Context, configPath, authToken string) (*MCPServer, error) {
 	s := &MCPServer{
 		ctx:        ctx,
 		configPath: configPath,
@@ -56,17 +58,18 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	mcp.AddTool(mcpServer, resetTool, resetHandler)
 
 	s.mux = http.NewServeMux()
-	s.mux.Handle("/", newMCPHandler(mcpServer))
+	s.mux.Handle("/", newMCPHandler(mcpServer, authToken))
 	return s, nil
 }
 
-func newMCPHandler(mcpServer *mcp.Server) http.Handler {
-	handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+func newMCPHandler(mcpServer *mcp.Server, authToken string) http.Handler {
+	transportHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 		return mcpServer
 	}, &mcp.StreamableHTTPOptions{
 		Stateless:                    true,
 		PropagateRequestCancellation: true,
 	})
+	authHandler := bearerAuthMiddleware(authToken, transportHandler)
 	protection := http.NewCrossOriginProtection()
 	originHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Origin") != "" {
@@ -77,9 +80,28 @@ func newMCPHandler(mcpServer *mcp.Server) http.Handler {
 				return
 			}
 		}
-		handler.ServeHTTP(w, r)
+		authHandler.ServeHTTP(w, r)
 	})
 	return httplog.Logger(protection.Handler(originHandler))
+}
+
+func bearerAuthMiddleware(token string, next http.Handler) http.Handler {
+	if token == "" {
+		return next
+	}
+	tokenHash := sha256.Sum256([]byte(token))
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, credential, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		credential = strings.TrimLeft(credential, " ")
+		credentialHash := sha256.Sum256([]byte(credential))
+		if !ok || credential == "" || !strings.EqualFold(scheme, "Bearer") || subtle.ConstantTimeCompare(credentialHash[:], tokenHash[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, http.StatusText(http.StatusUnauthorized), http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *MCPServer) Start(addr string) {
