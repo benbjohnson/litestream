@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -1909,6 +1910,132 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timeout waiting for PUT request")
+	}
+}
+
+func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
+	tests := []struct {
+		name                     string
+		endpoint                 string
+		wantAcceptEncodingSigned bool
+	}{
+		{
+			name:     "GoogleCloudStorageGlobal",
+			endpoint: "https://storage.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageExplicitPort",
+			endpoint: "https://storage.googleapis.com:443",
+		},
+		{
+			name:     "GoogleCloudStorageTrailingDot",
+			endpoint: "https://storage.googleapis.com.",
+		},
+		{
+			name:     "GoogleCloudStorageRegional",
+			endpoint: "https://storage.me-central2.rep.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageLocational",
+			endpoint: "https://us-central1-storage.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageMTLS",
+			endpoint: "https://storage.mtls.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageLegacyDownload",
+			endpoint: "https://storage-download.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageLegacyUpload",
+			endpoint: "https://storage-upload.googleapis.com",
+		},
+		{
+			name:                     "GoogleCloudStorageLookalike",
+			endpoint:                 "https://storage.googleapis.com.evil.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageMTLSLookalike",
+			endpoint:                 "https://storage.mtls.googleapis.com.evil.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageVirtualHostedBase",
+			endpoint:                 "https://bucket.storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageUserinfo",
+			endpoint:                 "attacker@storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageRegionalVirtualHostedBase",
+			endpoint:                 "https://backup-storage.storage.me-central2.rep.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageLocationalVirtualHostedBase",
+			endpoint:                 "https://backup-storage.us-central1-storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "UnrelatedGoogleAPI",
+			endpoint:                 "https://storageinsights.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "OtherS3CompatibleProvider",
+			endpoint:                 "https://s3.example.com",
+			wantAcceptEncodingSigned: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+				authorization := r.Header.Get("Authorization")
+				if authorization == "" {
+					t.Fatal("Authorization header is empty")
+				}
+
+				got := strings.Contains(authorization, "SignedHeaders=accept-encoding;")
+				if got != tt.wantAcceptEncodingSigned {
+					t.Fatalf("Accept-Encoding signed = %v, want %v: %s", got, tt.wantAcceptEncodingSigned, authorization)
+				}
+
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/xml"}},
+					Body: io.NopCloser(strings.NewReader(
+						`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><IsTruncated>false</IsTruncated></ListBucketResult>`,
+					)),
+				}, nil
+			})
+
+			cfg := aws.Config{
+				Region:      "us-east-1",
+				Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("test-access-key", "test-secret-key", "")),
+				HTTPClient:  httpClient,
+			}
+
+			c := NewReplicaClient()
+			c.Endpoint = tt.endpoint
+			c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+				o.BaseEndpoint = aws.String("https://example.com")
+				o.UsePathStyle = true
+				o.APIOptions = append(o.APIOptions, c.middlewareOption())
+			})
+
+			if _, err := client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+				Bucket: aws.String("test-bucket"),
+			}); err != nil {
+				t.Fatalf("ListObjectsV2() error: %v", err)
+			}
+		})
 	}
 }
 

@@ -604,6 +604,52 @@ func TestIsTigrisEndpoint(t *testing.T) {
 	}
 }
 
+func TestIsGoogleCloudStorageEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"storage.googleapis.com", true},
+		{"STORAGE.GOOGLEAPIS.COM", true},
+		{"https://storage.googleapis.com", true},
+		{"https://storage.googleapis.com:443", true},
+		{"https://storage.googleapis.com.", true},
+		{"http://storage.googleapis.com", true},
+		{"https://storage.googleapis.com/path", true},
+		{"https://storage.me-central2.rep.googleapis.com", true},
+		{"https://us-central1-storage.googleapis.com", true},
+		{"https://US-CENTRAL1-STORAGE.GOOGLEAPIS.COM", true},
+		{"https://us-central1-storage.googleapis.com:443", true},
+		{"https://us-central1-storage.googleapis.com.", true},
+		{"https://storage.mtls.googleapis.com", true},
+		{"https://storage-download.googleapis.com", true},
+		{"https://storage-upload.googleapis.com", true},
+		{"https://storage.googleapis.com.evil.com", false},
+		{"https://us-central1-storage.googleapis.com.evil.com", false},
+		{"https://storage.mtls.googleapis.com.evil.com", false},
+		{"https://attacker@storage.googleapis.com", false},
+		{"attacker@storage.googleapis.com", false},
+		{"storage.googleapis.com@evil.com", false},
+		{"https://bucket.storage.googleapis.com", false},
+		{"https://backup-storage.storage.me-central2.rep.googleapis.com", false},
+		{"https://backup-storage.us-central1-storage.googleapis.com", false},
+		{"https://storageinsights.googleapis.com", false},
+		{"https://storage..googleapis.com", false},
+		{"https://example.com", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsGoogleCloudStorageEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsGoogleCloudStorageEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestRegionFromS3ARN(t *testing.T) {
 	tests := []struct {
 		arn      string

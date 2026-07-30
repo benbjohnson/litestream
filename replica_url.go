@@ -222,6 +222,40 @@ func IsTigrisEndpoint(endpoint string) bool {
 	return host == "fly.storage.tigris.dev" || host == "t3.storage.dev"
 }
 
+// IsGoogleCloudStorageEndpoint returns true if the endpoint is Google Cloud Storage.
+func IsGoogleCloudStorageEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if u, err := url.Parse("//" + host); err == nil {
+		host = u.Hostname()
+	}
+	host = strings.TrimSuffix(host, ".")
+
+	labels := strings.Split(host, ".")
+	if len(labels) < 3 ||
+		labels[len(labels)-2] != "googleapis" ||
+		labels[len(labels)-1] != "com" {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" {
+			return false
+		}
+	}
+	if len(labels) > 3 {
+		for _, segment := range strings.Split(labels[1], "-") {
+			if segment == "storage" {
+				return false
+			}
+		}
+	}
+	for _, segment := range strings.Split(labels[0], "-") {
+		if segment == "storage" {
+			return true
+		}
+	}
+	return false
+}
+
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
 func IsDigitalOceanEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)
@@ -358,8 +392,14 @@ func extractEndpointHost(endpoint string) string {
 	}
 	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
 		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+			if u.User != nil {
+				return ""
+			}
 			return u.Host
 		}
+	}
+	if u, err := url.Parse("//" + endpoint); err == nil && u.User != nil {
+		return ""
 	}
 	return endpoint
 }

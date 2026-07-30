@@ -252,6 +252,28 @@ replicas:
 - Set `GOOGLE_APPLICATION_CREDENTIALS` environment variable
 - Or use workload identity on GCP
 
+### S3-Compatible XML API
+
+**Status**: Supported with HMAC keys
+
+```yaml
+replicas:
+  - type: s3
+    bucket: bucket-name
+    path: database-name
+    endpoint: https://storage.googleapis.com
+    region: us-east-1
+    force-path-style: true
+    access-key-id: your-hmac-access-key
+    secret-access-key: your-hmac-secret
+```
+
+Litestream automatically excludes `Accept-Encoding` from SigV4 signatures for
+Cloud Storage endpoints under the exact `googleapis.com` domain when `storage`
+is an exact segment of the first hostname label. This covers global, regional,
+locational, mTLS, and legacy upload and download endpoints while rejecting
+external lookalike domains.
+
 ## Azure Blob Storage (ABS)
 
 **Status**: Fully supported (native client)
@@ -342,6 +364,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
 | Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
+| Google Cloud Storage | Exact `googleapis.com` suffix with a first-label `storage` segment | Excludes `Accept-Encoding` from SigV4 signatures |
 
 ## Troubleshooting
 
