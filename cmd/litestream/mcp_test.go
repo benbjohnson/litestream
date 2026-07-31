@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -20,6 +22,39 @@ import (
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
+
+func TestMain(m *testing.M) {
+	if filepath.Base(os.Args[0]) == mcpTestExecutableName(runtime.GOOS) && os.Getenv("LITESTREAM_MCP_TEST") == "1" {
+		os.Exit(runMCPTestCommand())
+	}
+	os.Exit(m.Run())
+}
+
+func mcpTestExecutableName(goos string) string {
+	if goos == "windows" {
+		return "litestream.exe"
+	}
+	return "litestream"
+}
+
+func TestMCPTestExecutableName(t *testing.T) {
+	tests := []struct {
+		goos string
+		want string
+	}{
+		{goos: "linux", want: "litestream"},
+		{goos: "darwin", want: "litestream"},
+		{goos: "windows", want: "litestream.exe"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.goos, func(t *testing.T) {
+			if got := mcpTestExecutableName(test.goos); got != test.want {
+				t.Fatalf("executable name=%q, want %q", got, test.want)
+			}
+		})
+	}
+}
 
 func TestMCPServerTools(t *testing.T) {
 	const version = "v1.2.3-mcp-test"
@@ -89,7 +124,7 @@ func TestMCPServerTools(t *testing.T) {
 				"config":            "string",
 				"if_db_not_exists":  "boolean",
 				"if_replica_exists": "boolean",
-				"o":                 "string",
+				"output":            "string",
 				"parallelism":       "string",
 				"path":              "string",
 				"timestamp":         "string",
@@ -447,7 +482,7 @@ func TestMCPToolBehavior(t *testing.T) {
 		{
 			name:      "litestream_databases",
 			arguments: map[string]any{"config": ""},
-			want:      "<databases><-config><>\n",
+			want:      "<databases>\n",
 		},
 		{
 			name: "litestream_restore",
@@ -461,7 +496,7 @@ func TestMCPToolBehavior(t *testing.T) {
 				"if_db_not_exists":  false,
 				"if_replica_exists": true,
 			},
-			want: "<restore><-o><><-txid><><-timestamp><><-parallelism><><-if-db-not-exists><false><-if-replica-exists><true></data/db>\n",
+			want: "<restore><-if-replica-exists></data/db>\n",
 		},
 		{
 			name:      "litestream_ltx",
@@ -471,12 +506,12 @@ func TestMCPToolBehavior(t *testing.T) {
 		{
 			name:      "litestream_status",
 			arguments: map[string]any{"config": "", "path": ""},
-			want:      "<status><-config><><>\n",
+			want:      "<status>\n",
 		},
 		{
 			name:      "litestream_reset",
 			arguments: map[string]any{"path": "/data/db", "config": ""},
-			want:      "<reset><-config><></data/db>\n",
+			want:      "<reset></data/db>\n",
 		},
 	}
 
@@ -510,7 +545,7 @@ func TestMCPToolBehavior(t *testing.T) {
 		t.Fatalf("info tool error: %#v", result.Content)
 	}
 	for _, want := range []string{
-		"Litestream test-version",
+		"v1.2.3-mcp-test",
 		"Current Config Path:\n/custom/litestream.yml",
 		"Database: /data/db",
 		"<ltx><-config></custom/litestream.yml></data/db>",
@@ -536,6 +571,177 @@ func TestMCPToolBehavior(t *testing.T) {
 			t.Errorf("info error does not contain %q: %q", want, got)
 		}
 	}
+}
+
+func TestMCPToolsOmitEmptyConfig(t *testing.T) {
+	tests := []struct {
+		name        string
+		arguments   map[string]any
+		invocations []string
+	}{
+		{name: "litestream_databases", invocations: []string{"databases"}},
+		{name: "litestream_info", invocations: []string{"databases"}},
+		{name: "litestream_restore", arguments: map[string]any{"path": "/tmp/db"}, invocations: []string{"restore\x1f/tmp/db"}},
+		{name: "litestream_ltx", arguments: map[string]any{"path": "/tmp/db"}, invocations: []string{"ltx\x1f/tmp/db"}},
+		{name: "litestream_status", invocations: []string{"status"}},
+		{name: "litestream_reset", arguments: map[string]any{"path": "/tmp/db"}, invocations: []string{"reset\x1f/tmp/db"}},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			argsPath := useMCPTestCommand(t)
+			session := newMCPTestSession(t, "")
+			callMCPTool(t, session, test.name, test.arguments)
+			assertMCPInvocations(t, argsPath, test.invocations)
+		})
+	}
+}
+
+func TestRestoreToolArguments(t *testing.T) {
+	tests := []struct {
+		name       string
+		configPath string
+		arguments  map[string]any
+		invocation string
+	}{
+		{
+			name:       "all optional arguments",
+			configPath: "/default.yml",
+			arguments: map[string]any{
+				"path":              "/tmp/db",
+				"output":            "/tmp/restored.db",
+				"config":            "/custom.yml",
+				"txid":              "0000000000000001",
+				"timestamp":         "2026-07-16T12:00:00Z",
+				"parallelism":       "4",
+				"if_db_not_exists":  true,
+				"if_replica_exists": true,
+			},
+			invocation: strings.Join([]string{
+				"restore",
+				"-o", "/tmp/restored.db",
+				"-config", "/custom.yml",
+				"-txid", "0000000000000001",
+				"-timestamp", "2026-07-16T12:00:00Z",
+				"-parallelism", "4",
+				"-if-db-not-exists",
+				"-if-replica-exists",
+				"/tmp/db",
+			}, "\x1f"),
+		},
+		{
+			name:       "configured database path defaults output",
+			configPath: "/default.yml",
+			arguments:  map[string]any{"path": "/tmp/db"},
+			invocation: "restore\x1f-config\x1f/default.yml\x1f/tmp/db",
+		},
+		{
+			name:       "replica URL requires output",
+			configPath: "/default.yml",
+			arguments: map[string]any{
+				"path":   "s3://bucket/db",
+				"output": "/tmp/restored.db",
+				"config": "/custom.yml",
+			},
+			invocation: "restore\x1f-o\x1f/tmp/restored.db\x1fs3://bucket/db",
+		},
+		{
+			name: "legacy output alias",
+			arguments: map[string]any{
+				"path": "/tmp/db",
+				"o":    "/tmp/restored.db",
+			},
+			invocation: "restore\x1f-o\x1f/tmp/restored.db\x1f/tmp/db",
+		},
+		{
+			name:       "if database does not exist true",
+			arguments:  map[string]any{"path": "/tmp/db", "if_db_not_exists": true},
+			invocation: "restore\x1f-if-db-not-exists\x1f/tmp/db",
+		},
+		{
+			name:       "if database does not exist false",
+			arguments:  map[string]any{"path": "/tmp/db", "if_db_not_exists": false},
+			invocation: "restore\x1f/tmp/db",
+		},
+		{
+			name:       "if replica exists true",
+			arguments:  map[string]any{"path": "/tmp/db", "if_replica_exists": true},
+			invocation: "restore\x1f-if-replica-exists\x1f/tmp/db",
+		},
+		{
+			name:       "if replica exists false",
+			arguments:  map[string]any{"path": "/tmp/db", "if_replica_exists": false},
+			invocation: "restore\x1f/tmp/db",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			argsPath := useMCPTestCommand(t)
+			session := newMCPTestSession(t, test.configPath)
+			callMCPTool(t, session, "litestream_restore", test.arguments)
+			assertMCPInvocations(t, argsPath, []string{test.invocation})
+		})
+	}
+}
+
+func TestRestoreToolSchema(t *testing.T) {
+	tool, _ := RestoreTool("")
+	properties := schemaProperties(t, jsonObject(t, tool.InputSchema))
+
+	if _, ok := properties["output"]; !ok {
+		t.Fatal("output property is missing")
+	}
+	if _, ok := properties["o"]; ok {
+		t.Fatal("legacy o property is published")
+	}
+
+	descriptions := map[string]string{
+		"if_db_not_exists":  "Skip restore if the database already exists. Optional.",
+		"if_replica_exists": "Skip restore if no backups are found. Optional.",
+		"output":            "Output path for the restored database. Required for replica URLs; optional for configured databases, where it defaults to the database path.",
+	}
+	for name, want := range descriptions {
+		property := jsonObject(t, properties[name])
+		if got := property["description"]; got != want {
+			t.Fatalf("%s description=%q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestMCPToolsRequirePath(t *testing.T) {
+	tools := []string{"litestream_restore", "litestream_ltx", "litestream_reset"}
+	tests := []struct {
+		name      string
+		arguments map[string]any
+	}{
+		{name: "missing", arguments: map[string]any{}},
+		{name: "wrong type", arguments: map[string]any{"path": true}},
+	}
+
+	for _, tool := range tools {
+		for _, test := range tests {
+			t.Run(tool+"/"+test.name, func(t *testing.T) {
+				argsPath := useMCPTestCommand(t)
+				session := newMCPTestSession(t, "")
+				callMCPToolError(t, session, tool, test.arguments, "path")
+				assertNoMCPInvocations(t, argsPath)
+			})
+		}
+	}
+}
+
+func TestInfoToolUsesRunningVersion(t *testing.T) {
+	const version = "v1.2.3-running"
+	setVersion(t, version)
+	argsPath := useMCPTestCommand(t)
+	session := newMCPTestSession(t, "")
+
+	result := callMCPTool(t, session, "litestream_info", nil)
+	if got := textContent(t, result); !strings.Contains(got, "Version Information:\n"+version+"\n") {
+		t.Fatalf("info output does not contain running version %q: %q", version, got)
+	}
+	assertMCPInvocations(t, argsPath, []string{"databases"})
 }
 
 func TestMCPToolContextCancellation(t *testing.T) {
@@ -609,6 +815,133 @@ func schemaRequired(schema map[string]any) []string {
 	}
 	slices.Sort(required)
 	return required
+}
+
+func newMCPTestSession(t *testing.T, configPath string) *mcp.ClientSession {
+	t.Helper()
+
+	server, err := NewMCP(t.Context(), configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTransport, serverTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.mcpServer.Connect(t.Context(), serverTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := serverSession.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "v1.0.0"}, nil)
+	clientSession, err := client.Connect(t.Context(), clientTransport, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := clientSession.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return clientSession
+}
+
+func callMCPTool(t *testing.T, session *mcp.ClientSession, name string, arguments map[string]any) *mcp.CallToolResult {
+	t.Helper()
+
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: name, Arguments: arguments})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.IsError {
+		t.Fatalf("unexpected tool error: %#v", result.Content)
+	}
+	return result
+}
+
+func callMCPToolError(t *testing.T, session *mcp.ClientSession, name string, arguments map[string]any, want string) {
+	t.Helper()
+
+	result, err := session.CallTool(t.Context(), &mcp.CallToolParams{Name: name, Arguments: arguments})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError {
+		t.Fatalf("tool succeeded: %#v", result.Content)
+	}
+	if got := textContent(t, result); !strings.Contains(got, want) {
+		t.Fatalf("tool error does not contain %q: %q", want, got)
+	}
+}
+
+func useMCPTestCommand(t *testing.T) string {
+	t.Helper()
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	commandPath := filepath.Join(dir, mcpTestExecutableName(runtime.GOOS))
+	var linkErr error
+	if runtime.GOOS == "windows" {
+		linkErr = os.Link(executable, commandPath)
+	} else {
+		linkErr = os.Symlink(executable, commandPath)
+	}
+	if linkErr != nil {
+		t.Fatal(linkErr)
+	}
+	argsPath := filepath.Join(dir, "args")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("LITESTREAM_MCP_TEST", "1")
+	t.Setenv("LITESTREAM_MCP_ARGS_PATH", argsPath)
+	return argsPath
+}
+
+func runMCPTestCommand() int {
+	f, err := os.OpenFile(os.Getenv("LITESTREAM_MCP_ARGS_PATH"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if _, err := fmt.Fprintln(f, strings.Join(os.Args[1:], "\x1f")); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if err := f.Close(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	if len(os.Args) > 1 && os.Args[1] == "databases" {
+		fmt.Println("path\treplicas")
+	} else {
+		fmt.Println("ok")
+	}
+	return 0
+}
+
+func assertMCPInvocations(t *testing.T, argsPath string, want []string) {
+	t.Helper()
+
+	data, err := os.ReadFile(argsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("invocations=%q, want %q", got, want)
+	}
+}
+
+func assertNoMCPInvocations(t *testing.T, argsPath string) {
+	t.Helper()
+
+	if _, err := os.Stat(argsPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("expected no invocation, stat error: %v", err)
+	}
 }
 
 func installFakeLitestream(t *testing.T) {
