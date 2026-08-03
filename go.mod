@@ -25,7 +25,7 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/psanford/sqlite3vfs v0.0.0-20260519004904-f9180fa2acc9 // direct
+	github.com/psanford/sqlite3vfs v0.1.0 // direct
 	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.1
 	golang.org/x/crypto v0.52.0
@@ -61,7 +61,6 @@ require (
 	github.com/lmittmann/tint v1.1.3
 	github.com/mattn/go-isatty v0.0.20
 	github.com/pierrec/lz4/v4 v4.1.22
-	github.com/psanford/sqlite3vfs v0.1.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260209214922-2f26647a795e
 )
