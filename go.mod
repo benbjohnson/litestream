@@ -25,7 +25,7 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/psanford/sqlite3vfs v0.0.0-20260519004904-f9180fa2acc9 // direct
+	github.com/psanford/sqlite3vfs v0.1.0 // direct
 	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.2
 	golang.org/x/crypto v0.52.0
@@ -138,3 +138,5 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
+
+replace github.com/psanford/sqlite3vfs => github.com/corylanou/sqlite3vfs v0.1.0

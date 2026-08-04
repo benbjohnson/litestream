@@ -41,21 +41,18 @@ func main() {}
 //export LitestreamVFSRegister
 func LitestreamVFSRegister() *C.char {
 	var client litestream.ReplicaClient
-	var err error
 
 	replicaURL := os.Getenv("LITESTREAM_REPLICA_URL")
-	if replicaURL == "" {
-		return C.CString("LITESTREAM_REPLICA_URL environment variable required")
-	}
+	if replicaURL != "" {
+		var err error
+		client, err = litestream.NewReplicaClientFromURL(replicaURL)
+		if err != nil {
+			return C.CString(fmt.Sprintf("failed to create replica client: %s", err))
+		}
 
-	client, err = litestream.NewReplicaClientFromURL(replicaURL)
-	if err != nil {
-		return C.CString(fmt.Sprintf("failed to create replica client: %s", err))
-	}
-
-	// Initialize the client.
-	if err := client.Init(context.Background()); err != nil {
-		return C.CString(fmt.Sprintf("failed to initialize replica client: %s", err))
+		if err := client.Init(context.Background()); err != nil {
+			return C.CString(fmt.Sprintf("failed to initialize replica client: %s", err))
+		}
 	}
 
 	var level slog.Level
@@ -108,6 +105,25 @@ func LitestreamVFSRegister() *C.char {
 		return C.CString(fmt.Sprintf("failed to register VFS: %s", err))
 	}
 
+	return nil
+}
+
+//export GoLitestreamConfigure
+func GoLitestreamConfigure(dbName *C.char, key *C.char, value *C.char) *C.char {
+	name := C.GoString(dbName)
+	k := C.GoString(key)
+	v := C.GoString(value)
+
+	cfg := litestream.GetVFSConfig(name)
+	if cfg == nil {
+		cfg = &litestream.VFSConfig{}
+	}
+
+	if err := cfg.Set(k, v); err != nil {
+		return C.CString(err.Error())
+	}
+
+	litestream.SetVFSConfig(name, cfg)
 	return nil
 }
 
