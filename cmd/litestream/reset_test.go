@@ -53,6 +53,54 @@ func TestResetCommand_Run(t *testing.T) {
 	}
 }
 
+func TestResetCommand_RunWithConfigEnv(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "db.sqlite")
+	if err := os.WriteFile(dbPath, []byte(""), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Put the Litestream state at a non-default meta path that is only
+	// discoverable through the config, so the test fails if reset ignores
+	// LITESTREAM_CONFIG and falls back to the default path.
+	metaPath := filepath.Join(t.TempDir(), "meta")
+	db := litestream.NewDB(dbPath)
+	db.SetMetaPath(metaPath)
+	ltxDir := filepath.Join(db.LTXDir(), "0")
+	if err := os.MkdirAll(ltxDir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	ltxPath := filepath.Join(ltxDir, "0000000000000001-0000000000000001.ltx")
+	if err := os.WriteFile(ltxPath, []byte("ltx"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	replicaPath := filepath.Join(t.TempDir(), "replica")
+	configPath := filepath.Join(t.TempDir(), "litestream.yml")
+	config := "dbs:\n" +
+		"  - path: " + dbPath + "\n" +
+		"    meta-path: " + metaPath + "\n" +
+		"    replicas:\n" +
+		"      - url: file://" + replicaPath + "\n"
+	if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("LITESTREAM_CONFIG", configPath)
+
+	output := captureLTXCommandStdout(t, func() {
+		cmd := &ResetCommand{}
+		if err := cmd.Run(context.Background(), []string{dbPath}); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	if !strings.Contains(output, "Reset complete.") {
+		t.Fatalf("expected reset completion output:\n%s", output)
+	}
+	if _, err := os.Stat(ltxPath); !os.IsNotExist(err) {
+		t.Fatalf("expected LTX file at the config meta path to be removed, stat err=%v", err)
+	}
+}
+
 func createResetCommandTestData(t *testing.T) (string, string) {
 	t.Helper()
 
