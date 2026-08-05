@@ -109,6 +109,8 @@ func (c *writeTestReplicaClient) DeleteAll(ctx context.Context) error {
 	return nil
 }
 
+func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
+
 func ltxKey(level int, minTXID, maxTXID ltx.TXID) string {
 	return string(rune(level)) + "/" + minTXID.String() + "-" + maxTXID.String()
 }
@@ -1985,5 +1987,233 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 	}
 	if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestVFSFile_FileSize_AfterSync verifies that FileSize does not shrink after
+// syncToRemoteWithLock clears f.dirty. Before the fix, if dirty pages extended
+// the database beyond f.index and a sync cleared them before the poll goroutine
+// repopulated f.index, FileSize would transiently return a smaller value,
+// causing SQLite to report "database disk image is malformed".
+func TestVFSFile_FileSize_AfterSync(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+
+	// Seed with a 2-page database (pages 1 and 2 in the index).
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 2; pgno++ {
+		pages[pgno] = make([]byte, pageSize)
+	}
+	createTestLTXFile(t, client, 1, pageSize, 2, pages)
+
+	f := setupWriteableVFSFile(t, client)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// FileSize before writes should reflect the 2-page index.
+	sizeBefore, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(2) * int64(pageSize); sizeBefore != want {
+		t.Fatalf("initial FileSize = %d, want %d", sizeBefore, want)
+	}
+
+	// Write pages 3..10 to extend the database well beyond the index.
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		data := make([]byte, pageSize)
+		off := int64(pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt(data, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// FileSize after writes should reflect 10 pages (via f.dirty).
+	sizeAfterWrite, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(10) * int64(pageSize); sizeAfterWrite != want {
+		t.Fatalf("FileSize after write = %d, want %d", sizeAfterWrite, want)
+	}
+
+	// Sync: uploads dirty pages and clears f.dirty.
+	// We do NOT poll afterwards, so f.index still only knows about pages 1-2.
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify dirty was actually cleared (sync happened).
+	f.mu.Lock()
+	dirtyLen := len(f.dirty)
+	indexMax := uint32(0)
+	for pgno := range f.index {
+		if pgno > indexMax {
+			indexMax = pgno
+		}
+	}
+	f.mu.Unlock()
+
+	if dirtyLen != 0 {
+		t.Fatalf("expected 0 dirty pages after sync, got %d", dirtyLen)
+	}
+	if indexMax > 2 {
+		// If the index already covers the new pages, this test can't
+		// distinguish the fix from the old behavior. This shouldn't
+		// happen because we never polled.
+		t.Fatalf("index already covers page %d; test is ineffective", indexMax)
+	}
+
+	// This is the critical check: FileSize must not shrink after sync.
+	sizeAfterSync, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizeAfterSync < sizeAfterWrite {
+		t.Errorf("FileSize shrank after sync: was %d, now %d (index covers up to page %d, dirty cleared)",
+			sizeAfterWrite, sizeAfterSync, indexMax)
+	}
+}
+
+func TestVFSFile_SyncedPagesStayReadableBeforePoll(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 2; pgno++ {
+		pages[pgno] = bytes.Repeat([]byte{byte(pgno)}, int(pageSize))
+	}
+	createTestLTXFile(t, client, 1, pageSize, 2, pages)
+
+	f := setupWriteableVFSFile(t, client)
+	f.CacheSize = int(pageSize)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		data := bytes.Repeat([]byte{byte(pgno)}, int(pageSize))
+		off := int64(pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt(data, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	indexMax := uint32(0)
+	for pgno := range f.index {
+		if pgno > indexMax {
+			indexMax = pgno
+		}
+	}
+	f.mu.Unlock()
+
+	if indexMax > 2 {
+		t.Fatalf("index already covers page %d; test is ineffective", indexMax)
+	}
+
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		off := int64(pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt([]byte{0xff}, off+100); err != nil {
+			t.Fatal(err)
+		}
+
+		buf := make([]byte, pageSize)
+		if _, err := f.ReadAt(buf, off); err != nil {
+			t.Fatal(err)
+		}
+		if buf[0] != byte(pgno) || buf[100] != 0xff || buf[101] != byte(pgno) {
+			t.Fatalf("page %d was not preserved after sync before poll", pgno)
+		}
+	}
+}
+
+func TestVFSFile_PollReplacementEvictsSyncedByVisibleState(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	createTestLTXFile(t, client, 1, pageSize, 3, map[uint32][]byte{
+		1: bytes.Repeat([]byte{1}, int(pageSize)),
+		2: bytes.Repeat([]byte{2}, int(pageSize)),
+		3: bytes.Repeat([]byte{3}, int(pageSize)),
+	})
+
+	f := setupWriteableVFSFile(t, client)
+	f.CacheSize = int(pageSize * 8)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Seed cache entries that a direct index replacement must invalidate.
+	buf := make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ReadAt(buf, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	page2 := bytes.Repeat([]byte{9}, int(pageSize))
+	page3 := bytes.Repeat([]byte{8}, int(pageSize))
+	if _, err := f.WriteAt(page2, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(page3, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	createTestLTXFile(t, client, 3, pageSize, 2, map[uint32][]byte{
+		1: bytes.Repeat([]byte{4}, int(pageSize)),
+	})
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	_, page2Synced := f.synced[2]
+	_, page3Synced := f.synced[3]
+	_, page2Indexed := f.index[2]
+	commit := f.commit
+	f.mu.Unlock()
+
+	if !page2Synced {
+		t.Fatal("expected synced page 2 to remain until a visible page index covers it")
+	}
+	if page3Synced {
+		t.Fatal("expected synced page 3 to be evicted after replacement shrank commit to page 2")
+	}
+	if page2Indexed {
+		t.Fatal("test is ineffective: replacement index already covers page 2")
+	}
+	if commit != 2 {
+		t.Fatalf("commit = %d, want 2", commit)
+	}
+
+	buf = make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, page2) {
+		t.Fatal("page 2 did not read from synced overlay after replacement")
+	}
+
+	buf = make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(2*pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 0 {
+		t.Fatalf("page 3 read stale data after replacement: got first byte %d", buf[0])
 	}
 }
