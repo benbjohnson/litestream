@@ -101,6 +101,8 @@ func (c *writeTestReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.Fi
 	return nil
 }
 
+func (c *writeTestReplicaClient) SetLogger(_ *slog.Logger) {}
+
 func (c *writeTestReplicaClient) DeleteAll(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1985,5 +1987,93 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 	}
 	if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestVFSFile_FileSize_AfterSync verifies that FileSize does not shrink after
+// syncToRemoteWithLock clears f.dirty. Before the fix, if dirty pages extended
+// the database beyond f.index and a sync cleared them before the poll goroutine
+// repopulated f.index, FileSize would transiently return a smaller value,
+// causing SQLite to report "database disk image is malformed".
+func TestVFSFile_FileSize_AfterSync(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+
+	// Seed with a 2-page database (pages 1 and 2 in the index).
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 2; pgno++ {
+		pages[pgno] = make([]byte, pageSize)
+	}
+	createTestLTXFile(t, client, 1, pageSize, 2, pages)
+
+	f := setupWriteableVFSFile(t, client)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// FileSize before writes should reflect the 2-page index.
+	sizeBefore, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(2) * int64(pageSize); sizeBefore != want {
+		t.Fatalf("initial FileSize = %d, want %d", sizeBefore, want)
+	}
+
+	// Write pages 3..10 to extend the database well beyond the index.
+	for pgno := uint32(3); pgno <= 10; pgno++ {
+		data := make([]byte, pageSize)
+		off := int64(pgno-1) * int64(pageSize)
+		if _, err := f.WriteAt(data, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// FileSize after writes should reflect 10 pages (via f.dirty).
+	sizeAfterWrite, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := int64(10) * int64(pageSize); sizeAfterWrite != want {
+		t.Fatalf("FileSize after write = %d, want %d", sizeAfterWrite, want)
+	}
+
+	// Sync: uploads dirty pages and clears f.dirty.
+	// We do NOT poll afterwards, so f.index still only knows about pages 1-2.
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify dirty was actually cleared (sync happened).
+	f.mu.Lock()
+	dirtyLen := len(f.dirty)
+	indexMax := uint32(0)
+	for pgno := range f.index {
+		if pgno > indexMax {
+			indexMax = pgno
+		}
+	}
+	f.mu.Unlock()
+
+	if dirtyLen != 0 {
+		t.Fatalf("expected 0 dirty pages after sync, got %d", dirtyLen)
+	}
+	if indexMax > 2 {
+		// If the index already covers the new pages, this test can't
+		// distinguish the fix from the old behavior. This shouldn't
+		// happen because we never polled.
+		t.Fatalf("index already covers page %d; test is ineffective", indexMax)
+	}
+
+	// This is the critical check: FileSize must not shrink after sync.
+	sizeAfterSync, err := f.FileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sizeAfterSync < sizeAfterWrite {
+		t.Errorf("FileSize shrank after sync: was %d, now %d (index covers up to page %d, dirty cleared)",
+			sizeAfterWrite, sizeAfterSync, indexMax)
 	}
 }
