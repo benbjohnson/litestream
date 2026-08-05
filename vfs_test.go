@@ -113,6 +113,69 @@ func TestVFSFile_PendingIndexIsolation(t *testing.T) {
 	}
 }
 
+func TestVFSFile_Hydration_PendingIndexIsolation(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixtureWithPages(t, 1, 4096, []uint32{1, 2}, 'a'))
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationPath = filepath.Join(t.TempDir(), "hydration.db")
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !f.hydrator.Complete() {
+		select {
+		case <-deadline.C:
+			t.Fatal("hydration did not complete")
+		case <-ticker.C:
+		}
+	}
+
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatalf("lock shared: %v", err)
+	}
+
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read before poll: %v", err)
+	}
+	if buf[0] != 'a' {
+		t.Fatalf("read before poll=%q, want %q", buf[0], 'a')
+	}
+
+	client.addFixture(t, buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2}, 'b'))
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatalf("poll replica: %v", err)
+	}
+
+	if _, err := f.ReadAt(buf, 4096); err != nil {
+		t.Fatalf("read during shared lock: %v", err)
+	}
+	if buf[0] != 'a' {
+		t.Fatalf("read during shared lock=%q, want %q", buf[0], 'a')
+	}
+
+	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if _, err := f.ReadAt(buf, 4096); err != nil {
+		t.Fatalf("read after unlock: %v", err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("read after unlock=%q, want %q", buf[0], 'b')
+	}
+}
+
 func TestVFSFile_PendingIndexRace(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
@@ -828,9 +891,11 @@ func TestVFSFile_PollingCancelsBlockedLTXFiles(t *testing.T) {
 
 // mockReplicaClient implements ReplicaClient for deterministic LTX fixtures.
 type mockReplicaClient struct {
-	mu    sync.Mutex
-	files []*ltx.FileInfo
-	data  map[string][]byte
+	mu             sync.Mutex
+	files          []*ltx.FileInfo
+	data           map[string][]byte
+	openCount      atomic.Uint64
+	wholeOpenCount atomic.Uint64
 }
 
 type blockingReplicaClient struct {
@@ -841,6 +906,31 @@ type blockingReplicaClient struct {
 	once      sync.Once
 }
 
+type blockingOpenReplicaClient struct {
+	*mockReplicaClient
+	block   atomic.Bool
+	started chan struct{}
+	release chan struct{}
+}
+
+type failingWholeOpenReplicaClient struct {
+	*mockReplicaClient
+	fail atomic.Bool
+	err  error
+}
+
+type boundedWholeReadReplicaClient struct {
+	*mockReplicaClient
+	maxReadSize int
+	largestRead atomic.Int64
+}
+
+type boundedReadCloser struct {
+	io.ReadCloser
+	maxReadSize int
+	largestRead *atomic.Int64
+}
+
 type countingReplicaClient struct {
 	calls atomic.Uint64
 }
@@ -848,6 +938,8 @@ type countingReplicaClient struct {
 func newCountingReplicaClient() *countingReplicaClient { return &countingReplicaClient{} }
 
 func (c *countingReplicaClient) Type() string { return "count" }
+
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
@@ -881,6 +973,8 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 
 func (c *mockReplicaClient) Type() string { return "mock" }
 
+func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
 
 func (c *mockReplicaClient) addFixture(tb testing.TB, fx *ltxFixture) {
@@ -904,6 +998,10 @@ func (c *mockReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TX
 }
 
 func (c *mockReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.openCount.Add(1)
+	if offset == 0 && size == 0 {
+		c.wholeOpenCount.Add(1)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	key := c.makeKey(level, minTXID, maxTXID)
@@ -949,6 +1047,49 @@ func (c *blockingReplicaClient) LTXFiles(ctx context.Context, level int, seek lt
 
 func (c *blockingReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	return c.mockReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *blockingOpenReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	if offset == 0 && size == 0 && c.block.CompareAndSwap(true, false) {
+		close(c.started)
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.mockReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *failingWholeOpenReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	if offset == 0 && size == 0 && c.fail.Load() {
+		return nil, c.err
+	}
+	return c.mockReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func (c *boundedWholeReadReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	rc, err := c.mockReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	if offset != 0 || size != 0 {
+		return rc, nil
+	}
+	return &boundedReadCloser{ReadCloser: rc, maxReadSize: c.maxReadSize, largestRead: &c.largestRead}, nil
+}
+
+func (r *boundedReadCloser) Read(p []byte) (int, error) {
+	n := int64(len(p))
+	for current := r.largestRead.Load(); n > current; current = r.largestRead.Load() {
+		if r.largestRead.CompareAndSwap(current, n) {
+			break
+		}
+	}
+	if len(p) > r.maxReadSize {
+		return 0, fmt.Errorf("read buffer size %d exceeds limit %d", len(p), r.maxReadSize)
+	}
+	return r.ReadCloser.Read(p)
 }
 
 func (c *blockingReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
@@ -1215,6 +1356,482 @@ func TestVFSFile_Hydration_IncrementalUpdates(t *testing.T) {
 		if buf[i] != 'f' {
 			t.Fatalf("expected byte 'f' at position %d, got %q", i, buf[i])
 		}
+	}
+}
+
+func TestHydrator_ApplyUpdates_WholeFile(t *testing.T) {
+	client := newMockReplicaClient()
+	fixture := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'g')
+	client.addFixture(t, fixture)
+
+	index, err := FetchPageIndex(t.Context(), client, fixture.info)
+	if err != nil {
+		t.Fatalf("fetch page index: %v", err)
+	}
+	updates := make(map[uint32]ltx.PageIndexElem)
+	for pgno := uint32(1); pgno <= 7; pgno++ {
+		updates[pgno] = index[pgno]
+	}
+	client.openCount.Store(0)
+	client.wholeOpenCount.Store(0)
+
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	for pgno := uint32(1); pgno <= 8; pgno++ {
+		if err := h.WritePage(pgno, bytes.Repeat([]byte{'x'}, 4096)); err != nil {
+			t.Fatalf("write page %d: %v", pgno, err)
+		}
+	}
+
+	if err := h.applyUpdateSet(t.Context(), updates, []*ltx.FileInfo{fixture.info}); err != nil {
+		t.Fatalf("apply updates: %v", err)
+	}
+	if got, want := client.openCount.Load(), uint64(1); got != want {
+		t.Fatalf("open count=%d, want %d", got, want)
+	}
+	if got, want := client.wholeOpenCount.Load(), uint64(1); got != want {
+		t.Fatalf("whole open count=%d, want %d", got, want)
+	}
+
+	buf := make([]byte, 4096)
+	if _, err := h.ReadAt(buf, 6*4096); err != nil {
+		t.Fatalf("read updated page: %v", err)
+	}
+	if !bytes.Equal(buf, bytes.Repeat([]byte{'g'}, 4096)) {
+		t.Fatalf("updated page data mismatch")
+	}
+	if _, err := h.ReadAt(buf, 7*4096); err != nil {
+		t.Fatalf("read excluded page: %v", err)
+	}
+	if !bytes.Equal(buf, bytes.Repeat([]byte{'x'}, 4096)) {
+		t.Fatalf("excluded page was overwritten")
+	}
+}
+
+func TestHydrator_ApplyUpdates_WholeFileTXIDMismatch(t *testing.T) {
+	object := buildLTXFixtureWithPages(t, 3, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'x')
+	for _, tt := range []struct {
+		name    string
+		minTXID ltx.TXID
+		maxTXID ltx.TXID
+	}{
+		{name: "min", minTXID: 2, maxTXID: 3},
+		{name: "max", minTXID: 3, maxTXID: 4},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := newMockReplicaClient()
+			info := *object.info
+			info.MinTXID = tt.minTXID
+			info.MaxTXID = tt.maxTXID
+			client.data[client.key(&info)] = object.data
+
+			index, err := FetchPageIndex(t.Context(), client, &info)
+			if err != nil {
+				t.Fatalf("fetch page index: %v", err)
+			}
+
+			h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+			if err := h.Init(); err != nil {
+				t.Fatalf("init: %v", err)
+			}
+			t.Cleanup(func() {
+				if err := h.Close(); err != nil {
+					t.Errorf("close: %v", err)
+				}
+			})
+
+			err = h.applyUpdateSet(t.Context(), index, []*ltx.FileInfo{&info})
+			want := fmt.Sprintf("ltx transaction range %s-%s does not match requested %s-%s",
+				object.info.MinTXID, object.info.MaxTXID, info.MinTXID, info.MaxTXID)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("apply error=%v", err)
+			}
+		})
+	}
+}
+
+func TestHydrator_ApplyUpdates_WholeFileTruncatedTail(t *testing.T) {
+	fixture := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'g')
+	baseClient := newMockReplicaClient()
+	baseClient.addFixture(t, fixture)
+	index, err := FetchPageIndex(t.Context(), baseClient, fixture.info)
+	if err != nil {
+		t.Fatalf("fetch page index: %v", err)
+	}
+
+	var pageBlockEnd int64
+	for _, elem := range index {
+		if end := elem.Offset + elem.Size; end > pageBlockEnd {
+			pageBlockEnd = end
+		}
+	}
+	truncatedSize := pageBlockEnd + ltx.PageHeaderSize + 4
+	if truncatedSize >= int64(len(fixture.data)) {
+		t.Fatalf("truncated size=%d, fixture size=%d", truncatedSize, len(fixture.data))
+	}
+
+	client := newMockReplicaClient()
+	client.addFixture(t, &ltxFixture{
+		info: fixture.info,
+		data: append([]byte(nil), fixture.data[:truncatedSize]...),
+	})
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	if err := h.applyUpdateSet(t.Context(), index, []*ltx.FileInfo{fixture.info}); err == nil {
+		t.Fatal("expected truncated tail error")
+	}
+}
+
+func TestHydrator_ApplyUpdates_WholeFileBoundedTailRead(t *testing.T) {
+	const maxReadSize = 16 * 1024
+
+	pgnos := make([]uint32, 16384)
+	for i := range pgnos {
+		pgnos[i] = uint32(i + 1)
+	}
+	fixture := buildLTXFixtureWithPages(t, 2, 512, pgnos, 'g')
+	baseClient := newMockReplicaClient()
+	baseClient.addFixture(t, fixture)
+	index, err := FetchPageIndex(t.Context(), baseClient, fixture.info)
+	if err != nil {
+		t.Fatalf("fetch page index: %v", err)
+	}
+
+	var pageBlockEnd int64
+	for _, elem := range index {
+		if end := elem.Offset + elem.Size; end > pageBlockEnd {
+			pageBlockEnd = end
+		}
+	}
+	tailSize := fixture.info.Size - pageBlockEnd - ltx.PageHeaderSize
+	if tailSize <= maxReadSize {
+		t.Fatalf("tail size=%d, want greater than %d", tailSize, maxReadSize)
+	}
+
+	client := &boundedWholeReadReplicaClient{
+		mockReplicaClient: baseClient,
+		maxReadSize:       maxReadSize,
+	}
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 512, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	if err := h.applyUpdateSet(t.Context(), index, []*ltx.FileInfo{fixture.info}); err != nil {
+		t.Fatalf("apply updates: %v", err)
+	}
+	if got := client.largestRead.Load(); got > maxReadSize {
+		t.Fatalf("largest read=%d, want at most %d", got, maxReadSize)
+	}
+}
+
+func TestHydrator_ApplyUpdates_WholeFileBeyondLockPage(t *testing.T) {
+	client := newMockReplicaClient()
+	pgno := ltx.LockPgno(4096) + 1
+	fixture := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, pgno}, 'n')
+	client.addFixture(t, fixture)
+
+	index, err := FetchPageIndex(t.Context(), client, fixture.info)
+	if err != nil {
+		t.Fatalf("fetch page index: %v", err)
+	}
+	client.openCount.Store(0)
+	client.wholeOpenCount.Store(0)
+
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	if err := h.applyUpdateSet(t.Context(), index, []*ltx.FileInfo{fixture.info}); err != nil {
+		t.Fatalf("apply updates: %v", err)
+	}
+	if got, want := client.openCount.Load(), uint64(1); got != want {
+		t.Fatalf("open count=%d, want %d", got, want)
+	}
+	if got, want := client.wholeOpenCount.Load(), uint64(1); got != want {
+		t.Fatalf("whole open count=%d, want %d", got, want)
+	}
+
+	buf := make([]byte, 4096)
+	off := int64(pgno-1) * 4096
+	if _, err := h.ReadAt(buf, off); err != nil {
+		t.Fatalf("read page beyond lock page: %v", err)
+	}
+	if !bytes.Equal(buf, bytes.Repeat([]byte{'n'}, 4096)) {
+		t.Fatal("page beyond lock page data mismatch")
+	}
+}
+
+func TestHydrator_ApplyUpdates_SparseFile(t *testing.T) {
+	client := newMockReplicaClient()
+	fixture := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'h')
+	client.addFixture(t, fixture)
+
+	index, err := FetchPageIndex(t.Context(), client, fixture.info)
+	if err != nil {
+		t.Fatalf("fetch page index: %v", err)
+	}
+	updates := map[uint32]ltx.PageIndexElem{2: index[2]}
+	client.openCount.Store(0)
+	client.wholeOpenCount.Store(0)
+
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	if err := h.ApplyUpdates(t.Context(), updates); err != nil {
+		t.Fatalf("apply updates: %v", err)
+	}
+	if got, want := client.openCount.Load(), uint64(1); got != want {
+		t.Fatalf("open count=%d, want %d", got, want)
+	}
+	if got := client.wholeOpenCount.Load(); got != 0 {
+		t.Fatalf("whole open count=%d, want 0", got)
+	}
+}
+
+func TestHydrator_ApplyUpdates_ReadDuringFetch(t *testing.T) {
+	baseClient := newMockReplicaClient()
+	fixture := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2, 3, 4, 5, 6, 7, 8}, 'i')
+	baseClient.addFixture(t, fixture)
+
+	index, err := FetchPageIndex(t.Context(), baseClient, fixture.info)
+	if err != nil {
+		t.Fatalf("fetch page index: %v", err)
+	}
+
+	client := &blockingOpenReplicaClient{
+		mockReplicaClient: baseClient,
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+	}
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatalf("init: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+	if err := h.WritePage(1, bytes.Repeat([]byte{'x'}, 4096)); err != nil {
+		t.Fatalf("write page: %v", err)
+	}
+
+	client.block.Store(true)
+	applyErr := make(chan error, 1)
+	go func() {
+		applyErr <- h.applyUpdateSet(t.Context(), index, []*ltx.FileInfo{fixture.info})
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("apply did not start remote fetch")
+	}
+
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := h.ReadAt(make([]byte, 4096), 0)
+		readErr <- err
+	}()
+
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatalf("read during fetch: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read blocked during remote fetch")
+	}
+
+	close(client.release)
+	if err := <-applyErr; err != nil {
+		t.Fatalf("apply updates: %v", err)
+	}
+}
+
+func TestVFSFile_Hydration_ReadDuringIncrementalFetch(t *testing.T) {
+	baseClient := newMockReplicaClient()
+	pgnos := make([]uint32, 2048)
+	for i := range pgnos {
+		pgnos[i] = uint32(i + 1)
+	}
+	initial := buildLTXFixtureWithPages(t, 1, 4096, pgnos, 'j')
+	if initial.info.Size <= DefaultEstimatedPageIndexSize {
+		t.Fatalf("fixture size=%d, want greater than %d", initial.info.Size, DefaultEstimatedPageIndexSize)
+	}
+	baseClient.addFixture(t, initial)
+	client := &blockingOpenReplicaClient{
+		mockReplicaClient: baseClient,
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+	}
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationPath = filepath.Join(t.TempDir(), "hydration.db")
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !f.hydrator.Complete() {
+		select {
+		case <-deadline.C:
+			t.Fatal("hydration did not complete")
+		case <-ticker.C:
+		}
+	}
+
+	client.wholeOpenCount.Store(0)
+	baseClient.addFixture(t, buildLTXFixtureWithPages(t, 2, 4096, pgnos, 'k'))
+	client.block.Store(true)
+	pollErr := make(chan error, 1)
+	go func() {
+		pollErr <- f.pollReplicaClient(f.ctx)
+	}()
+
+	select {
+	case <-client.started:
+	case <-time.After(time.Second):
+		t.Fatal("poll did not start hydration fetch")
+	}
+
+	readData := make([]byte, 4096)
+	readErr := make(chan error, 1)
+	off := int64(pgnos[len(pgnos)-1]-1) * 4096
+	go func() {
+		_, err := f.ReadAt(readData, off)
+		readErr <- err
+	}()
+
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatalf("read during fetch: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("read blocked during hydration fetch")
+	}
+	if !bytes.Equal(readData, bytes.Repeat([]byte{'k'}, 4096)) {
+		t.Fatal("read during hydration fetch returned stale data")
+	}
+
+	close(client.release)
+	if err := <-pollErr; err != nil {
+		t.Fatalf("poll replica client: %v", err)
+	}
+
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, off); err != nil {
+		t.Fatalf("read updated page: %v", err)
+	}
+	if !bytes.Equal(buf, bytes.Repeat([]byte{'k'}, 4096)) {
+		t.Fatal("updated page data mismatch")
+	}
+	if got, want := client.wholeOpenCount.Load(), uint64(1); got != want {
+		t.Fatalf("whole open count=%d, want %d", got, want)
+	}
+}
+
+func TestVFSFile_Hydration_ApplyFailureFallsBackToRemote(t *testing.T) {
+	baseClient := newMockReplicaClient()
+	pgnos := make([]uint32, 2048)
+	for i := range pgnos {
+		pgnos[i] = uint32(i + 1)
+	}
+	baseClient.addFixture(t, buildLTXFixtureWithPages(t, 1, 4096, pgnos, 'l'))
+	openErr := errors.New("whole file unavailable")
+	client := &failingWholeOpenReplicaClient{
+		mockReplicaClient: baseClient,
+		err:               openErr,
+	}
+
+	f := NewVFSFile(client, "test.db", slog.Default())
+	f.hydrationPath = filepath.Join(t.TempDir(), "hydration.db")
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	})
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for !f.hydrator.Complete() {
+		select {
+		case <-deadline.C:
+			t.Fatal("hydration did not complete")
+		case <-ticker.C:
+		}
+	}
+
+	baseClient.addFixture(t, buildLTXFixtureWithPages(t, 2, 4096, pgnos, 'm'))
+	client.fail.Store(true)
+	if err := f.pollReplicaClient(f.ctx); !errors.Is(err, openErr) {
+		t.Fatalf("poll error=%v, want %v", err, openErr)
+	}
+	if f.hydrator.Complete() {
+		t.Fatal("hydrated reads remained enabled after apply failure")
+	}
+	if err := f.hydrator.Err(); !errors.Is(err, openErr) {
+		t.Fatalf("hydration error=%v, want %v", err, openErr)
+	}
+
+	buf := make([]byte, 4096)
+	off := int64(pgnos[len(pgnos)-1]-1) * 4096
+	if _, err := f.ReadAt(buf, off); err != nil {
+		t.Fatalf("read remote fallback: %v", err)
+	}
+	if !bytes.Equal(buf, bytes.Repeat([]byte{'m'}, 4096)) {
+		t.Fatal("remote fallback data mismatch")
 	}
 }
 
