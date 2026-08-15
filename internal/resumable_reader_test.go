@@ -3,6 +3,7 @@ package internal
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/superfly/ltx"
 )
@@ -360,4 +362,87 @@ func (r *errorAfterN) Read(p []byte) (int, error) {
 	n := copy(p, r.data[r.pos:r.pos+len(p)])
 	r.pos += n
 	return n, nil
+}
+
+func TestResumableReader_BackoffBetweenReopens(t *testing.T) {
+	// Burst-retrying a throttling provider (e.g. Tigris load-shedding with
+	// 408 RequestCanceled) lands every reopen attempt inside the same
+	// throttle window. Reopens must back off between attempts.
+	data := []byte("hello world")
+	var callTimes []time.Time
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			callTimes = append(callTimes, time.Now())
+			if len(callTimes) <= 2 {
+				return nil, fmt.Errorf("operation error S3: GetObject, api error RequestCanceled: Request is canceled.")
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:])), nil
+		},
+	}
+
+	r := NewResumableReader(context.Background(), client, 2, 1, 2, int64(len(data)), nil, slog.Default())
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	if len(callTimes) != 3 {
+		t.Fatalf("expected 3 OpenLTXFile calls, got %d", len(callTimes))
+	}
+	for i := 1; i < len(callTimes); i++ {
+		if gap := callTimes[i].Sub(callTimes[i-1]); gap < 100*time.Millisecond {
+			t.Fatalf("reopen attempt %d fired %v after attempt %d; want >= 100ms backoff", i+1, gap, i)
+		}
+	}
+}
+
+func TestResumableReader_ContextCancelAbortsBackoff(t *testing.T) {
+	// Cancellation has to interrupt the backoff itself, not just be noticed
+	// before the next attempt. Read() already returns early when the context
+	// is done at reopen time, so the wait is cancelled from another goroutine
+	// while it is in progress.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	opened := make(chan struct{}, 1)
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			select {
+			case opened <- struct{}{}:
+			default:
+			}
+			return nil, fmt.Errorf("connection reset")
+		},
+	}
+
+	go func() {
+		<-opened
+		cancel()
+	}()
+
+	r := NewResumableReader(ctx, client, 2, 1, 2, 11, nil, slog.Default())
+	start := time.Now()
+	_, err := io.ReadAll(r)
+	if err == nil {
+		t.Fatal("expected error after context cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("got %v, want an error wrapping context.Canceled", err)
+	}
+	// Full backoff without cancellation would be 250ms+500ms+1s.
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("read blocked %v after cancellation; backoff must abort on ctx.Done", elapsed)
+	}
+
+	// The cancellation is terminal, matching how the reader treats its other
+	// terminal errors: a later Read must not reopen the file.
+	before := len(opened)
+	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
+		t.Fatalf("read after cancellation returned %v, want context.Canceled", err)
+	}
+	if len(opened) != before {
+		t.Fatal("read after cancellation reopened the file; cancellation must be sticky")
+	}
 }
