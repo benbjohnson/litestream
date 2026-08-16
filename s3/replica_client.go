@@ -80,10 +80,15 @@ var errIncompatibleFileReplicaLayout = errors.New("incompatible file replica lay
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.Client // s3 service
-	uploader *manager.Uploader
-	logger   *slog.Logger
+	mu              sync.Mutex
+	s3              *s3.Client // s3 service
+	uploader        *manager.Uploader
+	logger          *slog.Logger
+	fileLayoutState struct {
+		sync.Mutex
+		checked bool
+		err     error
+	}
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -1620,15 +1625,31 @@ func (itr *fileIterator) Close() (err error) {
 	return itr.err
 }
 
-func (itr *fileIterator) checkFileReplicaLayout() error {
-	prefix := itr.client.Path + "/ltx/" + strconv.Itoa(itr.level) + "/"
-	paginator := s3.NewListObjectsV2Paginator(itr.client.s3, &s3.ListObjectsV2Input{
-		Bucket: aws.String(itr.client.Bucket),
+func (c *ReplicaClient) checkFileReplicaLayout(ctx context.Context, level int) error {
+	c.fileLayoutState.Lock()
+	defer c.fileLayoutState.Unlock()
+
+	if c.fileLayoutState.checked {
+		return c.fileLayoutState.err
+	}
+
+	err := c.detectFileReplicaLayout(ctx, level)
+	if err == nil || errors.Is(err, errIncompatibleFileReplicaLayout) {
+		c.fileLayoutState.checked = true
+		c.fileLayoutState.err = err
+	}
+	return err
+}
+
+func (c *ReplicaClient) detectFileReplicaLayout(ctx context.Context, level int) error {
+	prefix := c.Path + "/ltx/" + strconv.Itoa(level) + "/"
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
 		Prefix: aws.String(prefix),
 	})
 
 	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(itr.ctx)
+		page, err := paginator.NextPage(ctx)
 		if err != nil {
 			return fmt.Errorf("s3: check replica layout: %w", err)
 		}
@@ -1655,7 +1676,7 @@ func (itr *fileIterator) Next() bool {
 			if !itr.paginator.HasMorePages() {
 				if !itr.nativeLayout && !itr.layoutChecked && itr.level == litestream.SnapshotLevel {
 					itr.layoutChecked = true
-					itr.err = itr.checkFileReplicaLayout()
+					itr.err = itr.client.checkFileReplicaLayout(itr.ctx, itr.level)
 				}
 				return false
 			}
