@@ -17,6 +17,7 @@ import (
 	"path"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +75,8 @@ type contentMD5StackKey struct{}
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
+
+var errIncompatibleFileReplicaLayout = errors.New("incompatible file replica layout detected")
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
@@ -1508,6 +1511,9 @@ type fileIterator struct {
 	closed bool
 	err    error
 	info   *ltx.FileInfo
+
+	nativeLayout  bool
+	layoutChecked bool
 }
 
 func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
@@ -1614,6 +1620,28 @@ func (itr *fileIterator) Close() (err error) {
 	return itr.err
 }
 
+func (itr *fileIterator) checkFileReplicaLayout() error {
+	prefix := itr.client.Path + "/ltx/" + strconv.Itoa(itr.level) + "/"
+	paginator := s3.NewListObjectsV2Paginator(itr.client.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(itr.client.Bucket),
+		Prefix: aws.String(prefix),
+	})
+
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(itr.ctx)
+		if err != nil {
+			return fmt.Errorf("s3: check replica layout: %w", err)
+		}
+		for _, obj := range page.Contents {
+			if _, _, err := ltx.ParseFilename(path.Base(aws.ToString(obj.Key))); err == nil {
+				return fmt.Errorf("s3: %w at %q; file:// replicas cannot be copied directly to s3:// because their storage layouts differ; restore the file replica locally and create a new s3:// replica", errIncompatibleFileReplicaLayout, prefix)
+			}
+		}
+	}
+
+	return nil
+}
+
 // Next returns the next file. Returns false when no more files are available.
 func (itr *fileIterator) Next() bool {
 	if itr.closed || itr.err != nil {
@@ -1625,6 +1653,10 @@ func (itr *fileIterator) Next() bool {
 		// Load next page if needed
 		if itr.page == nil || itr.pageIndex >= len(itr.page.Contents) {
 			if !itr.paginator.HasMorePages() {
+				if !itr.nativeLayout && !itr.layoutChecked && itr.level == litestream.SnapshotLevel {
+					itr.layoutChecked = true
+					itr.err = itr.checkFileReplicaLayout()
+				}
 				return false
 			}
 
@@ -1672,6 +1704,7 @@ func (itr *fileIterator) Next() bool {
 			if err != nil {
 				continue // Skip non-LTX files
 			}
+			itr.nativeLayout = true
 
 			// Build file info
 			info := &ltx.FileInfo{

@@ -586,6 +586,82 @@ func newTestReplicaClient(t *testing.T, server *httptest.Server) *ReplicaClient 
 	return client
 }
 
+func TestReplicaClient_LTXFiles_FileReplicaLayout(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.URL.Query().Get("prefix")
+		contents := ""
+		keyCount := 0
+		if prefix == "replica/ltx/9/" {
+			contents = `<Contents><Key>replica/ltx/9/0000000000000001-0000000000000001.ltx</Key><LastModified>2026-08-16T00:00:00Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>610</Size><StorageClass>STANDARD</StorageClass></Contents>`
+			keyCount = 1
+		}
+
+		w.Header().Set("Content-Type", "application/xml")
+		if _, err := fmt.Fprintf(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>%s</ListBucketResult>`, prefix, keyCount, contents); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestReplicaClient(t, server)
+	itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+	if err != nil {
+		t.Fatalf("LTXFiles() error: %v", err)
+	}
+	if itr.Next() {
+		t.Fatalf("Next() = true, want false")
+	}
+	err = itr.Close()
+	if !errors.Is(err, errIncompatibleFileReplicaLayout) {
+		t.Fatalf("Close() error = %v, want incompatible layout error", err)
+	}
+	if got := err.Error(); !strings.Contains(got, "file:// replicas cannot be copied directly to s3://") {
+		t.Fatalf("Close() error = %q, want migration guidance", got)
+	}
+}
+
+func TestReplicaClient_LTXFiles_NativeLayout(t *testing.T) {
+	var fileLayoutRequested atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.URL.Query().Get("prefix")
+		contents := ""
+		keyCount := 0
+		if prefix == "replica/0009/" {
+			contents = `<Contents><Key>replica/0009/0000000000000001-0000000000000001.ltx</Key><LastModified>2026-08-16T00:00:00Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>610</Size><StorageClass>STANDARD</StorageClass></Contents>`
+			keyCount = 1
+		} else if prefix == "replica/ltx/9/" {
+			fileLayoutRequested.Store(true)
+		}
+
+		w.Header().Set("Content-Type", "application/xml")
+		if _, err := fmt.Fprintf(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>%s</ListBucketResult>`, prefix, keyCount, contents); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestReplicaClient(t, server)
+	itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+	if err != nil {
+		t.Fatalf("LTXFiles() error: %v", err)
+	}
+	if !itr.Next() {
+		t.Fatalf("Next() = false, error: %v", itr.Err())
+	}
+	if got, want := itr.Item().MaxTXID, ltx.TXID(1); got != want {
+		t.Fatalf("MaxTXID = %s, want %s", got, want)
+	}
+	if itr.Next() {
+		t.Fatal("Next() = true after final object")
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatalf("Close() error: %v", err)
+	}
+	if fileLayoutRequested.Load() {
+		t.Fatal("file layout prefix requested for native S3 replica")
+	}
+}
+
 // TestReplicaClient_WriteLTXFile_SinglePutKnownSize verifies the known-size
 // fast path sends one PutObject with an exact Content-Length and intact body.
 func TestReplicaClient_WriteLTXFile_SinglePutKnownSize(t *testing.T) {
