@@ -15,6 +15,8 @@
 #      url:  s3://my.bucket.com/db        # S3-based replication
 #      # Example Fly.io Tigris setup (signing/no-Content-MD5 are auto-enabled for this endpoint)
 #      # url: s3://my-tigris-bucket/db.sqlite?endpoint=fly.storage.tigris.dev&region=auto
+#      # Disable Accept-Encoding signing for proxies that rewrite the header (default: true)
+#      # sign-accept-encoding: false
 #      type: nats                         # NATS JetStream replication
 #      url: nats://nats.example.com:4222
 #      bucket: litestream-backups

@@ -507,6 +507,47 @@ dbs:
 	}
 }
 
+func TestNewS3ReplicaFromConfig_SignAcceptEncodingInheritance(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+sign-accept-encoding: false
+dbs:
+  - path: /tmp/db-inherits
+    replica:
+      type: s3
+      bucket: bucket
+      path: db
+  - path: /tmp/db-overrides
+    replica:
+      type: s3
+      bucket: bucket
+      path: db
+      sign-accept-encoding: true
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "InheritedFalse", index: 0},
+		{name: "ExplicitTrue", index: 1, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := main.NewS3ReplicaClientFromConfig(config.DBs[tt.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.SignAcceptEncoding != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", client.SignAcceptEncoding, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewSFTPReplicaFromConfig(t *testing.T) {
 	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnK0+GdwOelXlAXdqLx/qvS7WHMr3rH7zW2+0DtmK5r"
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{
@@ -3255,7 +3296,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 	t.Run("QuerySigningOptions", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://bucket/db?sign-payload=true&require-content-md5=false",
+			URL: "s3://bucket/db?sign-payload=true&sign-accept-encoding=false&require-content-md5=false",
 		}
 
 		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
@@ -3265,19 +3306,40 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if !client.SignPayload {
 			t.Error("expected SignPayload to be true when query parameter is set")
 		}
+		if client.SignAcceptEncoding {
+			t.Error("expected SignAcceptEncoding to be false when disabled via query")
+		}
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false when disabled via query")
 		}
 	})
 
+	t.Run("QuerySignAcceptEncodingAliases", func(t *testing.T) {
+		for _, param := range []string{"signAcceptEncoding", "sign-accept-encoding"} {
+			t.Run(param, func(t *testing.T) {
+				client, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+					URL: "s3://bucket/db?" + param + "=false",
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if client.SignAcceptEncoding {
+					t.Error("expected SignAcceptEncoding to be false")
+				}
+			})
+		}
+	})
+
 	t.Run("ConfigOverridesQuerySigning", func(t *testing.T) {
 		signTrue := true
+		signAcceptEncodingTrue := true
 		requireFalse := false
 		config := &main.ReplicaConfig{
-			URL: "s3://bucket/db?sign-payload=false&require-content-md5=true",
+			URL: "s3://bucket/db?sign-payload=false&sign-accept-encoding=false&require-content-md5=true",
 			ReplicaSettings: main.ReplicaSettings{
-				SignPayload:       &signTrue,
-				RequireContentMD5: &requireFalse,
+				SignPayload:        &signTrue,
+				SignAcceptEncoding: &signAcceptEncodingTrue,
+				RequireContentMD5:  &requireFalse,
 			},
 		}
 
@@ -3287,6 +3349,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if !client.SignPayload {
 			t.Error("expected config SignPayload to override query parameter")
+		}
+		if !client.SignAcceptEncoding {
+			t.Error("expected config SignAcceptEncoding to override query parameter")
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected config RequireContentMD5=false to override query parameter")
