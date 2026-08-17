@@ -587,11 +587,17 @@ func newTestReplicaClient(t *testing.T, server *httptest.Server) *ReplicaClient 
 }
 
 func TestReplicaClient_LTXFiles_FileReplicaLayout(t *testing.T) {
+	var nativeRequests atomic.Int32
+	var fileRequests atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		prefix := r.URL.Query().Get("prefix")
 		contents := ""
 		keyCount := 0
-		if prefix == "replica/ltx/9/" {
+		switch prefix {
+		case "replica/0009/":
+			nativeRequests.Add(1)
+		case "replica/ltx/9/":
+			fileRequests.Add(1)
 			contents = `<Contents><Key>replica/ltx/9/0000000000000001-0000000000000001.ltx</Key><LastModified>2026-08-16T00:00:00Z</LastModified><ETag>&quot;etag&quot;</ETag><Size>610</Size><StorageClass>STANDARD</StorageClass></Contents>`
 			keyCount = 1
 		}
@@ -604,19 +610,34 @@ func TestReplicaClient_LTXFiles_FileReplicaLayout(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	client := newTestReplicaClient(t, server)
-	itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
-	if err != nil {
-		t.Fatalf("LTXFiles() error: %v", err)
+	for range 2 {
+		itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+		if err != nil {
+			t.Fatalf("LTXFiles() error: %v", err)
+		}
+		if itr.Next() {
+			t.Fatalf("Next() = true, want false")
+		}
+		err = itr.Close()
+		if !errors.Is(err, errIncompatibleFileReplicaLayout) {
+			t.Fatalf("Close() error = %v, want incompatible layout error", err)
+		}
+		for _, part := range []string{
+			"file:// replicas cannot be copied directly to s3://",
+			"restore the file replica locally",
+			"create a new s3:// replica",
+		} {
+			if !strings.Contains(err.Error(), part) {
+				t.Fatalf("Close() error = %q, want %q", err, part)
+			}
+		}
 	}
-	if itr.Next() {
-		t.Fatalf("Next() = true, want false")
+
+	if got, want := nativeRequests.Load(), int32(2); got != want {
+		t.Fatalf("native layout requests = %d, want %d", got, want)
 	}
-	err = itr.Close()
-	if !errors.Is(err, errIncompatibleFileReplicaLayout) {
-		t.Fatalf("Close() error = %v, want incompatible layout error", err)
-	}
-	if got := err.Error(); !strings.Contains(got, "file:// replicas cannot be copied directly to s3://") {
-		t.Fatalf("Close() error = %q, want migration guidance", got)
+	if got, want := fileRequests.Load(), int32(1); got != want {
+		t.Fatalf("file layout requests = %d, want %d", got, want)
 	}
 }
 
@@ -699,6 +720,75 @@ func TestReplicaClient_LTXFiles_EmptyLayoutCheckOnce(t *testing.T) {
 		t.Fatalf("native layout requests = %d, want %d", got, want)
 	}
 	if got, want := fileRequests.Load(), int32(1); got != want {
+		t.Fatalf("file layout requests = %d, want %d", got, want)
+	}
+}
+
+func TestReplicaClient_LTXFiles_FileLayoutCheckRetriesTransientError(t *testing.T) {
+	var nativeRequests atomic.Int32
+	var fileRequests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		prefix := r.URL.Query().Get("prefix")
+		switch prefix {
+		case "replica/0009/":
+			nativeRequests.Add(1)
+		case "replica/ltx/9/":
+			if fileRequests.Add(1) == 1 {
+				w.Header().Set("Content-Type", "application/xml")
+				w.WriteHeader(http.StatusServiceUnavailable)
+				if _, err := fmt.Fprint(w, `<Error><Code>ServiceUnavailable</Code><Message>try again</Message></Error>`); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+				return
+			}
+		}
+
+		w.Header().Set("Content-Type", "application/xml")
+		if _, err := fmt.Fprintf(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><Prefix>%s</Prefix><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated></ListBucketResult>`, prefix); err != nil {
+			t.Errorf("write response: %v", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	client := newTestReplicaClient(t, server)
+	client.s3 = s3.New(s3.Options{
+		BaseEndpoint: aws.String(server.URL),
+		Region:       "us-east-1",
+		Credentials:  aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("test-access-key", "test-secret-key", "")),
+		Retryer:      aws.NopRetryer{},
+		UsePathStyle: true,
+	})
+
+	itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+	if err != nil {
+		t.Fatalf("LTXFiles() error: %v", err)
+	}
+	if itr.Next() {
+		t.Fatal("Next() = true, want false")
+	}
+	if err := itr.Close(); err == nil || errors.Is(err, errIncompatibleFileReplicaLayout) {
+		t.Fatalf("Close() error = %v, want transient layout check error", err)
+	} else if !strings.Contains(err.Error(), "s3: check replica layout") {
+		t.Fatalf("Close() error = %q, want layout check context", err)
+	}
+
+	for range 2 {
+		itr, err := client.LTXFiles(context.Background(), litestream.SnapshotLevel, 0, false)
+		if err != nil {
+			t.Fatalf("LTXFiles() error: %v", err)
+		}
+		if itr.Next() {
+			t.Fatal("Next() = true, want false")
+		}
+		if err := itr.Close(); err != nil {
+			t.Fatalf("Close() error: %v", err)
+		}
+	}
+
+	if got, want := nativeRequests.Load(), int32(3); got != want {
+		t.Fatalf("native layout requests = %d, want %d", got, want)
+	}
+	if got, want := fileRequests.Load(), int32(2); got != want {
 		t.Fatalf("file layout requests = %d, want %d", got, want)
 	}
 }
