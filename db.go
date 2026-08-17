@@ -2982,8 +2982,8 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 
 	// Use the last deleted snapshot's MaxTXID, rather than the first retained
 	// snapshot's MaxTXID, to preserve lower-level files in an in-flight restore
-	// plan (issue #1307). TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles
-	// in db_test.go guards this; issue #1333 tracks the idle database tradeoff.
+	// plan. TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles
+	// guards this conservative floor.
 	for i, info := range snapshots {
 		if slices.Contains(deleted, info) {
 			continue
