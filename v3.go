@@ -108,7 +108,7 @@ func FormatWALSegmentFilenameV3(index int, offset int64) string {
 
 var (
 	snapshotRegexV3   = regexp.MustCompile(`^([0-9a-f]{8})\.snapshot\.lz4$`)
-	walSegmentRegexV3 = regexp.MustCompile(`^([0-9a-f]{8})_([0-9a-f]{8})\.wal\.lz4$`)
+	walSegmentRegexV3 = regexp.MustCompile(`^([0-9a-f]{8})_([0-9a-f]{8,16})\.wal\.lz4$`)
 	generationRegexV3 = regexp.MustCompile(`^[0-9a-f]{16}$`)
 )
 
@@ -130,8 +130,14 @@ func ParseWALSegmentFilenameV3(filename string) (index int, offset int64, err er
 	if m == nil {
 		return 0, 0, fmt.Errorf("invalid v0.3.x WAL segment filename: %q", filename)
 	}
-	idx, _ := strconv.ParseInt(m[1], 16, 64)
-	off, _ := strconv.ParseInt(m[2], 16, 64)
+	idx, err := strconv.ParseInt(m[1], 16, 32)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid wal segment path: %s: %w", filename, err)
+	}
+	off, err := strconv.ParseInt(m[2], 16, 64)
+	if err != nil {
+		return 0, 0, fmt.Errorf("invalid wal segment path: %s: %w", filename, err)
+	}
 	return int(idx), off, nil
 }
 
