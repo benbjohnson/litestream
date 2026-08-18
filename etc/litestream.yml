@@ -32,3 +32,43 @@
 #      # Example formats:
 #      # host-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMvvypUkBrS9RCyV//p+UFCLg8yKNtTu/ew/cV6XXAAP
 #      # host-key: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ...
+
+# ------------------------------------------------------------------------------
+# Global options (defaults shown). All values below are commented out; they take
+# effect only when uncommented. The defaults are the values Litestream applies
+# when the key is omitted.
+
+# Compaction levels. Each array entry is one non-snapshot level; entry index
+# maps to the level number, so entry 0 = L1, entry 1 = L2, and so on. L0 is
+# implicit (the raw LTX stream) and has no interval. The highest configurable
+# level is L8; level 9 is the snapshot level, controlled by `snapshot` below.
+# levels:
+#   - interval: 30s                        # L1 (default: 30s)
+#   - interval: 5m                         # L2 (default: 5m)
+#   - interval: 1h                         # L3 (default: 1h)
+
+# Snapshot (level 9) settings.
+# snapshot:
+#   interval:  24h                         # How often full snapshots are taken (default: 24h)
+#   retention: 24h                         # How long snapshots are kept (default: 24h)
+
+# L0 retention. Controls how long fine-grained L0 (raw) files are kept, which
+# bounds how far back point-in-time restores can land.
+# l0-retention: 5m                         # default: 5m
+# l0-retention-check-interval: 15s         # How often expired L0 files are swept (default: 15s)
+
+# Retention enforcement. When enabled, Litestream deletes expired remote files
+# itself. Set to false to delegate expiry to cloud provider lifecycle policies.
+# retention:
+#   enabled: true                          # default: true
+
+# Prometheus metrics HTTP endpoint. Unset by default, which disables the
+# metrics server; set an address to enable it.
+# addr: ":9090"                            # default: unset (metrics server disabled)
+
+# Logging.
+# logging:
+#   level:  info                           # trace | debug | info | warn | error (default: info; env LOG_LEVEL overrides)
+#   type:   text                           # text | json | pretty (default: text)
+#   stderr: false                          # Log to stderr instead of stdout (default: false)
+#   source: false                          # Include source file:line in log records (default: false)
