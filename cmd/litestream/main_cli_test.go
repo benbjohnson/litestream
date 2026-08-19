@@ -95,6 +95,51 @@ func TestMainRequiredArgumentErrorsIncludeTryHints(t *testing.T) {
 	}
 }
 
+func TestMainMisplacedFlagsIncludeTryHints(t *testing.T) {
+	tests := []struct {
+		name string
+		args []string
+		hint string
+	}{
+		{
+			name: "ConfigBeforeCommand",
+			args: []string{"-config", "./c.yml", "databases"},
+			hint: "litestream databases -config ./c.yml\n or: LITESTREAM_CONFIG=./c.yml litestream databases",
+		},
+		{
+			name: "ConfigEqualsBeforeCommand",
+			args: []string{"--config=./c.yml", "restore", "-o", "/tmp/example.db", "s3://bucket/prefix"},
+			hint: "litestream restore --config=./c.yml -o /tmp/example.db s3://bucket/prefix\n or: LITESTREAM_CONFIG=./c.yml litestream restore -o /tmp/example.db s3://bucket/prefix",
+		},
+		{
+			name: "OtherFlagBeforeCommand",
+			args: []string{"-replica", "s3://bucket/prefix", "register", "/tmp/example.db"},
+			hint: "litestream register -replica s3://bucket/prefix /tmp/example.db",
+		},
+		{
+			name: "NoCommand",
+			args: []string{"-config", "./c.yml"},
+			hint: "litestream <command> -config ./c.yml\n or: LITESTREAM_CONFIG=./c.yml litestream <command>",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stdout, stderr, exitCode := runLitestreamMain(t, tt.args...)
+			if exitCode != 1 {
+				t.Fatalf("exit code=%d, want 1", exitCode)
+			}
+			if stdout != "" {
+				t.Fatalf("expected empty stdout, got:\n%s", stdout)
+			}
+			want := "Error: flags must come after the subcommand\nTry: " + tt.hint + "\n"
+			if stderr != want {
+				t.Fatalf("unexpected stderr:\n%s\nwant:\n%s", stderr, want)
+			}
+		})
+	}
+}
+
 func TestMainHarness(t *testing.T) {
 	if os.Getenv("LITESTREAM_TEST_MAIN") != "1" {
 		t.Skip("helper process only")

@@ -53,11 +53,46 @@ func TestMain_RunHelp(t *testing.T) {
 			t.Fatalf("Run returned error %v, want %v", err, flag.ErrHelp)
 		}
 	})
+}
 
-	t.Run("UnknownFlag", func(t *testing.T) {
-		err := main.NewMain().Run(context.Background(), []string{"-config", "litestream.yml"})
-		if !errors.Is(err, flag.ErrHelp) {
-			t.Fatalf("Run returned error %v, want %v", err, flag.ErrHelp)
+func TestMain_RunMisplacedFlags(t *testing.T) {
+	const want = "flags must come after the subcommand"
+
+	t.Run("FlagBeforeCommand", func(t *testing.T) {
+		for _, args := range [][]string{
+			{"-config", "litestream.yml", "databases"},
+			{"-config", "litestream.yml"},
+		} {
+			var err error
+			stdout := captureStdout(t, func() {
+				err = main.NewMain().Run(context.Background(), args)
+			})
+			if err == nil || err.Error() != want {
+				t.Fatalf("Run(%v) returned error %v, want %q", args, err, want)
+			} else if stdout != "" {
+				t.Fatalf("Run(%v) printed usage on stdout:\n%s", args, stdout)
+			}
+		}
+	})
+
+	t.Run("HelpFlagStillPrintsUsage", func(t *testing.T) {
+		for _, arg := range []string{"-h", "-help", "--help"} {
+			var err error
+			stdout := captureStdout(t, func() {
+				err = main.NewMain().Run(context.Background(), []string{arg})
+			})
+			if err != nil {
+				t.Fatalf("Run(%s) returned error: %v", arg, err)
+			} else if !strings.Contains(stdout, "litestream <command> [arguments]") {
+				t.Fatalf("Run(%s) did not print usage, got:\n%s", arg, stdout)
+			}
+		}
+	})
+
+	t.Run("FlagAfterCommand", func(t *testing.T) {
+		err := main.NewMain().Run(context.Background(), []string{"databases", "-config", filepath.Join(t.TempDir(), "missing.yml")})
+		if err == nil || err.Error() == want {
+			t.Fatalf("Run returned error %v, want config error", err)
 		}
 	})
 }
