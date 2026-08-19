@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -126,6 +127,143 @@ func TestVFS_ReadYourWrites(t *testing.T) {
 	err = sqldb.QueryRow("SELECT name FROM users WHERE id = 2").Scan(&name)
 	require.NoError(t, err)
 	require.Equal(t, "Robert", name)
+}
+
+func TestVFS_WideRepeatedInsertsDuringSync_Private(t *testing.T) {
+	runWideRepeatedInsertsDuringSyncPrivate(t, wideRepeatedInsertsConfig{
+		payloadColumnCount:   11,
+		indexCount:           4,
+		batchCount:           14,
+		rowsPerBatch:         1427,
+		intPrimaryKeyReplace: true,
+		syncInterval:         time.Second,
+		pollInterval:         time.Second,
+		sleepInterval:        500 * time.Millisecond,
+	})
+}
+
+type wideRepeatedInsertsConfig struct {
+	payloadColumnCount   int
+	indexCount           int
+	batchCount           int
+	rowsPerBatch         int
+	intPrimaryKeyReplace bool
+	syncInterval         time.Duration
+	pollInterval         time.Duration
+	sleepInterval        time.Duration
+}
+
+func runWideRepeatedInsertsDuringSyncPrivate(t *testing.T, cfg wideRepeatedInsertsConfig) {
+	t.Helper()
+
+	replicaDir := t.TempDir()
+	client := file.NewReplicaClient(replicaDir)
+
+	syncInterval := cfg.syncInterval
+	if syncInterval == 0 {
+		syncInterval = 100 * time.Millisecond
+	}
+	vfs := newWritableVFS(t, client, syncInterval, t.TempDir())
+	if cfg.pollInterval > 0 {
+		vfs.PollInterval = cfg.pollInterval
+	}
+	vfsName := fmt.Sprintf("litestream-wide-private-inserts-%d", time.Now().UnixNano())
+	require.NoError(t, sqlite3vfs.RegisterVFS(vfsName, vfs))
+
+	dbPath := filepath.Join(t.TempDir(), "wide-inserts.db")
+	dsn := fmt.Sprintf("file:%s?vfs=%s&cache=private", dbPath, vfsName)
+
+	db, err := sql.Open("sqlite3", dsn)
+	require.NoError(t, err)
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	runWideRepeatedInsertsDuringSyncSQL(t, db, cfg)
+}
+
+func runWideRepeatedInsertsDuringSyncSQL(t *testing.T, db *sql.DB, cfg wideRepeatedInsertsConfig) {
+	t.Helper()
+	sleepInterval := cfg.sleepInterval
+	if sleepInterval == 0 {
+		sleepInterval = 125 * time.Millisecond
+	}
+	columns := []string{"id", "revision", "shard", "marker"}
+	idType := "INTEGER"
+	if cfg.intPrimaryKeyReplace {
+		idType = "INT"
+	}
+	var ddl strings.Builder
+	ddl.WriteString("CREATE TABLE wide_syncing_rows (\n\t\tid ")
+	ddl.WriteString(idType)
+	ddl.WriteString(" NOT NULL")
+	if cfg.intPrimaryKeyReplace {
+		ddl.WriteString(" PRIMARY KEY ON CONFLICT REPLACE")
+	}
+	ddl.WriteString(`,
+		revision INTEGER NOT NULL,
+		shard INTEGER NOT NULL,
+		marker INTEGER NOT NULL`)
+	for i := 0; i < cfg.payloadColumnCount; i++ {
+		name := fmt.Sprintf("payload_%c", 'a'+rune(i))
+		columns = append(columns, name)
+		ddl.WriteString(",\n\t\t")
+		ddl.WriteString(name)
+		ddl.WriteString(" TEXT NOT NULL")
+	}
+	ddl.WriteString("\n\t) STRICT;")
+
+	indexes := []struct {
+		sql             string
+		payloadRequired int
+	}{
+		{sql: "CREATE INDEX i_wide_syncing_rows_revision ON wide_syncing_rows (revision, id);"},
+		{sql: "CREATE INDEX i_wide_syncing_rows_shard_marker ON wide_syncing_rows (shard, marker, id);"},
+		{sql: "CREATE INDEX i_wide_syncing_rows_payload_a ON wide_syncing_rows (payload_a);", payloadRequired: 1},
+		{sql: "CREATE INDEX i_wide_syncing_rows_payload_e ON wide_syncing_rows (payload_e);", payloadRequired: 5},
+	}
+	for i := 0; i < cfg.indexCount && i < len(indexes); i++ {
+		if cfg.payloadColumnCount < indexes[i].payloadRequired {
+			continue
+		}
+		ddl.WriteByte('\n')
+		ddl.WriteString(indexes[i].sql)
+	}
+
+	_, err := db.Exec(ddl.String())
+	require.NoError(t, err)
+
+	placeholders := make([]string, len(columns))
+	for i := range placeholders {
+		placeholders[i] = "?"
+	}
+	insertSQL := fmt.Sprintf(
+		"INSERT INTO wide_syncing_rows (%s) VALUES (%s)",
+		strings.Join(columns, ", "),
+		strings.Join(placeholders, ", "),
+	)
+	payloadMods := []int{101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151}
+
+	for batch := 0; batch < cfg.batchCount; batch++ {
+		start := 1 + batch*250
+		end := start + cfg.rowsPerBatch - 1
+		offset := batch * 1000000
+		tx, err := db.Begin()
+		require.NoError(t, err)
+		stmt, err := tx.Prepare(insertSQL)
+		require.NoError(t, err)
+		for id := start; id <= end; id++ {
+			args := []any{id, id + offset, id % 17, id % 97}
+			for i := 0; i < cfg.payloadColumnCount; i++ {
+				mod := payloadMods[i%len(payloadMods)]
+				args = append(args, fmt.Sprintf("%d-%c-%d", id+offset, 'a'+rune(i), id%mod))
+			}
+			_, err = stmt.Exec(args...)
+			require.NoErrorf(t, err, "batch=%d id=%d", batch, id)
+		}
+		require.NoError(t, stmt.Close())
+		require.NoError(t, tx.Commit())
+		time.Sleep(sleepInterval)
+	}
 }
 
 // TestVFS_MultipleTransactions tests multiple sequential transactions.
