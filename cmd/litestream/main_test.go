@@ -16,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -205,6 +207,150 @@ dbs:
 			t.Fatalf("DB.MetaDir=%v, want %v", got, want)
 		}
 	})
+}
+
+// Ensure keys that do not map to any config field are reported as warnings
+// naming the key's path, while the config still parses successfully.
+func TestParseConfig_UnrecognizedKeys(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		config string
+		want   []string
+	}{
+		{
+			name: "TopLevel",
+			config: `
+definitely-not-a-setting: true
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+`,
+			want: []string{"definitely-not-a-setting"},
+		},
+		{
+			name: "ReplicaRetention",
+			config: `
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+      retention: 72h
+`,
+			want: []string{"dbs[0].replica.retention"},
+		},
+		{
+			name: "LevelsRetention",
+			config: `
+levels:
+  - interval: 5m
+    retention: 1h
+  - interval: 1h
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+`,
+			want: []string{"levels[0].retention"},
+		},
+		{
+			name: "MultipleNested",
+			config: `
+dbs:
+  - path: /tmp/x.db
+    snapshot:
+      intervall: 1h
+    replica:
+      path: /tmp/xrep
+      age:
+        bogus: 1
+  - path: /tmp/y.db
+    replicas:
+      - path: /tmp/yrep
+        typo-here: 1
+logging:
+  lvl: debug
+`,
+			want: []string{
+				"dbs[0].snapshot.intervall",
+				"dbs[0].replica.age.bogus",
+				"dbs[1].replicas[0].typo-here",
+				"logging.lvl",
+			},
+		},
+		{
+			name: "Valid",
+			config: `
+access-key-id: XXX
+sync-interval: 5s
+levels:
+  - interval: 5m
+snapshot:
+  interval: 1h
+  retention: 24h
+logging:
+  level: info
+dbs:
+  - path: /tmp/x.db
+    snapshot:
+      interval: 2h
+    replica:
+      url: s3://foo/bar
+      part-size: 5MB
+      age:
+        identities: []
+`,
+			want: nil,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var config main.Config
+			output := captureStdout(t, func() {
+				var err error
+				if config, err = main.ParseConfig(strings.NewReader(tt.config), false); err != nil {
+					t.Fatalf("ParseConfig: %v", err)
+				}
+			})
+
+			// The config must still load; unknown keys are not an error.
+			if got, want := config.DBs[0].Path, "/tmp/x.db"; got != want {
+				t.Fatalf("DBs[0].Path=%v, want %v", got, want)
+			}
+
+			var got []string
+			for _, line := range strings.Split(output, "\n") {
+				if !strings.Contains(line, `msg="unrecognized config key, ignoring"`) {
+					continue
+				}
+				_, key, ok := strings.Cut(line, " key=")
+				if !ok {
+					t.Fatalf("warning has no key attribute: %s", line)
+				}
+				got = append(got, key)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("warned keys=%q, want %q\noutput:\n%s", got, tt.want, output)
+			}
+
+			// The set of unknown keys must agree with the YAML decoder's own
+			// strict mode, which reports the same keys without their paths.
+			var strictErr *yaml.TypeError
+			if err := yaml.UnmarshalStrict([]byte(tt.config), &main.Config{}); err != nil && !errors.As(err, &strictErr) {
+				t.Fatalf("UnmarshalStrict: %v", err)
+			}
+			var strictN int
+			if strictErr != nil {
+				for _, msg := range strictErr.Errors {
+					if strings.Contains(msg, "not found in type") {
+						strictN++
+					}
+				}
+			}
+			if strictN != len(tt.want) {
+				t.Fatalf("strict decode reports %d unknown keys, want %d: %v", strictN, len(tt.want), strictErr)
+			}
+		})
+	}
 }
 
 func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
