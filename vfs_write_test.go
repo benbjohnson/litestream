@@ -1987,3 +1987,97 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestVFSFile_FileSizeStableAfterSyncExtendsDatabase is a regression test:
+// FileSize() must not shrink after a sync that extended the database.
+// syncToRemote() clears f.dirty and adds the synced pages to the cache (not the
+// index), so before the fix FileSize() dropped back to the old indexed size,
+// SQLite read past EOF, and reported SQLITE_CORRUPT.
+func TestVFSFile_FileSizeStableAfterSyncExtendsDatabase(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	initialPage := make([]byte, pageSize)
+	copy(initialPage, "initial data")
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: initialPage})
+
+	f := setupWriteableVFSFile(t, client)
+	f.PollInterval = time.Hour // suppress background poll for a deterministic test
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Extend the database to 5 pages by writing page 5.
+	page5 := make([]byte, pageSize)
+	copy(page5, "page five")
+	if _, err := f.WriteAt(page5, int64(4)*int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+
+	want := int64(5) * int64(pageSize)
+	if size, err := f.FileSize(); err != nil {
+		t.Fatal(err)
+	} else if size != want {
+		t.Fatalf("before sync: FileSize()=%d, want %d", size, want)
+	}
+
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.dirty) != 0 {
+		t.Fatalf("expected f.dirty cleared after sync, got %d pages", len(f.dirty))
+	}
+
+	if size, err := f.FileSize(); err != nil {
+		t.Fatal(err)
+	} else if size != want {
+		t.Fatalf("after sync: FileSize()=%d shrank below committed size %d", size, want)
+	}
+}
+
+// TestVFSFile_PollDoesNotRegressWriterCommit is a regression test: in write mode
+// the poll can re-fetch the writer's own just-uploaded LTX (via a stale pos
+// snapshot). Its header commit is below the writer's current commit; before the
+// fix that was misread as a truncation and regressed f.commit, shrinking
+// FileSize() and corrupting reads under sustained writes.
+func TestVFSFile_PollDoesNotRegressWriterCommit(t *testing.T) {
+	client := newWriteTestReplicaClient()
+
+	pageSize := uint32(4096)
+	page := make([]byte, pageSize)
+	copy(page, "p1")
+	createTestLTXFile(t, client, 1, pageSize, 3, map[uint32][]byte{1: page})
+
+	f := setupWriteableVFSFile(t, client)
+	f.PollInterval = time.Hour // drive the poll manually
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Writer has advanced ahead of the replica: commit is 8, applied pos behind.
+	f.mu.Lock()
+	f.commit = 8
+	f.pos = ltx.Pos{TXID: 1}
+	f.mu.Unlock()
+
+	// A newer LTX (txid 2) whose header commit (5) is below the writer's current
+	// commit (8): the writer's own older upload observed via the poll.
+	updated := make([]byte, pageSize)
+	copy(updated, "p1'")
+	createTestLTXFile(t, client, 2, pageSize, 5, map[uint32][]byte{1: updated})
+
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	f.mu.Lock()
+	got := f.commit
+	f.mu.Unlock()
+	if got != 8 {
+		t.Fatalf("poll regressed f.commit to %d; want it to stay 8", got)
+	}
+}
+
+func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
