@@ -454,6 +454,21 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 		}
 	})
 
+	t.Run("WALPathIsFile", func(t *testing.T) {
+		tmpDir := t.TempDir()
+		walPath := filepath.Join(tmpDir, "generations", gen, "wal")
+		if err := os.MkdirAll(filepath.Dir(walPath), 0755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(walPath, nil, 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := file.NewReplicaClient(tmpDir).WALSegmentsV3(context.Background(), gen); err == nil {
+			t.Fatal("expected error")
+		}
+	})
+
 	t.Run("SingleSegment", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
@@ -537,6 +552,45 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 		}
 	})
 
+	t.Run("LargeOffsets", func(t *testing.T) {
+		tests := []struct {
+			name       string
+			wantOffset int64
+		}{
+			{name: "DifferenceExceedsMaxInt32", wantOffset: 0x80000001},
+			{name: "MaximumOffset", wantOffset: 0x7fffffffffffffff},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				tmpDir := t.TempDir()
+				walDir := filepath.Join(tmpDir, "generations", gen, "wal")
+				if err := os.MkdirAll(walDir, 0755); err != nil {
+					t.Fatal(err)
+				}
+				for _, offset := range []int64{0, tt.wantOffset} {
+					filename := litestream.FormatWALSegmentFilenameV3(1, offset)
+					if err := os.WriteFile(filepath.Join(walDir, filename), []byte("x"), 0644); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				segments, err := file.NewReplicaClient(tmpDir).WALSegmentsV3(context.Background(), gen)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(segments) != 2 {
+					t.Fatalf("expected 2 segments, got %d", len(segments))
+				}
+				if got, want := segments[0].Offset, int64(0); got != want {
+					t.Errorf("segments[0].Offset = %d, want %d", got, want)
+				}
+				if got, want := segments[1].Offset, tt.wantOffset; got != want {
+					t.Errorf("segments[1].Offset = %d, want %d", got, want)
+				}
+			})
+		}
+	})
+
 	t.Run("SkipsInvalidFilenames", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		walDir := filepath.Join(tmpDir, "generations", gen, "wal")
@@ -555,6 +609,9 @@ func TestReplicaClient_WALSegmentsV3(t *testing.T) {
 			if err := os.WriteFile(filepath.Join(walDir, name), []byte("x"), 0644); err != nil {
 				t.Fatal(err)
 			}
+		}
+		if err := os.Mkdir(filepath.Join(walDir, "subdir"), 0755); err != nil {
+			t.Fatal(err)
 		}
 		c := file.NewReplicaClient(tmpDir)
 
