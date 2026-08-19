@@ -51,6 +51,11 @@ type Compactor struct {
 	// CacheSetter optionally stores MaxLTXFileInfo for a level.
 	// If nil, max file info is not cached.
 	CacheSetter func(level int, info *ltx.FileInfo)
+
+	// SourceGapHandler is invoked when a TXID gap is detected in the source
+	// level during compaction. Used to trigger recovery, such as re-uploading
+	// missing L0 files from disk.
+	SourceGapHandler func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID)
 }
 
 // NewCompactor creates a new Compactor with the given client and logger.
@@ -125,15 +130,19 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		}
 	}()
 
-	var minTXID, maxTXID, expectedMinTXID ltx.TXID
+	// When the destination level already has files, the source must continue
+	// exactly at seekTXID or the destination level would become
+	// non-contiguous. Without a destination file the first source file is
+	// accepted as-is since earlier files may have been removed by retention.
+	var expectedMinTXID ltx.TXID
+	if prevMaxInfo.MaxTXID > 0 {
+		expectedMinTXID = seekTXID
+	}
+
+	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
 
-		// expectedMinTXID is zero until the first file is processed, then
-		// set to MaxTXID+1 after each file. We skip the contiguity check
-		// for the first file because LTXFiles filtering semantics vary
-		// across backends (e.g., file client filters by MinTXID, S3 by
-		// prefix) so we accept whatever the iterator returns first.
 		if expectedMinTXID != 0 && info.MinTXID != expectedMinTXID {
 			if info.MinTXID < expectedMinTXID {
 				return nil, fmt.Errorf("overlapping transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
@@ -142,6 +151,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 				"level", srcLevel,
 				"expected_min_txid", expectedMinTXID,
 				"actual_min_txid", info.MinTXID)
+			if c.SourceGapHandler != nil {
+				c.SourceGapHandler(srcLevel, expectedMinTXID, info.MinTXID)
+			}
 			break
 		}
 
