@@ -2173,6 +2173,14 @@ func (f *VFSFile) FileSize() (size int64, err error) {
 			size = v
 		}
 	}
+	// Anchor size to f.commit which tracks the highest page written and
+	// survives syncToRemoteWithLock clearing f.dirty. Without this,
+	// FileSize can transiently shrink between a sync flush (which clears
+	// f.dirty) and the next poll (which repopulates f.index), causing
+	// SQLite to report "database disk image is malformed".
+	if v := int64(f.commit) * int64(pageSize); v > size {
+		size = v
+	}
 	f.mu.Unlock()
 
 	f.logger.Debug("file size", "size", size)
