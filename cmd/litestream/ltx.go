@@ -19,7 +19,7 @@ type LTXCommand struct{}
 // Run executes the command.
 func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-ltx", flag.ContinueOnError)
-	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	var level levelVar
 	fs.Var(&level, "level", "compaction level (0-9 or \"all\")")
@@ -40,16 +40,13 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
-		if *stdin {
-			return fmt.Errorf("cannot specify a replica URL and the -stdin flag")
-		}
 		if r, err = NewReplicaFromConfig(&ReplicaConfig{URL: fs.Arg(0)}, nil); err != nil {
 			return err
 		}
 		internal.InitLog(os.Stdout, "INFO", "text", false)
 	} else {
 		// Load configuration.
-		config, err := ReadConfig(*configPath, *stdin, !*noExpandEnv)
+		config, err := ReadConfig(*configPath, !*noExpandEnv)
 		if err != nil {
 			return err
 		}
@@ -151,14 +148,11 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
-
-	-stdin
-	    Read configuration from standard input.
 
 	-level LEVEL
 	    Compaction level to list (0-9 or "all").
@@ -173,7 +167,7 @@ Examples:
 	$ litestream ltx /path/to/db
 
 	# List all LTX files using configuration from standard input.
-	$ cat /path/to/litestream.yml | litestream ltx -stdin /path/to/db
+	$ cat /path/to/litestream.yml | litestream ltx -config - /path/to/db
 
 	# List all LTX files for replica URL.
 	$ litestream ltx s3://mybkt/db
