@@ -613,6 +613,22 @@ func ReadConfigFile(filename string, expandEnv bool) (Config, error) {
 	return ParseConfig(f, expandEnv)
 }
 
+// stdinConfigPath is the -config value that reads the configuration from STDIN.
+const stdinConfigPath = "-"
+
+// ReadConfig unmarshals config from configPath. If configPath is blank then the
+// default config path is used. If configPath is "-" then config is read from STDIN.
+// If expandEnv is true then environment variables are expanded in the config.
+func ReadConfig(configPath string, expandEnv bool) (Config, error) {
+	switch configPath {
+	case "":
+		configPath = DefaultConfigPath()
+	case stdinConfigPath:
+		return ParseConfig(os.Stdin, expandEnv)
+	}
+	return ReadConfigFile(configPath, expandEnv)
+}
+
 // ParseConfig unmarshals config from a reader.
 // If expandEnv is true then environment variables are expanded in the config.
 func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
@@ -2069,7 +2085,7 @@ func DefaultConfigPath() string {
 }
 
 func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
-	return fs.String("config", "", "config path"),
+	return fs.String("config", "", "config path, or \"-\" to read from stdin"),
 		fs.Bool("no-expand-env", false, "do not expand env vars in config")
 }
 

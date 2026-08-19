@@ -25,10 +25,7 @@ func (c *DatabasesCommand) Run(_ context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	if *configPath == "" {
-		*configPath = DefaultConfigPath()
-	}
-	config, err := ReadConfigFile(*configPath, !*noExpandEnv)
+	config, err := ReadConfig(*configPath, !*noExpandEnv)
 	if err != nil {
 		return err
 	}
@@ -83,7 +80,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-json
@@ -96,6 +93,7 @@ Examples:
 
 	$ litestream databases
 	$ litestream databases -config /path/to/litestream.yml
+	$ cat /path/to/litestream.yml | litestream databases -config -
 	$ litestream databases -no-expand-env -config /path/to/litestream.yml
 
 `[1:],

@@ -100,6 +100,69 @@ func TestOpenConfigFile(t *testing.T) {
 	})
 }
 
+func TestReadConfig(t *testing.T) {
+	t.Run("ReadsFromStdin", func(t *testing.T) {
+		dbPath := filepath.Join(t.TempDir(), "db")
+		t.Setenv("LITESTREAM_STDIN_DB", dbPath)
+		withStdin(t, `
+dbs:
+  - path: $LITESTREAM_STDIN_DB
+    replicas:
+      - url: file:///tmp/replica
+`[1:])
+
+		config, err := main.ReadConfig("-", true)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := len(config.DBs), 1; got != want {
+			t.Fatalf("len(DBs)=%v, want %v", got, want)
+		} else if got, want := config.DBs[0].Path, dbPath; got != want {
+			t.Fatalf("DB.Path=%v, want %v", got, want)
+		} else if got, want := config.DBs[0].Replicas[0].URL, "file:///tmp/replica"; got != want {
+			t.Fatalf("Replica.URL=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("ReadsFromFile", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(configPath, []byte("dbs:\n  - path: /tmp/db\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfig(configPath, true)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := len(config.DBs), 1; got != want {
+			t.Fatalf("len(DBs)=%v, want %v", got, want)
+		} else if got, want := config.DBs[0].Path, "/tmp/db"; got != want {
+			t.Fatalf("DB.Path=%v, want %v", got, want)
+		}
+	})
+}
+
+func withStdin(t *testing.T, s string) {
+	t.Helper()
+
+	oldStdin := os.Stdin
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.WriteString(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	os.Stdin = r
+	t.Cleanup(func() {
+		os.Stdin = oldStdin
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
 func TestReadConfigFile(t *testing.T) {
 	// Ensure global AWS settings are propagated down to replica configurations.
 	t.Run("PropagateGlobalSettings", func(t *testing.T) {
