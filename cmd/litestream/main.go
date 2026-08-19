@@ -54,7 +54,7 @@ var (
 	ErrInvalidSnapshotRetention        = errors.New("snapshot retention must be greater than 0")
 	ErrInvalidCompactionInterval       = errors.New("compaction interval must be greater than 0")
 	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
-	ErrInvalidL0Retention              = errors.New("l0 retention must be greater than 0")
+	ErrInvalidL0Retention              = errors.New("l0 retention must not be negative")
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
 	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
@@ -432,7 +432,7 @@ func (c *Config) Validate() error {
 			Value: *c.Snapshot.Retention,
 		}
 	}
-	if c.L0Retention != nil && *c.L0Retention <= 0 {
+	if c.L0Retention != nil && *c.L0Retention < 0 {
 		return &ConfigValidationError{
 			Err:   ErrInvalidL0Retention,
 			Field: "l0-retention",

@@ -875,7 +875,7 @@ func TestParseReplicaURL_AccessPoint(t *testing.T) {
 }
 
 func TestConfig_Validate_L0Retention(t *testing.T) {
-	t.Run("ZeroRetention", func(t *testing.T) {
+	t.Run("ZeroRetentionDisables", func(t *testing.T) {
 		yaml := `
 l0-retention: 0s
 dbs:
@@ -883,9 +883,29 @@ dbs:
     replica:
       url: file:///tmp/replica
 `
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("expected zero l0 retention to be accepted: %v", err)
+		}
+		if config.L0Retention == nil {
+			t.Fatal("expected l0 retention to be set")
+		}
+		if *config.L0Retention != 0 {
+			t.Errorf("expected l0 retention of 0, got %v", *config.L0Retention)
+		}
+	})
+
+	t.Run("NegativeRetention", func(t *testing.T) {
+		yaml := `
+l0-retention: -1s
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
 		_, err := main.ParseConfig(strings.NewReader(yaml), false)
 		if err == nil {
-			t.Fatal("expected error for zero l0 retention")
+			t.Fatal("expected error for negative l0 retention")
 		}
 		if !errors.Is(err, main.ErrInvalidL0Retention) {
 			t.Errorf("expected ErrInvalidL0Retention, got %v", err)
