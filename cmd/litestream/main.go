@@ -1112,18 +1112,19 @@ type ReplicaSettings struct {
 	AutoRecover *bool `yaml:"auto-recover"`
 
 	// S3 settings
-	AccessKeyID       string    `yaml:"access-key-id"`
-	SecretAccessKey   string    `yaml:"secret-access-key"`
-	Region            string    `yaml:"region"`
-	Bucket            string    `yaml:"bucket"`
-	Endpoint          string    `yaml:"endpoint"`
-	ForcePathStyle    *bool     `yaml:"force-path-style"`
-	SignPayload       *bool     `yaml:"sign-payload"`
-	RequireContentMD5 *bool     `yaml:"require-content-md5"`
-	SkipVerify        bool      `yaml:"skip-verify"`
-	StorageClass      string    `yaml:"storage-class"`
-	PartSize          *ByteSize `yaml:"part-size"`
-	Concurrency       *int      `yaml:"concurrency"`
+	AccessKeyID        string    `yaml:"access-key-id"`
+	SecretAccessKey    string    `yaml:"secret-access-key"`
+	Region             string    `yaml:"region"`
+	Bucket             string    `yaml:"bucket"`
+	Endpoint           string    `yaml:"endpoint"`
+	ForcePathStyle     *bool     `yaml:"force-path-style"`
+	SignPayload        *bool     `yaml:"sign-payload"`
+	SignAcceptEncoding *bool     `yaml:"sign-accept-encoding"`
+	RequireContentMD5  *bool     `yaml:"require-content-md5"`
+	SkipVerify         bool      `yaml:"skip-verify"`
+	StorageClass       string    `yaml:"storage-class"`
+	PartSize           *ByteSize `yaml:"part-size"`
+	Concurrency        *int      `yaml:"concurrency"`
 
 	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
 	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
@@ -1217,6 +1218,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.SignPayload == nil {
 		rs.SignPayload = src.SignPayload
+	}
+	if rs.SignAcceptEncoding == nil {
+		rs.SignAcceptEncoding = src.SignAcceptEncoding
 	}
 	if rs.RequireContentMD5 == nil {
 		rs.RequireContentMD5 = src.RequireContentMD5
@@ -1449,6 +1453,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
 	}
+	signAcceptEncodingSetting := newBoolSetting(true)
+	if v := c.SignAcceptEncoding; v != nil {
+		signAcceptEncodingSetting.Set(*v)
+	}
 	requireSetting := newBoolSetting(true)
 	if v := c.RequireContentMD5; v != nil {
 		requireSetting.Set(*v)
@@ -1463,16 +1471,18 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Apply settings from URL, if specified.
 	var (
-		endpointWasSet        bool
-		usignPayload          bool
-		usignPayloadSet       bool
-		urequireContentMD5    bool
-		urequireContentMD5Set bool
-		ustorageClass         string
-		upartSize             int64
-		upartSizeSet          bool
-		uconcurrency          int64
-		uconcurrencySet       bool
+		endpointWasSet         bool
+		usignPayload           bool
+		usignPayloadSet        bool
+		usignAcceptEncoding    bool
+		usignAcceptEncodingSet bool
+		urequireContentMD5     bool
+		urequireContentMD5Set  bool
+		ustorageClass          string
+		upartSize              int64
+		upartSizeSet           bool
+		uconcurrency           int64
+		uconcurrencySet        bool
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1522,6 +1532,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			usignPayload = v
 			usignPayloadSet = true
 		}
+		if v, ok := litestream.BoolQueryValue(query, "signAcceptEncoding", "sign-accept-encoding"); ok {
+			usignAcceptEncoding = v
+			usignAcceptEncodingSet = true
+		}
 		if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
@@ -1565,6 +1579,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 		if !signSetting.set && usignPayloadSet {
 			signSetting.Set(usignPayload)
+		}
+		if !signAcceptEncodingSetting.set && usignAcceptEncodingSet {
+			signAcceptEncodingSetting.Set(usignAcceptEncoding)
 		}
 		if !requireSetting.set && urequireContentMD5Set {
 			requireSetting.Set(urequireContentMD5)
@@ -1625,6 +1642,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.StorageClass = storageClass
 
 	client.SignPayload = signSetting.value
+	client.SignAcceptEncoding = signAcceptEncodingSetting.value
 	client.RequireContentMD5 = requireSetting.value
 
 	if isCloudflareR2 {
