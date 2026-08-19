@@ -26,7 +26,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	opt := litestream.NewRestoreOptions()
 
 	fs := flag.NewFlagSet("litestream-restore", flag.ContinueOnError)
-	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.Var((*txidVar)(&opt.TXID), "txid", "transaction ID")
 	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
@@ -97,9 +97,6 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
 		}
-		if *stdin {
-			return fmt.Errorf("cannot specify a replica URL and the -stdin flag")
-		}
 		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
@@ -107,7 +104,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 			return err
 		}
 	} else {
-		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, *stdin, !*noExpandEnv, *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
+		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
 			return nil
 		} else if err != nil {
@@ -325,9 +322,9 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 }
 
 // loadFromConfig returns a replica & updates the restore options from a DB reference.
-func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath string, fromStdin, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
+func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath string, expandEnv, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	// Load configuration.
-	config, err := ReadConfig(configPath, fromStdin, expandEnv)
+	config, err := ReadConfig(configPath, expandEnv)
 	if err != nil {
 		return nil, err
 	}
@@ -372,14 +369,11 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
-
-	-stdin
-	    Read configuration from standard input.
 
 	-txid TXID
 	    Restore up to a specific hex-encoded transaction ID (inclusive).
@@ -434,7 +428,7 @@ Examples:
 	$ litestream restore /path/to/db
 
 	# Restore latest replica using configuration from standard input.
-	$ cat /path/to/litestream.yml | litestream restore -stdin /path/to/db
+	$ cat /path/to/litestream.yml | litestream restore -config - /path/to/db
 
 	# Restore replica for database to a given point in time.
 	$ litestream restore -timestamp 2020-01-01T00:00:00Z /path/to/db

@@ -15,7 +15,7 @@ type DatabasesCommand struct{}
 // Run executes the command.
 func (c *DatabasesCommand) Run(_ context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-databases", flag.ContinueOnError)
-	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -25,7 +25,7 @@ func (c *DatabasesCommand) Run(_ context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	config, err := ReadConfig(*configPath, *stdin, !*noExpandEnv)
+	config, err := ReadConfig(*configPath, !*noExpandEnv)
 	if err != nil {
 		return err
 	}
@@ -80,14 +80,11 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-json
 	    Output raw JSON instead of human-readable text.
-
-	-stdin
-	    Read configuration from standard input.
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
@@ -96,7 +93,7 @@ Examples:
 
 	$ litestream databases
 	$ litestream databases -config /path/to/litestream.yml
-	$ cat /path/to/litestream.yml | litestream databases -stdin
+	$ cat /path/to/litestream.yml | litestream databases -config -
 	$ litestream databases -no-expand-env -config /path/to/litestream.yml
 
 `[1:],
