@@ -18,7 +18,7 @@ type ResetCommand struct{}
 // Run executes the command.
 func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 	fs := flag.NewFlagSet("litestream-reset", flag.ContinueOnError)
-	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	dryRun := fs.Bool("dry-run", false, "print local state that would be removed without deleting")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
@@ -46,12 +46,9 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 
 	// A missing config file is tolerated only when the path is the implicit default.
 	resolvedConfigPath, explicitConfig := resolveConfigPath(*configPath)
-	if *stdin {
-		resolvedConfigPath, explicitConfig = *configPath, true
-	}
 
 	var dbConfig *DBConfig
-	config, configErr := ReadConfig(resolvedConfigPath, *stdin, !*noExpandEnv)
+	config, configErr := ReadConfig(resolvedConfigPath, !*noExpandEnv)
 	if configErr != nil && (explicitConfig || !errors.Is(configErr, ErrConfigFileNotFound)) {
 		return fmt.Errorf("cannot read config: %w", configErr)
 	}
@@ -167,14 +164,11 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
-
-	-stdin
-	    Read configuration from standard input.
 
 	-dry-run
 	    Print the local LTX files that would be removed without deleting them.
@@ -191,7 +185,7 @@ Examples:
 	litestream reset -config /etc/litestream.yml /path/to/database.db
 
 	# Reset using configuration from standard input
-	cat /etc/litestream.yml | litestream reset -stdin /path/to/database.db
+	cat /etc/litestream.yml | litestream reset -config - /path/to/database.db
 
 `[1:],
 		DefaultConfigPath(),

@@ -81,7 +81,7 @@ func TestDatabasesCommand_Run(t *testing.T) {
 
 		output := captureStdout(t, func() {
 			cmd := &main.DatabasesCommand{}
-			if err := cmd.Run(context.Background(), []string{"-stdin", "-json"}); err != nil {
+			if err := cmd.Run(context.Background(), []string{"-config", "-", "-json"}); err != nil {
 				t.Fatalf("unexpected error: %v", err)
 			}
 		})

@@ -165,7 +165,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 	onceFlag := fs.Bool("once", false, "replicate once and exit")
 	forceSnapshotFlag := fs.Bool("force-snapshot", false, "force snapshot when replicating once")
 	enforceRetentionFlag := fs.Bool("enforce-retention", false, "enforce retention of old snapshots when replicating once")
-	configPath, stdin, noExpandEnv := registerConfigFlag(fs)
+	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -175,10 +175,10 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 	switch fs.NArg() {
 	case 0:
 		// No arguments provided, use config file
-		if *configPath == "" && !*stdin {
+		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if c.Config, err = ReadConfig(*configPath, *stdin, !*noExpandEnv); err != nil {
+		if c.Config, err = ReadConfig(*configPath, !*noExpandEnv); err != nil {
 			return err
 		}
 		// Override log level if CLI flag provided (takes precedence over env var)
@@ -201,9 +201,6 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		// Database path and replica URLs provided via CLI
 		if *configPath != "" {
 			return fmt.Errorf("cannot specify a replica URL and the -config flag")
-		}
-		if *stdin {
-			return fmt.Errorf("cannot specify a replica URL and the -stdin flag")
 		}
 
 		// Initialize config with defaults when using command-line arguments
@@ -237,7 +234,9 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		c.Config.DBs = []*DBConfig{dbConfig}
 	}
 
-	c.Config.ConfigPath = *configPath
+	if *configPath != stdinConfigPath {
+		c.Config.ConfigPath = *configPath
+	}
 
 	// Override config exec command, if specified.
 	if *execFlag != "" {
@@ -626,7 +625,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-exec CMD
@@ -650,9 +649,6 @@ Arguments:
 	-log-level LEVEL
 	    Sets the log level. Overrides the config file setting.
 	    Valid values: trace, debug, info, warn, error
-
-	-stdin
-	    Read configuration from standard input.
 
 	-no-expand-env
 	    Disables environment variable expansion in configuration file.
