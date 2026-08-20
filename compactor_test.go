@@ -149,6 +149,35 @@ func TestCompactor_Compact(t *testing.T) {
 		}
 	})
 
+	t.Run("L1SeekGapStillCompacts", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		var gapCalled bool
+		compactor.SourceGapHandler = func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID) {
+			gapCalled = true
+		}
+
+		// Snapshot retention can legitimately delete L1 files above a
+		// lagging L2 max (TXIDs 3-4 here), so a gap at the seek position
+		// is valid above L0 and must not block compaction: the snapshot
+		// covers the missing range.
+		createTestLTXFile(t, client, 2, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 5)
+		createTestLTXFile(t, client, 1, 6, 6)
+
+		info, err := compactor.Compact(context.Background(), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 5 || info.MaxTXID != 6 {
+			t.Errorf("TXID range=%d-%d, want 5-6", info.MinTXID, info.MaxTXID)
+		}
+		if gapCalled {
+			t.Error("gap handler must not fire above L0")
+		}
+	})
+
 	t.Run("L0OverlapReturnsError", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())

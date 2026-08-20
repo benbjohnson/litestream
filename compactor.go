@@ -130,12 +130,15 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		}
 	}()
 
-	// When the destination level already has files, the source must continue
-	// exactly at seekTXID or the destination level would become
-	// non-contiguous. Without a destination file the first source file is
+	// When L1 already has files, L0 must continue exactly at seekTXID or L1
+	// would become non-contiguous: L0 retention only deletes files already
+	// compacted into L1, so a missing seek file is always a real gap. Above
+	// L0 the check must not apply — snapshot retention legitimately deletes
+	// source files past a lagging destination level, and the snapshot covers
+	// the missing range. Without a destination file the first source file is
 	// accepted as-is since earlier files may have been removed by retention.
 	var expectedMinTXID ltx.TXID
-	if prevMaxInfo.MaxTXID > 0 {
+	if srcLevel == 0 && prevMaxInfo.MaxTXID > 0 {
 		expectedMinTXID = seekTXID
 	}
 
