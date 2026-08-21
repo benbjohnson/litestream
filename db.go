@@ -707,7 +707,7 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 		return SyncStatus{}, fmt.Errorf("local position: %w", err)
 	}
 
-	remotePos, err := db.Replica.calcPos(ctx)
+	remotePos, _, err := db.Replica.calcPos(ctx)
 	if err != nil {
 		return SyncStatus{}, fmt.Errorf("remote position: %w", err)
 	}
