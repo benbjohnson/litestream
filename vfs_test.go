@@ -384,6 +384,95 @@ func TestVFSFile_OpenSeedsLevel1PositionFromPos(t *testing.T) {
 	}
 }
 
+// TestVFSFile_StraddlingL1FileAfterSeed reproduces the permanent
+// "non-contiguous ltx file" wedge at L1.
+//
+// When the index is built while L1 is empty, maxTXID1 is seeded from pos.TXID
+// (an L0/snapshot position) — here TXID 6 — which need not fall on an L1 file
+// boundary. When the writer's first L1 compaction then emits a file whose range
+// *straddles* that seed (1..b covers 6), the level-1 seek (seek=maxTXID1+1=7)
+// skips it because its MinTXID (1) < seek, and the following L1 file (c..1d)
+// then trips the strict MinTXID==maxTXID+1 contiguity check — wedging the
+// follower forever even though the data on disk is fully contiguous.
+//
+// Correct behavior: the straddling 1..b file is ingested (advancing maxTXID1 to
+// b), after which c..1d continues contiguously.
+func TestVFSFile_StraddlingL1FileAfterSeed(t *testing.T) {
+	client := newMockReplicaClient()
+
+	// Snapshot covering TXIDs 1..6, no L1 files yet. On open this makes
+	// pos.TXID = 6 and — since L1 is empty — seeds maxTXID1 = 6.
+	client.addFixture(t, buildLTXRangeFixture(t, SnapshotLevel, 1, 6, 's'))
+
+	f := NewVFSFile(client, "straddle.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	if got := f.maxTXID1; got != 6 {
+		t.Fatalf("precondition: maxTXID1 seeded to %s, want 6", got)
+	}
+
+	// The first L1 compaction emits 1..b — a range that straddles the seed (6).
+	// It must be ingested; today it is silently skipped (MinTXID 1 < seek 7).
+	client.addFixture(t, buildLTXRangeFixture(t, 1, 1, 0xb, 'A'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll after straddling L1 file: %v", err)
+	}
+	if got := f.maxTXID1; got != 0xb {
+		t.Fatalf("straddling L1 file 1-b was not ingested: maxTXID1=%s, want b", got)
+	}
+
+	// The next L1 file continues contiguously from b: c..1d. Without ingesting
+	// 1..b above, this is where the wedge surfaces as a non-contiguous error.
+	client.addFixture(t, buildLTXRangeFixture(t, 1, 0xc, 0x1d, 'B'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll after following L1 file: %v", err)
+	}
+	if got := f.maxTXID1; got != 0x1d {
+		t.Fatalf("following L1 file c-1d not ingested: maxTXID1=%s, want 1d", got)
+	}
+}
+
+// TestVFSFile_MergedWiderL1FileAfterConsume covers the L1->L1 re-compaction
+// variant of the straddle bug. After a follower has consumed an L1 file up to
+// some boundary (here b), compaction can merge that range with later ones into a
+// *wider* L1 file whose MinTXID is below the follower's watermark (7..1d covers
+// b). The follower must ingest that wider file rather than reject it as
+// non-contiguous — the same defect as the seed case, reached a different way.
+func TestVFSFile_MergedWiderL1FileAfterConsume(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXRangeFixture(t, SnapshotLevel, 1, 6, 's'))
+
+	f := NewVFSFile(client, "merge.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	// Consume an aligned L1 file 7..b, advancing maxTXID1 to b.
+	client.addFixture(t, buildLTXRangeFixture(t, 1, 7, 0xb, 'A'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll after aligned L1 file: %v", err)
+	}
+	if got := f.maxTXID1; got != 0xb {
+		t.Fatalf("aligned L1 file not ingested: maxTXID1=%s, want b", got)
+	}
+
+	// L1->L1 re-compaction merges 7..b with c..1d into a wider 7..1d file, whose
+	// MinTXID (7) is below the current watermark (b). seek=c naturally excludes
+	// the superseded 7..b (MaxTXID b < c), so the wider file is what must be
+	// ingested; it straddles b and advances the watermark to 1d.
+	client.addFixture(t, buildLTXRangeFixture(t, 1, 7, 0x1d, 'B'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll after merged wider L1 file: %v", err)
+	}
+	if got := f.maxTXID1; got != 0x1d {
+		t.Fatalf("merged wider L1 file not ingested: maxTXID1=%s, want 1d", got)
+	}
+}
+
 func TestVFSFile_HeaderForcesDeleteJournal(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'h'))
@@ -868,6 +957,8 @@ func (c *countingReplicaClient) DeleteLTXFiles(context.Context, []*ltx.FileInfo)
 
 func (c *countingReplicaClient) DeleteAll(context.Context) error { return nil }
 
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
+
 func newMockReplicaClient() *mockReplicaClient {
 	return &mockReplicaClient{data: make(map[string][]byte)}
 }
@@ -883,6 +974,8 @@ func (c *mockReplicaClient) Type() string { return "mock" }
 
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
 
+func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *mockReplicaClient) addFixture(tb testing.TB, fx *ltxFixture) {
 	tb.Helper()
 	c.mu.Lock()
@@ -896,7 +989,9 @@ func (c *mockReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TX
 	defer c.mu.Unlock()
 	var out []*ltx.FileInfo
 	for _, info := range c.files {
-		if info.Level == level && info.MinTXID >= seek {
+		// Mirror the real backends: return a file whose range reaches the seek
+		// (MaxTXID >= seek), including one that straddles it (MinTXID < seek).
+		if info.Level == level && info.MaxTXID >= seek {
 			out = append(out, info)
 		}
 	}
@@ -1042,6 +1137,49 @@ func buildLTXFixtureWithPages(tb testing.TB, txid ltx.TXID, pageSize uint32, pgn
 		CreatedAt: time.Now().UTC(),
 	}
 
+	return &ltxFixture{info: info, data: buf.Bytes()}
+}
+
+// buildLTXRangeFixture builds an LTX fixture spanning [minTXID, maxTXID] at the
+// given level, so tests can model a compacted file (snapshot/L1/L2+) whose range
+// covers multiple transactions — including one that straddles a poll watermark.
+// The existing builders only produce single-TXID (MinTXID==MaxTXID) files.
+func buildLTXRangeFixture(tb testing.TB, level int, minTXID, maxTXID ltx.TXID, fill byte) *ltxFixture {
+	tb.Helper()
+	const pageSize = 4096
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		tb.Fatalf("new encoder: %v", err)
+	}
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		PageSize:  pageSize,
+		Commit:    1, // single-page db; page contents are irrelevant to poll-watermark tests
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Timestamp: time.Now().UnixMilli(),
+		Flags:     ltx.HeaderFlagNoChecksum,
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		tb.Fatalf("encode header: %v", err)
+	}
+	page := bytes.Repeat([]byte{fill}, pageSize)
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, page); err != nil {
+		tb.Fatalf("encode page: %v", err)
+	}
+	if err := enc.Close(); err != nil {
+		tb.Fatalf("close encoder: %v", err)
+	}
+
+	info := &ltx.FileInfo{
+		Level:     level,
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Size:      int64(buf.Len()),
+		CreatedAt: time.Now().UTC(),
+	}
 	return &ltxFixture{info: info, data: buf.Bytes()}
 }
 
