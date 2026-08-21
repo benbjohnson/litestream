@@ -435,12 +435,13 @@ func TestVFSFile_StraddlingL1FileAfterSeed(t *testing.T) {
 	}
 }
 
-// TestVFSFile_MergedWiderL1FileAfterConsume covers the L1->L1 re-compaction
-// variant of the straddle bug. After a follower has consumed an L1 file up to
-// some boundary (here b), compaction can merge that range with later ones into a
-// *wider* L1 file whose MinTXID is below the follower's watermark (7..1d covers
-// b). The follower must ingest that wider file rather than reject it as
-// non-contiguous — the same defect as the seed case, reached a different way.
+// TestVFSFile_MergedWiderL1FileAfterConsume is a defensive test for overlapping
+// files within a level. litestream compacts level N into level N+1 and does not
+// rewrite files within a level, so this exact state should not arise in normal
+// operation — but pollLevel must not wedge if it ever encounters a wider file
+// whose range overlaps what a follower has already consumed. Here a follower at
+// watermark b meets a wider 7..1d file (MinTXID 7 < b); it must be ingested and
+// advance the watermark to 1d rather than be rejected as non-contiguous.
 func TestVFSFile_MergedWiderL1FileAfterConsume(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXRangeFixture(t, SnapshotLevel, 1, 6, 's'))
@@ -460,10 +461,10 @@ func TestVFSFile_MergedWiderL1FileAfterConsume(t *testing.T) {
 		t.Fatalf("aligned L1 file not ingested: maxTXID1=%s, want b", got)
 	}
 
-	// L1->L1 re-compaction merges 7..b with c..1d into a wider 7..1d file, whose
-	// MinTXID (7) is below the current watermark (b). seek=c naturally excludes
-	// the superseded 7..b (MaxTXID b < c), so the wider file is what must be
-	// ingested; it straddles b and advances the watermark to 1d.
+	// A wider 7..1d file appears whose MinTXID (7) is below the current watermark
+	// (b) — a within-level overlap. seek=c naturally excludes the narrower 7..b
+	// (MaxTXID b < c), so the wider file is what must be ingested; it straddles b
+	// and advances the watermark to 1d.
 	client.addFixture(t, buildLTXRangeFixture(t, 1, 7, 0x1d, 'B'))
 	if err := f.pollReplicaClient(context.Background()); err != nil {
 		t.Fatalf("poll after merged wider L1 file: %v", err)

@@ -2641,9 +2641,10 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 
 		// Position this file relative to the highest TXID applied so far:
 		//
-		//   1. Already covered (MaxTXID <= maxTXID): nothing new — skip. Handles
-		//      narrower files listed alongside a wider one that supersedes them
-		//      (e.g. from L1->L1 re-compaction).
+		//   1. Already covered (MaxTXID <= maxTXID): nothing new — skip. Defends
+		//      against a narrower file listed alongside a wider one that overlaps
+		//      it. litestream does not rewrite files within a level today, so this
+		//      is robustness, not a path exercised in normal operation.
 		//   2. Contiguous continuation, including a *straddling* compacted file
 		//      whose range starts at or below maxTXID but extends past it
 		//      (MinTXID <= maxTXID+1 <= MaxTXID): apply it and advance to its
