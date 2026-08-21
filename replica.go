@@ -236,7 +236,23 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 			return result, nil
 		}
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
-			return result, err
+			var ltxErr *LTXError
+			gapMaxTXID, gapExists := findL0GapMaxTXID(r.remoteL0Files, txID)
+			if !errors.As(err, &ltxErr) || ltxErr.Op != "open" ||
+				ltxErr.Path != r.db.LTXPath(0, txID, txID) || !os.IsNotExist(ltxErr.Err) || !gapExists {
+				return result, err
+			}
+
+			r.Logger().Warn("local L0 file missing during gap heal, forcing snapshot",
+				"gap_min_txid", txID.String(),
+				"gap_max_txid", gapMaxTXID.String())
+			info, err := r.db.Snapshot(ctx)
+			if err != nil {
+				return result, fmt.Errorf("snapshot for missing local L0 gap %s-%s: %w", txID, gapMaxTXID, err)
+			}
+			r.SetPos(ltx.Pos{TXID: info.MaxTXID})
+			result.synced = true
+			break
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
 		result.synced = true
@@ -288,10 +304,10 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 }
 
 // calcPos returns the position replication should resume from for level 0.
-// Files already compacted into level 1 are ignored. If a TXID gap exists in
-// the remaining L0 files, the returned position stops just before the gap so
-// the missing files are re-uploaded from disk; resuming from the maximum
-// TXID would leave the gap in place permanently and block compaction.
+// Files already covered by level 1 or a snapshot are ignored. If a TXID gap
+// exists in the remaining L0 files, the returned position stops just before
+// the gap so the missing files are re-uploaded from disk; resuming from the
+// maximum TXID would leave the gap in place permanently and block compaction.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileInfo, err error) {
 	l1Info, err := r.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
@@ -315,9 +331,17 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 	txID := l1Info.MaxTXID
 	for _, info := range l0Files {
 		if info.MaxTXID <= txID {
-			continue // already compacted into L1
+			continue // already covered by L1 or a snapshot
 		}
 		if txID != 0 && info.MinTXID > txID+1 {
+			snapshotInfo, err := r.db.MaxLTXFileInfo(ctx, SnapshotLevel)
+			if err != nil {
+				return pos, nil, fmt.Errorf("max snapshot ltx file: %w", err)
+			}
+			if snapshotInfo.MaxTXID >= info.MinTXID-1 {
+				txID = max(snapshotInfo.MaxTXID, info.MaxTXID)
+				continue
+			}
 			r.Logger().Warn("txid gap detected in remote L0 files, resuming replication before gap",
 				"expected", (txID + 1).String(),
 				"actual", info.MinTXID.String())
@@ -331,6 +355,15 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 func containsL0TXID(files []ltx.FileInfo, txID ltx.TXID) bool {
 	i := sort.Search(len(files), func(i int) bool { return files[i].MinTXID > txID })
 	return i > 0 && files[i-1].MaxTXID >= txID
+}
+
+func findL0GapMaxTXID(files []ltx.FileInfo, minTXID ltx.TXID) (ltx.TXID, bool) {
+	for _, info := range files {
+		if info.MinTXID > minTXID {
+			return info.MinTXID - 1, true
+		}
+	}
+	return 0, false
 }
 
 // InvalidatePos marks the replica position for recalculation on the next
