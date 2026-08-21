@@ -36,8 +36,9 @@ var errReplicaWaitForData = errors.New("no position, waiting for data")
 type Replica struct {
 	db *DB
 
-	mu  sync.RWMutex
-	pos ltx.Pos // current replicated position
+	mu            sync.RWMutex
+	pos           ltx.Pos // current replicated position
+	remoteL0Files []ltx.FileInfo
 
 	syncSem     *semaphore.Weighted
 	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
@@ -175,6 +176,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 			r.mu.Lock()
 			r.pos = ltx.Pos{}
 			r.mu.Unlock()
+			r.remoteL0Files = nil
 		}
 	}()
 
@@ -186,15 +188,17 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 	// such as when compaction detects a TXID gap in remote L0 files.
 	if r.posInvalid.Swap(false) {
 		r.SetPos(ltx.Pos{})
+		r.remoteL0Files = nil
 	}
 
 	// Calculate current replica position, if unknown.
 	if r.Pos().IsZero() {
-		pos, err := r.calcPos(ctx)
+		pos, remoteL0Files, err := r.calcPos(ctx)
 		if err != nil {
 			return result, fmt.Errorf("calc pos: %w", err)
 		}
 		r.SetPos(pos)
+		r.remoteL0Files = remoteL0Files
 	}
 
 	// Find current position of database.
@@ -213,6 +217,13 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 
 	// Replicate all L0 LTX files since last replica position.
 	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+		if err := ctx.Err(); err != nil {
+			return result, context.Cause(ctx)
+		}
+		if containsL0TXID(r.remoteL0Files, txID) {
+			r.SetPos(ltx.Pos{TXID: txID})
+			continue
+		}
 		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
 			result.limited = true
 			// Uploads succeeded, so record sync health; otherwise a
@@ -224,9 +235,6 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 				"replica_txid", r.Pos().TXID.String())
 			return result, nil
 		}
-		if err := ctx.Err(); err != nil {
-			return result, context.Cause(ctx)
-		}
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			return result, err
 		}
@@ -234,6 +242,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		result.synced = true
 		syncedFileN++
 	}
+	r.remoteL0Files = nil
 
 	// Record successful sync for heartbeat monitoring.
 	r.db.RecordSuccessfulSync()
@@ -283,29 +292,28 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 // the remaining L0 files, the returned position stops just before the gap so
 // the missing files are re-uploaded from disk; resuming from the maximum
 // TXID would leave the gap in place permanently and block compaction.
-func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
+func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileInfo, err error) {
 	l1Info, err := r.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
-		return pos, fmt.Errorf("max l1 ltx file: %w", err)
+		return pos, nil, fmt.Errorf("max l1 ltx file: %w", err)
 	}
 
 	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
-		return pos, fmt.Errorf("l0 ltx files: %w", err)
+		return pos, nil, fmt.Errorf("l0 ltx files: %w", err)
 	}
 	defer itr.Close()
 
-	var infos []ltx.FileInfo
 	for itr.Next() {
-		infos = append(infos, *itr.Item())
+		l0Files = append(l0Files, *itr.Item())
 	}
 	if err := itr.Close(); err != nil {
-		return pos, fmt.Errorf("close l0 iterator: %w", err)
+		return pos, nil, fmt.Errorf("close l0 iterator: %w", err)
 	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].MinTXID < infos[j].MinTXID })
+	sort.Slice(l0Files, func(i, j int) bool { return l0Files[i].MinTXID < l0Files[j].MinTXID })
 
 	txID := l1Info.MaxTXID
-	for _, info := range infos {
+	for _, info := range l0Files {
 		if info.MaxTXID <= txID {
 			continue // already compacted into L1
 		}
@@ -317,7 +325,12 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 		}
 		txID = info.MaxTXID
 	}
-	return ltx.Pos{TXID: txID}, nil
+	return ltx.Pos{TXID: txID}, l0Files, nil
+}
+
+func containsL0TXID(files []ltx.FileInfo, txID ltx.TXID) bool {
+	i := sort.Search(len(files), func(i int) bool { return files[i].MinTXID > txID })
+	return i > 0 && files[i-1].MaxTXID >= txID
 }
 
 // InvalidatePos marks the replica position for recalculation on the next
