@@ -380,12 +380,13 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 		seek:   seek,
 	}
 
-	// Create paginator for listing blobs with level prefix
+	// Create paginator for listing blobs with level prefix. List the whole
+	// level and filter by seek in the iterator (like the s3 backend). We can't
+	// narrow the list with a seek-derived key prefix: a file whose range
+	// straddles the seek has a MinTXID below it, so a prefix on the seek value
+	// would exclude the very file that covers the next needed TXID.
 	dir := litestream.LTXLevelDir(client.Path, level)
 	prefix := dir + "/"
-	if seek != 0 {
-		prefix += seek.String()
-	}
 
 	itr.pager = client.client.NewListBlobsFlatPager(client.Bucket, &azblob.ListBlobsFlatOptions{
 		Prefix:  &prefix,
@@ -457,8 +458,10 @@ func (itr *ltxFileIterator) loadNextPage() bool {
 			Size:    *item.Properties.ContentLength,
 		}
 
-		// Skip if below seek TXID
-		if info.MinTXID < itr.seek {
+		// Skip only if the file's whole range is below the seek TXID. A file
+		// whose range straddles the seek (MinTXID < seek <= MaxTXID) still
+		// covers the next TXID a follower needs, so it must be returned.
+		if info.MaxTXID < itr.seek {
 			continue
 		}
 

@@ -317,8 +317,8 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 			continue
 		}
 
-		// Apply seek filter
-		if minTXID < seek {
+		// Apply seek filter. Skip if the whole range is below seek.
+		if maxTXID < seek {
 			continue
 		}
 
