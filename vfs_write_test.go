@@ -39,6 +39,8 @@ func (c *writeTestReplicaClient) Type() string { return "test" }
 
 func (c *writeTestReplicaClient) Init(ctx context.Context) error { return nil }
 
+func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *writeTestReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
