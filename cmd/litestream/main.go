@@ -142,6 +142,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	switch cmd {
 	case "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
+	case "mcp":
+		return (&MCPCommand{}).Run(ctx, args)
 	case "replicate":
 		c := NewReplicateCommand()
 		if err := c.ParseFlags(ctx, args); err != nil {
@@ -169,6 +171,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			} else {
 				slog.Info("replication complete, litestream shutting down")
 			}
+		case err = <-c.mcpErrCh:
+			slog.Info("MCP server exited, litestream shutting down")
 		case sig := <-signalCh:
 			slog.Info("signal received, litestream shutting down", "signal", sig)
 
@@ -192,9 +196,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Gracefully close.
-		if e := c.Close(ctx); e != nil && err == nil {
-			err = e
-		}
+		err = errors.Join(err, c.Close(ctx))
 		slog.Info("litestream shut down")
 		return err
 
@@ -253,6 +255,7 @@ The commands are:
 	info         show daemon information
 	list         list all managed databases
 	ltx          list available LTX files for a database
+	mcp          runs the MCP server
 	register     register a database for replication
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database
