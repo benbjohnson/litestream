@@ -223,21 +223,25 @@ func (c *ReplicaClient) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	var err error
-	if c.sftpClient != nil {
-		err = errors.Join(err, c.sftpClient.Close())
-		c.sftpClient = nil
+	sftpClient, sshClient := c.sftpClient, c.sshClient
+	c.sftpClient, c.sshClient = nil, nil
+
+	var sshErr, sftpErr error
+	if sshClient != nil {
+		sshErr = sshClient.Close()
 	}
-	if c.sshClient != nil {
-		err = errors.Join(err, c.sshClient.Close())
-		c.sshClient = nil
+	if sftpClient != nil {
+		sftpErr = sftpClient.Close()
+		if errors.Is(sftpErr, io.EOF) || errors.Is(sftpErr, net.ErrClosed) {
+			sftpErr = nil
+		}
 	}
-	return err
+	return errors.Join(sshErr, sftpErr)
 }
 
 // DeleteAll deletes all LTX files.
 func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
-	defer func() { c.resetOnConnError(err) }()
+	defer c.resetOnConnError(&err)
 
 	sftpClient, err := c.init(ctx)
 	if err != nil {
@@ -281,7 +285,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 // SFTP uses file ModTime for timestamps, which is set via Chtimes() to preserve original timestamp.
 // The useMetadata parameter is ignored since ModTime always contains the accurate timestamp.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
-	defer func() { c.resetOnConnError(err) }()
+	defer c.resetOnConnError(&err)
 
 	sftpClient, err := c.init(ctx)
 	if err != nil {
@@ -320,7 +324,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 
 // WriteLTXFile writes a LTX file from rd into a remote file.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
-	defer func() { c.resetOnConnError(err) }()
+	defer c.resetOnConnError(&err)
 
 	sftpClient, err := c.init(ctx)
 	if err != nil {
@@ -392,7 +396,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 // OpenLTXFile returns a reader for an LTX file.
 // Returns os.ErrNotExist if no matching position is found.
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
-	defer func() { c.resetOnConnError(err) }()
+	defer c.resetOnConnError(&err)
 
 	sftpClient, err := c.init(ctx)
 	if err != nil {
@@ -421,7 +425,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
-	defer func() { c.resetOnConnError(err) }()
+	defer c.resetOnConnError(&err)
 
 	sftpClient, err := c.init(ctx)
 	if err != nil {
@@ -444,7 +448,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 
 // Cleanup deletes path & directories after empty.
 func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
-	defer func() { c.resetOnConnError(err) }()
+	defer c.resetOnConnError(&err)
 
 	sftpClient, err := c.init(ctx)
 	if err != nil {
@@ -458,17 +462,9 @@ func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
 }
 
 // resetOnConnError closes & clears the client if a connection error occurs.
-func (c *ReplicaClient) resetOnConnError(err error) {
-	if !errors.Is(err, sftp.ErrSSHFxConnectionLost) {
+func (c *ReplicaClient) resetOnConnError(err *error) {
+	if !errors.Is(*err, sftp.ErrSSHFxConnectionLost) {
 		return
 	}
-
-	if c.sftpClient != nil {
-		c.sftpClient.Close()
-		c.sftpClient = nil
-	}
-	if c.sshClient != nil {
-		c.sshClient.Close()
-		c.sshClient = nil
-	}
+	*err = errors.Join(*err, c.Close())
 }
