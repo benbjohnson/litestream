@@ -99,6 +99,12 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 		if r, err = c.loadFromURL(ctx, fs.Arg(0), *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
+			if *jsonOutput {
+				return printRestoreOutput(RestoreOutput{
+					Status: RestoreStatusSkipped,
+					Reason: RestoreReasonDatabaseExists,
+				})
+			}
 			return nil
 		} else if err != nil {
 			return err
@@ -109,6 +115,12 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 		if r, err = c.loadFromConfig(ctx, fs.Arg(0), *configPath, !*noExpandEnv, *ifDBNotExists, &opt); errors.Is(err, errSkipDBExists) {
 			slog.Info("database already exists, skipping")
+			if *jsonOutput {
+				return printRestoreOutput(RestoreOutput{
+					Status: RestoreStatusSkipped,
+					Reason: RestoreReasonDatabaseExists,
+				})
+			}
 			return nil
 		} else if err != nil {
 			return err
@@ -145,6 +157,12 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
+			if *jsonOutput {
+				return printRestoreOutput(RestoreOutput{
+					Status: RestoreStatusSkipped,
+					Reason: RestoreReasonNoMatchingBackups,
+				})
+			}
 			return nil
 		}
 		return fmt.Errorf("no matching backup files available")
@@ -152,17 +170,16 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return err
 	}
 	if *jsonOutput {
-		output, err := json.MarshalIndent(RestoreResult{
-			DBPath:         opt.OutputPath,
-			Replica:        r.Client.Type(),
-			TXID:           txid,
-			DurationMS:     time.Since(start).Milliseconds(),
-			IntegrityCheck: *integrityCheck,
-		}, "", "  ")
-		if err != nil {
-			return fmt.Errorf("failed to format response: %w", err)
-		}
-		fmt.Println(string(output))
+		return printRestoreOutput(RestoreOutput{
+			Status: RestoreStatusRestored,
+			RestoreResult: &RestoreResult{
+				DBPath:         opt.OutputPath,
+				Replica:        r.Client.Type(),
+				TXID:           txid,
+				DurationMS:     time.Since(start).Milliseconds(),
+				IntegrityCheck: *integrityCheck,
+			},
+		})
 	}
 	return nil
 }
@@ -185,12 +202,43 @@ type RestorePlanFile struct {
 	Timestamp string `json:"timestamp"`
 }
 
+type RestoreStatus string
+
+const (
+	RestoreStatusRestored RestoreStatus = "restored"
+	RestoreStatusSkipped  RestoreStatus = "skipped"
+)
+
+type RestoreReason string
+
+const (
+	RestoreReasonDatabaseExists    RestoreReason = "database_exists"
+	RestoreReasonNoMatchingBackups RestoreReason = "no_matching_backups"
+)
+
+type RestoreOutput struct {
+	Status RestoreStatus `json:"status"`
+	Reason RestoreReason `json:"reason,omitempty"`
+	*RestoreResult
+}
+
 type RestoreResult struct {
 	DBPath         string `json:"db_path"`
 	Replica        string `json:"replica"`
 	TXID           string `json:"txid"`
 	DurationMS     int64  `json:"duration_ms"`
 	IntegrityCheck string `json:"integrity_check"`
+}
+
+func printRestoreOutput(result RestoreOutput) error {
+	output, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to format response: %w", err)
+	}
+	if _, err := fmt.Println(string(output)); err != nil {
+		return fmt.Errorf("write response: %w", err)
+	}
+	return nil
 }
 
 func (c *RestoreCommand) dryRunPlan(ctx context.Context, source string, r *litestream.Replica, opt litestream.RestoreOptions) (RestorePlan, error) {
@@ -403,7 +451,7 @@ Arguments:
 	    Overwrite an existing output database and SQLite sidecar files.
 
 	-json
-	    Output raw JSON summary on successful restore.
+	    Output raw JSON outcome.
 
 	-f
 	    Follow mode. After restoring, continuously poll for and apply
