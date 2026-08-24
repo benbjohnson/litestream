@@ -18,6 +18,12 @@ This file tracks open issues on [benbjohnson/litestream.io](https://github.com/b
 | [#249](https://github.com/benbjohnson/litestream.io/issues/249) | Automatic v0.3.x backup restore | #1074, #1075 | Restore |
 | [#250](https://github.com/benbjohnson/litestream.io/issues/250) | MCP tools for v0.5.x changes | — | MCP |
 
+## MCP HTTP Bearer-Token Authentication
+
+User-facing documentation for #1384 must cover the optional `mcp-auth-token` setting and its environment variable expansion. Omitting the setting leaves the HTTP endpoint unauthenticated, while a configured token that expands to an empty value is invalid. Because bearer tokens sent over plaintext can be intercepted, an authenticated TLS reverse proxy, SSH tunnel, VPN, or private network should remain the primary access control.
+
+The token is a pre-shared secret that the operator configures on both the server and client; it is not OAuth, and Litestream provides no authorization discovery. Clients must explicitly send `Authorization: Bearer <token>`. MCP clients that expect automatic authorization discovery cannot connect without manual configuration, and the resulting 401 is expected rather than a bug. Full OAuth resource-server support—including RFC 9728 protected resource metadata, audience validation, and scope challenges—is possible future work and is not provided by this setting.
+
 ## AI Documentation Status
 
 Internal AI documentation (this repo) is tracked in [#1106](https://github.com/benbjohnson/litestream/issues/1106).
