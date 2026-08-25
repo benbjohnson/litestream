@@ -711,6 +711,38 @@ snapshot:
 		}
 	})
 
+	t.Run("RetentionShorterThanInterval", func(t *testing.T) {
+		yaml := `
+snapshot:
+  interval: 1h
+  retention: 30m
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for retention shorter than snapshot interval")
+		}
+		if !errors.Is(err, main.ErrInvalidSnapshotRetentionInterval) {
+			t.Errorf("expected ErrInvalidSnapshotRetentionInterval, got %v", err)
+		}
+	})
+
+	t.Run("DBRetentionShorterThanInterval", func(t *testing.T) {
+		yaml := `
+ dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 1h
+      retention: 30m
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for database retention shorter than snapshot interval")
+		}
+		if !errors.Is(err, main.ErrInvalidSnapshotRetentionInterval) {
+			t.Errorf("expected ErrInvalidSnapshotRetentionInterval, got %v", err)
+		}
+	})
+
 	t.Run("NegativeInterval", func(t *testing.T) {
 		yaml := `
 snapshot:
