@@ -44,17 +44,12 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	// Load configuration to find the database. Resolve the default config path
-	// (which honors LITESTREAM_CONFIG) when -config was not given, matching the
-	// other subcommands, but tolerate a missing config file since reset can
-	// operate on a database that is not listed in a config.
-	if *configPath == "" {
-		*configPath = DefaultConfigPath()
-	}
+	// A missing config file is tolerated only when the path is the implicit default.
+	resolvedConfigPath, explicitConfig := resolveConfigPath(*configPath)
 
 	var dbConfig *DBConfig
-	config, configErr := ReadConfigFile(*configPath, !*noExpandEnv)
-	if configErr != nil && !errors.Is(configErr, ErrConfigFileNotFound) {
+	config, configErr := ReadConfigFile(resolvedConfigPath, !*noExpandEnv)
+	if configErr != nil && (explicitConfig || !errors.Is(configErr, ErrConfigFileNotFound)) {
 		return fmt.Errorf("cannot read config: %w", configErr)
 	}
 
