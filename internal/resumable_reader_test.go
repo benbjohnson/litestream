@@ -271,7 +271,12 @@ func TestResumableReader(t *testing.T) {
 	})
 }
 
-func TestResumableReader_BoundsConnectionsAcrossPartialReads(t *testing.T) {
+func TestResumableReader_CompletesAcrossPartialReads(t *testing.T) {
+	// A backend that returns one byte per connection (closing early each time)
+	// used to exhaust the retry budget and fail. Now, because forward progress
+	// resets the consecutive-failure counter, the reader reconnects as many
+	// times as needed and delivers the whole file — one reconnect per byte of
+	// progress, naturally bounded by the file size.
 	data := []byte("0123456789abcdef")
 	var connectionN atomic.Int64
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -308,12 +313,56 @@ func TestResumableReader_BoundsConnectionsAcrossPartialReads(t *testing.T) {
 	}
 
 	r := newTestResumableReader(opener, int64(len(data)), data)
-	_, err := io.ReadAll(r)
-	if err == nil {
-		t.Error("ReadAll() error=nil, want retry limit error")
+	r.backoff = 0 // keep the test fast; correctness does not depend on the delay
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll() error=%v, want nil: one reconnect per byte of progress should complete", err)
 	}
-	if got, max := connectionN.Load(), int64(resumableReaderMaxRetries+1); got > max {
-		t.Errorf("connections=%d, want at most %d", got, max)
+	if !bytes.Equal(got, data) {
+		t.Fatalf("ReadAll() = %q, want %q", got, data)
+	}
+	// Each reset costs one reopen; progress guarantees completion, so the
+	// connection count is bounded by the file size, not the retry limit.
+	if got, max := connectionN.Load(), int64(len(data)); got > max {
+		t.Errorf("connections=%d, want at most %d (one per byte)", got, max)
+	}
+}
+
+func TestResumableReader_ResetsRetriesOnForwardProgress(t *testing.T) {
+	// The production restore failure: a stream that resets many more times than
+	// resumableReaderMaxRetries, but delivers a chunk of data between each reset
+	// (S3 dropping a connection at ~1.2MB, then again at ~25MB, with megabytes
+	// of progress in between). Forward progress must reset the consecutive
+	// failure budget so the read completes instead of aborting the restore.
+	data := []byte("the quick brown fox jumps over the lazy dog")
+	const chunk = 4
+	callCount := 0
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			callCount++
+			if int(offset)+chunk >= len(data) {
+				// Final segment: serve the rest cleanly.
+				return io.NopCloser(bytes.NewReader(data[offset:])), nil
+			}
+			// Serve `chunk` bytes from the offset, then drop the connection.
+			return io.NopCloser(&errorAfterN{data: data[offset:], n: chunk, err: fmt.Errorf("read: connection reset by peer")}), nil
+		},
+	}
+
+	r := newTestResumableReader(client, int64(len(data)), data)
+	r.backoff = 0 // keep the test fast
+
+	got, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	// len(data)=43 with chunk=4 forces ~10 resets, far more than maxRetries=3;
+	// the old lifetime-3 budget would have failed after the fourth.
+	if callCount <= resumableReaderMaxRetries+1 {
+		t.Fatalf("test did not exercise more than maxRetries resets; callCount=%d", callCount)
 	}
 }
 

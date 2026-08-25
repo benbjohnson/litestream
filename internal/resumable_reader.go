@@ -45,9 +45,16 @@ type ResumableReader struct {
 	size    int64 // expected total file size from FileInfo; 0 means unknown
 	offset  int64
 	rc      io.ReadCloser
-	retryN  int
-	err     error
-	logger  *slog.Logger
+	// retryN counts consecutive failures since the last forward progress, so a
+	// stream that periodically drops but keeps advancing is not limited by it;
+	// only a stream stuck at one offset trips resumableReaderMaxRetries.
+	retryN int
+	err    error
+	logger *slog.Logger
+
+	// backoff is defaulted from resumableReaderBackoff by NewResumableReader and
+	// overridable in tests to keep reconnect-heavy cases fast.
+	backoff time.Duration
 }
 
 // NewResumableReader creates a ResumableReader. Primarily exposed for testing.
@@ -61,9 +68,14 @@ func NewResumableReader(ctx context.Context, client LTXFileOpener, level int, mi
 		size:    size,
 		rc:      rc,
 		logger:  logger,
+		backoff: resumableReaderBackoff,
 	}
 }
 
+// resumableReaderMaxRetries bounds *consecutive* failed reads at a single
+// offset — a stream making no forward progress. It resets every time a Read
+// returns bytes, so a connection that periodically drops but keeps advancing
+// (the common S3/Tigris case during a large restore) is not limited by it.
 const resumableReaderMaxRetries = 3
 
 // resumableReaderBackoff is the base delay between retry attempts, doubling
@@ -98,6 +110,12 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 
 		n, err := r.rc.Read(p)
 		r.offset += int64(n)
+		if n > 0 {
+			// Forward progress: the connection recovered, so clear the
+			// consecutive-failure budget. Only reads that advance zero bytes
+			// count against resumableReaderMaxRetries.
+			r.retryN = 0
+		}
 
 		if err == nil {
 			return n, nil
@@ -174,7 +192,7 @@ func (r *ResumableReader) retry(err error) error {
 	case <-r.ctx.Done():
 		r.err = r.ctx.Err()
 		return r.err
-	case <-time.After(resumableReaderBackoff << (r.retryN - 1)):
+	case <-time.After(r.backoff << (r.retryN - 1)):
 	}
 	return nil
 }
