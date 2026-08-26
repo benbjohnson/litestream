@@ -374,9 +374,22 @@ func TestVFSFile_WriteModeCompactionPollKeepsNewerPage(t *testing.T) {
 	if err := f.Sync(0); err != nil {
 		t.Fatalf("sync newer page: %v", err)
 	}
+	f.mu.Lock()
+	elem := f.index[1]
+	f.mu.Unlock()
+	if elem.Level != 0 || elem.MaxTXID != 2 {
+		t.Fatalf("synced page index = %+v, want level 0 at TXID 2", elem)
+	}
 	if err := f.pollReplicaClient(context.Background()); err != nil {
 		t.Fatalf("poll compacted L1: %v", err)
 	}
+	f.mu.Lock()
+	elem = f.index[1]
+	f.mu.Unlock()
+	if elem.Level != 0 || elem.MaxTXID != 2 {
+		t.Fatalf("polled page index = %+v, want level 0 at TXID 2", elem)
+	}
+	f.cache.Purge()
 
 	buf := make([]byte, pageSize)
 	if _, err := f.ReadAt(buf, 0); err != nil {

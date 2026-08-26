@@ -1720,6 +1720,8 @@ func TestVFSFile_HydratedLevel1DoesNotRegressNewerL0Pages(t *testing.T) {
 func TestVFSFile_PollLevel1RepointsEqualTXIDPage(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	l0 := buildLTXFixture(t, 2, 'b')
+	client.addFixture(t, l0)
 
 	f := NewVFSFile(client, "equal-txid.db", slog.Default())
 	if err := f.Open(); err != nil {
@@ -1727,13 +1729,15 @@ func TestVFSFile_PollLevel1RepointsEqualTXIDPage(t *testing.T) {
 	}
 	defer f.Close()
 
-	l0 := buildLTXFixture(t, 2, 'b')
-	client.addFixture(t, l0)
-	if err := f.pollReplicaClient(context.Background()); err != nil {
-		t.Fatalf("poll L0: %v", err)
+	f.mu.Lock()
+	elem := f.index[1]
+	anchored := f.maxTXID1Anchored
+	f.mu.Unlock()
+	if elem.Level != 0 || elem.MaxTXID != 2 || anchored {
+		t.Fatalf("initial page index = %+v, anchored=%t; want unanchored level 0 at TXID 2", elem, anchored)
 	}
 
-	l1 := buildLTXFixture(t, 2, 'b')
+	l1 := buildLTXFixtureRange(t, 1, 2, 'b')
 	l1.info.Level = 1
 	client.addFixture(t, l1)
 	if err := f.pollReplicaClient(context.Background()); err != nil {
@@ -1741,10 +1745,11 @@ func TestVFSFile_PollLevel1RepointsEqualTXIDPage(t *testing.T) {
 	}
 
 	f.mu.Lock()
-	elem := f.index[1]
+	elem = f.index[1]
+	anchored = f.maxTXID1Anchored
 	f.mu.Unlock()
-	if elem.Level != 1 || elem.MaxTXID != 2 {
-		t.Fatalf("page index = %+v, want level 1 at TXID 2", elem)
+	if elem.Level != 1 || elem.MaxTXID != 2 || !anchored {
+		t.Fatalf("page index = %+v, anchored=%t; want anchored level 1 at TXID 2", elem, anchored)
 	}
 
 	client.mu.Lock()
