@@ -39,6 +39,8 @@ func (c *writeTestReplicaClient) Type() string { return "test" }
 
 func (c *writeTestReplicaClient) Init(ctx context.Context) error { return nil }
 
+func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *writeTestReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -346,6 +348,43 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 		t.Errorf("expected 2 LTX files, got %d", len(client.ltxFiles[0]))
 	}
 	client.mu.Unlock()
+}
+
+func TestVFSFile_WriteModeCompactionPollKeepsNewerPage(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	page := bytes.Repeat([]byte{'a'}, int(pageSize))
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: page})
+
+	f := setupWriteableVFSFile(t, client)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	compactor := NewCompactor(client, slog.Default())
+	if _, err := compactor.Compact(context.Background(), 1); err != nil {
+		t.Fatalf("compact L0 to L1: %v", err)
+	}
+
+	newer := bytes.Repeat([]byte{'b'}, int(pageSize))
+	if _, err := f.WriteAt(newer, 0); err != nil {
+		t.Fatalf("write newer page: %v", err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatalf("sync newer page: %v", err)
+	}
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll compacted L1: %v", err)
+	}
+
+	buf := make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read page: %v", err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("L1 poll regressed writer page to %q, want 'b'", buf[0])
+	}
 }
 
 func TestVFSFile_ConflictDetection(t *testing.T) {

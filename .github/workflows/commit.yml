@@ -62,6 +62,18 @@ jobs:
       - name: Verify shared library created
         run: file dist/litestream-vfs-linux-amd64.so
 
+  vfs-unit-test:
+    name: VFS Unit Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: "go.mod"
+
+      - run: go test -tags vfs -race -count=1 .
+
   build-windows:
     name: Build Windows
     runs-on: ubuntu-latest
