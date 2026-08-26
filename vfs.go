@@ -2023,12 +2023,17 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	}
 
 	// Create LTX file from dirty pages
-	ltxReader := f.createLTXFromDirty()
+	ltxReader, encodedCh := f.createLTXFromDirty()
 
 	// Upload LTX file to remote
 	info, err := f.client.WriteLTXFile(ctx, 0, f.pendingTXID, f.pendingTXID, ltxReader)
 	if err != nil {
+		_ = ltxReader.CloseWithError(err)
 		return fmt.Errorf("upload LTX: %w", err)
+	}
+	encoded := <-encodedCh
+	if encoded.err != nil {
+		return fmt.Errorf("encode LTX: %w", encoded.err)
 	}
 
 	f.logger.Info("synced to remote",
@@ -2048,7 +2053,9 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 		f.vfs.writeMu.Unlock()
 	}
 
-	// Update cache with synced pages (index will be populated naturally when pages are fetched)
+	mergePageIndexes(f.index, nil, encoded.index, nil)
+
+	// Update cache with synced pages
 	for pgno, bufferOff := range f.dirty {
 		cachedData := make([]byte, f.pageSize)
 		if _, err := f.bufferFile.ReadAt(cachedData, bufferOff); err != nil {
@@ -2111,12 +2118,18 @@ func (f *VFSFile) checkForConflict(ctx context.Context) error {
 	return nil
 }
 
+type encodedLTXResult struct {
+	index map[uint32]ltx.PageIndexElem
+	err   error
+}
+
 // createLTXFromDirty creates an LTX file from dirty pages.
 // Returns a streaming reader for the LTX data using io.Pipe to avoid loading
 // all data into memory at once.
 // Must be called with f.mu held.
-func (f *VFSFile) createLTXFromDirty() io.Reader {
+func (f *VFSFile) createLTXFromDirty() (*io.PipeReader, <-chan encodedLTXResult) {
 	pr, pw := io.Pipe()
+	resultCh := make(chan encodedLTXResult, 1)
 
 	// Sort page numbers (LTX encoder requires ordered pages)
 	pgnos := make([]uint32, 0, len(f.dirty))
@@ -2139,8 +2152,11 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 
 	go func() {
 		var err error
+		index := make(map[uint32]ltx.PageIndexElem, len(pgnos))
 		defer func() {
-			pw.CloseWithError(err)
+			resultCh <- encodedLTXResult{index: index, err: err}
+			close(resultCh)
+			_ = pw.CloseWithError(err)
 		}()
 
 		enc, encErr := ltx.NewEncoder(pw)
@@ -2178,9 +2194,17 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 				return
 			}
 
+			offset := enc.N()
 			if err = enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
 				err = fmt.Errorf("encode page %d: %w", pgno, err)
 				return
+			}
+			index[pgno] = ltx.PageIndexElem{
+				Level:   0,
+				MinTXID: pendingTXID,
+				MaxTXID: pendingTXID,
+				Offset:  offset,
+				Size:    enc.N() - offset,
 			}
 		}
 
@@ -2191,7 +2215,7 @@ func (f *VFSFile) createLTXFromDirty() io.Reader {
 		}
 	}()
 
-	return pr
+	return pr, resultCh
 }
 
 // initWriteBuffer initializes the write buffer file for durability.
@@ -2650,7 +2674,6 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	}
 	if level1.replaceIndex {
 		replaceIndex = true
-		baseCommit = level1.commit
 		newCommit = level1.commit
 		combined = make(map[uint32]ltx.PageIndexElem)
 		mergePageIndexes(combined, nil, level1.index, nil)
@@ -2765,28 +2788,31 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		}
 		defer func() { _ = itr.Close() }()
 
-		advanced := false
+		applied := false
 		for itr.Next() {
 			info := itr.Item()
-			if info.MaxTXID <= result.maxTXID {
+			sameUnanchoredBoundary := level >= 1 && !result.anchored && info.MaxTXID == result.maxTXID
+			if info.MaxTXID <= result.maxTXID && !sameUnanchoredBoundary {
 				continue
 			}
 
-			nextTXID := result.maxTXID + 1
-			if info.MinTXID > nextTXID {
-				gap := *info
-				return &gap, advanced, nil
+			if !sameUnanchoredBoundary {
+				nextTXID := result.maxTXID + 1
+				if info.MinTXID > nextTXID {
+					gap := *info
+					return &gap, applied, nil
+				}
 			}
 
 			f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 			idx, err := FetchPageIndex(ctx, f.client, info)
 			if err != nil {
-				return nil, advanced, fmt.Errorf("fetch page index: %w", err)
+				return nil, applied, fmt.Errorf("fetch page index: %w", err)
 			}
 			hdr, err := FetchLTXHeader(ctx, f.client, info)
 			if err != nil {
-				return nil, advanced, fmt.Errorf("fetch header: %w", err)
+				return nil, applied, fmt.Errorf("fetch header: %w", err)
 			}
 
 			if hdr.Commit < lastCommit {
@@ -2804,12 +2830,12 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			if level >= 1 {
 				result.anchored = true
 			}
-			advanced = true
+			applied = true
 		}
 		if err := itr.Err(); err != nil {
-			return nil, advanced, fmt.Errorf("iterate ltx files: %w", err)
+			return nil, applied, fmt.Errorf("iterate ltx files: %w", err)
 		}
-		return nil, advanced, nil
+		return nil, applied, nil
 	}
 
 	gap, _, err := poll(prevMaxTXID + 1)
