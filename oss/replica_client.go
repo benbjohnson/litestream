@@ -578,8 +578,8 @@ func (itr *fileIterator) Next() bool {
 				MaxTXID: maxTXID,
 			}
 
-			// Skip if below seek TXID
-			if info.MinTXID < itr.seek {
+			// Skip if the file's whole range is below the seek TXID.
+			if info.MaxTXID < itr.seek {
 				continue
 			}
 

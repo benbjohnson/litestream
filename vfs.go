@@ -2639,11 +2639,28 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
 
-		f.mu.Lock()
-		isNextTXID := info.MinTXID == maxTXID+1
-		f.mu.Unlock()
-		if !isNextTXID {
-			if level == 0 && info.MinTXID > maxTXID+1 {
+		// Position this file relative to the highest TXID applied so far:
+		//
+		//   1. Already covered (MaxTXID <= maxTXID): nothing new — skip. Defends
+		//      against a narrower file listed alongside a wider one that overlaps
+		//      it. litestream does not rewrite files within a level today, so this
+		//      is robustness, not a path exercised in normal operation.
+		//   2. Contiguous continuation, including a *straddling* compacted file
+		//      whose range starts at or below maxTXID but extends past it
+		//      (MinTXID <= maxTXID+1 <= MaxTXID): apply it and advance to its
+		//      MaxTXID. Re-applying the already-covered portion is an idempotent
+		//      page-index overwrite.
+		//   3. Real gap (MinTXID > maxTXID+1): at L0 defer to higher levels;
+		//      above L0 it is an error.
+		//
+		// Case 2 keeps a follower from wedging when compaction merges files into
+		// wider ranges: seeking by TXID must not reject a file that actually
+		// covers the next TXID we need (e.g. resuming at 6 and meeting a 1-b file).
+		if info.MaxTXID <= maxTXID {
+			continue
+		}
+		if info.MinTXID > maxTXID+1 {
+			if level == 0 {
 				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
 				break
 			}
