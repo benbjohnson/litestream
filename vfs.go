@@ -2511,7 +2511,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	newCommit := baseCommit
 	replaceIndex := false
 
-	maxTXID0, idx0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
+	maxTXID0, idx0, commit0, replace0, createdAt0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
@@ -2532,7 +2532,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		}
 	}
 
-	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
+	maxTXID1, idx1, commit1, replace1, createdAt1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
 	}
@@ -2604,8 +2604,10 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	if maxTXID0 > maxTXID1 {
 		f.pos.TXID = maxTXID0
+		f.latestLTXTime = latestTime(f.latestLTXTime, createdAt0)
 	} else {
 		f.pos.TXID = maxTXID1
+		f.latestLTXTime = latestTime(f.latestLTXTime, createdAt1)
 	}
 
 	f.maxTXID1 = maxTXID1
@@ -2621,12 +2623,19 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	return nil
 }
 
+func latestTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
 // pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
 // any index updates, the latest commit value, and if the index should be replaced.
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, error) {
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, time.Time, error) {
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return prevMaxTXID, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
+		return prevMaxTXID, nil, baseCommit, false, time.Time{}, fmt.Errorf("ltx files: %w", err)
 	}
 	defer func() { _ = itr.Close() }()
 
@@ -2635,6 +2644,8 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 	lastCommit := baseCommit
 	newCommit := baseCommit
 	replaceIndex := false
+	// CreatedAt of the newest LTX file applied (by TXID); zero if none applied.
+	var latestCreatedAt time.Time
 
 	for itr.Next() {
 		info := itr.Item()
@@ -2647,18 +2658,18 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
 				break
 			}
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
+			return maxTXID, nil, newCommit, replaceIndex, time.Time{}, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
+			return maxTXID, nil, newCommit, replaceIndex, time.Time{}, fmt.Errorf("fetch page index: %w", err)
 		}
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
+			return maxTXID, nil, newCommit, replaceIndex, time.Time{}, fmt.Errorf("fetch header: %w", err)
 		}
 
 		if hdr.Commit < lastCommit {
@@ -2673,9 +2684,10 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			index[k] = v
 		}
 		maxTXID = info.MaxTXID
+		latestCreatedAt = info.CreatedAt
 	}
 
-	return maxTXID, index, newCommit, replaceIndex, nil
+	return maxTXID, index, newCommit, replaceIndex, latestCreatedAt, nil
 }
 
 func (f *VFSFile) pageSizeBytes() (uint32, error) {
