@@ -14,7 +14,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime/debug"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -235,53 +234,30 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			m.Usage()
 			return flag.ErrHelp
 		} else if strings.HasPrefix(cmd, "-") {
-			return misplacedFlagsError(append([]string{cmd}, args...))
+			return misplacedFlagError(cmd)
 		}
 		return fmt.Errorf("litestream %s: unknown command", cmd)
 	}
 }
 
-// commandNames lists the subcommands dispatched by Main.Run.
-var commandNames = []string{
-	"databases", "info", "list", "ltx", "register", "replicate", "reset",
-	"restore", "start", "status", "stop", "sync", "unregister", "version",
-}
-
-// misplacedFlagsError returns the error for flags passed before the
-// subcommand, e.g. "litestream -config c.yml databases". Flags are only
-// parsed by subcommands, so the hint reorders the user's own arguments into
-// a form that can be pasted back. When -config is the misplaced flag it also
-// offers LITESTREAM_CONFIG, which is what works for shell aliases.
-func misplacedFlagsError(args []string) error {
-	var cmd, configPath string
-	var rest, envRest []string // envRest omits the -config flag.
-	for i := 0; i < len(args); i++ {
-		arg := args[i]
-		if cmd == "" && slices.Contains(commandNames, arg) {
-			cmd = arg
-			continue
-		}
-		rest = append(rest, arg)
-		if name := strings.TrimLeft(arg, "-"); name == "config" && i+1 < len(args) {
-			i++
-			configPath = args[i]
-			rest = append(rest, configPath)
-		} else if strings.HasPrefix(name, "config=") {
-			configPath = strings.TrimPrefix(name, "config=")
-		} else {
-			envRest = append(envRest, arg)
+// misplacedFlagError returns a usage error for a flag that appears before the
+// subcommand, e.g. "litestream -config c.yml databases". Only the subcommands
+// parse flags, so the hint shows where the flag belongs rather than guessing
+// the intended command. Shell aliases that lead with -config are pointed at
+// LITESTREAM_CONFIG, which works in any position.
+func misplacedFlagError(arg string) error {
+	name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+	if name == "config" {
+		return &usageError{
+			message: "flags must come after the subcommand",
+			hint: "litestream <command> -config PATH\n" +
+				" or: LITESTREAM_CONFIG=PATH litestream <command>",
 		}
 	}
-	if cmd == "" {
-		cmd = "<command>"
+	return &usageError{
+		message: "flags must come after the subcommand",
+		hint:    "litestream <command> [flags]",
 	}
-
-	hint := strings.Join(append([]string{"litestream", cmd}, rest...), " ")
-	if configPath != "" {
-		// main() prints the hint after "Try: ", so align the alternative under it.
-		hint += "\n or: " + strings.Join(append([]string{"LITESTREAM_CONFIG=" + configPath, "litestream", cmd}, envRest...), " ")
-	}
-	return &usageError{message: "flags must come after the subcommand", hint: hint}
 }
 
 // Usage prints the help screen to STDOUT.
