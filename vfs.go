@@ -1256,7 +1256,7 @@ func mergePageIndexes(dst, baseline, src, applied map[uint32]ltx.PageIndexElem) 
 		if !ok && baseline != nil {
 			current, ok = baseline[pgno]
 		}
-		if ok && current.MaxTXID >= elem.MaxTXID {
+		if ok && (current.MaxTXID > elem.MaxTXID || (current.MaxTXID == elem.MaxTXID && current.Level >= elem.Level)) {
 			continue
 		}
 		dst[pgno] = elem
