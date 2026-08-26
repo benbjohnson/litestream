@@ -7,14 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"maps"
 	"math"
 	"net/url"
 	"os"
 	"os/user"
 	"path"
 	"path/filepath"
-	"reflect"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -700,116 +698,24 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 
-	// The YAML decoder silently drops keys that do not map to a Config field,
-	// so a misspelled or nonexistent setting looks like it took effect. Warn
-	// about each one; this is intentionally not an error so that existing
-	// deployments with a stray key keep starting.
-	for _, key := range unrecognizedConfigKeys(buf) {
-		slog.Warn("unrecognized config key, ignoring", "key", key)
+	// The lenient decode above silently drops keys that do not map to a Config
+	// field, so a misspelled or nonexistent setting looks like it took effect.
+	// Decode again in strict mode into a scratch value purely for diagnostics:
+	// yaml.UnmarshalStrict reports both unrecognized and duplicate mapping keys.
+	// These are warnings rather than errors so that existing deployments with a
+	// stray key keep starting.
+	var strictConfig Config
+	if err := yaml.UnmarshalStrict(buf, &strictConfig); err != nil {
+		var typeErr *yaml.TypeError
+		if !errors.As(err, &typeErr) {
+			return config, fmt.Errorf("strictly decode config: %w", err)
+		}
+		for _, detail := range typeErr.Errors {
+			slog.Warn("configuration contains unrecognized or duplicate key", "detail", detail)
+		}
 	}
 
 	return config, nil
-}
-
-// yamlUnmarshalerType is the interface implemented by types with custom YAML decoding.
-var yamlUnmarshalerType = reflect.TypeOf((*yaml.Unmarshaler)(nil)).Elem()
-
-// unrecognizedConfigKeys returns the paths of the YAML keys in buf that do not
-// correspond to any field of Config, in document order. Paths are written as
-// they appear in the config, e.g. "dbs[0].replica.retention".
-//
-// yaml.v2's strict mode reports the same keys, but only as "field X not found
-// in type Y" with no path, so the decoded document is walked against the
-// Config field tags instead.
-func unrecognizedConfigKeys(buf []byte) []string {
-	var doc yaml.MapSlice
-	if err := yaml.Unmarshal(buf, &doc); err != nil {
-		return nil
-	}
-	return unrecognizedKeys(doc, reflect.TypeOf(Config{}), "")
-}
-
-// unrecognizedKeys compares the mapping m against the YAML fields of struct type t.
-func unrecognizedKeys(m yaml.MapSlice, t reflect.Type, prefix string) []string {
-	fields := yamlFields(t)
-	if fields == nil {
-		return nil // struct accepts arbitrary keys
-	}
-
-	var keys []string
-	for _, item := range m {
-		name := fmt.Sprint(item.Key)
-		if name == "<<" {
-			continue // merge key; the decoder expands it
-		}
-		typ, ok := fields[name]
-		if !ok {
-			keys = append(keys, prefix+name)
-			continue
-		}
-		keys = append(keys, unrecognizedValueKeys(item.Value, typ, prefix+name)...)
-	}
-	return keys
-}
-
-// unrecognizedValueKeys descends into nested mappings, and sequences of
-// mappings, whose Go type is a struct with known fields.
-func unrecognizedValueKeys(v interface{}, t reflect.Type, path string) []string {
-	for t.Kind() == reflect.Ptr {
-		t = t.Elem()
-	}
-	if reflect.PointerTo(t).Implements(yamlUnmarshalerType) {
-		return nil // custom decoding; keys are not known here
-	}
-
-	switch t.Kind() {
-	case reflect.Struct:
-		if m, ok := v.(yaml.MapSlice); ok {
-			return unrecognizedKeys(m, t, path+".")
-		}
-	case reflect.Slice, reflect.Array:
-		if items, ok := v.([]interface{}); ok {
-			var keys []string
-			for i, item := range items {
-				keys = append(keys, unrecognizedValueKeys(item, t.Elem(), fmt.Sprintf("%s[%d]", path, i))...)
-			}
-			return keys
-		}
-	}
-	return nil
-}
-
-// yamlFields maps the YAML key of each field of struct type t to the field's
-// type, following the gopkg.in/yaml.v2 tag rules including ",inline" structs.
-// It returns nil if t has an inline map and therefore accepts any key.
-func yamlFields(t reflect.Type) map[string]reflect.Type {
-	fields := make(map[string]reflect.Type)
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if f.PkgPath != "" && !f.Anonymous {
-			continue // unexported
-		}
-		name, opts, _ := strings.Cut(f.Tag.Get("yaml"), ",")
-		if name == "-" {
-			continue
-		}
-		if strings.Contains(","+opts+",", ",inline,") {
-			if f.Type.Kind() != reflect.Struct {
-				return nil
-			}
-			inner := yamlFields(f.Type)
-			if inner == nil {
-				return nil
-			}
-			maps.Copy(fields, inner)
-			continue
-		}
-		if name == "" {
-			name = strings.ToLower(f.Name)
-		}
-		fields[name] = f.Type
-	}
-	return fields
 }
 
 // CompactionLevelConfig the configuration for a single level of compaction.

@@ -12,11 +12,10 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
-
-	"gopkg.in/yaml.v2"
 
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
@@ -209,9 +208,11 @@ dbs:
 	})
 }
 
-// Ensure keys that do not map to any config field are reported as warnings
-// naming the key's path, while the config still parses successfully.
-func TestParseConfig_UnrecognizedKeys(t *testing.T) {
+// Ensure keys the decoder cannot map to a config field, and duplicate mapping
+// keys, are reported as warnings while the configuration still parses.
+func TestParseConfig_StrictWarnings(t *testing.T) {
+	const warnMsg = `msg="configuration contains unrecognized or duplicate key"`
+
 	for _, tt := range []struct {
 		name   string
 		config string
@@ -226,10 +227,10 @@ dbs:
     replica:
       path: /tmp/xrep
 `,
-			want: []string{"definitely-not-a-setting"},
+			want: []string{"line 2: field definitely-not-a-setting not found in type main.Config"},
 		},
 		{
-			name: "ReplicaRetention",
+			name: "UnrecognizedKey",
 			config: `
 dbs:
   - path: /tmp/x.db
@@ -237,7 +238,7 @@ dbs:
       path: /tmp/xrep
       retention: 72h
 `,
-			want: []string{"dbs[0].replica.retention"},
+			want: []string{"line 6: field retention not found in type main.ReplicaConfig"},
 		},
 		{
 			name: "LevelsRetention",
@@ -251,7 +252,7 @@ dbs:
     replica:
       path: /tmp/xrep
 `,
-			want: []string{"levels[0].retention"},
+			want: []string{"line 4: field retention not found in type main.CompactionLevelConfig"},
 		},
 		{
 			name: "MultipleNested",
@@ -262,8 +263,6 @@ dbs:
       intervall: 1h
     replica:
       path: /tmp/xrep
-      age:
-        bogus: 1
   - path: /tmp/y.db
     replicas:
       - path: /tmp/yrep
@@ -272,13 +271,27 @@ logging:
   lvl: debug
 `,
 			want: []string{
-				"dbs[0].snapshot.intervall",
-				"dbs[0].replica.age.bogus",
-				"dbs[1].replicas[0].typo-here",
-				"logging.lvl",
+				"line 5: field intervall not found in type main.SnapshotConfig",
+				"line 11: field typo-here not found in type main.ReplicaConfig",
+				"line 13: field lvl not found in type internal.LoggingConfig",
 			},
 		},
 		{
+			name: "DuplicateKey",
+			config: `
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+      path: /tmp/other
+`,
+			want: []string{"line 6: field path already set in type main.ReplicaConfig"},
+		},
+		{
+			// Strict decoding's failure mode is warning about keys that are
+			// in fact valid, so this exercises the shapes the decoder has to
+			// resolve itself: an inline struct, a custom unmarshaler
+			// (part-size), and a nested anonymous struct (age).
 			name: "Valid",
 			config: `
 access-key-id: XXX
@@ -306,48 +319,34 @@ dbs:
 		t.Run(tt.name, func(t *testing.T) {
 			var config main.Config
 			output := captureStdout(t, func() {
+				// Unrecognized and duplicate keys warn; they are never errors.
 				var err error
 				if config, err = main.ParseConfig(strings.NewReader(tt.config), false); err != nil {
 					t.Fatalf("ParseConfig: %v", err)
 				}
 			})
 
-			// The config must still load; unknown keys are not an error.
+			// Parsing continues, so the rest of the config is still applied.
 			if got, want := config.DBs[0].Path, "/tmp/x.db"; got != want {
 				t.Fatalf("DBs[0].Path=%v, want %v", got, want)
 			}
 
 			var got []string
 			for _, line := range strings.Split(output, "\n") {
-				if !strings.Contains(line, `msg="unrecognized config key, ignoring"`) {
+				if !strings.Contains(line, warnMsg) {
 					continue
 				}
-				_, key, ok := strings.Cut(line, " key=")
+				_, detail, ok := strings.Cut(line, " detail=")
 				if !ok {
-					t.Fatalf("warning has no key attribute: %s", line)
+					t.Fatalf("warning has no detail attribute: %s", line)
 				}
-				got = append(got, key)
+				if unquoted, err := strconv.Unquote(detail); err == nil {
+					detail = unquoted
+				}
+				got = append(got, detail)
 			}
 			if !slices.Equal(got, tt.want) {
-				t.Fatalf("warned keys=%q, want %q\noutput:\n%s", got, tt.want, output)
-			}
-
-			// The set of unknown keys must agree with the YAML decoder's own
-			// strict mode, which reports the same keys without their paths.
-			var strictErr *yaml.TypeError
-			if err := yaml.UnmarshalStrict([]byte(tt.config), &main.Config{}); err != nil && !errors.As(err, &strictErr) {
-				t.Fatalf("UnmarshalStrict: %v", err)
-			}
-			var strictN int
-			if strictErr != nil {
-				for _, msg := range strictErr.Errors {
-					if strings.Contains(msg, "not found in type") {
-						strictN++
-					}
-				}
-			}
-			if strictN != len(tt.want) {
-				t.Fatalf("strict decode reports %d unknown keys, want %d: %v", strictN, len(tt.want), strictErr)
+				t.Fatalf("warned details=%q, want %q\noutput:\n%s", got, tt.want, output)
 			}
 		})
 	}
