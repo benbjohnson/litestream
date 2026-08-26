@@ -1393,7 +1393,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
+		return nil, fmt.Errorf("unknown replica type in config: %q", c.ReplicaType())
 	}
 
 	r.Client.SetLogger(r.Logger())
