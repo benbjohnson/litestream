@@ -2,14 +2,17 @@ package litestream_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -577,4 +580,124 @@ func TestStore_SetRetentionEnabled(t *testing.T) {
 			t.Fatalf("expected db.RetentionEnabled=true for %s after reset", db.Path())
 		}
 	}
+}
+
+func TestStore_CompactDB_SerializesPerDBMaintenance(t *testing.T) {
+	// Teardown is registered with t.Cleanup (LIFO) so that on failure the
+	// held snapshot is released and joined before the store and databases
+	// close underneath it.
+	db0, sqldb0 := testingutil.MustOpenDBs(t)
+	t.Cleanup(func() { testingutil.MustCloseDBs(t, db0, sqldb0) })
+
+	db1, sqldb1 := testingutil.MustOpenDBs(t)
+	t.Cleanup(func() { testingutil.MustCloseDBs(t, db1, sqldb1) })
+
+	levels := litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: 1 * time.Second},
+	}
+	s := litestream.NewStore([]*litestream.DB{db0, db1}, levels)
+	s.CompactionMonitorEnabled = false
+	if err := s.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.Close(context.Background()) })
+
+	for _, tt := range []struct {
+		sqldb *sql.DB
+		db    *litestream.DB
+	}{{sqldb0, db0}, {sqldb1, db1}} {
+		if _, err := tt.sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tt.sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
+			t.Fatal(err)
+		} else if err := tt.db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := tt.db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Wrap db0's replica client so its snapshot write blocks until released,
+	// holding db0's maintenance slot the way a long-running snapshot upload does.
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseSnapshot := func() { releaseOnce.Do(func() { close(release) }) }
+	db0.Replica.Client = &blockingSnapshotClient{
+		ReplicaClient: db0.Replica.Client,
+		started:       started,
+		release:       release,
+	}
+
+	snapshotDone := make(chan error, 1)
+	go func() {
+		_, err := s.CompactDB(context.Background(), db0, s.SnapshotLevel())
+		snapshotDone <- err
+	}()
+	t.Cleanup(func() {
+		releaseSnapshot()
+		select {
+		case <-snapshotDone:
+		case <-time.After(10 * time.Second):
+			t.Error("snapshot goroutine did not exit after release")
+		}
+	})
+
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for snapshot to start")
+	}
+
+	// A concurrent compaction for the same database must be refused while the
+	// snapshot is in flight — refused, not queued, so run it with a deadline.
+	compactDone := make(chan error, 1)
+	go func() {
+		_, err := s.CompactDB(t.Context(), db0, levels[1])
+		compactDone <- err
+	}()
+	select {
+	case err := <-compactDone:
+		require.ErrorIs(t, err, litestream.ErrMaintenanceBusy)
+	case <-time.After(5 * time.Second):
+		t.Fatal("same-database compaction blocked behind the snapshot instead of returning ErrMaintenanceBusy")
+	}
+
+	// A different database must not be blocked by db0's snapshot.
+	_, err := s.CompactDB(t.Context(), db1, levels[1])
+	require.NoError(t, err)
+
+	releaseSnapshot()
+	select {
+	case err := <-snapshotDone:
+		snapshotDone <- err // requeue first so cleanup's join sees completion even on failure
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for snapshot to finish")
+	}
+
+	// Once the snapshot finishes, db0 maintenance is available again.
+	_, err = s.CompactDB(t.Context(), db0, levels[1])
+	require.NotErrorIs(t, err, litestream.ErrMaintenanceBusy)
+}
+
+type blockingSnapshotClient struct {
+	litestream.ReplicaClient
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (c *blockingSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level == litestream.SnapshotLevel {
+		c.once.Do(func() { close(c.started) })
+		select {
+		case <-c.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 }

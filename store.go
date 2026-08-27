@@ -23,6 +23,13 @@ var (
 	// re-compaction when restarting the process.
 	ErrCompactionTooEarly = errors.New("compaction too early")
 
+	// ErrMaintenanceBusy is returned when a snapshot or compaction is refused
+	// because another maintenance operation for the same database is still in
+	// flight. Maintenance is serialized per database so that concurrent
+	// operations cannot each hold a database-sized page index in memory at the
+	// same time (issue #1477); callers retry on the next monitor interval.
+	ErrMaintenanceBusy = errors.New("maintenance busy")
+
 	// ErrTxNotAvailable is returned when a transaction does not exist.
 	ErrTxNotAvailable = errors.New("transaction not available")
 
@@ -57,8 +64,17 @@ func (e *DBNotReadyError) Is(target error) bool {
 
 // Store defaults
 const (
-	DefaultSnapshotInterval  = 24 * time.Hour
-	DefaultSnapshotRetention = 24 * time.Hour
+	DefaultSnapshotInterval = 24 * time.Hour
+
+	// DefaultMaintenanceBusyRetryInterval caps how long a level monitor waits
+	// before retrying a database whose snapshot or compaction was refused with
+	// ErrMaintenanceBusy. Retries start at maintenanceBusyRetryBase and double
+	// on each consecutive busy pass up to this cap, so a momentary collision
+	// between levels resolves within a second while a long-running snapshot
+	// is not polled more than every few seconds.
+	DefaultMaintenanceBusyRetryInterval = 10 * time.Second
+	maintenanceBusyRetryBase            = time.Second
+	DefaultSnapshotRetention            = 24 * time.Hour
 
 	DefaultRetention              = 24 * time.Hour
 	DefaultRetentionCheckInterval = 1 * time.Hour
@@ -96,6 +112,10 @@ type Store struct {
 
 	// The frequency of snapshots.
 	SnapshotInterval time.Duration
+
+	// MaintenanceBusyRetryInterval bounds the delay before a level monitor
+	// retries databases that reported ErrMaintenanceBusy.
+	MaintenanceBusyRetryInterval time.Duration
 	// The duration of time that snapshots are kept before being deleted.
 	SnapshotRetention time.Duration
 
@@ -140,16 +160,17 @@ func NewStore(dbs []*DB, levels CompactionLevels) *Store {
 		dbs:    dbs,
 		levels: levels,
 
-		SnapshotInterval:         DefaultSnapshotInterval,
-		SnapshotRetention:        DefaultSnapshotRetention,
-		L0Retention:              DefaultL0Retention,
-		L0RetentionCheckInterval: DefaultL0RetentionCheckInterval,
-		CompactionMonitorEnabled: true,
-		RetentionEnabled:         true,
-		ShutdownSyncTimeout:      DefaultShutdownSyncTimeout,
-		ShutdownSyncInterval:     DefaultShutdownSyncInterval,
-		HeartbeatCheckInterval:   DefaultHeartbeatCheckInterval,
-		Logger:                   slog.Default().With(LogKeySystem, LogSystemStore),
+		SnapshotInterval:             DefaultSnapshotInterval,
+		MaintenanceBusyRetryInterval: DefaultMaintenanceBusyRetryInterval,
+		SnapshotRetention:            DefaultSnapshotRetention,
+		L0Retention:                  DefaultL0Retention,
+		L0RetentionCheckInterval:     DefaultL0RetentionCheckInterval,
+		CompactionMonitorEnabled:     true,
+		RetentionEnabled:             true,
+		ShutdownSyncTimeout:          DefaultShutdownSyncTimeout,
+		ShutdownSyncInterval:         DefaultShutdownSyncInterval,
+		HeartbeatCheckInterval:       DefaultHeartbeatCheckInterval,
+		Logger:                       slog.Default().With(LogKeySystem, LogSystemStore),
 	}
 
 	for _, db := range dbs {
@@ -566,6 +587,15 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 	timer := time.NewTimer(time.Nanosecond)
 	defer timer.Stop()
 
+	// Databases to revisit before the next regular pass: those refused with
+	// ErrMaintenanceBusy and those not yet ready. While any exist the monitor
+	// wakes early and only revisits them, leaving snapshot retention and the
+	// other databases to the regular schedule anchored at nextRegular.
+	var nextRegular time.Time
+	pending := make(map[*DB]struct{})
+	known := make(map[*DB]struct{}) // databases seen on the last regular pass
+	busyStreak := 0                 // consecutive passes that saw a busy database
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -575,32 +605,57 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		}
 
 		now := time.Now()
-		nextDelay := time.Until(lvl.NextCompactionAt(now))
+		earlyPass := len(pending) > 0 && now.Before(nextRegular)
+		if !earlyPass {
+			nextRegular = lvl.NextCompactionAt(now)
+			known = make(map[*DB]struct{}) // rebuilt from this regular pass
+		}
 
 		var notReadyDBs []string
+		busySet := make(map[*DB]struct{})
+		notReadySet := make(map[*DB]struct{})
 
 		for _, db := range s.DBs() {
 			if !db.IsOpen() {
 				continue // skip disabled DBs
 			}
+			if earlyPass {
+				// Early pass: only revisit busy or not-ready databases, plus
+				// any registered since the last regular pass so a new database
+				// still gets its initialization retries.
+				_, revisit := pending[db]
+				_, seen := known[db]
+				if !revisit && seen {
+					continue
+				}
+			}
+			known[db] = struct{}{}
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
 				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
+			case errors.Is(err, ErrMaintenanceBusy):
+				db.Logger.Debug("maintenance busy, will retry", "level", lvl.Level, "path", db.Path(), "retry", s.MaintenanceBusyRetryInterval)
+				busySet[db] = struct{}{}
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
+				notReadySet[db] = struct{}{}
 			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
 			}
 
-			if lvl.Level == SnapshotLevel {
+			if lvl.Level == SnapshotLevel && !earlyPass {
 				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
 					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 					db.Logger.Error("retention enforcement failed", "error", err)
 				}
 			}
 		}
+
+		// Computed after the work so a long pass cannot push the regular
+		// schedule out by its own runtime.
+		nextDelay := time.Until(nextRegular)
 
 		timedOut := !retryDeadline.IsZero() && now.After(retryDeadline)
 		if len(notReadyDBs) > 0 && !timedOut {
@@ -618,13 +673,50 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 					"hint", "database may have corrupted local state or blocked transactions; try removing -litestream directory and restarting")
 			}
 			retryDeadline = time.Time{}
+			notReadySet = nil // give up early retries; regular passes still cover them
 		}
 
-		if nextDelay < 0 {
-			nextDelay = 0
+		pending = make(map[*DB]struct{}, len(busySet)+len(notReadySet))
+		for db := range busySet {
+			pending[db] = struct{}{}
 		}
-		timer.Reset(nextDelay)
+		for db := range notReadySet {
+			pending[db] = struct{}{}
+		}
+
+		if len(busySet) > 0 {
+			busyStreak++
+		} else {
+			busyStreak = 0
+		}
+		timer.Reset(busyRetryDelay(nextDelay, busyStreak, s.MaintenanceBusyRetryInterval))
 	}
+}
+
+// busyRetryDelay returns the delay before the next monitor pass. While a
+// database keeps reporting ErrMaintenanceBusy (busyStreak > 0) the delay is
+// capped at an exponential backoff from maintenanceBusyRetryBase up to
+// maxRetry, so the refused operation is reattempted soon after the in-flight
+// one finishes rather than after the level's full interval (a snapshot losing
+// startup contention to L1 would otherwise wait until the next snapshot
+// boundary), and a momentary collision between levels costs about a second.
+func busyRetryDelay(nextDelay time.Duration, busyStreak int, maxRetry time.Duration) time.Duration {
+	if busyStreak > 0 && maxRetry > 0 {
+		retry := maintenanceBusyRetryBase
+		for i := 1; i < busyStreak && retry < maxRetry; i++ {
+			retry *= 2
+		}
+		if retry > maxRetry {
+			retry = maxRetry
+		}
+		if nextDelay > retry {
+			nextDelay = retry
+		}
+	}
+	if nextDelay < 0 {
+		nextDelay = 0
+	}
+	return nextDelay
 }
 
 func (s *Store) monitorL0Retention(ctx context.Context) {
@@ -771,6 +863,17 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	if db.PageSize() == 0 {
 		return nil, &DBNotReadyError{Reason: "page size not initialized"}
 	}
+
+	// Serialize maintenance per database: a snapshot and a compaction (or two
+	// compaction levels) each retain a database-sized page index, so letting
+	// them overlap multiplies peak memory with database size (issue #1477).
+	// Refuse instead of waiting so one database's long snapshot cannot stall
+	// the level monitor for every other database; the caller's next interval
+	// retries.
+	if !db.maintenanceMu.TryLock() {
+		return nil, ErrMaintenanceBusy
+	}
+	defer db.maintenanceMu.Unlock()
 
 	dstLevel := lvl.Level
 
