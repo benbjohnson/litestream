@@ -798,6 +798,8 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("new ltx compactor: %w", err)
 	}
+	defer func() { _ = c.Cleanup() }()
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
 	h.compactor = c
 
 	go func() {
