@@ -4,10 +4,13 @@
 package litestream
 
 import (
+	"bufio"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash"
 	"hash/fnv"
 	"io"
 	"log/slog"
@@ -34,6 +37,8 @@ const (
 
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
+
+	hydrationWriteBatchSize = 4 * 1024 * 1024
 )
 
 // ErrConflict is returned when the remote replica has newer transactions than expected.
@@ -566,17 +571,68 @@ type VFSFile struct {
 
 // Hydrator handles background hydration of the database to a local file.
 type Hydrator struct {
-	path       string         // Full path to hydration file
-	persistent bool           // True when file should survive across restarts
-	file       *os.File       // Local database file
-	complete   atomic.Bool    // True when restore completes
-	txid       ltx.TXID       // TXID the hydrated file is at
+	path       string      // Full path to hydration file
+	persistent bool        // True when file should survive across restarts
+	file       *os.File    // Local database file
+	complete   atomic.Bool // True when restore completes
+	txid       ltx.TXID    // TXID the hydrated file is at
+	applyMu    sync.RWMutex
 	mu         sync.Mutex     // Protects hydration file writes
 	err        error          // Stores fatal hydration error
 	compactor  *ltx.Compactor // Tracks compaction progress during restore
 	pageSize   uint32         // Page size of the database
 	client     ReplicaClient
 	logger     *slog.Logger
+}
+
+type hydrationLTXKey struct {
+	level   int
+	minTXID ltx.TXID
+	maxTXID ltx.TXID
+}
+
+type hydrationUpdateGroup struct {
+	info          *ltx.FileInfo
+	pageN         int
+	requestedSize int64
+}
+
+func (g *hydrationUpdateGroup) shouldFetchWholeFile() bool {
+	return g.info != nil && g.info.Size > 0 && g.requestedSize >= (g.info.Size+1)/2
+}
+
+type hydrationPage struct {
+	pgno uint32
+	data []byte
+}
+
+type hydrationCountingReader struct {
+	r io.Reader
+	n int64
+}
+
+func (r *hydrationCountingReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
+}
+
+type hydrationHashingByteReader struct {
+	r io.ByteReader
+	h hash.Hash64
+	n int64
+	b [1]byte
+}
+
+func (r *hydrationHashingByteReader) ReadByte() (byte, error) {
+	b, err := r.r.ReadByte()
+	if err != nil {
+		return 0, err
+	}
+	r.b[0] = b
+	_, _ = r.h.Write(r.b[:])
+	r.n++
+	return b, nil
 }
 
 // NewHydrator creates a new Hydrator instance.
@@ -631,7 +687,7 @@ func (h *Hydrator) SetComplete() {
 	h.complete.Store(true)
 }
 
-// Disable temporarily disables hydrated reads (used during time travel).
+// Disable disables hydrated reads during time travel or permanently after an apply failure.
 func (h *Hydrator) Disable() {
 	h.complete.Store(false)
 }
@@ -810,26 +866,240 @@ func (h *Hydrator) ReadAt(p []byte, off int64) (int, error) {
 
 // ApplyUpdates fetches updated pages and writes them to the hydration file.
 func (h *Hydrator) ApplyUpdates(ctx context.Context, updates map[uint32]ltx.PageIndexElem) error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	return h.applyUpdateSet(ctx, updates, nil)
+}
+
+func (h *Hydrator) applyUpdateSet(ctx context.Context, updates map[uint32]ltx.PageIndexElem, infos []*ltx.FileInfo) error {
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
+	return h.applyUpdates(ctx, updates, infos)
+}
+
+func (h *Hydrator) applyUpdates(ctx context.Context, updates map[uint32]ltx.PageIndexElem, infos []*ltx.FileInfo) error {
+	infoByKey := make(map[hydrationLTXKey]*ltx.FileInfo, len(infos))
+	for _, info := range infos {
+		infoByKey[hydrationLTXKey{level: info.Level, minTXID: info.MinTXID, maxTXID: info.MaxTXID}] = info
+	}
+
+	groups := make(map[hydrationLTXKey]*hydrationUpdateGroup)
+	for _, elem := range updates {
+		key := hydrationLTXKey{level: elem.Level, minTXID: elem.MinTXID, maxTXID: elem.MaxTXID}
+		group := groups[key]
+		if group == nil {
+			group = &hydrationUpdateGroup{
+				info: infoByKey[key],
+			}
+			groups[key] = group
+		}
+		group.pageN++
+		group.requestedSize += elem.Size
+	}
+
+	for key, group := range groups {
+		if group.shouldFetchWholeFile() {
+			if err := h.applyWholeLTX(ctx, key, group, updates); err != nil {
+				return err
+			}
+		}
+	}
 
 	for pgno, elem := range updates {
+		key := hydrationLTXKey{level: elem.Level, minTXID: elem.MinTXID, maxTXID: elem.MaxTXID}
+		if groups[key].shouldFetchWholeFile() {
+			continue
+		}
 		_, data, err := FetchPage(ctx, h.client, elem.Level, elem.MinTXID, elem.MaxTXID, elem.Offset, elem.Size)
 		if err != nil {
 			return fmt.Errorf("fetch updated page %d: %w", pgno, err)
 		}
-
-		off := int64(pgno-1) * int64(h.pageSize)
-		if _, err := h.file.WriteAt(data, off); err != nil {
-			return fmt.Errorf("write updated page %d: %w", pgno, err)
+		if err := h.writePages([]hydrationPage{{pgno: pgno, data: data}}); err != nil {
+			return err
 		}
 	}
 
 	return nil
 }
 
+func (h *Hydrator) applyWholeLTX(ctx context.Context, key hydrationLTXKey, group *hydrationUpdateGroup, updates map[uint32]ltx.PageIndexElem) error {
+	info := group.info
+	rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open ltx file: %w", err)
+	}
+	defer rc.Close()
+
+	r := &hydrationCountingReader{r: rc}
+	dec := ltx.NewDecoder(r)
+	if err := dec.DecodeHeader(); err != nil {
+		return fmt.Errorf("decode header: %w", err)
+	}
+	hdr := dec.Header()
+	if hdr.MinTXID != info.MinTXID || hdr.MaxTXID != info.MaxTXID {
+		return fmt.Errorf("ltx transaction range %s-%s does not match requested %s-%s", hdr.MinTXID, hdr.MaxTXID, info.MinTXID, info.MaxTXID)
+	}
+	if hdr.PageSize != h.pageSize {
+		return fmt.Errorf("ltx page size %d does not match hydration page size %d", hdr.PageSize, h.pageSize)
+	}
+
+	fileHash := ltx.NewHasher()
+	headerData, err := hdr.MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("marshal ltx header: %w", err)
+	}
+	_, _ = fileHash.Write(headerData)
+
+	var postApplyChecksum ltx.Checksum
+	pageHash := ltx.NewHasher()
+	if hdr.IsSnapshot() && !hdr.NoChecksum() {
+		postApplyChecksum = ltx.ChecksumFlag
+	}
+
+	batchPageN := hydrationWriteBatchSize / int(h.pageSize)
+	if batchPageN == 0 {
+		batchPageN = 1
+	}
+	batch := make([]hydrationPage, 0, batchPageN)
+	data := make([]byte, h.pageSize)
+	matchedPageN := 0
+	var prevPgno uint32
+
+	for {
+		var pageHdr ltx.PageHeader
+		if err := dec.DecodePage(&pageHdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode page: %w", err)
+		}
+
+		if pageHdr.Pgno <= prevPgno {
+			return fmt.Errorf("out-of-order ltx page numbers: %d,%d", prevPgno, pageHdr.Pgno)
+		}
+		prevPgno = pageHdr.Pgno
+
+		pageHeaderData, err := pageHdr.MarshalBinary()
+		if err != nil {
+			return fmt.Errorf("marshal ltx page header: %w", err)
+		}
+		_, _ = fileHash.Write(pageHeaderData)
+		_, _ = fileHash.Write(data)
+		if hdr.IsSnapshot() && !hdr.NoChecksum() && pageHdr.Pgno != hdr.LockPgno() {
+			postApplyChecksum = ltx.ChecksumFlag | (postApplyChecksum ^ ltx.ChecksumPageWithHasher(pageHash, pageHdr.Pgno, data))
+		}
+
+		elem, ok := updates[pageHdr.Pgno]
+		if !ok || (hydrationLTXKey{level: elem.Level, minTXID: elem.MinTXID, maxTXID: elem.MaxTXID}) != key {
+			continue
+		}
+
+		batch = append(batch, hydrationPage{pgno: pageHdr.Pgno, data: data})
+		matchedPageN++
+		data = make([]byte, h.pageSize)
+
+		if len(batch) == cap(batch) {
+			if err := h.writePages(batch); err != nil {
+				return err
+			}
+			batch = batch[:0]
+		}
+	}
+
+	zeroPageHeader, err := (&ltx.PageHeader{}).MarshalBinary()
+	if err != nil {
+		return fmt.Errorf("marshal ltx page block terminator: %w", err)
+	}
+	_, _ = fileHash.Write(zeroPageHeader)
+
+	if err := validateHydrationLTXTail(r, info.Size, hdr, fileHash, postApplyChecksum); err != nil {
+		return fmt.Errorf("validate ltx tail: %w", err)
+	}
+	if matchedPageN != group.pageN {
+		return fmt.Errorf("ltx file missing %d hydration pages", group.pageN-matchedPageN)
+	}
+	if err := h.writePages(batch); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func validateHydrationLTXTail(r *hydrationCountingReader, fileSize int64, hdr ltx.Header, fileHash hash.Hash64, postApplyChecksum ltx.Checksum) error {
+	br := bufio.NewReader(r)
+	indexReader := &hydrationHashingByteReader{r: br, h: fileHash}
+	for {
+		pgno, err := binary.ReadUvarint(indexReader)
+		if err != nil {
+			return fmt.Errorf("read page index pgno: %w", err)
+		}
+		if pgno == 0 {
+			break
+		}
+		if _, err := binary.ReadUvarint(indexReader); err != nil {
+			return fmt.Errorf("read page index offset: %w", err)
+		}
+		if _, err := binary.ReadUvarint(indexReader); err != nil {
+			return fmt.Errorf("read page index size: %w", err)
+		}
+	}
+
+	var pageIndexSizeData [8]byte
+	if _, err := io.ReadFull(br, pageIndexSizeData[:]); err != nil {
+		return fmt.Errorf("read page index byte size: %w", err)
+	}
+	_, _ = fileHash.Write(pageIndexSizeData[:])
+	if got, want := binary.BigEndian.Uint64(pageIndexSizeData[:]), uint64(indexReader.n); got != want {
+		return fmt.Errorf("page index size=%d, want %d", got, want)
+	}
+
+	var trailerData [ltx.TrailerSize]byte
+	if _, err := io.ReadFull(br, trailerData[:]); err != nil {
+		return fmt.Errorf("read ltx trailer: %w", err)
+	}
+	_, _ = fileHash.Write(trailerData[:ltx.TrailerChecksumOffset])
+
+	var trailer ltx.Trailer
+	if err := trailer.UnmarshalBinary(trailerData[:]); err != nil {
+		return fmt.Errorf("unmarshal ltx trailer: %w", err)
+	}
+	if err := trailer.Validate(hdr); err != nil {
+		return fmt.Errorf("validate ltx trailer: %w", err)
+	}
+	if got, want := ltx.ChecksumFlag|ltx.Checksum(fileHash.Sum64()), trailer.FileChecksum; got != want {
+		return ltx.ErrChecksumMismatch
+	}
+	if hdr.IsSnapshot() && !hdr.NoChecksum() && trailer.PostApplyChecksum != postApplyChecksum {
+		return fmt.Errorf("post-apply checksum in trailer (%s) does not match calculated checksum (%s)", trailer.PostApplyChecksum, postApplyChecksum)
+	}
+
+	var extra [1]byte
+	if _, err := io.ReadFull(br, extra[:]); err == nil {
+		return fmt.Errorf("unexpected data after ltx trailer")
+	} else if err != io.EOF {
+		return fmt.Errorf("read after ltx trailer: %w", err)
+	}
+	if r.n != fileSize {
+		return fmt.Errorf("ltx stream size=%d, want %d", r.n, fileSize)
+	}
+	return nil
+}
+
+func (h *Hydrator) writePages(pages []hydrationPage) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	for _, page := range pages {
+		off := int64(page.pgno-1) * int64(h.pageSize)
+		if _, err := h.file.WriteAt(page.data, off); err != nil {
+			return fmt.Errorf("write updated page %d: %w", page.pgno, err)
+		}
+	}
+	return nil
+}
+
 // WritePage writes a single page to the hydration file.
 func (h *Hydrator) WritePage(pgno uint32, data []byte) error {
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -842,6 +1112,9 @@ func (h *Hydrator) WritePage(pgno uint32, data []byte) error {
 
 // Truncate truncates the hydration file to the specified size.
 func (h *Hydrator) Truncate(size int64) error {
+	h.applyMu.Lock()
+	defer h.applyMu.Unlock()
+
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.file.Truncate(size)
@@ -1452,11 +1725,14 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 			return n, nil
 		}
 	}
+	hydrator := f.hydrator
+	hydrationReadLocked := len(f.pending) == 0 && !f.pendingReplace &&
+		hydrator != nil && hydrator.Complete() && hydrator.applyMu.TryRLock()
 	f.mu.Unlock()
 
-	// If hydration complete, read from local file
-	if f.hydrator != nil && f.hydrator.Complete() {
-		return f.hydrator.ReadAt(p, off)
+	if hydrationReadLocked {
+		defer hydrator.applyMu.RUnlock()
+		return hydrator.ReadAt(p, off)
 	}
 
 	// Check cache (cache is thread-safe)
@@ -2511,7 +2787,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	newCommit := baseCommit
 	replaceIndex := false
 
-	maxTXID0, idx0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
+	maxTXID0, idx0, infos0, commit0, replace0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
@@ -2532,7 +2808,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		}
 	}
 
-	maxTXID1, idx1, commit1, replace1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
+	maxTXID1, idx1, infos1, commit1, replace1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
 	}
@@ -2552,11 +2828,11 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	// Send updates to a pending list if there are active readers.
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	if f.targetTime != nil {
 		// Skip applying updates while time travel is active to avoid
 		// overwriting the historical snapshot state.
+		f.mu.Unlock()
 		return nil
 	}
 
@@ -2611,10 +2887,20 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.maxTXID1 = maxTXID1
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
-	// Apply updates to hydrated file if hydration is complete
-	if f.hydrator != nil && f.hydrator.Complete() && len(combined) > 0 {
-		if err := f.hydrator.ApplyUpdates(f.ctx, combined); err != nil {
-			f.logger.Error("failed to apply updates to hydrated file", "error", err)
+	hydrator := f.hydrator
+	applyHydration := hydrator != nil && hydrator.Complete() && len(combined) > 0
+	if applyHydration {
+		hydrator.applyMu.Lock()
+	}
+	f.mu.Unlock()
+
+	if applyHydration {
+		defer hydrator.applyMu.Unlock()
+		infos := append(infos0, infos1...)
+		if err := hydrator.applyUpdates(ctx, combined, infos); err != nil {
+			hydrator.SetErr(err)
+			hydrator.Disable()
+			return fmt.Errorf("apply updates to hydrated file: %w", err)
 		}
 	}
 
@@ -2623,14 +2909,15 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 // pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
 // any index updates, the latest commit value, and if the index should be replaced.
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, uint32, bool, error) {
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32) (ltx.TXID, map[uint32]ltx.PageIndexElem, []*ltx.FileInfo, uint32, bool, error) {
 	itr, err := f.client.LTXFiles(ctx, level, prevMaxTXID+1, false)
 	if err != nil {
-		return prevMaxTXID, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
+		return prevMaxTXID, nil, nil, baseCommit, false, fmt.Errorf("ltx files: %w", err)
 	}
 	defer func() { _ = itr.Close() }()
 
 	index := make(map[uint32]ltx.PageIndexElem)
+	var infos []*ltx.FileInfo
 	maxTXID := prevMaxTXID
 	lastCommit := baseCommit
 	newCommit := baseCommit
@@ -2647,18 +2934,18 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 				f.logger.Warn("ltx gap detected at L0, deferring to higher levels", "expected", maxTXID+1, "next", info.MinTXID)
 				break
 			}
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
+			return maxTXID, nil, infos, newCommit, replaceIndex, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, maxTXID, info.MinTXID, info.MaxTXID)
 		}
 
 		f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		idx, err := FetchPageIndex(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
+			return maxTXID, nil, infos, newCommit, replaceIndex, fmt.Errorf("fetch page index: %w", err)
 		}
 		hdr, err := FetchLTXHeader(ctx, f.client, info)
 		if err != nil {
-			return maxTXID, nil, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
+			return maxTXID, nil, infos, newCommit, replaceIndex, fmt.Errorf("fetch header: %w", err)
 		}
 
 		if hdr.Commit < lastCommit {
@@ -2672,10 +2959,11 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			f.logger.Debug("adding new page index", "page", k, "elem", v)
 			index[k] = v
 		}
+		infos = append(infos, info)
 		maxTXID = info.MaxTXID
 	}
 
-	return maxTXID, index, newCommit, replaceIndex, nil
+	return maxTXID, index, infos, newCommit, replaceIndex, nil
 }
 
 func (f *VFSFile) pageSizeBytes() (uint32, error) {
