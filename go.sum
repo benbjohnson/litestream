@@ -270,8 +270,8 @@ github.com/stretchr/testify v1.11.1 h1:7s2iGBzp5EwR7/aIZr8ao5+dra3wiQyKjjFuvgVKu
 github.com/stretchr/testify v1.11.1/go.mod h1:wZwfW3scLgRK+23gO65QZefKpKQRnfz6sD981Nm4B6U=
 github.com/studio-b12/gowebdav v0.11.0 h1:qbQzq4USxY28ZYsGJUfO5jR+xkFtcnwWgitp4Zp1irU=
 github.com/studio-b12/gowebdav v0.11.0/go.mod h1:bHA7t77X/QFExdeAnDzK6vKM34kEZAcE1OX4MfiwjkE=
-github.com/superfly/ltx v0.5.3-0.20260827162011-d457a1ab7844 h1:4TKqDSdHlpV4Me/BoP/D7gszAPidElRDf64KBwnFg+U=
-github.com/superfly/ltx v0.5.3-0.20260827162011-d457a1ab7844/go.mod h1:0OtLSLHHHPa3qDrAmwkLW5pUBfj365JS+bR9FEJDrM4=
+github.com/superfly/ltx v0.5.3-0.20260828134549-493c5d2d9e9f h1:/PPQGMNVM3bfmpv33zC8aTXtE1vyUk0xu3viTUZkR9k=
+github.com/superfly/ltx v0.5.3-0.20260828134549-493c5d2d9e9f/go.mod h1:0OtLSLHHHPa3qDrAmwkLW5pUBfj365JS+bR9FEJDrM4=
 github.com/tetratelabs/wazero v1.2.1 h1:J4X2hrGzJvt+wqltuvcSjHQ7ujQxA9gb6PeMs4qlUWs=
 github.com/tetratelabs/wazero v1.2.1/go.mod h1:wYx2gNRg8/WihJfSDxA1TIL8H+GkfLYm+bIfbblu9VQ=
 github.com/wasilibs/go-re2 v1.3.0 h1:LFhBNzoStM3wMie6rN2slD1cuYH2CGiHpvNL3UtcsMw=
