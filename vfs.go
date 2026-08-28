@@ -570,6 +570,7 @@ type Hydrator struct {
 	persistent bool           // True when file should survive across restarts
 	file       *os.File       // Local database file
 	complete   atomic.Bool    // True when restore completes
+	tainted    atomic.Bool    // True once an applied LTX file failed verification; never persisted
 	txid       ltx.TXID       // TXID the hydrated file is at
 	mu         sync.Mutex     // Protects hydration file writes
 	err        error          // Stores fatal hydration error
@@ -764,6 +765,7 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	defer rc.Close()
 
 	dec := ltx.NewDecoder(rc)
+	dec.SetRetainPageIndex(false) // pages are streamed; the index is validated, not kept
 	if err := dec.DecodeHeader(); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
@@ -771,23 +773,40 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Apply each page to the hydration file
+	// Apply each page to the hydration file. Pages are applied as they
+	// stream, so any failure from here on leaves unverified or partial
+	// content in the hydration file: mark it tainted so Close discards it
+	// instead of persisting it for a resume on the next start.
+	data := make([]byte, h.pageSize)
 	for {
 		var phdr ltx.PageHeader
-		data := make([]byte, h.pageSize)
 		if err := dec.DecodePage(&phdr, data); err == io.EOF {
 			break
 		} else if err != nil {
+			h.tainted.Store(true)
 			return fmt.Errorf("decode page: %w", err)
 		}
 
 		off := int64(phdr.Pgno-1) * int64(h.pageSize)
 		if _, err := h.file.WriteAt(data, off); err != nil {
+			h.tainted.Store(true)
 			return fmt.Errorf("write page %d: %w", phdr.Pgno, err)
 		}
 	}
 
+	// Read the page index and trailer so the file checksum is verified.
+	if err := dec.Close(); err != nil {
+		h.tainted.Store(true)
+		return fmt.Errorf("verify ltx file: %w", err)
+	}
+
 	return nil
+}
+
+// Tainted reports whether an applied LTX file failed verification, in which
+// case the hydration file's content cannot be trusted.
+func (h *Hydrator) Tainted() bool {
+	return h.tainted.Load()
 }
 
 // ReadAt reads data from the hydrated local file.
@@ -855,7 +874,7 @@ func (h *Hydrator) Close() error {
 		return nil
 	}
 
-	if h.persistent && h.txid > 0 {
+	if h.persistent && h.txid > 0 && !h.tainted.Load() {
 		if err := h.file.Sync(); err != nil {
 			h.logger.Warn("failed to sync hydration file", "error", err)
 		}
@@ -865,17 +884,19 @@ func (h *Hydrator) Close() error {
 		return h.file.Close()
 	}
 
-	if err := h.file.Close(); err != nil {
-		return err
-	}
-
-	if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
+	// Discard: remove the meta first so a restart can never resume from
+	// this file, then the file itself; report every failure, not the first.
+	var errs []error
 	if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
-		return err
+		errs = append(errs, err)
 	}
-	return nil
+	if err := h.file.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (h *Hydrator) metaPath() string {

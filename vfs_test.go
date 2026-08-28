@@ -5,6 +5,7 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -849,6 +850,8 @@ func newCountingReplicaClient() *countingReplicaClient { return &countingReplica
 
 func (c *countingReplicaClient) Type() string { return "count" }
 
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -880,6 +883,8 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 }
 
 func (c *mockReplicaClient) Type() string { return "mock" }
+
+func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
 
@@ -1398,4 +1403,118 @@ func TestVFSFile_Hydration_PersistentResumeOnReopen(t *testing.T) {
 	if !reopenedInfo.ModTime().Equal(initialInfo.ModTime()) {
 		t.Fatalf("expected hydration file modtime unchanged on reopen resume")
 	}
+}
+
+func TestHydrator_ApplyLTX_VerifiesFile(t *testing.T) {
+	newHydrator := func(t *testing.T, client ReplicaClient) *Hydrator {
+		t.Helper()
+		h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		t.Cleanup(func() { _ = h.Close() })
+		return h
+	}
+
+	t.Run("ValidFile", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		client.addFixture(t, fx)
+		h := newHydrator(t, client)
+		if err := h.ApplyLTX(context.Background(), fx.info); err != nil {
+			t.Fatalf("apply: %v", err)
+		}
+		buf := make([]byte, 4096)
+		if _, err := h.ReadAt(buf, 0); err != nil {
+			t.Fatal(err)
+		}
+		if buf[0] != 'a' || buf[4095] != 'a' {
+			t.Fatalf("page not applied: %q %q", buf[0], buf[4095])
+		}
+	})
+
+	t.Run("CorruptChecksumRejected", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		fx.data = bytes.Clone(fx.data)
+		fx.data[len(fx.data)-1] ^= 0xFF // flip a byte of the trailer's file checksum
+		client.addFixture(t, fx)
+		h := newHydrator(t, client)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected ApplyLTX to reject a file whose checksum does not verify")
+		}
+	})
+
+	t.Run("TaintedPersistentHydrationIsDiscarded", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		fx.data = bytes.Clone(fx.data)
+		fx.data[len(fx.data)-1] ^= 0xFF
+		client.addFixture(t, fx)
+		path := filepath.Join(t.TempDir(), "hydration.db")
+		h := NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		h.SetTXID(1)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected verification failure")
+		}
+		if !h.Tainted() {
+			t.Fatal("expected hydrator to be tainted")
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+			t.Fatalf("tainted persistent hydration must not save meta for resume (err=%v)", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("tainted persistent hydration file must be removed (err=%v)", err)
+		}
+	})
+
+	t.Run("MidFileCorruptionTaints", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixtureWithPages(t, 1, 4096, []uint32{1, 2}, 'a')
+		fx.data = bytes.Clone(fx.data)
+		// Corrupt the second page frame's header so decoding fails after
+		// page 1 has already been written to the hydration file. Frames are
+		// LZ4-compressed, so locate the second one from the first frame's
+		// size field rather than the page size.
+		firstFrame := ltx.HeaderSize
+		firstSize := int(binary.BigEndian.Uint32(fx.data[firstFrame+ltx.PageHeaderSize:]))
+		second := firstFrame + ltx.PageHeaderSize + 4 + firstSize
+		fx.data[second] ^= 0xFF
+		client.addFixture(t, fx)
+		path := filepath.Join(t.TempDir(), "hydration.db")
+		h := NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		h.SetTXID(1)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected apply to fail on the corrupted page")
+		}
+		if !h.Tainted() {
+			t.Fatal("expected hydrator to be tainted after a mid-file failure")
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+			t.Fatalf("meta must not be saved for a tainted hydration (err=%v)", err)
+		}
+	})
+
+	t.Run("TruncatedIndexRejected", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		fx.data = bytes.Clone(fx.data[:len(fx.data)-ltx.TrailerSize-4])
+		client.addFixture(t, fx)
+		h := newHydrator(t, client)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected ApplyLTX to reject a truncated file")
+		}
+	})
 }
