@@ -9,9 +9,10 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
-	"github.com/benbjohnson/litestream"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 )
 
 func ltxTestData(tb testing.TB, minTXID, maxTXID ltx.TXID, payload []byte) []byte {
