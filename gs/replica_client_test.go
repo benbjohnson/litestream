@@ -3,10 +3,13 @@ package gs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
+	"github.com/benbjohnson/litestream"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/superfly/ltx"
 )
@@ -77,5 +80,47 @@ func TestReplicaClient_OpenLTXFileReadsFullObject(t *testing.T) {
 
 	if !bytes.Equal(out, data) {
 		t.Fatalf("unexpected replica content: got %q, want %q", out, data)
+	}
+}
+
+var errTestSource = errors.New("injected source failure")
+
+type failAfterReader struct {
+	r         *bytes.Reader
+	remaining int
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, errTestSource
+	}
+
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= n
+	if err != nil {
+		return n, errTestSource
+	}
+	return n, nil
+}
+
+func TestReplicaClient_WriteLTXFileAbortsOnSourceError(t *testing.T) {
+	rc, server := setupTestClient(t)
+	defer server.Stop()
+
+	ctx := context.Background()
+	minTXID, maxTXID := ltx.TXID(1), ltx.TXID(1)
+	data := ltxTestData(t, minTXID, maxTXID, bytes.Repeat([]byte("payload"), 1024))
+	rd := &failAfterReader{r: bytes.NewReader(data), remaining: len(data) - 1}
+
+	if _, err := rc.WriteLTXFile(ctx, 0, minTXID, maxTXID, rd); !errors.Is(err, errTestSource) {
+		t.Fatalf("WriteLTXFile error = %v, want %v", err, errTestSource)
+	}
+
+	key := litestream.LTXFilePath(rc.Path, 0, minTXID, maxTXID)
+	if _, err := rc.bkt.Object(key).Attrs(ctx); !errors.Is(err, storage.ErrObjectNotExist) {
+		t.Fatalf("object attrs error = %v, want %v", err, storage.ErrObjectNotExist)
 	}
 }
