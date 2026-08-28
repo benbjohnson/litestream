@@ -16,8 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test nightly notifier classification
-        run: node --test .github/scripts/nightly-stability-jobs.test.js
+      - name: Test workflow scripts
+        run: node --test .github/scripts/*.test.js
 
       - uses: actions/setup-go@v5
         with:
