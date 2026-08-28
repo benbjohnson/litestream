@@ -341,8 +341,8 @@ Parameters with an alias accept both camelCase and hyphenated forms
 | `skipVerify` | `skip-verify` | Skip TLS verification | `false` |
 | `signPayload` | `sign-payload` | Sign request payloads | `true` |
 | `requireContentMD5` | `require-content-md5` | Require Content-MD5 header | `true` |
-| `concurrency` | | Multipart upload concurrency | `5` |
-| `partSize` | `part-size` | Multipart upload part size in bytes | `5242880` (5MB) |
+| `concurrency` | | Multipart upload concurrency | `5` (`2` for R2/Tigris) |
+| `partSize` | `part-size` | Multipart upload part size | `5242880` (5MB) (`16MiB` for Tigris) |
 | `storageClass` | `storage-class` | Storage class for uploaded objects | None |
 | `sseCustomerAlgorithm` | `sse-customer-algorithm` | SSE-C encryption algorithm | None |
 | `sseCustomerKey` | `sse-customer-key` | SSE-C encryption key | None |
@@ -361,7 +361,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
 | Scaleway | `*.scw.cloud` | `sign-payload=true` |
 | Filebase | `s3.filebase.com` | `sign-payload=true`, `force-path-style=true` |
-| Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false` |
+| Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false`, `concurrency=2`, `part-size=16MiB` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
 | Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
 | Google Cloud Storage | Exact `googleapis.com` suffix with a first-label `storage` segment | Excludes `Accept-Encoding` from SigV4 signatures |
