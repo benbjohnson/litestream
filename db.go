@@ -95,6 +95,7 @@ type DB struct {
 		l1Checked      bool
 		l0MaxTXID      ltx.TXID
 		l1MaxTXID      ltx.TXID
+		retention      time.Duration
 		waitingForTime bool
 		nextCheckAt    time.Time
 	}
@@ -3061,6 +3062,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			(!l1Cached && db.l0RetentionState.l1Checked && db.l0RetentionState.l1MaxTXID == 0)) &&
 		localMaxTXID == db.l0RetentionState.l0MaxTXID &&
 		cachedL1TXID == db.l0RetentionState.l1MaxTXID &&
+		db.l0RetentionState.retention == db.L0Retention &&
 		(!db.l0RetentionState.waitingForTime || time.Now().Before(db.l0RetentionState.nextCheckAt)) {
 		return nil
 	}
@@ -3083,6 +3085,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		db.l0RetentionState.l1Checked = true
 		db.l0RetentionState.l0MaxTXID = localMaxTXID
 		db.l0RetentionState.l1MaxTXID = maxL1TXID
+		db.l0RetentionState.retention = db.L0Retention
 		db.l0RetentionState.waitingForTime = false
 		db.l0RetentionState.nextCheckAt = time.Time{}
 		return nil
@@ -3162,6 +3165,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		db.l0RetentionState.l1Checked = true
 		db.l0RetentionState.l0MaxTXID = localMaxTXID
 		db.l0RetentionState.l1MaxTXID = maxL1TXID
+		db.l0RetentionState.retention = db.L0Retention
 		db.l0RetentionState.waitingForTime = !nextCheckAt.IsZero()
 		db.l0RetentionState.nextCheckAt = nextCheckAt
 		return nil
@@ -3188,6 +3192,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	db.l0RetentionState.l1Checked = true
 	db.l0RetentionState.l0MaxTXID = localMaxTXID
 	db.l0RetentionState.l1MaxTXID = maxL1TXID
+	db.l0RetentionState.retention = db.L0Retention
 	db.l0RetentionState.waitingForTime = !nextCheckAt.IsZero()
 	db.l0RetentionState.nextCheckAt = nextCheckAt
 
