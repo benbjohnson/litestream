@@ -689,3 +689,48 @@ func mustBuildChecksummedSnapshotLTX(tb testing.TB, pageSize uint32, pages [][]b
 
 	return buf.Bytes()
 }
+
+func TestNewRestoreCompactor(t *testing.T) {
+	const pageSize = 4096
+	pages := [][]byte{
+		newSQLiteHeaderPage(pageSize),
+		bytes.Repeat([]byte{0xE5}, pageSize),
+	}
+	snapshot := mustBuildSnapshotLTX(t, 1, 1, pageSize, pages)
+	update := mustBuildIncrementalLTX(t, 2, 2, pageSize, 2, 0xF6)
+
+	spillDir := t.TempDir()
+	pr, pw := io.Pipe()
+	c, err := newRestoreCompactor(pw, []io.Reader{bytes.NewReader(snapshot), bytes.NewReader(update)}, spillDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = c.Cleanup() }()
+
+	go func() {
+		_ = pw.CloseWithError(c.Compact(context.Background()))
+	}()
+
+	dec := newRestoreDecoder(pr)
+	var db bytes.Buffer
+	if err := dec.DecodeDatabaseTo(&db); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := db.Len(), len(pages)*pageSize; got != want {
+		t.Fatalf("decoded database size=%d, want %d", got, want)
+	}
+	if !bytes.Equal(db.Bytes()[pageSize:], bytes.Repeat([]byte{0xF6}, pageSize)) {
+		t.Fatal("page 2 does not contain compacted update")
+	}
+
+	if err := c.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(spillDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 {
+		t.Fatalf("spill dir not empty after cleanup: %d entries", len(ents))
+	}
+}
