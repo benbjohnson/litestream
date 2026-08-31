@@ -27,7 +27,7 @@ require (
 	github.com/prometheus/client_golang v1.17.0
 	github.com/psanford/sqlite3vfs v0.0.0-20260519004904-f9180fa2acc9 // direct
 	github.com/studio-b12/gowebdav v0.11.0
-	github.com/superfly/ltx v0.5.2
+	github.com/superfly/ltx v0.5.3-0.20260827162011-d457a1ab7844
 	golang.org/x/crypto v0.52.0
 	golang.org/x/sys v0.45.0
 	google.golang.org/api v0.155.0
