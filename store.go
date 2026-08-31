@@ -493,6 +493,9 @@ func (s *Store) SetL0Retention(d time.Duration) {
 	s.L0Retention = d
 	for _, db := range s.dbs {
 		db.L0Retention = d
+		db.l0RetentionState.mu.Lock()
+		db.l0RetentionState.initialized = false
+		db.l0RetentionState.mu.Unlock()
 	}
 }
 

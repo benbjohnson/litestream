@@ -85,6 +85,21 @@ type DB struct {
 		m map[int]*ltx.FileInfo
 	}
 
+	// l0RetentionState tracks the inputs to the last successful retention
+	// pass. Retention can be skipped while neither the local L0 watermark nor
+	// the cached L1 watermark has changed. This avoids repeatedly listing the
+	// replica for idle databases.
+	l0RetentionState struct {
+		mu             sync.Mutex
+		initialized    bool
+		l1Checked      bool
+		l0MaxTXID      ltx.TXID
+		l1MaxTXID      ltx.TXID
+		retention      time.Duration
+		waitingForTime bool
+		nextCheckAt    time.Time
+	}
+
 	// Cached position from the latest L0 LTX file.
 	// nil means cache is invalid; non-nil is the cached position.
 	pos struct {
@@ -538,6 +553,10 @@ func (db *DB) ResetLocalState(ctx context.Context) error {
 	db.maxLTXFileInfos.Unlock()
 
 	db.invalidatePosCache()
+	db.l0RetentionState.mu.Lock()
+	db.l0RetentionState.initialized = false
+	db.l0RetentionState.l1Checked = false
+	db.l0RetentionState.mu.Unlock()
 
 	db.Logger.Info("local state reset complete, next sync will create fresh snapshot")
 	return nil
@@ -3021,34 +3040,59 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
+	// Serialize retention passes and avoid remote LIST requests when the local
+	// L0 watermark and cached L1 watermark are unchanged. If the previous pass
+	// stopped at a too-recent file, retry when that file can become eligible.
+	db.l0RetentionState.mu.Lock()
+	defer db.l0RetentionState.mu.Unlock()
+
+	_, localMaxTXID, err := db.MaxLTX()
+	if err != nil {
+		return fmt.Errorf("fetch local l0 position: %w", err)
+	}
+	db.maxLTXFileInfos.Lock()
+	l1Info, l1Cached := db.maxLTXFileInfos.m[1]
+	var cachedL1TXID ltx.TXID
+	if l1Cached && l1Info != nil {
+		cachedL1TXID = l1Info.MaxTXID
+	}
+	db.maxLTXFileInfos.Unlock()
+	if db.l0RetentionState.initialized &&
+		((l1Cached && db.l0RetentionState.l1Checked && cachedL1TXID == db.l0RetentionState.l1MaxTXID) ||
+			(!l1Cached && db.l0RetentionState.l1Checked && db.l0RetentionState.l1MaxTXID == 0)) &&
+		localMaxTXID == db.l0RetentionState.l0MaxTXID &&
+		cachedL1TXID == db.l0RetentionState.l1MaxTXID &&
+		db.l0RetentionState.retention == db.L0Retention &&
+		(!db.l0RetentionState.waitingForTime || time.Now().Before(db.l0RetentionState.nextCheckAt)) {
+		return nil
+	}
+
 	db.Logger.Debug("starting l0 retention enforcement", "retention", db.L0Retention)
 
 	dbName := filepath.Base(db.Path())
 
 	// Determine the highest TXID that has been compacted into L1.
-	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	l1InfoValue, err := db.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
 		return fmt.Errorf("fetch l1 files: %w", err)
 	}
-	var maxL1TXID ltx.TXID
-	for itr.Next() {
-		info := itr.Item()
-		if info.MaxTXID > maxL1TXID {
-			maxL1TXID = info.MaxTXID
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return fmt.Errorf("close l1 iterator: %w", err)
-	}
+	maxL1TXID := l1InfoValue.MaxTXID
 	if maxL1TXID == 0 {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(0)
+		db.l0RetentionState.initialized = true
+		db.l0RetentionState.l1Checked = true
+		db.l0RetentionState.l0MaxTXID = localMaxTXID
+		db.l0RetentionState.l1MaxTXID = maxL1TXID
+		db.l0RetentionState.retention = db.L0Retention
+		db.l0RetentionState.waitingForTime = false
+		db.l0RetentionState.nextCheckAt = time.Time{}
 		return nil
 	}
 
 	threshold := time.Now().Add(-db.L0Retention)
-	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	itr, err := db.Replica.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch l0 files: %w", err)
 	}
@@ -3061,6 +3105,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		totalFiles        int
 		notCompactedCount int
 		tooRecentCount    int
+		nextCheckAt       time.Time
 	)
 	for itr.Next() {
 		info := itr.Item()
@@ -3081,6 +3126,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			// create gaps between retained files. VFS expects contiguous coverage.
 			processedAll = false
 			tooRecentCount++
+			nextCheckAt = createdAt.Add(db.L0Retention)
 			break
 		}
 
@@ -3115,6 +3161,13 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		"max_l1_txid", maxL1TXID)
 
 	if len(deleted) == 0 {
+		db.l0RetentionState.initialized = true
+		db.l0RetentionState.l1Checked = true
+		db.l0RetentionState.l0MaxTXID = localMaxTXID
+		db.l0RetentionState.l1MaxTXID = maxL1TXID
+		db.l0RetentionState.retention = db.L0Retention
+		db.l0RetentionState.waitingForTime = !nextCheckAt.IsZero()
+		db.l0RetentionState.nextCheckAt = nextCheckAt
 		return nil
 	}
 
@@ -3134,6 +3187,14 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	if len(deleted) > 0 {
 		db.invalidatePosCache()
 	}
+
+	db.l0RetentionState.initialized = true
+	db.l0RetentionState.l1Checked = true
+	db.l0RetentionState.l0MaxTXID = localMaxTXID
+	db.l0RetentionState.l1MaxTXID = maxL1TXID
+	db.l0RetentionState.retention = db.L0Retention
+	db.l0RetentionState.waitingForTime = !nextCheckAt.IsZero()
+	db.l0RetentionState.nextCheckAt = nextCheckAt
 
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
 
