@@ -714,7 +714,7 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	dec := ltx.NewDecoder(pr)
+	dec := newRestoreDecoder(pr)
 	if err := dec.DecodeDatabaseTo(h.file); err != nil {
 		return fmt.Errorf("decode database: %w", err)
 	}

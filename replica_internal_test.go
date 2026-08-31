@@ -543,3 +543,52 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 		}
 	}
 }
+
+func TestNewRestoreDecoder(t *testing.T) {
+	const pageSize = 4096
+	pages := [][]byte{
+		newSQLiteHeaderPage(pageSize),
+		bytes.Repeat([]byte{0xC3}, pageSize),
+		bytes.Repeat([]byte{0xD4}, pageSize),
+	}
+	data := mustBuildSnapshotLTX(t, 1, 5, pageSize, pages)
+
+	t.Run("DoesNotRetainPageIndex", func(t *testing.T) {
+		dec := newRestoreDecoder(bytes.NewReader(data))
+		var db bytes.Buffer
+		if err := dec.DecodeDatabaseTo(&db); err != nil {
+			t.Fatal(err)
+		}
+		if dec.PageIndex() != nil {
+			t.Fatalf("expected nil page index, got %d entries", len(dec.PageIndex()))
+		}
+		if got, want := db.Len(), len(pages)*pageSize; got != want {
+			t.Fatalf("decoded database size=%d, want %d", got, want)
+		}
+		for i, page := range pages {
+			if got := db.Bytes()[i*pageSize : (i+1)*pageSize]; !bytes.Equal(got, page) {
+				t.Fatalf("page %d data mismatch", i+1)
+			}
+		}
+	})
+
+	t.Run("DefaultDecoderRetainsPageIndex", func(t *testing.T) {
+		dec := ltx.NewDecoder(bytes.NewReader(data))
+		var db bytes.Buffer
+		if err := dec.DecodeDatabaseTo(&db); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := len(dec.PageIndex()), len(pages); got != want {
+			t.Fatalf("page index entries=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("StillValidatesCorruptPageIndex", func(t *testing.T) {
+		corrupt := bytes.Clone(data)
+		corrupt[len(corrupt)-ltx.TrailerSize-1] ^= 0xFF
+		dec := newRestoreDecoder(bytes.NewReader(corrupt))
+		if err := dec.DecodeDatabaseTo(io.Discard); err == nil {
+			t.Fatal("expected error decoding LTX file with corrupt page index")
+		}
+	})
+}
