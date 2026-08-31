@@ -489,6 +489,7 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate database configs
+	seenPaths := make(map[string]int) // cleaned path -> 1-based config index
 	for idx, db := range c.DBs {
 		// Validate that either path or dir is specified, but not both
 		if db.Path != "" && db.Dir != "" {
@@ -496,6 +497,17 @@ func (c *Config) Validate() error {
 		}
 		if db.Path == "" && db.Dir == "" {
 			return fmt.Errorf("database config #%d: must specify either 'path' or 'dir'", idx+1)
+		}
+
+		// Reject the same database path listed twice. The metadata directory is
+		// derived from the path, so two entries would share it and race on the
+		// same LTX temp files.
+		if db.Path != "" {
+			key := filepath.Clean(db.Path)
+			if first, ok := seenPaths[key]; ok {
+				return fmt.Errorf("database config #%d: duplicate path %q (already used by database config #%d); each database can be listed only once", idx+1, db.Path, first)
+			}
+			seenPaths[key] = idx + 1
 		}
 
 		// When using dir, pattern must be specified

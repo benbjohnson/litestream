@@ -2306,6 +2306,56 @@ func TestDBConfigValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("duplicate path", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/db.sqlite", Replica: &main.ReplicaConfig{Path: "/path/to/rep-a"}},
+			{Path: "/path/to/db.sqlite", Replica: &main.ReplicaConfig{Path: "/path/to/rep-b"}},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when the same path is listed twice")
+		}
+		if !strings.Contains(err.Error(), `database config #2: duplicate path "/path/to/db.sqlite"`) {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+		if !strings.Contains(err.Error(), "already used by database config #1") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("duplicate path after cleaning", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/db.sqlite"},
+			{Path: "/path/to/../to/db.sqlite"},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when the same path is listed twice in different spellings")
+		}
+		if !strings.Contains(err.Error(), "duplicate path") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("distinct paths", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/a.sqlite"},
+			{Path: "/path/to/b.sqlite"},
+			{Dir: "/path/to/dir", Pattern: "*.db"},
+			{Dir: "/path/to/dir", Pattern: "*.sqlite"},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for distinct paths: %v", err)
+		}
+	})
+
 	t.Run("valid directory configuration", func(t *testing.T) {
 		config := main.DefaultConfig()
 		config.DBs = []*main.DBConfig{
