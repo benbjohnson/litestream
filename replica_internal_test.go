@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -591,4 +592,100 @@ func TestNewRestoreDecoder(t *testing.T) {
 			t.Fatal("expected error decoding LTX file with corrupt page index")
 		}
 	})
+
+	// Overwrite the first index entry's page number so the index no longer
+	// matches the decoded pages. This is rejected by the structural index
+	// validation in Close, which runs before any checksum comparison, so a
+	// pass here proves validation is not skipped when retention is off.
+	t.Run("StillValidatesIndexStructure", func(t *testing.T) {
+		sizeField := binary.BigEndian.Uint64(data[len(data)-ltx.TrailerSize-8:])
+		indexStart := len(data) - ltx.TrailerSize - 8 - int(sizeField)
+		if got := data[indexStart]; got != 0x01 {
+			t.Fatalf("expected first index entry pgno varint 0x01 at offset %d, got %#x", indexStart, got)
+		}
+
+		corrupt := bytes.Clone(data)
+		corrupt[indexStart] = 0x03
+
+		dec := newRestoreDecoder(bytes.NewReader(corrupt))
+		err := dec.DecodeDatabaseTo(io.Discard)
+		if err == nil {
+			t.Fatal("expected error decoding LTX file with out-of-order page index")
+		}
+		if !strings.Contains(err.Error(), "page index") {
+			t.Fatalf("expected structural page index error, got: %v", err)
+		}
+
+		retainDec := ltx.NewDecoder(bytes.NewReader(corrupt))
+		retainErr := retainDec.DecodeDatabaseTo(io.Discard)
+		if retainErr == nil {
+			t.Fatal("expected error from retaining decoder on same corrupt input")
+		}
+		if err.Error() != retainErr.Error() {
+			t.Fatalf("validation parity broken: retain=false err %q, retain=true err %q", err, retainErr)
+		}
+	})
+
+	t.Run("StillValidatesPostApplyChecksum", func(t *testing.T) {
+		valid := mustBuildChecksummedSnapshotLTX(t, pageSize, pages, 0)
+		dec := newRestoreDecoder(bytes.NewReader(valid))
+		var db bytes.Buffer
+		if err := dec.DecodeDatabaseTo(&db); err != nil {
+			t.Fatal(err)
+		}
+		if dec.PageIndex() != nil {
+			t.Fatal("expected nil page index for checksummed snapshot")
+		}
+
+		invalid := mustBuildChecksummedSnapshotLTX(t, pageSize, pages, 1<<1)
+		dec = newRestoreDecoder(bytes.NewReader(invalid))
+		err := dec.DecodeDatabaseTo(io.Discard)
+		if err == nil {
+			t.Fatal("expected error decoding snapshot with wrong post-apply checksum")
+		}
+		if !strings.Contains(err.Error(), "post-apply checksum") {
+			t.Fatalf("expected post-apply checksum error, got: %v", err)
+		}
+	})
+}
+
+// mustBuildChecksummedSnapshotLTX encodes a snapshot LTX file with checksum
+// tracking enabled, XORing xor into the post-apply checksum so callers can
+// produce an otherwise-valid file whose post-apply checksum is wrong.
+func mustBuildChecksummedSnapshotLTX(tb testing.TB, pageSize uint32, pages [][]byte, xor uint64) []byte {
+	tb.Helper()
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		PageSize:  pageSize,
+		Commit:    uint32(len(pages)),
+		MinTXID:   1,
+		MaxTXID:   1,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		tb.Fatal(err)
+	}
+
+	chksum := ltx.ChecksumFlag
+	for i, page := range pages {
+		pgno := uint32(i + 1)
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, page); err != nil {
+			tb.Fatal(err)
+		}
+		chksum = ltx.ChecksumFlag | (chksum ^ ltx.ChecksumPage(pgno, page))
+	}
+
+	enc.SetPostApplyChecksum(ltx.ChecksumFlag | (chksum ^ ltx.Checksum(xor)))
+	if err := enc.Close(); err != nil {
+		tb.Fatal(err)
+	}
+
+	return buf.Bytes()
 }
