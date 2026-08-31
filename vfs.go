@@ -706,16 +706,24 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	defer func() { _ = c.Cleanup() }()
 	h.compactor = c
 
+	done := make(chan struct{})
 	go func() {
+		defer close(done)
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Close the pipe reader on failure so the compactor goroutine cannot stay
+	// blocked in a pipe write, then wait for it to finish so the deferred
+	// Cleanup never runs concurrently with Compact.
 	dec := newRestoreDecoder(pr)
-	if err := dec.DecodeDatabaseTo(h.file); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+	decodeErr := dec.DecodeDatabaseTo(h.file)
+	_ = pr.CloseWithError(decodeErr)
+	<-done
+	if decodeErr != nil {
+		return fmt.Errorf("decode database: %w", decodeErr)
 	}
 
 	h.txid = infos[len(infos)-1].MaxTXID
