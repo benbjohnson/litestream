@@ -604,6 +604,19 @@ func newRestoreDecoder(r io.Reader) *ltx.Decoder {
 	return dec
 }
 
+// newRestoreCompactor returns an LTX compactor for restore paths. Its output
+// page index spills into spillDir past the encoder's threshold, so compacting
+// a large database does not hold a per-page index in memory either (#1486).
+func newRestoreCompactor(w io.Writer, rdrs []io.Reader, spillDir string) (*ltx.Compactor, error) {
+	c, err := ltx.NewCompactor(w, rdrs)
+	if err != nil {
+		return nil, err
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	c.SetSpillDir(spillDir)
+	return c, nil
+}
+
 // Replica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
@@ -748,13 +761,12 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
+		c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(tmpOutputPath))
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		defer func() { _ = c.Cleanup() }()
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
