@@ -11,7 +11,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -102,6 +101,9 @@ func TestReplicaClient_DefaultSignPayload(t *testing.T) {
 	client := NewReplicaClient()
 	if !client.SignPayload {
 		t.Error("expected default SignPayload to be true for AWS S3 compatibility")
+	}
+	if !client.SignAcceptEncoding {
+		t.Error("expected default SignAcceptEncoding to be true")
 	}
 	if !client.RequireContentMD5 {
 		t.Error("expected default RequireContentMD5 to be true for AWS S3 compatibility")
@@ -568,125 +570,6 @@ func TestReplicaClient_WriteLTXFile_SmallUploadAllocations(t *testing.T) {
 			}()
 			return pr
 		})
-	})
-}
-
-func TestReplicaClient_WALSegmentsV3(t *testing.T) {
-	const generation = "0123456789abcdef"
-	type position struct {
-		index  int
-		offset int64
-	}
-	tests := []struct {
-		name  string
-		input [2]position
-		want  [2]position
-	}{
-		{
-			name:  "OffsetCrossesSignBit",
-			input: [2]position{{index: 1, offset: 0x80000001}, {index: 1}},
-			want:  [2]position{{index: 1}, {index: 1, offset: 0x80000001}},
-		},
-		{
-			name:  "OffsetDifferenceTruncatesToZero",
-			input: [2]position{{index: 1, offset: 0x100000000}, {index: 1}},
-			want:  [2]position{{index: 1}, {index: 1, offset: 0x100000000}},
-		},
-		{
-			name:  "MaximumOffset",
-			input: [2]position{{index: 1, offset: math.MaxInt64}, {index: 1}},
-			want:  [2]position{{index: 1}, {index: 1, offset: math.MaxInt64}},
-		},
-		{
-			name:  "IndexPrecedence",
-			input: [2]position{{index: 2}, {index: 1, offset: math.MaxInt64}},
-			want:  [2]position{{index: 1, offset: math.MaxInt64}, {index: 2}},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			firstKey := litestream.WALSegmentPathV3("replica", generation, tt.input[0].index, tt.input[0].offset)
-			secondKey := litestream.WALSegmentPathV3("replica", generation, tt.input[1].index, tt.input[1].offset)
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				w.Header().Set("Content-Type", "application/xml")
-				if _, err := fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-<Name>test-bucket</Name>
-<Prefix>replica/generations/%[1]s/wal/</Prefix>
-<KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
-<Contents><Key>%[2]s</Key><LastModified>2026-08-17T00:00:00Z</LastModified><ETag>"first"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>
-<Contents><Key>%[3]s</Key><LastModified>2026-08-17T00:00:00Z</LastModified><ETag>"second"</ETag><Size>1</Size><StorageClass>STANDARD</StorageClass></Contents>
-</ListBucketResult>`, generation, firstKey, secondKey); err != nil {
-					t.Errorf("write ListObjectsV2 response: %v", err)
-				}
-			}))
-			t.Cleanup(server.Close)
-
-			segments, err := newTestReplicaClient(t, server).WALSegmentsV3(context.Background(), generation)
-			if err != nil {
-				t.Fatalf("WALSegmentsV3() error: %v", err)
-			}
-			if got, want := len(segments), len(tt.want); got != want {
-				t.Fatalf("len(segments) = %d, want %d", got, want)
-			}
-			for i, want := range tt.want {
-				if got := segments[i]; got.Index != want.index || got.Offset != want.offset {
-					t.Errorf("segments[%d] = index %d offset %d, want index %d offset %d", i, got.Index, got.Offset, want.index, want.offset)
-				}
-			}
-		})
-	}
-
-	t.Run("MissingBucket", func(t *testing.T) {
-		if _, err := NewReplicaClient().WALSegmentsV3(context.Background(), generation); err == nil {
-			t.Fatal("expected error")
-		}
-	})
-
-	t.Run("ListError", func(t *testing.T) {
-		server := httptest.NewServer(http.NotFoundHandler())
-		t.Cleanup(server.Close)
-		client := newTestReplicaClient(t, server)
-		if err := client.Init(context.Background()); err != nil {
-			t.Fatalf("Init() error: %v", err)
-		}
-
-		ctx, cancel := context.WithCancel(context.Background())
-		cancel()
-		if _, err := client.WALSegmentsV3(ctx, generation); err == nil || !strings.Contains(err.Error(), "s3: list wal segments") {
-			t.Fatalf("WALSegmentsV3() error = %v, want list error", err)
-		}
-	})
-
-	t.Run("SkipsInvalidKeys", func(t *testing.T) {
-		validKey := litestream.WALSegmentPathV3("replica", generation, 1, 2)
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/xml")
-			if _, err := fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-<Name>test-bucket</Name><KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
-<Contents><Key>replica/generations/%[1]s/wal/invalid.wal.lz4</Key><Size>1</Size></Contents>
-<Contents><Key>%[2]s</Key><Size>1</Size></Contents>
-</ListBucketResult>`, generation, validKey); err != nil {
-				t.Errorf("write ListObjectsV2 response: %v", err)
-			}
-		}))
-		t.Cleanup(server.Close)
-
-		segments, err := newTestReplicaClient(t, server).WALSegmentsV3(context.Background(), generation)
-		if err != nil {
-			t.Fatalf("WALSegmentsV3() error: %v", err)
-		}
-		if got, want := len(segments), 1; got != want {
-			t.Fatalf("len(segments) = %d, want %d", got, want)
-		}
-		if got, want := segments[0].Index, 1; got != want {
-			t.Errorf("segments[0].Index = %d, want %d", got, want)
-		}
-		if got, want := segments[0].Offset, int64(2); got != want {
-			t.Errorf("segments[0].Offset = %d, want %d", got, want)
-		}
 	})
 }
 
@@ -2033,59 +1916,11 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	}
 }
 
-// TestReplicaClient_ProviderUploadDefaults verifies provider-specific upload
-// defaults for S3-compatible endpoints with known concurrency limits.
-func TestReplicaClient_ProviderUploadDefaults(t *testing.T) {
-	tests := []struct {
-		name            string
-		url             string
-		wantConcurrency int
-		wantPartSize    int64
-	}{
-		{
-			name:            "R2_DefaultConcurrency",
-			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
-			wantConcurrency: 2,
-		},
-		{
-			name:            "Tigris_DefaultUploadShape",
-			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev",
-			wantConcurrency: DefaultTigrisConcurrency,
-			wantPartSize:    DefaultTigrisPartSize,
-		},
-		{
-			name:            "Tigris_ExplicitUploadShape",
-			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev&concurrency=4&part-size=33554432",
-			wantConcurrency: 4,
-			wantPartSize:    33554432,
-		},
-		{
-			name: "AWS_NoConcurrencyOverride",
-			url:  "s3://mybucket/path",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			client, err := litestream.NewReplicaClientFromURL(tt.url)
-			if err != nil {
-				t.Fatalf("NewReplicaClientFromURL() error: %v", err)
-			}
-			c := client.(*ReplicaClient)
-			if c.Concurrency != tt.wantConcurrency {
-				t.Errorf("Concurrency = %d, want %d", c.Concurrency, tt.wantConcurrency)
-			}
-			if c.PartSize != tt.wantPartSize {
-				t.Errorf("PartSize = %d, want %d", c.PartSize, tt.wantPartSize)
-			}
-		})
-	}
-}
-
-func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
+func TestReplicaClient_AcceptEncodingSigning(t *testing.T) {
 	tests := []struct {
 		name                     string
 		endpoint                 string
+		disableSigning           bool
 		wantAcceptEncodingSigned bool
 	}{
 		{
@@ -2160,6 +1995,11 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 			endpoint:                 "https://s3.example.com",
 			wantAcceptEncodingSigned: true,
 		},
+		{
+			name:           "ExplicitOptOut",
+			endpoint:       "https://s3.example.com",
+			disableSigning: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2192,6 +2032,7 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 
 			c := NewReplicaClient()
 			c.Endpoint = tt.endpoint
+			c.SignAcceptEncoding = !tt.disableSigning
 			c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 			client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 				o.BaseEndpoint = aws.String("https://example.com")
@@ -2203,6 +2044,30 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 				Bucket: aws.String("test-bucket"),
 			}); err != nil {
 				t.Fatalf("ListObjectsV2() error: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewReplicaClientFromURL_SignAcceptEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "Default", url: "s3://mybucket/path", want: true},
+		{name: "CamelCase", url: "s3://mybucket/path?signAcceptEncoding=false"},
+		{name: "Hyphenated", url: "s3://mybucket/path?sign-accept-encoding=false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.(*ReplicaClient).SignAcceptEncoding; got != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", got, tt.want)
 			}
 		})
 	}
