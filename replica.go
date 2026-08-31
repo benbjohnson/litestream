@@ -594,6 +594,16 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 	return updatedAt, nil
 }
 
+// newRestoreDecoder returns an LTX decoder for paths that materialize a
+// database file and never read the decoder's page index. Retaining the index
+// would build a map with one entry per page, which dominates peak memory when
+// restoring large databases (#1486). Close still validates the index either way.
+func newRestoreDecoder(r io.Reader) *ltx.Decoder {
+	dec := ltx.NewDecoder(r)
+	dec.SetRetainPageIndex(false)
+	return dec
+}
+
 // Replica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
@@ -748,7 +758,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
-	dec := ltx.NewDecoder(pr)
+	dec := newRestoreDecoder(pr)
 	if err := dec.DecodeDatabaseTo(f); err != nil {
 		return fmt.Errorf("decode database: %w", err)
 	}
@@ -951,7 +961,7 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 	defer rc.Close()
 
-	dec := ltx.NewDecoder(rc)
+	dec := newRestoreDecoder(rc)
 	if err := dec.DecodeHeader(); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
