@@ -803,6 +803,9 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	// Close the pipe reader on failure so the compactor goroutine cannot stay
+	// blocked in a pipe write, then wait for it to finish so the deferred
+	// Cleanup never runs concurrently with Compact.
 	dec := newRestoreDecoder(pr)
 	decodeErr := dec.DecodeDatabaseTo(h.file)
 	_ = pr.CloseWithError(decodeErr)
