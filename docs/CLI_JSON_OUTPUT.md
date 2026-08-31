@@ -99,6 +99,37 @@ Outputs LTX file metadata for the selected database or replica URL.
 | `size` | number | LTX file size in bytes. |
 | `timestamp` | string | LTX file creation time in RFC 3339 format. |
 
+## `litestream monitor -json`
+
+Streams replication events from the control socket as newline-delimited JSON
+(NDJSON). Each line is one JSON object; this command does not write a single
+JSON document. The stream continues until the client disconnects.
+
+`full` events are the initial snapshot. The daemon emits one `full` event per
+database when the client connects. `sync` events are incremental updates emitted
+on each replica upload.
+
+```ndjson
+{"type":"full","timestamp":"2026-04-24T12:00:00Z","database":{"path":"/var/lib/app.db","enabled":true,"local_txid":"0000000000000004","replica_txid":"0000000000000004","last_sync_at":"2026-04-24T12:00:00Z","status":"ok"}}
+{"type":"sync","timestamp":"2026-04-24T12:00:10Z","database":{"path":"/var/lib/app.db","enabled":true,"replica_txid":"0000000000000005","status":"ok"}}
+```
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `type` | string | Event type: `full` for the initial per-database snapshot, or `sync` for a replica upload. |
+| `timestamp` | string | Event timestamp in RFC 3339 format. |
+| `database` | object | Database status payload. |
+| `database.path` | string | SQLite database path. |
+| `database.enabled` | boolean | Whether replication is enabled for the database in the daemon. |
+| `database.local_txid` | string | Latest local LTX transaction ID, when available. |
+| `database.replica_txid` | string | Latest transaction ID uploaded to the replica, when available. |
+| `database.last_sync_at` | string | Last successful replica sync time in RFC 3339 format, when available. |
+| `database.status` | string | Current database status: `ok`, `syncing`, `disabled`, `error`, or `initializing`. |
+| `database.sync_lag` | number | Difference between local and replica transaction IDs, when non-zero. |
+| `database.replica_type` | string | Replica client type, when configured. |
+| `database.db_size_bytes` | number | SQLite database file size in bytes, when available. |
+| `database.wal_size_bytes` | number | SQLite WAL file size in bytes, when available. |
+
 ## `litestream restore -json`
 
 Outputs a final summary object after a restore completes. Restore logs are
