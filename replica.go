@@ -854,7 +854,7 @@ func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) (
 	return readers, nil
 }
 
-func newRestoreCompactor(w io.Writer, rdrs []io.Reader) (*ltx.Compactor, error) {
+func newRestoreCompactor(w io.Writer, rdrs []io.Reader, spillDir string) (*ltx.Compactor, error) {
 	if len(rdrs) == 0 {
 		return nil, fmt.Errorf("at least one input reader required")
 	}
@@ -874,6 +874,7 @@ func newRestoreCompactor(w io.Writer, rdrs []io.Reader) (*ltx.Compactor, error) 
 	if err != nil {
 		return nil, err
 	}
+	c.SetSpillDir(spillDir)
 	if finalHeader.NoChecksum() {
 		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 	}
@@ -923,12 +924,16 @@ func (r *Replica) restorePlan(ctx context.Context, f *os.File, infos []*ltx.File
 	}()
 	go func() {
 		defer close(done)
-		c, err := newRestoreCompactor(pw, rdrs)
+		c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(f.Name()))
 		if err != nil {
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
-		_ = pw.CloseWithError(c.Compact(ctx))
+		err = c.Compact(ctx)
+		if cleanupErr := c.Cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleanup compactor: %w", cleanupErr))
+		}
+		_ = pw.CloseWithError(err)
 	}()
 	if err := newRestoreDecoder(pr).DecodeDatabaseTo(f); err != nil {
 		return fmt.Errorf("decode database: %w", err)

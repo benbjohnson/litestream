@@ -794,11 +794,10 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 
 	// Compact and decode using io.Pipe pattern
 	pr, pw := io.Pipe()
-	c, err := newRestoreCompactor(pw, rdrs)
+	c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(h.path))
 	if err != nil {
 		return fmt.Errorf("new ltx compactor: %w", err)
 	}
-	c.HeaderFlags = ltx.HeaderFlagNoChecksum
 	h.compactor = c
 
 	compactionDone := make(chan error, 1)
