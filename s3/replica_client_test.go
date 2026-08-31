@@ -2033,6 +2033,55 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	}
 }
 
+// TestReplicaClient_ProviderUploadDefaults verifies provider-specific upload
+// defaults for S3-compatible endpoints with known concurrency limits.
+func TestReplicaClient_ProviderUploadDefaults(t *testing.T) {
+	tests := []struct {
+		name            string
+		url             string
+		wantConcurrency int
+		wantPartSize    int64
+	}{
+		{
+			name:            "R2_DefaultConcurrency",
+			url:             "s3://mybucket/path?endpoint=https://account123.r2.cloudflarestorage.com",
+			wantConcurrency: 2,
+		},
+		{
+			name:            "Tigris_DefaultUploadShape",
+			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev",
+			wantConcurrency: DefaultTigrisConcurrency,
+			wantPartSize:    DefaultTigrisPartSize,
+		},
+		{
+			name:            "Tigris_ExplicitUploadShape",
+			url:             "s3://mybucket/path?endpoint=https://fly.storage.tigris.dev&concurrency=4&part-size=33554432",
+			wantConcurrency: 4,
+			wantPartSize:    33554432,
+		},
+		{
+			name: "AWS_NoConcurrencyOverride",
+			url:  "s3://mybucket/path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatalf("NewReplicaClientFromURL() error: %v", err)
+			}
+			c := client.(*ReplicaClient)
+			if c.Concurrency != tt.wantConcurrency {
+				t.Errorf("Concurrency = %d, want %d", c.Concurrency, tt.wantConcurrency)
+			}
+			if c.PartSize != tt.wantPartSize {
+				t.Errorf("PartSize = %d, want %d", c.PartSize, tt.wantPartSize)
+			}
+		})
+	}
+}
+
 func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 	tests := []struct {
 		name                     string

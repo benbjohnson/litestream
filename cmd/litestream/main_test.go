@@ -3199,6 +3199,12 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false for Tigris")
 		}
+		if client.Concurrency != s3.DefaultTigrisConcurrency {
+			t.Errorf("expected Tigris concurrency %d, got %d", s3.DefaultTigrisConcurrency, client.Concurrency)
+		}
+		if client.PartSize != s3.DefaultTigrisPartSize {
+			t.Errorf("expected Tigris part size %d, got %d", s3.DefaultTigrisPartSize, client.PartSize)
+		}
 	})
 
 	t.Run("TigrisConfigEndpoint", func(t *testing.T) {
@@ -3220,6 +3226,12 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false for config-based Tigris endpoint")
+		}
+		if client.Concurrency != s3.DefaultTigrisConcurrency {
+			t.Errorf("expected config-based Tigris concurrency %d, got %d", s3.DefaultTigrisConcurrency, client.Concurrency)
+		}
+		if client.PartSize != s3.DefaultTigrisPartSize {
+			t.Errorf("expected config-based Tigris part size %d, got %d", s3.DefaultTigrisPartSize, client.PartSize)
 		}
 	})
 

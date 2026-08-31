@@ -69,6 +69,13 @@ const DefaultMetadataConcurrency = 50
 // parts for Cloudflare R2, which has strict concurrent upload limits.
 const DefaultR2Concurrency = 2
 
+// DefaultTigrisConcurrency is the default number of concurrent multipart
+// upload parts for Tigris, which has strict concurrent upload limits.
+const DefaultTigrisConcurrency = 2
+
+// DefaultTigrisPartSize is the default multipart upload part size for Tigris.
+const DefaultTigrisPartSize = 16 * 1024 * 1024
+
 // contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
 // through the middleware stack from Serialize to Finalize phase.
 type contentMD5StackKey struct{}
@@ -252,6 +259,12 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		}
 		if !requireMD5Set {
 			requireMD5, requireMD5Set = false, true
+		}
+		if !concurrencySet {
+			client.Concurrency = DefaultTigrisConcurrency
+		}
+		if partSize == 0 {
+			client.PartSize = DefaultTigrisPartSize
 		}
 	}
 	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
