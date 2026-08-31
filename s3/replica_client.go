@@ -18,7 +18,6 @@ import (
 	"path"
 	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -84,19 +83,12 @@ type contentMD5StackKey struct{}
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
-var errIncompatibleFileReplicaLayout = errors.New("incompatible file replica layout detected")
-
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu              sync.Mutex
-	s3              *s3.Client // s3 service
-	uploader        *manager.Uploader
-	logger          *slog.Logger
-	fileLayoutState struct {
-		sync.Mutex
-		checked bool
-		err     error
-	}
+	mu       sync.Mutex
+	s3       *s3.Client // s3 service
+	uploader *manager.Uploader
+	logger   *slog.Logger
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -1530,9 +1522,6 @@ type fileIterator struct {
 	closed bool
 	err    error
 	info   *ltx.FileInfo
-
-	nativeLayout  bool
-	layoutChecked bool
 }
 
 func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
@@ -1639,44 +1628,6 @@ func (itr *fileIterator) Close() (err error) {
 	return itr.err
 }
 
-func (c *ReplicaClient) checkFileReplicaLayout(ctx context.Context, level int) error {
-	c.fileLayoutState.Lock()
-	defer c.fileLayoutState.Unlock()
-
-	if c.fileLayoutState.checked {
-		return c.fileLayoutState.err
-	}
-
-	err := c.detectFileReplicaLayout(ctx, level)
-	if err == nil || errors.Is(err, errIncompatibleFileReplicaLayout) {
-		c.fileLayoutState.checked = true
-		c.fileLayoutState.err = err
-	}
-	return err
-}
-
-func (c *ReplicaClient) detectFileReplicaLayout(ctx context.Context, level int) error {
-	prefix := c.Path + "/ltx/" + strconv.Itoa(level) + "/"
-	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
-		Bucket: aws.String(c.Bucket),
-		Prefix: aws.String(prefix),
-	})
-
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("s3: check replica layout: %w", err)
-		}
-		for _, obj := range page.Contents {
-			if _, _, err := ltx.ParseFilename(path.Base(aws.ToString(obj.Key))); err == nil {
-				return fmt.Errorf("s3: %w at %q; file:// replicas cannot be copied directly to s3:// because their storage layouts differ; restore the file replica locally and create a new s3:// replica", errIncompatibleFileReplicaLayout, prefix)
-			}
-		}
-	}
-
-	return nil
-}
-
 // Next returns the next file. Returns false when no more files are available.
 func (itr *fileIterator) Next() bool {
 	if itr.closed || itr.err != nil {
@@ -1688,10 +1639,6 @@ func (itr *fileIterator) Next() bool {
 		// Load next page if needed
 		if itr.page == nil || itr.pageIndex >= len(itr.page.Contents) {
 			if !itr.paginator.HasMorePages() {
-				if !itr.nativeLayout && !itr.layoutChecked && itr.level == litestream.SnapshotLevel {
-					itr.layoutChecked = true
-					itr.err = itr.client.checkFileReplicaLayout(itr.ctx, itr.level)
-				}
 				return false
 			}
 
@@ -1739,7 +1686,6 @@ func (itr *fileIterator) Next() bool {
 			if err != nil {
 				continue // Skip non-LTX files
 			}
-			itr.nativeLayout = true
 
 			// Build file info
 			info := &ltx.FileInfo{
