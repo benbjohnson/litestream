@@ -734,3 +734,52 @@ func TestNewRestoreCompactor(t *testing.T) {
 		t.Fatalf("spill dir not empty after cleanup: %d entries", len(ents))
 	}
 }
+
+func TestNewRestoreCompactor_ConsumerAbort(t *testing.T) {
+	const pageSize = 4096
+	pages := [][]byte{
+		newSQLiteHeaderPage(pageSize),
+		bytes.Repeat([]byte{0xA7}, pageSize),
+	}
+	snapshot := mustBuildSnapshotLTX(t, 1, 1, pageSize, pages)
+
+	spillDir := t.TempDir()
+	pr, pw := io.Pipe()
+	c, err := newRestoreCompactor(pw, []io.Reader{bytes.NewReader(snapshot)}, spillDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		err := c.Compact(context.Background())
+		_ = pw.CloseWithError(err)
+		done <- err
+	}()
+
+	hdr := make([]byte, ltx.HeaderSize)
+	if _, err := io.ReadFull(pr, hdr); err != nil {
+		t.Fatal(err)
+	}
+	_ = pr.CloseWithError(errors.New("consumer aborted"))
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected compact error after consumer abort")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("compactor still blocked after pipe reader closed")
+	}
+
+	if err := c.Cleanup(); err != nil {
+		t.Fatal(err)
+	}
+	ents, err := os.ReadDir(spillDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 {
+		t.Fatalf("spill dir not empty after cleanup: %d entries", len(ents))
+	}
+}

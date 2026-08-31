@@ -771,7 +771,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}()
 
 	dec := newRestoreDecoder(pr)
-	if err := dec.DecodeDatabaseTo(f); err != nil {
+	err = dec.DecodeDatabaseTo(f)
+	_ = pr.CloseWithError(err)
+	if err != nil {
 		return fmt.Errorf("decode database: %w", err)
 	}
 
