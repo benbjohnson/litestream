@@ -80,14 +80,13 @@ const resumableReaderMaxRetries = 3
 const resumableReaderBackoff = 250 * time.Millisecond
 
 func (r *ResumableReader) Read(p []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
 	for {
 		rc, err := r.stream()
 		if err != nil {
 			return 0, err
+		}
+		if r.err != nil {
+			return 0, r.err
 		}
 
 		// Reopen the stream from the current offset if the previous
