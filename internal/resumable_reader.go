@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -44,10 +45,17 @@ type ResumableReader struct {
 	maxTXID ltx.TXID
 	size    int64 // expected total file size from FileInfo; 0 means unknown
 	offset  int64
-	rc      io.ReadCloser
 	retryN  int
 	err     error
 	logger  *slog.Logger
+
+	// mu guards rc and closed. Close may be called from a different goroutine
+	// than Read: Compactor.Compact closes its source readers when it returns
+	// while its compaction goroutine may still be reading them. Once closed is
+	// set, Read must not reopen the stream or it would leak the new connection.
+	mu     sync.Mutex
+	rc     io.ReadCloser
+	closed bool
 }
 
 // NewResumableReader creates a ResumableReader. Primarily exposed for testing.
@@ -72,15 +80,19 @@ const resumableReaderMaxRetries = 3
 const resumableReaderBackoff = 250 * time.Millisecond
 
 func (r *ResumableReader) Read(p []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
 	for {
+		rc, err := r.stream()
+		if err != nil {
+			return 0, err
+		}
+		if r.err != nil {
+			return 0, r.err
+		}
+
 		// Reopen the stream from the current offset if the previous
-		// connection was closed (rc is nil after a retry).
-		if r.rc == nil {
-			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+		// connection was closed (the stream is nil after a retry).
+		if rc == nil {
+			newRC, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.ctx.Err() != nil {
 					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
@@ -93,10 +105,15 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 					"offset", r.offset, "error", err, "attempt", r.retryN)
 				continue
 			}
-			r.rc = rc
+			if !r.setStream(newRC) {
+				// Closed while the stream was being reopened.
+				_ = newRC.Close()
+				return 0, os.ErrClosed
+			}
+			rc = newRC
 		}
 
-		n, err := r.rc.Read(p)
+		n, err := rc.Read(p)
 		r.offset += int64(n)
 
 		if err == nil {
@@ -111,8 +128,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 				r.logger.Debug("premature EOF on ltx file, reconnecting",
 					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 					"offset", r.offset, "size", r.size, "attempt", r.retryN+1)
-				r.close()
-				r.rc = nil
+				r.dropStream()
 				if retryErr := r.retry(io.ErrUnexpectedEOF); retryErr != nil {
 					return n, retryErr
 				}
@@ -131,8 +147,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		r.logger.Debug("read error on ltx file, reconnecting",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"error", err, "offset", r.offset, "attempt", r.retryN+1)
-		r.close()
-		r.rc = nil
+		r.dropStream()
 		if retryErr := r.retry(err); retryErr != nil {
 			return n, retryErr
 		}
@@ -142,17 +157,64 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 	}
 }
 
+// Close closes the current underlying stream, if any, and marks the reader as
+// closed. Closing is permanent: subsequent reads fail with os.ErrClosed rather
+// than reopening the remote stream, which would leak the new connection.
 func (r *ResumableReader) Close() error {
-	if r.rc != nil {
-		return r.rc.Close()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	rc := r.rc
+	r.rc = nil
+	r.mu.Unlock()
+
+	if rc != nil {
+		return rc.Close()
 	}
 	return nil
 }
 
-func (r *ResumableReader) close() {
-	// The stream is already being discarded after a read failure, so a close
-	// error should not stop recovery. Log it only to aid debugging.
-	if err := r.rc.Close(); err != nil {
+// stream returns the current underlying stream, or nil if the next read should
+// reopen it. Returns os.ErrClosed if the reader has been closed.
+func (r *ResumableReader) stream() (io.ReadCloser, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, os.ErrClosed
+	}
+	return r.rc, nil
+}
+
+// setStream installs a newly reopened stream. It reports false if the reader
+// was closed while the stream was being opened, in which case the caller must
+// close the new stream itself.
+func (r *ResumableReader) setStream(rc io.ReadCloser) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	r.rc = rc
+	return true
+}
+
+// dropStream closes and clears the current stream after a read failure so the
+// next read reopens from the current offset. The stream is already being
+// discarded, so a close error should not stop recovery. Log it only to aid
+// debugging.
+func (r *ResumableReader) dropStream() {
+	r.mu.Lock()
+	rc := r.rc
+	r.rc = nil
+	r.mu.Unlock()
+
+	if rc == nil {
+		return
+	}
+	if err := rc.Close(); err != nil {
 		r.logger.Debug("close ltx file",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"offset", r.offset, "error", err)
