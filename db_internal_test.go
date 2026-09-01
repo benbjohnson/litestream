@@ -1029,7 +1029,7 @@ func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 1)
+	pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1044,6 +1044,170 @@ func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 	}
 	if got, want := len(pageMap), 2; got != want {
 		t.Fatalf("len(pageMap)=%d, want %d", got, want)
+	}
+}
+
+// TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction verifies that
+// a hard end offset is never read past, even when a transaction straddles it.
+// Regression test for #1490: the commit-frame break used to read a straddling
+// transaction through to its commit frame past the bound, which snapshotReader
+// then rejected with "snapshot wal read exceeded bound".
+func TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction(t *testing.T) {
+	// The fixture WAL holds two transactions: frames at offsets 32 and 4152
+	// committing at offset 8272, and one frame at offset 8272 committing at
+	// offset 12392.
+	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("MidTransaction", func(t *testing.T) {
+		r, err := NewWALReader(bytes.NewReader(b), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Bound inside the first transaction: the partial transaction must be
+		// discarded, not read through to its commit frame at offset 8272.
+		pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 0, 4152)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !limited {
+			t.Fatal("expected page map to stop at end offset")
+		}
+		if got, want := maxOffset, int64(0); got != want {
+			t.Fatalf("maxOffset=%d, want %d", got, want)
+		}
+		if got, want := commit, uint32(0); got != want {
+			t.Fatalf("commit=%d, want %d", got, want)
+		}
+		if got, want := len(pageMap), 0; got != want {
+			t.Fatalf("len(pageMap)=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("AtCommitBoundary", func(t *testing.T) {
+		r, err := NewWALReader(bytes.NewReader(b), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Bound exactly at the first transaction's commit frame end: the
+		// transaction must still be included.
+		pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 0, 8272)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !limited {
+			t.Fatal("expected page map to stop at end offset")
+		}
+		if got, want := maxOffset, int64(8272); got != want {
+			t.Fatalf("maxOffset=%d, want %d", got, want)
+		}
+		if got, want := commit, uint32(2); got != want {
+			t.Fatalf("commit=%d, want %d", got, want)
+		}
+		if got, want := len(pageMap), 2; got != want {
+			t.Fatalf("len(pageMap)=%d, want %d", got, want)
+		}
+	})
+}
+
+// TestDB_SnapshotReaderWALEndOffsetMidTransaction verifies that a snapshot
+// succeeds when the advertised WAL end offset lands inside a transaction.
+// Regression test for #1490: the snapshot WAL scan used to read the straddling
+// transaction through to its commit frame and then permanently fail with
+// "snapshot wal read exceeded bound".
+func TestDB_SnapshotReaderWALEndOffsetMidTransaction(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(100));`); err != nil {
+		t.Fatal(err)
+	}
+
+	// End the WAL with a transaction spanning multiple frames.
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(8000));`); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rewind the advertised WAL end by one frame so it lands inside the final
+	// multi-frame transaction, as a stale lastSyncedWALOffset can after a WAL
+	// restart.
+	frameSize := int64(WALFrameHeaderSize) + int64(db.PageSize())
+	db.mu.Lock()
+	db.syncState.lastSyncedWALOffset -= frameSize
+	walEndOffset := db.syncState.lastSyncedWALOffset
+	db.mu.Unlock()
+
+	wal, err := os.ReadFile(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if commit := binary.BigEndian.Uint32(wal[walEndOffset-frameSize+4:]); commit != 0 {
+		t.Fatalf("precondition: wal end offset %d must land inside a transaction", walEndOffset)
+	}
+
+	_, r, err := db.SnapshotReader(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	var buf bytes.Buffer
+	if _, err := io.Copy(&buf, r); err != nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+
+	dec := ltx.NewDecoder(bytes.NewReader(buf.Bytes()))
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	if got := dec.Header().WALOffset + dec.Header().WALSize; got > walEndOffset {
+		t.Fatalf("snapshot wal range end=%d exceeds advertised wal end offset %d", got, walEndOffset)
+	}
+	pageBuf := make([]byte, db.PageSize())
+	for {
+		var phdr ltx.PageHeader
+		if err := dec.DecodePage(&phdr, pageBuf); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := dec.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 
