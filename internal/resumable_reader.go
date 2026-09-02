@@ -117,6 +117,9 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		r.offset += int64(n)
 
 		if err == nil {
+			if n > 0 && n == len(p) {
+				r.retryN = 0
+			}
 			return n, nil
 		}
 
