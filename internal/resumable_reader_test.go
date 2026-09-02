@@ -376,9 +376,48 @@ func TestResumableReader_BoundsConnectionsAcrossPartialReads(t *testing.T) {
 	_, err := io.ReadAll(r)
 	if err == nil {
 		t.Error("ReadAll() error=nil, want retry limit error")
+	} else if !strings.Contains(err.Error(), "max retries exceeded") {
+		t.Errorf("ReadAll() error=%v, want retry limit error", err)
 	}
 	if got, max := connectionN.Load(), int64(resumableReaderMaxRetries+1); got > max {
 		t.Errorf("connections=%d, want at most %d", got, max)
+	}
+}
+
+func TestResumableReader_ResetsRetriesAfterCompleteRead(t *testing.T) {
+	const (
+		readSize     = 4 * 1024
+		progressSize = 64 * 1024
+		disconnectN  = resumableReaderMaxRetries + 2
+	)
+	data := bytes.Repeat([]byte("0123456789abcdef"), ((disconnectN+1)*progressSize)/16)
+	openN := 0
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			openN++
+			if openN <= disconnectN {
+				return io.NopCloser(&errorAfterN{
+					data: data[offset:],
+					n:    progressSize,
+					err:  fmt.Errorf("connection reset"),
+				}), nil
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:])), nil
+		},
+	}
+
+	r := newTestResumableReader(client, int64(len(data)), data)
+	got := make([]byte, len(data))
+	for offset := 0; offset < len(got); offset += readSize {
+		if _, err := io.ReadFull(r, got[offset:offset+readSize]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("read %d bytes, want %d", len(got), len(data))
+	}
+	if got, want := openN, disconnectN+1; got != want {
+		t.Fatalf("OpenLTXFile() count=%d, want %d", got, want)
 	}
 }
 
