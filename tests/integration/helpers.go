@@ -179,8 +179,26 @@ func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize i
 	return nil
 }
 
+const loadGenerationTimeoutMargin = 30 * time.Second
+
+func newLoadGenerationContext(ctx context.Context, duration time.Duration) (context.Context, func()) {
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), duration+loadGenerationTimeoutMargin)
+	stopCancel := context.AfterFunc(ctx, func() {
+		if ctx.Err() == context.Canceled {
+			cancel()
+		}
+	})
+	return loadCtx, func() {
+		stopCancel()
+		cancel()
+	}
+}
+
 func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time.Duration, pattern string) error {
-	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), "load",
+	loadCtx, cancel := newLoadGenerationContext(ctx, duration)
+	defer cancel()
+
+	cmd := exec.CommandContext(loadCtx, getBinaryPath("litestream-test"), "load",
 		"-db", db.Path,
 		"-write-rate", fmt.Sprintf("%d", writeRate),
 		"-duration", duration.String(),
@@ -215,7 +233,10 @@ func (db *TestDB) GenerateLoadWithOptions(ctx context.Context, writeRate int, du
 		args = append(args, "-payload-size", fmt.Sprintf("%d", payloadSize))
 	}
 
-	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), args...)
+	loadCtx, cancel := newLoadGenerationContext(ctx, duration)
+	defer cancel()
+
+	cmd := exec.CommandContext(loadCtx, getBinaryPath("litestream-test"), args...)
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 
 	db.t.Logf("Starting load generation: %d writes/sec for %v (%s pattern, %d workers, %d byte payload)",
