@@ -179,8 +179,40 @@ func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize i
 	return nil
 }
 
+const (
+	loadGenerationTimeoutMargin     = 30 * time.Second
+	loadGenerationDeadlineTolerance = time.Second
+)
+
+func deadlineMatchesLoadDuration(ctx context.Context, duration time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	delta := time.Until(deadline) - duration
+	return delta >= -loadGenerationDeadlineTolerance && delta <= loadGenerationDeadlineTolerance
+}
+
+func newLoadGenerationContext(ctx context.Context, duration time.Duration) (context.Context, context.CancelFunc) {
+	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), duration+loadGenerationTimeoutMargin)
+	completionDeadline := deadlineMatchesLoadDuration(ctx, duration)
+	stopCancel := context.AfterFunc(ctx, func() {
+		if ctx.Err() == context.DeadlineExceeded && completionDeadline {
+			return
+		}
+		cancel()
+	})
+	return loadCtx, func() {
+		stopCancel()
+		cancel()
+	}
+}
+
 func (db *TestDB) GenerateLoad(ctx context.Context, writeRate int, duration time.Duration, pattern string) error {
-	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), "load",
+	loadCtx, cancel := newLoadGenerationContext(ctx, duration)
+	defer cancel()
+
+	cmd := exec.CommandContext(loadCtx, getBinaryPath("litestream-test"), "load",
 		"-db", db.Path,
 		"-write-rate", fmt.Sprintf("%d", writeRate),
 		"-duration", duration.String(),
@@ -215,7 +247,10 @@ func (db *TestDB) GenerateLoadWithOptions(ctx context.Context, writeRate int, du
 		args = append(args, "-payload-size", fmt.Sprintf("%d", payloadSize))
 	}
 
-	cmd := exec.CommandContext(ctx, getBinaryPath("litestream-test"), args...)
+	loadCtx, cancel := newLoadGenerationContext(ctx, duration)
+	defer cancel()
+
+	cmd := exec.CommandContext(loadCtx, getBinaryPath("litestream-test"), args...)
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 
 	db.t.Logf("Starting load generation: %d writes/sec for %v (%s pattern, %d workers, %d byte payload)",
