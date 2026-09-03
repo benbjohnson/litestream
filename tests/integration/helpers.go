@@ -179,14 +179,28 @@ func (db *TestDB) PopulateWithOptions(targetSize string, pageSize int, rowSize i
 	return nil
 }
 
-const loadGenerationTimeoutMargin = 30 * time.Second
+const (
+	loadGenerationTimeoutMargin     = 30 * time.Second
+	loadGenerationDeadlineTolerance = time.Second
+)
 
-func newLoadGenerationContext(ctx context.Context, duration time.Duration) (context.Context, func()) {
+func deadlineMatchesLoadDuration(ctx context.Context, duration time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return false
+	}
+	delta := time.Until(deadline) - duration
+	return delta >= -loadGenerationDeadlineTolerance && delta <= loadGenerationDeadlineTolerance
+}
+
+func newLoadGenerationContext(ctx context.Context, duration time.Duration) (context.Context, context.CancelFunc) {
 	loadCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), duration+loadGenerationTimeoutMargin)
+	completionDeadline := deadlineMatchesLoadDuration(ctx, duration)
 	stopCancel := context.AfterFunc(ctx, func() {
-		if ctx.Err() == context.Canceled {
-			cancel()
+		if ctx.Err() == context.DeadlineExceeded && completionDeadline {
+			return
 		}
+		cancel()
 	})
 	return loadCtx, func() {
 		stopCancel()
