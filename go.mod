@@ -2,6 +2,8 @@ module github.com/benbjohnson/litestream
 
 go 1.26.0
 
+toolchain go1.26.8
+
 require (
 	cloud.google.com/go/storage v1.36.0
 	github.com/Azure/azure-sdk-for-go/sdk/azcore v1.18.2
