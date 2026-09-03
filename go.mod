@@ -1,8 +1,6 @@
 module github.com/benbjohnson/litestream
 
-go 1.25.0
-
-toolchain go1.25.14
+go 1.26.0
 
 require (
 	cloud.google.com/go/storage v1.36.0
@@ -28,7 +26,7 @@ require (
 	github.com/psanford/sqlite3vfs v0.0.0-20260519004904-f9180fa2acc9 // direct
 	github.com/studio-b12/gowebdav v0.11.0
 	github.com/superfly/ltx v0.5.2
-	golang.org/x/crypto v0.55.0
+	golang.org/x/crypto v0.56.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/api v0.155.0
 	gopkg.in/yaml.v2 v2.4.0
