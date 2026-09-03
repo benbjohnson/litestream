@@ -470,8 +470,12 @@ func TestResumableReader_ContextCancelDuringReopen(t *testing.T) {
 	}()
 
 	r := NewResumableReader(ctx, client, 2, 1, 2, 11, nil, slog.Default())
-	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
+	_, err := r.Read(make([]byte, 1))
+	if !errors.Is(err, context.Canceled) {
 		t.Errorf("Read() error=%v, want an error wrapping context.Canceled", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("Read() error=%v, want connection reset context", err)
 	}
 	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
 		t.Errorf("second Read() error=%v, want an error wrapping context.Canceled", err)
