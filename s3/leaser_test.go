@@ -267,6 +267,41 @@ func TestLeaser_RenewLease(t *testing.T) {
 	}
 }
 
+func TestLeaser_RenewLease_Hetzner(t *testing.T) {
+	oldETag := `"old-etag"`
+	newETag := `"new-etag"`
+	var receivedIfMatch string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			receivedIfMatch = r.Header.Get("If-Match")
+			w.Header().Set("ETag", newETag)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+	leaser.Endpoint = "https://fsn1.your-objectstorage.com"
+
+	lease, err := leaser.RenewLease(context.Background(), &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Second),
+		Owner:      "me",
+		ETag:       oldETag,
+	})
+	if err != nil {
+		t.Fatalf("RenewLease() error: %v", err)
+	}
+
+	if receivedIfMatch != "old-etag" {
+		t.Errorf("expected unquoted If-Match=%q, got %q", "old-etag", receivedIfMatch)
+	}
+	if lease.ETag != newETag {
+		t.Errorf("expected ETag=%q, got %q", newETag, lease.ETag)
+	}
+}
+
 func TestLeaser_RenewLease_LostLease(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
@@ -360,6 +395,118 @@ func TestLeaser_ReleaseLease(t *testing.T) {
 	}
 	if receivedIfMatch != `"my-etag"` {
 		t.Errorf("expected If-Match=%q, got %q", `"my-etag"`, receivedIfMatch)
+	}
+}
+
+func TestLeaser_ReleaseLease_Hetzner(t *testing.T) {
+	var putCalled atomic.Bool
+	var receivedIfMatch string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPut {
+			t.Errorf("expected PUT, got %s", r.Method)
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		putCalled.Store(true)
+		receivedIfMatch = r.Header.Get("If-Match")
+
+		var releasedLease litestream.Lease
+		if err := json.NewDecoder(r.Body).Decode(&releasedLease); err != nil {
+			t.Errorf("decode lease: %v", err)
+		}
+		if !releasedLease.IsExpired() {
+			t.Errorf("expected expired lease, got expires_at=%s", releasedLease.ExpiresAt)
+		}
+		if releasedLease.Generation != 5 {
+			t.Errorf("expected generation=5, got %d", releasedLease.Generation)
+		}
+		if releasedLease.Owner != "me" {
+			t.Errorf("expected owner=%q, got %q", "me", releasedLease.Owner)
+		}
+
+		w.Header().Set("ETag", `"released-etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+	leaser.Endpoint = "https://fsn1.your-objectstorage.com"
+	lease := &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       `"my-etag"`,
+	}
+
+	if err := leaser.ReleaseLease(context.Background(), lease); err != nil {
+		t.Fatalf("ReleaseLease() error: %v", err)
+	}
+	if !putCalled.Load() {
+		t.Error("expected PUT to be called")
+	}
+	if receivedIfMatch != "my-etag" {
+		t.Errorf("expected unquoted If-Match=%q, got %q", "my-etag", receivedIfMatch)
+	}
+}
+
+func TestLeaser_ReleaseLease_HetznerStaleETag(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusPreconditionFailed)
+		case http.MethodGet:
+			w.Header().Set("ETag", `"current-etag"`)
+			_ = json.NewEncoder(w).Encode(&litestream.Lease{
+				Generation: 6,
+				ExpiresAt:  time.Now().Add(time.Minute),
+				Owner:      "new-owner",
+			})
+		default:
+			t.Errorf("expected PUT or GET, got %s", r.Method)
+		}
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+	leaser.Endpoint = "https://fsn1.your-objectstorage.com"
+	lease := &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       `"stale-etag"`,
+	}
+
+	if err := leaser.ReleaseLease(context.Background(), lease); err != litestream.ErrLeaseNotHeld {
+		t.Errorf("expected ErrLeaseNotHeld for stale ETag, got %v", err)
+	}
+}
+
+func TestLeaser_ReleaseLease_HetznerAlreadyReleased(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodPut:
+			w.WriteHeader(http.StatusPreconditionFailed)
+		case http.MethodGet:
+			w.WriteHeader(http.StatusNotFound)
+		default:
+			t.Errorf("expected PUT or GET, got %s", r.Method)
+		}
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+	leaser.Endpoint = "https://fsn1.your-objectstorage.com"
+	lease := &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Minute),
+		Owner:      "me",
+		ETag:       `"released-etag"`,
+	}
+
+	if err := leaser.ReleaseLease(context.Background(), lease); !errors.Is(err, ErrLeaseAlreadyReleased) {
+		t.Errorf("expected ErrLeaseAlreadyReleased, got %v", err)
 	}
 }
 
@@ -595,6 +742,9 @@ func TestReplicaClient_NewLeaser(t *testing.T) {
 	}
 	if leaser.Path != client.Path {
 		t.Fatalf("leaser.Path=%q, want %q", leaser.Path, client.Path)
+	}
+	if leaser.Endpoint != client.Endpoint {
+		t.Fatalf("leaser.Endpoint=%q, want %q", leaser.Endpoint, client.Endpoint)
 	}
 	if leaser.Client() == nil {
 		t.Fatal("expected leaser client")
