@@ -43,10 +43,11 @@ type Leaser struct {
 	s3     S3API
 	logger *slog.Logger
 
-	Bucket string
-	Path   string
-	TTL    time.Duration
-	Owner  string
+	Bucket   string
+	Path     string
+	Endpoint string
+	TTL      time.Duration
+	Owner    string
 }
 
 func NewLeaser() *Leaser {
@@ -176,26 +177,54 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 		return ErrLeaseETagRequired
 	}
 
-	key := l.lockKey()
-	_, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
-		Bucket:  aws.String(l.Bucket),
-		Key:     aws.String(key),
-		IfMatch: aws.String(lease.ETag),
-	})
-	if err != nil {
-		if isNotExists(err) || isNotFoundError(err) {
-			return ErrLeaseAlreadyReleased
+	if litestream.IsHetznerEndpoint(l.Endpoint) {
+		// Hetzner ignores If-Match on DELETE requests. Replace the lock with an
+		// expired lease instead so a stale owner cannot delete a newer lease.
+		if err := l.releaseLeaseByWrite(ctx, lease); err != nil {
+			return err
 		}
-		if isPreconditionFailed(err) {
-			return litestream.ErrLeaseNotHeld
+	} else {
+		key := l.lockKey()
+		_, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
+			Bucket:  aws.String(l.Bucket),
+			Key:     aws.String(key),
+			IfMatch: aws.String(lease.ETag),
+		})
+		if err != nil {
+			if isNotExists(err) || isNotFoundError(err) {
+				return ErrLeaseAlreadyReleased
+			}
+			if isPreconditionFailed(err) {
+				return litestream.ErrLeaseNotHeld
+			}
+			return fmt.Errorf("delete lease: %w", err)
 		}
-		return fmt.Errorf("delete lease: %w", err)
 	}
 
 	l.logger.Debug("lease released",
 		"generation", lease.Generation,
 		"owner", lease.Owner)
 
+	return nil
+}
+
+func (l *Leaser) releaseLeaseByWrite(ctx context.Context, lease *litestream.Lease) error {
+	releasedLease := *lease
+	releasedLease.ExpiresAt = time.Time{}
+	if _, err := l.writeLease(ctx, &releasedLease, lease.ETag); err != nil {
+		var leaseErr *litestream.LeaseExistsError
+		if !errors.As(err, &leaseErr) {
+			return fmt.Errorf("expire lease: %w", err)
+		}
+
+		if _, _, readErr := l.readLease(ctx); readErr != nil {
+			if errors.Is(readErr, os.ErrNotExist) {
+				return ErrLeaseAlreadyReleased
+			}
+			return fmt.Errorf("read lease after failed release: %w", readErr)
+		}
+		return litestream.ErrLeaseNotHeld
+	}
 	return nil
 }
 
@@ -246,7 +275,7 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 	if etag == "" {
 		input.IfNoneMatch = aws.String("*")
 	} else {
-		input.IfMatch = aws.String(etag)
+		input.IfMatch = aws.String(l.ifMatchETag(etag))
 	}
 
 	out, err := l.s3.PutObject(ctx, input)
@@ -263,6 +292,15 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 	}
 
 	return newETag, nil
+}
+
+func (l *Leaser) ifMatchETag(etag string) string {
+	// Hetzner returns quoted ETags but only accepts the unquoted value in
+	// If-Match headers on PUT requests.
+	if litestream.IsHetznerEndpoint(l.Endpoint) && len(etag) >= 2 && etag[0] == '"' && etag[len(etag)-1] == '"' {
+		return etag[1 : len(etag)-1]
+	}
+	return etag
 }
 
 func isPreconditionFailed(err error) bool {
