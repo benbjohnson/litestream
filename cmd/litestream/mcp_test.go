@@ -666,6 +666,14 @@ func TestMCPServerBearerAuthConfig(t *testing.T) {
 	}{
 		{name: "token absent", wantStatus: http.StatusOK},
 		{name: "token configured", config: "mcp-auth-token: secret\n", wantStatus: http.StatusUnauthorized},
+		{name: "token empty", config: "mcp-auth-token: ''\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token null", config: "mcp-auth-token: null\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token blank", config: "mcp-auth-token: '   '\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token leading space", config: "mcp-auth-token: ' secret'\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token trailing space", config: "mcp-auth-token: 'secret '\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token multiline", config: "mcp-auth-token: |\n  secret\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token control", config: "mcp-auth-token: \"secret\\u0001\"\n", wantErr: ErrInvalidMCPAuthToken},
+		{name: "token unicode space", config: "mcp-auth-token: 'secret\u00a0'\n", wantErr: ErrInvalidMCPAuthToken},
 		{name: "token environment missing", config: "mcp-auth-token: ${" + envName + "}\n", wantErr: ErrInvalidMCPAuthToken},
 	}
 
@@ -675,6 +683,9 @@ func TestMCPServerBearerAuthConfig(t *testing.T) {
 			if test.wantErr != nil {
 				if !errors.Is(err, test.wantErr) {
 					t.Fatalf("error=%v, want %v", err, test.wantErr)
+				}
+				if strings.Contains(err.Error(), "secret") {
+					t.Fatal("validation error exposes the token")
 				}
 				return
 			}
@@ -859,7 +870,7 @@ func setVersion(t *testing.T, version string) {
 
 func TestMCPServerLifecycle(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	server, err := NewMCP(ctx, "")
+	server, err := NewMCP(ctx, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -874,7 +885,7 @@ func TestMCPServerLifecycle(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	other, err := NewMCP(ctx, "")
+	other, err := NewMCP(ctx, "", "")
 	if err != nil {
 		t.Fatal(err)
 	}

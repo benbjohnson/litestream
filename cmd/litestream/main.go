@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/dustin/go-humanize"
 	"github.com/superfly/ltx"
@@ -60,7 +61,7 @@ var (
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
 	ErrInvalidHeartbeatURL             = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
 	ErrInvalidHeartbeatInterval        = errors.New("heartbeat interval must be at least 1 minute")
-	ErrInvalidMCPAuthToken             = errors.New("mcp auth token must not be empty")
+	ErrInvalidMCPAuthToken             = errors.New("mcp auth token must not be empty or contain whitespace or control characters")
 	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
@@ -426,7 +427,9 @@ func DefaultConfig() Config {
 
 // Validate returns an error if config contains invalid settings.
 func (c *Config) Validate() error {
-	if c.MCPAuthToken != nil && *c.MCPAuthToken == "" {
+	if c.MCPAuthToken != nil && (*c.MCPAuthToken == "" || strings.ContainsFunc(*c.MCPAuthToken, func(r rune) bool {
+		return unicode.IsSpace(r) || unicode.IsControl(r)
+	})) {
 		return &ConfigValidationError{
 			Err:   ErrInvalidMCPAuthToken,
 			Field: "mcp-auth-token",
