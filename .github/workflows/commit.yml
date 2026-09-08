@@ -177,6 +177,11 @@ jobs:
       - name: Test v0.3 WAL ordering on 32-bit
         run: CGO_ENABLED=0 GOOS=linux GOARCH=386 go test -v ./file ./s3 -run '^TestReplicaClient_WALSegmentsV3$'
 
+      - name: Compile command tests for 32-bit Linux ARM
+        run: |
+          GOOS=linux GOARCH=arm GOARM=6 go test -c -o /dev/null ./cmd/litestream
+          GOOS=linux GOARCH=arm GOARM=7 go test -c -o /dev/null ./cmd/litestream
+
   ltx-behavioral-gate:
     name: LTX Behavioral Gate (short)
     runs-on: ubuntu-latest
