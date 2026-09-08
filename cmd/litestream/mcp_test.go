@@ -184,6 +184,26 @@ func TestMCPServerTools(t *testing.T) {
 			t.Errorf("%s required properties=%v, want %v", tool.Name, got, test.required)
 		}
 
+		daemonProperties := map[string][]string{
+			"litestream_list":        {"databases"},
+			"litestream_sync":        {"path", "replicated_txid", "status", "txid"},
+			"litestream_daemon_info": {"database_count", "pid", "started_at", "uptime_seconds", "version"},
+			"litestream_start":       {"path", "status", "txid"},
+			"litestream_stop":        {"path", "status", "txid"},
+			"litestream_register":    {"path", "status"},
+			"litestream_unregister":  {"path", "status", "txid"},
+		}
+		if want, ok := daemonProperties[tool.Name]; ok {
+			schema := jsonObject(t, tool.OutputSchema)
+			if got := slices.Sorted(maps.Keys(schemaProperties(t, schema))); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s output properties=%v, want %v", tool.Name, got, want)
+			}
+			if got := schemaRequired(schema); !reflect.DeepEqual(got, want) {
+				t.Errorf("%s required output properties=%v, want %v", tool.Name, got, want)
+			}
+			continue
+		}
+
 		outputSchema := jsonObject(t, tool.OutputSchema)
 		outputProperties := schemaProperties(t, outputSchema)
 		if got := slices.Sorted(maps.Keys(outputProperties)); !reflect.DeepEqual(got, []string{"text"}) {
@@ -369,9 +389,11 @@ func TestMCPDaemonToolBehavior(t *testing.T) {
 
 			text := textContent(t, result)
 			assertJSONEqual(t, []byte(text), []byte(responses[test.path]))
-			if got, want := result.StructuredContent, map[string]any{"text": text}; !reflect.DeepEqual(got, want) {
-				t.Fatalf("structured content=%v, want %v", got, want)
+			structured, err := json.Marshal(result.StructuredContent)
+			if err != nil {
+				t.Fatal(err)
 			}
+			assertJSONEqual(t, structured, []byte(responses[test.path]))
 		})
 	}
 }
@@ -459,41 +481,44 @@ func TestMCPDaemonToolContextCancellation(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires Unix sockets")
 	}
+	for _, cause := range []error{context.Canceled, errors.New("daemon request canceled by caller")} {
+		t.Run(cause.Error(), func(t *testing.T) {
+			requestStarted := make(chan struct{})
+			handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+				close(requestStarted)
+				<-r.Context().Done()
+			})
+			socketPath := startMCPDaemonTestServer(t, handler)
 
-	requestStarted := make(chan struct{})
-	handler := http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		close(requestStarted)
-		<-r.Context().Done()
-	})
-	socketPath := startMCPDaemonTestServer(t, handler)
+			_, toolHandler := DaemonInfoTool()
+			ctx, cancel := context.WithCancelCause(t.Context())
+			t.Cleanup(func() { cancel(context.Canceled) })
+			timeout := 10
+			done := make(chan daemonToolCallResult, 1)
+			go func() {
+				result, _, err := toolHandler(ctx, nil, daemonInfoInput{Socket: &socketPath, Timeout: &timeout})
+				done <- daemonToolCallResult{result: result, err: err}
+			}()
 
-	_, toolHandler := DaemonInfoTool()
-	ctx, cancel := context.WithCancel(t.Context())
-	t.Cleanup(cancel)
-	timeout := 10
-	done := make(chan daemonToolCallResult, 1)
-	go func() {
-		result, _, err := toolHandler(ctx, nil, daemonInfoInput{Socket: &socketPath, Timeout: &timeout})
-		done <- daemonToolCallResult{result: result, err: err}
-	}()
+			select {
+			case <-requestStarted:
+				cancel(cause)
+			case <-time.After(2 * time.Second):
+				t.Fatal("daemon request did not start")
+			}
 
-	select {
-	case <-requestStarted:
-		cancel()
-	case <-time.After(2 * time.Second):
-		t.Fatal("daemon request did not start")
-	}
-
-	select {
-	case call := <-done:
-		if !errors.Is(call.err, context.Canceled) {
-			t.Fatalf("error=%v, want context canceled", call.err)
-		}
-		if call.result != nil {
-			t.Fatalf("result=%v, want nil", call.result)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("daemon tool did not return after context cancellation")
+			select {
+			case call := <-done:
+				if !errors.Is(call.err, cause) {
+					t.Fatalf("error=%v, want %v", call.err, cause)
+				}
+				if call.result != nil {
+					t.Fatalf("result=%v, want nil", call.result)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("daemon tool did not return after context cancellation")
+			}
+		})
 	}
 }
 
