@@ -3,8 +3,10 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os/exec"
 	"slices"
@@ -24,6 +26,10 @@ type MCPServer struct {
 	mux        *http.ServeMux
 	mcpServer  *mcp.Server
 	httpServer *http.Server
+	httpCancel context.CancelFunc
+	errCh      chan error
+	httpDone   chan struct{}
+	httpErr    error
 	configPath string
 }
 
@@ -82,18 +88,65 @@ func newMCPHandler(mcpServer *mcp.Server) http.Handler {
 	return httplog.Logger(protection.Handler(originHandler))
 }
 
-func (s *MCPServer) Start(addr string) {
-	s.httpServer = &http.Server{
-		Addr:              addr,
-		Handler:           s.mux,
+func (s *MCPServer) Start(addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for MCP HTTP server: %w", err)
+	}
+	s.httpServer = s.newHTTPServer(s.ctx, listener.Addr().String())
+	s.errCh = make(chan error, 1)
+	s.httpDone = make(chan struct{})
+	go func() {
+		s.httpErr = s.runHTTP(s.ctx, listener)
+		s.errCh <- s.httpErr
+		close(s.httpDone)
+	}()
+	return nil
+}
+
+func (s *MCPServer) runHTTP(ctx context.Context, listener net.Listener) error {
+	defer s.httpCancel()
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("Starting MCP Streamable HTTP server", "addr", listener.Addr().String())
+		errCh <- s.httpServer.Serve(listener)
+	}()
+
+	select {
+	case <-ctx.Done():
+		if err := s.shutdownHTTP(); err != nil {
+			shutdownErr := fmt.Errorf("close MCP HTTP server: %w", err)
+			if err := s.httpServer.Close(); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("force close MCP HTTP server: %w", err))
+			}
+			if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("serve MCP HTTP server: %w", err))
+			}
+			return shutdownErr
+		}
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve MCP HTTP server: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve MCP HTTP server: %w", err)
+		}
+		return nil
+	}
+}
+
+func (s *MCPServer) newHTTPServer(ctx context.Context, addr string) *http.Server {
+	httpCtx, cancel := context.WithCancel(ctx)
+	s.httpCancel = cancel
+	return &http.Server{
+		Addr:    addr,
+		Handler: s.mux,
+		BaseContext: func(net.Listener) context.Context {
+			return httpCtx
+		},
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	go func() {
-		slog.Info("Starting MCP Streamable HTTP server", "addr", addr)
-		if err := s.httpServer.ListenAndServe(); err != nil {
-			slog.Error("MCP server error", "error", err)
-		}
-	}()
 }
 
 func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -102,7 +155,25 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Close attempts to gracefully shutdown the server.
 func (s *MCPServer) Close() error {
-	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	err := s.shutdownHTTP()
+	if s.httpDone != nil {
+		if err != nil {
+			err = errors.Join(err, s.httpServer.Close())
+		}
+		<-s.httpDone
+		err = errors.Join(err, s.httpErr)
+	}
+	return err
+}
+
+func (s *MCPServer) shutdownHTTP() error {
+	if s.httpServer == nil {
+		return nil
+	}
+	if s.httpCancel != nil {
+		s.httpCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), 10*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
 }
