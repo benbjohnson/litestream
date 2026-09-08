@@ -23,6 +23,7 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
 )
 
@@ -884,5 +885,87 @@ func TestMCPResourceCleanupPreservesErrors(t *testing.T) {
 	}
 	if client.closeN != 1 {
 		t.Fatalf("close calls=%d, want 1", client.closeN)
+	}
+}
+
+func TestRestorePlanPreservesExistingOutput(t *testing.T) {
+	fixture := newMCPTestFixture(t)
+	outputPath := filepath.Join(t.TempDir(), "existing.sqlite")
+	const original = "existing database contents"
+	if err := os.WriteFile(outputPath, []byte(original), 0600); err != nil {
+		t.Fatal(err)
+	}
+	callMCPToolText(t, handlerFromMCPTool(RestorePlanTool("")), map[string]any{
+		"path":   "file://" + fixture.replicaPath,
+		"output": outputPath,
+	})
+	if got, err := os.ReadFile(outputPath); err != nil || string(got) != original {
+		t.Fatalf("output=%q, error=%v; want original contents", got, err)
+	}
+}
+
+func TestRestorePlanPreservesCancellationCause(t *testing.T) {
+	fixture := newMCPTestFixture(t)
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("preview canceled by caller")
+	cancel(cause)
+	_, handler := RestorePlanTool("")
+	result, err := handler(ctx, mcp.CallToolRequest{
+		Params: mcp.CallToolParams{Arguments: map[string]any{"path": "file://" + fixture.replicaPath}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.IsError || !strings.Contains(mcpToolResultText(t, result), cause.Error()) {
+		t.Fatalf("preview did not preserve cancellation: %#v", result)
+	}
+}
+
+func TestMCPRestoreLegacyPreviewAndIntegrity(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(fmt.Sprintf("mixed=%t", mixed), func(t *testing.T) {
+			replicaPath, outputPath := createLegacyRestoreCommandTestData(t, mixed)
+			const original = "existing output"
+			if err := os.WriteFile(outputPath, []byte(original), 0600); err != nil {
+				t.Fatal(err)
+			}
+			arguments := map[string]any{"path": "file://" + replicaPath, "output": outputPath}
+			result := callMCPToolResult(t, handlerFromMCPTool(RestorePlanTool("")), arguments)
+			if !result.IsError || !strings.Contains(mcpToolResultText(t, result), "legacy backups") {
+				t.Fatalf("expected unsupported legacy preview: %#v", result)
+			}
+			if mixed {
+				arguments["txid"] = "0000000000000001"
+				callMCPToolText(t, handlerFromMCPTool(RestorePlanTool("")), arguments)
+			}
+			if got, err := os.ReadFile(outputPath); err != nil || string(got) != original {
+				t.Fatalf("output=%q, error=%v; want original contents", got, err)
+			}
+
+			for _, mode := range []string{"none", "quick", "full"} {
+				t.Run(mode, func(t *testing.T) {
+					path := filepath.Join(t.TempDir(), "restored.sqlite")
+					text := callMCPToolText(t, handlerFromMCPTool(RestoreTool("")), map[string]any{
+						"path": "file://" + replicaPath, "output": path, "integrity_check": mode,
+					})
+					var result RestoreResult
+					if err := json.Unmarshal([]byte(text), &result); err != nil {
+						t.Fatal(err)
+					}
+					if result.IntegrityCheck != mode || result.TXID != "" {
+						t.Fatalf("restore result=%#v", result)
+					}
+					db := testingutil.MustOpenSQLDB(t, path)
+					t.Cleanup(func() { testingutil.MustCloseSQLDB(t, db) })
+					var id int
+					if err := db.QueryRowContext(t.Context(), "SELECT id FROM t").Scan(&id); err != nil {
+						t.Fatal(err)
+					}
+					if id != 2 {
+						t.Fatalf("restored row=%d, want legacy row 2", id)
+					}
+				})
+			}
+		})
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -352,43 +353,7 @@ func TestRestoreCommandOutputAccessError(t *testing.T) {
 func TestRestoreCommandLegacySelection(t *testing.T) {
 	for _, mixed := range []bool{false, true} {
 		t.Run(map[bool]string{false: "legacy only", true: "newer legacy"}[mixed], func(t *testing.T) {
-			dir := t.TempDir()
-			replicaPath, restorePath := filepath.Join(dir, "replica"), filepath.Join(dir, "restored.db")
-			if mixed {
-				replicaPath, restorePath = createRestoreCommandTestData(t, t.Context())
-			}
-			source := filepath.Join(dir, "legacy.db")
-			db := testingutil.MustOpenSQLDB(t, source)
-			if _, err := db.ExecContext(t.Context(), "CREATE TABLE t (id INT); INSERT INTO t VALUES (2)"); err != nil {
-				t.Fatal(err)
-			}
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
-			data, err := os.ReadFile(source)
-			if err != nil {
-				t.Fatal(err)
-			}
-			var compressed bytes.Buffer
-			writer := lz4.NewWriter(&compressed)
-			if _, err := writer.Write(data); err != nil {
-				t.Fatal(err)
-			}
-			if err := writer.Close(); err != nil {
-				t.Fatal(err)
-			}
-			snapshotDir := filepath.Join(replicaPath, "generations", "0123456789abcdef", "snapshots")
-			if err := os.MkdirAll(snapshotDir, 0755); err != nil {
-				t.Fatal(err)
-			}
-			snapshot := filepath.Join(snapshotDir, "00000000.snapshot.lz4")
-			if err := os.WriteFile(snapshot, compressed.Bytes(), 0600); err != nil {
-				t.Fatal(err)
-			}
-			newer := time.Now().Add(time.Hour)
-			if err := os.Chtimes(snapshot, newer, newer); err != nil {
-				t.Fatal(err)
-			}
+			replicaPath, restorePath := createLegacyRestoreCommandTestData(t, mixed)
 			output := captureLTXCommandStdout(t, func() {
 				if err := (&RestoreCommand{}).Run(t.Context(), []string{"-json", "-o", restorePath, "file://" + replicaPath}); err != nil {
 					t.Fatal(err)
@@ -431,5 +396,104 @@ func TestRestoreCommandExplicitTXIDOutput(t *testing.T) {
 	}
 	if result.TXID != "0000000000000001" {
 		t.Fatalf("result=%+v", result)
+	}
+}
+
+func createLegacyRestoreCommandTestData(t *testing.T, mixed bool) (replicaPath, restorePath string) {
+	t.Helper()
+	dir := t.TempDir()
+	replicaPath, restorePath = filepath.Join(dir, "replica"), filepath.Join(dir, "restored.db")
+	if mixed {
+		replicaPath, restorePath = createRestoreCommandTestData(t, t.Context())
+	}
+	source := filepath.Join(dir, "legacy.db")
+	db := testingutil.MustOpenSQLDB(t, source)
+	if _, err := db.ExecContext(t.Context(), "CREATE TABLE t (id INT); INSERT INTO t VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compressed bytes.Buffer
+	writer := lz4.NewWriter(&compressed)
+	if _, err := writer.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	snapshotDir := filepath.Join(replicaPath, "generations", "0123456789abcdef", "snapshots")
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := filepath.Join(snapshotDir, "00000000.snapshot.lz4")
+	if err := os.WriteFile(snapshot, compressed.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	newer := time.Now().Add(time.Hour)
+	if err := os.Chtimes(snapshot, newer, newer); err != nil {
+		t.Fatal(err)
+	}
+	return replicaPath, restorePath
+}
+
+func TestRestoreCommandDryRunLegacy(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy only", true: "mixed"}[mixed], func(t *testing.T) {
+			replicaPath, outputPath := createLegacyRestoreCommandTestData(t, mixed)
+			sentinel := []byte("existing database contents")
+			if err := os.WriteFile(outputPath, sentinel, 0600); err != nil {
+				t.Fatal(err)
+			}
+			args := []string{"-dry-run", "-json", "-o", outputPath}
+			err := (&RestoreCommand{}).Run(t.Context(), append(args, "file://"+replicaPath))
+			if err == nil || !strings.Contains(err.Error(), "automatic restore preview is unsupported") {
+				t.Fatalf("error=%v, want unsupported legacy preview", err)
+			}
+			if mixed {
+				output := captureLTXCommandStdout(t, func() {
+					if err := (&RestoreCommand{}).Run(t.Context(), append(args, "-txid", "0000000000000001", "file://"+replicaPath)); err != nil {
+						t.Fatal(err)
+					}
+				})
+				var plan RestorePlan
+				if err := json.Unmarshal([]byte(output), &plan); err != nil {
+					t.Fatal(err)
+				}
+				if plan.MaxTXID != "0000000000000001" || len(plan.Files) == 0 {
+					t.Fatalf("unexpected LTX plan: %+v", plan)
+				}
+			}
+			got, err := os.ReadFile(outputPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, sentinel) {
+				t.Fatalf("preview modified output: %q", got)
+			}
+		})
+	}
+}
+
+type restorePreviewErrorClient struct {
+	*file.ReplicaClient
+	err error
+}
+
+func (c *restorePreviewErrorClient) GenerationsV3(context.Context) ([]string, error) {
+	return nil, c.err
+}
+
+func TestRestoreCommandDryRunLegacyLookupError(t *testing.T) {
+	lookupErr := errors.New("legacy listing failed")
+	client := &restorePreviewErrorClient{ReplicaClient: file.NewReplicaClient(t.TempDir()), err: lookupErr}
+	replica := litestream.NewReplicaWithClient(nil, client)
+	_, err := (&RestoreCommand{}).dryRunPlan(t.Context(), "replica", replica, litestream.NewRestoreOptions())
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error=%v, want %v", err, lookupErr)
 	}
 }
