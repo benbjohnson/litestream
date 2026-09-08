@@ -103,7 +103,7 @@ func runMCPTransport(ctx context.Context, run func(context.Context) error) error
 	defer stop()
 	err := run(runCtx)
 	cause := context.Cause(runCtx)
-	if cause != nil && errors.Is(err, context.Canceled) {
+	if cause != nil && err == context.Canceled {
 		return nil
 	}
 	return err
