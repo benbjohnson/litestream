@@ -267,6 +267,9 @@ func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica,
 	if opt.Follow {
 		return "", nil
 	}
+	if _, ok := r.Client.(litestream.ReplicaClientV3); ok {
+		return "", nil
+	}
 	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
 		return "", err
@@ -320,8 +323,10 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	}
 
 	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+	if _, err := os.Stat(opt.OutputPath); err == nil && ifDBNotExists {
 		return nil, errSkipDBExists
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 
 	syncInterval := litestream.DefaultSyncInterval
@@ -365,8 +370,10 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 	}
 
 	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+	if _, err := os.Stat(opt.OutputPath); err == nil && ifDBNotExists {
 		return nil, errSkipDBExists
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 
 	return db.Replica, nil

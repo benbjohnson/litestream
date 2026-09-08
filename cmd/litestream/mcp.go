@@ -7,11 +7,12 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"text/tabwriter"
 	"time"
 
@@ -22,12 +23,17 @@ import (
 	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/sftp"
 )
 
 type MCPServer struct {
 	ctx        context.Context
 	mux        *http.ServeMux
 	httpServer *http.Server
+	httpCancel context.CancelFunc
+	errCh      chan error
+	httpDone   chan struct{}
+	httpErr    error
 	configPath string
 }
 
@@ -39,7 +45,7 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 
 	mcpServer := server.NewMCPServer(
 		"Litestream MCP Server",
-		"1.0.0",
+		Version,
 		server.WithToolCapabilities(false),
 		server.WithRecovery(),
 		server.WithLogging(),
@@ -58,18 +64,65 @@ func NewMCP(ctx context.Context, configPath string) (*MCPServer, error) {
 	return s, nil
 }
 
-func (s *MCPServer) Start(addr string) {
-	s.httpServer = &http.Server{
-		Addr:              addr,
-		Handler:           s.mux,
+func (s *MCPServer) Start(addr string) error {
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen for MCP HTTP server: %w", err)
+	}
+	s.httpServer = s.newHTTPServer(s.ctx, listener.Addr().String())
+	s.errCh = make(chan error, 1)
+	s.httpDone = make(chan struct{})
+	go func() {
+		s.httpErr = s.runHTTP(s.ctx, listener)
+		s.errCh <- s.httpErr
+		close(s.httpDone)
+	}()
+	return nil
+}
+
+func (s *MCPServer) runHTTP(ctx context.Context, listener net.Listener) error {
+	defer s.httpCancel()
+	errCh := make(chan error, 1)
+	go func() {
+		slog.Info("Starting MCP Streamable HTTP server", "addr", listener.Addr().String())
+		errCh <- s.httpServer.Serve(listener)
+	}()
+
+	select {
+	case <-ctx.Done():
+		if err := s.shutdownHTTP(); err != nil {
+			shutdownErr := fmt.Errorf("close MCP HTTP server: %w", err)
+			if err := s.httpServer.Close(); err != nil {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("force close MCP HTTP server: %w", err))
+			}
+			if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+				shutdownErr = errors.Join(shutdownErr, fmt.Errorf("serve MCP HTTP server: %w", err))
+			}
+			return shutdownErr
+		}
+		if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve MCP HTTP server: %w", err)
+		}
+		return nil
+	case err := <-errCh:
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return fmt.Errorf("serve MCP HTTP server: %w", err)
+		}
+		return nil
+	}
+}
+
+func (s *MCPServer) newHTTPServer(ctx context.Context, addr string) *http.Server {
+	httpCtx, cancel := context.WithCancel(ctx)
+	s.httpCancel = cancel
+	return &http.Server{
+		Addr:    addr,
+		Handler: s.mux,
+		BaseContext: func(net.Listener) context.Context {
+			return httpCtx
+		},
 		ReadHeaderTimeout: 30 * time.Second,
 	}
-	go func() {
-		slog.Info("Starting MCP Streamable HTTP server", "addr", addr)
-		if err := s.httpServer.ListenAndServe(); err != nil {
-			slog.Error("MCP server error", "error", err)
-		}
-	}()
 }
 
 func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -78,7 +131,25 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Close attempts to gracefully shutdown the server.
 func (s *MCPServer) Close() error {
-	ctx, cancel := context.WithTimeout(s.ctx, 10*time.Second)
+	err := s.shutdownHTTP()
+	if s.httpDone != nil {
+		if err != nil {
+			err = errors.Join(err, s.httpServer.Close())
+		}
+		<-s.httpDone
+		err = errors.Join(err, s.httpErr)
+	}
+	return err
+}
+
+func (s *MCPServer) shutdownHTTP() error {
+	if s.httpServer == nil {
+		return nil
+	}
+	if s.httpCancel != nil {
+		s.httpCancel()
+	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(s.ctx), 10*time.Second)
 	defer cancel()
 	return s.httpServer.Shutdown(ctx)
 }
@@ -94,8 +165,9 @@ func DatabasesTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		cleanup := startMCPResourceCleanup(ctx, resources)
 		output, opErr := formatMCPDatabases(resources.DBs)
-		if err := closeMCPResources(opErr, resources); err != nil {
+		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)
 		}
 		return mcp.NewToolResultText(output), nil
@@ -113,8 +185,9 @@ func InfoTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		cleanup := startMCPResourceCleanup(ctx, resources)
 		output, opErr := formatMCPInfo(ctx, resources.ConfigPath, resources.DBs)
-		if err := closeMCPResources(opErr, resources); err != nil {
+		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)
 		}
 		return mcp.NewToolResultText(output), nil
@@ -171,10 +244,11 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		cleanup := startMCPResourceCleanup(ctx, resources)
 
 		output, opErr := restoreMCP(ctx, path, resources.Replica, opt,
 			req.GetBool("if_db_not_exists", false), req.GetBool("if_replica_exists", false))
-		if err := closeMCPResources(opErr, resources); err != nil {
+		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)
 		}
 		return mcp.NewToolResultText(output), nil
@@ -183,16 +257,10 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 func VersionTool() (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_version",
-		mcp.WithDescription("Print the Litestream binary version."),
+		mcp.WithDescription("Print the running Litestream binary version."),
 	)
-
-	return tool, func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		cmd := exec.CommandContext(ctx, "litestream", "version")
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return mcp.NewToolResultError(strings.TrimSpace(string(output)) + ": " + err.Error()), nil
-		}
-		return mcp.NewToolResultText(string(output)), nil
+	return tool, func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText(Version + "\n"), nil
 	}
 }
 
@@ -213,12 +281,13 @@ func LTXTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		cleanup := startMCPResourceCleanup(ctx, resources)
 		files, opErr := listMCPLTXFiles(ctx, resources.Replica, 0)
 		var output string
 		if opErr == nil {
 			output, opErr = formatMCPLTXFiles(files)
 		}
-		if err := closeMCPResources(opErr, resources); err != nil {
+		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)
 		}
 		return mcp.NewToolResultText(output), nil
@@ -237,12 +306,13 @@ func StatusTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		cleanup := startMCPResourceCleanup(ctx, resources)
 		statuses, opErr := loadMCPStatuses(ctx, resources.DBs, req.GetString("path", ""))
 		var output string
 		if opErr == nil {
 			output, opErr = formatMCPStatuses(statuses)
 		}
-		if err := closeMCPResources(opErr, resources); err != nil {
+		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)
 		}
 		return mcp.NewToolResultText(output), nil
@@ -265,12 +335,16 @@ func ResetTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		var cleanup mcpCloser
+		if resources != nil {
+			cleanup = startMCPResourceCleanup(ctx, resources)
+		}
 		opErr := db.ResetLocalState(ctx)
 		if opErr != nil {
 			opErr = fmt.Errorf("reset local state: %w", opErr)
 		}
 		if resources != nil {
-			opErr = closeMCPResources(opErr, resources)
+			opErr = closeMCPResources(opErr, cleanup)
 		}
 		if opErr != nil {
 			return mcpToolError(opErr)
@@ -315,6 +389,64 @@ type mcpCloser interface {
 }
 
 var errMCPReplicaClientNotClosable = errors.New("replica client does not implement cleanup contract")
+
+type mcpCleanup func() error
+
+func (cleanup mcpCleanup) Close() error {
+	return cleanup()
+}
+
+func startMCPResourceCleanup(ctx context.Context, resources mcpCloser) mcpCloser {
+	var cleanups []func() error
+	addReplica := func(r *litestream.Replica, path string) {
+		closeReplica := func() error {
+			err := closeMCPReplica(r)
+			if err != nil && path != "" {
+				return fmt.Errorf("close replica for %s: %w", path, err)
+			}
+			return err
+		}
+		if r != nil {
+			if _, ok := r.Client.(*sftp.ReplicaClient); ok {
+				cleanups = append(cleanups, closeMCPOnCancellation(ctx, closeReplica))
+				return
+			}
+		}
+		cleanups = append(cleanups, closeReplica)
+	}
+	switch resources := resources.(type) {
+	case *mcpDatabases:
+		for _, db := range resources.DBs {
+			addReplica(db.Replica, db.Path())
+		}
+	case *mcpReplica:
+		if resources.Databases != nil {
+			return startMCPResourceCleanup(ctx, resources.Databases)
+		}
+		addReplica(resources.Replica, "")
+	default:
+		cleanups = append(cleanups, resources.Close)
+	}
+	return mcpCleanup(func() error {
+		err := context.Cause(ctx)
+		for _, cleanup := range cleanups {
+			err = errors.Join(err, cleanup())
+		}
+		return err
+	})
+}
+
+func closeMCPOnCancellation(ctx context.Context, closeResource func() error) func() error {
+	var once sync.Once
+	var closeErr error
+	closeOnce := func() { once.Do(func() { closeErr = closeResource() }) }
+	stop := context.AfterFunc(ctx, closeOnce)
+	return func() error {
+		stop()
+		closeOnce()
+		return closeErr
+	}
+}
 
 func closeMCPResources(opErr error, resources mcpCloser) error {
 	return errors.Join(opErr, resources.Close())
