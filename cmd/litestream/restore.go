@@ -152,9 +152,12 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	txid := c.restoreTXID(ctx, r, opt)
+	txid, err := c.restoreTXID(ctx, r, &opt)
 	start := time.Now()
-	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
+	if err == nil {
+		err = r.Restore(ctx, opt)
+	}
+	if errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
 			if *jsonOutput {
@@ -299,18 +302,26 @@ func (c *RestoreCommand) printDryRunPlan(plan RestorePlan) {
 	}
 }
 
-func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) string {
+func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt *litestream.RestoreOptions) (string, error) {
 	if opt.TXID != 0 {
-		return opt.TXID.String()
+		return opt.TXID.String(), nil
 	}
 	if opt.Follow {
-		return ""
+		return "", nil
+	}
+	if _, ok := r.Client.(litestream.ReplicaClientV3); ok {
+		return "", nil
 	}
 	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
-	if err != nil || len(infos) == 0 {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return infos[len(infos)-1].MaxTXID.String()
+	if len(infos) == 0 {
+		return "", litestream.ErrTxNotAvailable
+	}
+	opt.TXID = infos[len(infos)-1].MaxTXID
+	opt.Timestamp = time.Time{}
+	return opt.TXID.String(), nil
 }
 
 func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
@@ -354,8 +365,10 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	}
 
 	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+	if _, err := os.Stat(opt.OutputPath); err == nil && ifDBNotExists {
 		return nil, errSkipDBExists
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 
 	syncInterval := litestream.DefaultSyncInterval
@@ -399,8 +412,10 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 	}
 
 	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+	if _, err := os.Stat(opt.OutputPath); err == nil && ifDBNotExists {
 		return nil, errSkipDBExists
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 
 	return db.Replica, nil
