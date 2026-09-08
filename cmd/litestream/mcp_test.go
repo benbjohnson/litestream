@@ -654,6 +654,17 @@ func TestRestoreToolArguments(t *testing.T) {
 			},
 			invocation: "restore\x1f-o\x1f/tmp/restored.db\x1f/tmp/db",
 		},
+
+		{
+			name:       "canonical output takes precedence",
+			arguments:  map[string]any{"path": "/tmp/db", "output": "/tmp/canonical.db", "o": "/tmp/legacy.db"},
+			invocation: "restore\x1f-o\x1f/tmp/canonical.db\x1f/tmp/db",
+		},
+		{
+			name:       "empty canonical output uses alias",
+			arguments:  map[string]any{"path": "/tmp/db", "output": "", "o": "/tmp/legacy.db"},
+			invocation: "restore\x1f-o\x1f/tmp/legacy.db\x1f/tmp/db",
+		},
 		{
 			name:       "if database does not exist true",
 			arguments:  map[string]any{"path": "/tmp/db", "if_db_not_exists": true},
@@ -1090,5 +1101,16 @@ func TestMCPServerLifecycle(t *testing.T) {
 	}
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRestoreToolRejectsInvalidAlias(t *testing.T) {
+	for _, value := range []any{true, 42, nil} {
+		t.Run(fmt.Sprint(value), func(t *testing.T) {
+			argsPath := useMCPTestCommand(t)
+			session := newMCPTestSession(t, "")
+			callMCPToolError(t, session, "litestream_restore", map[string]any{"path": "/tmp/db", "o": value}, "o")
+			assertNoMCPInvocations(t, argsPath)
+		})
 	}
 }
