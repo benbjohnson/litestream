@@ -5,8 +5,11 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"os/exec"
 	"slices"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/windows/svc"
 )
@@ -43,4 +46,29 @@ func TestWindowsServiceExecuteStopCloseError(t *testing.T) {
 	if !slices.Equal(states, want) {
 		t.Fatalf("states=%v, want %v", states, want)
 	}
+}
+
+func TestWindowsServiceCloseStopsExec(t *testing.T) {
+	command := NewReplicateCommand()
+	command.cmd = exec.Command(os.Args[0], "-test.run=^TestWindowsServiceExecHelper$")
+	command.cmd.Env = append(os.Environ(), "LITESTREAM_TEST_SERVICE_EXEC=1")
+	command.execCh = make(chan error, 1)
+	if err := command.cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	go func() { command.execCh <- command.cmd.Wait() }()
+	service := &windowsService{ctx: t.Context()}
+	if err := service.close(command); err != nil {
+		t.Fatal(err)
+	}
+	if command.cmd.ProcessState == nil || command.cmd.ProcessState.Success() {
+		t.Fatal("exec child was not terminated and reaped")
+	}
+}
+
+func TestWindowsServiceExecHelper(t *testing.T) {
+	if os.Getenv("LITESTREAM_TEST_SERVICE_EXEC") != "1" {
+		t.Skip("helper process only")
+	}
+	time.Sleep(time.Minute)
 }

@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -115,10 +117,18 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 }
 
 func (s *windowsService) close(c *ReplicateCommand) error {
-	if s.closeCommand != nil {
-		return s.closeCommand(s.ctx, c)
+	var stopErr error
+	if c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			stopErr = fmt.Errorf("stop exec process: %w", err)
+		} else {
+			<-c.execCh
+		}
 	}
-	return c.Close(s.ctx)
+	if s.closeCommand != nil {
+		return errors.Join(stopErr, s.closeCommand(s.ctx, c))
+	}
+	return errors.Join(stopErr, c.Close(s.ctx))
 }
 
 // Ensure implementation implements io.Writer interface.

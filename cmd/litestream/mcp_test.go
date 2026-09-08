@@ -39,6 +39,12 @@ func TestMCPCommandStdio(t *testing.T) {
 		t.Fatalf("connect: %v\nstderr:\n%s", err, stderr.String())
 	}
 
+	t.Cleanup(func() {
+		if err := session.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+
 	result, err := session.ListTools(t.Context(), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -160,7 +166,9 @@ func TestMCPCommandSecondSignal(t *testing.T) {
 		t.Skip("requires POSIX process signals")
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMCPCommandSecondSignalHelper$")
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMCPCommandSecondSignalHelper$")
 	cmd.Env = append(os.Environ(), "LITESTREAM_TEST_MCP_SECOND_SIGNAL=1")
 	stderr, err := cmd.StderrPipe()
 	if err != nil {
@@ -1080,4 +1088,27 @@ func captureMCPStdout(t *testing.T, fn func()) string {
 		t.Fatal(err)
 	}
 	return string(output)
+}
+
+func TestMCPTransportPreservesCancellationErrors(t *testing.T) {
+	shutdownErr := errors.New("shutdown failed")
+	for _, joined := range []bool{false, true} {
+		t.Run(fmt.Sprint(joined), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(t.Context())
+			cancel()
+			err := runMCPTransport(ctx, func(context.Context) error {
+				if joined {
+					return errors.Join(context.Canceled, shutdownErr)
+				}
+				return context.Canceled
+			})
+			if joined {
+				if !errors.Is(err, shutdownErr) {
+					t.Fatalf("error=%v, want shutdown failure", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
 }
