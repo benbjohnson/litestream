@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"maps"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -712,4 +713,49 @@ func setVersion(t *testing.T, version string) {
 	previous := Version
 	Version = version
 	t.Cleanup(func() { Version = previous })
+}
+
+func TestMCPServerLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	server, err := NewMCP(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	other, err := NewMCP(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Start(server.httpServer.Addr); err == nil {
+		t.Fatal("expected bind error")
+	}
+	cancel()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-server.errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("MCP server did not stop")
+	}
+	listener, err := net.Listen("tcp", server.httpServer.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
