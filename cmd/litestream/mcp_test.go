@@ -639,6 +639,19 @@ func TestMCPToolIntegration(t *testing.T) {
 				if _, err := os.Stat(fixture.localLTXPath); !errors.Is(err, fs.ErrNotExist) {
 					t.Fatalf("local LTX file still exists after reset: %v", err)
 				}
+				db := testingutil.MustOpenSQLDB(t, fixture.dbPath)
+				t.Cleanup(func() {
+					if err := db.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				var id int
+				if err := db.QueryRowContext(t.Context(), `SELECT id FROM test`).Scan(&id); err != nil {
+					t.Fatal(err)
+				}
+				if id != 1 {
+					t.Fatalf("database row after reset=%d, want 1", id)
+				}
 			},
 			errorArguments: map[string]any{"path": fixture.missingDBPath},
 			errorContains:  "database does not exist",
@@ -679,6 +692,11 @@ func TestMCPToolIntegration(t *testing.T) {
 			}
 			if got := textContent(t, result); !strings.Contains(got, test.errorContains) {
 				t.Fatalf("error content does not contain %q: %q", test.errorContains, got)
+			}
+			if test.name == "litestream_restore" {
+				if _, err := os.Stat(fixture.failedRestorePath); !errors.Is(err, fs.ErrNotExist) {
+					t.Fatalf("failed restore created output: %v", err)
+				}
 			}
 		})
 	}
