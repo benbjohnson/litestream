@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/pierrec/lz4/v4"
 
 	litestream "github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -125,8 +129,8 @@ func TestRestoreCommand_RunJSONOutput(t *testing.T) {
 	if got.Replica != "file" {
 		t.Fatalf("unexpected replica: %s", got.Replica)
 	}
-	if got.TXID == "" {
-		t.Fatal("expected txid")
+	if got.TXID != "" {
+		t.Fatalf("automatic legacy-capable restore reported unverified TXID %q", got.TXID)
 	}
 	if got.DurationMS < 0 {
 		t.Fatalf("unexpected duration_ms: %d", got.DurationMS)
@@ -317,5 +321,115 @@ func assertRestoreCommandDB(t *testing.T, path string) {
 	}
 	if count != 1 {
 		t.Fatalf("count=%d, want 1", count)
+	}
+}
+
+func TestRestoreCommandOutputAccessError(t *testing.T) {
+	for _, fromConfig := range []bool{false, true} {
+		t.Run(map[bool]string{false: "url", true: "config"}[fromConfig], func(t *testing.T) {
+			dir := t.TempDir()
+			output := filepath.Join(dir, strings.Repeat("x", 300))
+			args := []string{"-json", "-if-db-not-exists", "-o", output}
+			if fromConfig {
+				config := filepath.Join(dir, "litestream.yml")
+				dbPath := filepath.Join(dir, "db")
+				content := "dbs:\n  - path: " + dbPath + "\n    replica:\n      url: file://" + dir + "/replica\n"
+				if err := os.WriteFile(config, []byte(content), 0600); err != nil {
+					t.Fatal(err)
+				}
+				args = append(args, "-config", config, dbPath)
+			} else {
+				args = append(args, "file://"+dir+"/replica")
+			}
+			err := (&RestoreCommand{}).Run(t.Context(), args)
+			if err == nil || !strings.Contains(err.Error(), "cannot access output path") {
+				t.Fatalf("error=%v, want output access error", err)
+			}
+		})
+	}
+}
+
+func TestRestoreCommandLegacySelection(t *testing.T) {
+	for _, mixed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy only", true: "newer legacy"}[mixed], func(t *testing.T) {
+			dir := t.TempDir()
+			replicaPath, restorePath := filepath.Join(dir, "replica"), filepath.Join(dir, "restored.db")
+			if mixed {
+				replicaPath, restorePath = createRestoreCommandTestData(t, t.Context())
+			}
+			source := filepath.Join(dir, "legacy.db")
+			db := testingutil.MustOpenSQLDB(t, source)
+			if _, err := db.ExecContext(t.Context(), "CREATE TABLE t (id INT); INSERT INTO t VALUES (2)"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Close(); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(source)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var compressed bytes.Buffer
+			writer := lz4.NewWriter(&compressed)
+			if _, err := writer.Write(data); err != nil {
+				t.Fatal(err)
+			}
+			if err := writer.Close(); err != nil {
+				t.Fatal(err)
+			}
+			snapshotDir := filepath.Join(replicaPath, "generations", "0123456789abcdef", "snapshots")
+			if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+				t.Fatal(err)
+			}
+			snapshot := filepath.Join(snapshotDir, "00000000.snapshot.lz4")
+			if err := os.WriteFile(snapshot, compressed.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			newer := time.Now().Add(time.Hour)
+			if err := os.Chtimes(snapshot, newer, newer); err != nil {
+				t.Fatal(err)
+			}
+			output := captureLTXCommandStdout(t, func() {
+				if err := (&RestoreCommand{}).Run(t.Context(), []string{"-json", "-o", restorePath, "file://" + replicaPath}); err != nil {
+					t.Fatal(err)
+				}
+			})
+			var result RestoreResult
+			if err := json.Unmarshal([]byte(output), &result); err != nil {
+				t.Fatal(err)
+			}
+			if result.TXID != "" {
+				t.Fatalf("result=%+v, want unknown legacy TXID", result)
+			}
+			restored := testingutil.MustOpenSQLDB(t, restorePath)
+			defer func() {
+				if err := restored.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			var id int
+			if err := restored.QueryRowContext(t.Context(), "SELECT id FROM t").Scan(&id); err != nil {
+				t.Fatal(err)
+			}
+			if id != 2 {
+				t.Fatalf("restored id=%d, want legacy value 2", id)
+			}
+		})
+	}
+}
+
+func TestRestoreCommandExplicitTXIDOutput(t *testing.T) {
+	replicaPath, restorePath := createRestoreCommandTestData(t, t.Context())
+	output := captureLTXCommandStdout(t, func() {
+		if err := (&RestoreCommand{}).Run(t.Context(), []string{"-json", "-txid", "0000000000000001", "-o", restorePath, "file://" + replicaPath}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var result RestoreResult
+	if err := json.Unmarshal([]byte(output), &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.TXID != "0000000000000001" {
+		t.Fatalf("result=%+v", result)
 	}
 }
