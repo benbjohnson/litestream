@@ -532,16 +532,12 @@ func ResetTool(configPath string) (*mcp.Tool, mcp.ToolHandlerFor[resetInput, res
 	}
 }
 
-type daemonOutput struct {
-	Text string `json:"text" jsonschema:"Daemon response encoded as JSON."`
-}
-
 type daemonListInput struct {
 	Socket  *string `json:"socket,omitempty" jsonschema:"Path to the Litestream daemon control socket. Optional."`
 	Timeout *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonListTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonListInput, daemonOutput]) {
+func DaemonListTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonListInput, litestream.ListResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_list",
 		Description: "List databases managed by a running Litestream daemon.",
@@ -549,15 +545,15 @@ func DaemonListTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonListInput, daemonOutp
 		InputSchema: nonNullableInputSchema[daemonListInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonListInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonListInput) (*mcp.CallToolResult, litestream.ListResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonReadTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.ListResponse{}, err
 		}
 
 		var response litestream.ListResponse
 		if err := client.do(ctx, http.MethodGet, "/list", nil, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.ListResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -570,7 +566,7 @@ type daemonSyncInput struct {
 	Timeout *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonSyncTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonSyncInput, daemonOutput]) {
+func DaemonSyncTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonSyncInput, litestream.SyncResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_sync",
 		Description: "Force an immediate sync for a database managed by a running Litestream daemon, optionally waiting for remote replication.",
@@ -578,10 +574,10 @@ func DaemonSyncTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonSyncInput, daemonOutp
 		InputSchema: nonNullableInputSchema[daemonSyncInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonSyncInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonSyncInput) (*mcp.CallToolResult, litestream.SyncResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonWriteTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.SyncResponse{}, err
 		}
 
 		var response litestream.SyncResponse
@@ -591,7 +587,7 @@ func DaemonSyncTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonSyncInput, daemonOutp
 			Timeout: client.timeoutSeconds,
 		}
 		if err := client.do(ctx, http.MethodPost, "/sync", request, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.SyncResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -602,7 +598,7 @@ type daemonInfoInput struct {
 	Timeout *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonInfoTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonInfoInput, daemonOutput]) {
+func DaemonInfoTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonInfoInput, litestream.InfoResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_daemon_info",
 		Description: "Get version, process, uptime, and database count information from a running Litestream daemon.",
@@ -610,15 +606,15 @@ func DaemonInfoTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonInfoInput, daemonOutp
 		InputSchema: nonNullableInputSchema[daemonInfoInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonInfoInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonInfoInput) (*mcp.CallToolResult, litestream.InfoResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonReadTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.InfoResponse{}, err
 		}
 
 		var response litestream.InfoResponse
 		if err := client.do(ctx, http.MethodGet, "/info", nil, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.InfoResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -630,7 +626,7 @@ type daemonStartInput struct {
 	Timeout *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonStartTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonStartInput, daemonOutput]) {
+func DaemonStartTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonStartInput, litestream.StartResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_start",
 		Description: "Start replication for a database managed by a running Litestream daemon.",
@@ -638,16 +634,16 @@ func DaemonStartTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonStartInput, daemonOu
 		InputSchema: nonNullableInputSchema[daemonStartInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonStartInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonStartInput) (*mcp.CallToolResult, litestream.StartResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonWriteTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.StartResponse{}, err
 		}
 
 		var response litestream.StartResponse
 		request := litestream.StartRequest{Path: input.Path, Timeout: client.timeoutSeconds}
 		if err := client.do(ctx, http.MethodPost, "/start", request, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.StartResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -659,7 +655,7 @@ type daemonStopInput struct {
 	Timeout *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonStopTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonStopInput, daemonOutput]) {
+func DaemonStopTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonStopInput, litestream.StopResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_stop",
 		Description: "Stop replication for a database managed by a running Litestream daemon after a final sync.",
@@ -667,16 +663,16 @@ func DaemonStopTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonStopInput, daemonOutp
 		InputSchema: nonNullableInputSchema[daemonStopInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonStopInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonStopInput) (*mcp.CallToolResult, litestream.StopResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonWriteTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.StopResponse{}, err
 		}
 
 		var response litestream.StopResponse
 		request := litestream.StopRequest{Path: input.Path, Timeout: client.timeoutSeconds}
 		if err := client.do(ctx, http.MethodPost, "/stop", request, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.StopResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -689,7 +685,7 @@ type daemonRegisterInput struct {
 	Timeout    *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonRegisterTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonRegisterInput, daemonOutput]) {
+func DaemonRegisterTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonRegisterInput, litestream.RegisterDatabaseResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_register",
 		Description: "Register a database and replica with a running Litestream daemon.",
@@ -697,16 +693,16 @@ func DaemonRegisterTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonRegisterInput, da
 		InputSchema: nonNullableInputSchema[daemonRegisterInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonRegisterInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonRegisterInput) (*mcp.CallToolResult, litestream.RegisterDatabaseResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonWriteTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.RegisterDatabaseResponse{}, err
 		}
 
 		var response litestream.RegisterDatabaseResponse
 		request := litestream.RegisterDatabaseRequest{Path: input.Path, ReplicaURL: input.ReplicaURL}
 		if err := client.do(ctx, http.MethodPost, "/register", request, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.RegisterDatabaseResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -718,7 +714,7 @@ type daemonUnregisterInput struct {
 	Timeout *int    `json:"timeout,omitempty" jsonschema:"Maximum time to wait in seconds. Optional."`
 }
 
-func DaemonUnregisterTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonUnregisterInput, daemonOutput]) {
+func DaemonUnregisterTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonUnregisterInput, litestream.UnregisterDatabaseResponse]) {
 	tool := &mcp.Tool{
 		Name:        "litestream_unregister",
 		Description: "Stop replication and unregister a database from a running Litestream daemon.",
@@ -726,16 +722,16 @@ func DaemonUnregisterTool() (*mcp.Tool, mcp.ToolHandlerFor[daemonUnregisterInput
 		InputSchema: nonNullableInputSchema[daemonUnregisterInput](),
 	}
 
-	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonUnregisterInput) (*mcp.CallToolResult, daemonOutput, error) {
+	return tool, func(ctx context.Context, _ *mcp.CallToolRequest, input daemonUnregisterInput) (*mcp.CallToolResult, litestream.UnregisterDatabaseResponse, error) {
 		client, err := newDaemonClient(input.Socket, input.Timeout, defaultDaemonWriteTimeout)
 		if err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.UnregisterDatabaseResponse{}, err
 		}
 
 		var response litestream.UnregisterDatabaseResponse
 		request := litestream.UnregisterDatabaseRequest{Path: input.Path, Timeout: client.timeoutSeconds}
 		if err := client.do(ctx, http.MethodPost, "/unregister", request, &response); err != nil {
-			return nil, daemonOutput{}, err
+			return nil, litestream.UnregisterDatabaseResponse{}, err
 		}
 		return daemonResult(response)
 	}
@@ -798,7 +794,7 @@ func (c *daemonClient) do(ctx context.Context, method, endpoint string, input, o
 
 	response, err := client.Do(request)
 	if err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := context.Cause(ctx); ctxErr != nil {
 			return ctxErr
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
@@ -806,11 +802,10 @@ func (c *daemonClient) do(ctx context.Context, method, endpoint string, input, o
 		}
 		return daemonConnectionError(c.socketPath, err)
 	}
-	defer response.Body.Close()
-
-	data, err := io.ReadAll(response.Body)
-	if err != nil {
-		return fmt.Errorf("read daemon response: %w", err)
+	data, readErr := io.ReadAll(response.Body)
+	closeErr := response.Body.Close()
+	if err := errors.Join(readErr, closeErr); err != nil {
+		return fmt.Errorf("read daemon response: %w", errors.Join(err, context.Cause(ctx)))
 	}
 
 	operation := strings.TrimPrefix(endpoint, "/")
@@ -837,13 +832,14 @@ func daemonConnectionError(socketPath string, err error) error {
 	return fmt.Errorf("connect to Litestream daemon at socket %s: %w", socketPath, err)
 }
 
-func daemonResult(response any) (*mcp.CallToolResult, daemonOutput, error) {
+func daemonResult[Response any](response Response) (*mcp.CallToolResult, Response, error) {
 	data, err := json.MarshalIndent(response, "", "  ")
 	if err != nil {
-		return nil, daemonOutput{}, fmt.Errorf("format daemon response: %w", err)
+		var zero Response
+		return nil, zero, fmt.Errorf("format daemon response: %w", err)
 	}
 	text := string(data) + "\n"
-	return textResult(text), daemonOutput{Text: text}, nil
+	return textResult(text), response, nil
 }
 
 func textResult(text string) *mcp.CallToolResult {
