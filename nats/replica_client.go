@@ -477,8 +477,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	// If offset is non-zero then discard the beginning bytes.
 	if offset > 0 {
 		if _, err := io.CopyN(io.Discard, objectResult, offset); err != nil {
-			objectResult.Close()
-			return nil, fmt.Errorf("failed to discard offset bytes: %w", err)
+			return nil, fmt.Errorf("failed to discard offset bytes: %w", errors.Join(err, objectResult.Close()))
 		}
 	}
 

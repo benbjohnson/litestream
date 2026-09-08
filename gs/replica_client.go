@@ -175,17 +175,14 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	fullReader := io.MultiReader(&buf, rd)
 
 	w := c.bkt.Object(key).NewWriter(ctx)
-	defer w.Close()
 
 	// Store timestamp in GCS metadata for accurate timestamp retrieval
 	w.Metadata = map[string]string{
 		MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
 	}
 
-	n, err := io.Copy(w, fullReader)
-	if err != nil {
-		return info, err
-	} else if err := w.Close(); err != nil {
+	n, copyErr := io.Copy(w, fullReader)
+	if err := errors.Join(copyErr, w.Close()); err != nil {
 		return info, err
 	}
 

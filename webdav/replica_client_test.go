@@ -337,3 +337,99 @@ func parseRange(header string, size int) (start, end int, err error) {
 	}
 	return start, end, nil
 }
+
+func TestReplicaClient_PostInitCancellation(t *testing.T) {
+	for _, method := range []string{"PROPFIND", http.MethodGet} {
+		t.Run(method, func(t *testing.T) {
+			started := make(chan struct{})
+			var startOnce sync.Once
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusOK)
+					return
+				}
+				if r.Method != method {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if method == http.MethodGet {
+					w.Header().Set("Content-Length", "100")
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+				}
+				startOnce.Do(func() { close(started) })
+				select {
+				case <-r.Context().Done():
+				case <-release:
+				}
+			}))
+			t.Cleanup(func() {
+				close(release)
+				server.Close()
+			})
+			c := newTestReplicaClient(server.URL)
+			c.Timeout = time.Minute
+			t.Cleanup(func() {
+				if err := c.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			initCtx, initCancel := context.WithCancel(t.Context())
+			if err := c.Init(initCtx); err != nil {
+				t.Fatal(err)
+			}
+			initCancel()
+			ctx, cancel := context.WithCancel(t.Context())
+			t.Cleanup(cancel)
+			done := make(chan error, 1)
+			opened := make(chan struct{})
+			go func() {
+				if method == "PROPFIND" {
+					itr, err := c.LTXFiles(ctx, 0, 0, false)
+					if itr != nil {
+						err = errors.Join(err, itr.Close())
+					}
+					done <- err
+					return
+				}
+				rc, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
+				if err == nil {
+					close(opened)
+					_, err = io.ReadAll(rc)
+					err = errors.Join(err, rc.Close())
+				}
+				done <- err
+			}()
+			select {
+			case <-started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("post-init operation did not start")
+			}
+			if method == http.MethodGet {
+				select {
+				case <-opened:
+				case <-time.After(2 * time.Second):
+					t.Fatal("GET did not return response body")
+				}
+			}
+			independentCtx, independentCancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer independentCancel()
+			if err := c.DeleteAll(independentCtx); err != nil {
+				t.Fatalf("independent operation while request pending: %v", err)
+			}
+			cancel()
+			select {
+			case err := <-done:
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("error=%v, want context canceled", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Fatal("post-init operation did not stop after cancellation")
+			}
+			if err := c.DeleteAll(independentCtx); err != nil {
+				t.Fatalf("independent operation after cancellation: %v", err)
+			}
+		})
+	}
+}
