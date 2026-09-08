@@ -888,6 +888,13 @@ if [ "$LITESTREAM_TEST_BLOCK" = "$1" ]; then
 	: > "$LITESTREAM_TEST_READY_FILE"
 	exec sleep 60
 fi
+if [ -n "$LITESTREAM_TEST_STDERR" ]; then
+ printf '%s\n' "$LITESTREAM_TEST_STDERR" >&2
+fi
+if [ -n "$LITESTREAM_TEST_JSON" ]; then
+ printf '%s\n' "$LITESTREAM_TEST_JSON"
+ exit 0
+fi
 case "$1" in
   databases)
     printf '[{"path":"/data/db","replica":"s3"}]\n'
@@ -1088,5 +1095,56 @@ func TestMCPServerLifecycle(t *testing.T) {
 	}
 	if err := listener.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestMCPRestoreOutputAccessError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	installRestoreLitestream(t)
+	_, handler := RestoreTool("")
+	output := filepath.Join(t.TempDir(), strings.Repeat("x", 300))
+	result, _, err := handler(t.Context(), nil, restoreInput{Path: "file://" + t.TempDir(), Output: &output, IfDBNotExists: boolPointer(true)})
+	if err == nil || !strings.Contains(err.Error(), "cannot access output path") || result != nil {
+		t.Fatalf("result=%v error=%v, want output access error", result, err)
+	}
+}
+
+func TestMCPRestoreRejectsMalformedOutput(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	installFakeLitestream(t)
+	_, handler := RestoreTool("")
+	for _, tt := range []struct{ output, want string }{
+		{"{", "decode restore JSON"},
+		{`{"status":"unknown"}`, "unknown restore status"},
+		{`{"status":"skipped","reason":"unknown"}`, "unknown restore skip reason"},
+		{`{"status":"restored"}`, "missing result"},
+	} {
+		t.Run(tt.want, func(t *testing.T) {
+			t.Setenv("LITESTREAM_TEST_JSON", tt.output)
+			result, _, err := handler(t.Context(), nil, restoreInput{Path: "/tmp/db"})
+			if err == nil || !strings.Contains(err.Error(), tt.want) || result != nil {
+				t.Fatalf("result=%v error=%v, want %s", result, err, tt.want)
+			}
+		})
+	}
+}
+
+func TestMCPJSONIgnoresDiagnosticStderr(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("requires a POSIX shell")
+	}
+	installFakeLitestream(t)
+	t.Setenv("LITESTREAM_TEST_STDERR", "diagnostic on stderr")
+	_, handler := DatabasesTool("")
+	_, output, err := handler(t.Context(), nil, databasesInput{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output.Databases) != 1 {
+		t.Fatalf("databases=%v", output.Databases)
 	}
 }
