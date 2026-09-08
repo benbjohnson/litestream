@@ -8,10 +8,13 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -167,8 +170,8 @@ func TestRestoreToolRunWithoutLitestreamOnPATH(t *testing.T) {
 			if result.Replica != "file" {
 				t.Fatalf("replica=%q, want file", result.Replica)
 			}
-			if result.TXID == "" {
-				t.Fatal("expected restored txid")
+			if result.TXID != "" {
+				t.Fatalf("automatic file restore TXID=%q, want unknown", result.TXID)
 			}
 			assertRestoreCommandDB(t, outputPath)
 		})
@@ -346,9 +349,11 @@ func TestRestoreTXID(t *testing.T) {
 				t.Error(err)
 			}
 		})
+		replica := litestream.NewReplica(nil)
+		replica.Client = struct{ litestream.ReplicaClient }{resources.Replica.Client}
 		opt := litestream.NewRestoreOptions()
 
-		txID, err := (&RestoreCommand{}).restoreTXID(t.Context(), resources.Replica, &opt)
+		txID, err := (&RestoreCommand{}).restoreTXID(t.Context(), replica, &opt)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -507,4 +512,108 @@ func mcpToolResultText(t *testing.T, result *mcp.CallToolResult) string {
 		t.Fatalf("content type=%T, want mcp.TextContent", result.Content[0])
 	}
 	return content.Text
+}
+
+func TestMCPServerLifecycle(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	server, err := NewMCP(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.Start("127.0.0.1:0"); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := server.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	other, err := NewMCP(ctx, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := other.Start(server.httpServer.Addr); err == nil {
+		t.Fatal("expected bind error")
+	}
+	cancel()
+	if err := server.Close(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-server.errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("MCP server did not stop")
+	}
+	listener, err := net.Listen("tcp", server.httpServer.Addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMCPVersionWithoutPATH(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	previous := Version
+	Version = "v1.2.3-in-process"
+	t.Cleanup(func() { Version = previous })
+	if got := callMCPToolText(t, handlerFromMCPTool(VersionTool()), nil); got != Version+"\n" {
+		t.Fatalf("version=%q, want %q", got, Version+"\n")
+	}
+}
+
+func TestMCPCancellationCleanup(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("caller canceled")
+	closeErr := errors.New("cleanup failed")
+	closed := make(chan struct{})
+	var calls atomic.Int32
+	cleanup := closeMCPOnCancellation(ctx, func() error {
+		calls.Add(1)
+		close(closed)
+		return closeErr
+	})
+	cancel(cause)
+	select {
+	case <-closed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("cancellation did not close the resource")
+	}
+	if err := cleanup(); !errors.Is(err, closeErr) {
+		t.Fatalf("cleanup error=%v, want %v", err, closeErr)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("close calls=%d, want 1", got)
+	}
+}
+
+func TestMCPResourceCleanupPreservesErrors(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(t.Context())
+	cause := errors.New("caller canceled")
+	closeErr := errors.New("cleanup failed")
+	opErr := errors.New("operation failed")
+	client := &mcpClosingReplicaClient{closeErr: closeErr}
+	r := litestream.NewReplica(nil)
+	r.Client = client
+	cleanup := startMCPResourceCleanup(ctx, &mcpReplica{Replica: r})
+	cancel(cause)
+	if client.closeN != 0 {
+		t.Fatal("non-SFTP client closed before operation returned")
+	}
+	err := closeMCPResources(opErr, cleanup)
+	for _, want := range []error{opErr, closeErr, cause} {
+		if !errors.Is(err, want) {
+			t.Errorf("error=%v, want %v", err, want)
+		}
+	}
+	if client.closeN != 1 {
+		t.Fatalf("close calls=%d, want 1", client.closeN)
+	}
 }
