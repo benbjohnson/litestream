@@ -130,11 +130,11 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 
 	dir := litestream.LTXLevelDir(c.Path, level)
 	prefix := dir + "/"
-	if seek != 0 {
-		prefix += seek.String()
-	}
-
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
+	// List the whole level and filter by seek in the iterator (like the s3
+	// backend). We can't narrow the list with a seek-derived key prefix: a file
+	// whose range straddles the seek has a MinTXID below it, so a prefix on the
+	// seek value would exclude the very file that covers the next needed TXID.
+	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level, seek), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -240,15 +240,17 @@ type ltxFileIterator struct {
 	it     *storage.ObjectIterator
 	client *ReplicaClient
 	level  int
+	seek   ltx.TXID
 	info   *ltx.FileInfo
 	err    error
 }
 
-func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int) *ltxFileIterator {
+func newLTXFileIterator(it *storage.ObjectIterator, client *ReplicaClient, level int, seek ltx.TXID) *ltxFileIterator {
 	return &ltxFileIterator{
 		it:     it,
 		client: client,
 		level:  level,
+		seek:   seek,
 	}
 }
 
@@ -275,6 +277,13 @@ func (itr *ltxFileIterator) Next() bool {
 		// Parse index & offset, otherwise skip to the next object.
 		minTXID, maxTXID, err := ltx.ParseFilename(path.Base(attrs.Name))
 		if err != nil {
+			continue
+		}
+
+		// Skip only if the file's whole range is below the seek TXID. A file
+		// whose range straddles the seek (minTXID < seek <= maxTXID) still
+		// covers the next TXID a follower needs, so it must be returned.
+		if maxTXID < itr.seek {
 			continue
 		}
 
