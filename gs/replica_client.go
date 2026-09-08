@@ -183,11 +183,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		MetadataKeyTimestamp: timestamp.Format(time.RFC3339Nano),
 	}
 
-	n, err := io.Copy(w, fullReader)
-	if err != nil {
+	n, copyErr := io.Copy(w, fullReader)
+	if copyErr != nil {
 		cancel()
-		return info, err
-	} else if err := w.Close(); err != nil {
+	}
+	if err := errors.Join(copyErr, w.Close()); err != nil {
 		return info, err
 	}
 
