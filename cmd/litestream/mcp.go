@@ -253,7 +253,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 
 func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 	tool := mcp.NewTool("litestream_restore_plan",
-		mcp.WithDescription("Preview the ordered snapshot and LTX files for a restore without writing a database."),
+		mcp.WithDescription("Preview the ordered LTX files for a restore without writing a database. When legacy backups exist, specify an explicit TXID to preview LTX."),
 		mcp.WithReadOnlyHintAnnotation(true),
 		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("path", mcp.Required(), mcp.Description("Database path or replica URL.")),
@@ -280,11 +280,12 @@ func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		if err != nil {
 			return mcpToolError(err)
 		}
+		cleanup := startMCPResourceCleanup(ctx, resources)
 		plan, opErr := (&RestoreCommand{}).dryRunPlan(ctx, path, resources.Replica, opt)
 		if errors.Is(opErr, litestream.ErrTxNotAvailable) {
 			opErr = fmt.Errorf("no matching backup files available")
 		}
-		if err := closeMCPResources(opErr, resources); err != nil {
+		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)
 		}
 
