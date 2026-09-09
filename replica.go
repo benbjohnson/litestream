@@ -275,6 +275,14 @@ func (r *Replica) uploadLTXFile(ctx context.Context, localLevel, remoteLevel int
 		"maxTXID", info.MaxTXID,
 		"size", info.Size)
 
+	// Snapshot uploads (the base and boundary snapshots, routed to L9) must
+	// refresh the DB's cached snapshot-level max, consistent with db.Snapshot
+	if remoteLevel == SnapshotLevel {
+		r.db.maxLTXFileInfos.Lock()
+		r.db.maxLTXFileInfos.m[SnapshotLevel] = info
+		r.db.maxLTXFileInfos.Unlock()
+	}
+
 	// Track current position
 	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
 	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))

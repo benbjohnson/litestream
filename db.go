@@ -3415,7 +3415,10 @@ func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, erro
 		return ltx.FileInfo{}, fmt.Errorf("cannot determine L%d max ltx file for %q: %w", level, db.Path(), err)
 	}
 
-	db.maxLTXFileInfos.m[level] = &remoteInfo
+	// Only cache a real file. Mirrors the guard in Compactor.MaxLTXFileInfo.
+	if remoteInfo.MaxTXID > 0 {
+		db.maxLTXFileInfos.m[level] = &remoteInfo
+	}
 	return remoteInfo, nil
 }
 
