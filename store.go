@@ -789,6 +789,15 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		if err != nil {
 			return nil, fmt.Errorf("fetch db position: %w", err)
 		}
+		// The base (TXID 1) is the sync path's responsibility: it writes the
+		// initial full-DB image and the replica uploads it to the snapshot
+		// level. The monitor only produces periodic snapshots once the DB has
+		// advanced past the base (pos > 1). Standing down at pos <= 1 avoids
+		// a concurrent second full-DB read that would otherwise race the sync
+		// path's base capture.
+		if pos.TXID <= 1 {
+			return nil, ErrNoCompaction
+		}
 		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
 			return nil, ErrNoCompaction
 		}

@@ -595,6 +595,107 @@ func (db *DB) MaxLTX() (minTXID, maxTXID ltx.TXID, err error) {
 	return minTXID, maxTXID, nil
 }
 
+// openLevel0Anchor opens the local level-0 LTX file whose MaxTXID is maxTXID
+// and returns it along with its MinTXID. The file is either an increment
+// ([maxTXID, maxTXID]) or a snapshotting write ([1, maxTXID]); exactly one
+// exists for a given TXID, so we try the increment name first and fall back to
+// the snapshot name. Callers that assumed a [txID, txID] name must use this so
+// they resolve snapshots (tagged [1, txID], whether the initial snapshot or a
+// boundary snapshot) correctly.
+func (db *DB) openLevel0Anchor(maxTXID ltx.TXID) (f *os.File, minTXID ltx.TXID, err error) {
+	minTXID = maxTXID
+	path := db.LTXPath(0, minTXID, maxTXID)
+	f, err = os.Open(path)
+	if os.IsNotExist(err) && maxTXID > 1 {
+		minTXID = 1
+		path = db.LTXPath(0, minTXID, maxTXID)
+		f, err = os.Open(path)
+	}
+	if err != nil {
+		return nil, 0, NewLTXError("open", path, 0, uint64(minTXID), uint64(maxTXID), err)
+	}
+	return f, minTXID, nil
+}
+
+// uploadTarget resolves the local level-0 file the replica should upload next,
+// given the next TXID it needs (fromTXID = its resume position + 1).
+// Snapshotting writes are tagged [1, k] in the local L0 directory (the TX1
+// base and mid-stream boundary snapshots) and go to the remote snapshot
+// level; increments are tagged [k, k] and go to remote L0.
+//
+// Returns the file's MinTXID, its actual MaxTXID (which may exceed fromTXID
+// when a wider snapshot was used), and the destination remote level.
+func (db *DB) uploadTarget(fromTXID ltx.TXID) (minTXID, maxTXID ltx.TXID, remoteLevel int, err error) {
+	// The first write is always the base, so [1,1] is a snapshot; a [1, k]
+	// file for k > 1 is a boundary snapshot. No increment is ever [1, x].
+	if _, err := os.Stat(db.LTXPath(0, 1, fromTXID)); err == nil {
+		return 1, fromTXID, SnapshotLevel, nil
+	}
+	if _, err := os.Stat(db.LTXPath(0, fromTXID, fromTXID)); err == nil {
+		return fromTXID, fromTXID, 0, nil
+	}
+
+	// Neither exact name exists: fall back to the current live snapshot (the
+	// one [1, k] file that survives at a time), which may extend further than
+	// fromTXID and subsumes it.
+	if k, ok := db.currentSnapshotMaxTXID(); ok && k >= fromTXID {
+		return 1, k, SnapshotLevel, nil
+	}
+
+	path := db.LTXPath(0, fromTXID, fromTXID)
+	return 0, 0, 0, NewLTXError("open", path, 0, uint64(fromTXID), uint64(fromTXID), os.ErrNotExist)
+}
+
+// currentSnapshotMaxTXID returns the MaxTXID of the current live snapshot in
+// the local L0 directory (a file tagged [1, k]), if one exists. If more than
+// one such file happens to survive locally at once (the replica hasn't yet
+// confirmed the upload that would let an older one be cleaned up), the widest
+// is used, since it subsumes any narrower one.
+func (db *DB) currentSnapshotMaxTXID() (maxTXID ltx.TXID, ok bool) {
+	ents, err := os.ReadDir(db.LTXLevelDir(0))
+	if err != nil {
+		return 0, false
+	}
+	for _, ent := range ents {
+		min, max, err := ltx.ParseFilename(ent.Name())
+		if err != nil {
+			continue
+		}
+		if min == 1 && max > maxTXID {
+			maxTXID = max
+			ok = true
+		}
+	}
+	return maxTXID, ok
+}
+
+// deleteSupersededLocalSnapshot deletes the local file of a sync-path snapshot
+// the replica has just advanced past. It is called from the replica sync loop
+// immediately after a durable upload, with prevTXID = the replica's position
+// before that upload and (curMinTXID, curMaxTXID) = the file it just uploaded.
+//
+// Because a sync-path snapshot is uploaded to the L9 snapshot level instead of
+// L0, it is not cleaned up as increment LTX files are in EnforceL0RetentionByTime.
+// Thus, once both the snapshot and its succeeding file have been uploaded to the
+// replica, the snapshot file no longer serves a purpose locally and is deleted
+// to reclaim disk space.
+//
+// Deleting only [1, prevTXID] suffices because the contiguous walk visits every
+// superseded snapshot as prevTXID exactly once. Like all local retention, this
+// assumes a single replica walks the L0 directory.
+func (db *DB) deleteSupersededLocalSnapshot(prevTXID, curMinTXID, curMaxTXID ltx.TXID) {
+	if prevTXID == 0 {
+		return // nothing was anchored before this upload
+	}
+	stalePath := db.LTXPath(0, 1, prevTXID)
+	if stalePath == db.LTXPath(0, curMinTXID, curMaxTXID) {
+		return // we just (re)uploaded this exact file; it is still the live anchor
+	}
+	if err := os.Remove(stalePath); err != nil && !os.IsNotExist(err) {
+		db.Logger.Warn("failed to remove superseded local snapshot file", "path", stalePath, "error", err)
+	}
+}
+
 // FileInfo returns the cached file stats for the database file when it was initialized.
 func (db *DB) FileInfo() os.FileInfo {
 	return db.fileInfo
@@ -699,7 +800,11 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 		return SyncStatus{}, fmt.Errorf("local position: %w", err)
 	}
 
-	remotePos, err := db.Replica.calcPos(ctx)
+	// Snapshotting writes (the base and boundary snapshots) live only at the
+	// snapshot level, so the remote position must consider L9 as well as L0 —
+	// otherwise a replica that has uploaded the base but no increments reads as
+	// out of sync.
+	remotePos, err := db.Replica.calcRemotePos(ctx)
 	if err != nil {
 		return SyncStatus{}, fmt.Errorf("remote position: %w", err)
 	}
@@ -1688,18 +1793,20 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 		return info, nil // first sync
 	}
 
-	// Determine last WAL offset we save from.
-	ltxPath := db.LTXPath(0, exec.pos.TXID, exec.pos.TXID)
-	ltxFile, err := os.Open(ltxPath)
+	// Determine last WAL offset we save from. The anchor may be a snapshot
+	// tagged [1, TXID] (initial or boundary), so resolve its real range rather
+	// than assuming [TXID, TXID].
+	ltxFile, minTXID, err := db.openLevel0Anchor(exec.pos.TXID)
 	if err != nil {
-		return info, NewLTXError("open", ltxPath, 0, uint64(exec.pos.TXID), uint64(exec.pos.TXID), err)
+		return info, err
 	}
 	defer func() { _ = ltxFile.Close() }()
 
 	dec := ltx.NewDecoder(ltxFile)
 	if err := dec.DecodeHeader(); err != nil {
 		// Decode failure indicates corruption
-		ltxErr := NewLTXError("decode", ltxPath, 0, uint64(exec.pos.TXID), uint64(exec.pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+		ltxPath := db.LTXPath(0, minTXID, exec.pos.TXID)
+		ltxErr := NewLTXError("decode", ltxPath, 0, uint64(minTXID), uint64(exec.pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
 		return info, ltxErr
 	}
 	info.offset = dec.Header().WALOffset + dec.Header().WALSize
@@ -2011,7 +2118,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			s.reason = info.reason
 		})
 
-	filename := db.LTXPath(0, txID, txID)
+	// Snapshotting writes (the initial base and mid-stream boundary snapshots)
+	// are full-DB images. Tag them [1, txID] so the file itself durably marks
+	// it as a snapshot: the replica routes MinTXID==1 files to the remote
+	// snapshot level (L9), and no increment is ever [1, x] because the first
+	// write is always the base. Increments stay [txID, txID]. The file is
+	// still written into the local L0 directory so MaxLTX/Pos find the anchor.
+	minTXID := txID
+	if info.snapshotting {
+		minTXID = 1
+	}
+	filename := db.LTXPath(0, minTXID, txID)
 
 	logArgs := []any{
 		"txid", txID.String(),
@@ -2148,7 +2265,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		Flags:     ltx.HeaderFlagNoChecksum,
 		PageSize:  uint32(db.pageSize),
 		Commit:    commit,
-		MinTXID:   txID,
+		MinTXID:   minTXID,
 		MaxTXID:   txID,
 		Timestamp: timestamp.UnixMilli(),
 		WALOffset: info.offset,
@@ -2245,12 +2362,20 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 
 	result.synced = true
-	result.l0FileInfo = &ltx.FileInfo{
-		Level:     0,
-		MinTXID:   txID,
-		MaxTXID:   txID,
-		CreatedAt: time.Now(),
-		Size:      enc.N(),
+	// Only increments advance the L0 max used by the compaction ladder.
+	// Snapshotting writes are recorded at the snapshot level (via the remote
+	// L9 upload), not L0, so the ladder never sees a DB-sized image. Leaving
+	// l0FileInfo nil here keeps maxLTXFileInfos[0] pointing at the last
+	// increment (or empty at bootstrap); the anchor still resolves from the
+	// local L0 directory via MaxLTX/Pos.
+	if !info.snapshotting {
+		result.l0FileInfo = &ltx.FileInfo{
+			Level:     0,
+			MinTXID:   txID,
+			MaxTXID:   txID,
+			CreatedAt: time.Now(),
+			Size:      enc.N(),
+		}
 	}
 
 	encPos := enc.PostApplyPos()
@@ -2769,16 +2894,18 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 		return WALHeaderSize, nil
 	}
 
-	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
-	f, err := os.Open(ltxPath)
+	// The anchor may be a snapshot tagged [1, TXID] (initial or boundary);
+	// resolve its real range rather than assuming [TXID, TXID].
+	f, minTXID, err := db.openLevel0Anchor(pos.TXID)
 	if err != nil {
-		return 0, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
+		return 0, err
 	}
 	defer func() { _ = f.Close() }()
 
 	dec := ltx.NewDecoder(f)
 	if err := dec.DecodeHeader(); err != nil {
-		return 0, NewLTXError("decode", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
+		ltxPath := db.LTXPath(0, minTXID, pos.TXID)
+		return 0, NewLTXError("decode", ltxPath, 0, uint64(minTXID), uint64(pos.TXID), fmt.Errorf("%w: %w", ErrLTXCorrupted, err))
 	}
 
 	// Compare WAL headers. If the WAL was restarted since this LTX file was

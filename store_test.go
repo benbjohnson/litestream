@@ -107,6 +107,18 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// The base (TXID 1, above) is the sync path's own responsibility: the
+		// first sync is a snapshotting write, tagged [1,1] locally, and the
+		// replica upload routes it to the remote snapshot level automatically.
+		// A further increment is needed for L1 to compact.
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (200)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
 		_, err := s.CompactDB(t.Context(), db0, levels[1])
 		require.NoError(t, err)
 
@@ -137,6 +149,13 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 		s := litestream.NewStore([]*litestream.DB{db0}, levels)
 		s.CompactionMonitorEnabled = false
+		// The base write below lands at the snapshot level immediately (via the
+		// replica upload), so it counts against the SnapshotInterval throttle for
+		// the manual compaction below. Use a short-but-nonzero interval: long
+		// enough that the two manual calls below (executed back-to-back, no
+		// sleep) reliably land within the same interval window, short enough
+		// that sleeping past it (below) reliably clears the base's recency.
+		s.SnapshotInterval = 200 * time.Millisecond
 		if err := s.Open(t.Context()); err != nil {
 			t.Fatal(err)
 		}
@@ -152,6 +171,20 @@ func TestStore_CompactDB(t *testing.T) {
 		} else if err := db0.Replica.Sync(t.Context()); err != nil {
 			t.Fatal(err)
 		}
+
+		// The base (TXID 1, above) is the sync path's own responsibility and is
+		// already at the snapshot level; the monitor stands down at pos <= 1.
+		// Advance past the base so the monitor has a periodic snapshot to make.
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (200)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		// Clear the base's recency against the interval throttle above.
+		time.Sleep(2 * s.SnapshotInterval)
 
 		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
 			t.Fatal(err)
@@ -189,13 +222,27 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// The base (TXID 1, above) is itself a snapshotting write and the replica
+		// upload routes it to the snapshot level automatically -- that's the
+		// first SnapshotLevel write. The monitor stands down at pos <= 1, so
+		// advance past the base before exercising its periodic-snapshot path.
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (200)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
 		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrNoCompaction) {
 			t.Fatalf("unexpected error: %s", err)
 		}
-		if got, want := client.writeCount(), 1; got != want {
+		// One SnapshotLevel write for the base (via the replica upload) and one
+		// for the periodic snapshot above; the no-progress retry adds no more.
+		if got, want := client.writeCount(), 2; got != want {
 			t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
 		}
 	})

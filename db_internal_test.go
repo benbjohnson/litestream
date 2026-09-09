@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1686,14 +1687,20 @@ func TestDB_MonitorRetriesAndRecoversFromLTXStagingDiskFull(t *testing.T) {
 
 	diskFull.Store(false)
 
+	// The base (TXID 1) is a snapshotting write, uploaded to the remote
+	// snapshot level (l9) rather than remote L0, so both must be counted.
 	remoteLTXCount := func() int {
-		entries, err := os.ReadDir(filepath.Join(replicaDir, "l0"))
-		if os.IsNotExist(err) {
-			return 0
-		} else if err != nil {
-			t.Fatalf("read replica ltx dir: %v", err)
+		var n int
+		for _, level := range []string{"l0", "l9"} {
+			entries, err := os.ReadDir(filepath.Join(replicaDir, level))
+			if os.IsNotExist(err) {
+				continue
+			} else if err != nil {
+				t.Fatalf("read replica ltx dir: %v", err)
+			}
+			n += len(entries)
 		}
-		return len(entries)
+		return n
 	}
 
 	waitFor("automatic recovery", func() bool {
@@ -1789,6 +1796,19 @@ func TestDB_L0RetentionMetrics(t *testing.T) {
 	defer sqldb.Close()
 
 	if _, err := sqldb.Exec(`CREATE TABLE t (id INT, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The base must be captured in a snapshot before an empty L1's first
+	// compaction: Compact defers (ErrNoCompaction) until a snapshot exists,
+	// rather than pulling the DB-sized base into L1's first file.
+	if _, err := db.Snapshot(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
@@ -3079,14 +3099,33 @@ func TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint(t *testing.T) {
 	}
 	t.Logf("final txid=%d", pos.TXID)
 
-	var readers []io.ReadCloser
-	for txid := ltx.TXID(1); txid <= pos.TXID; txid++ {
-		path := db.LTXPath(0, txid, txid)
-		f, err := os.Open(path)
+	// Build the restore chain by walking backward from the current position,
+	// resolving each anchor the same way production code does (openLevel0Anchor),
+	// to construct the history of increments ([txid, txid]) and snapshots
+	// ([1,txid]).
+	type ltxFile struct {
+		min, max ltx.TXID
+		path     string
+	}
+	var files []ltxFile
+	for max := pos.TXID; max > 0; {
+		f, min, err := db.openLevel0Anchor(max)
 		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
+			t.Fatal(err)
+		}
+		files = append(files, ltxFile{min: min, max: max, path: f.Name()})
+		f.Close()
+		if min <= 1 {
+			break
+		}
+		max = min - 1
+	}
+
+	var readers []io.ReadCloser
+	// files were appended newest-first; reverse to oldest-first for the compactor.
+	for _, lf := range slices.Backward(files) {
+		f, err := os.Open(lf.path)
+		if err != nil {
 			t.Fatal(err)
 		}
 		readers = append(readers, f)
@@ -3759,7 +3798,18 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The first sync above is the base (a snapshotting write): it doesn't
+	// populate maxLTXFileInfos[0], since snapshotting writes are recorded at
+	// the snapshot level, not L0. A genuine increment is needed so the L0
+	// cache this test inspects below is populated.
 	if _, err := sqldb.Exec(`INSERT INTO t VALUES (2, 'after')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.Exec(`INSERT INTO t VALUES (3, 'after2')`); err != nil {
 		t.Fatal(err)
 	}
 

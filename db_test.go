@@ -220,6 +220,15 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		// Reconnecting to the same remote target on reopen (below) is the
+		// realistic restart scenario -- calcPos recovers the resume position
+		// from that target's own listing, so no historical local file (e.g. a
+		// superseded snapshot's local copy, already cleaned up once uploaded)
+		// is ever needed. A fresh, unrelated remote target would need the full
+		// history replayed from TXID 1, which is a distinct, unsupported
+		// scenario this test isn't about.
+		replicaClient := db.Replica.Client
+
 		if err := db.Close(context.Background()); err != nil {
 			t.Fatal(err)
 		} else if err := sqldb.Close(); err != nil {
@@ -231,8 +240,9 @@ func TestDB_Sync(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Reopen the managed database.
+		// Reopen the managed database, reconnecting to the same remote target.
 		db = testingutil.MustOpenDBAt(t, db.Path())
+		db.Replica.Client = replicaClient
 		defer testingutil.MustCloseDB(t, db)
 
 		// Re-sync and ensure new generation has been created.
@@ -413,6 +423,16 @@ func TestDB_Compact(t *testing.T) {
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
+		if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		// The base (TXID 1) must be captured in a snapshot before an empty L1's
+		// first compaction: Compact defers (ErrNoCompaction) until a snapshot
+		// exists, rather than pulling the DB-sized base into L1's first file.
+		if _, err := db.Snapshot(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
@@ -436,7 +456,7 @@ func TestDB_Compact(t *testing.T) {
 		if got, want := info.Level, 1; got != want {
 			t.Fatalf("Level=%v, want %v", got, want)
 		}
-		if got, want := info.MinTXID, ltx.TXID(1); got != want {
+		if got, want := info.MinTXID, ltx.TXID(2); got != want {
 			t.Fatalf("MinTXID=%s, want %s", got, want)
 		}
 		if got, want := info.MaxTXID, ltx.TXID(2); got != want {
@@ -455,6 +475,16 @@ func TestDB_Compact(t *testing.T) {
 		if err := db.Sync(context.Background()); err != nil {
 			t.Fatal(err)
 		}
+		if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		// The base (TXID 1) must be captured in a snapshot before an empty L1's
+		// first compaction: Compact defers (ErrNoCompaction) until a snapshot
+		// exists, rather than pulling the DB-sized base into L1's first file.
+		if _, err := db.Snapshot(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 
 		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
 			t.Fatal(err)
@@ -471,10 +501,10 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		// Compact to L1:1-2
+		// Compact to L1:2-2 (base at TXID 1 is skipped: already in the snapshot)
 		if info, err := db.Compact(t.Context(), 1); err != nil {
 			t.Fatal(err)
-		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000002.ltx`; got != want {
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000002-0000000000000002.ltx`; got != want {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 
@@ -496,12 +526,14 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 
-		// Compact to L2:1-3
+		// Compact to L2:2-3 (empty L2 also seeks past the snapshot at TXID 1,
+		// pulling both L1 files -- [2,2] and [3,3] -- which both start at or
+		// after snapMax+1)
 		if info, err := db.Compact(t.Context(), 2); err != nil {
 			t.Fatal(err)
 		} else if got, want := info.Level, 2; got != want {
 			t.Fatalf("Level=%v, want %v", got, want)
-		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000001-0000000000000003.ltx`; got != want {
+		} else if got, want := ltx.FormatFilename(info.MinTXID, info.MaxTXID), `0000000000000002-0000000000000003.ltx`; got != want {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 	})
@@ -891,6 +923,16 @@ func TestDB_EnforceL0RetentionByTime_RetentionDisabled(t *testing.T) {
 	} else if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
+
+	// The base (TXID 1, above) must be captured in a snapshot before an empty
+	// L1's first compaction: Compact defers (ErrNoCompaction) until a snapshot
+	// exists. Snapshotting right after the base (rather than after the loop
+	// below) leaves TXID 2-4 as genuine increments for L1 to compact. db.Snapshot
+	// reads the live DB directly, so this doesn't need db.Replica.Sync first.
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
 	for i := 0; i < 3; i++ {
 		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
 			t.Fatal(err)
@@ -924,7 +966,8 @@ func TestDB_EnforceL0RetentionByTime_RetentionDisabled(t *testing.T) {
 		t.Fatalf("expected at least 2 L0 files, got %d", beforeCount)
 	}
 
-	// Compact L0 to L1 so files become eligible for L0 retention.
+	// Compact L0 to L1 so files become eligible for L0 retention. The base was
+	// already captured in a snapshot above.
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
 	if _, err := store.CompactDB(t.Context(), db, &litestream.CompactionLevel{Level: 1, Interval: time.Nanosecond}); err != nil {
 		t.Fatal(err)
@@ -1058,6 +1101,18 @@ func TestCompaction_PreservesLastTimestamp(t *testing.T) {
 		if err := db.Replica.Sync(ctx); err != nil {
 			t.Fatalf("sync replica: %v", err)
 		}
+
+		// The base (TXID 1, the first iteration above) must be captured in a
+		// snapshot before an empty L1's first compaction: Compact defers
+		// (ErrNoCompaction) until a snapshot exists, rather than pulling the
+		// DB-sized base into L1's first file. Snapshotting right after the base
+		// (rather than after the whole loop) leaves TXID 2-10 as genuine
+		// increments for L1 to compact.
+		if i == 0 {
+			if _, err := db.Snapshot(ctx); err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
+		}
 	}
 
 	// Record the last L0 file timestamp before compaction
@@ -1179,16 +1234,32 @@ func TestDB_EnforceRetentionByTXID_LocalCleanup(t *testing.T) {
 		if err != nil {
 			t.Fatalf("get max ltx: %v", err)
 		}
-		localPath := db.LTXPath(0, minTXID, maxTXID)
-		firstBatchL0Files = append(firstBatchL0Files, localFile{
-			path:    localPath,
-			minTXID: minTXID,
-			maxTXID: maxTXID,
-		})
+		// The base (i == 0, TXID 1) is a snapshotting write: its local file is
+		// proactively removed by the replica once superseded by the next
+		// upload (see the cleanup in Replica.syncOnce), since its data already
+		// lives durably at the remote snapshot level and no anchor ever needs
+		// it again locally. It is never visible to EnforceRetentionByTXID
+		// (level 0, ...), which only sees files present in the remote L0
+		// listing. So only genuine increments (i >= 1) are tracked here as
+		// files that retention is responsible for.
+		if i > 0 {
+			localPath := db.LTXPath(0, minTXID, maxTXID)
+			firstBatchL0Files = append(firstBatchL0Files, localFile{
+				path:    localPath,
+				minTXID: minTXID,
+				maxTXID: maxTXID,
+			})
+		}
 
 		if err := db.Replica.Sync(ctx); err != nil {
 			t.Fatalf("sync replica batch1 %d: %v", i, err)
 		}
+	}
+
+	// The base's local file is proactively cleaned up once superseded -- it
+	// never lingers for EnforceRetentionByTXID to find.
+	if _, err := os.Stat(db.LTXPath(0, 1, 1)); !os.IsNotExist(err) {
+		t.Fatalf("base local file should have been proactively removed once superseded")
 	}
 
 	for _, lf := range firstBatchL0Files {
@@ -1267,6 +1338,17 @@ func TestDB_EnforceL0RetentionByTime(t *testing.T) {
 		}
 		if err := db.Replica.Sync(ctx); err != nil {
 			t.Fatalf("sync replica %d: %v", i, err)
+		}
+
+		// The base (TXID 1, the first iteration above) must be captured in a
+		// snapshot before an empty L1's first compaction: Compact defers
+		// (ErrNoCompaction) until a snapshot exists. Snapshotting right after the
+		// base (rather than after the whole loop) leaves TXID 2-3 as genuine
+		// increments for L1 to compact.
+		if i == 0 {
+			if _, err := db.Snapshot(ctx); err != nil {
+				t.Fatalf("snapshot: %v", err)
+			}
 		}
 	}
 

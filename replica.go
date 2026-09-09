@@ -204,7 +204,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		))
 
 	// Replicate all L0 LTX files since last replica position.
-	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+	for fromTXID, syncedFileN := r.Pos().TXID+1, 0; fromTXID <= dpos.TXID; fromTXID = r.Pos().TXID + 1 {
 		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
 			result.limited = true
 			// Uploads succeeded, so record sync health; otherwise a
@@ -219,12 +219,24 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		if err := ctx.Err(); err != nil {
 			return result, context.Cause(ctx)
 		}
-		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+		// Upload incremental L0 files to L0, and snapshots to L9.
+		prevTXID := r.Pos().TXID
+		minTXID, maxTXID, remoteLevel, err := r.db.uploadTarget(fromTXID)
+		if err != nil {
 			return result, err
 		}
-		r.SetPos(ltx.Pos{TXID: txID})
+		if err := r.uploadLTXFile(ctx, 0, remoteLevel, minTXID, maxTXID); err != nil {
+			return result, err
+		}
+		r.SetPos(ltx.Pos{TXID: maxTXID})
 		result.synced = true
 		syncedFileN++
+
+		// Delete the local file of any sync-path snapshot we've now advanced past
+		// (the initial snapshot or a boundary snapshot). Its bytes are durably at
+		// remote L9; its local L0-dir copy is only staging + anchor state that no
+		// retention path owns.
+		r.db.deleteSupersededLocalSnapshot(prevTXID, minTXID, maxTXID)
 	}
 
 	// Record successful sync for heartbeat monitoring.
@@ -245,15 +257,15 @@ func (r *Replica) lockSync(ctx context.Context) error {
 	return nil
 }
 
-func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (err error) {
-	filename := r.db.LTXPath(level, minTXID, maxTXID)
+func (r *Replica) uploadLTXFile(ctx context.Context, localLevel, remoteLevel int, minTXID, maxTXID ltx.TXID) (err error) {
+	filename := r.db.LTXPath(localLevel, minTXID, maxTXID)
 	f, err := os.Open(filename)
 	if err != nil {
-		return NewLTXError("open", filename, level, uint64(minTXID), uint64(maxTXID), err)
+		return NewLTXError("open", filename, localLevel, uint64(minTXID), uint64(maxTXID), err)
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	info, err := r.Client.WriteLTXFile(ctx, remoteLevel, minTXID, maxTXID, f)
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
@@ -270,13 +282,38 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	return nil
 }
 
-// calcPos returns the last position saved to the replica for level 0.
+// calcPos returns the last position saved to the replica for level 0. This is
+// the replica sync loop's resume point: it stays L0-only so every increment is
+// still uploaded to L0 (preserving point-in-time restore granularity) even when
+// a snapshot at L9 already covers a higher TXID. Re-encountering a snapshot TXID
+// is harmless -- uploadTarget re-routes it to L9 idempotently.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	info, err := r.MaxLTXFileInfo(ctx, 0)
 	if err != nil {
 		return pos, fmt.Errorf("max ltx file: %w", err)
 	}
 	return ltx.Pos{TXID: info.MaxTXID}, nil
+}
+
+// calcRemotePos returns the highest TXID durably present in the replica across
+// the increment level (L0) and the snapshot level (L9). Snapshotting writes --
+// the base and boundary snapshots -- are stored only at the snapshot level, so a
+// replica that has uploaded the base but no increments is still fully caught up.
+// Used for reporting replication status, not for the sync loop's resume point.
+func (r *Replica) calcRemotePos(ctx context.Context) (pos ltx.Pos, err error) {
+	l0, err := r.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		return pos, fmt.Errorf("max l0 ltx file: %w", err)
+	}
+	snap, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return pos, fmt.Errorf("max snapshot ltx file: %w", err)
+	}
+	txID := l0.MaxTXID
+	if snap.MaxTXID > txID {
+		txID = snap.MaxTXID
+	}
+	return ltx.Pos{TXID: txID}, nil
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
