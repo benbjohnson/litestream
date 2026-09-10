@@ -1257,6 +1257,14 @@ func (db *DB) lockExec(ctx context.Context) error {
 	return nil
 }
 
+// addDurationToCounter records positive durations without allowing a clock
+// adjustment to panic a Prometheus counter.
+func addDurationToCounter(counter prometheus.Counter, d time.Duration) {
+	if d > 0 {
+		counter.Add(d.Seconds())
+	}
+}
+
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
 	defer func() { db.finishSyncDiag(err) }()
@@ -1273,7 +1281,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		} else {
 			db.diskFullGauge.Set(0)
 		}
-		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.syncSecondsCounter, time.Since(t))
 	}()
 
 	exec, err := db.newSyncExecutor(ctx)
@@ -2647,7 +2655,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 		if err != nil {
 			db.checkpointErrorNCounterVec.With(labels).Inc()
 		}
-		db.checkpointSecondsCounterVec.With(labels).Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.checkpointSecondsCounterVec.With(labels), time.Since(t))
 	}()
 
 	// Ensure the read lock has been removed before issuing a checkpoint.

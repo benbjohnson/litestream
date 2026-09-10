@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/semaphore"
@@ -1110,6 +1111,35 @@ func TestCalcWALSize(t *testing.T) {
 					t.Errorf("calcWALSize(%d, %d) = %d (%.2f GB), suspiciously small, possible overflow",
 						tt.pageSize, tt.pageN, got, float64(got)/(1024*1024*1024))
 				}
+			}
+		})
+	}
+}
+
+// TestAddDurationToCounter ignores negative durations because Prometheus
+// counters cannot decrease. Negative durations can occur when the system clock
+// moves backwards between the start and end of an operation.
+func TestAddDurationToCounter(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration time.Duration
+		want     float64
+	}{
+		{name: "positive", duration: 1500 * time.Millisecond, want: 1.5},
+		{name: "zero", duration: 0, want: 0},
+		{name: "negative", duration: -500 * time.Millisecond, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "test_duration_seconds",
+				Help: "Test duration counter.",
+			})
+			addDurationToCounter(counter, tt.duration)
+
+			if got := testutil.ToFloat64(counter); got != tt.want {
+				t.Fatalf("counter value=%v, want %v", got, tt.want)
 			}
 		})
 	}
