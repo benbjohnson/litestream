@@ -276,11 +276,9 @@ func (r *Replica) uploadLTXFile(ctx context.Context, localLevel, remoteLevel int
 		"size", info.Size)
 
 	// Snapshot uploads (the base and boundary snapshots, routed to L9) must
-	// refresh the DB's cached snapshot-level max, consistent with db.Snapshot
+	// refresh the DB's cached snapshot-level max, consistent with db.Snapshot.
 	if remoteLevel == SnapshotLevel {
-		r.db.maxLTXFileInfos.Lock()
-		r.db.maxLTXFileInfos.m[SnapshotLevel] = info
-		r.db.maxLTXFileInfos.Unlock()
+		r.db.recordMaxLTXFile(SnapshotLevel, info)
 	}
 
 	// Track current position
