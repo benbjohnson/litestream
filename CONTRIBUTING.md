@@ -150,8 +150,8 @@ before merging:
 go build -o bin/litestream ./cmd/litestream
 go build -o bin/litestream-test ./cmd/litestream-test
 
-# Run the behavioral test suite
-go test -tags 'integration,soak' -run TestLTXBehavior -short -v ./tests/integration/
+# Run the behavioral test suite (~11m15s with -short)
+go test -tags 'integration,soak' -run TestLTXBehavior -short -v -timeout 20m ./tests/integration/
 ```
 
 This verifies LTX files are the right size and frequency, snapshots aren't excessive,
