@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,7 +64,7 @@ func TestReplica_ApplyNewLTXFiles_FillGapWithOverlappingCompactedFile(t *testing
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	got, err := r.applyNewLTXFiles(context.Background(), f, 150, pageSize)
+	got, err := r.applyNewLTXFiles(context.Background(), f, 150, pageSize, new(ltx.TXID))
 	if err != nil {
 		t.Fatalf("apply new ltx files: %v", err)
 	}
@@ -107,7 +108,7 @@ func TestReplica_ApplyNewLTXFiles_LevelZeroEmptyFallsBackToCompaction(t *testing
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	got, err := r.applyNewLTXFiles(context.Background(), f, 10, pageSize)
+	got, err := r.applyNewLTXFiles(context.Background(), f, 10, pageSize, new(ltx.TXID))
 	if err != nil {
 		t.Fatalf("apply new ltx files: %v", err)
 	}
@@ -132,7 +133,7 @@ func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	_, err := r.applyNewLTXFiles(context.Background(), f, 10, 4096)
+	_, err := r.applyNewLTXFiles(context.Background(), f, 10, 4096, new(ltx.TXID))
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -541,5 +542,95 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
 			t.Fatalf("page %d data mismatch", i+1)
 		}
+	}
+}
+
+func TestReplica_ApplyNewLTXFiles_UnreachableGapWarnsOnce(t *testing.T) {
+	const pageSize = 4096
+
+	for _, tt := range []struct {
+		name         string
+		level0       []*ltx.FileInfo
+		level1       []*ltx.FileInfo
+		cancelled    bool
+		wantWarnings int
+	}{
+		// The gap is visible in the level 0 listing itself.
+		{
+			name:         "GapInLevel0",
+			level0:       []*ltx.FileInfo{{Level: 0, MinTXID: 200, MaxTXID: 200}},
+			wantWarnings: 1,
+		},
+		// Level 0 has been compacted away entirely; the gap is only visible at
+		// a higher level.
+		{
+			name:         "NoLevel0Files",
+			level1:       []*ltx.FileInfo{{Level: 1, MinTXID: 200, MaxTXID: 250}},
+			wantWarnings: 1,
+		},
+		// Shutdown must stay quiet (see TestReplica_ContextCancellationNoLogs).
+		{
+			name:      "CancelledContext",
+			level0:    []*ltx.FileInfo{{Level: 0, MinTXID: 200, MaxTXID: 200}},
+			cancelled: true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &followTestReplicaClient{}
+			client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				var all []*ltx.FileInfo
+				switch level {
+				case 0:
+					all = tt.level0
+				case 1:
+					all = tt.level1
+				}
+
+				infos := make([]*ltx.FileInfo, 0, len(all))
+				for _, info := range all {
+					if info.MinTXID >= seek {
+						infos = append(infos, info)
+					}
+				}
+				return ltx.NewFileInfoSliceIterator(infos), nil
+			}
+
+			var logBuf bytes.Buffer
+			db := NewDB(filepath.Join(t.TempDir(), "follower.db"))
+			db.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+			r := NewReplicaWithClient(db, client)
+			f := mustCreateWritableDBFile(t)
+			defer func() { _ = f.Close() }()
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if tt.cancelled {
+				cancel()
+			}
+
+			// Poll several times from the same position, as the follow loop does
+			// on every interval, carrying the same stall state it carries.
+			// Nothing bridges the gap, so the position never advances and the
+			// condition must be reported exactly once.
+			stallTXID := new(ltx.TXID)
+			for i := 0; i < 3; i++ {
+				got, err := r.applyNewLTXFiles(ctx, f, 100, pageSize, stallTXID)
+				if err != nil {
+					t.Fatalf("apply new ltx files: %v", err)
+				}
+				if got != 100 {
+					t.Fatalf("txid=%s, want %s", got, ltx.TXID(100))
+				}
+			}
+
+			logs := logBuf.String()
+			if n := strings.Count(logs, "level=WARN"); n != tt.wantWarnings {
+				t.Fatalf("warnings=%d, want %d, logs=%q", n, tt.wantWarnings, logs)
+			}
+			if tt.wantWarnings > 0 && !strings.Contains(logs, "next_txid=00000000000000c8") {
+				t.Fatalf("expected next txid in warning, logs=%q", logs)
+			}
+		})
 	}
 }
