@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -179,6 +180,12 @@ func TestResumableReader(t *testing.T) {
 		if !strings.Contains(err.Error(), "max retries exceeded") {
 			t.Fatalf("expected 'max retries exceeded' error, got: %v", err)
 		}
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := r.Read(buf); !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("read after close returned %v, want os.ErrClosed", err)
+		}
 	})
 
 	t.Run("ReopenFailure", func(t *testing.T) {
@@ -271,6 +278,64 @@ func TestResumableReader(t *testing.T) {
 	})
 }
 
+func TestResumableReader_CloseWhileReopening(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	openStarted := make(chan struct{})
+	continueOpen := make(chan struct{})
+	stream := &closeTrackingReadCloser{Reader: bytes.NewReader(nil)}
+	var openN atomic.Int64
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			if openN.Add(1) == 1 {
+				close(openStarted)
+			}
+			select {
+			case <-continueOpen:
+				return stream, nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	r := NewResumableReader(ctx, client, 0, 1, 1, 1, nil, slog.Default())
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := r.Read(make([]byte, 1))
+		errCh <- err
+	}()
+
+	select {
+	case <-openStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for reopen")
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	close(continueOpen)
+
+	select {
+	case err := <-errCh:
+		if !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("read returned %v, want os.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for read")
+	}
+	if !stream.closed.Load() {
+		t.Fatal("reopened stream was not closed")
+	}
+	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("read after close returned %v, want os.ErrClosed", err)
+	}
+	if got := openN.Load(); got != 1 {
+		t.Fatalf("OpenLTXFile() count=%d, want 1", got)
+	}
+}
+
 func TestResumableReader_BoundsConnectionsAcrossPartialReads(t *testing.T) {
 	data := []byte("0123456789abcdef")
 	var connectionN atomic.Int64
@@ -311,9 +376,48 @@ func TestResumableReader_BoundsConnectionsAcrossPartialReads(t *testing.T) {
 	_, err := io.ReadAll(r)
 	if err == nil {
 		t.Error("ReadAll() error=nil, want retry limit error")
+	} else if !strings.Contains(err.Error(), "max retries exceeded") {
+		t.Errorf("ReadAll() error=%v, want retry limit error", err)
 	}
 	if got, max := connectionN.Load(), int64(resumableReaderMaxRetries+1); got > max {
 		t.Errorf("connections=%d, want at most %d", got, max)
+	}
+}
+
+func TestResumableReader_ResetsRetriesAfterCompleteRead(t *testing.T) {
+	const (
+		readSize     = 4 * 1024
+		progressSize = 64 * 1024
+		disconnectN  = resumableReaderMaxRetries + 2
+	)
+	data := bytes.Repeat([]byte("0123456789abcdef"), ((disconnectN+1)*progressSize)/16)
+	openN := 0
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			openN++
+			if openN <= disconnectN {
+				return io.NopCloser(&errorAfterN{
+					data: data[offset:],
+					n:    progressSize,
+					err:  fmt.Errorf("connection reset"),
+				}), nil
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:])), nil
+		},
+	}
+
+	r := newTestResumableReader(client, int64(len(data)), data)
+	got := make([]byte, len(data))
+	for offset := 0; offset < len(got); offset += readSize {
+		if _, err := io.ReadFull(r, got[offset:offset+readSize]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("read %d bytes, want %d", len(got), len(data))
+	}
+	if got, want := openN, disconnectN+1; got != want {
+		t.Fatalf("OpenLTXFile() count=%d, want %d", got, want)
 	}
 }
 
@@ -339,6 +443,16 @@ type testLTXFileOpener struct {
 
 func (t *testLTXFileOpener) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	return t.OpenLTXFileFunc(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+type closeTrackingReadCloser struct {
+	io.Reader
+	closed atomic.Bool
+}
+
+func (r *closeTrackingReadCloser) Close() error {
+	r.closed.Store(true)
+	return nil
 }
 
 // errorAfterN is a reader that returns data normally for the first n bytes,
