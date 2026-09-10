@@ -185,20 +185,13 @@ func WaitForDatabaseInReplica(t *testing.T, replicaPath, dbPath string, timeout 
 			}
 
 			// Check if this directory matches the database name and has LTX files
+			// at any compaction level (see ltxFilesAllLevels).
 			if info.IsDir() && filepath.Base(path) == dbName {
-				ltxDir := filepath.Join(path, "ltx", "0")
-				if _, err := os.Stat(ltxDir); err == nil {
-					entries, err := os.ReadDir(ltxDir)
-					if err == nil {
-						for _, entry := range entries {
-							if strings.HasSuffix(entry.Name(), ".ltx") {
-								relPath, _ := filepath.Rel(replicaPath, path)
-								t.Logf("Database %s detected in replica at %s (found %s)", dbName, relPath, entry.Name())
-								found = true
-								return nil
-							}
-						}
-					}
+				if matches := ltxFilesAllLevels(path); len(matches) > 0 {
+					relPath, _ := filepath.Rel(replicaPath, path)
+					t.Logf("Database %s detected in replica at %s (found %s)", dbName, relPath, filepath.Base(matches[0]))
+					found = true
+					return nil
 				}
 			}
 			return nil
@@ -256,9 +249,8 @@ func CountDatabasesInReplica(replicaPath string) (int, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		// Check if this database directory has LTX files
-		ltxDir := filepath.Join(replicaPath, entry.Name(), "ltx", "0")
-		if countLTXFiles(ltxDir) > 0 {
+		// Count a database as replicated if it has LTX files at any level.
+		if len(ltxFilesAllLevels(filepath.Join(replicaPath, entry.Name()))) > 0 {
 			count++
 		}
 	}

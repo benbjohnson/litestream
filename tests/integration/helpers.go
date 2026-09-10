@@ -460,12 +460,7 @@ func (db *TestDB) GetDatabaseSize() (int64, error) {
 }
 
 func (db *TestDB) GetReplicaFileCount() (int, error) {
-	ltxPath := filepath.Join(db.ReplicaPath, "ltx", "0")
-	files, err := filepath.Glob(filepath.Join(ltxPath, "*.ltx"))
-	if err != nil {
-		return 0, err
-	}
-	return len(files), nil
+	return len(ltxFilesAllLevels(db.ReplicaPath)), nil
 }
 
 func (db *TestDB) WaitForReplicaFiles(minFiles int, timeout time.Duration) (int, error) {
@@ -544,12 +539,30 @@ func (db *TestDB) WaitForSnapshots(timeout time.Duration) error {
 	}
 }
 
+// countLTXFiles counts .ltx files directly within a single level directory
+// (e.g. <db>/ltx/0). Callers that need to distinguish levels -- such as
+// asserting a base snapshot at ltx/9 separately from an increment at ltx/0 --
+// rely on this per-directory precision.
 func countLTXFiles(dir string) int {
 	matches, err := filepath.Glob(filepath.Join(dir, "*.ltx"))
 	if err != nil {
 		return 0
 	}
 	return len(matches)
+}
+
+// ltxFilesAllLevels returns the .ltx files under a database's replica directory
+// across every compaction level (dbReplicaDir/ltx/*/*.ltx). A database's initial
+// state is captured as a base snapshot uploaded directly to the snapshot level
+// (ltx/9); only later increments appear at ltx/0 and compactions at ltx/1+. Use
+// this whenever the question is merely "has this database been replicated at
+// all", independent of level.
+func ltxFilesAllLevels(dbReplicaDir string) []string {
+	matches, err := filepath.Glob(filepath.Join(dbReplicaDir, "ltx", "*", "*.ltx"))
+	if err != nil {
+		return nil
+	}
+	return matches
 }
 
 func GetTestDuration(t *testing.T, defaultDuration time.Duration) time.Duration {
