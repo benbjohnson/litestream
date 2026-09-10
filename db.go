@@ -354,9 +354,7 @@ func NewDB(path string) *DB {
 		return info, ok
 	}
 	db.compactor.CacheSetter = func(level int, info *ltx.FileInfo) {
-		db.maxLTXFileInfos.Lock()
-		defer db.maxLTXFileInfos.Unlock()
-		db.maxLTXFileInfos.m[level] = info
+		db.recordMaxLTXFile(level, info)
 	}
 
 	return db
@@ -2028,9 +2026,7 @@ func (db *DB) applySyncResult(state *syncState, result syncResult) {
 		db.pos.Unlock()
 	}
 	if result.l0FileInfo != nil {
-		db.maxLTXFileInfos.Lock()
-		db.maxLTXFileInfos.m[0] = result.l0FileInfo
-		db.maxLTXFileInfos.Unlock()
+		db.recordMaxLTXFile(0, result.l0FileInfo)
 	}
 }
 
@@ -2071,10 +2067,7 @@ func (db *DB) applySyncExecutor(exec *syncExecutor, notify bool) {
 	}
 
 	if exec.l0FileInfo != nil {
-		db.maxLTXFileInfos.Lock()
-		info := *exec.l0FileInfo
-		db.maxLTXFileInfos.m[0] = &info
-		db.maxLTXFileInfos.Unlock()
+		db.recordMaxLTXFile(0, exec.l0FileInfo)
 	}
 
 	db.mu.Lock()
@@ -2559,10 +2552,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 	db.pos.value = &pos
 	db.pos.Unlock()
 	if exec.l0FileInfo != nil {
-		db.maxLTXFileInfos.Lock()
-		info := *exec.l0FileInfo
-		db.maxLTXFileInfos.m[0] = &info
-		db.maxLTXFileInfos.Unlock()
+		db.recordMaxLTXFile(0, exec.l0FileInfo)
 	}
 	return nil
 }
@@ -3069,9 +3059,7 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 		return info, err
 	}
 
-	db.maxLTXFileInfos.Lock()
-	db.maxLTXFileInfos.m[SnapshotLevel] = info
-	db.maxLTXFileInfos.Unlock()
+	db.recordMaxLTXFile(SnapshotLevel, info)
 
 	return info, nil
 }
@@ -3399,13 +3387,43 @@ func (db *DB) CRC64(ctx context.Context) (uint64, ltx.Pos, error) {
 	return h.Sum64(), exec.pos, nil
 }
 
+// recordMaxLTXFile is the single writer for the maxLTXFileInfos cache. Every
+// path that observes a new max LTX file for a level -- the sync/checkpoint L0
+// writes, the L9 snapshot writes (db.Snapshot and the sync-path base/boundary
+// snapshot upload), the compactor's L1..L8 writes, and the read-through fills
+// from remote -- funnels through here so two invariants hold everywhere:
+//
+//   - Never cache an empty (MaxTXID == 0) result. A read-through fill that
+//     observes an empty level (e.g. a compaction-monitor tick before the base
+//     has finished uploading to L9) must not pin MaxTXID==0 and starve
+//     leveled compaction forever.
+//   - Never regress. L9 has two racing writers -- the snapshot monitor via
+//     db.Snapshot and the replica sync loop via uploadLTXFile -- that are not
+//     mutually serialized, so a lower-TXID writer must not clobber a higher
+//     one. Monotonicity is safe for every level because generation resets clear
+//     the whole map (see ResetLocalState) rather than writing a lower value,
+//     and the L0 error paths delete their entry rather than lowering it.
+//
+// The info is copied so callers may reuse their pointer.
+func (db *DB) recordMaxLTXFile(level int, info *ltx.FileInfo) {
+	if info == nil || info.MaxTXID == 0 {
+		return
+	}
+	db.maxLTXFileInfos.Lock()
+	defer db.maxLTXFileInfos.Unlock()
+	if cur, ok := db.maxLTXFileInfos.m[level]; ok && info.MaxTXID < cur.MaxTXID {
+		return
+	}
+	cp := *info
+	db.maxLTXFileInfos.m[level] = &cp
+}
+
 // MaxLTXFileInfo returns the metadata for the last LTX file in a level.
 // If cached, it will returned the local copy. Otherwise, it fetches from the replica.
 func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
 	db.maxLTXFileInfos.Lock()
-	defer db.maxLTXFileInfos.Unlock()
-
 	info, ok := db.maxLTXFileInfos.m[level]
+	db.maxLTXFileInfos.Unlock()
 	if ok {
 		return *info, nil
 	}
@@ -3415,10 +3433,7 @@ func (db *DB) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, erro
 		return ltx.FileInfo{}, fmt.Errorf("cannot determine L%d max ltx file for %q: %w", level, db.Path(), err)
 	}
 
-	// Only cache a real file. Mirrors the guard in Compactor.MaxLTXFileInfo.
-	if remoteInfo.MaxTXID > 0 {
-		db.maxLTXFileInfos.m[level] = &remoteInfo
-	}
+	db.recordMaxLTXFile(level, &remoteInfo)
 	return remoteInfo, nil
 }
 
