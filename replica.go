@@ -204,7 +204,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		))
 
 	// Replicate all L0 LTX files since last replica position.
-	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+	for fromTXID, syncedFileN := r.Pos().TXID+1, 0; fromTXID <= dpos.TXID; fromTXID = r.Pos().TXID + 1 {
 		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
 			result.limited = true
 			// Uploads succeeded, so record sync health; otherwise a
@@ -219,12 +219,24 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		if err := ctx.Err(); err != nil {
 			return result, context.Cause(ctx)
 		}
-		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
+		// Upload incremental L0 files to L0, and snapshots to L9.
+		prevTXID := r.Pos().TXID
+		minTXID, maxTXID, remoteLevel, err := r.db.uploadTarget(fromTXID)
+		if err != nil {
 			return result, err
 		}
-		r.SetPos(ltx.Pos{TXID: txID})
+		if err := r.uploadLTXFile(ctx, 0, remoteLevel, minTXID, maxTXID); err != nil {
+			return result, err
+		}
+		r.SetPos(ltx.Pos{TXID: maxTXID})
 		result.synced = true
 		syncedFileN++
+
+		// Delete the local file of any sync-path snapshot we've now advanced past
+		// (the initial snapshot or a boundary snapshot). Its bytes are durably at
+		// remote L9; its local L0-dir copy is only staging + anchor state that no
+		// retention path owns.
+		r.db.deleteSupersededLocalSnapshot(prevTXID, minTXID, maxTXID)
 	}
 
 	// Record successful sync for heartbeat monitoring.
@@ -245,15 +257,15 @@ func (r *Replica) lockSync(ctx context.Context) error {
 	return nil
 }
 
-func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID) (err error) {
-	filename := r.db.LTXPath(level, minTXID, maxTXID)
+func (r *Replica) uploadLTXFile(ctx context.Context, localLevel, remoteLevel int, minTXID, maxTXID ltx.TXID) (err error) {
+	filename := r.db.LTXPath(localLevel, minTXID, maxTXID)
 	f, err := os.Open(filename)
 	if err != nil {
-		return NewLTXError("open", filename, level, uint64(minTXID), uint64(maxTXID), err)
+		return NewLTXError("open", filename, localLevel, uint64(minTXID), uint64(maxTXID), err)
 	}
 	defer func() { _ = f.Close() }()
 
-	info, err := r.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, f)
+	info, err := r.Client.WriteLTXFile(ctx, remoteLevel, minTXID, maxTXID, f)
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
@@ -263,6 +275,12 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 		"maxTXID", info.MaxTXID,
 		"size", info.Size)
 
+	// Snapshot uploads (the base and boundary snapshots, routed to L9) must
+	// refresh the DB's cached snapshot-level max, consistent with db.Snapshot.
+	if remoteLevel == SnapshotLevel {
+		r.db.recordMaxLTXFile(SnapshotLevel, info)
+	}
+
 	// Track current position
 	//replicaWALIndexGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Index))
 	//replicaWALOffsetGaugeVec.WithLabelValues(r.db.Path(), r.Name()).Set(float64(rd.Pos().Offset))
@@ -270,13 +288,38 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	return nil
 }
 
-// calcPos returns the last position saved to the replica for level 0.
+// calcPos returns the last position saved to the replica for level 0. This is
+// the replica sync loop's resume point: it stays L0-only so every increment is
+// still uploaded to L0 (preserving point-in-time restore granularity) even when
+// a snapshot at L9 already covers a higher TXID. Re-encountering a snapshot TXID
+// is harmless -- uploadTarget re-routes it to L9 idempotently.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	info, err := r.MaxLTXFileInfo(ctx, 0)
 	if err != nil {
 		return pos, fmt.Errorf("max ltx file: %w", err)
 	}
 	return ltx.Pos{TXID: info.MaxTXID}, nil
+}
+
+// calcRemotePos returns the highest TXID durably present in the replica across
+// the increment level (L0) and the snapshot level (L9). Snapshotting writes --
+// the base and boundary snapshots -- are stored only at the snapshot level, so a
+// replica that has uploaded the base but no increments is still fully caught up.
+// Used for reporting replication status, not for the sync loop's resume point.
+func (r *Replica) calcRemotePos(ctx context.Context) (pos ltx.Pos, err error) {
+	l0, err := r.MaxLTXFileInfo(ctx, 0)
+	if err != nil {
+		return pos, fmt.Errorf("max l0 ltx file: %w", err)
+	}
+	snap, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return pos, fmt.Errorf("max snapshot ltx file: %w", err)
+	}
+	txID := l0.MaxTXID
+	if snap.MaxTXID > txID {
+		txID = snap.MaxTXID
+	}
+	return ltx.Pos{TXID: txID}, nil
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
@@ -1001,8 +1044,24 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 
 // fillFollowGap attempts to bridge a gap in level 0 files by searching
 // higher compaction levels for a file that covers the missing TXID range.
+//
+// The ladder levels (1..SnapshotLevel-1) are tried first, in order, preferring
+// the smallest contiguous forward step. If none of them can advance, we fall
+// back to the newest L9 snapshot that extends past currentTXID: snapshots are
+// full-DB images written directly to SnapshotLevel and Compact deliberately
+// seeks past them, leaving holes in the ladder that only a snapshot covers.
+// This mirrors CalcRestorePlan, which seeds from the snapshot before layering
+// ladder levels on top. Without it, a follower parked inside such a hole (its
+// L0 files pruned by retention) stalls silently.
 func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.TXID, gapMinTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
 	currentTXID := afterTXID
+
+	// sawAhead records whether we observed data past currentTXID that we could
+	// not reach contiguously. A caller-supplied gap (gapMinTXID > afterTXID+1,
+	// e.g. an L0 file ahead) is already such evidence; ladder scans below add to
+	// it. If we finish without advancing while sawAhead is set, the follower is
+	// genuinely stalled rather than merely caught up, and we warn.
+	sawAhead := gapMinTXID > afterTXID+1
 
 	for level := 1; level < SnapshotLevel; level++ {
 		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
@@ -1025,6 +1084,9 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 
 			// Skip if there's a gap at this level too.
 			if info.MinTXID > currentTXID+1 {
+				if info.MaxTXID > currentTXID {
+					sawAhead = true
+				}
 				break
 			}
 
@@ -1060,7 +1122,49 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 		}
 	}
 
+	// The ladder could not advance. Fall back to the newest snapshot that
+	// extends past currentTXID, then let the ladder resume on the next poll.
+	bridgedTXID, err := r.fillFollowGapFromSnapshot(ctx, f, currentTXID, pageSize)
+	if err != nil {
+		return currentTXID, err
+	}
+	currentTXID = bridgedTXID
+
+	// Still stuck with known data ahead: the follower is stalled, not caught up.
+	if currentTXID == afterTXID && sawAhead {
+		r.Logger().Warn("follow: unable to bridge gap; follower stalled",
+			"current_txid", currentTXID, "gap_min_txid", gapMinTXID)
+	}
+
 	return currentTXID, nil
+}
+
+// fillFollowGapFromSnapshot bridges a follow-mode gap using the newest L9
+// snapshot whose coverage extends past afterTXID. Applying a snapshot is a
+// full-DB image write (applyLTXFile truncates to the snapshot's page count),
+// which advances the follower to the snapshot's TXID so the ladder can resume.
+// Returns the (possibly unchanged) TXID reached; afterTXID when no snapshot can
+// help.
+func (r *Replica) fillFollowGapFromSnapshot(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+	// The newest snapshot is the one with the highest MaxTXID, so "newest
+	// snapshot that advances us" is simply the max snapshot when it clears
+	// afterTXID. MaxLTXFileInfo returns a zero-valued FileInfo (MaxTXID == 0)
+	// when no snapshot exists, which the guard below handles.
+	snapshot, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return afterTXID, fmt.Errorf("max snapshot ltx file: %w", err)
+	}
+	if snapshot.MaxTXID <= afterTXID {
+		return afterTXID, nil
+	}
+
+	if err := r.applyLTXFile(ctx, f, &snapshot, pageSize); err != nil {
+		return afterTXID, fmt.Errorf(
+			"apply gap-fill snapshot (level=%d, min=%s, max=%s): %w",
+			snapshot.Level, snapshot.MinTXID, snapshot.MaxTXID, err,
+		)
+	}
+	return snapshot.MaxTXID, nil
 }
 
 // RestoreV3 restores from a v0.3.x format backup.
