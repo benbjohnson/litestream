@@ -594,6 +594,29 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 	return updatedAt, nil
 }
 
+// newRestoreDecoder returns an LTX decoder for paths that materialize a
+// database file and never read the decoder's page index. Retaining the index
+// would build a map with one entry per page, which dominates peak memory when
+// restoring large databases (#1486). Close still validates the index either way.
+func newRestoreDecoder(r io.Reader) *ltx.Decoder {
+	dec := ltx.NewDecoder(r)
+	dec.SetRetainPageIndex(false)
+	return dec
+}
+
+// newRestoreCompactor returns an LTX compactor for restore paths. Its output
+// page index spills into spillDir past the encoder's threshold, so compacting
+// a large database does not hold a per-page index in memory either (#1486).
+func newRestoreCompactor(w io.Writer, rdrs []io.Reader, spillDir string) (*ltx.Compactor, error) {
+	c, err := ltx.NewCompactor(w, rdrs)
+	if err != nil {
+		return nil, err
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	c.SetSpillDir(spillDir)
+	return c, nil
+}
+
 // Replica restores the database from a replica based on the options given.
 // This method will restore into opt.OutputPath, if specified, or into the
 // DB's original database path. It can optionally restore from a specific
@@ -738,18 +761,19 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
+		c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(tmpOutputPath))
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		defer func() { _ = c.Cleanup() }()
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
-	dec := ltx.NewDecoder(pr)
-	if err := dec.DecodeDatabaseTo(f); err != nil {
+	dec := newRestoreDecoder(pr)
+	err = dec.DecodeDatabaseTo(f)
+	_ = pr.CloseWithError(err)
+	if err != nil {
 		return fmt.Errorf("decode database: %w", err)
 	}
 
@@ -951,7 +975,7 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 	defer rc.Close()
 
-	dec := ltx.NewDecoder(rc)
+	dec := newRestoreDecoder(rc)
 	if err := dec.DecodeHeader(); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
