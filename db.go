@@ -1113,6 +1113,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 	if err := internal.MkdirAll(db.metaPath, db.dirInfo); err != nil {
 		return err
 	}
+	db.compactor.SpillDir = db.metaPath
 
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(ctx); err != nil {
@@ -2883,6 +2884,11 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
 			return
 		}
+		// Very large snapshots spill their page index into the meta
+		// directory rather than holding it in memory; Cleanup covers the
+		// cancellation paths that never reach enc.Close.
+		enc.SetSpillDir(db.MetaPath())
+		defer enc.Cleanup()
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,
