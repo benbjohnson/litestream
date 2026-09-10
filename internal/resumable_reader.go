@@ -82,8 +82,12 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		if r.rc == nil {
 			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
-				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || r.ctx.Err() != nil {
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
+				}
+				if ctxErr := r.ctx.Err(); ctxErr != nil {
+					r.err = fmt.Errorf("reopen ltx file at offset %d: %v: %w", r.offset, err, ctxErr)
+					return 0, r.err
 				}
 				if retryErr := r.retry(fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)); retryErr != nil {
 					return 0, retryErr
