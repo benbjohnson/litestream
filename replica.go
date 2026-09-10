@@ -1046,8 +1046,24 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 
 // fillFollowGap attempts to bridge a gap in level 0 files by searching
 // higher compaction levels for a file that covers the missing TXID range.
+//
+// The ladder levels (1..SnapshotLevel-1) are tried first, in order, preferring
+// the smallest contiguous forward step. If none of them can advance, we fall
+// back to the newest L9 snapshot that extends past currentTXID: snapshots are
+// full-DB images written directly to SnapshotLevel and Compact deliberately
+// seeks past them, leaving holes in the ladder that only a snapshot covers.
+// This mirrors CalcRestorePlan, which seeds from the snapshot before layering
+// ladder levels on top. Without it, a follower parked inside such a hole (its
+// L0 files pruned by retention) stalls silently.
 func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.TXID, gapMinTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
 	currentTXID := afterTXID
+
+	// sawAhead records whether we observed data past currentTXID that we could
+	// not reach contiguously. A caller-supplied gap (gapMinTXID > afterTXID+1,
+	// e.g. an L0 file ahead) is already such evidence; ladder scans below add to
+	// it. If we finish without advancing while sawAhead is set, the follower is
+	// genuinely stalled rather than merely caught up, and we warn.
+	sawAhead := gapMinTXID > afterTXID+1
 
 	for level := 1; level < SnapshotLevel; level++ {
 		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
@@ -1070,6 +1086,9 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 
 			// Skip if there's a gap at this level too.
 			if info.MinTXID > currentTXID+1 {
+				if info.MaxTXID > currentTXID {
+					sawAhead = true
+				}
 				break
 			}
 
@@ -1105,7 +1124,49 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 		}
 	}
 
+	// The ladder could not advance. Fall back to the newest snapshot that
+	// extends past currentTXID, then let the ladder resume on the next poll.
+	bridgedTXID, err := r.fillFollowGapFromSnapshot(ctx, f, currentTXID, pageSize)
+	if err != nil {
+		return currentTXID, err
+	}
+	currentTXID = bridgedTXID
+
+	// Still stuck with known data ahead: the follower is stalled, not caught up.
+	if currentTXID == afterTXID && sawAhead {
+		r.Logger().Warn("follow: unable to bridge gap; follower stalled",
+			"current_txid", currentTXID, "gap_min_txid", gapMinTXID)
+	}
+
 	return currentTXID, nil
+}
+
+// fillFollowGapFromSnapshot bridges a follow-mode gap using the newest L9
+// snapshot whose coverage extends past afterTXID. Applying a snapshot is a
+// full-DB image write (applyLTXFile truncates to the snapshot's page count),
+// which advances the follower to the snapshot's TXID so the ladder can resume.
+// Returns the (possibly unchanged) TXID reached; afterTXID when no snapshot can
+// help.
+func (r *Replica) fillFollowGapFromSnapshot(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+	// The newest snapshot is the one with the highest MaxTXID, so "newest
+	// snapshot that advances us" is simply the max snapshot when it clears
+	// afterTXID. MaxLTXFileInfo returns a zero-valued FileInfo (MaxTXID == 0)
+	// when no snapshot exists, which the guard below handles.
+	snapshot, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return afterTXID, fmt.Errorf("max snapshot ltx file: %w", err)
+	}
+	if snapshot.MaxTXID <= afterTXID {
+		return afterTXID, nil
+	}
+
+	if err := r.applyLTXFile(ctx, f, &snapshot, pageSize); err != nil {
+		return afterTXID, fmt.Errorf(
+			"apply gap-fill snapshot (level=%d, min=%s, max=%s): %w",
+			snapshot.Level, snapshot.MinTXID, snapshot.MaxTXID, err,
+		)
+	}
+	return snapshot.MaxTXID, nil
 }
 
 // RestoreV3 restores from a v0.3.x format backup.
