@@ -41,6 +41,86 @@ func (c *snapshotCountingClient) writeCount() int {
 	return c.n
 }
 
+type l0RetentionCountingClient struct {
+	litestream.ReplicaClient
+	mu     sync.Mutex
+	counts map[int]int
+}
+
+func (c *l0RetentionCountingClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	c.mu.Lock()
+	c.counts[level]++
+	c.mu.Unlock()
+	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+func (c *l0RetentionCountingClient) count(level int) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts[level]
+}
+
+func TestDB_EnforceL0RetentionByTime_SkipsUnchangedDatabase(t *testing.T) {
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+	db.Replica = litestream.NewReplica(db)
+
+	client := &l0RetentionCountingClient{
+		ReplicaClient: &mock.ReplicaClient{
+			LTXFilesFunc: func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+					Level:     level,
+					MinTXID:   1,
+					MaxTXID:   1,
+					CreatedAt: time.Now().Add(-time.Hour),
+				}}), nil
+			},
+		},
+		counts: make(map[int]int),
+	}
+	db.Replica.Client = client
+	db.L0Retention = 24 * time.Hour
+
+	if err := os.MkdirAll(db.LTXLevelDir(0), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(db.LTXPath(0, 1, 1), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	beforeL1 := client.count(1)
+	beforeL0 := client.count(0)
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	firstL1 := client.count(1)
+	firstL0 := client.count(0)
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.count(1)-beforeL1, 1; got != want {
+		t.Fatalf("L1 LIST count after two unchanged passes=%d, want %d", got, want)
+	}
+	if got, want := client.count(0)-beforeL0, firstL0-beforeL0; got != want {
+		t.Fatalf("L0 LIST count after unchanged second pass=%d, want %d", got, want)
+	}
+	if firstL1-beforeL1 != 1 {
+		t.Fatalf("first pass L1 LIST count=%d, want 1", firstL1-beforeL1)
+	}
+
+	if err := os.WriteFile(db.LTXPath(0, 2, 2), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.count(1)-beforeL1, 1; got != want {
+		t.Fatalf("L1 LIST count after new L0 file=%d, want %d", got, want)
+	}
+	if got, want := client.count(0)-beforeL0, firstL0-beforeL0+1; got != want {
+		t.Fatalf("L0 LIST count after new L0 file=%d, want %d", got, want)
+	}
+}
+
 func TestDB_Path(t *testing.T) {
 	db := testingutil.NewDB(t, "/tmp/db")
 	if got, want := db.Path(), `/tmp/db`; got != want {
