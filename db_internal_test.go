@@ -33,9 +33,16 @@ type testReplicaClient struct {
 
 type earlyReturnSnapshotClient struct {
 	*testReplicaClient
+	reader chan *snapshotReadCloser
 }
 
-func (c *earlyReturnSnapshotClient) WriteLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+func (c *earlyReturnSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level != SnapshotLevel {
+		return c.testReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	}
+	if c.reader != nil {
+		c.reader <- r.(*snapshotReadCloser)
+	}
 	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
 }
 
@@ -119,6 +126,98 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 func mustAcquireSemaphore(s *semaphore.Weighted) {
 	if err := s.Acquire(context.Background(), 1); err != nil {
 		panic(err)
+	}
+}
+
+func TestDB_SnapshotJoinsEncoderOnEarlyReplicaReturn(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "db")
+	client := &earlyReturnSnapshotClient{
+		testReplicaClient: &testReplicaClient{dir: t.TempDir()},
+		reader:            make(chan *snapshotReadCloser, 1),
+	}
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if db.IsOpen() {
+			_ = db.Close(context.Background())
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	reader := <-client.reader
+
+	select {
+	case <-reader.done:
+	default:
+		t.Fatal("Snapshot returned before its encoder goroutine completed")
+	}
+
+	if !db.chkMu.TryLock() {
+		t.Fatal("snapshot encoder did not release the checkpoint lock")
+	}
+	db.chkMu.Unlock()
+}
+
+func TestSnapshotReadCloser_CloseWaitsForEncoder(t *testing.T) {
+	pr, pw := io.Pipe()
+	defer pw.Close()
+
+	reader := &snapshotReadCloser{PipeReader: pr, done: make(chan struct{})}
+	closeResult := make(chan error, 1)
+	go func() { closeResult <- reader.Close() }()
+
+	writeResult := make(chan error, 1)
+	go func() {
+		_, err := pw.Write([]byte("x"))
+		writeResult <- err
+	}()
+
+	select {
+	case err := <-writeResult:
+		if !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("write error=%v, want io.ErrClosedPipe", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reader close did not close the pipe")
+	}
+
+	select {
+	case err := <-closeResult:
+		t.Fatalf("Close returned before encoder completion: %v", err)
+	default:
+	}
+
+	close(reader.done)
+	select {
+	case err := <-closeResult:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not return after encoder completion")
 	}
 }
 
