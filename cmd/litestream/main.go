@@ -710,6 +710,23 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 
+	// The lenient decode above silently drops keys that do not map to a Config
+	// field, so a misspelled or nonexistent setting looks like it took effect.
+	// Decode again in strict mode into a scratch value purely for diagnostics:
+	// yaml.UnmarshalStrict reports both unrecognized and duplicate mapping keys.
+	// These are warnings rather than errors so that existing deployments with a
+	// stray key keep starting.
+	var strictConfig Config
+	if err := yaml.UnmarshalStrict(buf, &strictConfig); err != nil {
+		var typeErr *yaml.TypeError
+		if !errors.As(err, &typeErr) {
+			return config, fmt.Errorf("strictly decode config: %w", err)
+		}
+		for _, detail := range typeErr.Errors {
+			slog.Warn("configuration contains unrecognized or duplicate key", "detail", detail)
+		}
+	}
+
 	return config, nil
 }
 
