@@ -51,6 +51,11 @@ type Compactor struct {
 	// CacheSetter optionally stores MaxLTXFileInfo for a level.
 	// If nil, max file info is not cached.
 	CacheSetter func(level int, info *ltx.FileInfo)
+
+	// SourceGapHandler is invoked when a TXID gap is detected in the source
+	// level during compaction. Used to trigger recovery, such as re-uploading
+	// missing L0 files from disk.
+	SourceGapHandler func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID)
 }
 
 // NewCompactor creates a new Compactor with the given client and logger.
@@ -125,9 +130,35 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		}
 	}()
 
+	// When L1 already has files, L0 must continue exactly at seekTXID or L1
+	// would become non-contiguous: L0 retention only deletes files already
+	// compacted into L1, so a missing seek file is always a real gap. Above
+	// L0 the check must not apply — snapshot retention legitimately deletes
+	// source files past a lagging destination level, and the snapshot covers
+	// the missing range. Without a destination file the first source file is
+	// accepted as-is since earlier files may have been removed by retention.
+	var expectedMinTXID ltx.TXID
+	if srcLevel == 0 && prevMaxInfo.MaxTXID > 0 {
+		expectedMinTXID = seekTXID
+	}
+
 	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
+
+		if expectedMinTXID != 0 && info.MinTXID != expectedMinTXID {
+			if info.MinTXID < expectedMinTXID {
+				return nil, fmt.Errorf("overlapping transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
+			}
+			c.logger.Warn("stopping compaction at TXID gap",
+				"level", srcLevel,
+				"expected_min_txid", expectedMinTXID,
+				"actual_min_txid", info.MinTXID)
+			if c.SourceGapHandler != nil {
+				c.SourceGapHandler(srcLevel, expectedMinTXID, info.MinTXID)
+			}
+			break
+		}
 
 		if minTXID == 0 || info.MinTXID < minTXID {
 			minTXID = info.MinTXID
@@ -139,6 +170,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		if c.LocalFileOpener != nil {
 			if f, err := c.LocalFileOpener(srcLevel, info.MinTXID, info.MaxTXID); err == nil {
 				rdrs = append(rdrs, f)
+				expectedMinTXID = info.MaxTXID + 1
 				continue
 			} else if !os.IsNotExist(err) {
 				return nil, fmt.Errorf("open local ltx file: %w", err)
@@ -150,6 +182,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
 		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
+		expectedMinTXID = info.MaxTXID + 1
 	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction
