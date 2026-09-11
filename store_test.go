@@ -76,6 +76,40 @@ func TestStore_Open_InitErrorDoesNotOpenDBs(t *testing.T) {
 	}
 }
 
+func TestStore_Open_InitContextNotCancelled(t *testing.T) {
+	initCtxCh := make(chan context.Context, 1)
+	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		InitFunc: func(ctx context.Context) error {
+			initCtxCh <- ctx
+			return nil
+		},
+	})
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close(t.Context())
+
+	select {
+	case ctx := <-initCtxCh:
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("context passed to replica client Init() cancelled during Open: %v", err)
+		}
+		// Leave time for initGroup.Wait() to return and cancel its derived
+		// context; the client's context must remain usable.
+		time.Sleep(10 * time.Millisecond)
+		if err := ctx.Err(); err != nil {
+			t.Fatalf("context passed to replica client Init() cancelled after Open: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("replica client Init() never called")
+	}
+}
+
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
 		db0, sqldb0 := testingutil.MustOpenDBs(t)
