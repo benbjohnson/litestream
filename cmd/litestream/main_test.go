@@ -54,10 +54,10 @@ func TestMain_RunHelp(t *testing.T) {
 		}
 	})
 
-	t.Run("UnknownFlag", func(t *testing.T) {
+	t.Run("MisplacedFlag", func(t *testing.T) {
 		err := main.NewMain().Run(context.Background(), []string{"-config", "litestream.yml"})
-		if !errors.Is(err, flag.ErrHelp) {
-			t.Fatalf("Run returned error %v, want %v", err, flag.ErrHelp)
+		if err == nil || err.Error() != "flags must come after the subcommand" {
+			t.Fatalf("Run returned error %v, want misplaced flag error", err)
 		}
 	})
 }
