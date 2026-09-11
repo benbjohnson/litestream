@@ -84,7 +84,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		if *configPath == "" {
 			*configPath = DefaultConfigPath()
 		}
-		if c.Config, err = ReadConfigFile(*configPath, !*noExpandEnv); err != nil {
+		if c.Config, err = ReadConfig(*configPath, !*noExpandEnv); err != nil {
 			return err
 		}
 		// Override log level if CLI flag provided (takes precedence over env var)
@@ -140,7 +140,9 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 		c.Config.DBs = []*DBConfig{dbConfig}
 	}
 
-	c.Config.ConfigPath = *configPath
+	if *configPath != stdinConfigPath {
+		c.Config.ConfigPath = *configPath
+	}
 
 	// Override config exec command, if specified.
 	if *execFlag != "" {
@@ -532,7 +534,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-exec CMD
