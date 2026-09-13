@@ -10,6 +10,19 @@ on:
 
 name: Commit
 jobs:
+  python-wheel-test:
+    name: Python Wheel Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install setuptools wheel packaging
+      - run: python packages/python/scripts/test_wheel.py
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
