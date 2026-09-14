@@ -447,6 +447,83 @@ func TestDB_Compact(t *testing.T) {
 		}
 	})
 
+	// Ensure a TXID gap in remote L0 heals through replica re-upload so
+	// compaction can complete on the next pass. See issue #1151.
+	t.Run("L0GapHealsViaReplica", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		for i := range 2 {
+			if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		dpos, err := db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dpos.TXID < 4 {
+			t.Fatalf("expected at least 4 transactions, got %s", dpos.TXID)
+		}
+
+		// Remove an interior L0 file to simulate an upload that never
+		// became durable.
+		gapTXID := dpos.TXID - 1
+		if err := db.Replica.Client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+			{Level: 0, MinTXID: gapTXID, MaxTXID: gapTXID},
+		}); err != nil {
+			t.Fatal(err)
+		}
+
+		// Compaction stops at the gap and compacts only the contiguous prefix.
+		info, err := db.Compact(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.MaxTXID, gapTXID-1; got != want {
+			t.Fatalf("compacted MaxTXID=%s, want %s", got, want)
+		}
+
+		// The gap must have invalidated the replica position so the next
+		// sync re-uploads the missing file from disk.
+		if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		rd, err := db.Replica.Client.OpenLTXFile(t.Context(), 0, gapTXID, gapTXID, 0, 0)
+		if err != nil {
+			t.Fatalf("missing L0 file was not re-uploaded: %v", err)
+		}
+		_ = rd.Close()
+
+		// The next compaction pass covers the remainder.
+		info, err = db.Compact(t.Context(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := info.MinTXID, gapTXID; got != want {
+			t.Fatalf("compacted MinTXID=%s, want %s", got, want)
+		}
+		if got, want := info.MaxTXID, dpos.TXID; got != want {
+			t.Fatalf("compacted MaxTXID=%s, want %s", got, want)
+		}
+	})
+
 	// Ensure that higher level compactions pull from the correct levels.
 	t.Run("L2+", func(t *testing.T) {
 		db, sqldb := testingutil.MustOpenDBs(t)

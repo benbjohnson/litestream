@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -45,6 +46,151 @@ func TestCompactor_Compact(t *testing.T) {
 		_, err := compactor.Compact(context.Background(), 1)
 		if err != litestream.ErrNoCompaction {
 			t.Errorf("err=%v, want ErrNoCompaction", err)
+		}
+	})
+
+	t.Run("L0GapStopsAtGap", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		var gapLevel int
+		var gapExpected, gapActual ltx.TXID
+		compactor.SourceGapHandler = func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID) {
+			gapLevel, gapExpected, gapActual = srcLevel, expectedMinTXID, actualMinTXID
+		}
+
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		createTestLTXFile(t, client, 0, 3, 3)
+		// gap: TXID 4 missing
+		createTestLTXFile(t, client, 0, 5, 5)
+		createTestLTXFile(t, client, 0, 6, 6)
+
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 1 || info.MaxTXID != 3 {
+			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
+		}
+		if gapLevel != 0 || gapExpected != 4 || gapActual != 5 {
+			t.Errorf("gap handler: level=%d expected=%s actual=%s, want level=0 expected=4 actual=5", gapLevel, gapExpected, gapActual)
+		}
+
+		// Fill the gap and re-compact
+		createTestLTXFile(t, client, 0, 4, 4)
+
+		info, err = compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 4 || info.MaxTXID != 6 {
+			t.Errorf("TXID range=%d-%d, want 4-6", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("L0GapAtStart", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// Files 3,4,5 with gap at start (1,2 missing).
+		// The file client filters by minTXID >= seekTXID, so with no L1
+		// files these are all returned. The compactor should compact
+		// whatever contiguous set is available.
+		createTestLTXFile(t, client, 0, 3, 3)
+		createTestLTXFile(t, client, 0, 4, 4)
+		createTestLTXFile(t, client, 0, 5, 5)
+
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 3 || info.MaxTXID != 5 {
+			t.Errorf("TXID range=%d-%d, want 3-5", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("L0GapAtSeek", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		var gapLevel int
+		var gapExpected, gapActual ltx.TXID
+		compactor.SourceGapHandler = func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID) {
+			gapLevel, gapExpected, gapActual = srcLevel, expectedMinTXID, actualMinTXID
+		}
+
+		// L1 already covers 1-2, so compaction seeks L0 from TXID 3.
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 0, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
+		// gap: TXID 3 missing
+		createTestLTXFile(t, client, 0, 4, 4)
+		createTestLTXFile(t, client, 0, 5, 5)
+
+		// Compacting 4-5 would leave L1 non-contiguous, so nothing is
+		// compacted until the gap is healed.
+		if _, err := compactor.Compact(context.Background(), 1); !errors.Is(err, litestream.ErrNoCompaction) {
+			t.Fatalf("err=%v, want ErrNoCompaction", err)
+		}
+		if gapLevel != 0 || gapExpected != 3 || gapActual != 4 {
+			t.Errorf("gap handler: level=%d expected=%s actual=%s, want level=0 expected=3 actual=4", gapLevel, gapExpected, gapActual)
+		}
+
+		// Fill the gap and verify compaction resumes with the full range.
+		createTestLTXFile(t, client, 0, 3, 3)
+
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 3 || info.MaxTXID != 5 {
+			t.Errorf("TXID range=%d-%d, want 3-5", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("L1SeekGapStillCompacts", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		var gapCalled bool
+		compactor.SourceGapHandler = func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID) {
+			gapCalled = true
+		}
+
+		// Snapshot retention can legitimately delete L1 files above a
+		// lagging L2 max (TXIDs 3-4 here), so a gap at the seek position
+		// is valid above L0 and must not block compaction: the snapshot
+		// covers the missing range.
+		createTestLTXFile(t, client, 2, 1, 2)
+		createTestLTXFile(t, client, 1, 5, 5)
+		createTestLTXFile(t, client, 1, 6, 6)
+
+		info, err := compactor.Compact(context.Background(), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 5 || info.MaxTXID != 6 {
+			t.Errorf("TXID range=%d-%d, want 5-6", info.MinTXID, info.MaxTXID)
+		}
+		if gapCalled {
+			t.Error("gap handler must not fire above L0")
+		}
+	})
+
+	t.Run("L0OverlapReturnsError", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		createTestLTXFile(t, client, 0, 1, 3)
+		createTestLTXFile(t, client, 0, 2, 4) // overlap: MinTXID 2 < expected 4
+
+		_, err := compactor.Compact(context.Background(), 1)
+		if err == nil {
+			t.Fatal("expected error for overlapping files, got nil")
+		}
+		if !containsString(err.Error(), "overlapping") {
+			t.Errorf("expected overlapping error, got: %v", err)
 		}
 	})
 

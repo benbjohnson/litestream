@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +41,7 @@ type Replica struct {
 
 	syncSem     *semaphore.Weighted
 	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
+	posInvalid  atomic.Bool  // position must be recalculated on next sync
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -180,6 +182,12 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		return result, context.Cause(ctx)
 	}
 
+	// Recalculate the position when it has been invalidated externally,
+	// such as when compaction detects a TXID gap in remote L0 files.
+	if r.posInvalid.Swap(false) {
+		r.SetPos(ltx.Pos{})
+	}
+
 	// Calculate current replica position, if unknown.
 	if r.Pos().IsZero() {
 		pos, err := r.calcPos(ctx)
@@ -270,13 +278,53 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	return nil
 }
 
-// calcPos returns the last position saved to the replica for level 0.
+// calcPos returns the position replication should resume from for level 0.
+// Files already compacted into level 1 are ignored. If a TXID gap exists in
+// the remaining L0 files, the returned position stops just before the gap so
+// the missing files are re-uploaded from disk; resuming from the maximum
+// TXID would leave the gap in place permanently and block compaction.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
-	info, err := r.MaxLTXFileInfo(ctx, 0)
+	l1Info, err := r.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
-		return pos, fmt.Errorf("max ltx file: %w", err)
+		return pos, fmt.Errorf("max l1 ltx file: %w", err)
 	}
-	return ltx.Pos{TXID: info.MaxTXID}, nil
+
+	itr, err := r.Client.LTXFiles(ctx, 0, 0, false)
+	if err != nil {
+		return pos, fmt.Errorf("l0 ltx files: %w", err)
+	}
+	defer itr.Close()
+
+	var infos []ltx.FileInfo
+	for itr.Next() {
+		infos = append(infos, *itr.Item())
+	}
+	if err := itr.Close(); err != nil {
+		return pos, fmt.Errorf("close l0 iterator: %w", err)
+	}
+	sort.Slice(infos, func(i, j int) bool { return infos[i].MinTXID < infos[j].MinTXID })
+
+	txID := l1Info.MaxTXID
+	for _, info := range infos {
+		if info.MaxTXID <= txID {
+			continue // already compacted into L1
+		}
+		if txID != 0 && info.MinTXID > txID+1 {
+			r.Logger().Warn("txid gap detected in remote L0 files, resuming replication before gap",
+				"expected", (txID + 1).String(),
+				"actual", info.MinTXID.String())
+			break
+		}
+		txID = info.MaxTXID
+	}
+	return ltx.Pos{TXID: txID}, nil
+}
+
+// InvalidatePos marks the replica position for recalculation on the next
+// sync. Used when a TXID gap is detected in remote L0 files so the next sync
+// re-uploads the missing files from disk.
+func (r *Replica) InvalidatePos() {
+	r.posInvalid.Store(true)
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
