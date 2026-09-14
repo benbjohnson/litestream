@@ -850,6 +850,8 @@ func newCountingReplicaClient() *countingReplicaClient { return &countingReplica
 
 func (c *countingReplicaClient) Type() string { return "count" }
 
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -883,6 +885,8 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 }
 
 func (c *mockReplicaClient) Type() string { return "mock" }
+
+func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
 
@@ -1048,6 +1052,100 @@ func buildLTXFixtureWithPages(tb testing.TB, txid ltx.TXID, pageSize uint32, pgn
 	}
 
 	return &ltxFixture{info: info, data: buf.Bytes()}
+}
+
+func buildChecksumTrackedLTXFixture(tb testing.TB, hdr ltx.Header, pgnos []uint32, pages [][]byte, postApplyChecksum ltx.Checksum) *ltxFixture {
+	tb.Helper()
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		tb.Fatalf("new encoder: %v", err)
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		tb.Fatalf("encode header: %v", err)
+	}
+	for i, pgno := range pgnos {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, pages[i]); err != nil {
+			tb.Fatalf("encode page %d: %v", pgno, err)
+		}
+	}
+	enc.SetPostApplyChecksum(postApplyChecksum)
+	if err := enc.Close(); err != nil {
+		tb.Fatalf("close encoder: %v", err)
+	}
+
+	data := append([]byte(nil), buf.Bytes()...)
+	if err := ltx.NewDecoder(bytes.NewReader(data)).Verify(); err != nil {
+		tb.Fatalf("verify fixture: %v", err)
+	}
+	return &ltxFixture{
+		info: &ltx.FileInfo{
+			Level:     0,
+			MinTXID:   hdr.MinTXID,
+			MaxTXID:   hdr.MaxTXID,
+			Size:      int64(len(data)),
+			CreatedAt: time.UnixMilli(hdr.Timestamp).UTC(),
+		},
+		data: data,
+	}
+}
+
+func TestHydrator_Restore_ChecksumTracked(t *testing.T) {
+	const pageSize = 512
+
+	client := newMockReplicaClient()
+	page1 := bytes.Repeat([]byte{0x11}, pageSize)
+	page2 := bytes.Repeat([]byte{0x22}, pageSize)
+	updatedPage2 := bytes.Repeat([]byte{0x33}, pageSize)
+
+	snapshotChecksum := ltx.ChecksumFlag
+	snapshotChecksum = ltx.ChecksumFlag | (snapshotChecksum ^ ltx.ChecksumPage(1, page1))
+	snapshotChecksum = ltx.ChecksumFlag | (snapshotChecksum ^ ltx.ChecksumPage(2, page2))
+	snapshot := buildChecksumTrackedLTXFixture(t, ltx.Header{
+		Version:   ltx.Version,
+		PageSize:  pageSize,
+		Commit:    2,
+		MinTXID:   1,
+		MaxTXID:   1,
+		Timestamp: 1000,
+	}, []uint32{1, 2}, [][]byte{page1, page2}, snapshotChecksum)
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+
+	updatedChecksum := ltx.ChecksumFlag | (snapshotChecksum ^ ltx.ChecksumPage(2, page2) ^ ltx.ChecksumPage(2, updatedPage2))
+	incremental := buildChecksumTrackedLTXFixture(t, ltx.Header{
+		Version:          ltx.Version,
+		PageSize:         pageSize,
+		Commit:           2,
+		MinTXID:          2,
+		MaxTXID:          2,
+		Timestamp:        2000,
+		PreApplyChecksum: snapshotChecksum,
+	}, []uint32{2}, [][]byte{updatedPage2}, updatedChecksum)
+	client.addFixture(t, incremental)
+
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, pageSize, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = h.Close() })
+
+	if err := h.Restore(context.Background(), []*ltx.FileInfo{snapshot.info, incremental.info}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := h.TXID(), incremental.info.MaxTXID; got != want {
+		t.Fatalf("txid=%s, want %s", got, want)
+	}
+
+	got := make([]byte, 2*pageSize)
+	if _, err := h.file.ReadAt(got, 0); err != nil {
+		t.Fatal(err)
+	}
+	want := append(append([]byte(nil), page1...), updatedPage2...)
+	if !bytes.Equal(got, want) {
+		t.Fatalf("hydrated database mismatch: got %d bytes, want %d bytes", len(got), len(want))
+	}
 }
 
 // TestVFSFile_Hydration_Basic tests that hydration completes and reads from local file.
