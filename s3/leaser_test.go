@@ -302,6 +302,50 @@ func TestLeaser_RenewLease_Hetzner(t *testing.T) {
 	}
 }
 
+func TestLeaser_RenewLease_HetznerExplicitPort(t *testing.T) {
+	// Same as TestLeaser_RenewLease_Hetzner, but the endpoint carries an explicit
+	// port. Hetzner detection currently misses this because extractEndpointHost
+	// returns url.URL.Host, which includes the port, so the suffix match against
+	// ".your-objectstorage.com" fails and the lease takes the generic S3 path.
+	//
+	// That is a pre-existing bug in replica_url.go, not something this PR
+	// introduced. See benbjohnson/litestream#1523. Unskip once it is fixed.
+	t.Skip("blocked on #1523: provider detection drops endpoints with an explicit port")
+
+	oldETag := `"old-etag"`
+	newETag := `"new-etag"`
+	var receivedIfMatch string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPut {
+			receivedIfMatch = r.Header.Get("If-Match")
+			w.Header().Set("ETag", newETag)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	leaser := newTestLeaser(t, server.URL)
+	leaser.Endpoint = "https://fsn1.your-objectstorage.com:443"
+
+	lease, err := leaser.RenewLease(context.Background(), &litestream.Lease{
+		Generation: 5,
+		ExpiresAt:  time.Now().Add(5 * time.Second),
+		Owner:      "me",
+		ETag:       oldETag,
+	})
+	if err != nil {
+		t.Fatalf("RenewLease() error: %v", err)
+	}
+
+	if receivedIfMatch != "old-etag" {
+		t.Errorf("expected unquoted If-Match=%q, got %q", "old-etag", receivedIfMatch)
+	}
+	if lease.ETag != newETag {
+		t.Errorf("expected ETag=%q, got %q", newETag, lease.ETag)
+	}
+}
+
 func TestLeaser_RenewLease_LostLease(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPut {
