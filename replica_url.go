@@ -229,7 +229,7 @@ func IntQueryValue(query url.Values, keys ...string) (value int64, ok bool, err 
 
 // IsHetznerEndpoint returns true if the endpoint is Hetzner object storage service.
 func IsHetznerEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -238,7 +238,7 @@ func IsHetznerEndpoint(endpoint string) bool {
 
 // IsTigrisEndpoint returns true if the endpoint is the Tigris object storage service.
 func IsTigrisEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	return host == "fly.storage.tigris.dev" || host == "t3.storage.dev"
 }
 
@@ -278,7 +278,7 @@ func IsGoogleCloudStorageEndpoint(endpoint string) bool {
 
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
 func IsDigitalOceanEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -287,7 +287,7 @@ func IsDigitalOceanEndpoint(endpoint string) bool {
 
 // IsBackblazeEndpoint returns true if the endpoint is Backblaze B2.
 func IsBackblazeEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -296,7 +296,7 @@ func IsBackblazeEndpoint(endpoint string) bool {
 
 // IsFilebaseEndpoint returns true if the endpoint is Filebase.
 func IsFilebaseEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -305,7 +305,7 @@ func IsFilebaseEndpoint(endpoint string) bool {
 
 // IsScalewayEndpoint returns true if the endpoint is Scaleway Object Storage.
 func IsScalewayEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -314,7 +314,7 @@ func IsScalewayEndpoint(endpoint string) bool {
 
 // IsCloudflareR2Endpoint returns true if the endpoint is Cloudflare R2.
 func IsCloudflareR2Endpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -323,7 +323,7 @@ func IsCloudflareR2Endpoint(endpoint string) bool {
 
 // IsSupabaseEndpoint returns true if the endpoint is Supabase Storage S3.
 func IsSupabaseEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	host := extractEndpointHostname(endpoint)
 	if host == "" {
 		return false
 	}
@@ -401,6 +401,11 @@ func EnsureEndpointScheme(endpoint string) (string, bool) {
 		return "http://" + endpoint, true
 	}
 	return "https://" + endpoint, true
+}
+
+func extractEndpointHostname(endpoint string) string {
+	u := url.URL{Host: extractEndpointHost(endpoint)}
+	return u.Hostname()
 }
 
 // extractEndpointHost extracts the host from an endpoint URL or returns the
