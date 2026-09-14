@@ -743,6 +743,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
+		defer func() { _ = c.Cleanup() }()
 		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
