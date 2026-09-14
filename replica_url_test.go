@@ -1138,6 +1138,16 @@ func TestIsMinIOEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://minio.example.net:9443", true},
+		{" HTTPS://MINIO.EXAMPLE.NET:9443 ", true},
+		{"http://[::1]:9000", true},
+		{"[::1]:9000", true},
+		{"http://[::1]", false},
+		{"https://minio.example.net", false},
+		{"https://minio.example.net/path:9000", false},
+		{"https://minio.example.net:invalid", false},
+		{"https://user@minio.example.net:9000", false},
+		{"https://sfo3.digitaloceanspaces.com:443", false},
 		{"http://localhost:9000", true},
 		{"http://192.168.1.100:9000", true},
 		{"minio.local:9000", true},
