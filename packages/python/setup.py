@@ -1,5 +1,11 @@
 import os
-from setuptools import setup, Extension
+from setuptools import setup, Distribution
+
+
+class BinaryDistribution(Distribution):
+    def has_ext_modules(self):
+        return True
+
 
 setup(
     name="litestream-vfs",
@@ -11,7 +17,7 @@ setup(
     license="Apache-2.0",
     packages=["litestream_vfs"],
     package_data={"litestream_vfs": ["*.so", "*.dylib"]},
-    ext_modules=[Extension("litestream_vfs._noop", ["litestream_vfs/noop.c"])],
+    distclass=BinaryDistribution,
     python_requires=">=3.8",
     classifiers=[
         "Development Status :: 4 - Beta",

@@ -10,14 +10,27 @@ on:
 
 name: Commit
 jobs:
+  python-wheel-test:
+    name: Python Wheel Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install setuptools wheel packaging
+      - run: python packages/python/scripts/test_wheel.py
+
   lint:
     name: Lint
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Test nightly notifier classification
-        run: node --test .github/scripts/nightly-stability-jobs.test.js
+      - name: Test workflow scripts
+        run: node --test .github/scripts/*.test.js
 
       - uses: actions/setup-go@v5
         with:
@@ -174,6 +187,8 @@ jobs:
       - run: go test -v ./sftp
       - run: go test -v ./cmd/litestream
 
+      - name: Test v0.3 WAL ordering on 32-bit
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=386 go test -v ./file ./s3 -run '^TestReplicaClient_WALSegmentsV3$'
 
   ltx-behavioral-gate:
     name: LTX Behavioral Gate (short)
@@ -243,7 +258,7 @@ jobs:
             -p 9001:9001 \
             -e MINIO_ROOT_USER=minioadmin \
             -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data --console-address ":9001"
+            quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z server /data --console-address ":9001"
 
           # Wait for MinIO to be ready
           echo "Waiting for MinIO server to be ready..."

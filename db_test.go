@@ -1483,37 +1483,27 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
-	// Use a longer checkpoint interval so we can control when it triggers
-	db.CheckpointInterval = 100 * time.Millisecond
+	db.CheckpointInterval = time.Hour
 
-	// Create table and initial sync
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-
-	// Wait for interval to pass and sync to trigger initial checkpoint
-	time.Sleep(150 * time.Millisecond)
-	if err := db.Sync(t.Context()); err != nil {
+	if err := db.Checkpoint(t.Context(), litestream.CheckpointModePassive); err != nil {
 		t.Fatal(err)
 	}
 
-	// Record TXID after first checkpoint
 	posAfterFirstCheckpoint, err := db.Pos()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("TXID after first checkpoint: %d", posAfterFirstCheckpoint.TXID)
 
-	// Insert data immediately (before interval elapses)
 	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (data) VALUES ('delayed checkpoint test')`); err != nil {
 		t.Fatal(err)
 	}
-
-	// Sync immediately - this should NOT trigger a checkpoint (interval hasn't elapsed)
-	// but should set syncedSinceCheckpoint = true
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -1523,26 +1513,32 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("TXID after insert+sync: %d", posAfterInsert.TXID)
-
-	// Now wait for the interval to pass and sync again (no new data)
-	time.Sleep(150 * time.Millisecond)
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
+	if posAfterInsert.TXID <= posAfterFirstCheckpoint.TXID {
+		t.Fatalf("expected insert sync to advance TXID: checkpoint=%d insert=%d",
+			posAfterFirstCheckpoint.TXID, posAfterInsert.TXID)
 	}
 
-	// A checkpoint should have been triggered because syncedSinceCheckpoint was true
-	// The TXID should have advanced due to the checkpoint
-	posAfterDelayedCheckpoint, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
+	db.CheckpointInterval = time.Nanosecond
+	deadline := time.Now().Add(5 * time.Second)
+	posAfterDelayedCheckpoint := posAfterInsert
+	for {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		posAfterDelayedCheckpoint, err = db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if posAfterDelayedCheckpoint.TXID > posAfterInsert.TXID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for delayed checkpoint: insert=%d current=%d",
+				posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	t.Logf("TXID after delayed checkpoint: %d", posAfterDelayedCheckpoint.TXID)
-
-	// The TXID should have advanced from the insert position, indicating the checkpoint ran
-	if posAfterDelayedCheckpoint.TXID <= posAfterInsert.TXID {
-		t.Fatalf("expected TXID to advance after delayed checkpoint (syncedSinceCheckpoint should persist), got insert=%d delayed=%d",
-			posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
-	}
 }
 
 func TestDB_SyncStatus(t *testing.T) {
