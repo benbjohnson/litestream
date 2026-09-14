@@ -181,7 +181,7 @@ func (s *Store) Open(ctx context.Context) error {
 			}
 
 			if db.Replica != nil && db.Replica.Client != nil {
-				if err := db.Replica.Client.Init(initCtx); err != nil {
+				if err := db.Replica.Client.Init(s.ctx); err != nil {
 					return fmt.Errorf("initialize replica client for %q: %w", db.Path(), err)
 				}
 			}
