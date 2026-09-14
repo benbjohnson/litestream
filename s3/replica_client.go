@@ -140,6 +140,7 @@ func (c *ReplicaClient) NewLeaser(ctx context.Context) (*Leaser, error) {
 	leaser := NewLeaser()
 	leaser.Bucket = c.Bucket
 	leaser.Path = c.Path
+	leaser.Endpoint = c.Endpoint
 	leaser.SetClient(c.s3)
 	if c.logger != nil {
 		leaser.SetLogger(c.logger)

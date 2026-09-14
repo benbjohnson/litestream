@@ -154,6 +154,8 @@ Related issues: #912
 - `InvalidArgument` errors with default AWS SDK settings
 - Does not support `aws-chunked` content encoding
 - Requires signed payloads for all requests
+- Conditional PUT requests require unquoted ETags
+- Conditional DELETE requests ignore `If-Match`; lease release uses a conditional PUT
 
 **Configuration**:
 
