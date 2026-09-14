@@ -35,9 +35,8 @@ type Main struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
-	signals    <-chan os.Signal
-	newLeaser  func(context.Context, string) (litestream.Leaser, error)
-	newProcess func([]string) subprocess
+	signals   <-chan os.Signal
+	newLeaser func(context.Context, string) (litestream.Leaser, error)
 }
 
 func NewMain() *Main {
@@ -102,21 +101,18 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 	acquireCtx, stopAcquireSignalWatch := contextWithSignal(ctx, sigCh)
 	lease, err := acquireLease(acquireCtx, leaser, config.acquireTimeout, config.retryInterval)
 	if sig, ok := stopAcquireSignalWatch(); ok {
-		if releaseErr := releaseLease(leaser, lease); releaseErr != nil {
-			return fmt.Errorf("signal received while acquiring lease: %s; release lease: %v", sig, releaseErr)
-		}
-		return fmt.Errorf("signal received while acquiring lease: %s", sig)
+		return errors.Join(fmt.Errorf("signal received while acquiring lease: %s", sig), releaseLease(leaser, lease))
 	}
 	if err != nil {
 		return err
 	}
 
-	process := m.process(config.command)
+	process := exec.CommandContext(ctx, config.command[0], config.command[1:]...)
+	process.Stdin = m.Stdin
+	process.Stdout = m.Stdout
+	process.Stderr = m.Stderr
 	if err := process.Start(); err != nil {
-		if releaseErr := releaseLease(leaser, lease); releaseErr != nil {
-			return fmt.Errorf("start command: %w; release lease: %v", err, releaseErr)
-		}
-		return fmt.Errorf("start command: %w", err)
+		return errors.Join(fmt.Errorf("start command: %w", err), releaseLease(leaser, lease))
 	}
 
 	waitCh := make(chan error, 1)
@@ -124,14 +120,15 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 		waitCh <- process.Wait()
 	}()
 
-	leaseState := &leaseState{lease: lease}
 	renewCtx, cancelRenew := context.WithCancel(ctx)
 	renewErrCh := make(chan error, 1)
 	renewDone := make(chan struct{})
 	go func() {
 		defer close(renewDone)
-		if err := renewLease(renewCtx, leaser, leaseState, config.heartbeat); err != nil {
-			renewErrCh <- err
+		var renewErr error
+		lease, renewErr = renewLease(renewCtx, leaser, lease, config.heartbeat)
+		if renewErr != nil {
+			renewErrCh <- renewErr
 		}
 	}()
 
@@ -139,13 +136,7 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 	cancelRenew()
 	<-renewDone
 
-	if releaseErr := releaseLease(leaser, leaseState.Lease()); releaseErr != nil {
-		if err != nil {
-			return fmt.Errorf("%w; release lease: %v", err, releaseErr)
-		}
-		return releaseErr
-	}
-	return err
+	return errors.Join(err, releaseLease(leaser, lease))
 }
 
 func (m *Main) parseFlags(args []string) (runConfig, error) {
@@ -243,43 +234,6 @@ func (m *Main) signalChan() (<-chan os.Signal, func()) {
 	return notifySignals()
 }
 
-func (m *Main) process(args []string) subprocess {
-	if m.newProcess != nil {
-		return m.newProcess(args)
-	}
-
-	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = m.Stdin
-	cmd.Stdout = m.Stdout
-	cmd.Stderr = m.Stderr
-	return (*execProcess)(cmd)
-}
-
-type subprocess interface {
-	Start() error
-	Wait() error
-	Signal(os.Signal) error
-	Kill() error
-}
-
-type execProcess exec.Cmd
-
-func (p *execProcess) Start() error {
-	return (*exec.Cmd)(p).Start()
-}
-
-func (p *execProcess) Wait() error {
-	return (*exec.Cmd)(p).Wait()
-}
-
-func (p *execProcess) Signal(sig os.Signal) error {
-	return (*exec.Cmd)(p).Process.Signal(sig)
-}
-
-func (p *execProcess) Kill() error {
-	return (*exec.Cmd)(p).Process.Kill()
-}
-
 func newS3Leaser(ctx context.Context, rawURL string) (litestream.Leaser, error) {
 	client, err := litestream.NewReplicaClientFromURL(rawURL)
 	if err != nil {
@@ -333,42 +287,29 @@ func acquireLease(ctx context.Context, leaser litestream.Leaser, timeout, retryI
 	}
 }
 
-type leaseState struct {
-	lease *litestream.Lease
-}
-
-func (s *leaseState) Lease() *litestream.Lease {
-	return s.lease
-}
-
-func (s *leaseState) SetLease(lease *litestream.Lease) {
-	s.lease = lease
-}
-
-func renewLease(ctx context.Context, leaser litestream.Leaser, state *leaseState, heartbeat time.Duration) error {
+func renewLease(ctx context.Context, leaser litestream.Leaser, lease *litestream.Lease, heartbeat time.Duration) (*litestream.Lease, error) {
 	ticker := time.NewTicker(heartbeat)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return lease, nil
 		case <-ticker.C:
 		}
 
-		lease := state.Lease()
 		nextLease, err := leaser.RenewLease(ctx, lease)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return lease, nil
 			}
-			return fmt.Errorf("renew lease: %w", err)
+			return lease, fmt.Errorf("renew lease: %w", err)
 		}
-		state.SetLease(nextLease)
+		lease = nextLease
 	}
 }
 
-func waitForProcess(ctx context.Context, process subprocess, waitCh <-chan error, renewCh <-chan error, sigCh <-chan os.Signal) error {
+func waitForProcess(ctx context.Context, process *exec.Cmd, waitCh <-chan error, renewCh <-chan error, sigCh <-chan os.Signal) error {
 	signaled := false
 
 	for {
@@ -381,8 +322,8 @@ func waitForProcess(ctx context.Context, process subprocess, waitCh <-chan error
 
 		case err := <-renewCh:
 			if err != nil {
-				if killErr := process.Kill(); killErr != nil {
-					return fmt.Errorf("%w; kill command: %v", err, killErr)
+				if killErr := process.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+					return errors.Join(err, fmt.Errorf("kill command: %w", killErr))
 				}
 				<-waitCh
 				return err
@@ -390,20 +331,20 @@ func waitForProcess(ctx context.Context, process subprocess, waitCh <-chan error
 
 		case sig := <-sigCh:
 			if signaled {
-				if err := process.Kill(); err != nil {
+				if err := process.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					return fmt.Errorf("kill command: %w", err)
 				}
 				<-waitCh
 				return fmt.Errorf("signal received: %s", sig)
 			}
 			signaled = true
-			if err := process.Signal(sig); err != nil {
+			if err := process.Process.Signal(sig); err != nil {
 				return fmt.Errorf("signal command: %w", err)
 			}
 
 		case <-ctx.Done():
-			if err := process.Kill(); err != nil {
-				return fmt.Errorf("%w; kill command: %v", ctx.Err(), err)
+			if err := process.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				return errors.Join(ctx.Err(), fmt.Errorf("kill command: %w", err))
 			}
 			<-waitCh
 			return ctx.Err()
