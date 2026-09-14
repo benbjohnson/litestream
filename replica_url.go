@@ -229,25 +229,31 @@ func IntQueryValue(query url.Values, keys ...string) (value int64, ok bool, err 
 
 // IsHetznerEndpoint returns true if the endpoint is Hetzner object storage service.
 func IsHetznerEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return strings.HasSuffix(host, ".your-objectstorage.com")
 }
 
 // IsTigrisEndpoint returns true if the endpoint is the Tigris object storage service.
 func IsTigrisEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
 	return host == "fly.storage.tigris.dev" || host == "t3.storage.dev"
 }
 
 // IsGoogleCloudStorageEndpoint returns true if the endpoint is Google Cloud Storage.
 func IsGoogleCloudStorageEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if u, err := url.Parse("//" + host); err == nil {
-		host = u.Hostname()
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
+		return false
 	}
+	host := u.Hostname()
 	host = strings.TrimSuffix(host, ".")
 
 	labels := strings.Split(host, ".")
@@ -278,68 +284,73 @@ func IsGoogleCloudStorageEndpoint(endpoint string) bool {
 
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
 func IsDigitalOceanEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return strings.HasSuffix(host, ".digitaloceanspaces.com")
 }
 
 // IsBackblazeEndpoint returns true if the endpoint is Backblaze B2.
 func IsBackblazeEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return strings.HasSuffix(host, ".backblazeb2.com")
 }
 
 // IsFilebaseEndpoint returns true if the endpoint is Filebase.
 func IsFilebaseEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return host == "s3.filebase.com"
 }
 
 // IsScalewayEndpoint returns true if the endpoint is Scaleway Object Storage.
 func IsScalewayEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return strings.HasSuffix(host, ".scw.cloud")
 }
 
 // IsCloudflareR2Endpoint returns true if the endpoint is Cloudflare R2.
 func IsCloudflareR2Endpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return strings.HasSuffix(host, ".r2.cloudflarestorage.com")
 }
 
 // IsSupabaseEndpoint returns true if the endpoint is Supabase Storage S3.
 func IsSupabaseEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
+	host := u.Hostname()
 	return strings.HasSuffix(host, ".supabase.co")
 }
 
 // IsMinIOEndpoint returns true if the endpoint appears to be MinIO or similar
 // (a custom endpoint with a port number that is not a known cloud provider).
 func IsMinIOEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
-	// MinIO typically uses host:port format without .com domain
-	// Check for port number in the host
-	if !strings.Contains(host, ":") {
+	host := u.Hostname()
+	if u.Port() == "" {
 		return false
 	}
 	// Exclude known cloud providers
@@ -361,14 +372,11 @@ func IsMinIOEndpoint(endpoint string) bool {
 // endpoint (localhost, 127.0.0.1, or private network addresses).
 // These endpoints typically use HTTP instead of HTTPS.
 func IsLocalEndpoint(endpoint string) bool {
-	host := extractEndpointHost(endpoint)
-	if host == "" {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
 		return false
 	}
-	// Remove port if present
-	if idx := strings.LastIndex(host, ":"); idx != -1 {
-		host = host[:idx]
-	}
+	host := u.Hostname()
 	// Check for common local/development hostnames
 	return host == "localhost" ||
 		host == "127.0.0.1" ||
@@ -403,25 +411,23 @@ func EnsureEndpointScheme(endpoint string) (string, bool) {
 	return "https://" + endpoint, true
 }
 
-// extractEndpointHost extracts the host from an endpoint URL or returns the
-// endpoint as-is if it's not a full URL.
-func extractEndpointHost(endpoint string) string {
-	endpoint = strings.TrimSpace(strings.ToLower(endpoint))
-	if endpoint == "" {
-		return ""
+func parseEndpoint(endpoint string) (*url.URL, error) {
+	endpoint = strings.TrimSpace(endpoint)
+	if !strings.HasPrefix(strings.ToLower(endpoint), "http://") && !strings.HasPrefix(strings.ToLower(endpoint), "https://") {
+		endpoint = "//" + endpoint
 	}
-	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
-		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
-			if u.User != nil {
-				return ""
-			}
-			return u.Host
-		}
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return nil, err
 	}
-	if u, err := url.Parse("//" + endpoint); err == nil && u.User != nil {
-		return ""
+	if u.User != nil {
+		return nil, fmt.Errorf("endpoint must not contain user information")
 	}
-	return endpoint
+	if u.Hostname() == "" {
+		return nil, fmt.Errorf("endpoint hostname required")
+	}
+	u.Host = strings.ToLower(u.Host)
+	return u, nil
 }
 
 // IsURL returns true if s appears to be a URL (has a scheme).
