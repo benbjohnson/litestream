@@ -34,6 +34,9 @@ func DefaultSocketConfig() SocketConfig {
 type Server struct {
 	store *Store
 
+	// StatusMonitor handles replication status streaming.
+	StatusMonitor *StatusMonitor
+
 	// SocketPath is the path to the Unix socket.
 	SocketPath string
 
@@ -64,11 +67,12 @@ type Server struct {
 func NewServer(store *Store) *Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &Server{
-		store:       store,
-		SocketPerms: 0600,
-		ctx:         ctx,
-		cancel:      cancel,
-		logger:      slog.Default().With(LogKeySystem, LogSystemServer),
+		store:         store,
+		StatusMonitor: NewStatusMonitor(store),
+		SocketPerms:   0600,
+		ctx:           ctx,
+		cancel:        cancel,
+		logger:        slog.Default().With(LogKeySystem, LogSystemServer),
 	}
 
 	mux := http.NewServeMux()
@@ -80,6 +84,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /sync", s.handleSync)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
+	mux.HandleFunc("GET /monitor", s.handleMonitor)
 	mux.HandleFunc("GET /debug/sync-status", s.handleSyncStatus)
 
 	// pprof endpoints
@@ -341,6 +346,53 @@ func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
 		diagnostics = append(diagnostics, db.SyncDiagnostic())
 	}
 	writeJSON(w, http.StatusOK, SyncDiagnosticsResponse{Databases: diagnostics})
+}
+
+func (s *Server) handleMonitor(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSONError(w, http.StatusInternalServerError, "streaming not supported", nil)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	// Subscribe before getting full status to avoid missing events
+	sub := s.StatusMonitor.Subscribe()
+	defer s.StatusMonitor.Unsubscribe(sub)
+
+	// Send initial full status - one event per database
+	statuses := s.StatusMonitor.GetFullStatus()
+	for i := range statuses {
+		event := &StatusEvent{
+			Type:      "full",
+			Timestamp: time.Now(),
+			Database:  &statuses[i],
+		}
+		if err := json.NewEncoder(w).Encode(event); err != nil {
+			return
+		}
+	}
+	flusher.Flush()
+
+	// Stream events until client disconnects
+	ctx := r.Context()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case event, ok := <-sub.C:
+			if !ok {
+				return
+			}
+			if err := json.NewEncoder(w).Encode(event); err != nil {
+				return
+			}
+			flusher.Flush()
+		}
+	}
 }
 
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
