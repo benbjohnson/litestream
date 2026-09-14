@@ -169,6 +169,15 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			} else {
 				slog.Info("replication complete, litestream shutting down")
 			}
+		case err = <-c.mcpErrCh:
+			slog.Info("MCP server exited, litestream shutting down")
+			if c.cmd != nil {
+				if e := c.cmd.Process.Kill(); e != nil && !errors.Is(e, os.ErrProcessDone) {
+					err = errors.Join(err, fmt.Errorf("stop exec process: %w", e))
+				} else {
+					<-c.execCh
+				}
+			}
 		case sig := <-signalCh:
 			slog.Info("signal received, litestream shutting down", "signal", sig)
 
@@ -192,9 +201,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		}
 
 		// Gracefully close.
-		if e := c.Close(ctx); e != nil && err == nil {
-			err = e
-		}
+		err = errors.Join(err, c.Close(ctx))
 		slog.Info("litestream shut down")
 		return err
 
