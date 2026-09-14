@@ -692,6 +692,13 @@ func TestIsTigrisEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://fly.storage.tigris.dev:443", true},
+		{"http://fly.storage.tigris.dev:8080", true},
+		{"fly.storage.tigris.dev:443", true},
+		{"https://fly.storage.tigris.dev:8443/storage/v1/s3", true},
+		{"https://fly.storage.tigris.dev.example.com:443", false},
+		{"https://user@fly.storage.tigris.dev:443", false},
+		{"https://t3.storage.dev:443", true},
 		{"fly.storage.tigris.dev", true},
 		{"FLY.STORAGE.TIGRIS.DEV", true},
 		{"https://fly.storage.tigris.dev", true},
@@ -722,6 +729,12 @@ func TestIsGoogleCloudStorageEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://storage.googleapis.com:443", true},
+		{"http://storage.googleapis.com:8080", true},
+		{"storage.googleapis.com:443", true},
+		{"https://storage.googleapis.com:8443/storage/v1/s3", true},
+		{"https://storage.googleapis.com.example.com:443", false},
+		{"https://user@storage.googleapis.com:443", false},
 		{"storage.googleapis.com", true},
 		{"STORAGE.GOOGLEAPIS.COM", true},
 		{"https://storage.googleapis.com", true},
@@ -927,6 +940,12 @@ func TestIsDigitalOceanEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://sfo3.digitaloceanspaces.com:443", true},
+		{"http://sfo3.digitaloceanspaces.com:8080", true},
+		{"sfo3.digitaloceanspaces.com:443", true},
+		{"https://sfo3.digitaloceanspaces.com:8443/storage/v1/s3", true},
+		{"https://sfo3.digitaloceanspaces.com.example.com:443", false},
+		{"https://user@sfo3.digitaloceanspaces.com:443", false},
 		{"https://sfo3.digitaloceanspaces.com", true},
 		{"https://nyc3.digitaloceanspaces.com", true},
 		{"sfo3.digitaloceanspaces.com", true},
@@ -949,6 +968,12 @@ func TestIsBackblazeEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://s3.us-west-002.backblazeb2.com:443", true},
+		{"http://s3.us-west-002.backblazeb2.com:8080", true},
+		{"s3.us-west-002.backblazeb2.com:443", true},
+		{"https://s3.us-west-002.backblazeb2.com:8443/storage/v1/s3", true},
+		{"https://s3.us-west-002.backblazeb2.com.example.com:443", false},
+		{"https://user@s3.us-west-002.backblazeb2.com:443", false},
 		{"https://s3.us-west-002.backblazeb2.com", true},
 		{"https://s3.eu-central-003.backblazeb2.com", true},
 		{"s3.us-west-002.backblazeb2.com", true},
@@ -971,6 +996,12 @@ func TestIsFilebaseEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://s3.filebase.com:443", true},
+		{"http://s3.filebase.com:8080", true},
+		{"s3.filebase.com:443", true},
+		{"https://s3.filebase.com:8443/storage/v1/s3", true},
+		{"https://s3.filebase.com.example.com:443", false},
+		{"https://user@s3.filebase.com:443", false},
 		{"https://s3.filebase.com", true},
 		{"http://s3.filebase.com", true},
 		{"s3.filebase.com", true},
@@ -993,6 +1024,12 @@ func TestIsScalewayEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://s3.fr-par.scw.cloud:443", true},
+		{"http://s3.fr-par.scw.cloud:8080", true},
+		{"s3.fr-par.scw.cloud:443", true},
+		{"https://s3.fr-par.scw.cloud:8443/storage/v1/s3", true},
+		{"https://s3.fr-par.scw.cloud.example.com:443", false},
+		{"https://user@s3.fr-par.scw.cloud:443", false},
 		{"https://s3.fr-par.scw.cloud", true},
 		{"https://s3.nl-ams.scw.cloud", true},
 		{"s3.fr-par.scw.cloud", true},
@@ -1015,6 +1052,12 @@ func TestIsCloudflareR2Endpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://abcdef123456.r2.cloudflarestorage.com:443", true},
+		{"http://abcdef123456.r2.cloudflarestorage.com:8080", true},
+		{"abcdef123456.r2.cloudflarestorage.com:443", true},
+		{"https://abcdef123456.r2.cloudflarestorage.com:8443/storage/v1/s3", true},
+		{"https://abcdef123456.r2.cloudflarestorage.com.example.com:443", false},
+		{"https://user@abcdef123456.r2.cloudflarestorage.com:443", false},
 		{"https://abcdef123456.r2.cloudflarestorage.com", true},
 		{"https://account-id.r2.cloudflarestorage.com", true},
 		{"abcdef123456.r2.cloudflarestorage.com", true},
@@ -1037,6 +1080,12 @@ func TestIsSupabaseEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://myproject.supabase.co:443", true},
+		{"http://myproject.supabase.co:8080", true},
+		{"myproject.supabase.co:443", true},
+		{"https://myproject.supabase.co:8443/storage/v1/s3", true},
+		{"https://myproject.supabase.co.example.com:443", false},
+		{"https://user@myproject.supabase.co:443", false},
 		{"https://myproject.supabase.co/storage/v1/s3", true},
 		{"https://abcdefghij.supabase.co", true},
 		{"myproject.supabase.co", true},
@@ -1059,6 +1108,12 @@ func TestIsHetznerEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://fsn1.your-objectstorage.com:443", true},
+		{"http://fsn1.your-objectstorage.com:8080", true},
+		{"fsn1.your-objectstorage.com:443", true},
+		{"https://fsn1.your-objectstorage.com:8443/storage/v1/s3", true},
+		{"https://fsn1.your-objectstorage.com.example.com:443", false},
+		{"https://user@fsn1.your-objectstorage.com:443", false},
 		{"fsn1.your-objectstorage.com", true},
 		{"nbg1.your-objectstorage.com", true},
 		{"https://fsn1.your-objectstorage.com", true},
