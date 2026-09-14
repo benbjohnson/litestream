@@ -227,6 +227,25 @@ Examples:
   0000000000000065-00000000000000c8.ltx  (TXID 101-200)
 ```
 
+### Backend Storage Paths
+
+Replica storage paths are backend-specific and are not portable by recursively
+copying their raw contents:
+
+| Backend | Path | Example for level 9 |
+|---------|------|---------------------|
+| `file://` | `<root>/ltx/<level>/<filename>.ltx` | `<root>/ltx/9/0000000000000001-0000000000000064.ltx` |
+| `s3://` | `<prefix>/<level as four-digit lowercase hexadecimal>/<filename>.ltx` | `<prefix>/0009/0000000000000001-0000000000000064.ltx` |
+
+These established layouts remain different for backward compatibility with
+existing replicas. Neither backend writes a separate replica index or manifest
+object; file discovery scans the level directory or object prefix, and the page
+index is embedded in each LTX file.
+
+Do not copy a `file://` replica directory directly into an S3 bucket. Restore
+the database from the file replica locally, then create a new `s3://` replica
+from the restored database.
+
 ### Parsing Filenames
 
 ```go
