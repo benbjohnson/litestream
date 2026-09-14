@@ -1294,10 +1294,13 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	}
 
 	maxTXID1 := maxLevelTXID(infos, 1)
-	// Seed maxTXID1 from pos when there are no L1 files
-	if maxTXID1 == 0 {
-		maxTXID1 = pos.TXID
-	}
+	// When there are no L1 files yet, maxTXID1 must stay zero: the first
+	// L1 compaction emits a file starting at TXID 1 whose range can
+	// straddle the current L0 position. Seeding from the L0-derived
+	// pos.TXID skipped that file in the level-1 seek forever and wedged
+	// the follower on "non-contiguous ltx file" once the next L1 file
+	// appeared (#1460). Starting from zero consumes the first L1 file
+	// (and any later ones) contiguously instead.
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
