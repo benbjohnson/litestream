@@ -1,5 +1,12 @@
 default:
 
+VERSION = $(shell git describe --tags --always --dirty 2>/dev/null)
+
+.PHONY: build
+build:
+	mkdir -p dist
+	go build -ldflags "-X 'main.Version=$(VERSION)'" -o dist/litestream ./cmd/litestream
+
 docker:
 	docker build -t litestream .
 

@@ -1,8 +1,8 @@
 module github.com/benbjohnson/litestream
 
-go 1.25.0
+go 1.26.0
 
-toolchain go1.25.12
+toolchain go1.26.8
 
 require (
 	cloud.google.com/go/storage v1.36.0
@@ -25,14 +25,14 @@ require (
 	github.com/nats-io/nats.go v1.44.0
 	github.com/pkg/sftp v1.13.6
 	github.com/prometheus/client_golang v1.17.0
-	github.com/psanford/sqlite3vfs v0.0.0-20251127171934-4e34e03a991a // direct
+	github.com/psanford/sqlite3vfs v0.0.0-20260519004904-f9180fa2acc9 // direct
 	github.com/studio-b12/gowebdav v0.11.0
-	github.com/superfly/ltx v0.5.1
-	golang.org/x/crypto v0.52.0
-	golang.org/x/sys v0.45.0
+	github.com/superfly/ltx v0.5.2
+	golang.org/x/crypto v0.56.0
+	golang.org/x/sys v0.47.0
 	google.golang.org/api v0.155.0
 	gopkg.in/yaml.v2 v2.4.0
-	modernc.org/sqlite v1.44.3
+	modernc.org/sqlite v1.49.1
 )
 
 require (
@@ -45,9 +45,8 @@ require (
 	github.com/pkg/xattr v0.4.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/sirupsen/logrus v1.9.3 // indirect
-	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
-	golang.org/x/sync v0.21.0
-	modernc.org/libc v1.67.6 // indirect
+	golang.org/x/sync v0.22.0
+	modernc.org/libc v1.72.0 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
@@ -60,7 +59,7 @@ require (
 require (
 	github.com/lmittmann/tint v1.1.3
 	github.com/mattn/go-isatty v0.0.20
-	github.com/pierrec/lz4/v4 v4.1.22
+	github.com/pierrec/lz4/v4 v4.1.23
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto/x509roots/fallback v0.0.0-20260209214922-2f26647a795e
 )
@@ -127,9 +126,9 @@ require (
 	go.opentelemetry.io/otel v1.43.0 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
 	go.opentelemetry.io/otel/trace v1.43.0 // indirect
-	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/net v0.57.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
-	golang.org/x/text v0.39.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/time v0.7.0 // indirect
 	google.golang.org/genproto v0.0.0-20240116215550-a9fa1716bcac // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect

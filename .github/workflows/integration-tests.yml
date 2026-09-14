@@ -2,12 +2,6 @@ name: Integration Tests
 
 on:
   pull_request:
-    paths:
-      - '**.go'
-      - 'go.mod'
-      - 'go.sum'
-      - 'tests/integration/**'
-      - '.github/workflows/integration-tests.yml'
   workflow_dispatch:
     inputs:
       test_type:
@@ -24,10 +18,70 @@ permissions:
   contents: read
 
 jobs:
+  changes:
+    name: Detect Integration Test Changes
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      relevant: ${{ steps.paths.outputs.relevant }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check changed paths
+        id: paths
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              ...context.repo,
+              pull_number: context.payload.pull_request.number,
+              per_page: 100,
+            });
+            const totalChangedFiles = context.payload.pull_request.changed_files;
+            const matcherPath = '.github/scripts/integration-test-paths.js';
+            const completeResponse =
+              Array.isArray(files) &&
+              Number.isSafeInteger(totalChangedFiles) &&
+              totalChangedFiles >= 0 &&
+              totalChangedFiles === files.length &&
+              files.every(file =>
+                file !== null &&
+                typeof file === 'object' &&
+                !Array.isArray(file) &&
+                typeof file.filename === 'string' &&
+                file.filename.trim() !== '' &&
+                (file.previous_filename === undefined ||
+                  (typeof file.previous_filename === 'string' &&
+                    file.previous_filename.trim() !== ''))
+              );
+            const matcherChanged =
+              completeResponse &&
+              files.some(
+                file =>
+                  file.filename === matcherPath ||
+                  file.previous_filename === matcherPath
+              );
+            if (!completeResponse || matcherChanged) {
+              core.setOutput('relevant', 'true');
+              return;
+            }
+            const { hasRelevantIntegrationTestChanges } = require(
+              `${process.env.GITHUB_WORKSPACE}/.github/scripts/integration-test-paths`
+            );
+            const relevant = hasRelevantIntegrationTestChanges(
+              files,
+              totalChangedFiles
+            );
+            core.setOutput('relevant', String(relevant));
+
   quick-tests:
     name: Quick Integration Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'pull_request' || inputs.test_type == 'quick' || inputs.test_type == 'all'
+    needs: changes
+    if: always() && ((github.event_name == 'pull_request' && needs.changes.result == 'success' && needs.changes.outputs.relevant == 'true') || (github.event_name == 'workflow_dispatch' && (inputs.test_type == 'quick' || inputs.test_type == 'all')))
     steps:
       - uses: actions/checkout@v4
 
@@ -124,25 +178,52 @@ jobs:
   summary:
     name: Test Summary
     runs-on: ubuntu-latest
-    needs: [quick-tests]
+    needs: [changes, quick-tests]
     if: always() && (github.event_name == 'pull_request' || inputs.test_type == 'quick' || inputs.test_type == 'all')
     steps:
       - name: Generate summary
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          TEST_TYPE: ${{ inputs.test_type }}
+          CHANGES_RESULT: ${{ needs.changes.result }}
+          RELEVANT_CHANGES: ${{ needs.changes.outputs.relevant }}
+          QUICK_TESTS_RESULT: ${{ needs.quick-tests.result }}
+          ACTOR: ${{ github.actor }}
         run: |
-          echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
+          status=0
+          {
+            echo "## Integration Test Results"
+            echo ""
 
-          if [ "${{ needs.quick-tests.result }}" == "success" ]; then
-            echo "✅ **Quick Tests:** Passed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.quick-tests.result }}" == "failure" ]; then
-            echo "❌ **Quick Tests:** Failed" >> $GITHUB_STEP_SUMMARY
-          elif [ "${{ needs.quick-tests.result }}" == "skipped" ]; then
-            echo "⏭️ **Quick Tests:** Skipped" >> $GITHUB_STEP_SUMMARY
-          fi
+            if [ "$EVENT_NAME" = "pull_request" ]; then
+              if [ "$CHANGES_RESULT" != "success" ]; then
+                echo "❌ **Change Detection:** $CHANGES_RESULT"
+                status=1
+              elif [ "$RELEVANT_CHANGES" = "false" ]; then
+                echo "⏭️ **Quick Tests:** Skipped for irrelevant changes"
+              elif [ "$RELEVANT_CHANGES" != "true" ]; then
+                echo "❌ **Change Detection:** Invalid output"
+                status=1
+              elif [ "$QUICK_TESTS_RESULT" = "success" ]; then
+                echo "✅ **Quick Tests:** Passed"
+              else
+                echo "❌ **Quick Tests:** $QUICK_TESTS_RESULT"
+                status=1
+              fi
+            elif [ "$EVENT_NAME" = "workflow_dispatch" ] && { [ "$TEST_TYPE" = "quick" ] || [ "$TEST_TYPE" = "all" ]; }; then
+              if [ "$QUICK_TESTS_RESULT" = "success" ]; then
+                echo "✅ **Quick Tests:** Passed"
+              else
+                echo "❌ **Quick Tests:** $QUICK_TESTS_RESULT"
+                status=1
+              fi
+            else
+              echo "❌ **Workflow:** Unexpected invocation"
+              status=1
+            fi
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
-
-          # Note: Scenario and long-running tests run independently on workflow_dispatch.
-          # Check individual job results for those test suites.
+            echo ""
+            echo "---"
+            echo "**Triggered by:** @$ACTOR"
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

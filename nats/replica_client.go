@@ -130,12 +130,14 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.nc != nil {
+	if c.objectStore != nil {
 		return nil
 	}
 
-	if err := c.connect(ctx); err != nil {
-		return fmt.Errorf("nats: failed to connect: %w", err)
+	if c.nc == nil {
+		if err := c.connect(ctx); err != nil {
+			return fmt.Errorf("nats: failed to connect: %w", err)
+		}
 	}
 
 	if err := c.initObjectStore(ctx); err != nil {
@@ -147,6 +149,28 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 
 // connect establishes a connection to NATS server with proper configuration.
 func (c *ReplicaClient) connect(_ context.Context) error {
+	url := c.URL
+	if url == "" {
+		url = nats.DefaultURL
+	}
+
+	nc, err := nats.Connect(url, c.options()...)
+	if err != nil {
+		return fmt.Errorf("failed to connect to NATS server: %w", err)
+	}
+
+	js, err := jetstream.New(nc)
+	if err != nil {
+		nc.Close()
+		return fmt.Errorf("failed to create JetStream context: %w", err)
+	}
+
+	c.nc = nc
+	c.js = js
+	return nil
+}
+
+func (c *ReplicaClient) options() []nats.Option {
 	opts := []nats.Option{
 		nats.MaxReconnects(c.MaxReconnects),
 		nats.ReconnectWait(c.ReconnectWait),
@@ -176,6 +200,10 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 	}
 
 	// TLS configuration
+	if c.TLS {
+		opts = append(opts, nats.Secure())
+	}
+
 	if c.ClientCert != "" && c.ClientKey != "" {
 		opts = append(opts, nats.ClientCert(c.ClientCert, c.ClientKey))
 	}
@@ -184,28 +212,7 @@ func (c *ReplicaClient) connect(_ context.Context) error {
 		opts = append(opts, nats.RootCAs(c.RootCAs...))
 	}
 
-	// Note: NATS Connect doesn't directly support context cancellation during connection
-	// The context parameter is preserved for potential future use
-
-	url := c.URL
-	if url == "" {
-		url = nats.DefaultURL
-	}
-
-	nc, err := nats.Connect(url, opts...)
-	if err != nil {
-		return fmt.Errorf("failed to connect to NATS server: %w", err)
-	}
-
-	js, err := jetstream.New(nc)
-	if err != nil {
-		nc.Close()
-		return fmt.Errorf("failed to create JetStream context: %w", err)
-	}
-
-	c.nc = nc
-	c.js = js
-	return nil
+	return opts
 }
 
 // initObjectStore retrieves the existing object store bucket.
