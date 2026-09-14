@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,12 +25,15 @@ import (
 
 type l0WriteRecordingClient struct {
 	litestream.ReplicaClient
-	txIDs []ltx.TXID
+	txIDs         []ltx.TXID
+	snapshotTXIDs []ltx.TXID
 }
 
 func (c *l0WriteRecordingClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 	if level == 0 {
 		c.txIDs = append(c.txIDs, minTXID)
+	} else if level == litestream.SnapshotLevel {
+		c.snapshotTXIDs = append(c.snapshotTXIDs, maxTXID)
 	}
 	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 }
@@ -96,6 +100,136 @@ func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
 	}
 	if got, want := client.txIDs[0], gapTXID; got != want {
 		t.Fatalf("L0 write TXID=%s, want %s", got, want)
+	}
+}
+
+func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID < 5 {
+		t.Fatalf("expected at least 5 transactions, got %s", dpos.TXID)
+	}
+
+	gapMinTXID, gapMaxTXID := dpos.TXID-2, dpos.TXID-1
+	if err := db.Replica.Client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+		{Level: 0, MinTXID: gapMinTXID, MaxTXID: gapMinTXID},
+		{Level: 0, MinTXID: gapMaxTXID, MaxTXID: gapMaxTXID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for txID := gapMinTXID; txID <= gapMaxTXID; txID++ {
+		if err := os.Remove(db.LTXPath(0, txID, txID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	client := &l0WriteRecordingClient{ReplicaClient: db.Replica.Client}
+	db.Replica.Client = client
+	var logBuf bytes.Buffer
+	db.SetLogger(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := db.Replica.Pos().TXID, dpos.TXID; got != want {
+		t.Fatalf("replica pos=%s, want %s", got, want)
+	}
+	if got, want := client.snapshotTXIDs, []ltx.TXID{dpos.TXID}; !slices.Equal(got, want) {
+		t.Fatalf("snapshot TXIDs=%v, want %v", got, want)
+	}
+	for _, field := range []string{
+		`level=WARN`,
+		`msg="local L0 file missing during gap heal, forcing snapshot"`,
+		`gap_min_txid=` + gapMinTXID.String(),
+		`gap_max_txid=` + gapMaxTXID.String(),
+	} {
+		if !strings.Contains(logBuf.String(), field) {
+			t.Fatalf("fallback log missing %q: %s", field, logBuf.String())
+		}
+	}
+
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.snapshotTXIDs, []ltx.TXID{dpos.TXID}; !slices.Equal(got, want) {
+		t.Fatalf("snapshot TXIDs after recalculation=%v, want %v", got, want)
+	}
+
+	plan, err := litestream.CalcRestorePlan(t.Context(), client, 0, time.Time{}, db.Logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan), 1; got != want {
+		t.Fatalf("restore plan length=%d, want %d: %#v", got, want, plan)
+	}
+	if got, want := plan[0].Level, litestream.SnapshotLevel; got != want {
+		t.Fatalf("restore plan level=%d, want %d", got, want)
+	}
+	if got, want := plan[0].MinTXID, ltx.TXID(1); got != want {
+		t.Fatalf("restore plan min TXID=%s, want %s", got, want)
+	}
+	if got, want := plan[0].MaxTXID, dpos.TXID; got != want {
+		t.Fatalf("restore plan max TXID=%s, want %s", got, want)
+	}
+
+	restorePath := filepath.Join(t.TempDir(), "restore.db")
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = restorePath
+	if err := db.Replica.Restore(t.Context(), opt); err != nil {
+		t.Fatal(err)
+	}
+	restoredDB := testingutil.MustOpenSQLDB(t, restorePath)
+	defer testingutil.MustCloseSQLDB(t, restoredDB)
+	var rowN, idSum int
+	if err := restoredDB.QueryRowContext(t.Context(), `SELECT COUNT(*), SUM(id) FROM t`).Scan(&rowN, &idSum); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rowN, 3; got != want {
+		t.Fatalf("restored row count=%d, want %d", got, want)
+	}
+	if got, want := idSum, 3; got != want {
+		t.Fatalf("restored id sum=%d, want %d", got, want)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (3)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := db.Replica.Pos().TXID, dpos.TXID+1; got != want {
+		t.Fatalf("replica pos after new write=%s, want %s", got, want)
 	}
 }
 
