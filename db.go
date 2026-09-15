@@ -801,16 +801,16 @@ func (db *DB) SyncStatus(ctx context.Context) (SyncStatus, error) {
 	// Snapshotting writes (the base and boundary snapshots) live only at the
 	// snapshot level, so the remote position must consider L9 as well as L0 —
 	// otherwise a replica that has uploaded the base but no increments reads as
-	// out of sync.
-	remotePos, err := db.Replica.calcRemotePos(ctx)
+	// out of sync. remoteHead spans both levels.
+	head, _, err := db.Replica.remoteHead(ctx)
 	if err != nil {
 		return SyncStatus{}, fmt.Errorf("remote position: %w", err)
 	}
 
 	return SyncStatus{
 		LocalTXID:  localPos.TXID,
-		RemoteTXID: remotePos.TXID,
-		InSync:     localPos.TXID > 0 && localPos.TXID == remotePos.TXID,
+		RemoteTXID: head.MaxTXID,
+		InSync:     localPos.TXID > 0 && localPos.TXID == head.MaxTXID,
 	}, nil
 }
 
@@ -1683,12 +1683,24 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 	return db.bumpLitestreamSeq(ctx)
 }
 
-// checkDatabaseBehindReplica detects when a database has been restored to an
-// earlier state and the replica has a higher TXID. This handles issue #781.
+// checkDatabaseBehindReplica detects when the local database's replication
+// position lags the replica's durable head, most importantly after a restore to
+// a fresh volume: the database holds the replica's latest state but has no local
+// LTX files, so its position reads as 0. This handles issue #781.
 //
-// If detected, it clears local L0 files and fetches the latest L0 LTX file
-// from the replica to establish a baseline. The next DB.sync() will detect
-// the mismatch and trigger a snapshot at the current database state.
+// When detected, it clears any local L0 files and stages the replica's head file
+// as the local L0 anchor -- fetched from L0 for an increment head, or from L9
+// when the head is a snapshot (base uploaded with no increments yet, or the
+// increments aged out of L0) -- then seeds the replica's resume position to that
+// TXID. This re-establishes position continuity so replication resumes on the
+// SAME lineage, moving monotonically forward from the head rather than rewinding
+// to TXID 1 on a divergent lineage.
+//
+// It does not by itself make the WAL resumable. A restored database has a fresh
+// WAL that does not line up with the anchor's recorded WAL state, so the next
+// DB.sync() re-baselines by writing a full-DB boundary snapshot at the next TXID
+// (routed to L9). That snapshot is a forward continuation of the existing
+// lineage, not a new base -- the backup is never restarted or re-downloaded.
 func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	// Get database position from local L0 files
 	dbPos, err := db.Pos()
@@ -1696,22 +1708,29 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("get database position: %w", err)
 	}
 
-	// Get replica position from remote
-	replicaInfo, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	// Get the replica's true durable head. This must consider L9 as well as L0:
+	// the base and boundary snapshots are stored only at the snapshot level, so
+	// an L0-only read would miss a replica whose head is a snapshot -- the base
+	// uploaded with no increments yet, or the increments aged out of L0 by
+	// retention -- and wrongly conclude there is no remote data. The restored DB
+	// would then stay at position 0 and re-snapshot from TXID 1 on the next
+	// write, rewinding the backup onto a divergent, non-monotonic lineage.
+	headInfo, headLevel, err := db.Replica.remoteHead(ctx)
 	if err != nil {
-		return fmt.Errorf("get replica position: %w", err)
-	} else if replicaInfo.MaxTXID == 0 {
+		return fmt.Errorf("get replica head: %w", err)
+	} else if headInfo.MaxTXID == 0 {
 		return nil // No remote replica data yet
 	}
 
 	// Check if database is behind replica
-	if dbPos.TXID >= replicaInfo.MaxTXID {
+	if dbPos.TXID >= headInfo.MaxTXID {
 		return nil // Database is ahead or equal
 	}
 
 	db.Logger.Info("detected database behind replica",
 		"db_txid", dbPos.TXID,
-		"replica_txid", replicaInfo.MaxTXID)
+		"replica_txid", headInfo.MaxTXID,
+		"replica_level", headLevel)
 
 	// Clear local L0 files
 	l0Dir := db.LTXLevelDir(0)
@@ -1723,11 +1742,14 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("recreate L0 directory: %w", err)
 	}
 
-	// Fetch latest L0 LTX file from replica
-	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
-	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
+	// Fetch the head LTX file from the replica and stage it as the local L0
+	// anchor. An increment keeps its [k,k] name; a snapshot keeps its [1,k] name
+	// -- openLevel0Anchor and uploadTarget both resolve the snapshot-tagged form,
+	// and db.Pos() reads back the file's PostApplyPos either way.
+	minTXID, maxTXID := headInfo.MinTXID, headInfo.MaxTXID
+	reader, err := db.Replica.Client.OpenLTXFile(ctx, headLevel, minTXID, maxTXID, 0, 0)
 	if err != nil {
-		return fmt.Errorf("open remote L0 file: %w", err)
+		return fmt.Errorf("open remote head file: %w", err)
 	}
 	defer func() { _ = reader.Close() }()
 
@@ -1743,7 +1765,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 
 	if _, err := io.Copy(tmpFile, reader); err != nil {
 		_ = tmpFile.Close()
-		return fmt.Errorf("copy L0 file: %w", err)
+		return fmt.Errorf("copy head file: %w", err)
 	}
 
 	if err := tmpFile.Sync(); err != nil {
@@ -1761,9 +1783,18 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 	db.invalidatePosCache()
 
-	db.Logger.Info("fetched latest L0 file from replica",
+	// Seed the replica's resume position to the head we just staged. The sync
+	// loop's calcPos is L0-only and would otherwise re-derive a position of 0
+	// when the head is a snapshot at L9, walking from TXID 1 and re-uploading the
+	// entire base to L9. This is safe here (unlike inside calcPos): we just
+	// cleared L0 down to this single anchor, so there are no pending increments
+	// below it that the loop still needs to upload.
+	db.Replica.SetPos(ltx.Pos{TXID: maxTXID})
+
+	db.Logger.Info("fetched replica head file",
 		"min_txid", minTXID,
-		"max_txid", maxTXID)
+		"max_txid", maxTXID,
+		"level", headLevel)
 
 	return nil
 }

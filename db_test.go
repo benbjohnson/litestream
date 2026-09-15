@@ -665,6 +665,122 @@ func TestDB_SnapshotExcludesUnsyncedWALFrames(t *testing.T) {
 	}
 }
 
+// TestDB_ResumeFromSnapshotHeadAfterRestore exercises the fresh-volume restore
+// path when the replica's head lives only at the snapshot level (L9) with an
+// empty increment level (L0) -- the state left by a freshly-snapshotted or
+// idle-then-pruned database. Opening a restored copy must recover the head
+// position from L9 (via remoteHead) rather than treating the replica as empty,
+// which would leave the DB at TXID 0 and re-snapshot from scratch on the next
+// write, rewinding the backup onto a divergent lineage.
+func TestDB_ResumeFromSnapshotHeadAfterRestore(t *testing.T) {
+	db0, sqldb0 := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+	ctx := t.Context()
+
+	// Build a remote whose head is a snapshot at L9 with an empty L0.
+	if _, err := sqldb0.ExecContext(ctx, `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db0.Sync(ctx); err != nil { // base [1,1] -> L9
+		t.Fatal(err)
+	}
+	if _, err := sqldb0.ExecContext(ctx, `INSERT INTO t (id) VALUES (1);`); err != nil {
+		t.Fatal(err)
+	} else if err := db0.Sync(ctx); err != nil { // increment [2,2] -> L0
+		t.Fatal(err)
+	}
+	if _, err := db0.Snapshot(ctx); err != nil { // boundary snapshot [1,2] -> L9
+		t.Fatal(err)
+	}
+
+	client := db0.Replica.Client
+
+	// Drop the L0 increment so the head lives only at L9, as retention would.
+	if err := client.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: 0, MinTXID: 2, MaxTXID: 2}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity-check the remote shape: head at TXID 2 in L9, nothing in L0.
+	if info, err := db0.Replica.MaxLTXFileInfo(ctx, litestream.SnapshotLevel); err != nil {
+		t.Fatal(err)
+	} else if info.MaxTXID != 2 {
+		t.Fatalf("snapshot head TXID=%d, want 2", info.MaxTXID)
+	}
+	if info, err := db0.Replica.MaxLTXFileInfo(ctx, 0); err != nil {
+		t.Fatal(err)
+	} else if info.MaxTXID != 0 {
+		t.Fatalf("L0 head TXID=%d, want 0 (empty)", info.MaxTXID)
+	}
+
+	// Restore to a brand-new volume: a plain DB file with no litestream meta.
+	restoredPath := filepath.Join(t.TempDir(), "restored", "db")
+	if err := db0.Replica.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     restoredPath,
+		IntegrityCheck: litestream.IntegrityCheckNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Open the restored DB against the same remote.
+	db1 := testingutil.NewDB(t, restoredPath)
+	db1.MonitorInterval = 0     // init runs lazily on first Sync
+	db1.ShutdownSyncTimeout = 0 // no shutdown sync retry
+	db1.Replica = litestream.NewReplica(db1)
+	db1.Replica.Client = client
+	db1.Replica.MonitorEnabled = false
+	if err := db1.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer testingutil.MustCloseDB(t, db1)
+
+	// First DB sync triggers init -> checkDatabaseBehindReplica (restore recovery)
+	// then captures locally; force the replica upload afterward since the
+	// background monitor is disabled in tests.
+	if err := db1.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db1.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// The restore must recover its position from the replica's head and continue
+	// forward on the SAME lineage. Without the fix, checkDatabaseBehindReplica
+	// sees an empty L0, treats the replica as empty, leaves the DB at TXID 0, and
+	// the next sync re-snapshots from TXID 1 -- a rewind onto a divergent lineage
+	// whose head never advances past 2. With the fix it recovers the head (TXID 2)
+	// and replication moves monotonically forward. (A restored database has a
+	// fresh WAL, so that forward step is written as a boundary snapshot at the
+	// next TXID rather than a plain increment -- still the same lineage, not a new
+	// base.)
+	if pos, err := db1.Pos(); err != nil {
+		t.Fatal(err)
+	} else if pos.TXID < 2 {
+		t.Fatalf("resumed TXID=%d, want >= 2 (a lower value means it rewound and re-snapshotted from scratch)", pos.TXID)
+	}
+	if st, err := db1.SyncStatus(ctx); err != nil {
+		t.Fatal(err)
+	} else if !st.InSync || st.RemoteTXID <= 2 {
+		t.Fatalf("post-resume sync status=%+v, want InSync with RemoteTXID > 2 (replication did not continue forward on the same backup)", st)
+	}
+
+	// The restored + resumed database still holds the original row.
+	verifyPath := filepath.Join(t.TempDir(), "verify", "db")
+	if err := db1.Replica.Restore(ctx, litestream.RestoreOptions{
+		OutputPath:     verifyPath,
+		IntegrityCheck: litestream.IntegrityCheckNone,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	verifyDB := testingutil.MustOpenSQLDB(t, verifyPath)
+	defer testingutil.MustCloseSQLDB(t, verifyDB)
+	var count int
+	if err := verifyDB.QueryRowContext(ctx, `SELECT COUNT(*) FROM t;`).Scan(&count); err != nil {
+		t.Fatal(err)
+	} else if count != 1 {
+		t.Fatalf("restored row count=%d, want 1", count)
+	}
+}
+
 func TestDB_SnapshotAlwaysWrites(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
