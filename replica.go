@@ -289,10 +289,25 @@ func (r *Replica) uploadLTXFile(ctx context.Context, localLevel, remoteLevel int
 }
 
 // calcPos returns the last position saved to the replica for level 0. This is
-// the replica sync loop's resume point: it stays L0-only so every increment is
-// still uploaded to L0 (preserving point-in-time restore granularity) even when
-// a snapshot at L9 already covers a higher TXID. Re-encountering a snapshot TXID
-// is harmless -- uploadTarget re-routes it to L9 idempotently.
+// the replica sync loop's resume point, and it stays deliberately L0-only --
+// NOT the L9-aware remoteHead -- because the loop is responsible for uploading
+// every increment to L0 (preserving point-in-time restore granularity).
+//
+// It is not safe to resume from max(L0, L9) here. Periodic snapshots are written
+// straight to L9 by db.Snapshot (driven by the compaction monitor), out of band
+// from this loop and with no barrier that the increments below it have reached
+// L0 first. So the replica can transiently hold L9 = [1,s] while remote L0 tops
+// out at some s-k, with the increments (s-k, s] still pending locally. If a sync
+// error clears r.pos (see syncOnce) in that window and calcPos returned s, the
+// loop would resume at s+1 and skip those increments permanently -- restoring to
+// any TXID in (s-k, s) would then be impossible. Reading only L0 keeps the loop
+// backfilling every pending increment; a snapshot already at L9 is re-encountered
+// harmlessly, since uploadTarget re-routes it to L9 idempotently.
+//
+// The one place that must instead ask "how far is the replica, across L0 and
+// L9" is restore recovery (checkDatabaseBehindReplica), which runs before the
+// loop starts and against a freshly-cleared L0 with no pending increments; it
+// uses remoteHead and seeds r.pos directly.
 func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	info, err := r.MaxLTXFileInfo(ctx, 0)
 	if err != nil {
@@ -301,25 +316,29 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	return ltx.Pos{TXID: info.MaxTXID}, nil
 }
 
-// calcRemotePos returns the highest TXID durably present in the replica across
-// the increment level (L0) and the snapshot level (L9). Snapshotting writes --
-// the base and boundary snapshots -- are stored only at the snapshot level, so a
-// replica that has uploaded the base but no increments is still fully caught up.
-// Used for reporting replication status, not for the sync loop's resume point.
-func (r *Replica) calcRemotePos(ctx context.Context) (pos ltx.Pos, err error) {
+// remoteHead returns the LTX file at the highest TXID durably present in the
+// replica, along with the level it was found at. It considers both the
+// increment level (L0) and the snapshot level (L9): snapshotting writes -- the
+// base and boundary snapshots -- are stored only at L9, so a replica that has
+// uploaded the base but no increments (or whose increments have aged out of L0)
+// still has its head there. A zero FileInfo (MaxTXID == 0) means the replica is
+// empty. This is the single L9-aware source of truth for how far the replica
+// has durably gotten; use it whenever the question is the replica's position
+// rather than which increment the sync loop should upload next (see calcPos).
+func (r *Replica) remoteHead(ctx context.Context) (info ltx.FileInfo, level int, err error) {
 	l0, err := r.MaxLTXFileInfo(ctx, 0)
 	if err != nil {
-		return pos, fmt.Errorf("max l0 ltx file: %w", err)
+		return info, 0, fmt.Errorf("max l0 ltx file: %w", err)
 	}
 	snap, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
 	if err != nil {
-		return pos, fmt.Errorf("max snapshot ltx file: %w", err)
+		return info, 0, fmt.Errorf("max snapshot ltx file: %w", err)
 	}
-	txID := l0.MaxTXID
-	if snap.MaxTXID > txID {
-		txID = snap.MaxTXID
+	info, level = l0, 0
+	if snap.MaxTXID > info.MaxTXID {
+		info, level = snap, SnapshotLevel
 	}
-	return ltx.Pos{TXID: txID}, nil
+	return info, level, nil
 }
 
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
