@@ -484,3 +484,124 @@ func TestResumableReader_ContextCancelDuringReopen(t *testing.T) {
 		t.Errorf("OpenLTXFile() count=%d, want %d", got, want)
 	}
 }
+
+// A stream that goes silent is not a stream that breaks. Before the stall
+// timeout existed, both of these tests hung forever instead of failing.
+//
+// A third case belongs here and is deliberately left out for now:
+// Compactor.Compact closes its source readers when it returns, while the
+// compaction goroutine may still be parked in a read, and cancelStream is what
+// makes that Close land rather than queue behind the read on net/http's body
+// mutex. Asserting it needs a ResumableReader whose Close is sticky, so that a
+// cancelled read ends the reader instead of sending the retry loop off to open a
+// replacement stream. #1493 and #1500 add exactly that flag; once either is
+// merged, this file should grow a TestResumableReader_CloseUnblocksStalledRead
+// that parks a reader inside a silent read, calls Close, and requires it to
+// return.
+
+func TestResumableReader_ReconnectsOnStalledStream(t *testing.T) {
+	defer setStallTimeout(50 * time.Millisecond)()
+
+	data := []byte("hello world")
+	var opens atomic.Int32
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			if opens.Add(1) == 1 {
+				// The first stream hands over 5 bytes and then goes quiet.
+				// Only cancelling its request context can free the reader.
+				return io.NopCloser(newSilentAfterN(ctx, data, 5)), nil
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:])), nil
+		},
+	}
+
+	// rc is nil so the reader opens every stream itself, as restore does.
+	r := NewResumableReader(context.Background(), client, 0, 1, 1, int64(len(data)), nil, slog.Default())
+	got, err := readAllWithin(t, r, 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	if n := opens.Load(); n != 2 {
+		t.Fatalf("OpenLTXFile calls = %d, want 2 (original + reconnect past the stall)", n)
+	}
+}
+
+func TestResumableReader_StalledReadIsNotAUserCancel(t *testing.T) {
+	// A stall is retryable; a cancelled parent context is terminal. The stall
+	// path cancels a child context, so context.Canceled must not survive into
+	// the returned error where an errors.Is check would confuse the two.
+	defer setStallTimeout(20 * time.Millisecond)()
+
+	data := []byte("hello world")
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return io.NopCloser(newSilentAfterN(ctx, data, 5)), nil
+		},
+	}
+
+	r := NewResumableReader(context.Background(), client, 0, 1, 1, int64(len(data)), nil, slog.Default())
+	_, err := readAllWithin(t, r, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected the retry budget to be exhausted by repeated stalls")
+	}
+	if !errors.Is(err, ErrReadStalled) {
+		t.Fatalf("error %v does not wrap ErrReadStalled", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("stall error leaks context.Canceled, which callers treat as terminal: %v", err)
+	}
+}
+
+// setStallTimeout shortens the stall bound and returns a func restoring it.
+func setStallTimeout(d time.Duration) func() {
+	prev := resumableReaderStallTimeout
+	resumableReaderStallTimeout = d
+	return func() { resumableReaderStallTimeout = prev }
+}
+
+func readAllWithin(t *testing.T, r io.Reader, d time.Duration) ([]byte, error) {
+	t.Helper()
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(r)
+		ch <- result{b, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.b, res.err
+	case <-time.After(d):
+		t.Fatalf("read hung for %s: the stalled stream was never abandoned", d)
+		return nil, nil
+	}
+}
+
+// silentAfterN serves n bytes and then blocks until its request context is
+// cancelled, imitating a provider connection that stops delivering bytes
+// without ever closing.
+type silentAfterN struct {
+	ctx  context.Context
+	data []byte
+	n    int
+	off  int
+}
+
+func newSilentAfterN(ctx context.Context, data []byte, n int) *silentAfterN {
+	return &silentAfterN{ctx: ctx, data: data, n: n}
+}
+
+func (s *silentAfterN) Read(p []byte) (int, error) {
+	if s.off < s.n {
+		n := copy(p, s.data[s.off:s.n])
+		s.off += n
+		return n, nil
+	}
+	<-s.ctx.Done()
+	return 0, s.ctx.Err()
+}

@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -45,9 +46,14 @@ type ResumableReader struct {
 	size    int64 // expected total file size from FileInfo; 0 means unknown
 	offset  int64
 	rc      io.ReadCloser
-	retryN  int
-	err     error
-	logger  *slog.Logger
+	// cancel cancels the request context behind rc, but only for a stream this
+	// reader opened itself. A stream handed to NewResumableReader belongs to the
+	// caller, so there is nothing here to cancel until the first reconnect
+	// replaces it.
+	cancel context.CancelFunc
+	retryN int
+	err    error
+	logger *slog.Logger
 }
 
 // NewResumableReader creates a ResumableReader. Primarily exposed for testing.
@@ -71,6 +77,17 @@ const resumableReaderMaxRetries = 3
 // throttle window (e.g. Tigris 408 load shedding), guaranteeing exhaustion.
 const resumableReaderBackoff = 250 * time.Millisecond
 
+// resumableReaderStallTimeout bounds a single Read of an open stream. Nothing
+// else does: the S3 client sets no ResponseHeaderTimeout and no read deadline on
+// the response body, and TCP keepalive does not fire against a peer that is
+// alive but simply sending nothing. It is a var rather than a const only so
+// tests can shorten it.
+var resumableReaderStallTimeout = 30 * time.Second
+
+// ErrReadStalled reports a read that produced nothing for
+// resumableReaderStallTimeout and had its stream cancelled to force a reconnect.
+var ErrReadStalled = errors.New("ltx stream read stalled")
+
 func (r *ResumableReader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
@@ -80,8 +97,10 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (rc is nil after a retry).
 		if r.rc == nil {
-			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+			streamCtx, streamCancel := context.WithCancel(r.ctx)
+			rc, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
+				streamCancel()
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
 				}
@@ -97,10 +116,10 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 					"offset", r.offset, "error", err, "attempt", r.retryN)
 				continue
 			}
-			r.rc = rc
+			r.rc, r.cancel = rc, streamCancel
 		}
 
-		n, err := r.rc.Read(p)
+		n, err := r.readStream(p)
 		r.offset += int64(n)
 
 		if err == nil {
@@ -146,14 +165,67 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 	}
 }
 
+// readStream reads from the current stream under a stall timeout. A read that
+// produces nothing before the timeout expires has its stream's request context
+// cancelled, which unblocks the read with an error and sends the caller down the
+// reconnect path that already handles a dropped connection.
+//
+// Cancellation rather than Close: net/http's (*body).Read holds the body mutex
+// for the duration of the network read and (*body).Close wants that same mutex,
+// so a watchdog calling Close would queue behind the very read it is trying to
+// interrupt. Only the request context reaches a parked read.
+func (r *ResumableReader) readStream(p []byte) (int, error) {
+	// Captured per stream: by the time the timer fires, r.cancel may already
+	// belong to a healthy replacement, and cancelling that one would be a
+	// self-inflicted drop.
+	cancel := r.cancel
+	if cancel == nil || resumableReaderStallTimeout <= 0 {
+		return r.rc.Read(p)
+	}
+
+	var stalled atomic.Bool
+	timer := time.AfterFunc(resumableReaderStallTimeout, func() {
+		stalled.Store(true)
+		r.logger.Debug("ltx file read stalled, cancelling stream",
+			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+			"offset", r.offset, "timeout", resumableReaderStallTimeout)
+		cancel()
+	})
+	defer timer.Stop()
+
+	n, err := r.rc.Read(p)
+	if err != nil && stalled.Load() {
+		// %v, not %w: the underlying error is context.Canceled, and a stall is
+		// retryable where a cancelled parent context is terminal. Letting
+		// context.Canceled into the chain invites an errors.Is check above to
+		// abandon a restore that only needed to reconnect.
+		err = fmt.Errorf("%w after %s: %v", ErrReadStalled, resumableReaderStallTimeout, err)
+	}
+	return n, err
+}
+
 func (r *ResumableReader) Close() error {
+	r.cancelStream()
 	if r.rc != nil {
 		return r.rc.Close()
 	}
 	return nil
 }
 
+// cancelStream releases the request context behind the current stream. It runs
+// before every Close of that stream: a read parked on it holds net/http's body
+// mutex, which Close needs, so Close on its own would block behind the read
+// instead of ending it.
+func (r *ResumableReader) cancelStream() {
+	if r.cancel != nil {
+		r.cancel()
+		r.cancel = nil
+	}
+}
+
 func (r *ResumableReader) close() {
+	r.cancelStream()
+
 	// The stream is already being discarded after a read failure, so a close
 	// error should not stop recovery. Log it only to aid debugging.
 	if err := r.rc.Close(); err != nil {
