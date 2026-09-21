@@ -5,10 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 
 	"github.com/benbjohnson/litestream"
@@ -374,10 +376,59 @@ func TestStore_SnapshotInterval_Default(t *testing.T) {
 }
 
 func TestStore_Validate(t *testing.T) {
+	startedAt := float64(time.Now().UnixNano()) / 1e9
+	assertMetrics := func(t *testing.T, db *litestream.DB, level, result string) {
+		t.Helper()
+		families, err := prometheus.DefaultGatherer.Gather()
+		require.NoError(t, err)
+		got := make(map[string]float64)
+		for _, family := range families {
+			if !strings.HasPrefix(family.GetName(), "litestream_validation_") {
+				continue
+			}
+			for _, metric := range family.Metric {
+				labels := make(map[string]string)
+				for _, label := range metric.Label {
+					labels[label.GetName()] = label.GetValue()
+				}
+				if labels["db"] != db.Path() || labels["level"] != level {
+					continue
+				}
+				name := strings.TrimPrefix(family.GetName(), "litestream_validation_")
+				if name == "checks_total" {
+					require.Len(t, labels, 3)
+					require.NotNil(t, metric.Counter)
+					got[name+":"+labels["result"]] = metric.GetCounter().GetValue()
+				} else {
+					require.Len(t, labels, 2)
+					require.NotNil(t, metric.Gauge)
+					got[name] = metric.GetGauge().GetValue()
+				}
+			}
+		}
+		if result == "" {
+			require.Empty(t, got)
+			return
+		}
+		want := map[string]float64{
+			"checks_total:" + result:         1,
+			"success":                        0,
+			"last_success_timestamp_seconds": 0,
+		}
+		if result == "success" {
+			lastSuccess := got["last_success_timestamp_seconds"]
+			require.GreaterOrEqual(t, lastSuccess, startedAt)
+			require.LessOrEqual(t, lastSuccess, float64(time.Now().UnixNano())/1e9)
+			want["success"] = 1
+			want["last_success_timestamp_seconds"] = lastSuccess
+		}
+		require.Equal(t, want, got)
+	}
+
 	t.Run("AllLevelsValid", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 
-		db := &litestream.DB{}
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db.Replica = litestream.NewReplicaWithClient(db, client)
 
 		levels := litestream.CompactionLevels{
@@ -399,12 +450,14 @@ func TestStore_Validate(t *testing.T) {
 		if !result.Valid {
 			t.Errorf("expected valid result, got errors: %v", result.Errors)
 		}
+		assertMetrics(t, db, "0", "success")
+		assertMetrics(t, db, "1", "success")
 	})
 
 	t.Run("ErrorAtMultipleLevels", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 
-		db := &litestream.DB{}
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db.Replica = litestream.NewReplicaWithClient(db, client)
 
 		levels := litestream.CompactionLevels{
@@ -431,11 +484,13 @@ func TestStore_Validate(t *testing.T) {
 		if len(result.Errors) != 2 {
 			t.Errorf("expected 2 errors, got %d", len(result.Errors))
 		}
+		assertMetrics(t, db, "0", "invalid")
+		assertMetrics(t, db, "1", "invalid")
 	})
 
 	t.Run("NilReplica", func(t *testing.T) {
 		// DB with nil replica should be skipped
-		db := &litestream.DB{}
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		// db.Replica is nil
 
 		levels := litestream.CompactionLevels{
@@ -450,16 +505,17 @@ func TestStore_Validate(t *testing.T) {
 		if !result.Valid {
 			t.Errorf("expected valid result for nil replica, got errors: %v", result.Errors)
 		}
+		assertMetrics(t, db, "0", "")
 	})
 
 	t.Run("MultipleDBs", func(t *testing.T) {
 		client1 := file.NewReplicaClient(t.TempDir())
 		client2 := file.NewReplicaClient(t.TempDir())
 
-		db1 := &litestream.DB{}
+		db1 := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db1.Replica = litestream.NewReplicaWithClient(db1, client1)
 
-		db2 := &litestream.DB{}
+		db2 := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db2.Replica = litestream.NewReplicaWithClient(db2, client2)
 
 		levels := litestream.CompactionLevels{
@@ -485,6 +541,8 @@ func TestStore_Validate(t *testing.T) {
 		if len(result.Errors) != 1 {
 			t.Errorf("expected 1 error from db2, got %d", len(result.Errors))
 		}
+		assertMetrics(t, db1, "0", "success")
+		assertMetrics(t, db2, "0", "invalid")
 	})
 }
 
