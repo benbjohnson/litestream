@@ -17,20 +17,19 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-// Validation metrics use the database path and compaction level for attribution.
 var (
 	validationChecksCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "litestream_validation_checks_total",
 		Help: "Number of replica validation checks by result (success, invalid, or error).",
 	}, []string{"db", "level", "result"})
 
-	validationSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "litestream_validation_success",
+	lastValidationSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_last_validation_success",
 		Help: "Whether the last replica validation check succeeded (1) or failed (0). Zero before the first check completes.",
 	}, []string{"db", "level"})
 
-	validationLastSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "litestream_validation_last_success_timestamp_seconds",
+	lastValidationSuccessTimestampGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_last_validation_success_timestamp_seconds",
 		Help: "Unix time of the last successful replica validation check. Zero until a check succeeds.",
 	}, []string{"db", "level"})
 )
@@ -898,8 +897,8 @@ func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
 
 		for _, lvl := range levels {
 			level := strconv.Itoa(lvl.Level)
-			lastSuccess := validationLastSuccessGaugeVec.WithLabelValues(db.Path(), level)
-			success := validationSuccessGaugeVec.WithLabelValues(db.Path(), level)
+			lastSuccess := lastValidationSuccessTimestampGaugeVec.WithLabelValues(db.Path(), level)
+			success := lastValidationSuccessGaugeVec.WithLabelValues(db.Path(), level)
 			errs, err := db.Replica.ValidateLevel(ctx, lvl.Level)
 			if err != nil {
 				validationChecksCounterVec.WithLabelValues(db.Path(), level, "error").Inc()

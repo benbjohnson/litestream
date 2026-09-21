@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -383,7 +382,10 @@ func TestStore_Validate(t *testing.T) {
 		require.NoError(t, err)
 		got := make(map[string]float64)
 		for _, family := range families {
-			if !strings.HasPrefix(family.GetName(), "litestream_validation_") {
+			name := family.GetName()
+			switch name {
+			case "litestream_validation_checks_total", "litestream_last_validation_success", "litestream_last_validation_success_timestamp_seconds":
+			default:
 				continue
 			}
 			for _, metric := range family.Metric {
@@ -394,8 +396,7 @@ func TestStore_Validate(t *testing.T) {
 				if labels["db"] != db.Path() || labels["level"] != level {
 					continue
 				}
-				name := strings.TrimPrefix(family.GetName(), "litestream_validation_")
-				if name == "checks_total" {
+				if name == "litestream_validation_checks_total" {
 					require.Len(t, labels, 3)
 					require.NotNil(t, metric.Counter)
 					got[name+":"+labels["result"]] = metric.GetCounter().GetValue()
@@ -411,16 +412,16 @@ func TestStore_Validate(t *testing.T) {
 			return
 		}
 		want := map[string]float64{
-			"checks_total:" + result:         1,
-			"success":                        0,
-			"last_success_timestamp_seconds": 0,
+			"litestream_validation_checks_total:" + result:         1,
+			"litestream_last_validation_success":                   0,
+			"litestream_last_validation_success_timestamp_seconds": 0,
 		}
 		if result == "success" {
-			lastSuccess := got["last_success_timestamp_seconds"]
+			lastSuccess := got["litestream_last_validation_success_timestamp_seconds"]
 			require.GreaterOrEqual(t, lastSuccess, startedAt)
 			require.LessOrEqual(t, lastSuccess, float64(time.Now().UnixNano())/1e9)
-			want["success"] = 1
-			want["last_success_timestamp_seconds"] = lastSuccess
+			want["litestream_last_validation_success"] = 1
+			want["litestream_last_validation_success_timestamp_seconds"] = lastSuccess
 		}
 		require.Equal(t, want, got)
 	}
