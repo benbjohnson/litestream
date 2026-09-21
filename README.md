@@ -38,6 +38,12 @@ Do not drop `_litestream_lock` while Litestream is running. Synchronization
 around a checkpoint can fail until Litestream reinitializes the database.
 Restarting Litestream recreates the missing table automatically.
 
+Monitoring replica validation
+-----------------------------
+
+See [Replica validation metrics](docs/VALIDATION_METRICS.md) for Prometheus
+metrics and example alerts for failed or overdue validation checks.
+
 Contributing
 ------------
 
