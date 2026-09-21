@@ -859,6 +859,32 @@ replica_lag_seconds    // Replication lag
 replica_position      // Current replication position
 ```
 
+Periodic replica validation (`validation.interval`) exposes these metrics with
+`db` (database path) and `level` (compaction level) labels:
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `litestream_validation_checks_total` | Counter | Checks completed, with `result` set to `success`, `invalid`, or `error`. |
+| `litestream_validation_success` | Gauge | `1` if the last check passed; `0` if it failed or the first check has not finished. |
+| `litestream_validation_last_success_timestamp_seconds` | Gauge | Unix time of the last passing check, or `0` until a check passes. |
+
+`invalid` counts checks that found missing, overlapping, or unordered transaction
+ranges. `error` counts checks that could not complete, including storage errors,
+cancellation, and timeouts. Failed checks preserve the last success time.
+
+For a 15-minute validation interval, example Prometheus alert expressions are:
+
+```promql
+litestream_validation_success{job="litestream"} == 0
+time() - litestream_validation_last_success_timestamp_seconds{job="litestream"} > 1800
+```
+
+Series appear when a database level is first checked and reset on process restart.
+Also monitor missing expected series: disabled validation or an earlier storage
+error can prevent a level from being checked. Validation checks file continuity;
+an empty listing passes, and a passing check does not establish that a restore
+will succeed.
+
 ### Health Checks
 
 ```go
