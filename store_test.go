@@ -4,12 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -576,5 +578,68 @@ func TestStore_SetRetentionEnabled(t *testing.T) {
 		if !db.RetentionEnabled {
 			t.Fatalf("expected db.RetentionEnabled=true for %s after reset", db.Path())
 		}
+	}
+}
+
+// slowSnapshotClient drains every snapshot upload a page at a time, so the
+// snapshot's page reader is still running when the store closes.
+type slowSnapshotClient struct {
+	litestream.ReplicaClient
+	started chan struct{}
+	drained chan error
+}
+
+func (c *slowSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level != litestream.SnapshotLevel {
+		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	}
+	c.started <- struct{}{}
+	buf := make([]byte, 4096)
+	var err error
+	for err == nil {
+		_, err = io.ReadFull(r, buf)
+		time.Sleep(200 * time.Microsecond)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		err = nil
+	}
+	c.drained <- err
+	if err != nil {
+		return nil, err
+	}
+	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
+}
+
+func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	client := &slowSnapshotClient{
+		ReplicaClient: db.Replica.Client,
+		started:       make(chan struct{}),
+		drained:       make(chan error, 1),
+	}
+	db.Replica.Client = client
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 2000) INSERT INTO t (v) SELECT randomblob(4000) FROM n;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	s := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
+	if err := s.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	<-client.started
+	require.NoError(t, s.Close(context.Background()))
+	if err := <-client.drained; err != nil {
+		require.ErrorIs(t, err, context.Canceled)
 	}
 }
