@@ -857,6 +857,11 @@ sync_error_count      // Number of sync errors
 // Replica metrics
 replica_lag_seconds    // Replication lag
 replica_position      // Current replication position
+
+// Validation metrics have db and level labels.
+litestream_validation_checks_total                   // Checks by result: success, invalid, or error.
+litestream_last_validation_success                   // Last check: 1 passed, 0 failed or not yet complete.
+litestream_last_validation_success_timestamp_seconds // Unix time of last success, or 0 until a check passes.
 ```
 
 ### Health Checks
