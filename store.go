@@ -17,6 +17,24 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
+// Validation metrics use the database path and compaction level for attribution.
+var (
+	validationChecksCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "litestream_validation_checks_total",
+		Help: "Number of replica validation checks by result (success, invalid, or error).",
+	}, []string{"db", "level", "result"})
+
+	validationSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_validation_success",
+		Help: "Whether the last replica validation check succeeded (1) or failed (0). Zero before the first check completes.",
+	}, []string{"db", "level"})
+
+	validationLastSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "litestream_validation_last_success_timestamp_seconds",
+		Help: "Unix time of the last successful replica validation check. Zero until a check succeeds.",
+	}, []string{"db", "level"})
+)
+
 var (
 	// ErrNoCompaction is returned when no new files are available from the previous level.
 	ErrNoCompaction = errors.New("no compaction")
@@ -903,24 +921,6 @@ func (s *Store) Validate(ctx context.Context) (*ValidationResult, error) {
 
 	return result, nil
 }
-
-// Validation metrics use the database path and compaction level for attribution.
-var (
-	validationChecksCounterVec = promauto.NewCounterVec(prometheus.CounterOpts{
-		Name: "litestream_validation_checks_total",
-		Help: "Number of replica validation checks by result (success, invalid, or error).",
-	}, []string{"db", "level", "result"})
-
-	validationSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "litestream_validation_success",
-		Help: "Whether the last replica validation check succeeded (1) or failed (0). Zero before the first check completes.",
-	}, []string{"db", "level"})
-
-	validationLastSuccessGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "litestream_validation_last_success_timestamp_seconds",
-		Help: "Unix time of the last successful replica validation check. Zero until a check succeeds.",
-	}, []string{"db", "level"})
-)
 
 // monitorValidation periodically runs validation checks on all databases.
 func (s *Store) monitorValidation(ctx context.Context) {
