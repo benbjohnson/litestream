@@ -576,6 +576,31 @@ func TestLeaser_Type(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_NewLeaser(t *testing.T) {
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "test-path"
+	client.Region = "us-east-1"
+	client.Endpoint = "http://127.0.0.1:1"
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+
+	leaser, err := client.NewLeaser(context.Background())
+	if err != nil {
+		t.Fatalf("NewLeaser() error: %v", err)
+	}
+	if leaser.Bucket != client.Bucket {
+		t.Fatalf("leaser.Bucket=%q, want %q", leaser.Bucket, client.Bucket)
+	}
+	if leaser.Path != client.Path {
+		t.Fatalf("leaser.Path=%q, want %q", leaser.Path, client.Path)
+	}
+	if leaser.Client() == nil {
+		t.Fatal("expected leaser client")
+	}
+}
+
 func newTestLeaser(t *testing.T, serverURL string) *Leaser {
 	t.Helper()
 
