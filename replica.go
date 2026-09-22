@@ -831,13 +831,14 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 	defer ticker.Stop()
 
 	var consecutiveErrors int
+	var stallTXID ltx.TXID // position at which a follow gap was last reported
 	for {
 		select {
 		case <-ctx.Done():
 			r.Logger().Info("follow mode stopped")
 			return nil
 		case <-ticker.C:
-			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
+			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize, &stallTXID)
 			if err != nil {
 				if ctx.Err() != nil {
 					r.Logger().Info("follow mode stopped")
@@ -862,7 +863,7 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 // applyNewLTXFiles polls for new LTX files and applies them to the database.
 // It starts from level 0 and falls back to higher levels if there are gaps
 // (e.g., level 0 files were compacted away).
-func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32, stallTXID *ltx.TXID) (ltx.TXID, error) {
 	currentTXID := afterTXID
 
 	// Poll level 0 for the most recent incremental files.
@@ -888,7 +889,7 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 
 		// If there's a gap, try to fill it from higher compaction levels.
 		if info.MinTXID > currentTXID+1 {
-			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize)
+			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize, stallTXID)
 			if err != nil {
 				return closeLevel0(err)
 			}
@@ -899,6 +900,7 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 				continue
 			}
 			if info.MinTXID > currentTXID+1 {
+				r.reportFollowGap(ctx, stallTXID, currentTXID, info.MinTXID)
 				return closeLevel0(nil)
 			}
 		}
@@ -925,7 +927,7 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 	}
 
 	if !sawLevel0 {
-		bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, currentTXID+1, pageSize)
+		bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, currentTXID+1, pageSize, stallTXID)
 		if err != nil {
 			return currentTXID, err
 		}
@@ -1001,8 +1003,9 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 
 // fillFollowGap attempts to bridge a gap in level 0 files by searching
 // higher compaction levels for a file that covers the missing TXID range.
-func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.TXID, gapMinTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
+func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.TXID, gapMinTXID ltx.TXID, pageSize uint32, stallTXID *ltx.TXID) (ltx.TXID, error) {
 	currentTXID := afterTXID
+	var unreachableTXID ltx.TXID
 
 	for level := 1; level < SnapshotLevel; level++ {
 		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
@@ -1025,6 +1028,9 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 
 			// Skip if there's a gap at this level too.
 			if info.MinTXID > currentTXID+1 {
+				if unreachableTXID == 0 {
+					unreachableTXID = info.MinTXID
+				}
 				break
 			}
 
@@ -1060,7 +1066,28 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 		}
 	}
 
+	// No level bridged the gap but files exist beyond our position, so the
+	// follower cannot advance without operator intervention.
+	if unreachableTXID != 0 {
+		r.reportFollowGap(ctx, stallTXID, currentTXID, unreachableTXID)
+	}
+
 	return currentTXID, nil
+}
+
+// reportFollowGap warns that follow mode has no path from its current position
+// to the next available LTX file. stallTXID holds the position last reported by
+// the caller's follow loop; the follower retries every interval and its position
+// is monotonic, so reporting per position logs the condition once when it is
+// entered rather than on every poll. Stays silent during shutdown (see #235).
+func (r *Replica) reportFollowGap(ctx context.Context, stallTXID *ltx.TXID, currentTXID, nextTXID ltx.TXID) {
+	if ctx.Err() != nil || *stallTXID == currentTXID {
+		return
+	}
+	*stallTXID = currentTXID
+
+	r.Logger().Warn("follow: no ltx file available at current position, follower is not advancing",
+		"txid", currentTXID, "next_txid", nextTXID)
 }
 
 // RestoreV3 restores from a v0.3.x format backup.
