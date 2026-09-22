@@ -116,6 +116,156 @@ func TestReplica_ApplyNewLTXFiles_LevelZeroEmptyFallsBackToCompaction(t *testing
 	}
 }
 
+// TestReplica_ApplyNewLTXFiles_BridgesSnapshotHole reproduces the follow-mode
+// stall reported against the compaction-based-snapshot branch. Snapshots are
+// written to L9 and Compact seeks past them, so a ladder level can cover only
+// part of the history (here L1 = [6,12]) while the range [1,5] lives solely in
+// the L9 snapshot. With the follower's L0 files pruned by retention, the only
+// way past TXID 5 is the snapshot. A follower parked at TXID 3 must bridge the
+// hole via L9 and then let the ladder resume, ultimately reaching 12.
+func TestReplica_ApplyNewLTXFiles_BridgesSnapshotHole(t *testing.T) {
+	const pageSize = 4096
+
+	l1Info := &ltx.FileInfo{Level: 1, MinTXID: 6, MaxTXID: 12}
+	snapInfo := &ltx.FileInfo{Level: SnapshotLevel, MinTXID: 1, MaxTXID: 5}
+
+	fixtures := map[string][]byte{
+		ltxFixtureKey(l1Info.Level, l1Info.MinTXID, l1Info.MaxTXID): mustBuildIncrementalLTX(t, l1Info.MinTXID, l1Info.MaxTXID, pageSize, 1, 0xE5),
+		ltxFixtureKey(snapInfo.Level, snapInfo.MinTXID, snapInfo.MaxTXID): mustBuildSnapshotLTX(t, snapInfo.MinTXID, snapInfo.MaxTXID, pageSize, [][]byte{
+			newSQLiteHeaderPage(pageSize),
+			bytes.Repeat([]byte{0xF6}, pageSize),
+		}),
+	}
+
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		var all []*ltx.FileInfo
+		switch level {
+		case 0:
+			all = nil // pruned by retention
+		case 1:
+			all = []*ltx.FileInfo{l1Info}
+		case SnapshotLevel:
+			all = []*ltx.FileInfo{snapInfo}
+		}
+		infos := make([]*ltx.FileInfo, 0, len(all))
+		for _, info := range all {
+			if info.MinTXID >= seek {
+				infos = append(infos, info)
+			}
+		}
+		return ltx.NewFileInfoSliceIterator(infos), nil
+	}
+	client.OpenLTXFileFunc = func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		data, ok := fixtures[ltxFixtureKey(level, minTXID, maxTXID)]
+		if !ok {
+			return nil, os.ErrNotExist
+		}
+		return io.NopCloser(bytes.NewReader(data)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	// First poll bridges the hole via the L9 snapshot, reaching its TXID.
+	got, err := r.applyNewLTXFiles(context.Background(), f, 3, pageSize)
+	if err != nil {
+		t.Fatalf("apply new ltx files (poll 1): %v", err)
+	}
+	if got != 5 {
+		t.Fatalf("poll 1 txid=%s, want %s", got, ltx.TXID(5))
+	}
+
+	// Second poll resumes the ladder from L1 and catches up.
+	got, err = r.applyNewLTXFiles(context.Background(), f, got, pageSize)
+	if err != nil {
+		t.Fatalf("apply new ltx files (poll 2): %v", err)
+	}
+	if got != 12 {
+		t.Fatalf("poll 2 txid=%s, want %s", got, ltx.TXID(12))
+	}
+}
+
+// TestReplica_ApplyNewLTXFiles_StallWarnsWhenUnbridgeable verifies that a
+// follower with data ahead it genuinely cannot reach (a ladder hole with no
+// covering snapshot) makes no progress and emits a WARN, rather than stalling
+// silently.
+func TestReplica_ApplyNewLTXFiles_StallWarnsWhenUnbridgeable(t *testing.T) {
+	const pageSize = 4096
+
+	l1Info := &ltx.FileInfo{Level: 1, MinTXID: 6, MaxTXID: 12}
+
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		var all []*ltx.FileInfo
+		if level == 1 {
+			all = []*ltx.FileInfo{l1Info}
+		}
+		infos := make([]*ltx.FileInfo, 0, len(all))
+		for _, info := range all {
+			if info.MinTXID >= seek {
+				infos = append(infos, info)
+			}
+		}
+		return ltx.NewFileInfoSliceIterator(infos), nil
+	}
+	client.OpenLTXFileFunc = func(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		return nil, os.ErrNotExist
+	}
+
+	var logs bytes.Buffer
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+	db.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	r := NewReplicaWithClient(db, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	got, err := r.applyNewLTXFiles(context.Background(), f, 3, pageSize)
+	if err != nil {
+		t.Fatalf("apply new ltx files: %v", err)
+	}
+	if got != 3 {
+		t.Fatalf("txid=%s, want %s (no progress)", got, ltx.TXID(3))
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("follower stalled")) {
+		t.Fatalf("expected stall WARN, got logs: %q", logs.String())
+	}
+}
+
+// TestReplica_ApplyNewLTXFiles_CaughtUpDoesNotWarn ensures the stall WARN does
+// not fire on the steady-state idle path, where L0 is empty simply because the
+// follower is already at the head with no data ahead.
+func TestReplica_ApplyNewLTXFiles_CaughtUpDoesNotWarn(t *testing.T) {
+	const pageSize = 4096
+
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	client.OpenLTXFileFunc = func(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		return nil, os.ErrNotExist
+	}
+
+	var logs bytes.Buffer
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+	db.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	r := NewReplicaWithClient(db, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	got, err := r.applyNewLTXFiles(context.Background(), f, 12, pageSize)
+	if err != nil {
+		t.Fatalf("apply new ltx files: %v", err)
+	}
+	if got != 12 {
+		t.Fatalf("txid=%s, want %s (unchanged)", got, ltx.TXID(12))
+	}
+	if bytes.Contains(logs.Bytes(), []byte("follower stalled")) {
+		t.Fatalf("unexpected stall WARN on idle path: %q", logs.String())
+	}
+}
+
 func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	client := &followTestReplicaClient{}
 	client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
@@ -146,7 +296,7 @@ func TestReplica_UploadLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
 		db := NewDB(filepath.Join(t.TempDir(), "test.db"))
 		r := NewReplicaWithClient(db, &followTestReplicaClient{})
 
-		err := r.uploadLTXFile(context.Background(), 0, 1, 1)
+		err := r.uploadLTXFile(context.Background(), 0, 0, 1, 1)
 		if err == nil {
 			t.Fatal("expected error for missing LTX file")
 		}
@@ -174,7 +324,7 @@ func TestReplica_UploadLTXFile_OpenErrorReturnsLTXError(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		err := r.uploadLTXFile(context.Background(), 0, 1, 1)
+		err := r.uploadLTXFile(context.Background(), 0, 0, 1, 1)
 		if err == nil {
 			t.Fatal("expected error for permission denied")
 		}
