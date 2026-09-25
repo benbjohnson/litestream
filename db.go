@@ -2888,7 +2888,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		// directory rather than holding it in memory; Cleanup covers the
 		// cancellation paths that never reach enc.Close.
 		enc.SetSpillDir(db.MetaPath())
-		defer enc.Cleanup()
+		defer func() { _ = enc.Cleanup() }()
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,
