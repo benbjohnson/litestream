@@ -848,6 +848,7 @@ type countingReplicaClient struct {
 type failingPageReplicaClient struct {
 	*mockReplicaClient
 	failPageReads atomic.Bool
+	opens         atomic.Uint64
 }
 
 func newCountingReplicaClient() *countingReplicaClient { return &countingReplicaClient{} }
@@ -935,6 +936,7 @@ func (c *mockReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID,
 }
 
 func (c *failingPageReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.opens.Add(1)
 	if c.failPageReads.Load() && offset > 0 && size > 0 {
 		return nil, errors.New("injected page read failure")
 	}
@@ -1561,7 +1563,7 @@ func TestVFSFile_PollLevel1RecoversStraddlerAndNextFileTogether(t *testing.T) {
 	}
 }
 
-func TestVFSFile_PollLevel1SkipsFileBelowWatermark(t *testing.T) {
+func TestVFSFile_PollLevel1KeepsWatermarkForCoveredFile(t *testing.T) {
 	f, client := openVFSFileAtSnapshot(t, 6, 'a')
 
 	covered := buildLTXFixtureRange(t, 1, 5, 'b')
@@ -1573,6 +1575,55 @@ func TestVFSFile_PollLevel1SkipsFileBelowWatermark(t *testing.T) {
 	}
 	if got := f.MaxTXID1(); got != 6 {
 		t.Fatalf("maxTXID1 = %s, want 6", got)
+	}
+}
+
+func TestVFSFile_PollLevel1RepointsPageBelowWatermark(t *testing.T) {
+	client := newFailingPageReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	l0 := buildLTXFixture(t, 2, 'b')
+	client.addFixture(t, l0)
+	client.addFixture(t, buildLTXFixtureWithPage(t, 3, 4096, 2, 'c'))
+
+	f := NewVFSFile(client, "covered-l1.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	covered := buildLTXFixtureRange(t, 1, 2, 'b')
+	covered.info.Level = 1
+	client.addFixture(t, covered)
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll covered L1: %v", err)
+	}
+	if got := f.MaxTXID1(); got != 3 {
+		t.Fatalf("maxTXID1 = %s, want 3", got)
+	}
+	opens := client.opens.Load()
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("repeat poll of covered L1: %v", err)
+	}
+	if got := client.opens.Load(); got != opens {
+		t.Fatalf("repeat poll opened %d unchanged L1 files", got-opens)
+	}
+
+	f.mu.Lock()
+	elem := f.index[1]
+	f.mu.Unlock()
+	if elem.Level != 1 || elem.MaxTXID != 2 {
+		t.Fatalf("page index = %+v, want L1 at TXID 2", elem)
+	}
+	client.mu.Lock()
+	delete(client.data, client.key(l0.info))
+	client.mu.Unlock()
+	f.cache.Purge()
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read retained L1 page: %v", err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("retained L1 page = %q, want 'b'", buf[0])
 	}
 }
 
@@ -1764,6 +1815,49 @@ func TestVFSFile_PollLevel1RepointsEqualTXIDPage(t *testing.T) {
 	}
 }
 
+func TestVFSFile_PollLevel1RepointsEqualTXIDPageBeforeSuccessor(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	l0 := buildLTXFixture(t, 2, 'b')
+	client.addFixture(t, l0)
+
+	f := NewVFSFile(client, "equal-txid-successor.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	l1 := buildLTXFixtureRange(t, 1, 2, 'b')
+	l1.info.Level = 1
+	client.addFixture(t, l1)
+	successor := buildLTXFixtureWithPage(t, 3, 4096, 2, 'c')
+	successor.info.Level = 1
+	client.addFixture(t, successor)
+
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll L1: %v", err)
+	}
+
+	f.mu.Lock()
+	elem := f.index[1]
+	f.mu.Unlock()
+	if elem.Level != 1 || elem.MaxTXID != 2 {
+		t.Fatalf("page index = %+v, want L1 at TXID 2", elem)
+	}
+
+	client.mu.Lock()
+	delete(client.data, client.key(l0.info))
+	client.mu.Unlock()
+	f.cache.Purge()
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read retained L1 page: %v", err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("retained L1 page = %q, want 'b'", buf[0])
+	}
+}
+
 func TestVFSFile_PollLevel1KeepsNewerL0Page(t *testing.T) {
 	client := newMockReplicaClient()
 	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
@@ -1799,6 +1893,44 @@ func TestVFSFile_PollLevel1KeepsNewerL0Page(t *testing.T) {
 	}
 	if buf[0] != 'c' {
 		t.Fatalf("read newer L0 page = %q, want 'c'", buf[0])
+	}
+}
+
+func TestVFSFile_PollOlderLevel1KeepsNewerL0Growth(t *testing.T) {
+	client := newMockReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+
+	f := NewVFSFile(client, "older-l1-growth.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	client.addFixture(t, buildLTXFixtureWithPage(t, 2, 4096, 2, 'b'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll L0 growth: %v", err)
+	}
+
+	l1 := buildLTXFixture(t, 1, 'a')
+	l1.info.Level = 1
+	client.addFixture(t, l1)
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll older L1: %v", err)
+	}
+
+	f.mu.Lock()
+	commit := f.commit
+	_, hasPage2 := f.index[2]
+	f.mu.Unlock()
+	if commit != 2 || !hasPage2 {
+		t.Fatalf("older L1 discarded newer L0 growth: commit=%d, hasPage2=%t", commit, hasPage2)
+	}
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 4096); err != nil {
+		t.Fatalf("read newer L0 page: %v", err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("newer L0 page = %q, want 'b'", buf[0])
 	}
 }
 

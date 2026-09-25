@@ -518,6 +518,7 @@ type VFSFile struct {
 	pos              ltx.Pos  // Last TXID read from level 0 or 1
 	maxTXID1         ltx.TXID // Last TXID read from level 1
 	maxTXID1Anchored bool
+	maxTXID1Covered  ltx.TXID
 	index            map[uint32]ltx.PageIndexElem
 	pending          map[uint32]ltx.PageIndexElem
 	pendingReplace   bool
@@ -1224,6 +1225,11 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 	f.pos = pos
 	f.maxTXID1 = maxTXID1
 	f.maxTXID1Anchored = maxTXID1Anchored
+	if maxTXID1Anchored {
+		f.maxTXID1Covered = maxTXID1
+	} else {
+		f.maxTXID1Covered = 0
+	}
 	if len(infos) > 0 {
 		f.latestLTXTime = infos[len(infos)-1].CreatedAt
 	}
@@ -2550,12 +2556,13 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	baseCommit := f.commit
 	maxTXID1Snapshot := f.maxTXID1
 	maxTXID1AnchoredSnapshot := f.maxTXID1Anchored
+	maxTXID1CoveredSnapshot := f.maxTXID1Covered
 	f.mu.Unlock()
 
 	newCommit := baseCommit
 	replaceIndex := false
 
-	level0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit, true)
+	level0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit, true, 0)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
@@ -2575,18 +2582,18 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		}
 	}
 
-	level1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit, maxTXID1AnchoredSnapshot)
+	level1, err := f.pollLevel(ctx, 1, maxTXID1Snapshot, baseCommit, maxTXID1AnchoredSnapshot, maxTXID1CoveredSnapshot)
 	if err != nil {
 		return fmt.Errorf("poll L1: %w", err)
 	}
-	if level1.replaceIndex {
+	if level1.replaceIndex && level1.maxTXID >= level0.maxTXID {
 		replaceIndex = true
 		newCommit = level1.commit
 		combined = make(map[uint32]ltx.PageIndexElem)
 		mergePageIndexes(combined, nil, level1.index, nil)
 	} else {
 		mergePageIndexes(combined, nil, level1.index, nil)
-		if level1.commit > newCommit {
+		if level1.maxTXID >= level0.maxTXID && level1.commit > newCommit {
 			newCommit = level1.commit
 		}
 	}
@@ -2656,6 +2663,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	f.maxTXID1 = level1.maxTXID
 	f.maxTXID1Anchored = level1.anchored
+	f.maxTXID1Covered = level1.coveredTXID
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	// Apply updates to hydrated file if hydration is complete
@@ -2675,16 +2683,18 @@ type pollLevelResult struct {
 	commit       uint32
 	replaceIndex bool
 	anchored     bool
+	coveredTXID  ltx.TXID
 }
 
 // pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
 // any index updates, the latest commit value, and if the index should be replaced.
-func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32, anchored bool) (pollLevelResult, error) {
+func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID, baseCommit uint32, anchored bool, coveredTXID ltx.TXID) (pollLevelResult, error) {
 	result := pollLevelResult{
-		maxTXID:  prevMaxTXID,
-		index:    make(map[uint32]ltx.PageIndexElem),
-		commit:   baseCommit,
-		anchored: anchored,
+		maxTXID:     prevMaxTXID,
+		index:       make(map[uint32]ltx.PageIndexElem),
+		commit:      baseCommit,
+		anchored:    anchored,
+		coveredTXID: coveredTXID,
 	}
 	lastCommit := baseCommit
 
@@ -2698,6 +2708,19 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		applied := false
 		for itr.Next() {
 			info := itr.Item()
+			if level >= 1 && !result.anchored && info.MaxTXID < result.maxTXID {
+				if info.MaxTXID <= result.coveredTXID {
+					continue
+				}
+				idx, err := FetchPageIndex(ctx, f.client, info)
+				if err != nil {
+					return nil, applied, fmt.Errorf("fetch page index: %w", err)
+				}
+				mergePageIndexes(result.index, nil, idx, nil)
+				result.coveredTXID = info.MaxTXID
+				applied = true
+				continue
+			}
 			sameUnanchoredBoundary := level >= 1 && !result.anchored && info.MaxTXID == result.maxTXID
 			if info.MaxTXID <= result.maxTXID && !sameUnanchoredBoundary {
 				continue
@@ -2736,6 +2759,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			result.maxTXID = info.MaxTXID
 			if level >= 1 {
 				result.anchored = true
+				result.coveredTXID = info.MaxTXID
 			}
 			applied = true
 		}
@@ -2745,7 +2769,11 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		return nil, applied, nil
 	}
 
-	gap, _, err := poll(prevMaxTXID + 1)
+	seek := prevMaxTXID + 1
+	if level >= 1 && !anchored {
+		seek = 0
+	}
+	gap, recovered, err := poll(seek)
 	if err != nil {
 		return result, err
 	}
@@ -2755,12 +2783,28 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 		}
 		return result, nil
 	}
+	if seek == 0 {
+		if gap != nil {
+			return result, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, result.maxTXID, gap.MinTXID, gap.MaxTXID)
+		}
+		if !recovered {
+			return result, nil
+		}
+		gap, _, err = poll(result.maxTXID + 1)
+		if err != nil {
+			return result, err
+		}
+		if gap != nil {
+			return result, fmt.Errorf("non-contiguous ltx file: level=%d, current=%s, next=%s-%s", level, result.maxTXID, gap.MinTXID, gap.MaxTXID)
+		}
+		return result, nil
+	}
 	if gap == nil && result.anchored {
 		return result, nil
 	}
 
 	normalGap := gap
-	gap, recovered, err := poll(0)
+	gap, recovered, err = poll(0)
 	if err != nil {
 		return result, err
 	}
