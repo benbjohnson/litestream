@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const minioImage = "tobi312/minio:alpine-RELEASE.2025-09-07T16-13-09Z@sha256:e2226dea4b9aef896db02f7396102d48eb58cd339d930332e3d8bdac80012a78"
+
 func RequireDocker(t *testing.T) {
 	t.Helper()
 	if err := exec.Command("docker", "version").Run(); err != nil {
@@ -31,7 +33,7 @@ func StartMinioTestContainer(t *testing.T) (string, string) {
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
 		"-e", "MINIO_DOMAIN=s3-accesspoint.127.0.0.1.nip.io",
-		"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z", "server", "/data",
+		minioImage, "server", "/data",
 	}
 	containerID := runDockerCommand(t, args...)
 	portInfo := runDockerCommand(t, "port", name, "9000/tcp")

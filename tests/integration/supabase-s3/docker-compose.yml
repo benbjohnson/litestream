@@ -15,7 +15,7 @@ services:
       retries: 10
 
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: tobi312/minio:alpine-RELEASE.2025-09-07T16-13-09Z@sha256:e2226dea4b9aef896db02f7396102d48eb58cd339d930332e3d8bdac80012a78
     command: server /data --console-address ":9001"
     environment:
       MINIO_ROOT_USER: supa-storage
@@ -29,7 +29,7 @@ services:
       retries: 10
 
   minio-createbucket:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: tobi312/minio:alpine-RELEASE.2025-09-07T16-13-09Z@sha256:e2226dea4b9aef896db02f7396102d48eb58cd339d930332e3d8bdac80012a78
     depends_on:
       minio:
         condition: service_healthy
