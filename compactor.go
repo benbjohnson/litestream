@@ -31,6 +31,12 @@ type Compactor struct {
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
 
+	// SpillDir, when set, lets the ltx encoder spill the output page index of
+	// a very large compaction to a temp file in that directory instead of
+	// holding it in memory (ltx#96). DB sets it to the database meta
+	// directory, which is writable even in the hardened image.
+	SpillDir string
+
 	// CompactionVerifyErrorCounter is incremented when post-compaction
 	// verification fails. Optional; if nil, no metric is recorded.
 	CompactionVerifyErrorCounter prometheus.Counter
@@ -162,7 +168,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
+		defer func() { _ = comp.Cleanup() }()
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
+		comp.SetSpillDir(c.SpillDir)
 		_ = pw.CloseWithError(comp.Compact(ctx))
 	}()
 
