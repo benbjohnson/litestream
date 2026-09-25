@@ -54,7 +54,7 @@ var (
 	ErrInvalidSnapshotRetention        = errors.New("snapshot retention must be greater than 0")
 	ErrInvalidCompactionInterval       = errors.New("compaction interval must be greater than 0")
 	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
-	ErrInvalidL0Retention              = errors.New("l0 retention must be greater than 0")
+	ErrInvalidL0Retention              = errors.New("l0 retention must not be negative")
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
 	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
@@ -432,7 +432,7 @@ func (c *Config) Validate() error {
 			Value: *c.Snapshot.Retention,
 		}
 	}
-	if c.L0Retention != nil && *c.L0Retention <= 0 {
+	if c.L0Retention != nil && *c.L0Retention < 0 {
 		return &ConfigValidationError{
 			Err:   ErrInvalidL0Retention,
 			Field: "l0-retention",
@@ -489,6 +489,7 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate database configs
+	seenPaths := make(map[string]int) // cleaned path -> 1-based config index
 	for idx, db := range c.DBs {
 		// Validate that either path or dir is specified, but not both
 		if db.Path != "" && db.Dir != "" {
@@ -496,6 +497,17 @@ func (c *Config) Validate() error {
 		}
 		if db.Path == "" && db.Dir == "" {
 			return fmt.Errorf("database config #%d: must specify either 'path' or 'dir'", idx+1)
+		}
+
+		// Reject the same database path listed twice. The metadata directory is
+		// derived from the path, so two entries would share it and race on the
+		// same LTX temp files.
+		if db.Path != "" {
+			key := filepath.Clean(db.Path)
+			if first, ok := seenPaths[key]; ok {
+				return fmt.Errorf("database config #%d: duplicate path %q (already used by database config #%d); each database can be listed only once", idx+1, db.Path, first)
+			}
+			seenPaths[key] = idx + 1
 		}
 
 		// When using dir, pattern must be specified
@@ -1112,18 +1124,19 @@ type ReplicaSettings struct {
 	AutoRecover *bool `yaml:"auto-recover"`
 
 	// S3 settings
-	AccessKeyID       string    `yaml:"access-key-id"`
-	SecretAccessKey   string    `yaml:"secret-access-key"`
-	Region            string    `yaml:"region"`
-	Bucket            string    `yaml:"bucket"`
-	Endpoint          string    `yaml:"endpoint"`
-	ForcePathStyle    *bool     `yaml:"force-path-style"`
-	SignPayload       *bool     `yaml:"sign-payload"`
-	RequireContentMD5 *bool     `yaml:"require-content-md5"`
-	SkipVerify        bool      `yaml:"skip-verify"`
-	StorageClass      string    `yaml:"storage-class"`
-	PartSize          *ByteSize `yaml:"part-size"`
-	Concurrency       *int      `yaml:"concurrency"`
+	AccessKeyID        string    `yaml:"access-key-id"`
+	SecretAccessKey    string    `yaml:"secret-access-key"`
+	Region             string    `yaml:"region"`
+	Bucket             string    `yaml:"bucket"`
+	Endpoint           string    `yaml:"endpoint"`
+	ForcePathStyle     *bool     `yaml:"force-path-style"`
+	SignPayload        *bool     `yaml:"sign-payload"`
+	SignAcceptEncoding *bool     `yaml:"sign-accept-encoding"`
+	RequireContentMD5  *bool     `yaml:"require-content-md5"`
+	SkipVerify         bool      `yaml:"skip-verify"`
+	StorageClass       string    `yaml:"storage-class"`
+	PartSize           *ByteSize `yaml:"part-size"`
+	Concurrency        *int      `yaml:"concurrency"`
 
 	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
 	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
@@ -1217,6 +1230,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.SignPayload == nil {
 		rs.SignPayload = src.SignPayload
+	}
+	if rs.SignAcceptEncoding == nil {
+		rs.SignAcceptEncoding = src.SignAcceptEncoding
 	}
 	if rs.RequireContentMD5 == nil {
 		rs.RequireContentMD5 = src.RequireContentMD5
@@ -1393,7 +1409,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
+		return nil, fmt.Errorf("unknown replica type in config: %q", c.ReplicaType())
 	}
 
 	r.Client.SetLogger(r.Logger())
@@ -1449,6 +1465,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
 	}
+	signAcceptEncodingSetting := newBoolSetting(true)
+	if v := c.SignAcceptEncoding; v != nil {
+		signAcceptEncodingSetting.Set(*v)
+	}
 	requireSetting := newBoolSetting(true)
 	if v := c.RequireContentMD5; v != nil {
 		requireSetting.Set(*v)
@@ -1463,16 +1483,18 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Apply settings from URL, if specified.
 	var (
-		endpointWasSet        bool
-		usignPayload          bool
-		usignPayloadSet       bool
-		urequireContentMD5    bool
-		urequireContentMD5Set bool
-		ustorageClass         string
-		upartSize             int64
-		upartSizeSet          bool
-		uconcurrency          int64
-		uconcurrencySet       bool
+		endpointWasSet         bool
+		usignPayload           bool
+		usignPayloadSet        bool
+		usignAcceptEncoding    bool
+		usignAcceptEncodingSet bool
+		urequireContentMD5     bool
+		urequireContentMD5Set  bool
+		ustorageClass          string
+		upartSize              int64
+		upartSizeSet           bool
+		uconcurrency           int64
+		uconcurrencySet        bool
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1522,6 +1544,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			usignPayload = v
 			usignPayloadSet = true
 		}
+		if v, ok := litestream.BoolQueryValue(query, "signAcceptEncoding", "sign-accept-encoding"); ok {
+			usignAcceptEncoding = v
+			usignAcceptEncodingSet = true
+		}
 		if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
@@ -1565,6 +1591,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 		if !signSetting.set && usignPayloadSet {
 			signSetting.Set(usignPayload)
+		}
+		if !signAcceptEncodingSetting.set && usignAcceptEncodingSet {
+			signAcceptEncodingSetting.Set(usignAcceptEncoding)
 		}
 		if !requireSetting.set && urequireContentMD5Set {
 			requireSetting.Set(urequireContentMD5)
@@ -1625,10 +1654,15 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.StorageClass = storageClass
 
 	client.SignPayload = signSetting.value
+	client.SignAcceptEncoding = signAcceptEncodingSetting.value
 	client.RequireContentMD5 = requireSetting.value
 
 	if isCloudflareR2 {
 		client.Concurrency = s3.DefaultR2Concurrency
+	}
+	if isTigris {
+		client.Concurrency = s3.DefaultTigrisConcurrency
+		client.PartSize = s3.DefaultTigrisPartSize
 	}
 
 	// Apply upload configuration from URL query, then config overrides.
