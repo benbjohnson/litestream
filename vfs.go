@@ -802,7 +802,6 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) (retErr e
 	if err != nil {
 		return fmt.Errorf("new ltx compactor: %w", err)
 	}
-	defer func() { _ = c.Cleanup() }()
 	h.compactor = c
 
 	compactionDone := make(chan error, 1)
