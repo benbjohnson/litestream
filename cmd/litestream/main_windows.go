@@ -4,6 +4,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -18,6 +20,8 @@ const defaultConfigPath = `C:\Litestream\litestream.yml`
 
 // serviceName is the Windows Service name.
 const serviceName = "Litestream"
+
+const windowsServiceCloseExitCode = 4
 
 // isWindowsService returns true if currently executing within a Windows service.
 func isWindowsService() (bool, error) {
@@ -51,7 +55,9 @@ func runWindowsService(ctx context.Context) error {
 
 // windowsService is an interface adapter for svc.Handler.
 type windowsService struct {
-	ctx context.Context
+	ctx          context.Context
+	command      *ReplicateCommand
+	closeCommand func(context.Context, *ReplicateCommand) error
 }
 
 func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, statusCh chan<- svc.Status) (svcSpecificEC bool, exitCode uint32) {
@@ -61,10 +67,13 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 	statusCh <- svc.Status{State: svc.StartPending}
 
 	// Instantiate replication command and load configuration.
-	c := NewReplicateCommand()
-	if c.Config, err = ReadConfigFile(DefaultConfigPath(), true); err != nil {
-		slog.Error("cannot load configuration", "error", err)
-		return true, 1
+	c := s.command
+	if c == nil {
+		c = NewReplicateCommand()
+		if c.Config, err = ReadConfigFile(DefaultConfigPath(), true); err != nil {
+			slog.Error("cannot load configuration", "error", err)
+			return true, 1
+		}
 	}
 
 	// Execute replication command.
@@ -79,10 +88,23 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 
 	for {
 		select {
+		case err := <-c.mcpErrCh:
+			if err != nil {
+				slog.Error("MCP server exited", "error", err)
+			}
+			if closeErr := s.close(c); closeErr != nil {
+				slog.Error("cannot close replication", "error", closeErr)
+			}
+			statusCh <- svc.Status{State: svc.StopPending}
+			return true, 3
 		case req := <-r:
 			switch req.Cmd {
 			case svc.Stop:
-				c.Close(s.ctx)
+				if err := s.close(c); err != nil {
+					slog.Error("cannot close replication", "error", err)
+					statusCh <- svc.Status{State: svc.StopPending}
+					return true, windowsServiceCloseExitCode
+				}
 				statusCh <- svc.Status{State: svc.StopPending}
 				return false, windows.NO_ERROR
 			case svc.Interrogate:
@@ -92,6 +114,21 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 			}
 		}
 	}
+}
+
+func (s *windowsService) close(c *ReplicateCommand) error {
+	var stopErr error
+	if c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			stopErr = fmt.Errorf("stop exec process: %w", err)
+		} else {
+			<-c.execCh
+		}
+	}
+	if s.closeCommand != nil {
+		return errors.Join(stopErr, s.closeCommand(s.ctx, c))
+	}
+	return errors.Join(stopErr, c.Close(s.ctx))
 }
 
 // Ensure implementation implements io.Writer interface.
