@@ -2096,10 +2096,20 @@ func (c *ReplicaConfig) ReplicaType() string {
 
 // DefaultConfigPath returns the default config path.
 func DefaultConfigPath() string {
-	if v := os.Getenv("LITESTREAM_CONFIG"); v != "" {
-		return v
+	path, _ := resolveConfigPath("")
+	return path
+}
+
+// resolveConfigPath returns the config path to read for flagPath and reports
+// whether it was explicitly selected by the flag or by LITESTREAM_CONFIG.
+func resolveConfigPath(flagPath string) (path string, explicit bool) {
+	if flagPath != "" {
+		return flagPath, true
 	}
-	return defaultConfigPath
+	if v := os.Getenv("LITESTREAM_CONFIG"); v != "" {
+		return v, true
+	}
+	return defaultConfigPath, false
 }
 
 func registerConfigFlag(fs *flag.FlagSet) (configPath *string, noExpandEnv *bool) {
