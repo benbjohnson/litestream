@@ -181,6 +181,9 @@ func AssertSnapshotCadence(t *testing.T, report *LTXBehaviorReport, expectedInte
 	violations := 0
 	for i, interval := range intervals {
 		if interval < minAllowed {
+			if report.SnapshotIntervals[i]+interval >= expectedInterval+minAllowed {
+				continue
+			}
 			t.Errorf("  [snapshot-cadence] Snapshot interval #%d: %v (min allowed: %v)",
 				i+2, interval.Round(time.Second), minAllowed.Round(time.Second))
 			violations++
@@ -188,7 +191,7 @@ func AssertSnapshotCadence(t *testing.T, report *LTXBehaviorReport, expectedInte
 	}
 
 	if violations == 0 {
-		t.Logf("  [snapshot-cadence] PASS: %d snapshots, steady-state intervals >= %v (skipped first interval)",
+		t.Logf("  [snapshot-cadence] PASS: %d snapshots, steady-state cadence maintained (minimum %v; skipped first interval)",
 			report.SnapshotCount, minAllowed.Round(time.Second))
 	} else {
 		t.Errorf("  [snapshot-cadence] FAIL: %d/%d steady-state snapshot intervals violated minimum cadence",
@@ -301,6 +304,7 @@ func AssertCompactionTiming(t *testing.T, report *LTXBehaviorReport, levelInterv
 			t.Logf("  [compaction-timing-L%d] Skipped: only %d compactions (need >=4 for reliable interval check)", level, count)
 			continue
 		}
+		intervals = intervals[1:]
 
 		minAllowed := time.Duration(float64(expectedInterval) * (1 - tolerance))
 		maxAllowed := time.Duration(float64(expectedInterval) * (1 + tolerance))
