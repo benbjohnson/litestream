@@ -875,6 +875,16 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
+	if h.persistent {
+		if err := os.Remove(h.metaPath()); err == nil {
+			if err := syncDir(filepath.Dir(h.metaPath())); err != nil {
+				return fmt.Errorf("sync hydration meta directory: %w", err)
+			}
+		} else if !os.IsNotExist(err) {
+			return fmt.Errorf("remove hydration meta before applying ltx: %w", err)
+		}
+	}
+
 	// Apply each page to the hydration file. Pages are applied as they
 	// stream, so any failure from here on leaves unverified or partial
 	// content in the hydration file: mark it tainted so Close discards it
