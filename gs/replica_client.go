@@ -130,11 +130,18 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 
 	dir := litestream.LTXLevelDir(c.Path, level)
 	prefix := dir + "/"
+
+	// Use StartOffset (lexicographic >=) instead of extending the prefix with
+	// the seek TXID. LTX filenames are zero-padded fixed-width hex, so a
+	// lexicographic scan starting at the seek key returns every file whose
+	// MinTXID >= seek. Extending the prefix would only match objects whose
+	// key begins with that exact seek TXID string and silently skip the rest.
+	q := &storage.Query{Prefix: prefix}
 	if seek != 0 {
-		prefix += seek.String()
+		q.StartOffset = prefix + seek.String()
 	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, q), c, level), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -159,8 +166,18 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	// Combine buffered data with rest of reader
 	fullReader := io.MultiReader(&buf, rd)
 
-	w := c.bkt.Object(key).NewWriter(ctx)
-	defer w.Close()
+	// Use a cancellable context so that a failed Copy can abort the upload
+	// rather than finalizing a partial object via the deferred Close.
+	writerCtx, cancelWriter := context.WithCancel(ctx)
+	w := c.bkt.Object(key).NewWriter(writerCtx)
+	closed := false
+	defer func() {
+		if !closed {
+			cancelWriter()
+			_ = w.Close()
+		}
+		cancelWriter()
+	}()
 
 	// Store timestamp in GCS metadata for accurate timestamp retrieval
 	w.Metadata = map[string]string{
@@ -170,7 +187,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	n, err := io.Copy(w, fullReader)
 	if err != nil {
 		return info, err
-	} else if err := w.Close(); err != nil {
+	}
+	closed = true
+	if err := w.Close(); err != nil {
 		return info, err
 	}
 
