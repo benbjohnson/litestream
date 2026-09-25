@@ -138,7 +138,7 @@ func StartMinIOContainer(t *testing.T) (containerID string, endpoint string, vol
 		"-v", volumeName+":/data",
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
-		"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z", "server", "/data", "--console-address", ":9001")
+		"pgsty/minio:RELEASE.2026-08-04T00-00-00Z", "server", "/data", "--console-address", ":9001")
 
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 	if err := cmd.Run(); err != nil {
@@ -226,7 +226,7 @@ func minioClientCommand(containerID string, args ...string) *exec.Cmd {
 		"run", "--rm",
 		"--network", "container:" + containerID,
 		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000",
-		"quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z",
+		"pgsty/mc:RELEASE.2026-09-16T00-00-00Z",
 	}
 	return exec.Command("docker", append(dockerArgs, args...)...)
 }
