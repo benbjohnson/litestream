@@ -23,6 +23,7 @@ import (
 
 // writeTestReplicaClient is a mock ReplicaClient for testing write functionality.
 type writeTestReplicaClient struct {
+	vfsTestLogger
 	mu       sync.Mutex
 	ltxFiles map[int][]*ltx.FileInfo // level -> files
 	ltxData  map[string][]byte       // "level/minTXID-maxTXID" -> data
@@ -38,8 +39,6 @@ func newWriteTestReplicaClient() *writeTestReplicaClient {
 func (c *writeTestReplicaClient) Type() string { return "test" }
 
 func (c *writeTestReplicaClient) Init(ctx context.Context) error { return nil }
-
-func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *writeTestReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	c.mu.Lock()
