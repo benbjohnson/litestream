@@ -851,8 +851,6 @@ func newCountingReplicaClient() *countingReplicaClient { return &countingReplica
 
 func (c *countingReplicaClient) Type() string { return "count" }
 
-func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
-
 func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -886,8 +884,6 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 }
 
 func (c *mockReplicaClient) Type() string { return "mock" }
-
-func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
 
@@ -1497,6 +1493,45 @@ func TestHydrator_ApplyLTX_VerifiesFile(t *testing.T) {
 		}
 		if _, err := os.Stat(path); !os.IsNotExist(err) {
 			t.Fatalf("tainted persistent hydration file must be removed (err=%v)", err)
+		}
+	})
+
+	t.Run("PersistentMetaRemovedBeforePagesChange", func(t *testing.T) {
+		client := newMockReplicaClient()
+		valid := buildLTXFixture(t, 1, 'a')
+		client.addFixture(t, valid)
+		path := filepath.Join(t.TempDir(), "hydration.db")
+		h := NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		if err := h.ApplyLTX(context.Background(), valid.info); err != nil {
+			t.Fatalf("apply valid file: %v", err)
+		}
+		h.SetTXID(1)
+		if err := h.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		corrupt := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1}, 'b')
+		corrupt.data = bytes.Clone(corrupt.data)
+		corrupt.data[len(corrupt.data)-1] ^= 0xFF
+		client.addFixture(t, corrupt)
+		h = NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		if got := h.TXID(); got != 1 {
+			t.Fatalf("expected to resume at TXID 1, got %d", got)
+		}
+		if err := h.ApplyLTX(context.Background(), corrupt.info); err == nil {
+			t.Fatal("expected verification failure")
+		}
+		if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+			t.Fatalf("meta must be removed before a changed file can be resumed (err=%v)", err)
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("close tainted hydrator: %v", err)
 		}
 	})
 
