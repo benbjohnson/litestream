@@ -10,7 +10,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -293,19 +292,11 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	if err != nil {
 		return pos, fmt.Errorf("l0 ltx files: %w", err)
 	}
-	defer itr.Close()
-
-	var infos []ltx.FileInfo
-	for itr.Next() {
-		infos = append(infos, *itr.Item())
-	}
-	if err := itr.Close(); err != nil {
-		return pos, fmt.Errorf("close l0 iterator: %w", err)
-	}
-	sort.Slice(infos, func(i, j int) bool { return infos[i].MinTXID < infos[j].MinTXID })
+	defer func() { _ = itr.Close() }()
 
 	txID := l1Info.MaxTXID
-	for _, info := range infos {
+	for itr.Next() {
+		info := itr.Item()
 		if info.MaxTXID <= txID {
 			continue // already compacted into L1
 		}
@@ -316,6 +307,9 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 			break
 		}
 		txID = info.MaxTXID
+	}
+	if err := itr.Close(); err != nil {
+		return pos, fmt.Errorf("close l0 iterator: %w", err)
 	}
 	return ltx.Pos{TXID: txID}, nil
 }

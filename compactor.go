@@ -150,6 +150,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			if info.MinTXID < expectedMinTXID {
 				return nil, fmt.Errorf("overlapping transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
 			}
+			if srcLevel != 0 {
+				return nil, fmt.Errorf("non-contiguous transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
+			}
 			c.logger.Warn("stopping compaction at TXID gap",
 				"level", srcLevel,
 				"expected_min_txid", expectedMinTXID,
