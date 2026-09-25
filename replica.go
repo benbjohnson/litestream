@@ -302,7 +302,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 	if err != nil {
 		return pos, nil, fmt.Errorf("l0 ltx files: %w", err)
 	}
-	defer itr.Close()
+	defer func() { _ = itr.Close() }()
 
 	for itr.Next() {
 		l0Files = append(l0Files, *itr.Item())

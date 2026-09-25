@@ -178,6 +178,23 @@ func TestCompactor_Compact(t *testing.T) {
 		}
 	})
 
+	t.Run("L1InteriorGapReturnsError", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		createTestLTXFile(t, client, 1, 1, 2)
+		createTestLTXFile(t, client, 1, 4, 5)
+
+		if _, err := compactor.Compact(context.Background(), 2); err == nil || !containsString(err.Error(), "non-contiguous") {
+			t.Fatalf("err=%v, want non-contiguous transaction ids", err)
+		}
+		if info, err := compactor.MaxLTXFileInfo(context.Background(), 2); err != nil {
+			t.Fatal(err)
+		} else if info.MaxTXID != 0 {
+			t.Fatalf("unexpected L2 file: %s", info.MaxTXID)
+		}
+	})
+
 	t.Run("L0OverlapReturnsError", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
