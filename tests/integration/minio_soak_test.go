@@ -326,8 +326,7 @@ func countMinIOLTXFiles(t *testing.T, containerID, bucket string) int {
 	cmd := exec.Command("docker", "run", "--rm",
 		"--link", containerID+":minio",
 		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@minio:9000",
-		"--entrypoint", "mc",
-		minioImage, "ls", "minio/"+bucket+"/", "--recursive")
+		"quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z", "ls", "minio/"+bucket+"/", "--recursive")
 
 	output, err := cmd.CombinedOutput()
 	if err != nil {
