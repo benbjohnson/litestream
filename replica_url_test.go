@@ -1148,6 +1148,8 @@ func TestIsMinIOEndpoint(t *testing.T) {
 		{"https://minio.example.net:invalid", false},
 		{"https://user@minio.example.net:9000", false},
 		{"https://sfo3.digitaloceanspaces.com:443", false},
+		{"https://fsn1.your-objectstorage.com:443", false},
+		{"https://storage.googleapis.com:443", false},
 		{"http://localhost:9000", true},
 		{"http://192.168.1.100:9000", true},
 		{"minio.local:9000", true},

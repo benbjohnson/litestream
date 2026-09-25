@@ -362,7 +362,9 @@ func IsMinIOEndpoint(endpoint string) bool {
 		strings.Contains(host, ".r2.cloudflarestorage.com") ||
 		strings.Contains(host, "tigris.dev") ||
 		strings.Contains(host, "t3.storage.dev") ||
-		strings.Contains(host, ".supabase.co") {
+		strings.Contains(host, ".supabase.co") ||
+		strings.HasSuffix(host, ".your-objectstorage.com") ||
+		strings.HasSuffix(host, ".googleapis.com") {
 		return false
 	}
 	return true
