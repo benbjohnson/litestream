@@ -2244,6 +2244,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		db.invalidatePosCache()
 		return result, fmt.Errorf("rename ltx file: %w", err)
 	}
+	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
+		db.maxLTXFileInfos.Lock()
+		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
+		db.maxLTXFileInfos.Unlock()
+		db.invalidatePosCache()
+		return result, fmt.Errorf("sync ltx dir: %w", err)
+	}
 
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
@@ -3019,6 +3026,10 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
+	// Use the last deleted snapshot's MaxTXID, rather than the first retained
+	// snapshot's MaxTXID, to preserve lower-level files in an in-flight restore
+	// plan. TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles
+	// guards this conservative floor.
 	for i, info := range snapshots {
 		if slices.Contains(deleted, info) {
 			continue
