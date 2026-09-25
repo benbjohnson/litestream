@@ -231,6 +231,26 @@ func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
 	if got, want := db.Replica.Pos().TXID, dpos.TXID+1; got != want {
 		t.Fatalf("replica pos after new write=%s, want %s", got, want)
 	}
+
+	if err := client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+		{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: dpos.TXID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.snapshotTXIDs, []ltx.TXID{dpos.TXID, dpos.TXID + 1}; !slices.Equal(got, want) {
+		t.Fatalf("snapshot TXIDs after remote snapshot deletion=%v, want %v", got, want)
+	}
+	plan, err = litestream.CalcRestorePlan(t.Context(), client, 0, time.Time{}, db.Logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || plan[0].Level != litestream.SnapshotLevel || plan[0].MaxTXID != dpos.TXID+1 {
+		t.Fatalf("restore plan after remote snapshot deletion=%#v", plan)
+	}
 }
 
 func TestReplica_Sync(t *testing.T) {

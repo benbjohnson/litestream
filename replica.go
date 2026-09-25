@@ -334,7 +334,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 			continue // already covered by L1 or a snapshot
 		}
 		if txID != 0 && info.MinTXID > txID+1 {
-			snapshotInfo, err := r.db.MaxLTXFileInfo(ctx, SnapshotLevel)
+			snapshotInfo, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
 			if err != nil {
 				return pos, nil, fmt.Errorf("max snapshot ltx file: %w", err)
 			}
