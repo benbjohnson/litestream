@@ -2077,7 +2077,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	if info.snapshotting {
 		maxSyncWALBytes = 0
 	}
-	pageMap, maxOffset, walCommit, limited, err := rd.pageMap(ctx, maxSyncWALBytes)
+	pageMap, maxOffset, walCommit, limited, err := rd.pageMap(ctx, maxSyncWALBytes, 0)
 	if err != nil {
 		return result, fmt.Errorf("page map: %w", err)
 	}
@@ -2829,12 +2829,14 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		}
 
 		// Build a mapping of changed page numbers and their latest content.
-		maxBytes := pos.walEndOffset - WALHeaderSize
+		// The read is hard-bounded to the advertised WAL end so a transaction
+		// that straddles the bound is discarded rather than read through to a
+		// commit frame past the bound (#1490).
 		pageMap := make(map[uint32]int64)
 		var maxOffset int64
 		var walCommit uint32
-		if maxBytes > 0 {
-			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+		if pos.walEndOffset > WALHeaderSize {
+			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, 0, pos.walEndOffset)
 			if err != nil {
 				pw.CloseWithError(fmt.Errorf("page map: %w", err))
 				return
