@@ -279,9 +279,6 @@ func TestReplica_RestoreRetriesInitialLTXOpenError(t *testing.T) {
 func TestReplica_Restore_ChecksumTracked(t *testing.T) {
 	const pageSize = 512
 
-	ctx := context.Background()
-	client := file.NewReplicaClient(t.TempDir())
-
 	page1 := bytes.Repeat([]byte{0x11}, pageSize)
 	page2 := bytes.Repeat([]byte{0x22}, pageSize)
 	updatedPage2 := bytes.Repeat([]byte{0x33}, pageSize)
@@ -289,43 +286,70 @@ func TestReplica_Restore_ChecksumTracked(t *testing.T) {
 	snapshotChecksum := ltx.ChecksumFlag
 	snapshotChecksum = ltx.ChecksumFlag | (snapshotChecksum ^ ltx.ChecksumPage(1, page1))
 	snapshotChecksum = ltx.ChecksumFlag | (snapshotChecksum ^ ltx.ChecksumPage(2, page2))
-	writeChecksumTrackedLTXFile(t, client, litestream.SnapshotLevel, ltx.Header{
-		Version:   ltx.Version,
-		PageSize:  pageSize,
-		Commit:    2,
-		MinTXID:   1,
-		MaxTXID:   1,
-		Timestamp: 1000,
-	}, []uint32{1, 2}, [][]byte{page1, page2}, snapshotChecksum)
-
 	updatedChecksum := ltx.ChecksumFlag | (snapshotChecksum ^ ltx.ChecksumPage(2, page2) ^ ltx.ChecksumPage(2, updatedPage2))
-	writeChecksumTrackedLTXFile(t, client, 0, ltx.Header{
-		Version:          ltx.Version,
-		PageSize:         pageSize,
-		Commit:           2,
-		MinTXID:          2,
-		MaxTXID:          2,
-		Timestamp:        2000,
-		PreApplyChecksum: snapshotChecksum,
-	}, []uint32{2}, [][]byte{updatedPage2}, updatedChecksum)
-
-	r := litestream.NewReplicaWithClient(nil, client)
-	restorePath := filepath.Join(t.TempDir(), "restored.db")
-	if err := r.Restore(ctx, litestream.RestoreOptions{OutputPath: restorePath}); err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name                  string
+		snapshotNoChecksum    bool
+		incrementalNoChecksum bool
+	}{
+		{name: "tracked chain"},
+		{name: "tracked snapshot and legacy incremental", incrementalNoChecksum: true},
+		{name: "legacy snapshot and tracked incremental", snapshotNoChecksum: true},
 	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := file.NewReplicaClient(t.TempDir())
+			snapshotHeader := ltx.Header{
+				Version:   ltx.Version,
+				PageSize:  pageSize,
+				Commit:    2,
+				MinTXID:   1,
+				MaxTXID:   1,
+				Timestamp: 1000,
+			}
+			snapshotPostChecksum := snapshotChecksum
+			if tt.snapshotNoChecksum {
+				snapshotHeader.Flags = ltx.HeaderFlagNoChecksum
+				snapshotPostChecksum = 0
+			}
+			writeRestoreLTXFile(t, client, litestream.SnapshotLevel, snapshotHeader, []uint32{1, 2}, [][]byte{page1, page2}, snapshotPostChecksum)
 
-	got, err := os.ReadFile(restorePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := append(append([]byte(nil), page1...), updatedPage2...)
-	if !bytes.Equal(got, want) {
-		t.Fatalf("restored database mismatch: got %d bytes, want %d bytes", len(got), len(want))
+			incrementalHeader := ltx.Header{
+				Version:          ltx.Version,
+				PageSize:         pageSize,
+				Commit:           2,
+				MinTXID:          2,
+				MaxTXID:          2,
+				Timestamp:        2000,
+				PreApplyChecksum: snapshotChecksum,
+			}
+			incrementalPostChecksum := updatedChecksum
+			if tt.incrementalNoChecksum {
+				incrementalHeader.Flags = ltx.HeaderFlagNoChecksum
+				incrementalHeader.PreApplyChecksum = 0
+				incrementalPostChecksum = 0
+			}
+			writeRestoreLTXFile(t, client, 0, incrementalHeader, []uint32{2}, [][]byte{updatedPage2}, incrementalPostChecksum)
+
+			r := litestream.NewReplicaWithClient(nil, client)
+			restorePath := filepath.Join(t.TempDir(), "restored.db")
+			if err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: restorePath}); err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := os.ReadFile(restorePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := append(append([]byte(nil), page1...), updatedPage2...)
+			if !bytes.Equal(got, want) {
+				t.Fatalf("restored database mismatch: got %d bytes, want %d bytes", len(got), len(want))
+			}
+		})
 	}
 }
 
-func writeChecksumTrackedLTXFile(t testing.TB, client litestream.ReplicaClient, level int, hdr ltx.Header, pgnos []uint32, pages [][]byte, postApplyChecksum ltx.Checksum) {
+func writeRestoreLTXFile(t testing.TB, client litestream.ReplicaClient, level int, hdr ltx.Header, pgnos []uint32, pages [][]byte, postApplyChecksum ltx.Checksum) {
 	t.Helper()
 
 	var buf bytes.Buffer
