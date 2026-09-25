@@ -94,16 +94,6 @@ jobs:
           go build -o bin/litestream ./cmd/litestream
           go build -o bin/litestream-test ./cmd/litestream-test
 
-      - name: Prepare MinIO test image
-        run: |
-          mkdir -p "$RUNNER_TEMP/minio-image"
-          curl -fL --retry 3 -o "$RUNNER_TEMP/minio-image/minio" \
-            https://github.com/minio/minio/releases/download/RELEASE.2025-09-07T16-13-09Z/minio.linux-amd64.RELEASE.2025-09-07T16-13-09Z
-          printf '7c5bd8512c6e966455b1d198209358b2d191c77a83ab377c4073281065fb855f  %s\n' "$RUNNER_TEMP/minio-image/minio" | sha256sum -c -
-          chmod +x "$RUNNER_TEMP/minio-image/minio"
-          printf 'FROM scratch\nCOPY minio /usr/bin/minio\nENTRYPOINT ["/usr/bin/minio"]\n' > "$RUNNER_TEMP/minio-image/Dockerfile"
-          docker build -t quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z "$RUNNER_TEMP/minio-image"
-
       - name: Run quick integration tests
         run: |
           go test -v -tags=integration -timeout=30m ./tests/integration/... \
