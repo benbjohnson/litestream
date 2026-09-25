@@ -120,7 +120,7 @@ func startMinioContainerForProxy(t *testing.T, networkName string) string {
 		"--network", networkName,
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
-		"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z", "server", "/data",
+		"pgsty/minio:RELEASE.2026-08-04T00-00-00Z", "server", "/data",
 	)
 
 	time.Sleep(3 * time.Second)
@@ -165,7 +165,7 @@ func createMinioBucket(t *testing.T, networkName, minioName, bucket string) {
 	cmd := exec.Command("docker", "run", "--rm",
 		"--network", networkName,
 		"-e", fmt.Sprintf("MC_HOST_minio=http://minioadmin:minioadmin@%s:9000", minioName),
-		"quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z", "mb", "minio/"+bucket,
+		"pgsty/mc:RELEASE.2026-09-16T00-00-00Z", "mb", "minio/"+bucket,
 	)
 	output, err := cmd.CombinedOutput()
 	if err != nil && !strings.Contains(string(output), "already exists") {

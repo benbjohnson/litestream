@@ -31,7 +31,7 @@ func StartMinioTestContainer(t *testing.T) (string, string) {
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
 		"-e", "MINIO_DOMAIN=s3-accesspoint.127.0.0.1.nip.io",
-		"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z", "server", "/data",
+		"pgsty/minio:RELEASE.2026-08-04T00-00-00Z", "server", "/data",
 	}
 	containerID := runDockerCommand(t, args...)
 	portInfo := runDockerCommand(t, "port", name, "9000/tcp")
