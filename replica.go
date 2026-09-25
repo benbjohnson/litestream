@@ -710,6 +710,8 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	if err != nil {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	}
+	restoreCtx, cancelRestore := context.WithCancel(ctx)
+	defer cancelRestore()
 
 	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
 
@@ -731,7 +733,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
+		rdrs = append(rdrs, internal.NewResumableReader(restoreCtx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
@@ -760,21 +762,34 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	pr, pw := io.Pipe()
 
+	compactionDone := make(chan error, 1)
 	go func() {
 		c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(tmpOutputPath))
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			err = fmt.Errorf("new ltx compactor: %w", err)
+			_ = pw.CloseWithError(err)
+			compactionDone <- err
 			return
 		}
-		defer func() { _ = c.Cleanup() }()
-		_ = pw.CloseWithError(c.Compact(ctx))
+		err = c.Compact(restoreCtx)
+		if cleanupErr := c.Cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleanup compactor: %w", cleanupErr))
+		}
+		_ = pw.CloseWithError(err)
+		compactionDone <- err
 	}()
 
 	dec := newRestoreDecoder(pr)
-	err = dec.DecodeDatabaseTo(f)
-	_ = pr.CloseWithError(err)
-	if err != nil {
-		return fmt.Errorf("decode database: %w", err)
+	decodeErr := dec.DecodeDatabaseTo(f)
+	_ = pr.CloseWithError(decodeErr)
+	if decodeErr != nil {
+		cancelRestore()
+	}
+	compactErr := <-compactionDone
+	if decodeErr != nil {
+		return fmt.Errorf("decode database: %w", decodeErr)
+	} else if compactErr != nil {
+		return fmt.Errorf("compact restore: %w", compactErr)
 	}
 
 	if err := f.Sync(); err != nil {
