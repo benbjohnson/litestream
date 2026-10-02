@@ -106,8 +106,8 @@ type VFS struct {
 
 	writeMu        sync.Mutex
 	writeFile      *VFSFile // current RESERVED lock holder (nil if none)
-	lastSyncedTXID ltx.TXID // highest TXID synced by any local connection
-	writeSeq       uint64   // atomic counter for unique buffer paths
+	lastSyncedTXID map[string]ltx.TXID
+	writeSeq       uint64 // atomic counter for unique buffer paths
 
 	tempDirOnce sync.Once
 	tempDir     string
@@ -118,10 +118,11 @@ type VFS struct {
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
 	return &VFS{
-		client:       client,
-		logger:       logger.With("vfs", "true"),
-		PollInterval: DefaultPollInterval,
-		CacheSize:    DefaultCacheSize,
+		client:         client,
+		logger:         logger.With("vfs", "true"),
+		PollInterval:   DefaultPollInterval,
+		CacheSize:      DefaultCacheSize,
+		lastSyncedTXID: make(map[string]ltx.TXID),
 	}
 }
 
@@ -181,6 +182,7 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 	f.perConnClient = perConnClient
 
 	if cfg != nil {
+		f.replicaURL = cfg.ReplicaURL
 		if cfg.PollInterval != nil {
 			f.PollInterval = *cfg.PollInterval
 		}
@@ -269,8 +271,8 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 
 	if writeEnabled {
 		vfs.writeMu.Lock()
-		if f.expectedTXID > vfs.lastSyncedTXID {
-			vfs.lastSyncedTXID = f.expectedTXID
+		if f.expectedTXID > vfs.lastSyncedTXID[f.replicaURL] {
+			vfs.lastSyncedTXID[f.replicaURL] = f.expectedTXID
 		}
 		vfs.writeMu.Unlock()
 	}
@@ -594,9 +596,10 @@ func (tf *localTempFile) DeviceCharacteristics() sqlite3vfs.DeviceCharacteristic
 
 // VFSFile implements the SQLite VFS file interface.
 type VFSFile struct {
-	mu     sync.Mutex
-	client ReplicaClient
-	name   string
+	mu         sync.Mutex
+	client     ReplicaClient
+	name       string
+	replicaURL string
 
 	pos             ltx.Pos  // Last TXID read from level 0 or 1
 	maxTXID1        ltx.TXID // Last TXID read from level 1
@@ -2023,8 +2026,8 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
-		if f.expectedTXID > f.vfs.lastSyncedTXID {
-			f.vfs.lastSyncedTXID = f.expectedTXID
+		if f.expectedTXID > f.vfs.lastSyncedTXID[f.replicaURL] {
+			f.vfs.lastSyncedTXID[f.replicaURL] = f.expectedTXID
 		}
 		f.vfs.writeMu.Unlock()
 	}
@@ -2306,9 +2309,9 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 				return sqlite3vfs.BusyError
 			}
 			f.vfs.writeFile = f
-			if f.vfs.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
-				f.expectedTXID = f.vfs.lastSyncedTXID
-				f.pendingTXID = f.vfs.lastSyncedTXID + 1
+			if lastSyncedTXID := f.vfs.lastSyncedTXID[f.replicaURL]; lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
+				f.expectedTXID = lastSyncedTXID
+				f.pendingTXID = lastSyncedTXID + 1
 				f.pos = ltx.Pos{TXID: f.expectedTXID}
 			}
 			f.vfs.writeMu.Unlock()
