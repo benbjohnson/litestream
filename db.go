@@ -195,6 +195,7 @@ type DB struct {
 // These fields are threaded through sync/checkpoint methods via pointer.
 type syncState struct {
 	truncatePassiveFailed bool
+	walContinuityVerified bool
 
 	// syncedSinceCheckpoint tracks whether any data has been synced since
 	// the last checkpoint. Used to prevent time-based checkpoints from
@@ -775,6 +776,7 @@ func (db *DB) Open() (err error) {
 	}
 	// Recreate context for fresh start (handles reopen after close)
 	db.ctx, db.cancel = context.WithCancel(context.Background())
+	db.syncState.walContinuityVerified = false
 	db.mu.Unlock()
 
 	// Validate fields on database.
@@ -1685,6 +1687,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 
 	if exec.pos.TXID == 0 {
 		info.offset = WALHeaderSize
+		exec.state.walContinuityVerified = true
 		return info, nil // first sync
 	}
 
@@ -1751,6 +1754,25 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
 	if !saltMatch {
 		exec.state.truncatePassiveFailed = false
+	} else if !exec.state.walContinuityVerified && info.offset > WALHeaderSize {
+		checksum, err := db.readWALContinuityChecksum()
+		if err != nil {
+			return info, err
+		}
+		ok, err := db.verifyWALContinuity(ctx, checksum, uint64(exec.pos.TXID), info.offset, info.salt1, info.salt2)
+		if err != nil {
+			return info, fmt.Errorf("verify wal continuity: %w", err)
+		}
+		if !ok {
+			info.offset = WALHeaderSize
+			info.salt1, info.salt2 = salt1, salt2
+			info.snapshotting = true
+			info.reason = "wal continuity checksum mismatch or unavailable"
+			return info, nil
+		}
+		exec.state.walContinuityVerified = true
+	} else {
+		exec.state.walContinuityVerified = true
 	}
 
 	// Handle edge case where we're at WAL header (WALOffset=32, WALSize=0).
@@ -2223,6 +2245,19 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		}
 		return result, fmt.Errorf("close ltx file: %w", err)
 	}
+	finalOffset := info.offset + sz
+	checksum1, checksum2 := rd.CommitChecksum()
+	if err := db.writeWALContinuityChecksum(walContinuityChecksum{
+		Version:   walContinuityChecksumVersion,
+		TXID:      uint64(txID),
+		Offset:    finalOffset,
+		Salt1:     rd.salt1,
+		Salt2:     rd.salt2,
+		Checksum1: checksum1,
+		Checksum2: checksum2,
+	}); err != nil {
+		return result, err
+	}
 
 	// Atomically rename file to final path.
 	db.setSyncDiagPhase(diagPhaseRenameLTX, func(s *diagState) {
@@ -2260,8 +2295,8 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	// This is the WALOffset + WALSize from the LTX we just created.
 	// Using this instead of file size prevents issue #997 where stale
 	// frames with old salt values cause perpetual checkpoint triggering.
-	finalOffset := info.offset + sz
 	result.newWALSize = finalOffset
+	exec.state.walContinuityVerified = true
 
 	// Track if we synced to the exact end of the WAL file.
 	// This is used by verify() to distinguish expected checkpoint truncation
