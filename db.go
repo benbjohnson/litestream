@@ -2247,17 +2247,6 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 	finalOffset := info.offset + sz
 	checksum1, checksum2 := rd.CommitChecksum()
-	if err := db.writeWALContinuityChecksum(walContinuityChecksum{
-		Version:   walContinuityChecksumVersion,
-		TXID:      uint64(txID),
-		Offset:    finalOffset,
-		Salt1:     rd.salt1,
-		Salt2:     rd.salt2,
-		Checksum1: checksum1,
-		Checksum2: checksum2,
-	}); err != nil {
-		return result, err
-	}
 
 	// Atomically rename file to final path.
 	db.setSyncDiagPhase(diagPhaseRenameLTX, func(s *diagState) {
@@ -2277,6 +2266,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		db.maxLTXFileInfos.Unlock()
 		db.invalidatePosCache()
 		return result, fmt.Errorf("sync ltx dir: %w", err)
+	}
+	if err := db.writeWALContinuityChecksum(walContinuityChecksum{
+		Version:   walContinuityChecksumVersion,
+		TXID:      uint64(txID),
+		Offset:    finalOffset,
+		Salt1:     rd.salt1,
+		Salt2:     rd.salt2,
+		Checksum1: checksum1,
+		Checksum2: checksum2,
+	}); err != nil {
+		return result, err
 	}
 
 	result.synced = true

@@ -46,10 +46,9 @@ func (db *DB) readWALContinuityChecksum() (*walContinuityChecksum, error) {
 	return &checksum, nil
 }
 
-// writeWALContinuityChecksum atomically persists the checksum metadata before
-// the corresponding LTX file is published. A crash between these writes can
-// cause a safe resnapshot on the next open, but cannot leave an unverified LTX
-// position appearing verified.
+// writeWALContinuityChecksum atomically persists checksum metadata for an LTX
+// file that has already been durably published. A crash before this write
+// leaves a TXID mismatch that forces a safe resnapshot on the next open.
 func (db *DB) writeWALContinuityChecksum(checksum walContinuityChecksum) error {
 	path := db.walContinuityChecksumPath()
 	dir := filepath.Dir(path)
