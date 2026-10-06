@@ -207,6 +207,16 @@ func (c *RestoreCommand) dryRunPlan(ctx context.Context, source string, r *lites
 		return RestorePlan{}, fmt.Errorf("cannot use -dry-run with -f")
 	}
 
+	if client, ok := r.Client.(litestream.ReplicaClientV3); ok && opt.TXID == 0 {
+		createdAt, updatedAt, err := r.TimeBoundsV3(ctx, client)
+		if err != nil {
+			return RestorePlan{}, fmt.Errorf("inspect legacy backups for restore preview: %w", err)
+		}
+		if !createdAt.IsZero() || !updatedAt.IsZero() {
+			return RestorePlan{}, fmt.Errorf("automatic restore preview is unsupported when legacy backups exist; specify a TXID to preview LTX backups")
+		}
+	}
+
 	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
 	if err != nil {
 		return RestorePlan{}, err
