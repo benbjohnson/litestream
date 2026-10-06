@@ -125,6 +125,35 @@ replicas:
 - Works well with default settings
 - Force path style recommended for single-server deployments
 
+### Garage
+
+**Status**: Supported with configuration when an intermediary rewrites `Accept-Encoding`
+
+```yaml
+dbs:
+  - path: /path/to/database.db
+    replica:
+      type: s3
+      bucket: bucket-name
+      path: database-name
+      endpoint: https://your-garage-server
+      region: garage
+      force-path-style: true
+      sign-accept-encoding: false
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
+```
+
+`sign-accept-encoding` defaults to `true`. Set it to `false` when a reverse
+proxy or other intermediary removes or rewrites `Accept-Encoding`, which would
+otherwise invalidate the SigV4 signature. Litestream removes the header before
+signing, although Go's HTTP transport may still add an unsigned header on the
+wire.
+
+Disabling this setting improves compatibility but removes `Accept-Encoding`
+from SigV4 integrity protection, so changes to that header are no longer
+detected during signature validation. Reported by @ahgraber in #1424.
+
 ### Scaleway Object Storage
 
 **Status**: Supported with configuration
@@ -340,9 +369,10 @@ Parameters with an alias accept both camelCase and hyphenated forms
 | `forcePathStyle` | `force-path-style` | Use path-style URLs | `false` (auto for custom endpoints) |
 | `skipVerify` | `skip-verify` | Skip TLS verification | `false` |
 | `signPayload` | `sign-payload` | Sign request payloads | `true` |
+| `signAcceptEncoding` | `sign-accept-encoding` | Include Accept-Encoding in SigV4 signatures | `true` |
 | `requireContentMD5` | `require-content-md5` | Require Content-MD5 header | `true` |
-| `concurrency` | | Multipart upload concurrency | `5` |
-| `partSize` | `part-size` | Multipart upload part size in bytes | `5242880` (5MB) |
+| `concurrency` | | Multipart upload concurrency | `5` (`2` for R2/Tigris) |
+| `partSize` | `part-size` | Multipart upload part size | `5242880` (5MB) (`16MiB` for Tigris) |
 | `storageClass` | `storage-class` | Storage class for uploaded objects | None |
 | `sseCustomerAlgorithm` | `sse-customer-algorithm` | SSE-C encryption algorithm | None |
 | `sseCustomerKey` | `sse-customer-key` | SSE-C encryption key | None |
@@ -361,7 +391,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
 | Scaleway | `*.scw.cloud` | `sign-payload=true` |
 | Filebase | `s3.filebase.com` | `sign-payload=true`, `force-path-style=true` |
-| Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false` |
+| Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false`, `concurrency=2`, `part-size=16MiB` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
 | Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
 | Google Cloud Storage | Exact `googleapis.com` suffix with a first-label `storage` segment | Excludes `Accept-Encoding` from SigV4 signatures |
@@ -381,6 +411,12 @@ Litestream automatically detects certain providers and applies appropriate defau
 - Try `sign-payload=true` in the URL
 - Verify credentials are correct
 - Check endpoint URL format
+
+**`signed header accept-encoding is not present`**
+
+- An intermediary removed or rewrote `Accept-Encoding` after request signing
+- Set `sign-accept-encoding=false` in the replica URL or configuration
+- This trades signature coverage of that header for intermediary compatibility
 
 **`MissingContentLength`**
 
