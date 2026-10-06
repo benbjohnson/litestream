@@ -850,8 +850,6 @@ func newCountingReplicaClient() *countingReplicaClient { return &countingReplica
 
 func (c *countingReplicaClient) Type() string { return "count" }
 
-func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
-
 func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
@@ -885,8 +883,6 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 }
 
 func (c *mockReplicaClient) Type() string { return "mock" }
-
-func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
 
