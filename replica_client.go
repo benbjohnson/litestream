@@ -131,6 +131,13 @@ func fetchPageIndexData(ctx context.Context, client ReplicaClient, info *ltx.Fil
 	if err != nil {
 		return nil, fmt.Errorf("read ltx page index: %w", err)
 	}
+	// The replica may return fewer bytes than a page index footer occupies, for
+	// example if the file is truncated or otherwise corrupt. Slicing the footer
+	// off the end unchecked would index past the start of the buffer and panic.
+	if len(b) < ltx.TrailerSize+8 {
+		return nil, fmt.Errorf("ltx file too short to contain a page index: %d bytes", len(b))
+	}
+
 	size := binary.BigEndian.Uint64(b[len(b)-ltx.TrailerSize-8:])
 	if off := len(b) - int(size) - ltx.TrailerSize - 8; off > 0 {
 		return io.NopCloser(bytes.NewReader(b[off:])), nil

@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"path"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -207,6 +208,25 @@ func BoolQueryValue(query url.Values, keys ...string) (value bool, ok bool) {
 	return false, false
 }
 
+// IntQueryValue returns a positive integer value from URL query parameters.
+// It checks keys in order and returns the value and whether it was set.
+// Returns an error if a present value is not a positive integer.
+func IntQueryValue(query url.Values, keys ...string) (value int64, ok bool, err error) {
+	if query == nil {
+		return 0, false, nil
+	}
+	for _, key := range keys {
+		if raw := query.Get(key); raw != "" {
+			n, err := strconv.ParseInt(raw, 10, 64)
+			if err != nil || n <= 0 {
+				return 0, false, fmt.Errorf("invalid value for query parameter %q: %q (must be a positive integer)", key, raw)
+			}
+			return n, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
 // IsHetznerEndpoint returns true if the endpoint is Hetzner object storage service.
 func IsHetznerEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)
@@ -220,6 +240,40 @@ func IsHetznerEndpoint(endpoint string) bool {
 func IsTigrisEndpoint(endpoint string) bool {
 	host := extractEndpointHost(endpoint)
 	return host == "fly.storage.tigris.dev" || host == "t3.storage.dev"
+}
+
+// IsGoogleCloudStorageEndpoint returns true if the endpoint is Google Cloud Storage.
+func IsGoogleCloudStorageEndpoint(endpoint string) bool {
+	host := extractEndpointHost(endpoint)
+	if u, err := url.Parse("//" + host); err == nil {
+		host = u.Hostname()
+	}
+	host = strings.TrimSuffix(host, ".")
+
+	labels := strings.Split(host, ".")
+	if len(labels) < 3 ||
+		labels[len(labels)-2] != "googleapis" ||
+		labels[len(labels)-1] != "com" {
+		return false
+	}
+	for _, label := range labels {
+		if label == "" {
+			return false
+		}
+	}
+	if len(labels) > 3 {
+		for _, segment := range strings.Split(labels[1], "-") {
+			if segment == "storage" {
+				return false
+			}
+		}
+	}
+	for _, segment := range strings.Split(labels[0], "-") {
+		if segment == "storage" {
+			return true
+		}
+	}
+	return false
 }
 
 // IsDigitalOceanEndpoint returns true if the endpoint is Digital Ocean Spaces.
@@ -358,8 +412,14 @@ func extractEndpointHost(endpoint string) string {
 	}
 	if strings.HasPrefix(endpoint, "http://") || strings.HasPrefix(endpoint, "https://") {
 		if u, err := url.Parse(endpoint); err == nil && u.Host != "" {
+			if u.User != nil {
+				return ""
+			}
 			return u.Host
 		}
+	}
+	if u, err := url.Parse("//" + endpoint); err == nil && u.User != nil {
+		return ""
 	}
 	return endpoint
 }

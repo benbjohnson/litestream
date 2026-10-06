@@ -12,12 +12,15 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 	_ "modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -26,6 +29,14 @@ import (
 // testReplicaClient is a minimal mock for testing that doesn't cause import cycles.
 type testReplicaClient struct {
 	dir string
+}
+
+type earlyReturnSnapshotClient struct {
+	*testReplicaClient
+}
+
+func (c *earlyReturnSnapshotClient) WriteLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
 }
 
 func (c *testReplicaClient) Init(_ context.Context) error { return nil }
@@ -105,6 +116,432 @@ func (c *testReplicaClient) DeleteAll(_ context.Context) error {
 	return nil
 }
 
+func mustAcquireSemaphore(s *semaphore.Weighted) {
+	if err := s.Acquire(context.Background(), 1); err != nil {
+		panic(err)
+	}
+}
+
+func TestDB_SyncHonorsContextWaitingForExecLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	mustAcquireSemaphore(db.execSem)
+	defer db.execSem.Release(1)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Sync(ctx) }()
+
+	// Cancel only once the sync is observably queued on the executor so the
+	// error always comes from the semaphore wait, not an earlier ctx check.
+	deadline := time.After(5 * time.Second)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for db.SyncDiagnostic().ExecutorWaiterCount != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("sync returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("sync diagnostic did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+	cancel()
+
+	err := <-done
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+	if !strings.Contains(err.Error(), "wait for db sync executor") {
+		t.Fatalf("err=%q, want sync executor context", err)
+	}
+}
+
+func TestDB_SyncDiagnosticReportsExecutorWait(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	mustAcquireSemaphore(db.execSem)
+	defer db.execSem.Release(1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- db.Sync(ctx) }()
+
+	deadline := time.After(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	var diag SyncDiagnostic
+	for {
+		diag = db.SyncDiagnostic()
+		if diag.ExecutorWaiterCount == 1 {
+			break
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("sync returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("sync diagnostic did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+
+	if diag.ExecutorWaitStarted == nil {
+		t.Fatal("expected executor wait start time")
+	}
+	if diag.ExecutorWaitSeconds <= 0 {
+		t.Fatalf("executor_wait_seconds=%f, want positive", diag.ExecutorWaitSeconds)
+	}
+
+	cancel()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+	if got := db.SyncDiagnostic().ExecutorWaiterCount; got != 0 {
+		t.Fatalf("executor_waiter_count=%d, want 0", got)
+	}
+}
+
+func TestDB_LockExecDoesNotStarveQueuedWaiter(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	mustAcquireSemaphore(db.execSem)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := db.lockExec(ctx)
+		done <- err
+		if err == nil {
+			db.execSem.Release(1)
+		}
+	}()
+
+	deadline := time.After(100 * time.Millisecond)
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		if db.SyncDiagnostic().ExecutorWaiterCount == 1 {
+			break
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("lockExec returned before reporting executor wait: %v", err)
+		case <-deadline:
+			t.Fatal("lockExec did not report executor wait")
+		case <-ticker.C:
+		}
+	}
+
+	hogReady := make(chan struct{})
+	hogAcquired := make(chan struct{})
+	hogDone := make(chan struct{})
+	go func() {
+		close(hogReady)
+		mustAcquireSemaphore(db.execSem)
+		close(hogAcquired)
+		time.Sleep(150 * time.Millisecond)
+		db.execSem.Release(1)
+		close(hogDone)
+	}()
+	<-hogReady
+	time.Sleep(5 * time.Millisecond)
+
+	db.execSem.Release(1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lockExec returned error: %v", err)
+		}
+	case <-hogAcquired:
+		// The hog legitimately acquires right after the queued waiter
+		// releases, so only fail if the waiter had not already succeeded.
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("lockExec returned error: %v", err)
+			}
+		default:
+			<-hogDone
+			err := <-done
+			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}
+	case <-ctx.Done():
+		err := <-done
+		t.Fatalf("lockExec timed out waiting behind later lock attempt: %v", err)
+	}
+}
+
+func TestReplica_SyncHonorsContextWaitingForSyncLock(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+
+	mustAcquireSemaphore(r.syncSem)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() { done <- r.Sync(ctx) }()
+
+	select {
+	case err := <-done:
+		r.syncSem.Release(1)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err=%v, want context deadline exceeded", err)
+		}
+		if !strings.Contains(err.Error(), "wait for replica sync") {
+			t.Fatalf("err=%q, want replica sync context", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		r.syncSem.Release(1)
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("replica sync did not return after lock release")
+		}
+		t.Fatal("replica sync did not honor context while waiting for sync lock")
+	}
+}
+
+func TestReplica_LockSyncDoesNotStarveQueuedWaiter(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	r := NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	mustAcquireSemaphore(r.syncSem)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		err := r.lockSync(ctx)
+		done <- err
+		if err == nil {
+			r.syncSem.Release(1)
+		}
+	}()
+
+	// Wait until the waiter is observably queued so the hog cannot jump
+	// ahead of it in the semaphore FIFO.
+	waitDeadline := time.After(5 * time.Second)
+	waitTicker := time.NewTicker(time.Millisecond)
+	defer waitTicker.Stop()
+	for r.syncWaiters.Load() != 1 {
+		select {
+		case err := <-done:
+			t.Fatalf("lockSync returned before queueing on semaphore: %v", err)
+		case <-waitDeadline:
+			t.Fatal("lockSync did not report queued waiter")
+		case <-waitTicker.C:
+		}
+	}
+
+	hogReady := make(chan struct{})
+	hogAcquired := make(chan struct{})
+	hogDone := make(chan struct{})
+	go func() {
+		close(hogReady)
+		mustAcquireSemaphore(r.syncSem)
+		close(hogAcquired)
+		time.Sleep(150 * time.Millisecond)
+		r.syncSem.Release(1)
+		close(hogDone)
+	}()
+	<-hogReady
+	time.Sleep(5 * time.Millisecond)
+
+	r.syncSem.Release(1)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("lockSync returned error: %v", err)
+		}
+	case <-hogAcquired:
+		// The hog legitimately acquires right after the queued waiter
+		// releases, so only fail if the waiter had not already succeeded.
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("lockSync returned error: %v", err)
+			}
+		default:
+			<-hogDone
+			err := <-done
+			t.Fatalf("later lock acquired before queued waiter; err=%v", err)
+		}
+	case <-ctx.Done():
+		err := <-done
+		t.Fatalf("lockSync timed out waiting behind later lock attempt: %v", err)
+	}
+}
+
+func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: t.TempDir()}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t DEFAULT VALUES;`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID < 2 {
+		t.Fatalf("db txid=%s, want at least 2", dpos.TXID)
+	}
+	r.SetPos(ltx.Pos{TXID: dpos.TXID - 2})
+
+	result, err := r.syncOnce(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("expected limited replica sync to upload one file")
+	}
+	if !result.limited {
+		t.Fatal("expected limited replica sync to stop before catching up")
+	}
+	if got, want := r.Pos().TXID, dpos.TXID-1; got != want {
+		t.Fatalf("replica txid=%s, want %s", got, want)
+	}
+	if db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("limited replica sync with successful uploads should record sync health")
+	}
+
+	result, err = r.syncOnce(context.Background(), 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.synced {
+		t.Fatal("expected final replica sync to upload remaining files")
+	}
+	if result.limited {
+		t.Fatal("expected final replica sync to catch up")
+	}
+	if got, want := r.Pos().TXID, dpos.TXID; got != want {
+		t.Fatalf("replica txid=%s, want %s", got, want)
+	}
+	if db.LastSuccessfulSyncAt().IsZero() {
+		t.Fatal("full replica sync should record sync success")
+	}
+}
+
+func TestReplicaMonitor_DrainsLimitedBacklogWithoutWaitingForInterval(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: t.TempDir()}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	r.MaxSyncLTXFiles = 1
+	r.SyncInterval = time.Hour
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := sqldb.Exec(`INSERT INTO t DEFAULT VALUES;`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID <= ltx.TXID(r.MaxSyncLTXFiles) {
+		t.Fatalf("db txid=%s, want backlog larger than %d", dpos.TXID, r.MaxSyncLTXFiles)
+	}
+
+	r.MonitorEnabled = true
+	if err := r.Start(db.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := r.Pos().TXID; got == dpos.TXID {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("replica txid=%s, want %s before next sync interval", r.Pos().TXID, dpos.TXID)
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestDB_SyncDiagnostic(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 
@@ -156,6 +593,457 @@ func TestDB_SyncDiagnostic(t *testing.T) {
 	}
 	if diag.Error != "boom" {
 		t.Fatalf("error=%q, want boom", diag.Error)
+	}
+}
+
+func TestDB_WriteLTXFromWALHonorsCanceledContext(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	walPath := filepath.Join(dir, "db-wal")
+
+	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	db := NewDB(dbPath)
+	db.pageSize = 1024
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:  ltx.Version,
+		Flags:    ltx.HeaderFlagNoChecksum,
+		PageSize: 1024,
+		Commit:   1,
+		MinTXID:  1,
+		MaxTXID:  1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err = db.writeLTXFromWAL(ctx, enc, walFile, 0, 1, map[uint32]int64{1: 0})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want context canceled", err)
+	}
+}
+
+func TestDB_SyncChunksWALAtCommitBoundary(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.MaxSyncWALBytes = int64(WALFrameHeaderSize + 4096)
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 20 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	result, err := db.syncOnce(context.Background(), db.MaxSyncWALBytes)
+	if err != nil {
+		t.Fatal(err)
+	} else if !result.synced {
+		t.Fatal("expected sync to create an LTX file")
+	} else if !result.limited {
+		t.Fatal("expected sync to stop at WAL byte limit")
+	} else if result.syncedToWALEnd {
+		t.Fatal("expected first bounded sync to leave pending WAL frames")
+	}
+
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	syncedToWALEnd := db.syncState.syncedToWALEnd
+	db.mu.RUnlock()
+	if !syncedToWALEnd {
+		t.Fatal("expected public Sync to finish remaining WAL chunks")
+	}
+}
+
+func TestDB_SyncTruncateCheckpointFiresDuringChunkedCatchUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Sync fully with the truncate threshold disabled so the last synced WAL
+	// offset ends up past the threshold without a checkpoint having run.
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	db.MaxSyncWALBytes = int64(WALFrameHeaderSize + 4096)
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	for range 20 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// A single bounded chunk leaves pending WAL frames, but the truncate
+	// threshold has been exceeded so the checkpoint must fire anyway.
+	result, err := db.syncOnce(t.Context(), db.MaxSyncWALBytes)
+	if err != nil {
+		t.Fatal(err)
+	} else if !result.limited {
+		t.Fatal("expected sync to stop at WAL byte limit")
+	}
+
+	db.mu.RLock()
+	syncedOffsetAfter := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if db.exceedsTruncateThreshold(syncedOffsetAfter) {
+		t.Fatalf("expected checkpoint during catch-up to restart the wal: offset=%d", syncedOffsetAfter)
+	}
+}
+
+func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
+	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
+
+	db.chkMu.RLock()
+	err = db.Sync(t.Context())
+	db.chkMu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got == 0 {
+		t.Fatal("expected a passive checkpoint attempt before truncate")
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 0 {
+		t.Fatalf("truncate checkpoints=%v, want 0 after passive restarted the wal", got)
+	}
+
+	db.mu.RLock()
+	restartedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if db.exceedsTruncateThreshold(restartedOffset) {
+		t.Fatalf("expected passive checkpoint to restart the wal: offset=%d", restartedOffset)
+	}
+}
+
+func TestDB_CheckpointTruncateSkipsRepeatedPassiveWithoutProgress(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.BusyTimeout = 50 * time.Millisecond
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	for range 5 {
+		if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES (zeroblob(3000));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold a read transaction so neither checkpoint mode can restart the WAL.
+	tx, err := sqldb.Begin()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var n int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	lastSyncedWALOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+
+	db.TruncatePageN = 2
+	if !db.exceedsTruncateThreshold(lastSyncedWALOffset) {
+		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
+	}
+
+	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
+	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
+
+	for range 2 {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 1 {
+		t.Fatalf("passive checkpoints=%v, want 1 across repeated blocked syncs", got)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 2 {
+		t.Fatalf("truncate checkpoints=%v, want 2 across repeated blocked syncs", got)
+	}
+
+	db.mu.RLock()
+	blockedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if !db.exceedsTruncateThreshold(blockedOffset) {
+		t.Fatalf("expected wal to remain unrestarted while reader is open: offset=%d", blockedOffset)
+	}
+
+	db.TruncatePageN = DefaultTruncatePageN
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	db.TruncatePageN = 2
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 2 {
+		t.Fatalf("passive checkpoints=%v, want 2 after threshold cleared", got)
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 3 {
+		t.Fatalf("truncate checkpoints=%v, want 3 after threshold cleared", got)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	db.TruncatePageN = 1
+	if err := db.Checkpoint(t.Context(), CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	restartedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if !db.exceedsTruncateThreshold(restartedOffset) {
+		t.Fatalf("precondition: restarted wal offset %d must meet the truncate threshold", restartedOffset)
+	}
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 4 {
+		t.Fatalf("passive checkpoints=%v, want 4 after wal restart", got)
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 4 {
+		t.Fatalf("truncate checkpoints=%v, want 4 after wal restart", got)
+	}
+}
+
+func TestDB_ExceedsTruncateThreshold(t *testing.T) {
+	const pageSize = 4096
+
+	tests := []struct {
+		name          string
+		truncatePageN int
+		walSize       int64
+		want          bool
+	}{
+		{
+			name:          "configured threshold",
+			truncatePageN: 2,
+			walSize:       calcWALSize(pageSize, 2),
+			want:          true,
+		},
+		{
+			name:          "zero below default threshold",
+			truncatePageN: 0,
+			walSize:       calcWALSize(pageSize, DefaultTruncatePageN) - 1,
+			want:          false,
+		},
+		{
+			name:          "zero at default threshold",
+			truncatePageN: 0,
+			walSize:       calcWALSize(pageSize, DefaultTruncatePageN),
+			want:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &DB{pageSize: pageSize, TruncatePageN: tt.truncatePageN}
+			if got := db.exceedsTruncateThreshold(tt.walSize); got != tt.want {
+				t.Fatalf("exceedsTruncateThreshold(%d)=%t, want %t", tt.walSize, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
+	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := NewWALReader(bytes.NewReader(b), slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !limited {
+		t.Fatal("expected page map to stop at limit")
+	}
+	if got, want := maxOffset, int64(8272); got != want {
+		t.Fatalf("maxOffset=%d, want %d", got, want)
+	}
+	if got, want := commit, uint32(2); got != want {
+		t.Fatalf("commit=%d, want %d", got, want)
+	}
+	if got, want := len(pageMap), 2; got != want {
+		t.Fatalf("len(pageMap)=%d, want %d", got, want)
 	}
 }
 
@@ -506,6 +1394,330 @@ func TestDB_Sync_ErrorMetrics(t *testing.T) {
 	}
 }
 
+type enospcLTXStagingFile struct {
+	failOp string
+}
+
+func (f *enospcLTXStagingFile) Write(p []byte) (int, error) {
+	if f.failOp == "write" {
+		return 0, syscall.ENOSPC
+	}
+	return len(p), nil
+}
+
+func (f *enospcLTXStagingFile) Sync() error {
+	if f.failOp == "sync" {
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+func (f *enospcLTXStagingFile) Close() error {
+	if f.failOp == "close" {
+		return syscall.ENOSPC
+	}
+	return nil
+}
+
+func isLTXStagingPath(name string) bool {
+	return strings.HasSuffix(name, ".tmp") && strings.Contains(name, string(filepath.Separator)+"ltx"+string(filepath.Separator)+"0"+string(filepath.Separator))
+}
+
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestDB_SyncReturnsDiskFullErrorForLTXStaging(t *testing.T) {
+	tests := []struct {
+		name   string
+		failOp string
+	}{
+		{name: "Open", failOp: "open"},
+		{name: "Write", failOp: "write"},
+		{name: "Sync", failOp: "sync"},
+		{name: "Close", failOp: "close"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			dbPath := filepath.Join(dir, "db")
+
+			db := NewDB(dbPath)
+			db.MonitorInterval = 0
+			db.ShutdownSyncTimeout = 0
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close(context.Background()) }()
+
+			sqldb, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+
+			if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('initial snapshot')`); err != nil {
+				t.Fatal(err)
+			}
+
+			db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+				if isLTXStagingPath(name) {
+					if tt.failOp == "open" {
+						return nil, syscall.ENOSPC
+					}
+					return &enospcLTXStagingFile{failOp: tt.failOp}, nil
+				}
+				return defaultOpenLTXFile(name, flag, perm)
+			}
+
+			err = db.Sync(context.Background())
+			if err == nil {
+				t.Fatal("expected disk full error")
+			}
+
+			var ltxErr *LTXError
+			if !errors.As(err, &ltxErr) {
+				t.Fatalf("expected *LTXError, got %T: %v", err, err)
+			}
+			if !errors.Is(err, ErrDiskFull) {
+				t.Fatalf("expected ErrDiskFull, got %v", err)
+			}
+			if !errors.Is(err, syscall.ENOSPC) {
+				t.Fatalf("expected ENOSPC in error chain, got %v", err)
+			}
+			if ltxErr.Path == "" {
+				t.Fatal("expected staging path")
+			}
+			if want := "stage-" + tt.failOp; ltxErr.Op != want {
+				t.Fatalf("op=%q, want %q", ltxErr.Op, want)
+			}
+			if ltxErr.MinTXID != 1 || ltxErr.MaxTXID != 1 {
+				t.Fatalf("unexpected LTX identity: min=%d max=%d", ltxErr.MinTXID, ltxErr.MaxTXID)
+			}
+			if !strings.Contains(err.Error(), "stage-"+tt.failOp) || !strings.Contains(err.Error(), "disk full") {
+				t.Fatalf("error message %q should identify disk-full staging failure", err.Error())
+			}
+			if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 1 {
+				t.Fatalf("litestream_disk_full=%v, want 1", got)
+			}
+		})
+	}
+}
+
+func TestDB_DiskFullGaugeResetsOnOtherSyncErrors(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('data')`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if isLTXStagingPath(name) {
+			return nil, syscall.ENOSPC
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
+	if err := db.Sync(context.Background()); err == nil {
+		t.Fatal("expected disk full error")
+	}
+	if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 1 {
+		t.Fatalf("litestream_disk_full=%v, want 1", got)
+	}
+
+	db.openLTXFile = defaultOpenLTXFile
+	if err := os.Remove(db.WALPath()); err != nil {
+		t.Fatal(err)
+	}
+	err = db.Sync(context.Background())
+	if err == nil {
+		t.Fatal("expected error from sync with missing WAL")
+	}
+	if errors.Is(err, ErrDiskFull) {
+		t.Fatalf("expected non-disk-full error, got %v", err)
+	}
+	if got := testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())); got != 0 {
+		t.Fatalf("litestream_disk_full=%v, want 0 after a non-disk-full error", got)
+	}
+}
+
+func TestDB_MonitorRetriesAndRecoversFromLTXStagingDiskFull(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	replicaDir := t.TempDir()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: replicaDir}
+	db.Replica.SyncInterval = 5 * time.Millisecond
+
+	var logs lockedLogBuffer
+	db.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('initial snapshot')`); err != nil {
+		t.Fatal(err)
+	}
+
+	var stagingAttempts atomic.Int64
+	var diskFull atomic.Bool
+	diskFull.Store(true)
+
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		if isLTXStagingPath(name) {
+			stagingAttempts.Add(1)
+			if diskFull.Load() {
+				return &enospcLTXStagingFile{failOp: "write"}, nil
+			}
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
+
+	done := make(chan struct{})
+	db.MonitorInterval = 5 * time.Millisecond
+	go func() {
+		defer close(done)
+		db.monitor()
+	}()
+
+	defer func() {
+		db.cancel()
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Error("monitor did not stop")
+		}
+		db.openLTXFile = defaultOpenLTXFile
+		if err := sqldb.Close(); err != nil {
+			t.Errorf("close sql db: %v", err)
+		}
+		if err := db.Close(context.Background()); err != nil {
+			t.Errorf("close db: %v", err)
+		}
+	}()
+
+	waitFor := func(name string, fn func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) {
+			if fn() {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatalf("timed out waiting for %s", name)
+	}
+
+	waitFor("disk-full signal", func() bool {
+		s := logs.String()
+		return stagingAttempts.Load() >= 1 &&
+			testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())) == 1 &&
+			strings.Contains(s, "disk full while staging ltx file, replication paused until space is freed")
+	})
+
+	s := logs.String()
+	if strings.Contains(s, `msg="sync error"`) {
+		t.Fatalf("disk-full staging error should not use generic sync error log: %s", s)
+	}
+	if !strings.Contains(s, ".tmp") {
+		t.Fatalf("disk-full log should include staging path: %s", s)
+	}
+
+	diskFull.Store(false)
+
+	remoteLTXCount := func() int {
+		entries, err := os.ReadDir(filepath.Join(replicaDir, "l0"))
+		if os.IsNotExist(err) {
+			return 0
+		} else if err != nil {
+			t.Fatalf("read replica ltx dir: %v", err)
+		}
+		return len(entries)
+	}
+
+	waitFor("automatic recovery", func() bool {
+		pos, err := db.Pos()
+		return stagingAttempts.Load() >= 2 &&
+			err == nil &&
+			pos.TXID >= 1 &&
+			remoteLTXCount() >= 1 &&
+			testutil.ToFloat64(diskFullGaugeVec.WithLabelValues(db.Path())) == 0
+	})
+
+	if _, err := sqldb.Exec(`INSERT INTO t(data) VALUES ('after recovery')`); err != nil {
+		t.Fatal(err)
+	}
+
+	waitFor("continued monitor sync after recovery", func() bool {
+		pos, err := db.Pos()
+		return stagingAttempts.Load() >= 3 &&
+			err == nil &&
+			pos.TXID >= 2 &&
+			remoteLTXCount() >= 2
+	})
+}
+
 // TestDB_Checkpoint_ErrorMetrics verifies that checkpoint error counter is incremented on failure.
 func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 	dir := t.TempDir()
@@ -542,7 +1754,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -1166,6 +2378,26 @@ func TestIsDiskFullError(t *testing.T) {
 			err:      fmt.Errorf("sync failed: %w", errors.New("no space left on device")),
 			expected: true,
 		},
+		{
+			name:     "typed ErrDiskFull",
+			err:      fmt.Errorf("stage ltx: %w", ErrDiskFull),
+			expected: true,
+		},
+		{
+			name:     "typed syscall.ENOSPC",
+			err:      fmt.Errorf("write: %w", syscall.ENOSPC),
+			expected: true,
+		},
+		{
+			name:     "not enough space on the disk (windows)",
+			err:      errors.New("write file: There is not enough space on the disk."),
+			expected: true,
+		},
+		{
+			name:     "database or disk is full (sqlite)",
+			err:      errors.New("database or disk is full (13)"),
+			expected: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -1633,6 +2865,151 @@ func TestDB_WriteLTXFromWAL_PageGrowthCoverage(t *testing.T) {
 	}
 }
 
+func TestDB_WriteLTXFromWAL_FillsMissingGrowthPagesFromDB(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+	walPath := filepath.Join(dir, "db-wal")
+
+	const pageSize = 1024
+
+	dbFile, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbFile.Close()
+
+	for pgno := 1; pgno <= 5; pgno++ {
+		page := bytes.Repeat([]byte{byte(pgno)}, pageSize)
+		if _, err := dbFile.WriteAt(page, int64(pgno-1)*pageSize); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	walFile, err := os.OpenFile(walPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer walFile.Close()
+
+	frameSize := int64(WALFrameHeaderSize + pageSize)
+	pageMap := map[uint32]int64{
+		3: 0,
+		5: frameSize,
+	}
+	for _, pgno := range []uint32{3, 5} {
+		offset := pageMap[pgno] + WALFrameHeaderSize
+		page := bytes.Repeat([]byte{byte(pgno + 10)}, pageSize)
+		if _, err := walFile.WriteAt(page, offset); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db := NewDB(dbPath)
+	db.pageSize = pageSize
+	db.f = dbFile
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    5,
+		MinTXID:   2,
+		MaxTXID:   2,
+		Timestamp: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.writeLTXFromWAL(t.Context(), enc, walFile, 2, 5, pageMap); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := ltx.NewDecoder(bytes.NewReader(buf.Bytes()))
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+
+	var pgnos []uint32
+	got := make(map[uint32][]byte)
+	pageBuf := make([]byte, pageSize)
+	for {
+		var phdr ltx.PageHeader
+		if err := dec.DecodePage(&phdr, pageBuf); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		pgnos = append(pgnos, phdr.Pgno)
+		got[phdr.Pgno] = append([]byte(nil), pageBuf...)
+	}
+
+	wantPgnos := []uint32{3, 4, 5}
+	if len(pgnos) != len(wantPgnos) {
+		t.Fatalf("page numbers mismatch: got=%v want=%v", pgnos, wantPgnos)
+	}
+	for i := range wantPgnos {
+		if pgnos[i] != wantPgnos[i] {
+			t.Fatalf("page numbers mismatch: got=%v want=%v", pgnos, wantPgnos)
+		}
+	}
+	if !bytes.Equal(got[3], bytes.Repeat([]byte{13}, pageSize)) {
+		t.Fatal("expected page 3 to come from WAL")
+	}
+	if !bytes.Equal(got[4], bytes.Repeat([]byte{4}, pageSize)) {
+		t.Fatal("expected page 4 to come from database")
+	}
+	if !bytes.Equal(got[5], bytes.Repeat([]byte{15}, pageSize)) {
+		t.Fatal("expected page 5 to come from WAL")
+	}
+
+	snapshot := new(bytes.Buffer)
+	snapshotEnc, err := ltx.NewEncoder(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotEnc.EncodeHeader(ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    2,
+		MinTXID:   1,
+		MaxTXID:   1,
+		Timestamp: time.Now().UnixMilli(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, pgno := range []uint32{1, 2} {
+		page := bytes.Repeat([]byte{byte(pgno)}, pageSize)
+		if err := snapshotEnc.EncodePage(ltx.PageHeader{Pgno: uint32(pgno)}, page); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := snapshotEnc.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	compacted := new(bytes.Buffer)
+	c, err := ltx.NewCompactor(compacted, []io.Reader{
+		bytes.NewReader(snapshot.Bytes()),
+		bytes.NewReader(buf.Bytes()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	if err := c.Compact(context.Background()); err != nil {
+		t.Fatalf("compaction failed: %v", err)
+	}
+}
+
 // TestDB_Sync_CompactionValidAfterGrowthAndCheckpoint verifies that compaction
 // produces valid snapshots after a cycle of: grow DB, sync, checkpoint, grow
 // more, sync. If the zero-fill bug existed, compaction would fail with
@@ -1817,16 +3194,53 @@ func TestDB_CheckpointCreatesSnapshotL0(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Verify a snapshot L0 was created during checkpoint.
+	// Verify a snapshot L0 was created during checkpoint. A TRUNCATE
+	// checkpoint reports zero frame counts, so it cannot prove that no
+	// commits landed between the pre-checkpoint sync and the checkpoint;
+	// it must take the boundary snapshot unconditionally. An incremental
+	// (non-snapshot) L0 here would silently drop those commits.
 	l0AfterEntries, _ := os.ReadDir(l0Dir)
-	newL0Count := 0
+	newL0Count, newSnapshotCount := 0, 0
 	for _, entry := range l0AfterEntries {
-		if !l0BeforeNames[entry.Name()] {
-			newL0Count++
+		if l0BeforeNames[entry.Name()] {
+			continue
+		}
+		newL0Count++
+
+		f, err := os.Open(filepath.Join(l0Dir, entry.Name()))
+		if err != nil {
+			t.Fatal(err)
+		}
+		dec := ltx.NewDecoder(f)
+		if err := dec.DecodeHeader(); err != nil {
+			f.Close()
+			t.Fatalf("decode header %s: %v", entry.Name(), err)
+		}
+		hdr := dec.Header()
+		pageCount := 0
+		pageData := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				f.Close()
+				t.Fatalf("decode page %s: %v", entry.Name(), err)
+			}
+			pageCount++
+		}
+		f.Close()
+
+		// A boundary snapshot contains every page up to the commit.
+		if uint32(pageCount) == hdr.Commit {
+			newSnapshotCount++
 		}
 	}
 	if newL0Count == 0 {
 		t.Fatal("expected checkpoint to create at least one new L0 file")
+	}
+	if newSnapshotCount == 0 {
+		t.Fatal("expected TRUNCATE checkpoint to create a boundary snapshot L0")
 	}
 }
 
@@ -1953,10 +3367,18 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	case err := <-writerDone:
 		t.Fatalf("writer exited before starting: %v", err)
 	}
-	if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
-		cancelWriter()
-		<-writerDone
-		t.Fatal(err)
+	checkpointDeadline := time.Now().Add(5 * time.Second)
+	for {
+		err := db.Checkpoint(ctx, CheckpointModeTruncate)
+		if err == nil {
+			break
+		}
+		if !isSQLiteBusyError(err) || time.Now().After(checkpointDeadline) {
+			cancelWriter()
+			<-writerDone
+			t.Fatal(err)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	cancelWriter()
 	if err := <-writerDone; err != nil {
@@ -2075,6 +3497,55 @@ func TestDB_CheckpointPageGapWithConcurrentWrites(t *testing.T) {
 	}
 
 	t.Logf("all %d pages present across L0 files (commit=%d)", len(allPages), maxCommit)
+
+	replicaDir := t.TempDir()
+	replicaL0Dir := filepath.Join(replicaDir, "l0")
+	if err := os.Mkdir(replicaL0Dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l0Entries, err := os.ReadDir(db.LTXLevelDir(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range l0Entries {
+		srcPath := filepath.Join(db.LTXLevelDir(0), entry.Name())
+		dstPath := filepath.Join(replicaL0Dir, entry.Name())
+
+		src, err := os.Open(srcPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		dst, err := os.Create(dstPath)
+		if err != nil {
+			_ = src.Close()
+			t.Fatal(err)
+		}
+		if _, err := io.Copy(dst, src); err != nil {
+			_ = src.Close()
+			_ = dst.Close()
+			t.Fatal(err)
+		}
+		if err := src.Close(); err != nil {
+			_ = dst.Close()
+			t.Fatal(err)
+		}
+		if err := dst.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	restorePath := filepath.Join(dir, "restored.db")
+	restoreDB := NewDB(restorePath)
+	restoreReplica := NewReplica(restoreDB)
+	restoreReplica.Client = &testReplicaClient{dir: replicaDir}
+
+	restoreOpt := NewRestoreOptions()
+	restoreOpt.OutputPath = restorePath
+	restoreOpt.IntegrityCheck = IntegrityCheckFull
+
+	if err := restoreReplica.Restore(ctx, restoreOpt); err != nil {
+		t.Fatalf("restore from local ltx chain: %v", err)
+	}
 }
 
 // TestDB_Sync_InitErrorMetrics verifies that sync error counter is incremented
@@ -2635,5 +4106,548 @@ func TestReplicaMonitor_RecoversFromPositionError(t *testing.T) {
 			t.Fatal("replication did not resume after auto-recovery")
 		}
 		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestDB_CloseWithCanceledContextStillCleansUp(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// A canceled context may fail the final sync, but cleanup (read lock
+	// release, handle closes, state reset) must always run.
+	_ = db.Close(ctx)
+
+	db.mu.Lock()
+	opened, sqlDB, f, rtx := db.opened, db.db, db.f, db.rtx
+	db.mu.Unlock()
+
+	if opened {
+		t.Fatal("db still marked open after Close with canceled context")
+	}
+	if sqlDB != nil {
+		t.Fatal("sql handle not released after Close with canceled context")
+	}
+	if f != nil {
+		t.Fatal("file handle not released after Close with canceled context")
+	}
+	if rtx != nil {
+		t.Fatal("read lock not released after Close with canceled context")
+	}
+}
+
+// syncRestoreIntegrityConfig parameterizes runSyncRestoreIntegrity with the
+// pieces that differ between the sync/restore integrity test variants.
+type syncRestoreIntegrityConfig struct {
+	configure  func(db *DB)
+	schema     string
+	iterations int
+	insertRows func(t *testing.T, ctx context.Context, sqldb *sql.DB, iteration int)
+	afterSync  func(t *testing.T, ctx context.Context, sqldb *sql.DB, iteration int)
+	countQuery string
+	wantRows   int
+}
+
+// runSyncRestoreIntegrity opens a replicated database, runs insert/sync
+// iterations, closes everything, restores from the replica, and verifies
+// integrity and row count of the restored database.
+func runSyncRestoreIntegrity(t *testing.T, cfg syncRestoreIntegrityConfig) {
+	t.Helper()
+
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	replicaDir := t.TempDir()
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: replicaDir}
+	db.Replica.MonitorEnabled = false
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	cfg.configure(db)
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close(context.Background()) })
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sqldb.Close() }()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(cfg.schema); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := context.Background()
+
+	for i := 0; i < cfg.iterations; i++ {
+		cfg.insertRows(t, ctx, sqldb, i)
+
+		if err := db.Sync(ctx); err != nil {
+			t.Fatalf("sync iteration %d: %v", i, err)
+		}
+
+		if cfg.afterSync != nil {
+			cfg.afterSync(t, ctx, sqldb, i)
+		}
+	}
+
+	if err := db.Sync(ctx); err != nil {
+		t.Fatalf("final sync: %v", err)
+	}
+	if err := sqldb.Close(); err != nil {
+		t.Fatalf("close sqlite db: %v", err)
+	}
+	if err := db.Close(ctx); err != nil {
+		t.Fatalf("close db: %v", err)
+	}
+
+	restorePath := filepath.Join(t.TempDir(), "restored.db")
+	restoreDB := NewDB(restorePath)
+	restoreDB.Replica = NewReplica(restoreDB)
+	restoreDB.Replica.Client = &testReplicaClient{dir: replicaDir}
+	restoreDB.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := restoreDB.Replica.Restore(ctx, RestoreOptions{OutputPath: restorePath}); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+
+	restoredDB, err := sql.Open("sqlite", restorePath)
+	if err != nil {
+		t.Fatalf("open restored db: %v", err)
+	}
+	defer func() { _ = restoredDB.Close() }()
+
+	rows, err := restoredDB.QueryContext(ctx, `PRAGMA integrity_check`)
+	if err != nil {
+		t.Fatalf("integrity check: %v", err)
+	}
+	defer rows.Close()
+
+	var results []string
+	for rows.Next() {
+		var result string
+		if err := rows.Scan(&result); err != nil {
+			t.Fatal(err)
+		}
+		results = append(results, result)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	if len(results) == 0 {
+		t.Fatal("integrity check returned no results")
+	}
+	if results[0] != "ok" {
+		t.Fatalf("integrity check failed on restored database: %v", results)
+	}
+
+	var count int
+	if err := restoredDB.QueryRowContext(ctx, cfg.countQuery).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != cfg.wantRows {
+		t.Fatalf("restored row count=%d, want %d", count, cfg.wantRows)
+	}
+}
+
+func TestSyncRestoreIntegrity(t *testing.T) {
+	runSyncRestoreIntegrity(t, syncRestoreIntegrityConfig{
+		configure: func(db *DB) {
+			db.MinCheckpointPageN = 50
+			db.CheckpointInterval = 100 * time.Millisecond
+		},
+		schema: `
+			CREATE TABLE IF NOT EXISTS data (
+				ROWID INTEGER PRIMARY KEY AUTOINCREMENT,
+				_uid TEXT NOT NULL,
+				_resource_version INTEGER NOT NULL,
+				_updated_at DATETIME NOT NULL,
+				name TEXT,
+				data_json BLOB,
+				is_active INTEGER,
+				UNIQUE (_uid, _resource_version)
+			);
+			CREATE INDEX IF NOT EXISTS data_uid_idx ON data (_uid);
+			CREATE INDEX IF NOT EXISTS data_name_idx ON data (name);
+		`,
+		iterations: 20,
+		insertRows: func(t *testing.T, ctx context.Context, sqldb *sql.DB, i int) {
+			t.Helper()
+			for j := 0; j < 10; j++ {
+				uid := fmt.Sprintf("uid-%d-%d", i, j)
+				_, err := sqldb.ExecContext(ctx,
+					`INSERT INTO data (_uid, _resource_version, _updated_at, name, data_json, is_active)
+					 VALUES (?, 1, datetime('now'), ?, ?, ?)`,
+					uid, fmt.Sprintf("item-%d-%d", i, j),
+					[]byte(fmt.Sprintf(`{"key":"k%d","value":%d}`, j, j)),
+					j%2,
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+		countQuery: `SELECT COUNT(*) FROM data`,
+		wantRows:   20 * 10,
+	})
+}
+
+func TestSyncRestoreIntegrity_WithCheckpoints(t *testing.T) {
+	var checkpointN int
+	runSyncRestoreIntegrity(t, syncRestoreIntegrityConfig{
+		configure: func(db *DB) {
+			db.MinCheckpointPageN = 20
+			db.TruncatePageN = 200
+			db.CheckpointInterval = 50 * time.Millisecond
+		},
+		schema:     `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT, extra BLOB)`,
+		iterations: 30,
+		insertRows: func(t *testing.T, ctx context.Context, sqldb *sql.DB, i int) {
+			t.Helper()
+			for j := 0; j < 20; j++ {
+				_, err := sqldb.ExecContext(ctx,
+					`INSERT INTO t (val, extra) VALUES (?, ?)`,
+					fmt.Sprintf("val-%d-%d", i, j),
+					bytes.Repeat([]byte{byte(i)}, 512),
+				)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+		},
+		afterSync: func(t *testing.T, ctx context.Context, sqldb *sql.DB, i int) {
+			t.Helper()
+			if i%5 != 4 {
+				return
+			}
+			if _, err := sqldb.ExecContext(ctx, `PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+				t.Logf("passive checkpoint %d: %v", i, err)
+				return
+			}
+			checkpointN++
+		},
+		countQuery: `SELECT COUNT(*) FROM t`,
+		wantRows:   30 * 20,
+	})
+	if checkpointN == 0 {
+		t.Fatal("no passive checkpoints succeeded; variant did not exercise the checkpoint path")
+	}
+}
+
+func TestDB_SnapshotClosesReaderWhenReplicaReturnsEarly(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &earlyReturnSnapshotClient{testReplicaClient: &testReplicaClient{dir: t.TempDir()}}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !db.chkMu.TryLock() {
+		t.Fatal("checkpoint lock remains held after Snapshot returns")
+	}
+	db.chkMu.Unlock()
+}
+
+// TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints verifies that a
+// snapshot's content matches its advertised position while checkpoints and
+// writes run concurrently. The position capture and chkMu read lock must be
+// atomic with respect to checkpoints: if a checkpoint can run between them,
+// the snapshot reads post-position pages from the database file while its
+// header still claims the earlier transaction — the #1164 corruption class.
+func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping in short mode")
+	}
+
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`PRAGMA busy_timeout = 5000`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE kv (id INTEGER PRIMARY KEY, v INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`INSERT INTO kv VALUES (1, 0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx := t.Context()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// valueAt records which kv value was current at each synced position so
+	// snapshots can be checked against the state their header advertises.
+	var valueMu sync.Mutex
+	valueAt := map[ltx.TXID]int64{}
+	recordPos := func(v int64) error {
+		pos, err := db.Pos()
+		if err != nil {
+			return err
+		}
+		valueMu.Lock()
+		valueAt[pos.TXID] = v
+		valueMu.Unlock()
+		return nil
+	}
+	if err := recordPos(0); err != nil {
+		t.Fatal(err)
+	}
+
+	stop := make(chan struct{})
+	errCh := make(chan error, 2)
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for v := int64(1); ; v++ {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			if _, err := sqldb.Exec(`UPDATE kv SET v = ? WHERE id = 1`, v); err != nil {
+				errCh <- err
+				return
+			}
+			if err := db.Sync(ctx); err != nil {
+				errCh <- err
+				return
+			}
+			if err := recordPos(v); err != nil {
+				errCh <- err
+				return
+			}
+		}
+	}()
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			// TRUNCATE resets the WAL so subsequent snapshots must read
+			// cold pages from the database file — the path that exposes
+			// a checkpoint racing the position capture.
+			if err := db.Checkpoint(ctx, CheckpointModeTruncate); err != nil {
+				if !isSQLiteBusyError(err) {
+					errCh <- err
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}()
+
+	var loMatchN, hiMatchN int
+	for i := range 15 {
+		select {
+		case err := <-errCh:
+			t.Fatal(err)
+		default:
+		}
+
+		pos, r, err := db.SnapshotReader(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		dec := ltx.NewDecoder(r)
+		if err := dec.DecodeHeader(); err != nil {
+			t.Fatal(err)
+		}
+		hdr := dec.Header()
+		if hdr.MaxTXID != pos.TXID {
+			t.Fatalf("snapshot header txid=%s, want advertised position %s", hdr.MaxTXID, pos.TXID)
+		}
+
+		restorePath := filepath.Join(t.TempDir(), fmt.Sprintf("restore-%d.db", i))
+		rf, err := os.Create(restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pageData := make([]byte, hdr.PageSize)
+		for {
+			var phdr ltx.PageHeader
+			if err := dec.DecodePage(&phdr, pageData); err == io.EOF {
+				break
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rf.WriteAt(pageData, int64(phdr.Pgno-1)*int64(hdr.PageSize)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := dec.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := rf.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
+		}
+
+		restoredDB, err := sql.Open("sqlite", restorePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var integrity string
+		if err := restoredDB.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+			t.Fatal(err)
+		}
+		var got int64
+		if err := restoredDB.QueryRow(`SELECT v FROM kv WHERE id = 1`).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		restoredDB.Close()
+		if integrity != "ok" {
+			t.Fatalf("snapshot %d integrity check failed: %s", i, integrity)
+		}
+
+		// The snapshot content must match the kv value recorded at a mapped
+		// TXID bracketing the snapshot position: the nearest at or before it,
+		// or the nearest after it. The writer records its commit under
+		// db.Pos() read after Sync returns, so a concurrent TRUNCATE boundary
+		// snapshot can mint the next TXID first and the commit lands under
+		// that later TXID while the commit's own TXID stays unmapped. Skip if
+		// recording lags behind the snapshot position entirely.
+		valueMu.Lock()
+		var wantLo, wantHi int64
+		var loTXID, hiTXID, maxTXID ltx.TXID
+		for txid, val := range valueAt {
+			if txid > maxTXID {
+				maxTXID = txid
+			}
+			if txid <= pos.TXID && txid >= loTXID {
+				loTXID, wantLo = txid, val
+			}
+			if txid > pos.TXID && (hiTXID == 0 || txid < hiTXID) {
+				hiTXID, wantHi = txid, val
+			}
+		}
+		valueMu.Unlock()
+		if pos.TXID > maxTXID {
+			continue
+		}
+		switch {
+		case loTXID != 0 && got == wantLo:
+			loMatchN++
+		case hiTXID != 0 && got == wantHi:
+			hiMatchN++
+		default:
+			t.Fatalf("snapshot at txid %s contains v=%d, want %d (recorded at txid %s) or %d (recorded at txid %s): content inconsistent with advertised position",
+				pos.TXID, got, wantLo, loTXID, wantHi, hiTXID)
+		}
+	}
+
+	// A hi-bracket match is ambiguous: it tolerates the rare recording race
+	// but is also what a snapshot with content ahead of its advertised
+	// position produces. The race is a narrow window while a chkMu handoff
+	// regression is systematic, so require at least one unambiguous match.
+	if loMatchN == 0 {
+		t.Fatalf("no snapshot matched the value recorded at or before its position (hi-bracket matches=%d): content may be ahead of advertised position", hiMatchN)
+	}
+
+	close(stop)
+	wg.Wait()
+	select {
+	case err := <-errCh:
+		t.Fatal(err)
+	default:
 	}
 }
