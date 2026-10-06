@@ -1253,6 +1253,27 @@ func TestHydrator_Close_Persistent(t *testing.T) {
 	}
 }
 
+func TestHydrator_Restore_WriteFailure(t *testing.T) {
+	client := newMockReplicaClient()
+	pgnos := make([]uint32, 100)
+	for i := range pgnos {
+		pgnos[i] = uint32(i + 1)
+	}
+	fixture := buildLTXFixtureWithPages(t, 1, 4096, pgnos, 'a')
+	client.addFixture(t, fixture)
+
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Restore(context.Background(), []*ltx.FileInfo{fixture.info}); err == nil || !strings.Contains(err.Error(), "write page") {
+		t.Fatalf("expected hydration write error, got %v", err)
+	}
+}
+
 func TestHydrator_Init_Resume(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "hydration.db")
