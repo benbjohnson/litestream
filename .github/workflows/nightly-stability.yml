@@ -132,6 +132,8 @@ jobs:
         with:
           go-version-file: "go.mod"
 
+      - uses: ./.github/actions/build-minio-image
+
       - name: Build binaries
         run: |
           go build -o bin/litestream ./cmd/litestream
@@ -177,6 +179,8 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
+
+      - uses: ./.github/actions/build-minio-image
 
       - name: Build binaries
         run: |
