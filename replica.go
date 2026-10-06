@@ -738,12 +738,11 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	pr, pw := io.Pipe()
 
 	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
+		c, err := newRestoreCompactor(pw, rdrs)
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 
@@ -796,6 +795,32 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	return nil
+}
+
+func newRestoreCompactor(w io.Writer, rdrs []io.Reader) (*ltx.Compactor, error) {
+	if len(rdrs) == 0 {
+		return nil, fmt.Errorf("at least one input reader required")
+	}
+
+	last := len(rdrs) - 1
+	finalHeader, replay, err := ltx.PeekHeader(rdrs[last])
+	if err != nil {
+		return nil, fmt.Errorf("peek final input header: %w", err)
+	}
+	if closer, ok := rdrs[last].(io.Closer); ok {
+		rdrs[last] = internal.NewReadCloser(replay, closer)
+	} else {
+		rdrs[last] = replay
+	}
+
+	c, err := ltx.NewCompactor(w, rdrs)
+	if err != nil {
+		return nil, err
+	}
+	if finalHeader.NoChecksum() {
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
+	}
+	return c, nil
 }
 
 // follow enters a continuous restore loop, polling for new LTX files and
