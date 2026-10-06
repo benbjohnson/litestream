@@ -3,9 +3,11 @@ package webdav
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -32,11 +34,13 @@ const (
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 type ReplicaClient struct {
-	mu     sync.Mutex
-	client *gowebdav.Client
-	logger *slog.Logger
+	mu        sync.Mutex
+	transport *http.Transport
+	connected bool
+	logger    *slog.Logger
 
 	URL      string
 	Username string
@@ -93,29 +97,55 @@ func (c *ReplicaClient) Init(ctx context.Context) error {
 	return err
 }
 
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.transport != nil {
+		c.transport.CloseIdleConnections()
+		c.transport = nil
+	}
+	c.connected = false
+	return nil
+}
+
 // init initializes the connection and returns the WebDAV client.
 func (c *ReplicaClient) init(ctx context.Context) (_ *gowebdav.Client, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if c.client != nil {
-		return c.client, nil
+	if err := context.Cause(ctx); err != nil {
+		return nil, err
 	}
 
 	if c.URL == "" {
 		return nil, fmt.Errorf("webdav url required")
 	}
 
-	c.client = gowebdav.NewClient(c.URL, c.Username, c.Password)
-
-	c.client.SetTimeout(c.Timeout)
-
-	if err := c.client.Connect(); err != nil {
-		c.client = nil
-		return nil, fmt.Errorf("webdav: cannot connect to server: %w", err)
+	if c.transport == nil {
+		c.transport = &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		}
 	}
-
-	return c.client, nil
+	client := gowebdav.NewClient(c.URL, c.Username, c.Password)
+	client.SetTransport(c.transport)
+	client.SetTimeout(c.Timeout)
+	client.SetInterceptor(func(_ string, req *http.Request) {
+		*req = *req.WithContext(ctx)
+	})
+	if !c.connected {
+		if err := client.Connect(); err != nil {
+			c.transport.CloseIdleConnections()
+			return nil, fmt.Errorf("webdav: cannot connect to server: %w", err)
+		}
+		c.connected = true
+	}
+	return client, nil
 }
 
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
@@ -259,8 +289,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("webdav: cannot create temp file: %w", err)
 	}
 	defer func() {
-		_ = tmpFile.Close()
-		_ = os.Remove(tmpFile.Name())
+		err = errors.Join(err, tmpFile.Close(), os.Remove(tmpFile.Name()))
 	}()
 
 	fullReader := io.MultiReader(&buf, rd)
@@ -282,7 +311,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	// WriteStreamWithLength requires both a seekable reader and known size,
 	// which we now have from the temp file. This avoids chunked encoding
 	// and ensures reliable uploads across all WebDAV server configurations.
-	if err := client.WriteStreamWithLength(filename, tmpFile, size, 0644); err != nil {
+	if err := client.WriteStreamWithLength(filename, struct{ io.ReadSeeker }{tmpFile}, size, 0644); err != nil {
 		return nil, fmt.Errorf("webdav: cannot write file %q: %w", filename, err)
 	}
 
@@ -330,11 +359,12 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 		if _, err := io.CopyN(io.Discard, rc, offset); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
-				_ = rc.Close()
+				if closeErr := rc.Close(); closeErr != nil {
+					return nil, fmt.Errorf("webdav: cannot close file %q: %w", filename, closeErr)
+				}
 				return io.NopCloser(bytes.NewReader(nil)), nil
 			}
-			_ = rc.Close()
-			return nil, fmt.Errorf("webdav: cannot skip offset in file %q: %w", filename, err)
+			return nil, fmt.Errorf("webdav: cannot skip offset in file %q: %w", filename, errors.Join(err, rc.Close()))
 		}
 
 		return rc, nil

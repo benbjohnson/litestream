@@ -546,6 +546,29 @@ func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
 	})
 }
 
+func TestReplicaClient_SFTP_Close(t *testing.T) {
+	privateKey := mustParseTestSFTPHostKey(t)
+	addr := testingutil.MockSFTPServer(t, privateKey)
+
+	c := testingutil.NewSFTPReplicaClient(t)
+	c.User = "foo"
+	c.Host = addr
+	c.HostKey = string(ssh.MarshalAuthorizedKey(privateKey.PublicKey()))
+
+	closer, ok := any(c).(litestream.ReplicaClientCloser)
+	if !ok {
+		t.Fatal("SFTP client does not implement cleanup contract")
+	}
+	for i := 0; i < 2; i++ {
+		if err := c.Init(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := closer.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestReplicaClient_SFTP_WriteLTXFileAtomic(t *testing.T) {
 	privateKey := mustParseTestSFTPHostKey(t)
 	addr := testingutil.MockSFTPServer(t, privateKey)
