@@ -47,6 +47,8 @@ function isRelevantIntegrationTestPath(filename) {
     filename === 'go.mod' ||
     filename === 'go.sum' ||
     filename.startsWith('tests/integration/') ||
+    filename.startsWith('etc/minio/') ||
+    filename.startsWith('.github/actions/build-minio-image/') ||
     filename === '.github/scripts/integration-test-paths.js' ||
     filename === '.github/workflows/integration-tests.yml'
   );
