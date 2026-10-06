@@ -119,7 +119,10 @@ func ParseSnapshotFilenameV3(filename string) (index int, err error) {
 	if m == nil {
 		return 0, fmt.Errorf("invalid v0.3.x snapshot filename: %q", filename)
 	}
-	idx, _ := strconv.ParseInt(m[1], 16, 64)
+	idx, err := strconv.ParseInt(m[1], 16, 32)
+	if err != nil {
+		return 0, fmt.Errorf("invalid snapshot path: %s: %w", filename, err)
+	}
 	return int(idx), nil
 }
 
