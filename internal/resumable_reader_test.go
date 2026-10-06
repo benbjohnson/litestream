@@ -446,3 +446,41 @@ func TestResumableReader_ContextCancelAbortsBackoff(t *testing.T) {
 		t.Fatal("read after cancellation reopened the file; cancellation must be sticky")
 	}
 }
+
+func TestResumableReader_ContextCancelDuringReopen(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	opened := make(chan struct{})
+	openN := 0
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			openN++
+			if openN == 1 {
+				close(opened)
+			}
+			<-ctx.Done()
+			return nil, fmt.Errorf("connection reset")
+		},
+	}
+
+	go func() {
+		<-opened
+		cancel()
+	}()
+
+	r := NewResumableReader(ctx, client, 2, 1, 2, 11, nil, slog.Default())
+	_, err := r.Read(make([]byte, 1))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Read() error=%v, want an error wrapping context.Canceled", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "connection reset") {
+		t.Errorf("Read() error=%v, want connection reset context", err)
+	}
+	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, context.Canceled) {
+		t.Errorf("second Read() error=%v, want an error wrapping context.Canceled", err)
+	}
+	if got, want := openN, 1; got != want {
+		t.Errorf("OpenLTXFile() count=%d, want %d", got, want)
+	}
+}
