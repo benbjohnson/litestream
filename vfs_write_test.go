@@ -841,6 +841,129 @@ func TestVFSFile_NewDatabase_WriteAndSync(t *testing.T) {
 	client.mu.Unlock()
 }
 
+func TestVFS_SyncWatermarkIsScopedPerDatabase(t *testing.T) {
+	// One VFS serves every database opened in the process (LitestreamVFSRegister creates a single
+	// instance), so the "highest TXID synced locally" high-water mark must be tracked per database.
+	// A per-process mark leaks the first database's TXID into the next one's sequence.
+	vfs := NewVFS(nil, slog.Default())
+
+	logger := slog.Default()
+	tmpDir := t.TempDir()
+
+	// First database: write one transaction, which lands at TXID 1.
+	clientA := newWriteTestReplicaClient()
+	f1 := NewVFSFile(clientA, "db1", logger)
+	f1.vfs = vfs
+	f1.writeEnabled = true
+	f1.dirty = make(map[uint32]int64)
+	f1.bufferPath = tmpDir + "/buffer-db1"
+	if err := f1.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f1.Close()
+	if _, err := f1.WriteAt([]byte("database one"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second database: a distinct replica and a distinct file. Its first transaction must be
+	// TXID 1 as well, because nothing has been synced to *its* replica.
+	clientB := newWriteTestReplicaClient()
+	f2 := NewVFSFile(clientB, "db2", logger)
+	f2.vfs = vfs
+	f2.writeEnabled = true
+	f2.dirty = make(map[uint32]int64)
+	f2.bufferPath = tmpDir + "/buffer-db2"
+	if err := f2.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+
+	// SQLite takes RESERVED at the start of a write transaction; this is where the leaked mark
+	// used to be applied.
+	if err := f2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	if f2.expectedTXID != 0 || f2.pendingTXID != 1 {
+		t.Errorf("second database starts at expectedTXID=%d pendingTXID=%d, want 0 and 1",
+			f2.expectedTXID, f2.pendingTXID)
+	}
+
+	// Complete the write transactions the way SQLite does: RESERVED lock, write, unlock, sync.
+	// Sync is a no-op inside a transaction, so the unlock is part of the sequence and not a detail.
+	for i := range 2 {
+		if err := f2.Lock(sqlite3vfs.LockReserved); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f2.WriteAt([]byte("database two"), int64(i)*4096); err != nil {
+			t.Fatal(err)
+		}
+		if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
+			t.Fatal(err)
+		}
+		if err := f2.Sync(0); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	clientB.mu.Lock()
+	defer clientB.mu.Unlock()
+	if len(clientB.ltxFiles[0]) == 0 {
+		t.Fatalf("second replica received no LTX file: the leaked TXID mark made the file " +
+			"believe it was already synced at TXID 1")
+	}
+	if info := clientB.ltxFiles[0][0]; info.MinTXID != 1 || info.MaxTXID != 1 {
+		t.Errorf("second replica's first LTX is min=%d max=%d, want 1 and 1", info.MinTXID, info.MaxTXID)
+	}
+}
+
+func TestVFS_SyncWatermarkStillAppliesToTheSameDatabase(t *testing.T) {
+	// The mark exists for a reason: a second connection to the *same* database must continue from
+	// what the first one synced instead of reusing a stale TXID.
+	vfs := NewVFS(nil, slog.Default())
+
+	logger := slog.Default()
+	tmpDir := t.TempDir()
+	client := newWriteTestReplicaClient()
+
+	f1 := NewVFSFile(client, "same.db", logger)
+	f1.vfs = vfs
+	f1.writeEnabled = true
+	f1.dirty = make(map[uint32]int64)
+	f1.bufferPath = tmpDir + "/buffer-1"
+	if err := f1.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f1.Close()
+	if _, err := f1.WriteAt([]byte("first connection"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f1.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+
+	// A second connection to the same database, sharing the client and the file name.
+	f2 := NewVFSFile(client, "same.db", logger)
+	f2.vfs = vfs
+	f2.writeEnabled = true
+	f2.dirty = make(map[uint32]int64)
+	f2.bufferPath = tmpDir + "/buffer-2"
+	if err := f2.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+
+	if err := f2.Lock(sqlite3vfs.LockReserved); err != nil {
+		t.Fatal(err)
+	}
+	if f2.expectedTXID != 1 || f2.pendingTXID != 2 {
+		t.Errorf("second connection starts at expectedTXID=%d pendingTXID=%d, want 1 and 2",
+			f2.expectedTXID, f2.pendingTXID)
+	}
+}
+
 func TestVFSFile_NewDatabase_FileSize(t *testing.T) {
 	// Test that FileSize returns 0 for a new empty database
 	client := newWriteTestReplicaClient()

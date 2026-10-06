@@ -104,16 +104,39 @@ type VFS struct {
 	// Set to 0 to delete immediately after compaction.
 	L0Retention time.Duration
 
-	writeMu        sync.Mutex
-	writeFile      *VFSFile // current RESERVED lock holder (nil if none)
-	lastSyncedTXID ltx.TXID // highest TXID synced by any local connection
-	writeSeq       uint64   // atomic counter for unique buffer paths
+	writeMu   sync.Mutex
+	writeFile *VFSFile // current RESERVED lock holder (nil if none)
+	// Highest TXID synced locally, per database name. A single field was shared by every database
+	// in the process: LitestreamVFSRegister creates one VFS, so the first database's TXID leaked
+	// into the next one's sequence, which started a brand-new replica at TXID 2 and left it
+	// unreadable. Guarded by writeMu.
+	syncWatermarks map[string]ltx.TXID
+	writeSeq       uint64 // atomic counter for unique buffer paths
 
 	tempDirOnce sync.Once
 	tempDir     string
 	tempDirErr  error
 	tempFiles   sync.Map // canonical name -> absolute path
 	tempNames   sync.Map // canonical name -> struct{}{}
+}
+
+// syncWatermark returns the highest TXID synced locally for a database.
+//
+// The caller must hold vfs.writeMu.
+func (vfs *VFS) syncWatermark(name string) ltx.TXID {
+	return vfs.syncWatermarks[name]
+}
+
+// recordSyncWatermark raises the highest TXID synced locally for a database.
+//
+// The caller must hold vfs.writeMu.
+func (vfs *VFS) recordSyncWatermark(name string, txid ltx.TXID) {
+	if vfs.syncWatermarks == nil {
+		vfs.syncWatermarks = make(map[string]ltx.TXID)
+	}
+	if txid > vfs.syncWatermarks[name] {
+		vfs.syncWatermarks[name] = txid
+	}
 }
 
 func NewVFS(client ReplicaClient, logger *slog.Logger) *VFS {
@@ -269,9 +292,7 @@ func (vfs *VFS) openMainDB(name string, uriParameters map[string]string, flags s
 
 	if writeEnabled {
 		vfs.writeMu.Lock()
-		if f.expectedTXID > vfs.lastSyncedTXID {
-			vfs.lastSyncedTXID = f.expectedTXID
-		}
+		vfs.recordSyncWatermark(f.name, f.expectedTXID)
 		vfs.writeMu.Unlock()
 	}
 
@@ -2023,9 +2044,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
-		if f.expectedTXID > f.vfs.lastSyncedTXID {
-			f.vfs.lastSyncedTXID = f.expectedTXID
-		}
+		f.vfs.recordSyncWatermark(f.name, f.expectedTXID)
 		f.vfs.writeMu.Unlock()
 	}
 
@@ -2306,9 +2325,11 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 				return sqlite3vfs.BusyError
 			}
 			f.vfs.writeFile = f
-			if f.vfs.lastSyncedTXID > f.expectedTXID && len(f.dirty) == 0 {
-				f.expectedTXID = f.vfs.lastSyncedTXID
-				f.pendingTXID = f.vfs.lastSyncedTXID + 1
+			// Catch up to another connection to *this* database within the same process: it may
+			// have synced a newer transaction than this connection has seen.
+			if synced := f.vfs.syncWatermark(f.name); synced > f.expectedTXID && len(f.dirty) == 0 {
+				f.expectedTXID = synced
+				f.pendingTXID = synced + 1
 				f.pos = ltx.Pos{TXID: f.expectedTXID}
 			}
 			f.vfs.writeMu.Unlock()
