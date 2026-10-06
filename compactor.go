@@ -10,6 +10,8 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 )
 
 // Compactor handles compaction and retention for LTX files.
@@ -147,7 +149,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
-		rdrs = append(rdrs, f)
+		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
 	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction
@@ -157,7 +159,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	go func() {
 		comp, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
@@ -165,6 +167,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}()
 
 	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	_ = pr.CloseWithError(err)
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)
 	}

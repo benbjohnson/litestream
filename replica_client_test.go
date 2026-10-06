@@ -11,6 +11,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/mock"
 	"github.com/benbjohnson/litestream/s3"
 )
 
@@ -471,17 +473,7 @@ func TestReplicaClient_S3_UnsignedPayloadRejected(t *testing.T) {
 }
 
 func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
-	testHostKeyPEM := `-----BEGIN OPENSSH PRIVATE KEY-----
-b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
-QyNTUxOQAAACAJytPhncDnpV5QF3ai8f6r0u1hzK96x+81tvtA7ZiuawAAAJAIcGGVCHBh
-lQAAAAtzc2gtZWQyNTUxOQAAACAJytPhncDnpV5QF3ai8f6r0u1hzK96x+81tvtA7Ziuaw
-AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
-7WHMr3rH7zW2+0DtmK5rAAAADGZlbGl4QGJvcmVhcwE=
------END OPENSSH PRIVATE KEY-----`
-	privateKey, err := ssh.ParsePrivateKey([]byte(testHostKeyPEM))
-	if err != nil {
-		t.Fatal(err)
-	}
+	privateKey := mustParseTestSFTPHostKey(t)
 
 	t.Run("ValidHostKey", func(t *testing.T) {
 		addr := testingutil.MockSFTPServer(t, privateKey)
@@ -492,7 +484,7 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		c.Host = addr
 		c.HostKey = expectedHostKey
 
-		err = c.Init(context.Background())
+		err := c.Init(context.Background())
 		if err != nil {
 			t.Fatalf("SFTP connection failed: %v", err)
 		}
@@ -506,7 +498,7 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		c.Host = addr
 		c.HostKey = invalidHostKey
 
-		err = c.Init(context.Background())
+		err := c.Init(context.Background())
 		if err == nil {
 			t.Fatalf("SFTP connection established despite invalid host key")
 		}
@@ -515,12 +507,18 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		}
 	})
 	t.Run("IgnoreHostKey", func(t *testing.T) {
+		previousLogger := slog.Default()
+		t.Cleanup(func() { slog.SetDefault(previousLogger) })
+
+		var capturedMu sync.Mutex
 		var captured []string
 		slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 			ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 				if a.Key == slog.MessageKey {
+					capturedMu.Lock()
 					captured = append(captured, a.Value.String())
+					capturedMu.Unlock()
 				}
 				return a
 			},
@@ -532,18 +530,133 @@ AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
 		c.User = "foo"
 		c.Host = addr
 
-		err = c.Init(context.Background())
+		err := c.Init(context.Background())
 		if err != nil {
 			t.Fatalf("SFTP connection failed: %v", err)
 		}
 
-		if !slices.ContainsFunc(captured, func(msg string) bool {
+		capturedMu.Lock()
+		foundWarning := slices.ContainsFunc(captured, func(msg string) bool {
 			return strings.Contains(msg, "sftp host key not verified")
-		}) {
+		})
+		capturedMu.Unlock()
+		if !foundWarning {
 			t.Errorf("Expected warning not found")
 		}
-
 	})
+}
+
+func TestReplicaClient_SFTP_WriteLTXFileAtomic(t *testing.T) {
+	privateKey := mustParseTestSFTPHostKey(t)
+	addr := testingutil.MockSFTPServer(t, privateKey)
+	expectedHostKey := string(ssh.MarshalAuthorizedKey(privateKey.PublicKey()))
+
+	c := testingutil.NewSFTPReplicaClient(t)
+	c.User = "foo"
+	c.Host = addr
+	c.HostKey = expectedHostKey
+	c.Path = t.TempDir()
+
+	data := createLTXData(1, 1, bytes.Repeat([]byte("x"), 1024))
+	r := newBlockingReader(data, ltx.HeaderSize)
+	errCh := make(chan error, 1)
+
+	go func() {
+		_, err := c.WriteLTXFile(context.Background(), 0, 1, 1, r)
+		errCh <- err
+	}()
+
+	select {
+	case <-r.blocked:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for blocked SFTP write")
+	}
+
+	itr, err := c.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		close(r.release)
+		t.Fatal(err)
+	}
+	if itr.Next() {
+		close(r.release)
+		t.Fatalf("LTXFiles exposed in-progress file: %+v", itr.Item())
+	}
+	if err := itr.Close(); err != nil {
+		close(r.release)
+		t.Fatal(err)
+	}
+
+	close(r.release)
+	select {
+	case err := <-errCh:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for SFTP write")
+	}
+
+	itr, err = c.LTXFiles(context.Background(), 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+	if !itr.Next() {
+		t.Fatal("expected completed LTX file")
+	}
+	info := itr.Item()
+	if info.MinTXID != 1 || info.MaxTXID != 1 {
+		t.Fatalf("unexpected LTX file: %+v", info)
+	}
+	if itr.Next() {
+		t.Fatalf("unexpected extra LTX file: %+v", itr.Item())
+	}
+}
+
+func mustParseTestSFTPHostKey(t *testing.T) ssh.Signer {
+	t.Helper()
+
+	privateKey, err := ssh.ParsePrivateKey([]byte(testSFTPHostKeyPEM))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return privateKey
+}
+
+const testSFTPHostKeyPEM = `-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACAJytPhncDnpV5QF3ai8f6r0u1hzK96x+81tvtA7ZiuawAAAJAIcGGVCHBh
+lQAAAAtzc2gtZWQyNTUxOQAAACAJytPhncDnpV5QF3ai8f6r0u1hzK96x+81tvtA7Ziuaw
+AAAEDzV1D6COyvFGhSiZa6ll9aXZ2IMWED3KGrvCNjEEtYHwnK0+GdwOelXlAXdqLx/qvS
+7WHMr3rH7zW2+0DtmK5rAAAADGZlbGl4QGJvcmVhcwE=
+-----END OPENSSH PRIVATE KEY-----`
+
+type blockingReader struct {
+	r          *bytes.Reader
+	blockAfter int64
+	blocked    chan struct{}
+	release    chan struct{}
+	once       sync.Once
+	n          int64
+}
+
+func newBlockingReader(data []byte, blockAfter int64) *blockingReader {
+	return &blockingReader{
+		r:          bytes.NewReader(data),
+		blockAfter: blockAfter,
+		blocked:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+}
+
+func (r *blockingReader) Read(p []byte) (int, error) {
+	if r.n >= r.blockAfter {
+		r.once.Do(func() { close(r.blocked) })
+		<-r.release
+	}
+	n, err := r.r.Read(p)
+	r.n += int64(n)
+	return n, err
 }
 
 // TestReplicaClient_S3_MultipartThresholds tests multipart upload behavior at various
@@ -959,4 +1072,27 @@ func TestReplicaClient_PITR_CalcRestorePlanWithManyFiles(t *testing.T) {
 			}
 		})
 	})
+}
+
+// A replica can return fewer bytes than a page index footer occupies, for
+// example if the file is truncated. That must surface as an error rather than
+// panicking on a negative slice index.
+func TestFetchPageIndex_ShortRead(t *testing.T) {
+	client := &mock.ReplicaClient{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return io.NopCloser(bytes.NewReader([]byte("short"))), nil
+		},
+	}
+
+	_, err := litestream.FetchPageIndex(context.Background(), client, &ltx.FileInfo{
+		Level:   0,
+		MinTXID: 1,
+		MaxTXID: 1,
+		Size:    5,
+	})
+	if err == nil {
+		t.Fatal("expected an error for a truncated ltx file")
+	} else if !strings.Contains(err.Error(), "too short") {
+		t.Fatalf("unexpected error: %v", err)
+	}
 }

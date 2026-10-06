@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -314,6 +315,50 @@ func mustBuildIncrementalLTX(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize,
 	return buf.Bytes()
 }
 
+// mustBuildSnapshotLTX encodes an LTX file containing the given pages
+// numbered sequentially from pgno 1 with commit set to the page count.
+func mustBuildSnapshotLTX(tb testing.TB, minTXID, maxTXID ltx.TXID, pageSize uint32, pages [][]byte) []byte {
+	tb.Helper()
+
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		tb.Fatal(err)
+	}
+
+	hdr := ltx.Header{
+		Version:   ltx.Version,
+		Flags:     ltx.HeaderFlagNoChecksum,
+		PageSize:  pageSize,
+		Commit:    uint32(len(pages)),
+		MinTXID:   minTXID,
+		MaxTXID:   maxTXID,
+		Timestamp: time.Now().UnixMilli(),
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		tb.Fatal(err)
+	}
+	for i, page := range pages {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(i + 1)}, page); err != nil {
+			tb.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		tb.Fatal(err)
+	}
+
+	return buf.Bytes()
+}
+
+// newSQLiteHeaderPage returns a page containing a minimal SQLite file header.
+func newSQLiteHeaderPage(pageSize uint32) []byte {
+	page := make([]byte, pageSize)
+	copy(page, "SQLite format 3\x00")
+	binary.BigEndian.PutUint16(page[16:18], uint16(pageSize))
+	page[18], page[19] = 0x01, 0x01
+	return page
+}
+
 func mustCreateWritableDBFile(tb testing.TB) *os.File {
 	tb.Helper()
 
@@ -410,5 +455,91 @@ func TestCheckIntegrity_CorruptDB(t *testing.T) {
 	err = checkIntegrity(context.Background(), dbPath, IntegrityCheckFull)
 	if err == nil {
 		t.Fatal("expected integrity check to fail on corrupt database")
+	}
+}
+
+func TestApplyLTXFile_TruncatesAfterWrite(t *testing.T) {
+	const pageSize = 4096
+
+	info := &ltx.FileInfo{Level: 0, MinTXID: 10, MaxTXID: 10}
+
+	page2 := bytes.Repeat([]byte{0xAB}, pageSize)
+	ltxData := mustBuildSnapshotLTX(t, info.MinTXID, info.MaxTXID, pageSize, [][]byte{
+		newSQLiteHeaderPage(pageSize),
+		page2,
+	})
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(ltxData)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("applyLTXFile: %v", err)
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSize := int64(2) * int64(pageSize)
+	if fi.Size() != expectedSize {
+		t.Fatalf("file size=%d, want %d", fi.Size(), expectedSize)
+	}
+
+	readBuf := make([]byte, pageSize)
+	if _, err := f.ReadAt(readBuf, int64(pageSize)); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(readBuf, page2) {
+		t.Fatal("page 2 data mismatch after applyLTXFile")
+	}
+}
+
+func TestApplyLTXFile_MultiplePages(t *testing.T) {
+	const pageSize = 4096
+	const numPages = 5
+
+	info := &ltx.FileInfo{Level: 0, MinTXID: 1, MaxTXID: 1}
+
+	pages := make([][]byte, numPages)
+	for i := range pages {
+		pages[i] = bytes.Repeat([]byte{byte(0x10 + i)}, pageSize)
+	}
+	pages[0] = newSQLiteHeaderPage(pageSize)
+	ltxData := mustBuildSnapshotLTX(t, info.MinTXID, info.MaxTXID, pageSize, pages)
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(ltxData)), nil
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+		t.Fatalf("applyLTXFile: %v", err)
+	}
+
+	fi, err := f.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedSize := int64(numPages) * int64(pageSize)
+	if fi.Size() != expectedSize {
+		t.Fatalf("file size=%d, want %d", fi.Size(), expectedSize)
+	}
+
+	readBuf := make([]byte, pageSize)
+	for i := uint32(0); i < numPages; i++ {
+		if _, err := f.ReadAt(readBuf, int64(i)*int64(pageSize)); err != nil {
+			t.Fatalf("read page %d: %v", i+1, err)
+		}
+		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
+			t.Fatalf("page %d data mismatch", i+1)
+		}
 	}
 }

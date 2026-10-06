@@ -411,7 +411,7 @@ func TestServer_HandleRegister(t *testing.T) {
 
 		var result litestream.RegisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "already_exists", result.Status)
+		require.Equal(t, "already_registered", result.Status)
 	})
 }
 
@@ -462,7 +462,8 @@ func TestServer_HandleUnregister(t *testing.T) {
 
 		var result litestream.UnregisterDatabaseResponse
 		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
-		require.Equal(t, "unregistered", result.Status)
+		require.Equal(t, "already_unregistered", result.Status)
+		require.Zero(t, result.TXID)
 	})
 
 	t.Run("Success", func(t *testing.T) {
@@ -653,6 +654,55 @@ func TestServer_HandleSync(t *testing.T) {
 		require.NoError(t, json.NewDecoder(resp2.Body).Decode(&result2))
 		require.Equal(t, "no_change", result2.Status)
 		require.Equal(t, result1.TXID, result2.TXID)
+	})
+}
+
+func TestServer_HandleSyncStatus(t *testing.T) {
+	t.Run("AllDatabases", func(t *testing.T) {
+		db, sqldb := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db, sqldb)
+
+		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		resp, err := client.Get("http://localhost/debug/sync-status")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+
+		var result litestream.SyncDiagnosticsResponse
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+		require.Len(t, result.Databases, 1)
+		require.Equal(t, db.Path(), result.Databases[0].Path)
+		require.False(t, result.Databases[0].Active)
+	})
+
+	t.Run("DatabaseNotFound", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		client := newSocketClient(t, server.SocketPath)
+		resp, err := client.Get("http://localhost/debug/sync-status?path=/nonexistent/db")
+		require.NoError(t, err)
+		defer resp.Body.Close()
+
+		require.Equal(t, http.StatusNotFound, resp.StatusCode)
 	})
 }
 

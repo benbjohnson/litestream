@@ -13,6 +13,7 @@ import (
 	"os/user"
 	"path"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -35,10 +36,14 @@ import (
 	"github.com/benbjohnson/litestream/webdav"
 )
 
-// Build information.
-var (
-	Version = "(development build)"
-)
+// Version is set via -ldflags "-X main.Version=..." on release and Makefile
+// builds; otherwise it is resolved from embedded VCS build info at startup.
+var Version = defaultVersion
+
+func init() {
+	bi, _ := debug.ReadBuildInfo()
+	Version = resolveVersion(Version, bi)
+}
 
 // errStop is a terminal error for indicating program should quit.
 var errStop = errors.New("stop")
@@ -49,7 +54,7 @@ var (
 	ErrInvalidSnapshotRetention        = errors.New("snapshot retention must be greater than 0")
 	ErrInvalidCompactionInterval       = errors.New("compaction interval must be greater than 0")
 	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
-	ErrInvalidL0Retention              = errors.New("l0 retention must be greater than 0")
+	ErrInvalidL0Retention              = errors.New("l0 retention must not be negative")
 	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
 	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
 	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
@@ -80,12 +85,32 @@ func main() {
 	internal.InitLog(os.Stdout, "INFO", "text", false)
 
 	m := NewMain()
-	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, flag.ErrHelp) || errors.Is(err, errStop) {
+	if err := m.Run(context.Background(), os.Args[1:]); errors.Is(err, errStop) {
+		os.Exit(1)
+	} else if errors.Is(err, flag.ErrHelp) {
+		for _, arg := range os.Args[1:] {
+			if arg == "-h" || arg == "-help" || arg == "--help" {
+				os.Exit(0)
+			}
+		}
 		os.Exit(1)
 	} else if err != nil {
-		slog.Error("failed to run", "error", err)
+		_, _ = fmt.Fprintf(os.Stderr, "Error: %s\n", err)
+		var usageErr *usageError
+		if errors.As(err, &usageErr) && usageErr.hint != "" {
+			_, _ = fmt.Fprintf(os.Stderr, "Try: %s\n", usageErr.hint)
+		}
 		os.Exit(1)
 	}
+}
+
+type usageError struct {
+	message string
+	hint    string
+}
+
+func (e *usageError) Error() string {
+	return e.message
 }
 
 // Main represents the main program execution.
@@ -202,7 +227,7 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		fmt.Fprintln(os.Stderr, "Warning: 'wal' command is deprecated, please use 'ltx' instead")
 		return (&LTXCommand{}).Run(ctx, args)
 	default:
-		if cmd == "help" || cmd == "-h" || cmd == "--help" {
+		if cmd == "help" || cmd == "-h" || cmd == "-help" || cmd == "--help" {
 			m.Usage()
 			return nil
 		} else if cmd == "" || strings.HasPrefix(cmd, "-") {
@@ -328,6 +353,42 @@ func (c *Config) propagateGlobalSettings() {
 	}
 }
 
+func (c *Config) applyDBSnapshotConfig(globalIntervalSet, globalRetentionSet bool) error {
+	var interval *time.Duration
+	var intervalDB string
+	var retention *time.Duration
+	var retentionDB string
+
+	for _, db := range c.DBs {
+		dbID := db.Path
+		if dbID == "" {
+			dbID = db.Dir
+		}
+		if db.Snapshot.Interval != nil {
+			if interval != nil && *interval != *db.Snapshot.Interval {
+				return fmt.Errorf("conflicting database snapshot intervals: %s has %v, %s has %v", intervalDB, *interval, dbID, *db.Snapshot.Interval)
+			}
+			interval = db.Snapshot.Interval
+			intervalDB = dbID
+		}
+		if db.Snapshot.Retention != nil {
+			if retention != nil && *retention != *db.Snapshot.Retention {
+				return fmt.Errorf("conflicting database snapshot retentions: %s has %v, %s has %v", retentionDB, *retention, dbID, *db.Snapshot.Retention)
+			}
+			retention = db.Snapshot.Retention
+			retentionDB = dbID
+		}
+	}
+
+	if !globalIntervalSet && interval != nil {
+		c.Snapshot.Interval = interval
+	}
+	if !globalRetentionSet && retention != nil {
+		c.Snapshot.Retention = retention
+	}
+	return nil
+}
+
 // DefaultConfig returns a new instance of Config with defaults set.
 func DefaultConfig() Config {
 	defaultSnapshotInterval := 24 * time.Hour
@@ -371,7 +432,7 @@ func (c *Config) Validate() error {
 			Value: *c.Snapshot.Retention,
 		}
 	}
-	if c.L0Retention != nil && *c.L0Retention <= 0 {
+	if c.L0Retention != nil && *c.L0Retention < 0 {
 		return &ConfigValidationError{
 			Err:   ErrInvalidL0Retention,
 			Field: "l0-retention",
@@ -428,6 +489,7 @@ func (c *Config) Validate() error {
 	}
 
 	// Validate database configs
+	seenPaths := make(map[string]int) // cleaned path -> 1-based config index
 	for idx, db := range c.DBs {
 		// Validate that either path or dir is specified, but not both
 		if db.Path != "" && db.Dir != "" {
@@ -437,6 +499,17 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("database config #%d: must specify either 'path' or 'dir'", idx+1)
 		}
 
+		// Reject the same database path listed twice. The metadata directory is
+		// derived from the path, so two entries would share it and race on the
+		// same LTX temp files.
+		if db.Path != "" {
+			key := filepath.Clean(db.Path)
+			if first, ok := seenPaths[key]; ok {
+				return fmt.Errorf("database config #%d: duplicate path %q (already used by database config #%d); each database can be listed only once", idx+1, db.Path, first)
+			}
+			seenPaths[key] = idx + 1
+		}
+
 		// When using dir, pattern must be specified
 		if db.Dir != "" && db.Pattern == "" {
 			return fmt.Errorf("database config #%d: 'pattern' is required when using 'dir'", idx+1)
@@ -444,11 +517,32 @@ func (c *Config) Validate() error {
 		if db.Watch && db.Dir == "" {
 			return fmt.Errorf("database config #%d: 'watch' can only be enabled with a directory", idx+1)
 		}
+		if db.MetaDir != nil && db.Dir == "" {
+			return fmt.Errorf("database config #%d: 'meta-dir' can only be used with a directory", idx+1)
+		}
+		if db.MetaPath != nil && db.MetaDir != nil {
+			return fmt.Errorf("database config #%d: cannot specify both 'meta-path' and 'meta-dir'", idx+1)
+		}
 
 		// Use path or dir for identifying the config in error messages
 		dbIdentifier := db.Path
 		if dbIdentifier == "" {
 			dbIdentifier = db.Dir
+		}
+
+		if db.Snapshot.Interval != nil && *db.Snapshot.Interval <= 0 {
+			return &ConfigValidationError{
+				Err:   ErrInvalidSnapshotInterval,
+				Field: fmt.Sprintf("dbs[%s].snapshot.interval", dbIdentifier),
+				Value: *db.Snapshot.Interval,
+			}
+		}
+		if db.Snapshot.Retention != nil && *db.Snapshot.Retention <= 0 {
+			return &ConfigValidationError{
+				Err:   ErrInvalidSnapshotRetention,
+				Field: fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
+				Value: *db.Snapshot.Retention,
+			}
 		}
 
 		// Validate sync intervals for replicas
@@ -552,6 +646,15 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		}))
 	}
 
+	var raw struct {
+		Snapshot *SnapshotConfig `yaml:"snapshot"`
+	}
+	if err := yaml.Unmarshal(buf, &raw); err != nil {
+		return config, err
+	}
+	globalSnapshotIntervalSet := raw.Snapshot != nil && raw.Snapshot.Interval != nil
+	globalSnapshotRetentionSet := raw.Snapshot != nil && raw.Snapshot.Retention != nil
+
 	// Save defaults before unmarshaling
 	defaultSnapshotInterval := config.Snapshot.Interval
 	defaultSnapshotRetention := config.Snapshot.Retention
@@ -574,6 +677,9 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 	if config.L0RetentionCheckInterval == nil {
 		config.L0RetentionCheckInterval = defaultL0RetentionCheckInterval
+	}
+	if err := config.applyDBSnapshotConfig(globalSnapshotIntervalSet, globalSnapshotRetentionSet); err != nil {
+		return config, err
 	}
 
 	// Normalize paths.
@@ -619,12 +725,15 @@ type DBConfig struct {
 	Pattern            string         `yaml:"pattern"`   // File pattern to match (e.g., "*.db", "*.sqlite")
 	Recursive          bool           `yaml:"recursive"` // Scan subdirectories recursively
 	Watch              bool           `yaml:"watch"`     // Enable directory monitoring for changes
+	Snapshot           SnapshotConfig `yaml:"snapshot"`
 	MetaPath           *string        `yaml:"meta-path"`
+	MetaDir            *string        `yaml:"meta-dir"`
 	MonitorInterval    *time.Duration `yaml:"monitor-interval"`
 	CheckpointInterval *time.Duration `yaml:"checkpoint-interval"`
 	BusyTimeout        *time.Duration `yaml:"busy-timeout"`
 	MinCheckpointPageN *int           `yaml:"min-checkpoint-page-count"`
 	TruncatePageN      *int           `yaml:"truncate-page-n"`
+	MaxSyncWALBytes    *int64         `yaml:"max-sync-wal-bytes"`
 
 	RestoreIfDBNotExists bool `yaml:"restore-if-db-not-exists"`
 
@@ -634,6 +743,10 @@ type DBConfig struct {
 
 // NewDBFromConfig instantiates a DB based on a configuration.
 func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
+	if dbc.MetaDir != nil {
+		return nil, fmt.Errorf("'meta-dir' can only be used with a directory")
+	}
+
 	configPath, err := expand(dbc.Path)
 	if err != nil {
 		return nil, err
@@ -665,6 +778,9 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	}
 	if dbc.TruncatePageN != nil {
 		db.TruncatePageN = *dbc.TruncatePageN
+	}
+	if dbc.MaxSyncWALBytes != nil {
+		db.MaxSyncWALBytes = *dbc.MaxSyncWALBytes
 	}
 
 	// Instantiate and attach replica.
@@ -703,6 +819,9 @@ func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 
 	if dbc.Pattern == "" {
 		return nil, fmt.Errorf("pattern is required for directory replication")
+	}
+	if dbc.MetaPath != nil && dbc.MetaDir != nil {
+		return nil, fmt.Errorf("cannot specify both 'meta-path' and 'meta-dir'")
 	}
 
 	dirPath, err := expand(dbc.Dir)
@@ -763,13 +882,23 @@ func newDBFromDirectoryEntry(dbc *DBConfig, dirPath, dbPath string) (*litestream
 	// Ensure every database discovered beneath a directory receives a unique
 	// metadata path. Without this, all databases share the same meta-path and
 	// clobber each other's replication state.
-	if dbc.MetaPath != nil {
+	switch {
+	case dbc.MetaDir != nil:
+		baseMetaDir, err := expand(*dbc.MetaDir)
+		if err != nil {
+			return nil, fmt.Errorf("failed to expand meta dir for %s: %w", dbPath, err)
+		}
+		metaPathCopy := filepath.Join(baseMetaDir, relPath+litestream.MetaDirSuffix)
+		dbConfigCopy.MetaPath = &metaPathCopy
+		dbConfigCopy.MetaDir = nil
+	case dbc.MetaPath != nil:
 		baseMetaPath, err := expand(*dbc.MetaPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to expand meta path for %s: %w", dbPath, err)
 		}
 		metaPathCopy := deriveMetaPathForDirectoryEntry(baseMetaPath, relPath)
 		dbConfigCopy.MetaPath = &metaPathCopy
+		dbConfigCopy.MetaDir = nil
 	}
 
 	// Deep copy replica config and make path unique per database.
@@ -985,23 +1114,29 @@ type ReplicaSettings struct {
 	SyncInterval       *time.Duration `yaml:"sync-interval"`
 	ValidationInterval *time.Duration `yaml:"validation-interval"`
 
+	// Maximum L0 files to upload in a single monitor sync run.
+	// Set to zero to process all pending L0 files in one run.
+	MaxSyncLTXFiles *int `yaml:"max-sync-ltx-files"`
+
 	// If true, automatically reset local state when LTX errors are detected.
 	// This allows recovery from corrupted/missing LTX files by forcing a fresh sync.
 	// Disabled by default to prevent silent data loss scenarios.
 	AutoRecover *bool `yaml:"auto-recover"`
 
 	// S3 settings
-	AccessKeyID       string    `yaml:"access-key-id"`
-	SecretAccessKey   string    `yaml:"secret-access-key"`
-	Region            string    `yaml:"region"`
-	Bucket            string    `yaml:"bucket"`
-	Endpoint          string    `yaml:"endpoint"`
-	ForcePathStyle    *bool     `yaml:"force-path-style"`
-	SignPayload       *bool     `yaml:"sign-payload"`
-	RequireContentMD5 *bool     `yaml:"require-content-md5"`
-	SkipVerify        bool      `yaml:"skip-verify"`
-	PartSize          *ByteSize `yaml:"part-size"`
-	Concurrency       *int      `yaml:"concurrency"`
+	AccessKeyID        string    `yaml:"access-key-id"`
+	SecretAccessKey    string    `yaml:"secret-access-key"`
+	Region             string    `yaml:"region"`
+	Bucket             string    `yaml:"bucket"`
+	Endpoint           string    `yaml:"endpoint"`
+	ForcePathStyle     *bool     `yaml:"force-path-style"`
+	SignPayload        *bool     `yaml:"sign-payload"`
+	SignAcceptEncoding *bool     `yaml:"sign-accept-encoding"`
+	RequireContentMD5  *bool     `yaml:"require-content-md5"`
+	SkipVerify         bool      `yaml:"skip-verify"`
+	StorageClass       string    `yaml:"storage-class"`
+	PartSize           *ByteSize `yaml:"part-size"`
+	Concurrency        *int      `yaml:"concurrency"`
 
 	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
 	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
@@ -1036,7 +1171,7 @@ type ReplicaSettings struct {
 	NKey          string         `yaml:"nkey"`
 	Username      string         `yaml:"username"`
 	Token         string         `yaml:"token"`
-	TLS           bool           `yaml:"tls"`
+	TLS           *bool          `yaml:"tls"`
 	RootCAs       []string       `yaml:"root-cas"`
 	ClientCert    string         `yaml:"client-cert"`
 	ClientKey     string         `yaml:"client-key"`
@@ -1064,6 +1199,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.ValidationInterval == nil && src.ValidationInterval != nil {
 		rs.ValidationInterval = src.ValidationInterval
+	}
+	if rs.MaxSyncLTXFiles == nil && src.MaxSyncLTXFiles != nil {
+		rs.MaxSyncLTXFiles = src.MaxSyncLTXFiles
 	}
 
 	// Recovery settings
@@ -1093,11 +1231,17 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	if rs.SignPayload == nil {
 		rs.SignPayload = src.SignPayload
 	}
+	if rs.SignAcceptEncoding == nil {
+		rs.SignAcceptEncoding = src.SignAcceptEncoding
+	}
 	if rs.RequireContentMD5 == nil {
 		rs.RequireContentMD5 = src.RequireContentMD5
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
+	}
+	if rs.StorageClass == "" {
+		rs.StorageClass = src.StorageClass
 	}
 
 	// S3 SSE settings
@@ -1161,7 +1305,7 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	if rs.Token == "" {
 		rs.Token = src.Token
 	}
-	if !rs.TLS {
+	if rs.TLS == nil {
 		rs.TLS = src.TLS
 	}
 	if len(rs.RootCAs) == 0 {
@@ -1223,6 +1367,9 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 	if v := c.SyncInterval; v != nil {
 		r.SyncInterval = *v
 	}
+	if v := c.MaxSyncLTXFiles; v != nil {
+		r.MaxSyncLTXFiles = *v
+	}
 	if v := c.AutoRecover; v != nil {
 		r.AutoRecoverEnabled = *v
 	}
@@ -1262,7 +1409,7 @@ func NewReplicaFromConfig(c *ReplicaConfig, db *litestream.DB) (_ *litestream.Re
 			return nil, err
 		}
 	default:
-		return nil, fmt.Errorf("unknown replica type in config: %q", c.Type)
+		return nil, fmt.Errorf("unknown replica type in config: %q", c.ReplicaType())
 	}
 
 	r.Client.SetLogger(r.Logger())
@@ -1313,9 +1460,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
+	storageClass := c.StorageClass
 	signSetting := newBoolSetting(true)
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
+	}
+	signAcceptEncodingSetting := newBoolSetting(true)
+	if v := c.SignAcceptEncoding; v != nil {
+		signAcceptEncodingSetting.Set(*v)
 	}
 	requireSetting := newBoolSetting(true)
 	if v := c.RequireContentMD5; v != nil {
@@ -1331,11 +1483,18 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Apply settings from URL, if specified.
 	var (
-		endpointWasSet        bool
-		usignPayload          bool
-		usignPayloadSet       bool
-		urequireContentMD5    bool
-		urequireContentMD5Set bool
+		endpointWasSet         bool
+		usignPayload           bool
+		usignPayloadSet        bool
+		usignAcceptEncoding    bool
+		usignAcceptEncodingSet bool
+		urequireContentMD5     bool
+		urequireContentMD5Set  bool
+		ustorageClass          string
+		upartSize              int64
+		upartSizeSet           bool
+		uconcurrency           int64
+		uconcurrencySet        bool
 	)
 	if endpoint != "" {
 		endpointWasSet = true
@@ -1385,9 +1544,30 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			usignPayload = v
 			usignPayloadSet = true
 		}
+		if v, ok := litestream.BoolQueryValue(query, "signAcceptEncoding", "sign-accept-encoding"); ok {
+			usignAcceptEncoding = v
+			usignAcceptEncodingSet = true
+		}
 		if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
+		}
+		if v := query.Get("storageClass"); v != "" {
+			ustorageClass = v
+		} else if v := query.Get("storage-class"); v != "" {
+			ustorageClass = v
+		}
+		if v, ok, err := litestream.IntQueryValue(query, "partSize", "part-size"); err != nil {
+			return nil, err
+		} else if ok {
+			upartSize = v
+			upartSizeSet = true
+		}
+		if v, ok, err := litestream.IntQueryValue(query, "concurrency"); err != nil {
+			return nil, err
+		} else if ok {
+			uconcurrency = v
+			uconcurrencySet = true
 		}
 
 		// Only apply URL parts to field that have not been overridden.
@@ -1403,11 +1583,17 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if endpoint == "" {
 			endpoint = uendpoint
 		}
+		if storageClass == "" {
+			storageClass = ustorageClass
+		}
 		if !forcePathStyle {
 			forcePathStyle = uforcePathStyle
 		}
 		if !signSetting.set && usignPayloadSet {
 			signSetting.Set(usignPayload)
+		}
+		if !signAcceptEncodingSetting.set && usignAcceptEncodingSet {
+			signAcceptEncodingSetting.Set(usignAcceptEncoding)
 		}
 		if !requireSetting.set && urequireContentMD5Set {
 			requireSetting.Set(urequireContentMD5)
@@ -1421,6 +1607,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	// Detect S3-compatible provider endpoints for applying appropriate defaults.
 	// These providers require specific settings to work correctly with AWS SDK v2.
+	isHetzner := litestream.IsHetznerEndpoint(endpoint)
 	isTigris := litestream.IsTigrisEndpoint(endpoint)
 	if !isTigris && !endpointWasSet && litestream.IsTigrisEndpoint(c.Endpoint) {
 		isTigris = true
@@ -1443,7 +1630,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
@@ -1464,15 +1651,27 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	client.StorageClass = storageClass
 
 	client.SignPayload = signSetting.value
+	client.SignAcceptEncoding = signAcceptEncodingSetting.value
 	client.RequireContentMD5 = requireSetting.value
 
 	if isCloudflareR2 {
 		client.Concurrency = s3.DefaultR2Concurrency
 	}
+	if isTigris {
+		client.Concurrency = s3.DefaultTigrisConcurrency
+		client.PartSize = s3.DefaultTigrisPartSize
+	}
 
-	// Apply upload configuration if specified.
+	// Apply upload configuration from URL query, then config overrides.
+	if upartSizeSet {
+		client.PartSize = upartSize
+	}
+	if uconcurrencySet {
+		client.Concurrency = int(uconcurrency)
+	}
 	if c.PartSize != nil {
 		client.PartSize = int64(*c.PartSize)
 	}
@@ -1765,6 +1964,9 @@ func newNATSReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ 
 	client.Token = c.Token
 
 	// Set TLS options
+	if c.TLS != nil {
+		client.TLS = *c.TLS
+	}
 	client.RootCAs = c.RootCAs
 	client.ClientCert = c.ClientCert
 	client.ClientKey = c.ClientKey

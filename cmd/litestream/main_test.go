@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -177,6 +179,32 @@ dbs:
 			t.Fatalf("Replica.URL=%v, want %v", got, want)
 		}
 	})
+
+	t.Run("DirectoryMetaDir", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - dir: /path/to/dbs
+    pattern: "*.db"
+    recursive: true
+    meta-dir: /path/to/litestream-state
+    replica:
+      url: file:///path/to/replicas
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if config.DBs[0].MetaDir == nil {
+			t.Fatal("expected MetaDir to be set")
+		}
+		if got, want := *config.DBs[0].MetaDir, "/path/to/litestream-state"; got != want {
+			t.Fatalf("DB.MetaDir=%v, want %v", got, want)
+		}
+	})
 }
 
 func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
@@ -219,6 +247,30 @@ func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
 	}
 }
 
+func TestNewDBFromConfig_MetaDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	dbPath := filepath.Join(tmpDir, "db.sqlite")
+	metaDir := filepath.Join(tmpDir, "litestream-state")
+	replicaPath := filepath.Join(tmpDir, "replica")
+
+	config := &main.DBConfig{
+		Path:    dbPath,
+		MetaDir: &metaDir,
+		Replica: &main.ReplicaConfig{
+			Type: "file",
+			Path: replicaPath,
+		},
+	}
+
+	_, err := main.NewDBFromConfig(config)
+	if err == nil {
+		t.Fatal("expected error when meta-dir is used without dir")
+	}
+	if !strings.Contains(err.Error(), "'meta-dir' can only be used with a directory") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 func TestNewFileReplicaFromConfig(t *testing.T) {
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{Path: "/foo"}, nil)
 	if err != nil {
@@ -231,6 +283,24 @@ func TestNewFileReplicaFromConfig(t *testing.T) {
 }
 
 func TestNewS3ReplicaFromConfig(t *testing.T) {
+	t.Run("ExplicitTypeWithEndpointLikeURL", func(t *testing.T) {
+		c := &main.ReplicaConfig{
+			Type: "s3",
+			URL:  "rook-ceph-rgw:8080",
+			Path: "path",
+			ReplicaSettings: main.ReplicaSettings{
+				Bucket: "bucket",
+			},
+		}
+		_, err := main.NewReplicaFromConfig(c, nil)
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if got, want := err.Error(), "cannot specify url & path for s3 replica"; got != want {
+			t.Fatalf("error=%q, want %q", got, want)
+		}
+	})
+
 	t.Run("URL", func(t *testing.T) {
 		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo/bar"}, nil)
 		if err != nil {
@@ -353,6 +423,128 @@ func TestNewGSReplicaFromConfig(t *testing.T) {
 		t.Fatalf("Bucket=%s, want %s", got, want)
 	} else if got, want := client.Path, "bar"; got != want {
 		t.Fatalf("Path=%s, want %s", got, want)
+	}
+}
+
+func TestNewNATSReplicaFromConfig_TLS(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: true
+      root-cas: [ca.pem]
+      client-cert: client.pem
+      client-key: client-key.pem
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, ok := r.Client.(*nats.ReplicaClient)
+	if !ok {
+		t.Fatal("unexpected replica type")
+	}
+	if !client.TLS {
+		t.Fatal("TLS=false, want true")
+	}
+	if got, want := client.RootCAs, []string{"ca.pem"}; !slices.Equal(got, want) {
+		t.Fatalf("RootCAs=%v, want %v", got, want)
+	}
+	if got, want := client.ClientCert, "client.pem"; got != want {
+		t.Fatalf("ClientCert=%q, want %q", got, want)
+	}
+	if got, want := client.ClientKey, "client-key.pem"; got != want {
+		t.Fatalf("ClientKey=%q, want %q", got, want)
+	}
+}
+
+func TestNewNATSReplicaFromConfig_TLSOverridesGlobalDefault(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+tls: true
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: false
+  - path: /tmp/db-inherits
+    replica:
+      type: nats
+      bucket: bucket
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "ExplicitFalse", index: 0, want: false},
+		{name: "InheritedTrue", index: 1, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, err := main.NewReplicaFromConfig(config.DBs[test.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, ok := r.Client.(*nats.ReplicaClient)
+			if !ok {
+				t.Fatal("unexpected replica type")
+			}
+			if client.TLS != test.want {
+				t.Fatalf("TLS=%v, want %v", client.TLS, test.want)
+			}
+		})
+	}
+}
+
+func TestNewS3ReplicaFromConfig_SignAcceptEncodingInheritance(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+sign-accept-encoding: false
+dbs:
+  - path: /tmp/db-inherits
+    replica:
+      type: s3
+      bucket: bucket
+      path: db
+  - path: /tmp/db-overrides
+    replica:
+      type: s3
+      bucket: bucket
+      path: db
+      sign-accept-encoding: true
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "InheritedFalse", index: 0},
+		{name: "ExplicitTrue", index: 1, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := main.NewS3ReplicaClientFromConfig(config.DBs[tt.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.SignAcceptEncoding != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", client.SignAcceptEncoding, tt.want)
+			}
+		})
 	}
 }
 
@@ -479,6 +671,57 @@ snapshot:
 		}
 	})
 
+	t.Run("DBLevelCompatibility", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 10m
+      retention: 2h
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.DBs[0].Snapshot.Interval == nil || *config.DBs[0].Snapshot.Interval != 10*time.Minute {
+			t.Fatalf("expected db snapshot interval of 10m, got %v", config.DBs[0].Snapshot.Interval)
+		}
+		if config.DBs[0].Snapshot.Retention == nil || *config.DBs[0].Snapshot.Retention != 2*time.Hour {
+			t.Fatalf("expected db snapshot retention of 2h, got %v", config.DBs[0].Snapshot.Retention)
+		}
+		if config.Snapshot.Interval == nil || *config.Snapshot.Interval != 10*time.Minute {
+			t.Fatalf("expected promoted snapshot interval of 10m, got %v", config.Snapshot.Interval)
+		}
+		if config.Snapshot.Retention == nil || *config.Snapshot.Retention != 2*time.Hour {
+			t.Fatalf("expected promoted snapshot retention of 2h, got %v", config.Snapshot.Retention)
+		}
+	})
+
+	t.Run("GlobalSnapshotTakesPrecedence", func(t *testing.T) {
+		yaml := `
+snapshot:
+  interval: 1h
+  retention: 24h
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 10m
+      retention: 2h
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.Snapshot.Interval == nil || *config.Snapshot.Interval != time.Hour {
+			t.Fatalf("expected global snapshot interval of 1h, got %v", config.Snapshot.Interval)
+		}
+		if config.Snapshot.Retention == nil || *config.Snapshot.Retention != 24*time.Hour {
+			t.Fatalf("expected global snapshot retention of 24h, got %v", config.Snapshot.Retention)
+		}
+	})
+
 	t.Run("ZeroInterval", func(t *testing.T) {
 		yaml := `
 snapshot:
@@ -521,6 +764,41 @@ snapshot:
 		}
 		if !errors.Is(err, main.ErrInvalidSnapshotInterval) {
 			t.Errorf("expected ErrInvalidSnapshotInterval, got %v", err)
+		}
+	})
+
+	t.Run("DBLevelZeroInterval", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      interval: 0s
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for zero database snapshot interval")
+		}
+		if !errors.Is(err, main.ErrInvalidSnapshotInterval) {
+			t.Errorf("expected ErrInvalidSnapshotInterval, got %v", err)
+		}
+	})
+
+	t.Run("DBLevelConflictingIntervals", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/a.db
+    snapshot:
+      interval: 10m
+  - path: /tmp/b.db
+    snapshot:
+      interval: 20m
+`
+		_, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err == nil {
+			t.Fatal("expected error for conflicting database snapshot intervals")
+		}
+		if !strings.Contains(err.Error(), "conflicting database snapshot intervals") {
+			t.Errorf("expected conflicting interval error, got %v", err)
 		}
 	})
 
@@ -638,7 +916,7 @@ func TestParseReplicaURL_AccessPoint(t *testing.T) {
 }
 
 func TestConfig_Validate_L0Retention(t *testing.T) {
-	t.Run("ZeroRetention", func(t *testing.T) {
+	t.Run("ZeroRetentionDisables", func(t *testing.T) {
 		yaml := `
 l0-retention: 0s
 dbs:
@@ -646,9 +924,29 @@ dbs:
     replica:
       url: file:///tmp/replica
 `
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("expected zero l0 retention to be accepted: %v", err)
+		}
+		if config.L0Retention == nil {
+			t.Fatal("expected l0 retention to be set")
+		}
+		if *config.L0Retention != 0 {
+			t.Errorf("expected l0 retention of 0, got %v", *config.L0Retention)
+		}
+	})
+
+	t.Run("NegativeRetention", func(t *testing.T) {
+		yaml := `
+l0-retention: -1s
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
 		_, err := main.ParseConfig(strings.NewReader(yaml), false)
 		if err == nil {
-			t.Fatal("expected error for zero l0 retention")
+			t.Fatal("expected error for negative l0 retention")
 		}
 		if !errors.Is(err, main.ErrInvalidL0Retention) {
 			t.Errorf("expected ErrInvalidL0Retention, got %v", err)
@@ -843,6 +1141,91 @@ dbs:
 		}
 		if *config.DBs[0].Replicas[1].SyncInterval != 1*time.Minute {
 			t.Errorf("expected second replica sync interval of 1m, got %v", *config.DBs[0].Replicas[1].SyncInterval)
+		}
+	})
+}
+
+// TestReplicaConfig_MaxSyncLTXFiles tests that max-sync-ltx-files is parsed
+// from YAML and applied to the replica.
+func TestReplicaConfig_MaxSyncLTXFiles(t *testing.T) {
+	t.Run("Specified", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+      max-sync-ltx-files: 32
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatal("expected one database")
+		}
+		if config.DBs[0].Replica == nil {
+			t.Fatal("expected replica to be set")
+		}
+		if config.DBs[0].Replica.MaxSyncLTXFiles == nil {
+			t.Fatal("expected max-sync-ltx-files to be set")
+		}
+		if *config.DBs[0].Replica.MaxSyncLTXFiles != 32 {
+			t.Errorf("expected max-sync-ltx-files of 32, got %v", *config.DBs[0].Replica.MaxSyncLTXFiles)
+		}
+
+		r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := r.MaxSyncLTXFiles, 32; got != want {
+			t.Errorf("Replica.MaxSyncLTXFiles=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("NotSpecified", func(t *testing.T) {
+		yaml := `
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.DBs[0].Replica.MaxSyncLTXFiles != nil {
+			t.Errorf("expected max-sync-ltx-files to be nil when not specified, got %v", *config.DBs[0].Replica.MaxSyncLTXFiles)
+		}
+
+		r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got, want := r.MaxSyncLTXFiles, litestream.DefaultMaxSyncLTXFiles; got != want {
+			t.Errorf("Replica.MaxSyncLTXFiles=%v, want %v", got, want)
+		}
+	})
+
+	t.Run("GlobalDefault", func(t *testing.T) {
+		yaml := `
+max-sync-ltx-files: 16
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if config.DBs[0].Replica.MaxSyncLTXFiles == nil {
+			t.Fatal("expected max-sync-ltx-files to be inherited from global settings")
+		}
+		if *config.DBs[0].Replica.MaxSyncLTXFiles != 16 {
+			t.Errorf("expected max-sync-ltx-files of 16, got %v", *config.DBs[0].Replica.MaxSyncLTXFiles)
 		}
 	})
 }
@@ -1517,6 +1900,86 @@ dbs:
 	})
 }
 
+// TestDBConfig_MaxSyncWALBytes tests that the max-sync-wal-bytes configuration
+// field is properly parsed from YAML and applied to the DB instance.
+func TestDBConfig_MaxSyncWALBytes(t *testing.T) {
+	t.Run("Specified", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /tmp/test.db
+    max-sync-wal-bytes: 16777216
+    replica:
+      url: file:///tmp/replica
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatal("expected one database config")
+		}
+
+		dbc := config.DBs[0]
+		if dbc.MaxSyncWALBytes == nil {
+			t.Fatal("expected max-sync-wal-bytes to be set")
+		}
+		if got, want := *dbc.MaxSyncWALBytes, int64(16777216); got != want {
+			t.Errorf("MaxSyncWALBytes = %d, want %d", got, want)
+		}
+
+		// Test that the value is properly applied to the DB
+		db, err := main.NewDBFromConfig(dbc)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got, want := db.MaxSyncWALBytes, int64(16777216); got != want {
+			t.Errorf("db.MaxSyncWALBytes = %d, want %d", got, want)
+		}
+	})
+
+	t.Run("NotSpecified_UsesDefault", func(t *testing.T) {
+		filename := filepath.Join(t.TempDir(), "litestream.yml")
+		if err := os.WriteFile(filename, []byte(`
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`[1:]), 0666); err != nil {
+			t.Fatal(err)
+		}
+
+		config, err := main.ReadConfigFile(filename, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if len(config.DBs) != 1 {
+			t.Fatal("expected one database config")
+		}
+
+		dbc := config.DBs[0]
+		if dbc.MaxSyncWALBytes != nil {
+			t.Errorf("expected MaxSyncWALBytes to be nil when not specified, got %v", *dbc.MaxSyncWALBytes)
+		}
+
+		// Test that the DB uses the default value
+		db, err := main.NewDBFromConfig(dbc)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if got, want := db.MaxSyncWALBytes, int64(litestream.DefaultMaxSyncWALBytes); got != want {
+			t.Errorf("db.MaxSyncWALBytes = %d, want default %d", got, want)
+		}
+	})
+}
+
 func TestFindSQLiteDatabases(t *testing.T) {
 	// Create a temporary directory using t.TempDir() - automatically cleaned up
 	tmpDir := t.TempDir()
@@ -1827,6 +2290,49 @@ func TestDBConfigValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("meta-dir with path configuration", func(t *testing.T) {
+		metaDir := "/path/to/meta"
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Path:    "/path/to/db.sqlite",
+					MetaDir: &metaDir,
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when meta-dir is used without dir")
+		}
+		if !strings.Contains(err.Error(), "'meta-dir' can only be used with a directory") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("meta-path and meta-dir specified", func(t *testing.T) {
+		metaPath := "/path/to/meta"
+		metaDir := "/path/to/meta-dir"
+		config := main.Config{
+			DBs: []*main.DBConfig{
+				{
+					Dir:      "/path/to/dir",
+					Pattern:  "*.db",
+					MetaPath: &metaPath,
+					MetaDir:  &metaDir,
+				},
+			},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when both meta-path and meta-dir are specified")
+		}
+		if !strings.Contains(err.Error(), "cannot specify both 'meta-path' and 'meta-dir'") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
 	t.Run("valid path configuration", func(t *testing.T) {
 		config := main.DefaultConfig()
 		config.DBs = []*main.DBConfig{
@@ -1838,6 +2344,56 @@ func TestDBConfigValidation(t *testing.T) {
 		err := config.Validate()
 		if err != nil {
 			t.Errorf("unexpected validation error for valid path config: %v", err)
+		}
+	})
+
+	t.Run("duplicate path", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/db.sqlite", Replica: &main.ReplicaConfig{Path: "/path/to/rep-a"}},
+			{Path: "/path/to/db.sqlite", Replica: &main.ReplicaConfig{Path: "/path/to/rep-b"}},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when the same path is listed twice")
+		}
+		if !strings.Contains(err.Error(), `database config #2: duplicate path "/path/to/db.sqlite"`) {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+		if !strings.Contains(err.Error(), "already used by database config #1") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("duplicate path after cleaning", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/db.sqlite"},
+			{Path: "/path/to/../to/db.sqlite"},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when the same path is listed twice in different spellings")
+		}
+		if !strings.Contains(err.Error(), "duplicate path") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("distinct paths", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/a.sqlite"},
+			{Path: "/path/to/b.sqlite"},
+			{Dir: "/path/to/dir", Pattern: "*.db"},
+			{Dir: "/path/to/dir", Pattern: "*.sqlite"},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for distinct paths: %v", err)
 		}
 	})
 
@@ -2176,6 +2732,73 @@ func TestNewDBsFromDirectoryConfig_ReplicasArrayURL(t *testing.T) {
 	}
 }
 
+func TestNewDBsFromDirectoryConfig_MetaDir(t *testing.T) {
+	tmpDir := t.TempDir()
+	metaDir := filepath.Join(t.TempDir(), "litestream-state")
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "tenant-a", "data.metadata"))
+	createSQLiteDB(t, filepath.Join(tmpDir, "tenant-b", "nested", "data.metadata"))
+
+	config := &main.DBConfig{
+		Dir:       tmpDir,
+		Pattern:   "*.metadata",
+		Recursive: true,
+		MetaDir:   &metaDir,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	if len(dbs) != 2 {
+		t.Fatalf("expected 2 databases, got %d", len(dbs))
+	}
+
+	expectedMetaPaths := map[string]string{
+		filepath.Join(tmpDir, "tenant-a", "data.metadata"):           filepath.Join(metaDir, "tenant-a", "data.metadata"+litestream.MetaDirSuffix),
+		filepath.Join(tmpDir, "tenant-b", "nested", "data.metadata"): filepath.Join(metaDir, "tenant-b", "nested", "data.metadata"+litestream.MetaDirSuffix),
+	}
+
+	for _, db := range dbs {
+		expectedMetaPath, ok := expectedMetaPaths[db.Path()]
+		if !ok {
+			t.Errorf("unexpected database path: %s", db.Path())
+			continue
+		}
+		if db.MetaPath() != expectedMetaPath {
+			t.Errorf("database %s: expected meta path %s, got %s", db.Path(), expectedMetaPath, db.MetaPath())
+		}
+	}
+}
+
+func TestNewDBsFromDirectoryConfig_MetaDirAndMetaPath(t *testing.T) {
+	tmpDir := t.TempDir()
+	metaDir := filepath.Join(t.TempDir(), "litestream-state")
+	metaPath := filepath.Join(t.TempDir(), "litestream-meta")
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	createSQLiteDB(t, filepath.Join(tmpDir, "data.db"))
+
+	config := &main.DBConfig{
+		Dir:      tmpDir,
+		Pattern:  "*.db",
+		MetaDir:  &metaDir,
+		MetaPath: &metaPath,
+		Replica:  &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	_, err := main.NewDBsFromDirectoryConfig(config)
+	if err == nil {
+		t.Fatal("expected error when both meta-dir and meta-path are specified")
+	}
+	if !strings.Contains(err.Error(), "cannot specify both 'meta-path' and 'meta-dir'") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
 // TestNewDBsFromDirectoryConfig_SpecialCharacters verifies that special characters
 // in database filenames are handled correctly in replica paths.
 func TestNewDBsFromDirectoryConfig_SpecialCharacters(t *testing.T) {
@@ -2429,6 +3052,59 @@ func TestDirectoryMonitor_RecursiveDetectsNestedDatabases(t *testing.T) {
 	}
 }
 
+func TestDirectoryMonitor_MetaDir(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	metaDir := filepath.Join(t.TempDir(), "litestream-state")
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+
+	config := &main.DBConfig{
+		Dir:       rootDir,
+		Pattern:   "*.db",
+		Recursive: true,
+		Watch:     true,
+		MetaDir:   &metaDir,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(nil, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Fatalf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, nil)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	dbPath := filepath.Join(rootDir, "tenant-a", "data.db")
+	createSQLiteDB(t, dbPath)
+
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), dbPath) }) {
+		t.Fatalf("expected database %s to be detected", dbPath)
+	}
+
+	for _, db := range store.DBs() {
+		if db.Path() != dbPath {
+			continue
+		}
+		expectedMetaPath := filepath.Join(metaDir, "tenant-a", "data.db"+litestream.MetaDirSuffix)
+		if db.MetaPath() != expectedMetaPath {
+			t.Fatalf("MetaPath=%s, want %s", db.MetaPath(), expectedMetaPath)
+		}
+		return
+	}
+	t.Fatalf("database %s not found", dbPath)
+}
+
 // createSQLiteDB creates a minimal SQLite database file for testing
 func createSQLiteDB(t *testing.T, path string) {
 	t.Helper()
@@ -2453,7 +3129,7 @@ func createSQLiteDB(t *testing.T, path string) {
 func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 	t.Run("URLWithEndpointQuery", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-west-2&forcePathStyle=true&skipVerify=true",
+			URL: "s3://mybucket/path/to/db?endpoint=localhost:9000&region=us-west-2&forcePathStyle=true&skipVerify=true&storage-class=ONEZONE_IA",
 		}
 
 		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
@@ -2478,6 +3154,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if !client.SkipVerify {
 			t.Error("expected SkipVerify to be true")
+		}
+		if client.StorageClass != "ONEZONE_IA" {
+			t.Errorf("expected storage class 'ONEZONE_IA', got %q", client.StorageClass)
 		}
 	})
 
@@ -2508,10 +3187,11 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 	t.Run("ConfigOverridesQuery", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://mybucket/path?endpoint=from-query&region=us-east-1",
+			URL: "s3://mybucket/path?endpoint=from-query&region=us-east-1&storage-class=ONEZONE_IA",
 			ReplicaSettings: main.ReplicaSettings{
-				Endpoint: "from-config",
-				Region:   "us-west-1",
+				Endpoint:     "from-config",
+				Region:       "us-west-1",
+				StorageClass: "GLACIER_IR",
 			},
 		}
 
@@ -2526,6 +3206,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if client.Region != "us-west-1" {
 			t.Errorf("expected region from config 'us-west-1', got %q", client.Region)
+		}
+		if client.StorageClass != "GLACIER_IR" {
+			t.Errorf("expected storage class from config 'GLACIER_IR', got %q", client.StorageClass)
 		}
 	})
 
@@ -2557,6 +3240,12 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false for Tigris")
 		}
+		if client.Concurrency != s3.DefaultTigrisConcurrency {
+			t.Errorf("expected Tigris concurrency %d, got %d", s3.DefaultTigrisConcurrency, client.Concurrency)
+		}
+		if client.PartSize != s3.DefaultTigrisPartSize {
+			t.Errorf("expected Tigris part size %d, got %d", s3.DefaultTigrisPartSize, client.PartSize)
+		}
 	})
 
 	t.Run("TigrisConfigEndpoint", func(t *testing.T) {
@@ -2578,6 +3267,12 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false for config-based Tigris endpoint")
+		}
+		if client.Concurrency != s3.DefaultTigrisConcurrency {
+			t.Errorf("expected config-based Tigris concurrency %d, got %d", s3.DefaultTigrisConcurrency, client.Concurrency)
+		}
+		if client.PartSize != s3.DefaultTigrisPartSize {
+			t.Errorf("expected config-based Tigris part size %d, got %d", s3.DefaultTigrisPartSize, client.PartSize)
 		}
 	})
 
@@ -2601,7 +3296,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 	t.Run("QuerySigningOptions", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://bucket/db?sign-payload=true&require-content-md5=false",
+			URL: "s3://bucket/db?sign-payload=true&sign-accept-encoding=false&require-content-md5=false",
 		}
 
 		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
@@ -2611,19 +3306,40 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if !client.SignPayload {
 			t.Error("expected SignPayload to be true when query parameter is set")
 		}
+		if client.SignAcceptEncoding {
+			t.Error("expected SignAcceptEncoding to be false when disabled via query")
+		}
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false when disabled via query")
 		}
 	})
 
+	t.Run("QuerySignAcceptEncodingAliases", func(t *testing.T) {
+		for _, param := range []string{"signAcceptEncoding", "sign-accept-encoding"} {
+			t.Run(param, func(t *testing.T) {
+				client, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+					URL: "s3://bucket/db?" + param + "=false",
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if client.SignAcceptEncoding {
+					t.Error("expected SignAcceptEncoding to be false")
+				}
+			})
+		}
+	})
+
 	t.Run("ConfigOverridesQuerySigning", func(t *testing.T) {
 		signTrue := true
+		signAcceptEncodingTrue := true
 		requireFalse := false
 		config := &main.ReplicaConfig{
-			URL: "s3://bucket/db?sign-payload=false&require-content-md5=true",
+			URL: "s3://bucket/db?sign-payload=false&sign-accept-encoding=false&require-content-md5=true",
 			ReplicaSettings: main.ReplicaSettings{
-				SignPayload:       &signTrue,
-				RequireContentMD5: &requireFalse,
+				SignPayload:        &signTrue,
+				SignAcceptEncoding: &signAcceptEncodingTrue,
+				RequireContentMD5:  &requireFalse,
 			},
 		}
 
@@ -2633,6 +3349,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if !client.SignPayload {
 			t.Error("expected config SignPayload to override query parameter")
+		}
+		if !client.SignAcceptEncoding {
+			t.Error("expected config SignAcceptEncoding to override query parameter")
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected config RequireContentMD5=false to override query parameter")
@@ -2675,6 +3394,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			{"CloudflareR2", "https://accountid.r2.cloudflarestorage.com"},
 			{"MinIO", "http://localhost:9000"},
 			{"Supabase", "https://myproject.supabase.co/storage/v1/s3"},
+			{"Hetzner", "https://fsn1.your-objectstorage.com"},
 		}
 
 		for _, tt := range tests {
@@ -2733,6 +3453,139 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 		if client.SignPayload {
 			t.Error("expected explicit SignPayload=false to override R2 default")
+		}
+	})
+
+	t.Run("URLWithUploadParams", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?part-size=10485760&concurrency=4",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 10485760 {
+			t.Errorf("expected PartSize 10485760, got %d", client.PartSize)
+		}
+		if client.Concurrency != 4 {
+			t.Errorf("expected Concurrency 4, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("URLWithUploadParamsCamelCase", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?partSize=8388608",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 8388608 {
+			t.Errorf("expected PartSize 8388608, got %d", client.PartSize)
+		}
+
+		config = &main.ReplicaConfig{
+			URL: "s3://mybucket/path?partSize=8388608&part-size=1048576",
+		}
+
+		client, err = main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 8388608 {
+			t.Errorf("expected camelCase partSize to win, got %d", client.PartSize)
+		}
+	})
+
+	t.Run("ConfigOverridesQueryUploadParams", func(t *testing.T) {
+		partSize := main.ByteSize(5 * 1024 * 1024)
+		concurrency := 8
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?part-size=1048576&concurrency=2",
+			ReplicaSettings: main.ReplicaSettings{
+				PartSize:    &partSize,
+				Concurrency: &concurrency,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != int64(5*1024*1024) {
+			t.Errorf("expected config PartSize %d to override query, got %d", int64(5*1024*1024), client.PartSize)
+		}
+		if client.Concurrency != 8 {
+			t.Errorf("expected config Concurrency 8 to override query, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("InvalidUploadParams", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			url   string
+			param string
+		}{
+			{"part-size_non_numeric", "s3://mybucket/path?part-size=abc", "part-size"},
+			{"part-size_zero", "s3://mybucket/path?part-size=0", "part-size"},
+			{"part-size_negative", "s3://mybucket/path?part-size=-1", "part-size"},
+			{"concurrency_non_numeric", "s3://mybucket/path?concurrency=abc", "concurrency"},
+			{"concurrency_zero", "s3://mybucket/path?concurrency=0", "concurrency"},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: tt.url}, nil)
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tt.url)
+				}
+				if !strings.Contains(err.Error(), tt.param) {
+					t.Errorf("expected error to name parameter %q, got %q", tt.param, err.Error())
+				}
+			})
+		}
+	})
+
+	t.Run("R2QueryConcurrencyOverride", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://bucket/db?endpoint=https://accountid.r2.cloudflarestorage.com&concurrency=5",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Concurrency != 5 {
+			t.Errorf("expected query concurrency 5 to override R2 default, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("UploadParamsParity", func(t *testing.T) {
+		url := "s3://mybucket/path?endpoint=http://localhost:9000&part-size=8388608&concurrency=4"
+
+		urlClient, err := litestream.NewReplicaClientFromURL(url)
+		if err != nil {
+			t.Fatalf("URL factory error: %v", err)
+		}
+		uc := urlClient.(*s3.ReplicaClient)
+
+		cc, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: url}, nil)
+		if err != nil {
+			t.Fatalf("Config factory error: %v", err)
+		}
+
+		if uc.PartSize != cc.PartSize {
+			t.Errorf("PartSize: URL=%d, Config=%d", uc.PartSize, cc.PartSize)
+		}
+		if uc.Concurrency != cc.Concurrency {
+			t.Errorf("Concurrency: URL=%d, Config=%d", uc.Concurrency, cc.Concurrency)
 		}
 	})
 }
@@ -2900,6 +3753,7 @@ access-key-id: GLOBAL_S3_KEY
 secret-access-key: GLOBAL_S3_SECRET
 region: global-region
 endpoint: global.endpoint.com
+storage-class: GLACIER_IR
 account-name: global-abs-account
 account-key: global-abs-key
 host: global.sftp.host
@@ -2946,6 +3800,9 @@ dbs:
 		}
 		if got, want := s3Replica.Endpoint, "global.endpoint.com"; got != want {
 			t.Errorf("s3Replica.Endpoint=%v, want %v", got, want)
+		}
+		if got, want := s3Replica.StorageClass, "GLACIER_IR"; got != want {
+			t.Errorf("s3Replica.StorageClass=%v, want %v", got, want)
 		}
 		if s3Replica.SyncInterval == nil || *s3Replica.SyncInterval != expectedSyncInterval {
 			t.Errorf("s3Replica.SyncInterval=%v, want %v", s3Replica.SyncInterval, expectedSyncInterval)

@@ -108,5 +108,10 @@ Options:
 
   -timeout SECONDS
       Maximum time to wait in seconds (default: 10).
+
+Examples:
+  $ litestream list
+  $ litestream list -json
+  $ litestream list -socket /tmp/litestream.sock
 `[1:])
 }

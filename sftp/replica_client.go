@@ -292,11 +292,19 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
 	}
 
-	f, err := sftpClient.OpenFile(filename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	tmpFilename := fmt.Sprintf("%s.%d.%d.tmp", filename, os.Getpid(), time.Now().UnixNano())
+	f, err := sftpClient.OpenFile(tmpFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
-		return nil, fmt.Errorf("sftp: cannot open snapshot file for writing: %w", err)
+		return nil, fmt.Errorf("sftp: cannot open temporary snapshot file for writing: %w", err)
 	}
-	defer f.Close()
+	defer func() {
+		if f != nil {
+			_ = f.Close()
+		}
+		if err != nil {
+			_ = sftpClient.Remove(tmpFilename)
+		}
+	}()
 
 	n, err := io.Copy(f, fullReader)
 	if err != nil {
@@ -304,10 +312,14 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	} else if err := f.Close(); err != nil {
 		return nil, err
 	}
+	f = nil
 
-	// Set file ModTime to preserve original timestamp
-	if err := sftpClient.Chtimes(filename, timestamp, timestamp); err != nil {
+	if err := sftpClient.Chtimes(tmpFilename, timestamp, timestamp); err != nil {
 		return nil, fmt.Errorf("sftp: cannot set file timestamps: %w", err)
+	}
+
+	if err := sftpClient.Rename(tmpFilename, filename); err != nil {
+		return nil, fmt.Errorf("sftp: cannot rename temporary ltx file %q to %q: %w", tmpFilename, filename, err)
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "PUT").Inc()
