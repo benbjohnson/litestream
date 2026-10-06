@@ -1,5 +1,5 @@
 name: Build MinIO test image
-description: Build MinIO and mc from pinned upstream source (etc/minio/Dockerfile), cached in the GitHub Actions cache.
+description: Build MinIO and mc from pinned upstream source (etc/minio/Dockerfile), cached in the GitHub Actions cache. Only main writes the cache; pull requests restore it.
 
 runs:
   using: composite
@@ -12,4 +12,4 @@ runs:
         tags: litestream-minio:RELEASE.2025-09-07T16-13-09Z
         load: true
         cache-from: type=gha,scope=litestream-minio
-        cache-to: type=gha,mode=max,scope=litestream-minio
+        cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=max,scope=litestream-minio' || '' }}
