@@ -102,6 +102,9 @@ func TestReplicaClient_DefaultSignPayload(t *testing.T) {
 	if !client.SignPayload {
 		t.Error("expected default SignPayload to be true for AWS S3 compatibility")
 	}
+	if !client.SignAcceptEncoding {
+		t.Error("expected default SignAcceptEncoding to be true")
+	}
 	if !client.RequireContentMD5 {
 		t.Error("expected default RequireContentMD5 to be true for AWS S3 compatibility")
 	}
@@ -1913,10 +1916,11 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	}
 }
 
-func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
+func TestReplicaClient_AcceptEncodingSigning(t *testing.T) {
 	tests := []struct {
 		name                     string
 		endpoint                 string
+		disableSigning           bool
 		wantAcceptEncodingSigned bool
 	}{
 		{
@@ -1991,6 +1995,11 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 			endpoint:                 "https://s3.example.com",
 			wantAcceptEncodingSigned: true,
 		},
+		{
+			name:           "ExplicitOptOut",
+			endpoint:       "https://s3.example.com",
+			disableSigning: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2023,6 +2032,7 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 
 			c := NewReplicaClient()
 			c.Endpoint = tt.endpoint
+			c.SignAcceptEncoding = !tt.disableSigning
 			c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 			client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 				o.BaseEndpoint = aws.String("https://example.com")
@@ -2034,6 +2044,30 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 				Bucket: aws.String("test-bucket"),
 			}); err != nil {
 				t.Fatalf("ListObjectsV2() error: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewReplicaClientFromURL_SignAcceptEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "Default", url: "s3://mybucket/path", want: true},
+		{name: "CamelCase", url: "s3://mybucket/path?signAcceptEncoding=false"},
+		{name: "Hyphenated", url: "s3://mybucket/path?sign-accept-encoding=false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.(*ReplicaClient).SignAcceptEncoding; got != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", got, tt.want)
 			}
 		})
 	}
