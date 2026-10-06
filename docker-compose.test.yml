@@ -1,6 +1,7 @@
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    image: litestream-minio:RELEASE.2025-09-07T16-13-09Z
+    build: etc/minio
     ports:
       - "9000:9000"
       - "9001:9001"

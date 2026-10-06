@@ -233,6 +233,8 @@ test('includes paths that affect quick integration tests', () => {
     'go.mod',
     'go.sum',
     'tests/integration/restore_testdata.sql',
+    'etc/minio/Dockerfile',
+    '.github/actions/build-minio-image/action.yml',
     '.github/workflows/integration-tests.yml',
     '.github/scripts/integration-test-paths.js',
   ];
@@ -246,6 +248,7 @@ test('excludes paths that do not affect quick integration tests', () => {
   const irrelevantPaths = [
     'README.md',
     'docs/config.md',
+    'etc/litestream.yml',
     'internal/db/replica.js',
     'tools/go.mod',
     'tests/unit/database_testdata.sql',
