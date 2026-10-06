@@ -31,6 +31,14 @@ type testReplicaClient struct {
 	dir string
 }
 
+type earlyReturnSnapshotClient struct {
+	*testReplicaClient
+}
+
+func (c *earlyReturnSnapshotClient) WriteLTXFile(_ context.Context, level int, minTXID, maxTXID ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
+}
+
 func (c *testReplicaClient) Init(_ context.Context) error { return nil }
 
 func (c *testReplicaClient) SetLogger(_ *slog.Logger) {}
@@ -460,6 +468,80 @@ func TestReplica_SyncOnceLimitsLTXFiles(t *testing.T) {
 	}
 }
 
+func TestReplicaMonitor_DrainsLimitedBacklogWithoutWaitingForInterval(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	client := &testReplicaClient{dir: t.TempDir()}
+	r := NewReplicaWithClient(db, client)
+	r.MonitorEnabled = false
+	r.MaxSyncLTXFiles = 1
+	r.SyncInterval = time.Hour
+	db.Replica = r
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		if _, err := sqldb.Exec(`INSERT INTO t DEFAULT VALUES;`); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID <= ltx.TXID(r.MaxSyncLTXFiles) {
+		t.Fatalf("db txid=%s, want backlog larger than %d", dpos.TXID, r.MaxSyncLTXFiles)
+	}
+
+	r.MonitorEnabled = true
+	if err := r.Start(db.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := r.Pos().TXID; got == dpos.TXID {
+			return
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("replica txid=%s, want %s before next sync interval", r.Pos().TXID, dpos.TXID)
+		case <-ticker.C:
+		}
+	}
+}
+
 func TestDB_SyncDiagnostic(t *testing.T) {
 	db := NewDB(filepath.Join(t.TempDir(), "db"))
 
@@ -744,6 +826,13 @@ func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
 	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
 	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
 
+	db.chkMu.RLock()
+	err = db.Sync(t.Context())
+	db.chkMu.RUnlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -763,7 +852,7 @@ func TestDB_CheckpointPassiveRestartSkipsTruncate(t *testing.T) {
 	}
 }
 
-func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T) {
+func TestDB_CheckpointTruncateSkipsRepeatedPassiveWithoutProgress(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "db")
 
@@ -823,14 +912,21 @@ func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T)
 		t.Fatalf("precondition: synced WAL offset %d must exceed the truncate threshold", lastSyncedWALOffset)
 	}
 
+	passiveBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive))
 	truncateBaseline := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate))
 
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
+	for range 2 {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
 	}
 
-	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got == 0 {
-		t.Fatal("expected fall-through to a truncate checkpoint attempt when passive cannot restart the wal")
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 1 {
+		t.Fatalf("passive checkpoints=%v, want 1 across repeated blocked syncs", got)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 2 {
+		t.Fatalf("truncate checkpoints=%v, want 2 across repeated blocked syncs", got)
 	}
 
 	db.mu.RLock()
@@ -838,6 +934,87 @@ func TestDB_CheckpointTruncateFallsThroughWhenPassiveCannotRestart(t *testing.T)
 	db.mu.RUnlock()
 	if !db.exceedsTruncateThreshold(blockedOffset) {
 		t.Fatalf("expected wal to remain unrestarted while reader is open: offset=%d", blockedOffset)
+	}
+
+	db.TruncatePageN = DefaultTruncatePageN
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	db.TruncatePageN = 2
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 2 {
+		t.Fatalf("passive checkpoints=%v, want 2 after threshold cleared", got)
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 3 {
+		t.Fatalf("truncate checkpoints=%v, want 3 after threshold cleared", got)
+	}
+
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	db.TruncatePageN = 1
+	if err := db.Checkpoint(t.Context(), CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	restartedOffset := db.syncState.lastSyncedWALOffset
+	db.mu.RUnlock()
+	if !db.exceedsTruncateThreshold(restartedOffset) {
+		t.Fatalf("precondition: restarted wal offset %d must meet the truncate threshold", restartedOffset)
+	}
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModePassive)) - passiveBaseline; got != 4 {
+		t.Fatalf("passive checkpoints=%v, want 4 after wal restart", got)
+	}
+	if got := testutil.ToFloat64(checkpointNCounterVec.WithLabelValues(db.Path(), CheckpointModeTruncate)) - truncateBaseline; got != 4 {
+		t.Fatalf("truncate checkpoints=%v, want 4 after wal restart", got)
+	}
+}
+
+func TestDB_ExceedsTruncateThreshold(t *testing.T) {
+	const pageSize = 4096
+
+	tests := []struct {
+		name          string
+		truncatePageN int
+		walSize       int64
+		want          bool
+	}{
+		{
+			name:          "configured threshold",
+			truncatePageN: 2,
+			walSize:       calcWALSize(pageSize, 2),
+			want:          true,
+		},
+		{
+			name:          "zero below default threshold",
+			truncatePageN: 0,
+			walSize:       calcWALSize(pageSize, DefaultTruncatePageN) - 1,
+			want:          false,
+		},
+		{
+			name:          "zero at default threshold",
+			truncatePageN: 0,
+			walSize:       calcWALSize(pageSize, DefaultTruncatePageN),
+			want:          true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			db := &DB{pageSize: pageSize, TruncatePageN: tt.truncatePageN}
+			if got := db.exceedsTruncateThreshold(tt.walSize); got != tt.want {
+				t.Fatalf("exceedsTruncateThreshold(%d)=%t, want %t", tt.walSize, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -4197,6 +4374,46 @@ func TestSyncRestoreIntegrity_WithCheckpoints(t *testing.T) {
 	}
 }
 
+func TestDB_SnapshotClosesReaderWhenReplicaReturnsEarly(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "db")
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &earlyReturnSnapshotClient{testReplicaClient: &testReplicaClient{dir: t.TempDir()}}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if !db.chkMu.TryLock() {
+		t.Fatal("checkpoint lock remains held after Snapshot returns")
+	}
+	db.chkMu.Unlock()
+}
+
 // TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints verifies that a
 // snapshot's content matches its advertised position while checkpoints and
 // writes run concurrently. The position capture and chkMu read lock must be
@@ -4361,8 +4578,8 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 		if err := rf.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if closer, ok := r.(io.Closer); ok {
-			_ = closer.Close()
+		if err := r.Close(); err != nil {
+			t.Fatal(err)
 		}
 
 		restoredDB, err := sql.Open("sqlite", restorePath)

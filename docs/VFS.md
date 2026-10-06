@@ -36,6 +36,7 @@ The VFS extension provides:
 
 ### Prerequisites
 
+- SQLite 3.31.0+ runtime
 - Go 1.21+
 - GCC (Linux) or Clang (macOS)
 - CGO enabled

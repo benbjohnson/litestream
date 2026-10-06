@@ -527,7 +527,7 @@ Usage:
 
 	litestream replicate [arguments]
 
-	litestream replicate [arguments] DB_PATH REPLICA_URL [REPLICA_URL...]
+	litestream replicate [arguments] DB_PATH REPLICA_URL
 
 Arguments:
 

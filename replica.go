@@ -53,8 +53,8 @@ type Replica struct {
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
 
-	// Maximum L0 files to upload in a single monitor sync run.
-	// Set to zero to process all pending L0 files in one run.
+	// Maximum L0 files to upload in a single monitor sync batch.
+	// Set to zero to process all pending L0 files in one batch.
 	MaxSyncLTXFiles int
 
 	// If true, replica monitors database for changes automatically.
@@ -142,8 +142,18 @@ func (r *Replica) Stop(hard bool) (err error) {
 // Sync copies new WAL frames from the shadow WAL to the replica client.
 // Only one Sync can run at a time to prevent concurrent uploads of the same file.
 func (r *Replica) Sync(ctx context.Context) (err error) {
-	_, err = r.syncOnce(ctx, 0)
-	return err
+	return r.sync(ctx, 0)
+}
+
+func (r *Replica) sync(ctx context.Context, maxSyncLTXFiles int) error {
+	for {
+		result, err := r.syncOnce(ctx, maxSyncLTXFiles)
+		if err != nil {
+			return err
+		} else if !result.limited {
+			return nil
+		}
+	}
 }
 
 type replicaSyncResult struct {
@@ -187,7 +197,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		return result, errReplicaWaitForData
 	}
 
-	r.Logger().Info("replica sync",
+	r.Logger().Debug("replica sync",
 		slog.Group("txid",
 			slog.String("replica", r.Pos().TXID.String()),
 			slog.String("db", dpos.TXID.String()),
@@ -247,7 +257,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
-	r.Logger().Info("ltx file uploaded",
+	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
 		"minTXID", info.MinTXID,
 		"maxTXID", info.MaxTXID,
@@ -427,7 +437,7 @@ func (r *Replica) monitor(ctx context.Context) {
 		notify = r.db.Notify()
 
 		// Synchronize the shadow wal into the replication directory.
-		if _, err := r.syncOnce(ctx, r.MaxSyncLTXFiles); err != nil {
+		if err := r.sync(ctx, r.MaxSyncLTXFiles); err != nil {
 			if errors.Is(err, errReplicaWaitForData) {
 				continue
 			}
@@ -752,6 +762,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	r.Logger().Debug("renaming database from temporary location")
 	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
 		return err
+	}
+	if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
+		return fmt.Errorf("sync restore output dir: %w", err)
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
@@ -1142,6 +1155,9 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	// Rename to final path.
 	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
 		return fmt.Errorf("rename to output path: %w", err)
+	}
+	if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
+		return fmt.Errorf("sync restore output dir: %w", err)
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
@@ -1728,15 +1744,10 @@ func WriteTXIDFile(outputPath string, txid ltx.TXID) error {
 		return fmt.Errorf("rename txid file: %w", err)
 	}
 
-	dir, err := os.Open(filepath.Dir(txidPath))
-	if err != nil {
-		return fmt.Errorf("open txid dir for sync: %w", err)
-	}
-	if err := dir.Sync(); err != nil {
-		_ = dir.Close()
+	if err := internal.FsyncDir(filepath.Dir(txidPath)); err != nil {
 		return fmt.Errorf("sync txid dir: %w", err)
 	}
-	return dir.Close()
+	return nil
 }
 
 // ReadTXIDFile reads the TXID from a sidecar file at <outputPath>-txid.

@@ -59,7 +59,7 @@ const (
 //
 //  3. TruncatePageN (TRUNCATE): Blocking checkpoint at ~121k pages (~500MB).
 //     Emergency brake for runaway WAL growth. Can block writes while waiting
-//     for long-lived read transactions. Configurable/disableable.
+//     for long-lived read transactions. Configurable with a default backstop.
 //
 // The RESTART checkpoint mode was permanently removed due to production issues
 // with indefinite write blocking (issue #724). All checkpoints now use either
@@ -132,8 +132,7 @@ type DB struct {
 	//
 	// Uses TRUNCATE checkpoint mode (blocking). Prevents unbounded WAL growth
 	// from long-lived read transactions. Default: 121359 pages (~500MB with 4KB
-	// page size). Set to 0 to disable forced truncation (use with caution as
-	// WAL can grow unbounded if read transactions prevent checkpointing).
+	// page size). Set to 0 to retain the default emergency threshold.
 	TruncatePageN int
 
 	// Time between automatic checkpoints in the WAL. This is done to allow
@@ -195,6 +194,8 @@ type DB struct {
 // syncState holds mutable sync-tracking fields extracted from DB.
 // These fields are threaded through sync/checkpoint methods via pointer.
 type syncState struct {
+	truncatePassiveFailed bool
+
 	// syncedSinceCheckpoint tracks whether any data has been synced since
 	// the last checkpoint. Used to prevent time-based checkpoints from
 	// triggering when there are no actual database changes, which would
@@ -219,11 +220,12 @@ type syncState struct {
 }
 
 type syncExecutor struct {
-	state      syncState
-	pos        ltx.Pos
-	posChanged bool
-	l0FileInfo *ltx.FileInfo
-	synced     bool
+	state               syncState
+	pos                 ltx.Pos
+	posChanged          bool
+	l0FileInfo          *ltx.FileInfo
+	synced              bool
+	checkpointAttempted bool
 }
 
 type diagOp string
@@ -1406,31 +1408,45 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 	if db.pageSize == 0 {
 		return nil
 	}
+	if !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
+		exec.state.truncatePassiveFailed = false
+	}
 
 	// Priority 1: Emergency truncate checkpoint (TRUNCATE mode, blocking)
 	// This prevents unbounded WAL growth from long-lived read transactions.
 	if db.exceedsTruncateThreshold(origWALSize) {
-		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
+		truncateThreshold := calcWALSize(uint32(db.pageSize), uint32(db.effectiveTruncatePageN()))
 
-		// Try a PASSIVE checkpoint first: if it restarts the WAL and brings
-		// the synced offset below the threshold, the blocking TRUNCATE and
-		// its mandatory boundary snapshot are skipped.
-		if restarted, err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
-			if !isSQLiteBusyError(err) {
-				return err
+		if !exec.state.truncatePassiveFailed {
+			// Try a PASSIVE checkpoint first: if it restarts the WAL and brings
+			// the synced offset below the threshold, the blocking TRUNCATE and
+			// its mandatory boundary snapshot are skipped.
+			if restarted, err := db.checkpointWithExecutor(ctx, CheckpointModePassive, exec); err != nil {
+				if !isSQLiteBusyError(err) {
+					return err
+				}
+				exec.state.truncatePassiveFailed = true
+				db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
+			} else if restarted {
+				exec.state.truncatePassiveFailed = false
+				if !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
+					db.Logger.Info("wal restarted by passive checkpoint, skipping truncate checkpoint",
+						"wal_size", origWALSize,
+						"threshold", truncateThreshold)
+					return nil
+				}
+			} else if exec.checkpointAttempted {
+				exec.state.truncatePassiveFailed = true
 			}
-			db.Logger.Log(ctx, internal.LevelTrace, "passive checkpoint skipped", "reason", "database busy")
-		} else if restarted && !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
-			db.Logger.Info("wal restarted by passive checkpoint, skipping truncate checkpoint",
-				"wal_size", origWALSize,
-				"threshold", truncateThreshold)
-			return nil
 		}
 
 		db.Logger.Info("forcing truncate checkpoint",
 			"wal_size", origWALSize,
 			"threshold", truncateThreshold)
-		_, err := db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
+		restarted, err := db.checkpointWithExecutor(ctx, CheckpointModeTruncate, exec)
+		if restarted || !db.exceedsTruncateThreshold(exec.state.lastSyncedWALOffset) {
+			exec.state.truncatePassiveFailed = false
+		}
 		return err
 	}
 
@@ -1480,8 +1496,16 @@ func (db *DB) checkpointIfNeeded(ctx context.Context, exec *syncExecutor, origWA
 // exceedsTruncateThreshold returns true once walSize has grown past the
 // emergency truncate checkpoint threshold.
 func (db *DB) exceedsTruncateThreshold(walSize int64) bool {
-	return db.TruncatePageN > 0 && db.pageSize != 0 &&
-		walSize >= calcWALSize(uint32(db.pageSize), uint32(db.TruncatePageN))
+	truncatePageN := db.effectiveTruncatePageN()
+	return truncatePageN > 0 && db.pageSize != 0 &&
+		walSize >= calcWALSize(uint32(db.pageSize), uint32(truncatePageN))
+}
+
+func (db *DB) effectiveTruncatePageN() int {
+	if db.TruncatePageN == 0 {
+		return DefaultTruncatePageN
+	}
+	return db.TruncatePageN
 }
 
 // isSQLiteBusyError returns true if the error is an SQLITE_BUSY error.
@@ -1687,6 +1711,8 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	if fi, err := os.Stat(db.WALPath()); err != nil {
 		return info, fmt.Errorf("open wal file: %w", err)
 	} else if info.offset > fi.Size() {
+		exec.state.truncatePassiveFailed = false
+
 		// If we previously synced to the exact end of the WAL, this truncation
 		// is expected (normal checkpoint behavior). Reset position and continue
 		// incrementally rather than triggering a full snapshot. See issue #927.
@@ -1723,6 +1749,9 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	salt1 := binary.BigEndian.Uint32(hdr0[16:])
 	salt2 := binary.BigEndian.Uint32(hdr0[20:])
 	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
+	if !saltMatch {
+		exec.state.truncatePassiveFailed = false
+	}
 
 	// Handle edge case where we're at WAL header (WALOffset=32, WALSize=0).
 	// This can happen when an LTX file represents a state at the beginning of the WAL
@@ -2207,6 +2236,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		db.invalidatePosCache()
 		return result, fmt.Errorf("rename ltx file: %w", err)
 	}
+	if err := internal.FsyncDir(filepath.Dir(filename)); err != nil {
+		db.maxLTXFileInfos.Lock()
+		delete(db.maxLTXFileInfos.m, 0) // clear cache if in unknown state
+		db.maxLTXFileInfos.Unlock()
+		db.invalidatePosCache()
+		return result, fmt.Errorf("sync ltx dir: %w", err)
+	}
 
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
@@ -2410,6 +2446,7 @@ func (db *DB) checkpoint(ctx context.Context, mode string, state *syncState) err
 // whether the checkpoint restarted the WAL. It returns false without
 // checkpointing when the checkpoint lock is held by an in-progress snapshot.
 func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syncExecutor) (walRestarted bool, err error) {
+	exec.checkpointAttempted = false
 	db.setSyncDiagPhase(diagPhaseCheckpointLock,
 		func(s *diagState) {
 			s.checkpointMode = mode
@@ -2426,6 +2463,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		return false, nil
 	}
 	defer db.chkMu.Unlock()
+	exec.checkpointAttempted = true
 
 	// Read WAL header before checkpoint to check if it has been restarted.
 	db.setSyncDiagPhase(diagPhaseCheckpointReadWALHeader,
@@ -2515,6 +2553,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 		exec.state.syncedSinceCheckpoint = false
 		return false, nil
 	}
+	exec.state.truncatePassiveFailed = false
 
 	if mode == CheckpointModePassive {
 		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
@@ -2645,20 +2684,28 @@ type snapshotReadPosition struct {
 	pageSize     int
 	walEndOffset int64
 	db           *DB
+	closeOnce    sync.Once
 }
 
 func (p *snapshotReadPosition) close() {
-	if p.db != nil {
-		p.db.chkMu.RUnlock()
-		p.db = nil
-	}
+	p.closeOnce.Do(func() { p.db.chkMu.RUnlock() })
+}
+
+type snapshotReadCloser struct {
+	*io.PipeReader
+	pos *snapshotReadPosition
+}
+
+func (r *snapshotReadCloser) Close() error {
+	defer r.pos.close()
+	return r.PipeReader.Close()
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
-// Internal checkpoints are disabled until the reader is fully drained or
-// closed (it implements io.Closer). An abandoned reader blocks checkpoints
-// for the life of the process.
-func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.Reader, error) {
+// Internal checkpoints remain disabled until the reader reaches EOF or is
+// closed. Callers must close readers they do not fully consume; abandoning a
+// reader blocks checkpoints indefinitely.
+func (db *DB) SnapshotReader(ctx context.Context) (ltx.Pos, io.ReadCloser, error) {
 	pos, err := db.snapshotPosition(ctx)
 	if err != nil {
 		return ltx.Pos{}, nil, err
@@ -2752,7 +2799,7 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 	return dec.Header().WALOffset + dec.Header().WALSize, nil
 }
 
-func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.Reader, error) {
+func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io.ReadCloser, error) {
 	db.Logger.Debug("snapshot", "txid", pos.pos.TXID.String(), "walEndOffset", pos.walEndOffset)
 
 	// TODO(ltx): Read database size from database header.
@@ -2846,7 +2893,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		_ = pw.Close()
 	}()
 
-	return pr, nil
+	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
@@ -2888,12 +2935,10 @@ func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer func() { _ = r.Close() }()
 
 	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
-		if closer, ok := r.(io.Closer); ok {
-			_ = closer.Close()
-		}
 		return info, err
 	}
 
@@ -2935,6 +2980,10 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
+	// Use the last deleted snapshot's MaxTXID, rather than the first retained
+	// snapshot's MaxTXID, to preserve lower-level files in an in-flight restore
+	// plan. TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles
+	// guards this conservative floor.
 	for i, info := range snapshots {
 		if slices.Contains(deleted, info) {
 			continue
