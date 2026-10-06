@@ -361,7 +361,7 @@ func TestVFSFile_OpenSeedsLevel1Position(t *testing.T) {
 	}
 }
 
-func TestVFSFile_OpenSeedsLevel1PositionFromPos(t *testing.T) {
+func TestVFSFile_OpenKeepsLevel1PositionAtZeroWithoutL1Files(t *testing.T) {
 	client := newMockReplicaClient()
 	snapshot := buildLTXFixture(t, 1, 's')
 	snapshot.info.Level = SnapshotLevel
@@ -376,12 +376,59 @@ func TestVFSFile_OpenSeedsLevel1PositionFromPos(t *testing.T) {
 	}
 	defer f.Close()
 
-	pos := f.Pos().TXID
-	if pos == 0 {
+	if pos := f.Pos().TXID; pos == 0 {
 		t.Fatalf("expected non-zero position")
 	}
-	if got := f.maxTXID1; got != pos {
-		t.Fatalf("expected maxTXID1 to equal pos when no L1 files, got %s want %s", got, pos)
+	// maxTXID1 must stay zero so the first L1 file — which starts at
+	// TXID 1 regardless of how far L0 has advanced — is consumed
+	// contiguously (#1460). Seeding it from the L0 position skipped the
+	// straddling first compaction output forever.
+	if got := f.maxTXID1; got != 0 {
+		t.Fatalf("expected maxTXID1 to stay zero when no L1 files, got %s", got)
+	}
+}
+
+func TestVFSFile_PollConsumesStraddlingL1Compaction(t *testing.T) {
+	client := newMockReplicaClient()
+	snapshot := buildLTXFixture(t, 1, 's')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	for txid := ltx.TXID(2); txid <= 6; txid++ {
+		l0 := buildLTXFixture(t, txid, byte('0'+int(txid)%10))
+		l0.info.Level = 0
+		client.addFixture(t, l0)
+	}
+
+	f := NewVFSFile(client, "l1-straddle.db", slog.Default())
+	if err := f.Open(); err != nil {
+		t.Fatalf("open vfs file: %v", err)
+	}
+	defer f.Close()
+
+	// The writer's first L0->L1 compaction emits a file whose range
+	// straddles the follower's L0 position (1..0xb vs pos 6), followed
+	// by the next L1 file (0xc..0x1d). The fixture bodies are single-TXID
+	// LTX files; only the advertised TXID range matters for the seek and
+	// contiguity checks under test.
+	straddler := buildLTXFixture(t, 0xb, 'A')
+	straddler.info.Level = 1
+	straddler.info.MinTXID = 1
+	client.addFixture(t, straddler)
+	next := buildLTXFixture(t, 0x1d, 'B')
+	next.info.Level = 1
+	next.info.MinTXID = 0xc
+	client.addFixture(t, next)
+
+	// Before the fix this wedged forever with:
+	//   poll L1: non-contiguous ltx file: level=1, current=6, next=c-1d
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll replica: %v", err)
+	}
+	if got, want := f.maxTXID1, ltx.TXID(0x1d); got != want {
+		t.Fatalf("unexpected maxTXID1: got %s want %s", got, want)
+	}
+	if got, want := f.Pos().TXID, ltx.TXID(0x1d); got != want {
+		t.Fatalf("unexpected pos after straddling L1 consumption: got %s want %s", got, want)
 	}
 }
 
@@ -852,6 +899,8 @@ func (c *countingReplicaClient) Type() string { return "count" }
 
 func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
+func (c *countingReplicaClient) SetLogger(*slog.Logger) {}
+
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	c.calls.Add(1)
 	return ltx.NewFileInfoSliceIterator(nil), nil
@@ -885,6 +934,8 @@ func newBlockingReplicaClient() *blockingReplicaClient {
 func (c *mockReplicaClient) Type() string { return "mock" }
 
 func (c *mockReplicaClient) Init(context.Context) error { return nil }
+
+func (c *mockReplicaClient) SetLogger(*slog.Logger) {}
 
 func (c *mockReplicaClient) addFixture(tb testing.TB, fx *ltxFixture) {
 	tb.Helper()
