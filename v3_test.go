@@ -73,6 +73,7 @@ func TestParseSnapshotFilenameV3(t *testing.T) {
 			{"00000001.snapshot.lz4", 1},
 			{"000000ff.snapshot.lz4", 255},
 			{"12345678.snapshot.lz4", 0x12345678},
+			{"7fffffff.snapshot.lz4", 0x7fffffff},
 		}
 		for _, tt := range tests {
 			index, err := litestream.ParseSnapshotFilenameV3(tt.filename)
@@ -96,6 +97,9 @@ func TestParseSnapshotFilenameV3(t *testing.T) {
 			"0000000g.snapshot.lz4",  // invalid hex
 			"00000001.SNAPSHOT.lz4",  // uppercase
 			"00000001.snapshot.lz4.bak",
+			"80000000.snapshot.lz4",
+			"f2345678.snapshot.lz4",
+			"ffffffff.snapshot.lz4",
 		}
 		for _, filename := range invalids {
 			_, err := litestream.ParseSnapshotFilenameV3(filename)
