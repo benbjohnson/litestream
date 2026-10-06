@@ -3,8 +3,11 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -83,6 +86,66 @@ func TestCompactor_Compact(t *testing.T) {
 			t.Errorf("TXID range=%d-%d, want 1-3", info.MinTXID, info.MaxTXID)
 		}
 	})
+}
+
+func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
+	client := newEarlyReturnCompactionClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
+	client.failWrites = true
+
+	before := countCompactorPipeWriters()
+	if _, err := compactor.Compact(context.Background(), 1); err == nil {
+		t.Fatal("expected error")
+	} else if !strings.Contains(err.Error(), "write ltx file: early write failure") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	deadline := time.NewTimer(time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if got := countCompactorPipeWriters(); got <= before {
+			break
+		}
+		select {
+		case <-deadline.C:
+			t.Fatalf("compactor goroutine leaked: got %d, want <= %d", countCompactorPipeWriters(), before)
+		case <-ticker.C:
+		}
+	}
+}
+
+func TestCompactor_CompactResumesRemoteSourceAfterDisconnect(t *testing.T) {
+	client := newDisconnectingCompactionClient(t.TempDir(), 16)
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+
+	info, err := compactor.Compact(context.Background(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Level != 1 {
+		t.Errorf("Level=%d, want 1", info.Level)
+	}
+	if info.MinTXID != 1 || info.MaxTXID != 1 {
+		t.Errorf("TXID range=%d-%d, want 1-1", info.MinTXID, info.MaxTXID)
+	}
+
+	var resumed bool
+	for _, offset := range client.openOffsets[1:] {
+		if offset > 0 {
+			resumed = true
+			break
+		}
+	}
+	if !resumed {
+		t.Fatalf("OpenLTXFile offsets=%v, want reopen at non-zero offset", client.openOffsets)
+	}
 }
 
 func TestCompactor_MaxLTXFileInfo(t *testing.T) {
@@ -599,4 +662,78 @@ func createTestLTXFileWithTimestamp(t testing.TB, client litestream.ReplicaClien
 	if _, err := client.WriteLTXFile(context.Background(), level, minTXID, maxTXID, io.NopCloser(&buf)); err != nil {
 		t.Fatal(err)
 	}
+}
+
+type earlyReturnCompactionClient struct {
+	litestream.ReplicaClient
+	failWrites bool
+}
+
+func newEarlyReturnCompactionClient(path string) *earlyReturnCompactionClient {
+	return &earlyReturnCompactionClient{ReplicaClient: file.NewReplicaClient(path)}
+}
+
+func (c *earlyReturnCompactionClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if c.failWrites {
+		return nil, fmt.Errorf("early write failure")
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+type disconnectingCompactionClient struct {
+	litestream.ReplicaClient
+	dropAfter   int64
+	dropped     bool
+	openOffsets []int64
+}
+
+func newDisconnectingCompactionClient(path string, dropAfter int64) *disconnectingCompactionClient {
+	return &disconnectingCompactionClient{
+		ReplicaClient: file.NewReplicaClient(path),
+		dropAfter:     dropAfter,
+	}
+}
+
+func (c *disconnectingCompactionClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.openOffsets = append(c.openOffsets, offset)
+
+	rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	if !c.dropped && offset == 0 {
+		c.dropped = true
+		return &disconnectingReadCloser{ReadCloser: rc, remaining: c.dropAfter}, nil
+	}
+	return rc, nil
+}
+
+type disconnectingReadCloser struct {
+	io.ReadCloser
+	remaining int64
+}
+
+func (r *disconnectingReadCloser) Read(p []byte) (int, error) {
+	if r.remaining <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > r.remaining {
+		p = p[:int(r.remaining)]
+	}
+
+	n, err := r.ReadCloser.Read(p)
+	r.remaining -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	if r.remaining <= 0 {
+		return n, io.EOF
+	}
+	return n, nil
+}
+
+func countCompactorPipeWriters() int {
+	buf := make([]byte, 2<<20)
+	n := runtime.Stack(buf, true)
+	return strings.Count(string(buf[:n]), "github.com/benbjohnson/litestream.(*Compactor).Compact.func")
 }

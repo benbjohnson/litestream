@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"hash/crc64"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -18,6 +19,27 @@ import (
 	"github.com/benbjohnson/litestream/internal/testingutil"
 	"github.com/benbjohnson/litestream/mock"
 )
+
+type snapshotCountingClient struct {
+	litestream.ReplicaClient
+	mu sync.Mutex
+	n  int
+}
+
+func (c *snapshotCountingClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level == litestream.SnapshotLevel {
+		c.mu.Lock()
+		c.n++
+		c.mu.Unlock()
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+func (c *snapshotCountingClient) writeCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
 
 func TestDB_Path(t *testing.T) {
 	db := testingutil.NewDB(t, "/tmp/db")
@@ -550,6 +572,106 @@ func TestDB_Snapshot(t *testing.T) {
 	}
 }
 
+func TestDB_SnapshotExcludesUnsyncedWALFrames(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (2);`); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.MaxTXID != pos.TXID {
+		t.Fatalf("snapshot txid=%s, want %s", info.MaxTXID, pos.TXID)
+	}
+
+	rc, err := db.Replica.Client.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, pos.TXID, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rc.Close()
+
+	restorePath := filepath.Join(t.TempDir(), "snapshot.db")
+	f, err := os.Create(restorePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ltx.NewDecoder(rc).DecodeDatabaseTo(f); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	restored := testingutil.MustOpenSQLDB(t, restorePath)
+	defer testingutil.MustCloseSQLDB(t, restored)
+
+	var count int
+	if err := restored.QueryRowContext(t.Context(), `SELECT COUNT(*) FROM t;`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 1 {
+		t.Fatalf("restored row count=%d, want 1", count)
+	}
+}
+
+func TestDB_SnapshotAlwaysWrites(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	client := &snapshotCountingClient{ReplicaClient: db.Replica.Client}
+	db.Replica.Client = client
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
+		t.Fatal(err)
+	} else if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	// Snapshot is a primitive that always writes, even at the same
+	// position, so -force-snapshot can re-upload a suspect snapshot.
+	// Duplicate skipping belongs to callers like Store.CompactDB.
+	info0, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	info1, err := db.Snapshot(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got, want := ltx.FormatFilename(info1.MinTXID, info1.MaxTXID), ltx.FormatFilename(info0.MinTXID, info0.MaxTXID); got != want {
+		t.Fatalf("Filename=%s, want %s", got, want)
+	}
+	if got, want := client.writeCount(), 2; got != want {
+		t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
+	}
+}
+
 func TestDB_EnforceRetention(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -596,7 +718,7 @@ func TestDB_EnforceRetention(t *testing.T) {
 	retentionTime := time.Now().Add(-150 * time.Millisecond)
 	if minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), retentionTime); err != nil {
 		t.Fatal(err)
-	} else if got, want := minSnapshotTXID, ltx.TXID(4); got != want {
+	} else if got, want := minSnapshotTXID, ltx.TXID(3); got != want {
 		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
 	}
 
@@ -619,6 +741,23 @@ func TestDB_EnforceRetention(t *testing.T) {
 	// Should have fewer snapshots than before
 	if afterCount >= beforeCount {
 		t.Fatalf("expected fewer snapshots after retention, before=%d after=%d", beforeCount, afterCount)
+	}
+}
+
+func TestDB_EnforceSnapshotRetention_ReturnsZeroWithoutPriorSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, time.Now().Add(-time.Hour))
+
+	minSnapshotTXID, err := db.EnforceSnapshotRetention(t.Context(), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := minSnapshotTXID, ltx.TXID(0); got != want {
+		t.Fatalf("MinSnapshotTXID=%s, want %s", got, want)
 	}
 }
 
@@ -679,6 +818,62 @@ func TestDB_EnforceSnapshotRetention_RetentionDisabled(t *testing.T) {
 	afterCount := countFiles()
 	if afterCount != beforeCount {
 		t.Fatalf("expected %d remote snapshots (no remote deletion), got %d", beforeCount, afterCount)
+	}
+}
+
+func TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles(t *testing.T) {
+	ctx := context.Background()
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer testingutil.MustCloseDB(t, db)
+
+	oldTime := time.Now().Add(-2 * time.Hour)
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 5, oldTime)
+	createTestLTXFileWithTimestamp(t, client, 1, 6, 10, oldTime.Add(time.Minute))
+
+	plan, err := litestream.CalcRestorePlan(ctx, client, 10, time.Time{}, db.Logger)
+	if err != nil {
+		t.Fatalf("calc restore plan: %v", err)
+	}
+
+	var plannedInfo *ltx.FileInfo
+	for _, info := range plan {
+		if info.Level == 1 && info.MinTXID == 6 && info.MaxTXID == 10 {
+			plannedInfo = info
+			break
+		}
+	}
+	if plannedInfo == nil {
+		t.Fatalf("restore plan does not include L1 6-10: %#v", plan)
+	}
+
+	createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 11, time.Now())
+	createTestLTXFileWithTimestamp(t, client, 1, 11, 11, time.Now())
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
+		{Level: 0},
+		{Level: 1, Interval: time.Hour},
+	})
+	store.SnapshotRetention = time.Hour
+
+	if err := store.EnforceSnapshotRetention(ctx, db); err != nil {
+		t.Fatalf("enforce snapshot retention: %v", err)
+	}
+
+	rc, err := client.OpenLTXFile(ctx, plannedInfo.Level, plannedInfo.MinTXID, plannedInfo.MaxTXID, 0, 0)
+	if err != nil {
+		t.Fatalf("planned LTX file was deleted by retention: level=%d min=%s max=%s: %v", plannedInfo.Level, plannedInfo.MinTXID, plannedInfo.MaxTXID, err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("close planned LTX file: %v", err)
 	}
 }
 
@@ -1288,37 +1483,27 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
-	// Use a longer checkpoint interval so we can control when it triggers
-	db.CheckpointInterval = 100 * time.Millisecond
+	db.CheckpointInterval = time.Hour
 
-	// Create table and initial sync
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-
-	// Wait for interval to pass and sync to trigger initial checkpoint
-	time.Sleep(150 * time.Millisecond)
-	if err := db.Sync(t.Context()); err != nil {
+	if err := db.Checkpoint(t.Context(), litestream.CheckpointModePassive); err != nil {
 		t.Fatal(err)
 	}
 
-	// Record TXID after first checkpoint
 	posAfterFirstCheckpoint, err := db.Pos()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("TXID after first checkpoint: %d", posAfterFirstCheckpoint.TXID)
 
-	// Insert data immediately (before interval elapses)
 	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (data) VALUES ('delayed checkpoint test')`); err != nil {
 		t.Fatal(err)
 	}
-
-	// Sync immediately - this should NOT trigger a checkpoint (interval hasn't elapsed)
-	// but should set syncedSinceCheckpoint = true
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -1328,26 +1513,32 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("TXID after insert+sync: %d", posAfterInsert.TXID)
-
-	// Now wait for the interval to pass and sync again (no new data)
-	time.Sleep(150 * time.Millisecond)
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
+	if posAfterInsert.TXID <= posAfterFirstCheckpoint.TXID {
+		t.Fatalf("expected insert sync to advance TXID: checkpoint=%d insert=%d",
+			posAfterFirstCheckpoint.TXID, posAfterInsert.TXID)
 	}
 
-	// A checkpoint should have been triggered because syncedSinceCheckpoint was true
-	// The TXID should have advanced due to the checkpoint
-	posAfterDelayedCheckpoint, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
+	db.CheckpointInterval = time.Nanosecond
+	deadline := time.Now().Add(5 * time.Second)
+	posAfterDelayedCheckpoint := posAfterInsert
+	for {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		posAfterDelayedCheckpoint, err = db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if posAfterDelayedCheckpoint.TXID > posAfterInsert.TXID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for delayed checkpoint: insert=%d current=%d",
+				posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	t.Logf("TXID after delayed checkpoint: %d", posAfterDelayedCheckpoint.TXID)
-
-	// The TXID should have advanced from the insert position, indicating the checkpoint ran
-	if posAfterDelayedCheckpoint.TXID <= posAfterInsert.TXID {
-		t.Fatalf("expected TXID to advance after delayed checkpoint (syncedSinceCheckpoint should persist), got insert=%d delayed=%d",
-			posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
-	}
 }
 
 func TestDB_SyncStatus(t *testing.T) {

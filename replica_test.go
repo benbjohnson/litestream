@@ -254,6 +254,43 @@ func TestReplica_RestoreAndReplicateAfterDataLoss(t *testing.T) {
 	t.Log("Test passed: New data after restore was successfully replicated")
 }
 
+func TestReplica_RestoreRetriesInitialLTXOpenError(t *testing.T) {
+	ctx := context.Background()
+
+	client := &transientOpenFailureClient{
+		ReplicaClient:     file.NewReplicaClient(t.TempDir()),
+		remainingFailures: 2,
+	}
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+
+	r := litestream.NewReplicaWithClient(nil, client)
+	restorePath := filepath.Join(t.TempDir(), "restored.db")
+	if err := r.Restore(ctx, litestream.RestoreOptions{OutputPath: restorePath}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(restorePath); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.openCount, 3; got < want {
+		t.Fatalf("OpenLTXFile() count=%d, want at least %d", got, want)
+	}
+}
+
+type transientOpenFailureClient struct {
+	litestream.ReplicaClient
+	remainingFailures int
+	openCount         int
+}
+
+func (c *transientOpenFailureClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	c.openCount++
+	if offset == 0 && c.remainingFailures > 0 {
+		c.remainingFailures--
+		return nil, fmt.Errorf("net/http: TLS handshake timeout")
+	}
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
 func TestReplica_CalcRestorePlan(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -857,6 +894,39 @@ func TestReplica_Restore_InvalidFileSize(t *testing.T) {
 	})
 }
 
+func TestReplica_Restore_RemovesTempFileOnFailure(t *testing.T) {
+	invalidLTX := bytes.Repeat([]byte{0xff}, ltx.HeaderSize)
+
+	var c mock.ReplicaClient
+	c.LTXFilesFunc = func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+		if level == litestream.SnapshotLevel {
+			return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{
+				Level:     litestream.SnapshotLevel,
+				MinTXID:   1,
+				MaxTXID:   1,
+				Size:      int64(len(invalidLTX)),
+				CreatedAt: time.Now(),
+			}}), nil
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	c.OpenLTXFileFunc = func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(invalidLTX)), nil
+	}
+
+	r := litestream.NewReplicaWithClient(nil, &c)
+	outputPath := filepath.Join(t.TempDir(), "restored.db")
+
+	err := r.Restore(context.Background(), litestream.RestoreOptions{OutputPath: outputPath})
+	if err == nil {
+		t.Fatal("expected restore error")
+	}
+
+	if _, err := os.Stat(outputPath + ".tmp"); !os.IsNotExist(err) {
+		t.Fatalf("expected temp restore file to be removed, err=%v", err)
+	}
+}
+
 func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 	// This test verifies that context cancellation errors are not logged during shutdown.
 	// The fix for issue #235 ensures that context.Canceled and context.DeadlineExceeded
@@ -1112,6 +1182,155 @@ func TestReplica_RestoreV3(t *testing.T) {
 		}
 
 		// Verify restored database
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("MultipleWALIndices", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{"wal0"}, []string{"wal1"})
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData[0]},
+			{index: 1, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("MissingWALIndex", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{"wal0"}, []string{"wal2"})
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData[0]},
+			{index: 2, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "missing WAL index") {
+			t.Fatalf("expected missing WAL index error, got %v", err)
+		}
+	})
+
+	t.Run("MissingWALOffset", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALData(t, dbData)
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData},
+			{index: 0, offset: 999999, data: []byte("wal gap")},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err == nil || !strings.Contains(err.Error(), "missing WAL segment") {
+			t.Fatalf("expected missing WAL segment error, got %v", err)
+		}
+	})
+
+	t.Run("SnapshotIndexNonZero", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{"wal5"}, []string{"wal6"})
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 5, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 5, offset: 0, data: walData[0]},
+			{index: 6, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
+		verifyRestoredDB(t, outputPath)
+	})
+
+	t.Run("WALTruncationBetweenIndices", func(t *testing.T) {
+		ctx := context.Background()
+		tmpDir := t.TempDir()
+		replicaDir := t.TempDir()
+
+		gen := "0123456789abcdef"
+		dbData := createTestSQLiteDB(t)
+		walData := createTestWALSequence(t, dbData, []string{strings.Repeat("x", 128*1024)}, []string{"small"})
+		if len(walData[0]) <= len(walData[1]) {
+			t.Fatalf("expected first WAL to be larger than second WAL: %d <= %d", len(walData[0]), len(walData[1]))
+		}
+
+		createV3Backup(t, replicaDir, gen, []v3SnapshotData{
+			{index: 0, data: dbData},
+		}, []v3WALSegmentData{
+			{index: 0, offset: 0, data: walData[0]},
+			{index: 1, offset: 0, data: walData[1]},
+		})
+
+		c := file.NewReplicaClient(replicaDir)
+		r := litestream.NewReplicaWithClient(nil, c)
+
+		outputPath := tmpDir + "/restored.db"
+		err := r.RestoreV3(ctx, litestream.RestoreOptions{
+			OutputPath: outputPath,
+		})
+		if err != nil {
+			t.Fatalf("RestoreV3 failed: %v", err)
+		}
+
 		verifyRestoredDB(t, outputPath)
 	})
 
@@ -1671,7 +1890,7 @@ func writeV3WALSegment(t *testing.T, dir string, index int, offset int64, data [
 		t.Fatal(err)
 	}
 
-	filename := fmt.Sprintf("%08x-%016x.wal.lz4", index, offset)
+	filename := litestream.FormatWALSegmentFilenameV3(index, offset)
 	if err := os.WriteFile(filepath.Join(dir, filename), buf.Bytes(), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -1698,25 +1917,43 @@ func createTestSQLiteDB(t *testing.T) []byte {
 	return data
 }
 
-// createTestWALData creates minimal valid WAL data for testing.
-// For simplicity, returns an empty WAL header (32 bytes) which is valid.
 func createTestWALData(t *testing.T, dbData []byte) []byte {
 	t.Helper()
+	return createTestWALSequence(t, dbData, []string{"wal"})[0]
+}
 
-	// Create a minimal WAL header
-	// WAL header is 32 bytes:
-	// - magic number (4 bytes): 0x377f0683 (big-endian) or 0x377f0682 (little-endian)
-	// - file format version (4 bytes): 3007000
-	// - page size (4 bytes)
-	// - checkpoint sequence (4 bytes)
-	// - salt-1 (4 bytes)
-	// - salt-2 (4 bytes)
-	// - checksum-1 (4 bytes)
-	// - checksum-2 (4 bytes)
+func createTestWALSequence(t *testing.T, dbData []byte, valuesByIndex ...[]string) [][]byte {
+	t.Helper()
 
-	// For testing, we'll create an empty WAL that doesn't need frames applied
-	// This is sufficient for testing the restore mechanism
-	return make([]byte, 32) // Empty WAL header placeholder
+	tmpPath := t.TempDir() + "/test.db"
+	if err := os.WriteFile(tmpPath, dbData, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	sqldb := testingutil.MustOpenSQLDB(t, tmpPath)
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+
+	walData := make([][]byte, 0, len(valuesByIndex))
+	for _, values := range valuesByIndex {
+		for _, value := range values {
+			if _, err := sqldb.Exec(`INSERT INTO test (value) VALUES (?)`, value); err != nil {
+				t.Fatal(err)
+			}
+		}
+		data, err := os.ReadFile(tmpPath + "-wal")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(data) == 0 {
+			t.Fatal("expected WAL data")
+		}
+		walData = append(walData, append([]byte(nil), data...))
+		if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	return walData
 }
 
 func TestWriteTXIDFile(t *testing.T) {

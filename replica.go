@@ -12,17 +12,22 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream/internal"
 )
 
 // Default replica settings.
 const (
-	DefaultSyncInterval = 1 * time.Second
+	DefaultSyncInterval    = 1 * time.Second
+	DefaultMaxSyncLTXFiles = 256
 )
+
+var errReplicaWaitForData = errors.New("no position, waiting for data")
 
 // Replica connects a database to a replication destination via a ReplicaClient.
 // The replica manages periodic synchronization and maintaining the current
@@ -33,7 +38,8 @@ type Replica struct {
 	mu  sync.RWMutex
 	pos ltx.Pos // current replicated position
 
-	syncMu sync.Mutex // protects Sync() from concurrent calls
+	syncSem     *semaphore.Weighted
+	syncWaiters atomic.Int64 // diagnostic instrumentation: goroutines queued on syncSem
 
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
@@ -46,6 +52,10 @@ type Replica struct {
 
 	// Time between syncs with the shadow WAL.
 	SyncInterval time.Duration
+
+	// Maximum L0 files to upload in a single monitor sync batch.
+	// Set to zero to process all pending L0 files in one batch.
+	MaxSyncLTXFiles int
 
 	// If true, replica monitors database for changes automatically.
 	// Set to false if replica is being used synchronously (such as in tests).
@@ -60,11 +70,13 @@ type Replica struct {
 
 func NewReplica(db *DB) *Replica {
 	r := &Replica{
-		db:     db,
-		cancel: func() {},
+		db:      db,
+		syncSem: semaphore.NewWeighted(1),
+		cancel:  func() {},
 
-		SyncInterval:   DefaultSyncInterval,
-		MonitorEnabled: true,
+		SyncInterval:    DefaultSyncInterval,
+		MaxSyncLTXFiles: DefaultMaxSyncLTXFiles,
+		MonitorEnabled:  true,
 	}
 
 	return r
@@ -130,8 +142,30 @@ func (r *Replica) Stop(hard bool) (err error) {
 // Sync copies new WAL frames from the shadow WAL to the replica client.
 // Only one Sync can run at a time to prevent concurrent uploads of the same file.
 func (r *Replica) Sync(ctx context.Context) (err error) {
-	r.syncMu.Lock()
-	defer r.syncMu.Unlock()
+	return r.sync(ctx, 0)
+}
+
+func (r *Replica) sync(ctx context.Context, maxSyncLTXFiles int) error {
+	for {
+		result, err := r.syncOnce(ctx, maxSyncLTXFiles)
+		if err != nil {
+			return err
+		} else if !result.limited {
+			return nil
+		}
+	}
+}
+
+type replicaSyncResult struct {
+	synced  bool
+	limited bool
+}
+
+func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result replicaSyncResult, err error) {
+	if err := r.lockSync(ctx); err != nil {
+		return result, err
+	}
+	defer r.syncSem.Release(1)
 
 	// Clear last position if if an error occurs during sync.
 	defer func() {
@@ -142,11 +176,15 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 		}
 	}()
 
+	if err := ctx.Err(); err != nil {
+		return result, context.Cause(ctx)
+	}
+
 	// Calculate current replica position, if unknown.
 	if r.Pos().IsZero() {
 		pos, err := r.calcPos(ctx)
 		if err != nil {
-			return fmt.Errorf("calc pos: %w", err)
+			return result, fmt.Errorf("calc pos: %w", err)
 		}
 		r.SetPos(pos)
 	}
@@ -154,28 +192,56 @@ func (r *Replica) Sync(ctx context.Context) (err error) {
 	// Find current position of database.
 	dpos, err := r.db.Pos()
 	if err != nil {
-		return fmt.Errorf("cannot determine current position: %w", err)
+		return result, fmt.Errorf("cannot determine current position: %w", err)
 	} else if dpos.IsZero() {
-		return fmt.Errorf("no position, waiting for data")
+		return result, errReplicaWaitForData
 	}
 
-	r.Logger().Info("replica sync",
+	r.Logger().Debug("replica sync",
 		slog.Group("txid",
 			slog.String("replica", r.Pos().TXID.String()),
 			slog.String("db", dpos.TXID.String()),
 		))
 
 	// Replicate all L0 LTX files since last replica position.
-	for txID := r.Pos().TXID + 1; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+	for txID, syncedFileN := r.Pos().TXID+1, 0; txID <= dpos.TXID; txID = r.Pos().TXID + 1 {
+		if maxSyncLTXFiles > 0 && syncedFileN >= maxSyncLTXFiles {
+			result.limited = true
+			// Uploads succeeded, so record sync health; otherwise a
+			// sustained backlog reads as unhealthy while progressing.
+			r.db.RecordSuccessfulSync()
+			r.Logger().Debug("replica sync limited",
+				"synced_files", syncedFileN,
+				"db_txid", dpos.TXID.String(),
+				"replica_txid", r.Pos().TXID.String())
+			return result, nil
+		}
+		if err := ctx.Err(); err != nil {
+			return result, context.Cause(ctx)
+		}
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
-			return err
+			return result, err
 		}
 		r.SetPos(ltx.Pos{TXID: txID})
+		result.synced = true
+		syncedFileN++
 	}
 
 	// Record successful sync for heartbeat monitoring.
 	r.db.RecordSuccessfulSync()
 
+	return result, nil
+}
+
+func (r *Replica) lockSync(ctx context.Context) error {
+	if r.syncSem.TryAcquire(1) {
+		return nil
+	}
+	r.syncWaiters.Add(1)
+	defer r.syncWaiters.Add(-1)
+	if err := r.syncSem.Acquire(ctx, 1); err != nil {
+		return fmt.Errorf("wait for replica sync: %w", context.Cause(ctx))
+	}
 	return nil
 }
 
@@ -191,7 +257,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 	if err != nil {
 		return fmt.Errorf("write ltx file: %w", err)
 	}
-	r.Logger().Info("ltx file uploaded",
+	r.Logger().Debug("ltx file uploaded",
 		"level", info.Level,
 		"minTXID", info.MinTXID,
 		"maxTXID", info.MaxTXID,
@@ -327,10 +393,7 @@ func (r *Replica) monitor(ctx context.Context) {
 	ticker := time.NewTicker(r.SyncInterval)
 	defer ticker.Stop()
 
-	// Continuously check for new data to replicate.
-	ch := make(chan struct{})
-	close(ch)
-	var notify <-chan struct{} = ch
+	notify := r.db.Notify()
 
 	var backoff time.Duration
 	var lastLogTime time.Time
@@ -355,18 +418,30 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 		}
 
-		// Wait for changes to the database.
-		select {
-		case <-ctx.Done():
+		// If the position is unavailable, skip the wait so Sync() surfaces
+		// the error to the backoff & auto-recovery handling below.
+		if pos, err := r.db.Pos(); err == nil && pos.TXID <= r.Pos().TXID {
+			// Wait for new data, but still sync on an interval so idle
+			// databases continue recording sync health for heartbeats.
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+			case <-notify:
+			}
+		} else if ctx.Err() != nil {
 			return
-		case <-notify:
 		}
 
 		// Fetch new notify channel before replicating data.
 		notify = r.db.Notify()
 
 		// Synchronize the shadow wal into the replication directory.
-		if err := r.Sync(ctx); err != nil {
+		if err := r.sync(ctx, r.MaxSyncLTXFiles); err != nil {
+			if errors.Is(err, errReplicaWaitForData) {
+				continue
+			}
+
 			// Don't log context cancellation errors during shutdown
 			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 				consecutiveErrs++
@@ -633,12 +708,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
-		// Add file to be compacted.
-		f, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
-		if err != nil {
-			return fmt.Errorf("open ltx file: %w", err)
-		}
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, r.Logger()))
+		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
@@ -657,6 +727,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
 	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
+	defer func() { _ = os.Remove(tmpOutputPath) }()
 
 	f, err := os.Create(tmpOutputPath)
 	if err != nil {
@@ -691,6 +762,9 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	r.Logger().Debug("renaming database from temporary location")
 	if err := os.Rename(tmpOutputPath, opt.OutputPath); err != nil {
 		return err
+	}
+	if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
+		return fmt.Errorf("sync restore output dir: %w", err)
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
@@ -909,6 +983,9 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 
 	if hdr.Commit > 0 {
+		if err := f.Sync(); err != nil {
+			return fmt.Errorf("sync before truncate: %w", err)
+		}
 		newSize := int64(hdr.Commit) * int64(pageSize)
 		if err := f.Truncate(newSize); err != nil {
 			return fmt.Errorf("truncate: %w", err)
@@ -1071,13 +1148,16 @@ func (r *Replica) RestoreV3(ctx context.Context, opt RestoreOptions) error {
 	}
 
 	// Apply WAL segments.
-	if err := r.applyWALSegmentsV3(ctx, client, snapshot.Generation, segments, tmpPath); err != nil {
+	if err := r.applyWALSegmentsV3(ctx, client, snapshot.Generation, snapshot.Index, segments, tmpPath); err != nil {
 		return fmt.Errorf("apply WAL segments: %w", err)
 	}
 
 	// Rename to final path.
 	if err := os.Rename(tmpPath, opt.OutputPath); err != nil {
 		return fmt.Errorf("rename to output path: %w", err)
+	}
+	if err := internal.FsyncDir(filepath.Dir(opt.OutputPath)); err != nil {
+		return fmt.Errorf("sync restore output dir: %w", err)
 	}
 
 	if opt.IntegrityCheck != IntegrityCheckNone {
@@ -1161,7 +1241,7 @@ func (r *Replica) downloadSnapshotV3(ctx context.Context, client ReplicaClientV3
 }
 
 // applyWALSegmentsV3 applies WAL segments to the database file.
-func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3, generation string, segments []WALSegmentInfoV3, dbPath string) error {
+func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3, generation string, snapshotIndex int, segments []WALSegmentInfoV3, dbPath string) error {
 	if len(segments) == 0 {
 		return nil
 	}
@@ -1170,6 +1250,8 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 	walPath := dbPath + "-wal"
 	var f *os.File
 	var err error
+	expectedIndex := snapshotIndex
+	offset := int64(0)
 
 	defer func() {
 		if f != nil {
@@ -1184,7 +1266,11 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 			return err
 		}
 		f = nil
-		return checkpointV3(dbPath)
+		if err = checkpointV3(dbPath); err != nil {
+			return err
+		}
+		r.Logger().Debug("applied WAL index", "generation", generation, "index", expectedIndex-1, "bytes", offset)
+		return nil
 	}
 
 	// Reconstruct each wal file, appending non-zero offsets, and apply them
@@ -1195,31 +1281,39 @@ func (r *Replica) applyWALSegmentsV3(ctx context.Context, client ReplicaClientV3
 			if err = applyLastWalFile(); err != nil {
 				return err
 			}
+			if seg.Index != expectedIndex {
+				return fmt.Errorf("missing WAL index: expected %d/0, got %d/%d", expectedIndex, seg.Index, seg.Offset)
+			}
+			offset = 0
 			// Open a new WAL file
-			if f, err = os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY, 0644); err != nil {
+			if f, err = os.OpenFile(walPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644); err != nil {
 				return err
 			}
+			expectedIndex++
+		} else if seg.Offset != offset {
+			return fmt.Errorf("missing WAL segment: expected %d/%d, got %d/%d", seg.Index, offset, seg.Index, seg.Offset)
 		}
-		if err := r.appendWALSegmentV3(ctx, client, generation, seg, f); err != nil {
+		if n, err := r.appendWALSegmentV3(ctx, client, generation, seg, f); err != nil {
 			return fmt.Errorf("write WAL segment %d/%d: %w", seg.Index, seg.Offset, err)
+		} else {
+			offset += n
+			r.Logger().Debug("wrote WAL segment", "generation", generation, "index", seg.Index, "offset", seg.Offset, "bytes", n)
 		}
-		r.Logger().Debug("wrote WAL segment", "generation", generation, "index", seg.Index, "offset", seg.Offset)
 	}
 
 	return applyLastWalFile()
 }
 
 // appendWALSegmentV3 appends the specified segment to an open WAL file f.
-func (r *Replica) appendWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, f *os.File) error {
+func (r *Replica) appendWALSegmentV3(ctx context.Context, client ReplicaClientV3, generation string, seg WALSegmentInfoV3, f *os.File) (int64, error) {
 	// Download WAL segment.
 	rc, err := client.OpenWALSegmentV3(ctx, generation, seg.Index, seg.Offset)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = rc.Close() }()
 
-	_, err = io.Copy(f, rc)
-	return err
+	return io.Copy(f, rc)
 }
 
 // checkpointV3 checkpoints the WAL file into the database.
@@ -1650,15 +1744,10 @@ func WriteTXIDFile(outputPath string, txid ltx.TXID) error {
 		return fmt.Errorf("rename txid file: %w", err)
 	}
 
-	dir, err := os.Open(filepath.Dir(txidPath))
-	if err != nil {
-		return fmt.Errorf("open txid dir for sync: %w", err)
-	}
-	if err := dir.Sync(); err != nil {
-		_ = dir.Close()
+	if err := internal.FsyncDir(filepath.Dir(txidPath)); err != nil {
 		return fmt.Errorf("sync txid dir: %w", err)
 	}
-	return dir.Close()
+	return nil
 }
 
 // ReadTXIDFile reads the TXID from a sidecar file at <outputPath>-txid.

@@ -80,6 +80,7 @@ func NewServer(store *Store) *Server {
 	mux.HandleFunc("POST /sync", s.handleSync)
 	mux.HandleFunc("GET /list", s.handleList)
 	mux.HandleFunc("GET /info", s.handleInfo)
+	mux.HandleFunc("GET /debug/sync-status", s.handleSyncStatus)
 
 	// pprof endpoints
 	mux.HandleFunc("GET /debug/pprof/", pprof.Index)
@@ -189,14 +190,31 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		defer cancel()
 	}
 
-	if err := s.store.EnableDB(ctx, expandedPath); err != nil {
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("database not found: %s", expandedPath), nil)
+		return
+	}
+
+	status := "started"
+	if db.IsOpen() {
+		status = "already_running"
+	} else {
+		if err := s.store.EnableDB(ctx, expandedPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+			return
+		}
+	}
+	txID, err := s.storeTXID(expandedPath)
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, StartResponse{
-		Status: "started",
+		Status: status,
 		Path:   expandedPath,
+		TXID:   txID,
 	})
 }
 
@@ -225,15 +243,45 @@ func (s *Server) handleStop(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
-	if err := s.store.DisableDB(ctx, expandedPath); err != nil {
+	db := s.store.FindDB(expandedPath)
+	if db == nil {
+		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("database not found: %s", expandedPath), nil)
+		return
+	}
+
+	status := "stopped"
+	if !db.IsOpen() {
+		status = "already_stopped"
+	} else {
+		if err := s.store.DisableDB(ctx, expandedPath); err != nil {
+			writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
+			return
+		}
+	}
+	txID, err := s.storeTXID(expandedPath)
+	if err != nil {
 		writeJSONError(w, http.StatusInternalServerError, err.Error(), nil)
 		return
 	}
 
 	writeJSON(w, http.StatusOK, StopResponse{
-		Status: "stopped",
+		Status: status,
 		Path:   expandedPath,
+		TXID:   txID,
 	})
+}
+
+func (s *Server) storeTXID(path string) (uint64, error) {
+	db := s.store.FindDB(path)
+	if db == nil {
+		return 0, fmt.Errorf("database not found: %s", path)
+	}
+
+	_, maxTXID, err := db.MaxLTX()
+	if err != nil {
+		return 0, fmt.Errorf("read txid: %w", err)
+	}
+	return uint64(maxTXID), nil
 }
 
 func (s *Server) handleTXID(w http.ResponseWriter, r *http.Request) {
@@ -266,6 +314,35 @@ func (s *Server) handleTXID(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleSyncStatus(w http.ResponseWriter, r *http.Request) {
+	path := r.URL.Query().Get("path")
+	if path != "" {
+		expandedPath, err := s.expandPath(path)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
+			return
+		}
+
+		db := s.store.FindDB(expandedPath)
+		if db == nil {
+			writeJSONError(w, http.StatusNotFound, "database not found", nil)
+			return
+		}
+
+		writeJSON(w, http.StatusOK, SyncDiagnosticsResponse{
+			Databases: []SyncDiagnostic{db.SyncDiagnostic()},
+		})
+		return
+	}
+
+	dbs := s.store.DBs()
+	diagnostics := make([]SyncDiagnostic, 0, len(dbs))
+	for _, db := range dbs {
+		diagnostics = append(diagnostics, db.SyncDiagnostic())
+	}
+	writeJSON(w, http.StatusOK, SyncDiagnosticsResponse{Databases: diagnostics})
+}
+
 func writeJSON(w http.ResponseWriter, status int, v interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -291,6 +368,7 @@ type StartRequest struct {
 type StartResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 // StopRequest is the request body for the /stop endpoint.
@@ -303,6 +381,7 @@ type StopRequest struct {
 type StopResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 // ErrorResponse is returned when an error occurs.
@@ -314,6 +393,11 @@ type ErrorResponse struct {
 // TXIDResponse is the response body for the /txid endpoint.
 type TXIDResponse struct {
 	TXID uint64 `json:"txid"`
+}
+
+// SyncDiagnosticsResponse is the response body for /debug/sync-status.
+type SyncDiagnosticsResponse struct {
+	Databases []SyncDiagnostic `json:"databases"`
 }
 
 func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
@@ -481,6 +565,7 @@ type UnregisterDatabaseRequest struct {
 type UnregisterDatabaseResponse struct {
 	Status string `json:"status"`
 	Path   string `json:"path"`
+	TXID   uint64 `json:"txid"`
 }
 
 func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -509,7 +594,7 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// Check if database already exists.
 	if existing := s.store.FindDB(expandedPath); existing != nil {
 		writeJSON(w, http.StatusOK, RegisterDatabaseResponse{
-			Status: "already_exists",
+			Status: "already_registered",
 			Path:   expandedPath,
 		})
 		return
@@ -568,14 +653,28 @@ func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(s.ctx, time.Duration(timeout)*time.Second)
 	defer cancel()
 
+	db := s.store.FindDB(expandedPath)
+
 	// Remove database from store (this also closes it).
 	if err := s.store.UnregisterDB(ctx, expandedPath); err != nil {
 		writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to unregister database: %v", err), nil)
 		return
 	}
+	var txID uint64
+	status := "already_unregistered"
+	if db != nil {
+		_, maxTXID, err := db.MaxLTX()
+		if err != nil {
+			writeJSONError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read final txid: %v", err), nil)
+			return
+		}
+		txID = uint64(maxTXID)
+		status = "unregistered"
+	}
 
 	writeJSON(w, http.StatusOK, UnregisterDatabaseResponse{
-		Status: "unregistered",
+		Status: status,
 		Path:   expandedPath,
+		TXID:   txID,
 	})
 }

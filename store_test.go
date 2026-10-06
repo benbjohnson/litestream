@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -13,7 +14,67 @@ import (
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/internal/testingutil"
+	"github.com/benbjohnson/litestream/mock"
 )
+
+func TestStore_Open_InitError(t *testing.T) {
+	want := errors.New("init error")
+	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error { return want },
+	})
+
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("Open() error = %v, want %v", err, want)
+	}
+}
+
+func TestStore_Open_InitErrorDoesNotOpenDBs(t *testing.T) {
+	want := errors.New("init error")
+	initStarted := make(chan struct{})
+	allowFailure := make(chan struct{})
+
+	db0 := litestream.NewDB(filepath.Join(t.TempDir(), "db0"))
+	db0.MonitorInterval = 0
+	db0.Replica = litestream.NewReplicaWithClient(db0, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error {
+			close(initStarted)
+			<-allowFailure
+			return nil
+		},
+	})
+	t.Cleanup(func() {
+		if db0.IsOpen() {
+			if err := db0.Close(context.Background()); err != nil {
+				t.Errorf("close db0: %v", err)
+			}
+		}
+	})
+
+	db1 := litestream.NewDB(filepath.Join(t.TempDir(), "db1"))
+	db1.MonitorInterval = 0
+	db1.Replica = litestream.NewReplicaWithClient(db1, &mock.ReplicaClient{
+		InitFunc: func(context.Context) error {
+			<-initStarted
+			close(allowFailure)
+			return want
+		},
+	})
+
+	store := litestream.NewStore([]*litestream.DB{db0, db1}, litestream.CompactionLevels{{Level: 0}})
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(t.Context()); !errors.Is(err, want) {
+		t.Fatalf("Open() error = %v, want %v", err, want)
+	}
+	if db0.IsOpen() {
+		t.Fatal("db0 opened before all replica clients initialized")
+	}
+	if db1.IsOpen() {
+		t.Fatal("db1 opened before all replica clients initialized")
+	}
+}
 
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
@@ -102,6 +163,43 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 	})
 
+	t.Run("SnapshotNoProgress", func(t *testing.T) {
+		db0, sqldb0 := testingutil.MustOpenDBs(t)
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+		client := &snapshotCountingClient{ReplicaClient: db0.Replica.Client}
+		db0.Replica.Client = client
+
+		s := litestream.NewStore([]*litestream.DB{db0}, litestream.CompactionLevels{{Level: 0}})
+		s.SnapshotInterval = time.Nanosecond
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		if _, err := sqldb0.ExecContext(t.Context(), `CREATE TABLE t (id INT);`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (100)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrNoCompaction) {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got, want := client.writeCount(), 1; got != want {
+			t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
+		}
+	})
+
 	// Regression test for GitHub issue #877: level 9 compaction fails with
 	// "page size not initialized yet" error when attempted before DB initialization.
 	t.Run("DBNotReady", func(t *testing.T) {
@@ -139,11 +237,6 @@ func TestStore_Integration(t *testing.T) {
 	db.MonitorInterval = factor * 100 * time.Millisecond
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = file.NewReplicaClient(t.TempDir())
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
-	defer testingutil.MustCloseSQLDB(t, sqldb)
 
 	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 		{Level: 0},
@@ -155,6 +248,9 @@ func TestStore_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer store.Close(t.Context())
+
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
 
 	// Create initial table
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
