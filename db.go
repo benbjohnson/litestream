@@ -2980,6 +2980,10 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 		deleted = deleted[:len(deleted)-1]
 	}
 
+	// Use the last deleted snapshot's MaxTXID, rather than the first retained
+	// snapshot's MaxTXID, to preserve lower-level files in an in-flight restore
+	// plan. TestStore_EnforceSnapshotRetention_RetainsInFlightRestorePlanFiles
+	// guards this conservative floor.
 	for i, info := range snapshots {
 		if slices.Contains(deleted, info) {
 			continue

@@ -102,6 +102,9 @@ func TestReplicaClient_DefaultSignPayload(t *testing.T) {
 	if !client.SignPayload {
 		t.Error("expected default SignPayload to be true for AWS S3 compatibility")
 	}
+	if !client.SignAcceptEncoding {
+		t.Error("expected default SignAcceptEncoding to be true")
+	}
 	if !client.RequireContentMD5 {
 		t.Error("expected default RequireContentMD5 to be true for AWS S3 compatibility")
 	}
@@ -1913,10 +1916,11 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	}
 }
 
-func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
+func TestReplicaClient_AcceptEncodingSigning(t *testing.T) {
 	tests := []struct {
 		name                     string
 		endpoint                 string
+		disableSigning           bool
 		wantAcceptEncodingSigned bool
 	}{
 		{
@@ -1991,6 +1995,11 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 			endpoint:                 "https://s3.example.com",
 			wantAcceptEncodingSigned: true,
 		},
+		{
+			name:           "ExplicitOptOut",
+			endpoint:       "https://s3.example.com",
+			disableSigning: true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -2023,6 +2032,7 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 
 			c := NewReplicaClient()
 			c.Endpoint = tt.endpoint
+			c.SignAcceptEncoding = !tt.disableSigning
 			c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 			client := s3.NewFromConfig(cfg, func(o *s3.Options) {
 				o.BaseEndpoint = aws.String("https://example.com")
@@ -2034,6 +2044,30 @@ func TestReplicaClient_GCSAcceptEncodingNotSigned(t *testing.T) {
 				Bucket: aws.String("test-bucket"),
 			}); err != nil {
 				t.Fatalf("ListObjectsV2() error: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewReplicaClientFromURL_SignAcceptEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "Default", url: "s3://mybucket/path", want: true},
+		{name: "CamelCase", url: "s3://mybucket/path?signAcceptEncoding=false"},
+		{name: "Hyphenated", url: "s3://mybucket/path?sign-accept-encoding=false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.(*ReplicaClient).SignAcceptEncoding; got != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -2930,5 +2964,37 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
 		if err := release(io.ErrUnexpectedEOF); err != nil {
 			t.Fatalf("release after failure %d: %v", i, err)
 		}
+	}
+}
+
+// TestTransportRetryer_RetriesProviderThrottleResponses covers S3-compatible
+// providers that load-shed with HTTP 408 / api error "RequestCanceled"
+// (observed from Tigris during soak testing). The SDK defaults treat neither
+// as retryable, so restores failed after effectively zero patience.
+func TestTransportRetryer_RetriesProviderThrottleResponses(t *testing.T) {
+	retryer := newTransportRetryer()
+
+	status408 := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusRequestTimeout}}, Err: fmt.Errorf("request timeout")}
+	if !retryer.IsErrorRetryable(status408) {
+		t.Fatal("HTTP 408 must be retryable for S3-compatible providers")
+	}
+
+	canceledCode := &smithy.GenericAPIError{Code: "RequestCanceled", Message: "Request is canceled."}
+	if !retryer.IsErrorRetryable(canceledCode) {
+		t.Fatal(`api error code "RequestCanceled" (server-side load shed) must be retryable`)
+	}
+
+	// A bare wrapped context.Canceled proves little: every classifier returns
+	// "unknown" for it, so it would come back non-retryable even without the
+	// canceled-error guard. Wrapping a RequestCanceled API error in a real
+	// smithy.CanceledError is the case that actually exercises precedence --
+	// the guard must win over the RequestCanceled classifier added above.
+	clientCanceled := &smithy.CanceledError{Err: &smithy.GenericAPIError{Code: "RequestCanceled", Message: "Request is canceled."}}
+	if retryer.IsErrorRetryable(clientCanceled) {
+		t.Fatal("genuine client-side cancellation must NOT be retryable, even wrapping a RequestCanceled api error")
+	}
+
+	if retryer.IsErrorRetryable(fmt.Errorf("wrapped: %w", context.Canceled)) {
+		t.Fatal("genuine client-side context cancellation must NOT be retryable")
 	}
 }
