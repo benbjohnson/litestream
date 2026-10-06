@@ -2,9 +2,12 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"time"
 
 	"github.com/superfly/ltx"
 )
@@ -42,6 +45,8 @@ type ResumableReader struct {
 	size    int64 // expected total file size from FileInfo; 0 means unknown
 	offset  int64
 	rc      io.ReadCloser
+	retryN  int
+	err     error
 	logger  *slog.Logger
 }
 
@@ -61,14 +66,36 @@ func NewResumableReader(ctx context.Context, client LTXFileOpener, level int, mi
 
 const resumableReaderMaxRetries = 3
 
+// resumableReaderBackoff is the base delay between retry attempts, doubling
+// per attempt. Zero-delay retries land every attempt inside the same provider
+// throttle window (e.g. Tigris 408 load shedding), guaranteeing exhaustion.
+const resumableReaderBackoff = 250 * time.Millisecond
+
 func (r *ResumableReader) Read(p []byte) (int, error) {
-	for attempt := 0; attempt <= resumableReaderMaxRetries; attempt++ {
+	if r.err != nil {
+		return 0, r.err
+	}
+
+	for {
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (rc is nil after a retry).
 		if r.rc == nil {
 			rc, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
-				return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
+				}
+				if ctxErr := r.ctx.Err(); ctxErr != nil {
+					r.err = fmt.Errorf("reopen ltx file at offset %d: %v: %w", r.offset, err, ctxErr)
+					return 0, r.err
+				}
+				if retryErr := r.retry(fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)); retryErr != nil {
+					return 0, retryErr
+				}
+				r.logger.Debug("reopen ltx file failed, retrying",
+					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+					"offset", r.offset, "error", err, "attempt", r.retryN)
+				continue
 			}
 			r.rc = rc
 		}
@@ -87,9 +114,12 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 			if r.size > 0 && r.offset < r.size {
 				r.logger.Debug("premature EOF on ltx file, reconnecting",
 					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
-					"offset", r.offset, "size", r.size, "attempt", attempt+1)
-				r.rc.Close()
+					"offset", r.offset, "size", r.size, "attempt", r.retryN+1)
+				r.close()
 				r.rc = nil
+				if retryErr := r.retry(io.ErrUnexpectedEOF); retryErr != nil {
+					return n, retryErr
+				}
 				if n > 0 {
 					// Return the bytes we did get. The caller (e.g. io.ReadFull)
 					// will call Read again, which will trigger the reopen above.
@@ -104,22 +134,51 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// stream so the next iteration reopens from the current offset.
 		r.logger.Debug("read error on ltx file, reconnecting",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
-			"error", err, "offset", r.offset, "attempt", attempt+1)
-		r.rc.Close()
+			"error", err, "offset", r.offset, "attempt", r.retryN+1)
+		r.close()
 		r.rc = nil
+		if retryErr := r.retry(err); retryErr != nil {
+			return n, retryErr
+		}
 		if n > 0 {
 			return n, nil
 		}
-		continue
 	}
-
-	return 0, fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d)",
-		r.level, r.minTXID, r.maxTXID, r.offset)
 }
 
 func (r *ResumableReader) Close() error {
 	if r.rc != nil {
 		return r.rc.Close()
+	}
+	return nil
+}
+
+func (r *ResumableReader) close() {
+	// The stream is already being discarded after a read failure, so a close
+	// error should not stop recovery. Log it only to aid debugging.
+	if err := r.rc.Close(); err != nil {
+		r.logger.Debug("close ltx file",
+			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+			"offset", r.offset, "error", err)
+	}
+}
+
+func (r *ResumableReader) retry(err error) error {
+	r.retryN++
+	if r.retryN > resumableReaderMaxRetries {
+		r.err = fmt.Errorf("max retries exceeded reading ltx file (level=%d, min=%s, max=%s, offset=%d): %w",
+			r.level, r.minTXID, r.maxTXID, r.offset, err)
+		return r.err
+	}
+
+	// Wait before the caller reopens. Retrying with no delay lands every
+	// attempt inside the same provider throttle window, so the attempts are
+	// spent without the provider ever getting a chance to recover.
+	select {
+	case <-r.ctx.Done():
+		r.err = r.ctx.Err()
+		return r.err
+	case <-time.After(resumableReaderBackoff << (r.retryN - 1)):
 	}
 	return nil
 }
