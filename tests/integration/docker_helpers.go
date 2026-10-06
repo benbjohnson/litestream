@@ -6,10 +6,14 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 )
+
+const defaultMinIOImage = "litestream-minio:RELEASE.2025-09-07T16-13-09Z"
 
 func RequireDocker(t *testing.T) {
 	t.Helper()
@@ -18,8 +22,31 @@ func RequireDocker(t *testing.T) {
 	}
 }
 
+func minioImage() string {
+	if image := os.Getenv("LITESTREAM_MINIO_IMAGE"); image != "" {
+		return image
+	}
+	return defaultMinIOImage
+}
+
+// RequireMinIOImage returns the MinIO test image, building it from
+// etc/minio/Dockerfile when it is not already present.
+func RequireMinIOImage(t *testing.T) string {
+	t.Helper()
+	image := minioImage()
+	if exec.Command("docker", "image", "inspect", image).Run() == nil {
+		return image
+	}
+	_, file, _, _ := runtime.Caller(0)
+	buildContext := filepath.Join(filepath.Dir(file), "..", "..", "etc", "minio")
+	t.Logf("Building MinIO test image %s from %s", image, buildContext)
+	runDockerCommand(t, "build", "-t", image, buildContext)
+	return image
+}
+
 func StartMinioTestContainer(t *testing.T) (string, string) {
 	t.Helper()
+	image := RequireMinIOImage(t)
 
 	name := fmt.Sprintf("litestream-minio-%d", time.Now().UnixNano())
 	exec.Command("docker", "rm", "-f", name).Run()
@@ -31,7 +58,7 @@ func StartMinioTestContainer(t *testing.T) (string, string) {
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
 		"-e", "MINIO_DOMAIN=s3-accesspoint.127.0.0.1.nip.io",
-		"quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z", "server", "/data",
+		image, "server", "/data",
 	}
 	containerID := runDockerCommand(t, args...)
 	portInfo := runDockerCommand(t, "port", name, "9000/tcp")
