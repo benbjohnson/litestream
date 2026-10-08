@@ -214,6 +214,7 @@ type syncState struct {
 }
 
 type syncExecutor struct {
+	writeTx             *sql.Tx
 	state               syncState
 	pos                 ltx.Pos
 	posChanged          bool
@@ -1181,7 +1182,7 @@ func (db *DB) acquireReadLock(ctx context.Context) error {
 	}
 
 	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.BeginTx(ctx, nil)
+	tx, err := db.db.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return err
 	}
@@ -1743,7 +1744,7 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor, proof 
 		}
 		if proven {
 			tail, err := readWALFileAt(db.WALPath(), info.offset, WALFrameHeaderSize)
-			if err != nil && !(errors.Is(err, io.EOF) && len(tail) == 0) {
+			if err != nil && (!errors.Is(err, io.EOF) || len(tail) != 0) {
 				return info, fmt.Errorf("verify sealed wal tail: %w", err)
 			}
 			if len(tail) != 0 && binary.BigEndian.Uint32(tail[8:]) == proof.salt1 && binary.BigEndian.Uint32(tail[12:]) == proof.salt2 {
@@ -1887,6 +1888,9 @@ func (db *DB) newSyncExecutor(ctx context.Context) (*syncExecutor, error) {
 	} else if db.db == nil {
 		return nil, nil
 	}
+	if err := db.acquireReadLock(ctx); err != nil {
+		return nil, fmt.Errorf("acquire read lock: %w", err)
+	}
 
 	pos, err := db.Pos()
 	if err != nil {
@@ -1989,12 +1993,34 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		defer db.chkMu.RUnlock()
 	}
 
-	fi, err := db.f.Stat()
-	if err != nil {
-		return result, err
+	var snapshotTx *sql.Tx
+	defer func() {
+		if snapshotTx != nil {
+			if rollbackErr := rollback(snapshotTx); rollbackErr != nil {
+				err = errors.Join(err, fmt.Errorf("rollback snapshot barrier: %w", rollbackErr))
+			}
+		}
+	}()
+	lockSnapshot := func() error {
+		if exec.writeTx == nil {
+			var err error
+			snapshotTx, err = db.db.BeginTx(ctx, nil)
+			if err != nil {
+				return fmt.Errorf("begin snapshot barrier: %w", err)
+			}
+			if _, err := snapshotTx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
+				return fmt.Errorf("acquire snapshot barrier: %w", err)
+			}
+		}
+		info.snapshotting = true
+		info.offset = WALHeaderSize
+		return nil
 	}
-	mode := fi.Mode()
-	commit := uint32(fi.Size() / int64(db.pageSize))
+	if info.snapshotting {
+		if err := lockSnapshot(); err != nil {
+			return result, err
+		}
+	}
 
 	walFile, err := os.Open(db.WALPath())
 	if err != nil {
@@ -2012,15 +2038,27 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		// If we cannot verify the previous frame
 		var pfmError *PrevFrameMismatchError
 		if rd, err = NewWALReaderWithOffset(ctx, walFile, info.offset, info.salt1, info.salt2, walReaderLogger); errors.As(err, &pfmError) {
-			db.Logger.Log(ctx, internal.LevelTrace, "prev frame mismatch, snapshotting", "err", pfmError.Err)
-			info.offset = WALHeaderSize
+			if err := lockSnapshot(); err != nil {
+				return result, err
+			}
+			info.reason = "wal changed after verification"
+			result.resetWAL = true
+			result.syncedToWALEnd = false
+			db.Logger.Debug("wal reset", "reason", info.reason, "proof_available", false, "continuity_proven", false, "snapshotting", true)
 			if rd, err = NewWALReader(walFile, walReaderLogger); err != nil {
-				return result, fmt.Errorf("new wal reader, after reset")
+				return result, fmt.Errorf("new wal reader after reset: %w", err)
 			}
 		} else if err != nil {
 			return result, fmt.Errorf("new wal reader with offset: %w", err)
 		}
 	}
+
+	fi, err := db.f.Stat()
+	if err != nil {
+		return result, err
+	}
+	mode := fi.Mode()
+	commit := uint32(fi.Size() / int64(db.pageSize))
 
 	// Build a mapping of changed page numbers and their latest content.
 	db.setSyncDiagPhase(diagPhaseSyncPageMap,
@@ -2457,6 +2495,9 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			return false, fmt.Errorf("_litestream_lock: %w", err)
 		}
 
+		exec.writeTx = barrierTx
+		defer func() { exec.writeTx = nil }()
+
 		result, err = db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
 		if err != nil {
 			return false, fmt.Errorf("cannot seal wal before passive checkpoint: %w", err)
@@ -2494,6 +2535,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			return false, fmt.Errorf("rollback passive checkpoint barrier: %w", err)
 		}
 		barrierTx = nil
+		exec.writeTx = nil
 	}
 
 	if err = db.bumpLitestreamSeq(ctx); err != nil {
@@ -2558,6 +2600,9 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	if _, err := tx.ExecContext(ctx, `INSERT INTO _litestream_lock (id) VALUES (1);`); err != nil {
 		return false, fmt.Errorf("_litestream_lock: %w", err)
 	}
+
+	exec.writeTx = tx
+	defer func() { exec.writeTx = nil }()
 
 	// Copy anything that may have occurred after the checkpoint.
 	db.setSyncDiagPhase(diagPhaseCheckpointSnapshotBoundary,
