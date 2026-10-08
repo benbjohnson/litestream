@@ -23,3 +23,16 @@ func Fileinfo(fi os.FileInfo) (uid, gid int) {
 func fixRootDirectory(p string) string {
 	return p
 }
+
+// FsyncDir syncs a directory so a preceding rename within it is durable.
+func FsyncDir(path string) error {
+	dir, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	if err := dir.Sync(); err != nil {
+		_ = dir.Close()
+		return err
+	}
+	return dir.Close()
+}
