@@ -1734,7 +1734,22 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor, proof 
 	if info.offset > fi.Size() || !saltMatch {
 		proven := proof != nil && proof.pos == exec.pos &&
 			proof.offset == info.offset && proof.salt1 == info.salt1 && proof.salt2 == info.salt2 &&
-			salt1 == proof.salt1+1
+			salt1 == proof.salt1+1 && info.offset <= fi.Size() && info.offset > WALHeaderSize+frameSize
+		if proven {
+			proven, err = db.lastPageMatch(ctx, dec, info.offset-frameSize, frameSize)
+			if err != nil {
+				return info, fmt.Errorf("verify sealed wal frame: %w", err)
+			}
+		}
+		if proven {
+			tail, err := readWALFileAt(db.WALPath(), info.offset, WALFrameHeaderSize)
+			if err != nil && !(errors.Is(err, io.EOF) && len(tail) == 0) {
+				return info, fmt.Errorf("verify sealed wal tail: %w", err)
+			}
+			if len(tail) != 0 && binary.BigEndian.Uint32(tail[8:]) == proof.salt1 && binary.BigEndian.Uint32(tail[12:]) == proof.salt2 {
+				proven = false
+			}
+		}
 		info.reason = "wal salt reset"
 		if info.offset > fi.Size() {
 			info.reason = "wal truncated"

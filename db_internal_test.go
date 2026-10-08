@@ -4962,3 +4962,80 @@ func TestDB_VerifyWALResetProof(t *testing.T) {
 		})
 	}
 }
+
+func TestDB_PassiveCheckpointProofWithPinnedGeneration(t *testing.T) {
+	for _, mode := range []string{CheckpointModeTruncate, CheckpointModeRestart} {
+		t.Run(mode, func(t *testing.T) {
+			db, sqldb := newWALResetTestDB(t)
+			ctx := context.Background()
+			insertWALResetRows(t, sqldb, 80)
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			reader, err := db.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rollback(reader)
+			var count int
+			if err := reader.QueryRow(`SELECT count(*) FROM data`).Scan(&count); err != nil {
+				t.Fatal(err)
+			}
+			exec, err := db.newSyncExecutor(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			barrier, err := db.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rollback(barrier)
+			if _, err := barrier.Exec(`INSERT INTO _litestream_lock (id) VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			result, err := db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec.applySyncResult(result)
+			sealed, err := db.verifyWithExecutor(ctx, exec, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			proof := &walResetProof{pos: exec.pos, offset: sealed.offset, salt1: sealed.salt1, salt2: sealed.salt2}
+			if _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
+				t.Fatal(err)
+			}
+			if err := rollback(barrier); err != nil {
+				t.Fatal(err)
+			}
+			insertWALResetRows(t, sqldb, 121)
+			header, err := readWALHeader(db.WALPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if binary.BigEndian.Uint32(header[16:]) != sealed.salt1 {
+				t.Fatal("reader did not pin source generation")
+			}
+			if err := rollback(reader); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.releaseReadLock(); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(` + mode + `); INSERT INTO heartbeat VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.acquireReadLock(ctx); err != nil {
+				t.Fatal(err)
+			}
+			result, err = db.verifyAndSyncWithProof(ctx, true, exec, 0, proof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec.applySyncResult(result)
+			db.applySyncExecutor(exec, false)
+			assertWALResetRestore(t, db, 201)
+		})
+	}
+}
