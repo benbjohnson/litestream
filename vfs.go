@@ -2825,8 +2825,33 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			if !sameUnanchoredBoundary {
 				nextTXID := result.maxTXID + 1
 				if info.MinTXID > nextTXID {
-					gap := *info
-					return &gap, applied, nil
+					snapshot, err := NewCompactor(f.client, f.logger).MaxLTXFileInfo(ctx, SnapshotLevel)
+					if err != nil {
+						return nil, applied, fmt.Errorf("snapshot baseline: %w", err)
+					}
+					if snapshot.MaxTXID < info.MinTXID-1 {
+						gap := *info
+						return &gap, applied, nil
+					}
+					idx, err := FetchPageIndex(ctx, f.client, &snapshot)
+					if err != nil {
+						return nil, applied, fmt.Errorf("snapshot page index: %w", err)
+					}
+					hdr, err := FetchLTXHeader(ctx, f.client, &snapshot)
+					if err != nil {
+						return nil, applied, fmt.Errorf("snapshot header: %w", err)
+					}
+					result.index = idx
+					result.replaceIndex = true
+					result.maxTXID = snapshot.MaxTXID
+					result.commit = hdr.Commit
+					result.anchored = true
+					result.coveredTXID = snapshot.MaxTXID
+					lastCommit = hdr.Commit
+					applied = true
+					if info.MaxTXID <= snapshot.MaxTXID {
+						continue
+					}
 				}
 			}
 

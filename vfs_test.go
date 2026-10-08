@@ -1634,6 +1634,91 @@ func TestVFSFile_PollLevel1RepointsPageBelowWatermark(t *testing.T) {
 	}
 }
 
+func TestVFSFile_PollSnapshotGapReplacesIndex(t *testing.T) {
+	for _, locked := range []bool{false, true} {
+		t.Run(fmt.Sprint(locked), func(t *testing.T) {
+			client := newMockReplicaClient()
+			prefix := buildLTXFixtureRangeWithPages(t, 1, 2, 4096, []uint32{1, 2, 3}, 'a')
+			prefix.info.Level = 1
+			client.addFixture(t, prefix)
+			f := NewVFSFile(client, "snapshot-gap.db", slog.Default())
+			if err := f.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			buf := make([]byte, 4096)
+			if _, err := f.ReadAt(buf, 0); err != nil {
+				t.Fatal(err)
+			}
+			if locked {
+				if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot := buildLTXFixtureRangeWithPages(t, 1, 6, 4096, []uint32{1, 2}, 'b')
+			snapshot.info.Level = SnapshotLevel
+			client.addFixture(t, snapshot)
+			client.addFixture(t, buildLTXFixtureWithPage(t, 7, 4096, 2, 'c'))
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if locked {
+				if _, err := f.ReadAt(buf, 0); err != nil {
+					t.Fatal(err)
+				}
+				if buf[0] != 'a' {
+					t.Fatalf("active reader changed: %q", buf[0])
+				}
+				if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.ReadAt(buf, 0); err != nil {
+				t.Fatal(err)
+			}
+			if buf[0] != 'b' {
+				t.Fatalf("snapshot page=%q", buf[0])
+			}
+			if _, err := f.ReadAt(buf, 4096); err != nil {
+				t.Fatal(err)
+			}
+			if buf[0] != 'c' {
+				t.Fatalf("tail page=%q", buf[0])
+			}
+			if _, err := f.ReadAt(buf, 8192); err == nil {
+				t.Fatal("retired page remains readable")
+			}
+		})
+	}
+}
+
+func TestVFSFile_PollSnapshotCoveredGap(t *testing.T) {
+	for _, level := range []int{0, 1} {
+		t.Run(fmt.Sprint(level), func(t *testing.T) {
+			f, client := openVFSFileAtSnapshot(t, 2, 'a')
+			snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+			snapshot.info.Level = SnapshotLevel
+			client.addFixture(t, snapshot)
+			tail := buildLTXFixtureRange(t, 7, 8, 'c')
+			tail.info.Level = level
+			client.addFixture(t, tail)
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if f.Pos().TXID != 8 {
+				t.Fatalf("reader stalled at %s", f.Pos().TXID)
+			}
+			buf := make([]byte, 4096)
+			if _, err := f.ReadAt(buf, 0); err != nil {
+				t.Fatal(err)
+			}
+			if buf[0] != 'c' {
+				t.Fatalf("page=%q, want c", buf[0])
+			}
+		})
+	}
+}
+
 func TestVFSFile_PollLevel1RejectsRealGap(t *testing.T) {
 	f, client := openVFSFileAtSnapshot(t, 6, 'a')
 

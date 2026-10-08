@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -24,12 +25,16 @@ import (
 
 type l0WriteRecordingClient struct {
 	litestream.ReplicaClient
-	txIDs []ltx.TXID
+	txIDs         []ltx.TXID
+	snapshotTXIDs []ltx.TXID
 }
 
 func (c *l0WriteRecordingClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
-	if level == 0 {
+	switch level {
+	case 0:
 		c.txIDs = append(c.txIDs, minTXID)
+	case litestream.SnapshotLevel:
+		c.snapshotTXIDs = append(c.snapshotTXIDs, maxTXID)
 	}
 	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 }
@@ -96,6 +101,252 @@ func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
 	}
 	if got, want := client.txIDs[0], gapTXID; got != want {
 		t.Fatalf("L0 write TXID=%s, want %s", got, want)
+	}
+}
+
+func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID < 5 {
+		t.Fatalf("expected at least 5 transactions, got %s", dpos.TXID)
+	}
+
+	gapMinTXID, gapMaxTXID := dpos.TXID-2, dpos.TXID-1
+	if err := db.Replica.Client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+		{Level: 0, MinTXID: gapMinTXID, MaxTXID: gapMinTXID},
+		{Level: 0, MinTXID: gapMaxTXID, MaxTXID: gapMaxTXID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for txID := gapMinTXID; txID <= gapMaxTXID; txID++ {
+		if err := os.Remove(db.LTXPath(0, txID, txID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for level := 1; level <= 2; level++ {
+		info, err := db.Compact(t.Context(), level)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MaxTXID != gapMinTXID-1 {
+			t.Fatalf("initial prefix: %#v", info)
+		}
+	}
+
+	client := &l0WriteRecordingClient{ReplicaClient: db.Replica.Client}
+	db.Replica.Client = client
+	var logBuf bytes.Buffer
+	db.SetLogger(slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := db.Replica.Pos().TXID, dpos.TXID; got != want {
+		t.Fatalf("replica pos=%s, want %s", got, want)
+	}
+	if got, want := client.snapshotTXIDs, []ltx.TXID{dpos.TXID}; !slices.Equal(got, want) {
+		t.Fatalf("snapshot TXIDs=%v, want %v", got, want)
+	}
+	for _, field := range []string{
+		`level=WARN`,
+		`msg="local L0 file missing during gap heal, forcing snapshot"`,
+		`gap_min_txid=` + gapMinTXID.String(),
+		`gap_max_txid=` + gapMaxTXID.String(),
+	} {
+		if !strings.Contains(logBuf.String(), field) {
+			t.Fatalf("fallback log missing %q: %s", field, logBuf.String())
+		}
+	}
+
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.snapshotTXIDs, []ltx.TXID{dpos.TXID}; !slices.Equal(got, want) {
+		t.Fatalf("snapshot TXIDs after recalculation=%v, want %v", got, want)
+	}
+
+	plan, err := litestream.CalcRestorePlan(t.Context(), client, 0, time.Time{}, db.Logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := len(plan), 1; got != want {
+		t.Fatalf("restore plan length=%d, want %d: %#v", got, want, plan)
+	}
+	if got, want := plan[0].Level, litestream.SnapshotLevel; got != want {
+		t.Fatalf("restore plan level=%d, want %d", got, want)
+	}
+	if got, want := plan[0].MinTXID, ltx.TXID(1); got != want {
+		t.Fatalf("restore plan min TXID=%s, want %s", got, want)
+	}
+	if got, want := plan[0].MaxTXID, dpos.TXID; got != want {
+		t.Fatalf("restore plan max TXID=%s, want %s", got, want)
+	}
+
+	restorePath := filepath.Join(t.TempDir(), "restore.db")
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = restorePath
+	if err := db.Replica.Restore(t.Context(), opt); err != nil {
+		t.Fatal(err)
+	}
+	restoredDB := testingutil.MustOpenSQLDB(t, restorePath)
+	defer testingutil.MustCloseSQLDB(t, restoredDB)
+	var rowN, idSum int
+	if err := restoredDB.QueryRowContext(t.Context(), `SELECT COUNT(*), SUM(id) FROM t`).Scan(&rowN, &idSum); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := rowN, 3; got != want {
+		t.Fatalf("restored row count=%d, want %d", got, want)
+	}
+	if got, want := idSum, 3; got != want {
+		t.Fatalf("restored id sum=%d, want %d", got, want)
+	}
+
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (3)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := db.Replica.Pos().TXID, dpos.TXID+1; got != want {
+		t.Fatalf("replica pos after new write=%s, want %s", got, want)
+	}
+
+	if err := client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+		{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: dpos.TXID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := client.snapshotTXIDs, []ltx.TXID{dpos.TXID, dpos.TXID + 1}; !slices.Equal(got, want) {
+		t.Fatalf("snapshot TXIDs after remote snapshot deletion=%v, want %v", got, want)
+	}
+	plan, err = litestream.CalcRestorePlan(t.Context(), client, 0, time.Time{}, db.Logger)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan) != 1 || plan[0].Level != litestream.SnapshotLevel || plan[0].MaxTXID != dpos.TXID+1 {
+		t.Fatalf("restore plan after remote snapshot deletion=%#v", plan)
+	}
+
+	for i := 4; i < 7; i++ {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	l1, err := db.Compact(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l1.MinTXID <= dpos.TXID+1 || l1.MaxTXID != dpos.TXID+4 {
+		t.Fatalf("L1 did not restart after snapshot: %#v", l1)
+	}
+	db.L0Retention = time.Nanosecond
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for txid := ltx.TXID(1); txid <= dpos.TXID+1; txid++ {
+		if _, err := os.Stat(db.LTXPath(0, txid, txid)); !os.IsNotExist(err) {
+			t.Fatalf("local gapped prefix %s remains: %v", txid, err)
+		}
+	}
+	itr, err := client.LTXFiles(t.Context(), 0, 0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for itr.Next() {
+		if info := itr.Item(); info.MaxTXID <= dpos.TXID+1 {
+			t.Errorf("gapped L0 prefix retained: %#v", info)
+		}
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l2, err := db.Compact(t.Context(), 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.MaxTXID != l1.MaxTXID {
+		t.Fatalf("L2 did not advance: %#v", l2)
+	}
+	levels := litestream.CompactionLevels{}
+	for level := 0; level < litestream.SnapshotLevel; level++ {
+		levels = append(levels, &litestream.CompactionLevel{Level: level})
+		errs, err := db.Replica.ValidateLevel(t.Context(), level)
+		if err != nil || len(errs) != 0 {
+			t.Fatalf("validate level %d: %v %v", level, errs, err)
+		}
+	}
+	store := litestream.NewStore([]*litestream.DB{db}, levels)
+	validation, err := store.Validate(t.Context())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !validation.Valid {
+		t.Fatalf("store validation: %v", validation.Errors)
+	}
+	for i := 7; i < 10; i++ {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	opt.OutputPath = filepath.Join(t.TempDir(), "later.db")
+	if err := db.Replica.Restore(t.Context(), opt); err != nil {
+		t.Fatal(err)
+	}
+	laterDB := testingutil.MustOpenSQLDB(t, opt.OutputPath)
+	defer testingutil.MustCloseSQLDB(t, laterDB)
+	if err := laterDB.QueryRowContext(t.Context(), `SELECT COUNT(*), SUM(id) FROM t`).Scan(&rowN, &idSum); err != nil {
+		t.Fatal(err)
+	}
+	if rowN != 10 || idSum != 45 {
+		t.Fatalf("later restore count=%d sum=%d", rowN, idSum)
 	}
 }
 

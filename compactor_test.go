@@ -20,6 +20,70 @@ import (
 	"github.com/benbjohnson/litestream/file"
 )
 
+func TestCompactor_CompactSnapshotBaselineWithoutDestination(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+	for _, txid := range []ltx.TXID{1, 2, 5, 6, 7} {
+		createTestLTXFile(t, client, 0, txid, txid)
+	}
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+	info, err := compactor.Compact(t.Context(), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.MinTXID != 6 || info.MaxTXID != 7 {
+		t.Fatalf("unexpected range: %#v", info)
+	}
+}
+
+func TestCompactor_CompactSnapshotBaseline(t *testing.T) {
+	for _, snapshotTXID := range []ltx.TXID{0, 2, 3, 4, 6} {
+		t.Run(snapshotTXID.String(), func(t *testing.T) {
+			client := file.NewReplicaClient(t.TempDir())
+			compactor := litestream.NewCompactor(client, slog.Default())
+			createTestLTXFile(t, client, 1, 1, 2)
+			for txid := ltx.TXID(4); txid <= 6; txid++ {
+				createTestLTXFile(t, client, 0, txid, txid)
+			}
+			if snapshotTXID != 0 {
+				createTestLTXFile(t, client, litestream.SnapshotLevel, 1, snapshotTXID)
+			}
+			info, err := compactor.Compact(t.Context(), 1)
+			if snapshotTXID < 3 || snapshotTXID == 6 {
+				if !errors.Is(err, litestream.ErrNoCompaction) {
+					t.Fatalf("info=%v err=%v, want no compaction", info, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.MinTXID != snapshotTXID+1 || info.MaxTXID != 6 {
+				t.Fatalf("unexpected range: %#v", info)
+			}
+			if err := compactor.VerifyLevelConsistency(t.Context(), 1); err != nil {
+				t.Fatal(err)
+			}
+			replica := litestream.NewReplica(nil)
+			replica.Client = client
+			validation, err := replica.ValidateLevel(t.Context(), 1)
+			if err != nil || len(validation) != 0 {
+				t.Fatalf("validation=%v err=%v", validation, err)
+			}
+			if err := client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: snapshotTXID}}); err != nil {
+				t.Fatal(err)
+			}
+			if err := compactor.VerifyLevelConsistency(t.Context(), 1); err == nil {
+				t.Fatal("deleted snapshot still covers gap")
+			}
+			validation, err = replica.ValidateLevel(t.Context(), 1)
+			if err != nil || len(validation) != 1 {
+				t.Fatalf("validation after snapshot deletion=%v err=%v", validation, err)
+			}
+		})
+	}
+}
+
 func TestCompactor_Compact(t *testing.T) {
 	t.Run("L0ToL1", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
