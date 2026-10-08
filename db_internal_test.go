@@ -2100,9 +2100,85 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	}
 }
 
+func TestDB_acquireReadLock_ContextLifetime(t *testing.T) {
+	for _, cancelBefore := range []bool{false, true} {
+		t.Run(fmt.Sprintf("CancelBefore=%t", cancelBefore), func(t *testing.T) {
+			db := NewDB(filepath.Join(t.TempDir(), "db"))
+			var err error
+			if db.db, err = sql.Open("sqlite", db.Path()); err != nil {
+				t.Fatal(err)
+			}
+			defer db.db.Close()
+			defer func() {
+				if err := db.releaseReadLock(); err != nil {
+					t.Error(err)
+				}
+			}()
+			if _, err := db.db.Exec(`CREATE TABLE _litestream_seq (id INTEGER);`); err != nil {
+				t.Fatal(err)
+			}
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if cancelBefore {
+				cancel()
+			}
+			err = db.acquireReadLock(ctx)
+			if cancelBefore {
+				if !errors.Is(err, context.Canceled) {
+					t.Fatalf("acquireReadLock error=%v, want context.Canceled", err)
+				}
+				if db.rtx != nil || db.db.Stats().InUse != 0 {
+					t.Fatal("canceled acquisition retained a transaction")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			cancel()
+			if err := db.rtx.Commit(); err != nil {
+				t.Fatalf("guard transaction inherited caller cancellation: %v", err)
+			}
+		})
+	}
+}
+
+func TestDB_execCheckpoint_ReacquireError(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	var err error
+	if db.db, err = sql.Open("sqlite", db.Path()); err != nil {
+		t.Fatal(err)
+	}
+	defer db.db.Close()
+	defer func() {
+		if err := db.releaseReadLock(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := db.db.Exec(`PRAGMA journal_mode = wal; CREATE TABLE _litestream_seq (id INTEGER);`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.acquireReadLock(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.db.Exec(`DROP TABLE _litestream_seq;`); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = db.execCheckpoint(ctx, "PASSIVE")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkpoint error=%v, want context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "reacquire read lock") {
+		t.Fatalf("checkpoint error=%v, want reacquire read lock error", err)
+	}
+}
+
 func TestDB_ReadLockSurvivesSyncCancellation(t *testing.T) {
-	for _, checkpoint := range []bool{false, true} {
-		t.Run(fmt.Sprintf("Checkpoint=%t", checkpoint), func(t *testing.T) {
+	for _, operation := range []string{"SyncAndWait", "Checkpoint", "CanceledCheckpoint"} {
+		t.Run(operation, func(t *testing.T) {
 			db := NewDB(filepath.Join(t.TempDir(), "db"))
 			db.MonitorInterval = 0
 			db.Replica = NewReplica(db)
@@ -2128,11 +2204,16 @@ func TestDB_ReadLockSurvivesSyncCancellation(t *testing.T) {
 
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
-			if checkpoint {
+			if operation != "SyncAndWait" {
 				if err := db.Sync(context.Background()); err != nil {
 					t.Fatal(err)
 				}
-				if err := db.Checkpoint(ctx, "PASSIVE"); err != nil {
+				if operation == "CanceledCheckpoint" {
+					cancel()
+					if _, err := db.execCheckpoint(ctx, "PASSIVE"); !errors.Is(err, context.Canceled) {
+						t.Fatalf("checkpoint error=%v, want context.Canceled", err)
+					}
+				} else if err := db.Checkpoint(ctx, "PASSIVE"); err != nil {
 					t.Fatal(err)
 				}
 			} else if err := db.SyncAndWait(ctx); err != nil {
