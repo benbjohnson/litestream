@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -849,7 +850,8 @@ type blockingReplicaClient struct {
 
 type countingReplicaClient struct {
 	vfsTestLogger
-	calls atomic.Uint64
+	calls         atomic.Uint64
+	snapshotCalls atomic.Uint64
 }
 
 type failingPageReplicaClient struct {
@@ -870,6 +872,9 @@ func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	c.calls.Add(1)
+	if level == SnapshotLevel {
+		c.snapshotCalls.Add(1)
+	}
 	return ltx.NewFileInfoSliceIterator(nil), nil
 }
 
@@ -1631,6 +1636,246 @@ func TestVFSFile_PollLevel1RepointsPageBelowWatermark(t *testing.T) {
 	}
 	if buf[0] != 'b' {
 		t.Fatalf("retained L1 page = %q, want 'b'", buf[0])
+	}
+}
+
+func TestVFSFile_PollIdleSnapshotListRate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newCountingReplicaClient()
+		f := NewVFSFile(client, "test.db", slog.Default())
+		for range 180 {
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Second)
+		}
+		if got := client.snapshotCalls.Load(); got != 3 {
+			t.Fatalf("snapshot LIST calls=%d, want 3 across 180 idle polls", got)
+		}
+		if got := client.calls.Load() - client.snapshotCalls.Load(); got != 360 {
+			t.Fatalf("L0/L1 LIST calls=%d, want 360", got)
+		}
+	})
+}
+
+func TestVFSFile_PollIdleSnapshotEventually(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newMockReplicaClient()
+		snapshot := buildLTXFixtureRange(t, 1, 2, 'a')
+		snapshot.info.Level = SnapshotLevel
+		client.addFixture(t, snapshot)
+		f := NewVFSFile(client, "test.db", slog.Default())
+		f.PollInterval = time.Hour
+		if err := f.Open(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		if err := f.pollReplicaClient(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		snapshot = buildLTXFixtureRange(t, 1, 6, 'b')
+		snapshot.info.Level = SnapshotLevel
+		client.addFixture(t, snapshot)
+		for range 59 {
+			time.Sleep(time.Second)
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if f.Pos().TXID != 2 {
+				t.Fatalf("snapshot adopted before cadence elapsed: %s", f.Pos().TXID)
+			}
+		}
+		time.Sleep(time.Second)
+		if err := f.pollReplicaClient(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if f.Pos().TXID != 6 {
+			t.Fatalf("snapshot not adopted after one minute: %s", f.Pos().TXID)
+		}
+		snapshot = buildLTXFixtureRange(t, 1, 8, 'c')
+		snapshot.info.Level = SnapshotLevel
+		client.addFixture(t, snapshot)
+		if err := f.pollReplicaClient(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if f.Pos().TXID != 8 {
+			t.Fatalf("progress did not reset reconciliation: %s", f.Pos().TXID)
+		}
+	})
+}
+
+func TestVFSFile_PollSnapshotGapBypassesIdleCadence(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	tail := buildLTXFixtureRange(t, 7, 8, 'c')
+	tail.info.Level = 1
+	client.addFixture(t, tail)
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatalf("gap recovery delayed: %s", f.Pos().TXID)
+	}
+}
+
+func TestVFSFile_PollIdleSnapshot(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 6 {
+		t.Fatalf("idle reader at %s", f.Pos().TXID)
+	}
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("snapshot page=%q", buf[0])
+	}
+}
+
+func TestVFSFile_PollSnapshotBehindGlobalPosition(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	for txid := ltx.TXID(3); txid <= 8; txid++ {
+		client.addFixture(t, buildLTXFixture(t, txid, 'c'))
+	}
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatal(f.Pos())
+	}
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	oldL1 := buildLTXFixtureRange(t, 5, 6, 'b')
+	oldL1.info.Level = 1
+	client.addFixture(t, oldL1)
+	client.mu.Lock()
+	delete(client.data, client.key(snapshot.info))
+	client.mu.Unlock()
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatalf("read snapshot behind global position: %v", err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatalf("position regressed: %s", f.Pos().TXID)
+	}
+}
+
+func TestVFSFile_PollPrefersStraddlerToSnapshot(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	straddler := buildLTXFixtureRange(t, 1, 8, 'c')
+	straddler.info.Level = 1
+	client.addFixture(t, straddler)
+	client.addFixture(t, buildLTXFixture(t, 5, 'b'))
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	client.mu.Lock()
+	delete(client.data, client.key(snapshot.info))
+	client.mu.Unlock()
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatalf("read unnecessary snapshot: %v", err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatalf("reader at %s", f.Pos().TXID)
+	}
+}
+
+func TestVFSFile_PollSnapshotGapReplacesIndex(t *testing.T) {
+	for _, locked := range []bool{false, true} {
+		t.Run(fmt.Sprint(locked), func(t *testing.T) {
+			client := newMockReplicaClient()
+			prefix := buildLTXFixtureRangeWithPages(t, 1, 2, 4096, []uint32{1, 2, 3}, 'a')
+			prefix.info.Level = SnapshotLevel
+			client.addFixture(t, prefix)
+			f := NewVFSFile(client, "snapshot-gap.db", slog.Default())
+			if err := f.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer f.Close()
+			oldL1 := buildLTXFixtureRangeWithPages(t, 1, 2, 4096, []uint32{1, 2, 3}, 'a')
+			oldL1.info.Level = 1
+			client.addFixture(t, oldL1)
+			buf := make([]byte, 4096)
+			if _, err := f.ReadAt(buf, 0); err != nil {
+				t.Fatal(err)
+			}
+			if locked {
+				if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+					t.Fatal(err)
+				}
+			}
+			snapshot := buildLTXFixtureRangeWithPages(t, 1, 6, 4096, []uint32{1, 2}, 'b')
+			snapshot.info.Level = SnapshotLevel
+			client.addFixture(t, snapshot)
+			client.addFixture(t, buildLTXFixtureWithPage(t, 7, 4096, 2, 'c'))
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if locked {
+				if _, err := f.ReadAt(buf, 0); err != nil {
+					t.Fatal(err)
+				}
+				if buf[0] != 'a' {
+					t.Fatalf("active reader changed: %q", buf[0])
+				}
+				if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.ReadAt(buf, 0); err != nil {
+				t.Fatal(err)
+			}
+			if buf[0] != 'b' {
+				t.Fatalf("snapshot page=%q", buf[0])
+			}
+			if _, err := f.ReadAt(buf, 4096); err != nil {
+				t.Fatal(err)
+			}
+			if buf[0] != 'c' {
+				t.Fatalf("tail page=%q", buf[0])
+			}
+			if _, err := f.ReadAt(buf, 8192); err == nil {
+				t.Fatal("retired page remains readable")
+			}
+		})
+	}
+}
+
+func TestVFSFile_PollSnapshotCoveredGap(t *testing.T) {
+	for _, level := range []int{0, 1} {
+		t.Run(fmt.Sprint(level), func(t *testing.T) {
+			f, client := openVFSFileAtSnapshot(t, 2, 'a')
+			snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+			snapshot.info.Level = SnapshotLevel
+			client.addFixture(t, snapshot)
+			tail := buildLTXFixtureRange(t, 7, 8, 'c')
+			tail.info.Level = level
+			client.addFixture(t, tail)
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if f.Pos().TXID != 8 {
+				t.Fatalf("reader stalled at %s", f.Pos().TXID)
+			}
+			buf := make([]byte, 4096)
+			if _, err := f.ReadAt(buf, 0); err != nil {
+				t.Fatal(err)
+			}
+			if buf[0] != 'c' {
+				t.Fatalf("page=%q, want c", buf[0])
+			}
+		})
 	}
 }
 
