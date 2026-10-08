@@ -5358,3 +5358,69 @@ func TestDB_SyncSnapshotsWhenWALResetsAfterVerification(t *testing.T) {
 		t.Fatalf("encoded pages=%d, want full database=%d", pages, commit)
 	}
 }
+
+func TestDB_SyncRejectsWALResetDuringPageCopy(t *testing.T) {
+	db, sqldb := newWALResetTestDB(t)
+	ctx := context.Background()
+	insertWALResetRows(t, sqldb, 80)
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.releaseReadLock(); err != nil {
+		t.Fatal(err)
+	}
+	insertWALResetRows(t, sqldb, 121)
+	if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(PASSIVE)`); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldState := db.syncState
+	walSize, err := db.walFileSize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempted := false
+	db.openLTXFile = func(name string, flag int, perm os.FileMode) (ltxStagingFile, error) {
+		attempted = true
+		tx, err := sqldb.Begin()
+		if err != nil {
+			return nil, err
+		}
+		defer func() {
+			if err := rollback(tx); err != nil {
+				t.Error(err)
+			}
+		}()
+		for n := int64(0); n < walSize/int64(db.pageSize); n++ {
+			if _, err := tx.Exec(`INSERT INTO heartbeat VALUES (zeroblob(3500))`); err != nil {
+				return nil, err
+			}
+		}
+		if err := tx.Commit(); err != nil {
+			return nil, err
+		}
+		return defaultOpenLTXFile(name, flag, perm)
+	}
+	err = db.Sync(ctx)
+	db.openLTXFile = defaultOpenLTXFile
+	if !attempted {
+		t.Fatal("page-copy interleaving was not reached")
+	}
+	if err == nil || !strings.Contains(err.Error(), "wal changed while copying pages") {
+		t.Fatalf("sync error=%v, want WAL change detection", err)
+	}
+	after, posErr := db.Pos()
+	if posErr != nil {
+		t.Fatal(posErr)
+	}
+	if after != before || db.syncState != oldState {
+		t.Fatal("failed page copy published sync state")
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	assertWALResetRestore(t, db, 201)
+}

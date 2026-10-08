@@ -2199,6 +2199,14 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		return result, fmt.Errorf("close ltx encoder: %w", err)
 	}
 
+	hdr, err := readWALHeader(db.WALPath())
+	if err != nil {
+		return result, fmt.Errorf("verify wal after copying pages: %w", err)
+	}
+	if binary.BigEndian.Uint32(hdr[16:]) != rd.salt1 || binary.BigEndian.Uint32(hdr[20:]) != rd.salt2 {
+		return result, errors.New("wal changed while copying pages")
+	}
+
 	// Sync & close LTX file.
 	db.setSyncDiagPhase(diagPhaseFsyncLTX, func(s *diagState) {
 		s.txID = txID
