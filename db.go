@@ -457,6 +457,7 @@ func (db *DB) SetLogger(logger *slog.Logger) {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	logger = logger.With(LogKeyDB, filepath.Base(db.path))
 	db.Logger = logger
 	if db.compactor != nil {
 		db.compactor.setLogger(logger.With(LogKeySubsystem, LogSubsystemCompactor))
