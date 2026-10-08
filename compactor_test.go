@@ -93,6 +93,13 @@ func TestCompactor_SnapshotBaselineLocalProbe(t *testing.T) {
 			createTestLTXFile(t, client, 1, 1, 2)
 			createTestLTXFile(t, client, 0, 6, 6)
 			createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+			gapCalls := 0
+			c.SourceGapHandler = func(level int, expected, actual ltx.TXID) {
+				gapCalls++
+				if level != 0 || expected != 3 || actual != 6 {
+					t.Fatalf("gap handler: level=%d expected=%s actual=%s", level, expected, actual)
+				}
+			}
 			probes := 0
 			probe := &gapProbeReader{Reader: bytes.NewReader(nil)}
 			c.LocalFileOpener = func(level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
@@ -108,6 +115,13 @@ func TestCompactor_SnapshotBaselineLocalProbe(t *testing.T) {
 			_, err := c.Compact(t.Context(), 1)
 			if probes != 1 {
 				t.Fatalf("probe count=%d", probes)
+			}
+			wantGapCalls := 0
+			if probeErr == nil {
+				wantGapCalls = 1
+			}
+			if gapCalls != wantGapCalls {
+				t.Fatalf("gap handler calls=%d, want %d", gapCalls, wantGapCalls)
 			}
 			switch {
 			case probeErr == nil:
