@@ -2095,8 +2095,8 @@ func TestDB_Verify_WALOffsetAtHeader_SaltMismatch(t *testing.T) {
 	if !info.snapshotting {
 		t.Errorf("expected snapshotting=true when salt mismatches, got false")
 	}
-	if info.reason != "wal header salt reset, snapshotting" {
-		t.Errorf("expected reason='wal header salt reset, snapshotting', got %q", info.reason)
+	if info.reason != "wal salt reset" {
+		t.Errorf("expected reason='wal salt reset', got %q", info.reason)
 	}
 }
 
@@ -3876,76 +3876,30 @@ func TestVerifyAndSync_DelaysStateMutationUntilApply(t *testing.T) {
 	}
 }
 
-func TestVerifyAndSync_DelaysExpectedTruncationStateMutationUntilApply(t *testing.T) {
-	dir := t.TempDir()
-	dbPath := filepath.Join(dir, "db")
-
-	db := NewDB(dbPath)
-	db.MonitorInterval = 0
-	db.CheckpointInterval = 0
-	db.Replica = NewReplica(db)
-	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
-	db.Replica.MonitorEnabled = false
-
-	if err := db.Open(); err != nil {
-		t.Fatal(err)
-	}
-	defer func() {
-		_ = db.Close(context.Background())
-	}()
-
-	sqldb, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer sqldb.Close()
-
-	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := sqldb.Exec(`INSERT INTO t VALUES (1, 'before')`); err != nil {
-		t.Fatal(err)
-	}
-
+func TestVerifyAndSync_TruncationWithoutNewWritesTakesSnapshot(t *testing.T) {
+	db, sqldb := newWALResetTestDB(t)
 	ctx := context.Background()
+	insertWALResetRows(t, sqldb, 80)
 	if err := db.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
-
-	db.mu.Lock()
-	defer db.mu.Unlock()
-
-	if !db.syncState.syncedToWALEnd {
-		t.Fatal("syncedToWALEnd=false, want true after sync")
-	}
-	oldSyncedToWALEnd := db.syncState.syncedToWALEnd
-
-	if err := os.Truncate(db.WALPath(), WALHeaderSize); err != nil {
+	if err := db.releaseReadLock(); err != nil {
 		t.Fatal(err)
 	}
-
-	result, err := db.verifyAndSync(ctx, false, &db.syncState)
-	if err != nil {
+	if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 		t.Fatal(err)
 	}
-	if result.synced {
-		t.Fatal("verifyAndSync reported a sync, want no sync after truncation without new writes")
+	if err := db.acquireReadLock(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if result.syncedToWALEnd {
-		t.Fatal("result.syncedToWALEnd=true, want false")
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
 	}
-	if db.syncState.syncedToWALEnd != oldSyncedToWALEnd {
-		t.Fatalf("syncedToWALEnd mutated early: got %t, want %t", db.syncState.syncedToWALEnd, oldSyncedToWALEnd)
+	pages, commit := walResetLTXPageCount(t, db)
+	if pages != int(commit) {
+		t.Fatalf("encoded pages=%d, want %d", pages, commit)
 	}
-
-	db.applySyncResult(&db.syncState, result)
-
-	if db.syncState.syncedToWALEnd {
-		t.Fatal("syncedToWALEnd=true after apply, want false")
-	}
+	assertWALResetRestore(t, db, 80)
 }
 
 func TestApplySyncExecutor_PreservesInvalidatedPosCache(t *testing.T) {
@@ -4679,5 +4633,332 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+func TestDB_SyncExternalWALResetTakesBoundarySnapshot(t *testing.T) {
+	for _, mode := range []string{CheckpointModeTruncate, CheckpointModeRestart} {
+		t.Run(mode, func(t *testing.T) {
+			db, sqldb := newWALResetTestDB(t)
+			ctx := context.Background()
+			insertWALResetRows(t, sqldb, 80)
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if !db.syncState.syncedToWALEnd {
+				t.Fatal("initial sync did not reach WAL end")
+			}
+			if err := db.releaseReadLock(); err != nil {
+				t.Fatal(err)
+			}
+			insertWALResetRows(t, sqldb, 121)
+			var busy, log, checkpointed int
+			if err := sqldb.QueryRow(`PRAGMA wal_checkpoint(`+mode+`)`).Scan(&busy, &log, &checkpointed); err != nil {
+				t.Fatal(err)
+			}
+			if busy != 0 || log != checkpointed {
+				t.Fatalf("checkpoint: %d,%d,%d", busy, log, checkpointed)
+			}
+			if _, err := sqldb.Exec(`INSERT INTO heartbeat VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.acquireReadLock(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertWALResetRestore(t, db, 201)
+			pages, commit := walResetLTXPageCount(t, db)
+			if pages != int(commit) {
+				t.Fatalf("encoded pages=%d, want full database=%d", pages, commit)
+			}
+		})
+	}
+}
+
+func newWALResetTestDB(t *testing.T) (*DB, *sql.DB) {
+	t.Helper()
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 100000
+	db.TruncatePageN = 1000000
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sqldb.SetMaxOpenConns(1)
+	t.Cleanup(func() {
+		if err := sqldb.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	if _, err := sqldb.Exec(`PRAGMA journal_mode=wal; PRAGMA wal_autocheckpoint=0; CREATE TABLE data (id INTEGER PRIMARY KEY, value BLOB); CREATE TABLE heartbeat (value INTEGER);`); err != nil {
+		t.Fatal(err)
+	}
+	return db, sqldb
+}
+
+func insertWALResetRows(t *testing.T, sqldb *sql.DB, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO data(value) VALUES (zeroblob(3500))`); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func walResetLTXPageCount(t *testing.T, db *DB) (int, uint32) {
+	t.Helper()
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Open(db.LTXPath(0, pos.TXID, pos.TXID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	dec := ltx.NewDecoder(f)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	buf := make([]byte, dec.Header().PageSize)
+	n := 0
+	for {
+		var hdr ltx.PageHeader
+		if err := dec.DecodePage(&hdr, buf); err == io.EOF {
+			break
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	if err := dec.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return n, dec.Header().Commit
+}
+
+func assertWALResetRestore(t *testing.T, db *DB, want int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "restored.db")
+	restored := NewDB(path)
+	restored.Replica = NewReplica(restored)
+	restored.Replica.Client = db.Replica.Client
+	if err := restored.Replica.Restore(ctx, RestoreOptions{OutputPath: path}); err != nil {
+		t.Fatal(err)
+	}
+	sqldb, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	var integrity string
+	if err := sqldb.QueryRow(`PRAGMA integrity_check`).Scan(&integrity); err != nil {
+		t.Fatal(err)
+	}
+	if integrity != "ok" {
+		t.Fatalf("integrity_check=%s", integrity)
+	}
+	var got int
+	if err := sqldb.QueryRow(`SELECT count(*) FROM data`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != want {
+		t.Fatalf("restored row count=%d, want %d", got, want)
+	}
+	var wantHeartbeat int
+	if err := db.db.QueryRow(`SELECT count(*) FROM heartbeat`).Scan(&wantHeartbeat); err != nil {
+		t.Fatal(err)
+	}
+	if err := sqldb.QueryRow(`SELECT count(*) FROM heartbeat`).Scan(&got); err != nil {
+		t.Fatal(err)
+	}
+	if got != wantHeartbeat {
+		t.Fatalf("restored heartbeat count=%d, want %d", got, wantHeartbeat)
+	}
+}
+
+func TestDB_PassiveCheckpointSealedWALStaysIncremental(t *testing.T) {
+	db, sqldb := newWALResetTestDB(t)
+	insertWALResetRows(t, sqldb, 100)
+	ctx := context.Background()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	insertWALResetRows(t, sqldb, 1)
+	before, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+	after, err := readWALHeader(db.WALPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Equal(before[16:24], after[16:24]) {
+		t.Fatal("PASSIVE checkpoint did not restart WAL")
+	}
+	pages, commit := walResetLTXPageCount(t, db)
+	if pages >= int(commit) {
+		t.Fatalf("encoded pages=%d, want fewer than full database=%d", pages, commit)
+	}
+	assertWALResetRestore(t, db, 101)
+}
+
+func TestVerifyAndSync_DelaysResetSnapshotStateMutationUntilApply(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail=%t", fail), func(t *testing.T) {
+			db, sqldb := newWALResetTestDB(t)
+			ctx := context.Background()
+			insertWALResetRows(t, sqldb, 80)
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.releaseReadLock(); err != nil {
+				t.Fatal(err)
+			}
+			insertWALResetRows(t, sqldb, 121)
+			if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(TRUNCATE); INSERT INTO heartbeat VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.acquireReadLock(ctx); err != nil {
+				t.Fatal(err)
+			}
+			db.syncState.truncatePassiveFailed = true
+			exec, err := db.newSyncExecutor(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldState, oldPos, oldL0 := exec.state, exec.pos, db.maxLTXFileInfos.m[0]
+			injected := errors.New("snapshot staging failure")
+			if fail {
+				db.openLTXFile = func(string, int, os.FileMode) (ltxStagingFile, error) { return nil, injected }
+			}
+			result, err := db.verifyAndSyncWithExecutor(ctx, false, exec, 0)
+			db.openLTXFile = defaultOpenLTXFile
+			if fail {
+				if !errors.Is(err, injected) {
+					t.Fatalf("error=%v, want injected failure", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			if exec.state != oldState || exec.pos != oldPos || db.syncState != oldState || *db.pos.value != oldPos || db.maxLTXFileInfos.m[0] != oldL0 {
+				t.Fatal("reset snapshot mutated state before apply")
+			}
+			if fail {
+				return
+			}
+			if result.pos == nil || result.pos.TXID != oldPos.TXID+1 {
+				t.Fatalf("result position=%v", result.pos)
+			}
+			exec.applySyncResult(result)
+			db.applySyncExecutor(exec, false)
+			if db.syncState.truncatePassiveFailed {
+				t.Fatal("reset state was not applied")
+			}
+			pages, commit := walResetLTXPageCount(t, db)
+			if pages != int(commit) {
+				t.Fatalf("encoded pages=%d, want %d", pages, commit)
+			}
+			assertWALResetRestore(t, db, 201)
+		})
+	}
+}
+
+func TestDB_VerifyWALResetProof(t *testing.T) {
+	for _, name := range []string{"sealed", "missing", "position", "offset", "salt", "later-generation"} {
+		t.Run(name, func(t *testing.T) {
+			db, sqldb := newWALResetTestDB(t)
+			ctx := context.Background()
+			insertWALResetRows(t, sqldb, 80)
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			exec, err := db.newSyncExecutor(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tx, err := db.db.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rollback(tx)
+			if _, err := tx.Exec(`INSERT INTO _litestream_lock (id) VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			result, err := db.verifyAndSyncWithExecutor(ctx, true, exec, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			exec.applySyncResult(result)
+			sealed, err := db.verifyWithExecutor(ctx, exec, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sealed.snapshotting {
+				t.Fatal("sealed WAL requires snapshot")
+			}
+			proof := &walResetProof{pos: exec.pos, offset: sealed.offset, salt1: sealed.salt1, salt2: sealed.salt2}
+			if _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
+				t.Fatal(err)
+			}
+			if err := rollback(tx); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`INSERT INTO heartbeat VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			switch name {
+			case "missing":
+				proof = nil
+			case "position":
+				proof.pos.TXID++
+			case "offset":
+				proof.offset += int64(db.pageSize + WALFrameHeaderSize)
+			case "salt":
+				proof.salt2++
+			case "later-generation":
+				if err := db.releaseReadLock(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sqldb.Exec(`PRAGMA wal_checkpoint(RESTART); INSERT INTO heartbeat VALUES (2)`); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.acquireReadLock(ctx); err != nil {
+					t.Fatal(err)
+				}
+			}
+			info, err := db.verifyWithExecutor(ctx, exec, proof)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.resetWAL {
+				t.Fatal("WAL did not reset")
+			}
+			if want := name != "sealed"; info.snapshotting != want {
+				t.Fatalf("snapshotting=%t, want %t", info.snapshotting, want)
+			}
+		})
 	}
 }
