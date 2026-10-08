@@ -2687,7 +2687,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		newCommit = level1.commit
 		combined = make(map[uint32]ltx.PageIndexElem)
 		mergePageIndexes(combined, nil, level1.index, nil)
-	} else {
+	} else if !level0.replaceIndex || level1.maxTXID >= level0.maxTXID {
 		mergePageIndexes(combined, nil, level1.index, nil)
 		if level1.maxTXID >= level0.maxTXID && level1.commit > newCommit {
 			newCommit = level1.commit

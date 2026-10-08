@@ -1639,13 +1639,16 @@ func TestVFSFile_PollSnapshotGapReplacesIndex(t *testing.T) {
 		t.Run(fmt.Sprint(locked), func(t *testing.T) {
 			client := newMockReplicaClient()
 			prefix := buildLTXFixtureRangeWithPages(t, 1, 2, 4096, []uint32{1, 2, 3}, 'a')
-			prefix.info.Level = 1
+			prefix.info.Level = SnapshotLevel
 			client.addFixture(t, prefix)
 			f := NewVFSFile(client, "snapshot-gap.db", slog.Default())
 			if err := f.Open(); err != nil {
 				t.Fatal(err)
 			}
 			defer f.Close()
+			oldL1 := buildLTXFixtureRangeWithPages(t, 1, 2, 4096, []uint32{1, 2, 3}, 'a')
+			oldL1.info.Level = 1
+			client.addFixture(t, oldL1)
 			buf := make([]byte, 4096)
 			if _, err := f.ReadAt(buf, 0); err != nil {
 				t.Fatal(err)
