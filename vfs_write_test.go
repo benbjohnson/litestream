@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -1833,6 +1834,104 @@ func TestVFS_MultipleConnections_NoFalseConflict(t *testing.T) {
 	}
 	if f2.expectedTXID != 3 {
 		t.Fatalf("expected f2.expectedTXID=3, got %d", f2.expectedTXID)
+	}
+}
+
+func TestVFS_MultipleReplicas_IndependentTXIDs(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		initialTXID   ltx.TXID
+		defaultClient bool
+	}{
+		{name: "NewReplicas"},
+		{name: "ExistingReplica", initialTXID: 2},
+		{name: "DefaultClient", defaultClient: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clients := map[string]*writeTestReplicaClient{
+				"first":  newWriteTestReplicaClient(),
+				"second": newWriteTestReplicaClient(),
+			}
+			registerTestReplicaClientFactory(t, "vfs-txid", func(_, host, _ string, _ url.Values, _ *url.Userinfo) (ReplicaClient, error) {
+				return &struct{ ReplicaClient }{clients[host]}, nil
+			})
+			for txid := ltx.TXID(1); txid <= tt.initialTXID; txid++ {
+				createTestLTXFile(t, clients["first"], txid, DefaultPageSize, 1, map[uint32][]byte{1: make([]byte, DefaultPageSize)})
+			}
+
+			v := NewVFS(clients["first"], slog.Default())
+			v.WriteSyncInterval = time.Hour
+			v.PollInterval = time.Hour
+
+			open := func(name, replica string, writeEnabled bool) *VFSFile {
+				t.Helper()
+				params := map[string]string{
+					"replica_url":   "vfs-txid://" + replica + "/db",
+					"write_enabled": fmt.Sprint(writeEnabled),
+				}
+				if tt.defaultClient && replica == "first" {
+					delete(params, "replica_url")
+				}
+				file, _, err := v.OpenURI(name, params, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := file.(*VFSFile)
+				t.Cleanup(func() {
+					if err := f.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				return f
+			}
+			write := func(f *VFSFile, replica string, txid ltx.TXID) {
+				t.Helper()
+				if err := f.Lock(sqlite3vfs.LockReserved); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.WriteAt([]byte(replica), 100); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Unlock(sqlite3vfs.LockShared); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Sync(0); err != nil {
+					t.Fatal(err)
+				}
+				client := clients[replica]
+				client.mu.Lock()
+				defer client.mu.Unlock()
+				files := client.ltxFiles[0]
+				if len(files) != int(txid) {
+					t.Fatalf("%s: expected %d LTX files, got %d", replica, txid, len(files))
+				}
+				info := files[len(files)-1]
+				if info.MinTXID != txid || info.MaxTXID != txid {
+					t.Fatalf("%s: expected LTX TXID %d, got %d-%d", replica, txid, info.MinTXID, info.MaxTXID)
+				}
+			}
+
+			first := open("test.db", "first", true)
+			write(first, "first", tt.initialTXID+1)
+			second := open("test.db", "second", true)
+			write(second, "second", 1)
+			write(first, "first", tt.initialTXID+2)
+			write(second, "second", 2)
+			alias := open("alias.db", "first", true)
+			write(first, "first", tt.initialTXID+3)
+			write(alias, "first", tt.initialTXID+4)
+
+			for _, replica := range []string{"first", "second"} {
+				reader := open("reader.db", replica, false)
+				data := make([]byte, len(replica))
+				if _, err := reader.ReadAt(data, 100); err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != replica {
+					t.Fatalf("%s: unexpected replica data %q", replica, data)
+				}
+			}
+		})
 	}
 }
 
