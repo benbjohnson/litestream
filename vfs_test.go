@@ -15,6 +15,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -849,7 +850,8 @@ type blockingReplicaClient struct {
 
 type countingReplicaClient struct {
 	vfsTestLogger
-	calls atomic.Uint64
+	calls         atomic.Uint64
+	snapshotCalls atomic.Uint64
 }
 
 type failingPageReplicaClient struct {
@@ -870,6 +872,9 @@ func (c *countingReplicaClient) Init(context.Context) error { return nil }
 
 func (c *countingReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	c.calls.Add(1)
+	if level == SnapshotLevel {
+		c.snapshotCalls.Add(1)
+	}
 	return ltx.NewFileInfoSliceIterator(nil), nil
 }
 
@@ -1631,6 +1636,90 @@ func TestVFSFile_PollLevel1RepointsPageBelowWatermark(t *testing.T) {
 	}
 	if buf[0] != 'b' {
 		t.Fatalf("retained L1 page = %q, want 'b'", buf[0])
+	}
+}
+
+func TestVFSFile_PollIdleSnapshotListRate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newCountingReplicaClient()
+		f := NewVFSFile(client, "test.db", slog.Default())
+		for range 180 {
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(time.Second)
+		}
+		if got := client.snapshotCalls.Load(); got != 3 {
+			t.Fatalf("snapshot LIST calls=%d, want 3 across 180 idle polls", got)
+		}
+		if got := client.calls.Load() - client.snapshotCalls.Load(); got != 360 {
+			t.Fatalf("L0/L1 LIST calls=%d, want 360", got)
+		}
+	})
+}
+
+func TestVFSFile_PollIdleSnapshotEventually(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := newMockReplicaClient()
+		snapshot := buildLTXFixtureRange(t, 1, 2, 'a')
+		snapshot.info.Level = SnapshotLevel
+		client.addFixture(t, snapshot)
+		f := NewVFSFile(client, "test.db", slog.Default())
+		f.PollInterval = time.Hour
+		if err := f.Open(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = f.Close() })
+		if err := f.pollReplicaClient(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		snapshot = buildLTXFixtureRange(t, 1, 6, 'b')
+		snapshot.info.Level = SnapshotLevel
+		client.addFixture(t, snapshot)
+		for range 59 {
+			time.Sleep(time.Second)
+			if err := f.pollReplicaClient(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if f.Pos().TXID != 2 {
+				t.Fatalf("snapshot adopted before cadence elapsed: %s", f.Pos().TXID)
+			}
+		}
+		time.Sleep(time.Second)
+		if err := f.pollReplicaClient(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if f.Pos().TXID != 6 {
+			t.Fatalf("snapshot not adopted after one minute: %s", f.Pos().TXID)
+		}
+		snapshot = buildLTXFixtureRange(t, 1, 8, 'c')
+		snapshot.info.Level = SnapshotLevel
+		client.addFixture(t, snapshot)
+		if err := f.pollReplicaClient(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if f.Pos().TXID != 8 {
+			t.Fatalf("progress did not reset reconciliation: %s", f.Pos().TXID)
+		}
+	})
+}
+
+func TestVFSFile_PollSnapshotGapBypassesIdleCadence(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	tail := buildLTXFixtureRange(t, 7, 8, 'c')
+	tail.info.Level = 1
+	client.addFixture(t, tail)
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatalf("gap recovery delayed: %s", f.Pos().TXID)
 	}
 }
 

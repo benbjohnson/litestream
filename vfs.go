@@ -33,6 +33,8 @@ const (
 	DefaultCacheSize    = 10 * 1024 * 1024 // 10MB
 	DefaultPageSize     = 4096             // SQLite default page size
 
+	idleSnapshotInterval = time.Minute
+
 	pageFetchRetryAttempts = 6
 	pageFetchRetryDelay    = 15 * time.Millisecond
 )
@@ -615,6 +617,8 @@ type VFSFile struct {
 	lockType         sqlite3vfs.LockType        // Current lock state
 	pageSize         uint32
 	commit           uint32
+
+	nextIdleSnapshotCheck time.Time
 
 	// Write support fields (only used when writeEnabled is true)
 	writeEnabled  bool             // Whether write support is enabled
@@ -2675,7 +2679,13 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 			return fmt.Errorf("poll L1: %w", err)
 		}
 	}
-	if gapErr != nil || max(level0.maxTXID, level1.maxTXID) <= pos.TXID {
+	f.mu.Lock()
+	checkSnapshot := gapErr != nil || (max(level0.maxTXID, level1.maxTXID) <= pos.TXID && !time.Now().Before(f.nextIdleSnapshotCheck))
+	if checkSnapshot {
+		f.nextIdleSnapshotCheck = time.Now().Add(idleSnapshotInterval)
+	}
+	f.mu.Unlock()
+	if checkSnapshot {
 		snapshot, snapshotErr := NewCompactor(f.client, f.logger).MaxLTXFileInfo(ctx, SnapshotLevel)
 		if snapshotErr != nil {
 			return fmt.Errorf("snapshot baseline: %w", snapshotErr)
@@ -2786,6 +2796,9 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		f.pos.TXID = level1.maxTXID
 	}
 
+	if f.pos.TXID > pos.TXID || level1.maxTXID > maxTXID1Snapshot {
+		f.nextIdleSnapshotCheck = time.Time{}
+	}
 	f.maxTXID1 = level1.maxTXID
 	f.maxTXID1Anchored = level1.anchored
 	f.maxTXID1Covered = level1.coveredTXID
