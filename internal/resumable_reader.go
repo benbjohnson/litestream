@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -45,15 +46,18 @@ type ResumableReader struct {
 	maxTXID ltx.TXID
 	size    int64 // expected total file size from FileInfo; 0 means unknown
 	offset  int64
-	rc      io.ReadCloser
-	// cancel cancels the request context behind rc, but only for a stream this
-	// reader opened itself. A stream handed to NewResumableReader belongs to the
-	// caller, so there is nothing here to cancel until the first reconnect
-	// replaces it.
+	retryN  int
+	err     error
+	logger  *slog.Logger
+
+	// mu guards rc and closed. Close may be called from a different goroutine
+	// than Read: Compactor.Compact closes its source readers when it returns
+	// while its compaction goroutine may still be reading them. Once closed is
+	// set, Read must not reopen the stream or it would leak the new connection.
+	mu     sync.Mutex
+	rc     io.ReadCloser
 	cancel context.CancelFunc
-	retryN int
-	err    error
-	logger *slog.Logger
+	closed bool
 }
 
 // NewResumableReader creates a ResumableReader. Primarily exposed for testing.
@@ -89,16 +93,20 @@ var resumableReaderStallTimeout = 30 * time.Second
 var ErrReadStalled = errors.New("ltx stream read stalled")
 
 func (r *ResumableReader) Read(p []byte) (int, error) {
-	if r.err != nil {
-		return 0, r.err
-	}
-
 	for {
+		rc, cancel, err := r.stream()
+		if err != nil {
+			return 0, err
+		}
+		if r.err != nil {
+			return 0, r.err
+		}
+
 		// Reopen the stream from the current offset if the previous
-		// connection was closed (rc is nil after a retry).
-		if r.rc == nil {
+		// connection was closed (the stream is nil after a retry).
+		if rc == nil {
 			streamCtx, streamCancel := context.WithCancel(r.ctx)
-			rc, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+			newRC, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
 				streamCancel()
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -116,13 +124,22 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 					"offset", r.offset, "error", err, "attempt", r.retryN)
 				continue
 			}
-			r.rc, r.cancel = rc, streamCancel
+			if !r.setStream(newRC, streamCancel) {
+				// Closed while the stream was being reopened.
+				streamCancel()
+				_ = newRC.Close()
+				return 0, os.ErrClosed
+			}
+			rc, cancel = newRC, streamCancel
 		}
 
-		n, err := r.readStream(p)
+		n, err := r.readStream(rc, cancel, p)
 		r.offset += int64(n)
 
 		if err == nil {
+			if n > 0 && n == len(p) {
+				r.retryN = 0
+			}
 			return n, nil
 		}
 
@@ -134,8 +151,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 				r.logger.Debug("premature EOF on ltx file, reconnecting",
 					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 					"offset", r.offset, "size", r.size, "attempt", r.retryN+1)
-				r.close()
-				r.rc = nil
+				r.dropStream()
 				if retryErr := r.retry(io.ErrUnexpectedEOF); retryErr != nil {
 					return n, retryErr
 				}
@@ -154,8 +170,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		r.logger.Debug("read error on ltx file, reconnecting",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"error", err, "offset", r.offset, "attempt", r.retryN+1)
-		r.close()
-		r.rc = nil
+		r.dropStream()
 		if retryErr := r.retry(err); retryErr != nil {
 			return n, retryErr
 		}
@@ -174,61 +189,100 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 // for the duration of the network read and (*body).Close wants that same mutex,
 // so a watchdog calling Close would queue behind the very read it is trying to
 // interrupt. Only the request context reaches a parked read.
-func (r *ResumableReader) readStream(p []byte) (int, error) {
+func (r *ResumableReader) readStream(rc io.ReadCloser, cancel context.CancelFunc, p []byte) (int, error) {
 	// Captured per stream: by the time the timer fires, r.cancel may already
 	// belong to a healthy replacement, and cancelling that one would be a
 	// self-inflicted drop.
-	cancel := r.cancel
-	if cancel == nil || resumableReaderStallTimeout <= 0 {
-		return r.rc.Read(p)
+	timeout, offset := resumableReaderStallTimeout, r.offset
+	if cancel == nil || timeout <= 0 {
+		return rc.Read(p)
 	}
 
 	var stalled atomic.Bool
-	timer := time.AfterFunc(resumableReaderStallTimeout, func() {
+	timer := time.AfterFunc(timeout, func() {
 		stalled.Store(true)
 		r.logger.Debug("ltx file read stalled, cancelling stream",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
-			"offset", r.offset, "timeout", resumableReaderStallTimeout)
+			"offset", offset, "timeout", timeout)
 		cancel()
 	})
 	defer timer.Stop()
 
-	n, err := r.rc.Read(p)
+	n, err := rc.Read(p)
 	if err != nil && stalled.Load() {
 		// %v, not %w: the underlying error is context.Canceled, and a stall is
 		// retryable where a cancelled parent context is terminal. Letting
 		// context.Canceled into the chain invites an errors.Is check above to
 		// abandon a restore that only needed to reconnect.
-		err = fmt.Errorf("%w after %s: %v", ErrReadStalled, resumableReaderStallTimeout, err)
+		err = fmt.Errorf("%w after %s: %v", ErrReadStalled, timeout, err)
 	}
 	return n, err
 }
 
+// Close closes the current underlying stream, if any, and marks the reader as
+// closed. Closing is permanent: subsequent reads fail with os.ErrClosed rather
+// than reopening the remote stream, which would leak the new connection.
 func (r *ResumableReader) Close() error {
-	r.cancelStream()
-	if r.rc != nil {
-		return r.rc.Close()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	r.closed = true
+	rc, cancel := r.rc, r.cancel
+	r.rc, r.cancel = nil, nil
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if rc != nil {
+		return rc.Close()
 	}
 	return nil
 }
 
-// cancelStream releases the request context behind the current stream. It runs
-// before every Close of that stream: a read parked on it holds net/http's body
-// mutex, which Close needs, so Close on its own would block behind the read
-// instead of ending it.
-func (r *ResumableReader) cancelStream() {
-	if r.cancel != nil {
-		r.cancel()
-		r.cancel = nil
+// stream returns the current underlying stream, or nil if the next read should
+// reopen it. Returns os.ErrClosed if the reader has been closed.
+func (r *ResumableReader) stream() (io.ReadCloser, context.CancelFunc, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return nil, nil, os.ErrClosed
 	}
+	return r.rc, r.cancel, nil
 }
 
-func (r *ResumableReader) close() {
-	r.cancelStream()
+// setStream installs a newly reopened stream. It reports false if the reader
+// was closed while the stream was being opened, in which case the caller must
+// close the new stream itself.
+func (r *ResumableReader) setStream(rc io.ReadCloser, cancel context.CancelFunc) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed {
+		return false
+	}
+	r.rc, r.cancel = rc, cancel
+	return true
+}
 
-	// The stream is already being discarded after a read failure, so a close
-	// error should not stop recovery. Log it only to aid debugging.
-	if err := r.rc.Close(); err != nil {
+// dropStream closes and clears the current stream after a read failure so the
+// next read reopens from the current offset. The stream is already being
+// discarded, so a close error should not stop recovery. Log it only to aid
+// debugging.
+func (r *ResumableReader) dropStream() {
+	r.mu.Lock()
+	rc, cancel := r.rc, r.cancel
+	r.rc, r.cancel = nil, nil
+	r.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if rc == nil {
+		return
+	}
+	if err := rc.Close(); err != nil {
 		r.logger.Debug("close ltx file",
 			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"offset", r.offset, "error", err)

@@ -383,9 +383,6 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 	// Create paginator for listing blobs with level prefix
 	dir := litestream.LTXLevelDir(client.Path, level)
 	prefix := dir + "/"
-	if seek != 0 {
-		prefix += seek.String()
-	}
 
 	itr.pager = client.client.NewListBlobsFlatPager(client.Bucket, &azblob.ListBlobsFlatOptions{
 		Prefix:  &prefix,

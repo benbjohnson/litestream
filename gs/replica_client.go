@@ -129,12 +129,12 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	}
 
 	dir := litestream.LTXLevelDir(c.Path, level)
-	prefix := dir + "/"
+	query := &storage.Query{Prefix: dir + "/"}
 	if seek != 0 {
-		prefix += seek.String()
+		query.StartOffset = query.Prefix + seek.String()
 	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, query), c, level), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
@@ -159,8 +159,9 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	// Combine buffered data with rest of reader
 	fullReader := io.MultiReader(&buf, rd)
 
-	w := c.bkt.Object(key).NewWriter(ctx)
-	defer w.Close()
+	writeCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	w := c.bkt.Object(key).NewWriter(writeCtx)
 
 	// Store timestamp in GCS metadata for accurate timestamp retrieval
 	w.Metadata = map[string]string{
@@ -169,6 +170,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	n, err := io.Copy(w, fullReader)
 	if err != nil {
+		cancel()
 		return info, err
 	} else if err := w.Close(); err != nil {
 		return info, err
