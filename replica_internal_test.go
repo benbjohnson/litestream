@@ -625,7 +625,7 @@ func TestReplica_CalcPosSnapshotWarnsOnce(t *testing.T) {
 	}
 	var logs bytes.Buffer
 	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
-	db.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	db.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)).With(LogKeyDB, "test.db"))
 	r := NewReplicaWithClient(db, client)
 	for range 3 {
 		pos, _, err := r.calcPos(t.Context())
@@ -638,6 +638,9 @@ func TestReplica_CalcPosSnapshotWarnsOnce(t *testing.T) {
 	}
 	if n := strings.Count(logs.String(), "historical continuity abandoned"); n != 1 {
 		t.Fatalf("warning count=%d: %s", n, logs.String())
+	}
+	if n := strings.Count(logs.String(), "db=test.db"); n != 1 {
+		t.Fatalf("db attribute count=%d: %s", n, logs.String())
 	}
 	for _, field := range []string{"level=WARN", "db=test.db", "src_level=0", "dst_level=9", "expected_txid=0000000000000003", "actual_txid=0000000000000006", "snapshot_max_txid=0000000000000005", "retired_min_txid=0000000000000003", "retired_max_txid=0000000000000005", "local healing unavailable"} {
 		if !strings.Contains(logs.String(), field) {
