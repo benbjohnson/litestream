@@ -23,7 +23,7 @@ func TestCompactor_Compact(t *testing.T) {
 		compactor := litestream.NewCompactor(client, slog.Default())
 
 		// The base is captured in the snapshot at TXID 1; L0 holds increments
-		// from TXID 2 onward. Compaction into the empty L1 seeks from snapMax+1.
+		// from TXID 2 onward. Compaction into the empty L1 skips the snapshot.
 		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
 		createTestLTXFile(t, client, 0, 3, 3)
@@ -59,7 +59,7 @@ func TestCompactor_Compact(t *testing.T) {
 		createTestLTXFile(t, client, 0, 2, 2)
 		createTestLTXFile(t, client, 0, 3, 3)
 
-		// Compact to L1 (seeks from snapMax+1 = 2)
+		// Compact to L1 (starts at TXID 2, after the snapshot)
 		_, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
@@ -77,7 +77,7 @@ func TestCompactor_Compact(t *testing.T) {
 			t.Errorf("TXID range=%d-%d, want 4-4", info.MinTXID, info.MaxTXID)
 		}
 
-		// Now compact L1 to L2 (empty L2 seeks from snapMax+1 = 2, pulling all L1)
+		// Now compact L1 to L2 (empty L2 pulls all L1, which follows the snapshot)
 		info, err = compactor.Compact(context.Background(), 2)
 		if err != nil {
 			t.Fatal(err)
@@ -104,9 +104,8 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		createTestLTXFile(t, client, 0, 6, 6)
 		createTestLTXFile(t, client, 0, 7, 7)
 
-		// L1 has never been compacted (empty destination): should seek from
-		// snapMax+1 rather than TXID 1, skipping the file already captured
-		// in the snapshot.
+		// L1 has never been compacted (empty destination): the file already
+		// captured in the snapshot is skipped rather than compacted from TXID 1.
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
@@ -145,14 +144,14 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		}
 
 		// Once the snapshot lands (covering the base at TXID 1), the same empty
-		// destination proceeds, seeking from snapMax+1 and skipping the base.
+		// destination proceeds, skipping the snapshot-covered base.
 		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if info.MinTXID != 2 || info.MaxTXID != 2 {
-			t.Errorf("TXID range=%d-%d, want 2-2 (base skipped, seek from snapMax+1)", info.MinTXID, info.MaxTXID)
+			t.Errorf("TXID range=%d-%d, want 2-2 (snapshot-covered base skipped)", info.MinTXID, info.MaxTXID)
 		}
 	})
 
@@ -164,7 +163,7 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		// proceed (an empty destination defers until the snapshot lands).
 		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 
-		// L1 already has files up through TXID 3 (seeded from snapMax+1 = 2).
+		// L1 already has files up through TXID 3 (the base [1,1] is skipped).
 		createTestLTXFile(t, client, 0, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
 		createTestLTXFile(t, client, 0, 3, 3)
@@ -182,9 +181,8 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		}
 		createTestLTXFile(t, client, 0, 11, 11)
 
-		// The seek is max(dstMax, snapMax)+1 = 11: the ladder skips the
-		// snapshot-covered range 4..10 instead of re-writing it, and picks up at
-		// TXID 11. This is the whole point of the policy -- snapshot-covered data
+		// The source files 4..10 are wholly covered by the snapshot: the ladder
+		// skips them instead of re-writing them, and picks up at TXID 11. This is the whole point of the policy -- snapshot-covered data
 		// is never dragged back through the ladder.
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
@@ -227,10 +225,11 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		createTestLTXFile(t, client, 0, 6, 6)
 		createTestLTXFile(t, client, 0, 7, 7)
 
-		// L1 (head=3) lags the snapshot (max=5). A naive seek of dstMax+1 = 4
-		// would read L0 files on BOTH sides of the hole -- {[4,4],[6,6],[7,7]} --
-		// a non-contiguous input that ltx.Compactor rejects. The policy seeks from
-		// max(3,5)+1 = 6 instead, skipping the redundant [4,4] and the hole.
+		// L1 (head=3) lags the snapshot (max=5). Compacting every L0 file from
+		// dstMax+1 = 4 would read files on BOTH sides of the hole --
+		// {[4,4],[6,6],[7,7]} -- a non-contiguous input that ltx.Compactor
+		// rejects. The snapshot wholly covers [4,4], so it is skipped along with
+		// the hole.
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatalf("straddle should be avoided by seeking past the snapshot, got: %v", err)
@@ -242,6 +241,74 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		// L1 is {[2,3],[6,7]}: the gap [4,5] is spanned by the snapshot [1,5].
 		if err := compactor.VerifyLevelConsistency(context.Background(), 1); err != nil {
 			t.Errorf("expected snapshot-covered gap to verify, got: %v", err)
+		}
+	})
+
+	t.Run("NonEmptyDestinationCarriesStraddler", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		// L1 and L2 have both caught up through TXID 3.
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+		createTestLTXFile(t, client, 1, 2, 3)
+		createTestLTXFile(t, client, 2, 2, 3)
+
+		// L1 compacted [4,7] before a snapshot at TXID 5 landed, so that file
+		// straddles the snapshot.
+		createTestLTXFile(t, client, 1, 4, 7)
+		createTestLTXFile(t, client, 1, 8, 9)
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+
+		// The straddler extends past the snapshot, so L2 must take it: skipping
+		// it would leave 6..7 out of L2.
+		info, err := compactor.Compact(context.Background(), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 4 || info.MaxTXID != 9 {
+			t.Errorf("TXID range=%d-%d, want 4-9 (straddler carried up)", info.MinTXID, info.MaxTXID)
+		}
+
+		// L2 is {[2,3],[4,9]}: contiguous.
+		if err := compactor.VerifyLevelConsistency(context.Background(), 2); err != nil {
+			t.Errorf("expected contiguous L2, got: %v", err)
+		}
+	})
+
+	t.Run("EmptyDestinationCarriesStraddler", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+		createTestLTXFile(t, client, 1, 4, 7)
+		createTestLTXFile(t, client, 1, 8, 9)
+
+		// The output overlaps the snapshot [1,5], which restore applies
+		// correctly; it must not lose 6..7.
+		info, err := compactor.Compact(context.Background(), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 4 || info.MaxTXID != 9 {
+			t.Errorf("TXID range=%d-%d, want 4-9 (straddler carried up)", info.MinTXID, info.MaxTXID)
+		}
+	})
+
+	t.Run("SkipsWhollyCoveredSourceFiles", func(t *testing.T) {
+		client := file.NewReplicaClient(t.TempDir())
+		compactor := litestream.NewCompactor(client, slog.Default())
+
+		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+		createTestLTXFile(t, client, 1, 2, 3)
+		createTestLTXFile(t, client, 1, 4, 5)
+		createTestLTXFile(t, client, 1, 6, 7)
+
+		info, err := compactor.Compact(context.Background(), 2)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 6 || info.MaxTXID != 7 {
+			t.Errorf("TXID range=%d-%d, want 6-7 (files ending at or before the snapshot skipped)", info.MinTXID, info.MaxTXID)
 		}
 	})
 }
