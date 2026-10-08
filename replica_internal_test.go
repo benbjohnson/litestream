@@ -566,6 +566,7 @@ func TestReplica_CalcPos(t *testing.T) {
 		{name: "L0BelowL1Ignored", l1: []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 3}}, l0: l0(1, 2, 3), want: 3},
 		{name: "GapAboveL1BoundaryResumesAtL1", l1: []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 3}}, l0: l0(1, 2, 3, 5, 6), want: 3},
 		{name: "InteriorGapAboveL1StopsBeforeGap", l1: []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 3}}, l0: l0(4, 5, 7), want: 5},
+		{name: "UnsortedListingWithGap", l0: l0(4, 1, 2), want: 2},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &followTestReplicaClient{}
@@ -581,7 +582,7 @@ func TestReplica_CalcPos(t *testing.T) {
 			}
 
 			r := NewReplicaWithClient(nil, client)
-			pos, err := r.calcPos(context.Background())
+			pos, _, err := r.calcPos(context.Background())
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -601,7 +602,7 @@ func TestReplica_CalcPos(t *testing.T) {
 		}
 
 		r := NewReplicaWithClient(nil, client)
-		if _, err := r.calcPos(context.Background()); err == nil || !bytes.Contains([]byte(err.Error()), []byte("level 0 listing failed")) {
+		if _, _, err := r.calcPos(context.Background()); err == nil || !bytes.Contains([]byte(err.Error()), []byte("level 0 listing failed")) {
 			t.Fatalf("err=%v, want level 0 listing failure", err)
 		}
 	})
