@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -34,7 +35,8 @@ var errReplicaWaitForData = errors.New("no position, waiting for data")
 // The replica manages periodic synchronization and maintaining the current
 // replica position.
 type Replica struct {
-	db *DB
+	db                  *DB
+	snapshotTransitions snapshotTransitionLog
 
 	mu            sync.RWMutex
 	pos           ltx.Pos // current replicated position
@@ -239,7 +241,7 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 			var ltxErr *LTXError
 			gapMaxTXID, gapExists := findL0GapMaxTXID(r.remoteL0Files, txID)
 			if !errors.As(err, &ltxErr) || ltxErr.Op != "open" ||
-				ltxErr.Path != r.db.LTXPath(0, txID, txID) || !os.IsNotExist(ltxErr.Err) || !gapExists {
+				ltxErr.Path != r.db.LTXPath(0, txID, txID) || !errors.Is(ltxErr.Err, fs.ErrNotExist) || !gapExists {
 				return result, err
 			}
 
@@ -334,11 +336,25 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 			continue // already covered by L1 or a snapshot
 		}
 		if txID != 0 && info.MinTXID > txID+1 {
-			snapshotInfo, err := r.MaxLTXFileInfo(ctx, SnapshotLevel)
-			if err != nil {
-				return pos, nil, fmt.Errorf("max snapshot ltx file: %w", err)
+			localUnavailable := true
+			if r.db != nil {
+				_, err := os.Stat(r.db.LTXPath(0, txID+1, txID+1))
+				switch {
+				case err == nil:
+					localUnavailable = false
+				case !errors.Is(err, fs.ErrNotExist):
+					return pos, nil, fmt.Errorf("stat local gap file: %w", err)
+				}
+			}
+			var snapshotInfo ltx.FileInfo
+			if localUnavailable {
+				snapshotInfo, err = r.MaxLTXFileInfo(ctx, SnapshotLevel)
+				if err != nil {
+					return pos, nil, fmt.Errorf("max snapshot ltx file: %w", err)
+				}
 			}
 			if snapshotInfo.MaxTXID >= info.MinTXID-1 {
+				r.snapshotTransitions.warn(ctx, r.Logger(), 0, SnapshotLevel, txID+1, info.MinTXID, snapshotInfo.MaxTXID, txID+1)
 				txID = max(snapshotInfo.MaxTXID, info.MaxTXID)
 				continue
 			}

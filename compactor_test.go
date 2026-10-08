@@ -20,6 +20,116 @@ import (
 	"github.com/benbjohnson/litestream/file"
 )
 
+func TestCompactor_SnapshotBaselineWarnsOnce(t *testing.T) {
+	client := file.NewReplicaClient(t.TempDir())
+	var logs bytes.Buffer
+	c := litestream.NewCompactor(client, slog.New(slog.NewTextHandler(&logs, nil)).With("db", "test.db"))
+	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, 0, 3, 3)
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+	for range 3 {
+		if _, err := c.Compact(t.Context(), 1); !errors.Is(err, litestream.ErrNoCompaction) {
+			t.Fatal(err)
+		}
+	}
+	if n := strings.Count(logs.String(), "historical continuity abandoned"); n != 1 {
+		t.Fatalf("warning count=%d: %s", n, logs.String())
+	}
+	for _, field := range []string{"level=WARN", "db=test.db", "src_level=0", "dst_level=1", "expected_txid=0000000000000002", "actual_txid=0000000000000003", "snapshot_max_txid=0000000000000005", "retired_min_txid=0000000000000001", "retired_max_txid=0000000000000005", "local healing unavailable"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Fatalf("missing %q: %s", field, logs.String())
+		}
+	}
+}
+
+func TestCompactor_SnapshotBaselineStraddler(t *testing.T) {
+	for _, skipped := range []bool{false, true} {
+		for _, overlap := range []bool{false, true} {
+			t.Run(fmt.Sprintf("skipped=%v/overlap=%v", skipped, overlap), func(t *testing.T) {
+				client := file.NewReplicaClient(t.TempDir())
+				c := litestream.NewCompactor(client, slog.Default())
+				createTestLTXFile(t, client, 1, 1, 3)
+				if skipped {
+					createTestLTXFile(t, client, 1, 5, 90)
+				}
+				createTestLTXFile(t, client, 1, 95, 110)
+				if overlap {
+					createTestLTXFile(t, client, 1, 105, 120)
+				}
+				createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 100)
+				info, err := c.Compact(t.Context(), 2)
+				if overlap {
+					if err == nil || !strings.Contains(err.Error(), "overlapping transaction ids") {
+						t.Fatalf("overlap error=%v", err)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.MinTXID != 95 || info.MaxTXID != 110 {
+					t.Fatalf("straddler relabeled: %#v", info)
+				}
+			})
+		}
+	}
+}
+
+type gapProbeReader struct {
+	io.Reader
+	closed bool
+}
+
+func (r *gapProbeReader) Close() error {
+	r.closed = true
+	return nil
+}
+
+func TestCompactor_SnapshotBaselineLocalProbe(t *testing.T) {
+	for _, probeErr := range []error{nil, fmt.Errorf("wrapped: %w", os.ErrNotExist), os.ErrPermission} {
+		t.Run(fmt.Sprint(probeErr), func(t *testing.T) {
+			client := file.NewReplicaClient(t.TempDir())
+			c := litestream.NewCompactor(client, slog.Default())
+			createTestLTXFile(t, client, 1, 1, 2)
+			createTestLTXFile(t, client, 0, 6, 6)
+			createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 5)
+			probes := 0
+			probe := &gapProbeReader{Reader: bytes.NewReader(nil)}
+			c.LocalFileOpener = func(level int, minTXID, maxTXID ltx.TXID) (io.ReadCloser, error) {
+				if minTXID != 3 {
+					return nil, os.ErrNotExist
+				}
+				probes++
+				if probeErr != nil {
+					return nil, probeErr
+				}
+				return probe, nil
+			}
+			_, err := c.Compact(t.Context(), 1)
+			if probes != 1 {
+				t.Fatalf("probe count=%d", probes)
+			}
+			switch {
+			case probeErr == nil:
+				if !probe.closed {
+					t.Fatal("local probe reader not closed")
+				}
+				if !errors.Is(err, litestream.ErrNoCompaction) {
+					t.Fatalf("available local file skipped: %v", err)
+				}
+			case errors.Is(probeErr, os.ErrNotExist):
+				if err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if !errors.Is(err, probeErr) {
+					t.Fatalf("probe error lost: %v", err)
+				}
+			}
+		})
+	}
+}
+
 func TestCompactor_CompactSnapshotBaselineWithoutDestination(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	compactor := litestream.NewCompactor(client, slog.Default())

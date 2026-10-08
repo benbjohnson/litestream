@@ -104,9 +104,108 @@ func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
 	}
 }
 
+func TestReplica_SnapshotCoveredGapPrefersLocalHeal(t *testing.T) {
+	for _, trigger := range []string{"compaction", "invalidation"} {
+		t.Run(trigger, func(t *testing.T) {
+			db, sqldb := testingutil.MustOpenDBs(t)
+			defer testingutil.MustCloseDBs(t, db, sqldb)
+			if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Replica.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			prefix, err := db.Compact(t.Context(), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for i := range 4 {
+				if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t VALUES (?)`, i); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Sync(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Replica.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := db.Snapshot(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			gap := prefix.MaxTXID + 1
+			if err := db.Replica.Client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+				{Level: 0, MinTXID: gap, MaxTXID: gap},
+				{Level: 0, MinTXID: gap + 1, MaxTXID: gap + 1},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			client := &l0WriteRecordingClient{ReplicaClient: db.Replica.Client}
+			db.Replica.Client = client
+			if trigger == "compaction" {
+				if _, err := db.Compact(t.Context(), 1); !errors.Is(err, litestream.ErrNoCompaction) {
+					t.Fatalf("compaction bypassed heal: %v", err)
+				}
+			} else {
+				db.Replica.InvalidatePos()
+			}
+			if err := db.Replica.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(client.txIDs, []ltx.TXID{gap, gap + 1}) || len(client.snapshotTXIDs) != 0 {
+				t.Fatalf("uploads=%v snapshots=%v", client.txIDs, client.snapshotTXIDs)
+			}
+			info, err := db.Compact(t.Context(), 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if info.MinTXID != gap || info.MaxTXID != gap+3 {
+				t.Fatalf("non-contiguous L1: %#v", info)
+			}
+			opt := litestream.NewRestoreOptions()
+			opt.OutputPath = filepath.Join(t.TempDir(), "historical.db")
+			opt.TXID = gap
+			if err := db.Replica.Restore(t.Context(), opt); err != nil {
+				t.Fatal(err)
+			}
+			restored := testingutil.MustOpenSQLDB(t, opt.OutputPath)
+			defer testingutil.MustCloseSQLDB(t, restored)
+			var count, sum int
+			if err := restored.QueryRowContext(t.Context(), `SELECT COUNT(*), SUM(id) FROM t`).Scan(&count, &sum); err != nil {
+				t.Fatal(err)
+			}
+			if count != 1 || sum != 0 {
+				t.Fatalf("historical count=%d sum=%d", count, sum)
+			}
+		})
+	}
+}
+
 func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
+	for _, scheduler := range []bool{false, true} {
+		t.Run(fmt.Sprintf("store=%v", scheduler), func(t *testing.T) {
+			testReplicaMissingLocalSnapshotLifecycle(t, scheduler)
+		})
+	}
+}
+
+func testReplicaMissingLocalSnapshotLifecycle(t *testing.T, scheduler bool) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
+	levels := litestream.CompactionLevels{{Level: 0}, {Level: 1, Interval: time.Nanosecond}, {Level: 2, Interval: time.Nanosecond}}
+	store := litestream.NewStore([]*litestream.DB{db}, levels)
+	compact := func(ctx context.Context, level int) (*ltx.FileInfo, error) {
+		if scheduler {
+			return store.CompactDB(ctx, db, levels[level])
+		}
+		return db.Compact(ctx, level)
+	}
 
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
@@ -151,12 +250,17 @@ func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
 	}
 
 	for level := 1; level <= 2; level++ {
-		info, err := db.Compact(t.Context(), level)
+		info, err := compact(t.Context(), level)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if info.MaxTXID != gapMinTXID-1 {
 			t.Fatalf("initial prefix: %#v", info)
+		}
+		if scheduler {
+			if _, err := store.CompactDB(t.Context(), db, &litestream.CompactionLevel{Level: level, Interval: 24 * time.Hour}); !errors.Is(err, litestream.ErrCompactionTooEarly) {
+				t.Fatalf("scheduler eligibility: %v", err)
+			}
 		}
 	}
 
@@ -274,7 +378,7 @@ func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	l1, err := db.Compact(t.Context(), 1)
+	l1, err := compact(t.Context(), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,22 +406,19 @@ func TestReplica_InvalidatePos_MissingLocalL0FallsBackToSnapshot(t *testing.T) {
 	if err := itr.Close(); err != nil {
 		t.Fatal(err)
 	}
-	l2, err := db.Compact(t.Context(), 2)
+	l2, err := compact(t.Context(), 2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if l2.MaxTXID != l1.MaxTXID {
 		t.Fatalf("L2 did not advance: %#v", l2)
 	}
-	levels := litestream.CompactionLevels{}
 	for level := 0; level < litestream.SnapshotLevel; level++ {
-		levels = append(levels, &litestream.CompactionLevel{Level: level})
 		errs, err := db.Replica.ValidateLevel(t.Context(), level)
 		if err != nil || len(errs) != 0 {
 			t.Fatalf("validate level %d: %v %v", level, errs, err)
 		}
 	}
-	store := litestream.NewStore([]*litestream.DB{db}, levels)
 	validation, err := store.Validate(t.Context())
 	if err != nil {
 		t.Fatal(err)

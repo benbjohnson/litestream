@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -606,4 +607,41 @@ func TestReplica_CalcPos(t *testing.T) {
 			t.Fatalf("err=%v, want level 0 listing failure", err)
 		}
 	})
+}
+
+func TestReplica_CalcPosSnapshotWarnsOnce(t *testing.T) {
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		var infos []*ltx.FileInfo
+		switch level {
+		case 0:
+			infos = []*ltx.FileInfo{{Level: 0, MinTXID: 6, MaxTXID: 6}}
+		case 1:
+			infos = []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 2}}
+		case SnapshotLevel:
+			infos = []*ltx.FileInfo{{Level: SnapshotLevel, MinTXID: 1, MaxTXID: 5}}
+		}
+		return ltx.NewFileInfoSliceIterator(infos), nil
+	}
+	var logs bytes.Buffer
+	db := NewDB(filepath.Join(t.TempDir(), "test.db"))
+	db.SetLogger(slog.New(slog.NewTextHandler(&logs, nil)))
+	r := NewReplicaWithClient(db, client)
+	for range 3 {
+		pos, _, err := r.calcPos(t.Context())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if pos.TXID != 6 {
+			t.Fatalf("pos=%s", pos.TXID)
+		}
+	}
+	if n := strings.Count(logs.String(), "historical continuity abandoned"); n != 1 {
+		t.Fatalf("warning count=%d: %s", n, logs.String())
+	}
+	for _, field := range []string{"level=WARN", "db=test.db", "src_level=0", "dst_level=9", "expected_txid=0000000000000003", "actual_txid=0000000000000006", "snapshot_max_txid=0000000000000005", "retired_min_txid=0000000000000003", "retired_max_txid=0000000000000005", "local healing unavailable"} {
+		if !strings.Contains(logs.String(), field) {
+			t.Fatalf("missing %q: %s", field, logs.String())
+		}
+	}
 }
