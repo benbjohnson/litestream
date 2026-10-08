@@ -3,12 +3,17 @@ package gs
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"slices"
 	"testing"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"github.com/fsouza/fake-gcs-server/fakestorage"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 )
 
 func ltxTestData(tb testing.TB, minTXID, maxTXID ltx.TXID, payload []byte) []byte {
@@ -77,5 +82,87 @@ func TestReplicaClient_OpenLTXFileReadsFullObject(t *testing.T) {
 
 	if !bytes.Equal(out, data) {
 		t.Fatalf("unexpected replica content: got %q, want %q", out, data)
+	}
+}
+
+func TestReplicaClient_LTXFilesSeek(t *testing.T) {
+	rc, server := setupTestClient(t)
+	defer server.Stop()
+
+	ctx := context.Background()
+	for _, txID := range []ltx.TXID{1, 3, 5} {
+		data := ltxTestData(t, txID, txID, nil)
+		if _, err := rc.WriteLTXFile(ctx, 0, txID, txID, bytes.NewReader(data)); err != nil {
+			t.Fatalf("WriteLTXFile(%s): %v", txID, err)
+		}
+	}
+
+	for _, tt := range []struct {
+		name string
+		seek ltx.TXID
+		want []ltx.TXID
+	}{
+		{name: "exact", seek: 3, want: []ltx.TXID{3, 5}},
+		{name: "next available", seek: 2, want: []ltx.TXID{3, 5}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			itr, err := rc.LTXFiles(ctx, 0, tt.seek, false)
+			if err != nil {
+				t.Fatalf("LTXFiles: %v", err)
+			}
+
+			var got []ltx.TXID
+			for itr.Next() {
+				got = append(got, itr.Item().MinTXID)
+			}
+			if err := itr.Close(); err != nil {
+				t.Fatalf("Close: %v", err)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("MinTXIDs=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+var errTestSource = errors.New("injected source failure")
+
+type failAfterReader struct {
+	r         *bytes.Reader
+	remaining int
+}
+
+func (r *failAfterReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		return 0, errTestSource
+	}
+
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.r.Read(p)
+	r.remaining -= n
+	if err != nil {
+		return n, errTestSource
+	}
+	return n, nil
+}
+
+func TestReplicaClient_WriteLTXFileAbortsOnSourceError(t *testing.T) {
+	rc, server := setupTestClient(t)
+	defer server.Stop()
+
+	ctx := context.Background()
+	minTXID, maxTXID := ltx.TXID(1), ltx.TXID(1)
+	data := ltxTestData(t, minTXID, maxTXID, bytes.Repeat([]byte("payload"), 1024))
+	rd := &failAfterReader{r: bytes.NewReader(data), remaining: len(data) - 1}
+
+	if _, err := rc.WriteLTXFile(ctx, 0, minTXID, maxTXID, rd); !errors.Is(err, errTestSource) {
+		t.Fatalf("WriteLTXFile error = %v, want %v", err, errTestSource)
+	}
+
+	key := litestream.LTXFilePath(rc.Path, 0, minTXID, maxTXID)
+	if _, err := rc.bkt.Object(key).Attrs(ctx); !errors.Is(err, storage.ErrObjectNotExist) {
+		t.Fatalf("object attrs error = %v, want %v", err, storage.ErrObjectNotExist)
 	}
 }

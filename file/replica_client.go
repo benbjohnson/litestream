@@ -2,6 +2,7 @@ package file
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"io"
@@ -349,7 +350,7 @@ func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([
 		if a.Index != b.Index {
 			return a.Index - b.Index
 		}
-		return int(a.Offset - b.Offset)
+		return cmp.Compare(a.Offset, b.Offset)
 	})
 	return segments, nil
 }
