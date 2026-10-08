@@ -1187,7 +1187,7 @@ func (db *DB) acquireReadLock(ctx context.Context) error {
 	}
 
 	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.BeginTx(ctx, nil)
+	tx, err := db.db.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return err
 	}
