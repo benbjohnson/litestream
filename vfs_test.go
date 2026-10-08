@@ -1634,6 +1634,74 @@ func TestVFSFile_PollLevel1RepointsPageBelowWatermark(t *testing.T) {
 	}
 }
 
+func TestVFSFile_PollIdleSnapshot(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 6 {
+		t.Fatalf("idle reader at %s", f.Pos().TXID)
+	}
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("snapshot page=%q", buf[0])
+	}
+}
+
+func TestVFSFile_PollSnapshotBehindGlobalPosition(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	for txid := ltx.TXID(3); txid <= 8; txid++ {
+		client.addFixture(t, buildLTXFixture(t, txid, 'c'))
+	}
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatal(f.Pos())
+	}
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	oldL1 := buildLTXFixtureRange(t, 5, 6, 'b')
+	oldL1.info.Level = 1
+	client.addFixture(t, oldL1)
+	client.mu.Lock()
+	delete(client.data, client.key(snapshot.info))
+	client.mu.Unlock()
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatalf("read snapshot behind global position: %v", err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatalf("position regressed: %s", f.Pos().TXID)
+	}
+}
+
+func TestVFSFile_PollPrefersStraddlerToSnapshot(t *testing.T) {
+	f, client := openVFSFileAtSnapshot(t, 2, 'a')
+	straddler := buildLTXFixtureRange(t, 1, 8, 'c')
+	straddler.info.Level = 1
+	client.addFixture(t, straddler)
+	client.addFixture(t, buildLTXFixture(t, 5, 'b'))
+	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
+	snapshot.info.Level = SnapshotLevel
+	client.addFixture(t, snapshot)
+	client.mu.Lock()
+	delete(client.data, client.key(snapshot.info))
+	client.mu.Unlock()
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Fatalf("read unnecessary snapshot: %v", err)
+	}
+	if f.Pos().TXID != 8 {
+		t.Fatalf("reader at %s", f.Pos().TXID)
+	}
+}
+
 func TestVFSFile_PollSnapshotGapReplacesIndex(t *testing.T) {
 	for _, locked := range []bool{false, true} {
 		t.Run(fmt.Sprint(locked), func(t *testing.T) {
