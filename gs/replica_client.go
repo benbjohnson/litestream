@@ -129,12 +129,12 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	}
 
 	dir := litestream.LTXLevelDir(c.Path, level)
-	prefix := dir + "/"
+	query := &storage.Query{Prefix: dir + "/"}
 	if seek != 0 {
-		prefix += seek.String()
+		query.StartOffset = query.Prefix + seek.String()
 	}
 
-	return newLTXFileIterator(c.bkt.Objects(ctx, &storage.Query{Prefix: prefix}), c, level), nil
+	return newLTXFileIterator(c.bkt.Objects(ctx, query), c, level), nil
 }
 
 // WriteLTXFile writes an LTX file from rd to a remote path.
