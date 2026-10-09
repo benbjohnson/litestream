@@ -40,7 +40,8 @@ type ReplicateCommand struct {
 	Config Config
 
 	// MCP server
-	MCP *MCPServer
+	MCP      *MCPServer
+	mcpErrCh <-chan error
 
 	// Server for IPC control commands.
 	Server *litestream.Server
@@ -185,7 +186,10 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		go c.MCP.Start(c.Config.MCPAddr)
+		if err := c.MCP.Start(c.Config.MCPAddr); err != nil {
+			return fmt.Errorf("start MCP server: %w", err)
+		}
+		c.mcpErrCh = c.MCP.errCh
 	}
 
 	// Setup databases.
@@ -434,6 +438,7 @@ func (c *ReplicateCommand) runOnce(ctx context.Context) {
 
 // Close closes all open databases.
 func (c *ReplicateCommand) Close(ctx context.Context) error {
+	var closeErr error
 	for _, monitor := range c.directoryMonitors {
 		monitor.Close()
 	}
@@ -441,7 +446,7 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 
 	if c.Server != nil {
 		if err := c.Server.Close(); err != nil {
-			slog.Error("error closing control server", "error", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("close control server: %w", err))
 		}
 	}
 	if c.Store != nil {
@@ -449,16 +454,16 @@ func (c *ReplicateCommand) Close(ctx context.Context) error {
 			if errors.Is(err, litestream.ErrShutdownInterrupted) {
 				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
 			} else {
-				slog.Error("failed to close database", "error", err)
+				closeErr = errors.Join(closeErr, fmt.Errorf("close database: %w", err))
 			}
 		}
 	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
 		if err := c.MCP.Close(); err != nil {
-			slog.Error("error closing MCP server", "error", err)
+			closeErr = errors.Join(closeErr, fmt.Errorf("close MCP server: %w", err))
 		}
 	}
-	return nil
+	return closeErr
 }
 
 // SetDone sets the done channel used for interrupt handling during shutdown.
