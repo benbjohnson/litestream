@@ -22,7 +22,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/semaphore"
-	_ "modernc.org/sqlite"
+	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream/internal"
 )
@@ -2276,6 +2276,168 @@ func testCheckpointSnapshot(t *testing.T, mode string) {
 		t.Errorf("verify() returned snapshotting=true after checkpoint, reason=%q. "+
 			"This is the bug: checkpoint followed by sync should NOT require full snapshot.",
 			info2.reason)
+	}
+}
+
+// TestDB_PersistWALOnEveryConnection checks that every connection in
+// Litestream's pool has PERSIST_WAL set, not just the first one. Any of them
+// can be the last to close.
+func TestDB_PersistWALOnEveryConnection(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db")
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+		t.Fatal(err)
+	}
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.Replica = NewReplicaWithClient(db, &testReplicaClient{dir: t.TempDir()})
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(ctx) }()
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hold several connections at once so the pool has to open new ones.
+	var conns []*sql.Conn
+	defer func() {
+		for _, conn := range conns {
+			_ = conn.Close()
+		}
+	}()
+	for i := 0; i < 3; i++ {
+		conn, err := db.db.Conn(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		conns = append(conns, conn)
+
+		var persist int
+		if err := conn.Raw(func(driverConn any) error {
+			fc, ok := driverConn.(sqlite.FileControl)
+			if !ok {
+				return fmt.Errorf("driver does not implement FileControl")
+			}
+			persist, err = fc.FileControlPersistWAL("main", -1)
+			return err
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if persist != 1 {
+			t.Errorf("connection %d: PERSIST_WAL=%d, want 1", i, persist)
+		}
+	}
+}
+
+// TestDB_CloseKeepsWALAfterMonitorCheckpoint reproduces the shutdown sequence
+// that deleted the WAL on Close and forced a full snapshot on the next start.
+//
+// The monitor checkpoints under db.ctx, so the long-running read transaction
+// it re-acquires is bound to db.ctx. Close cancels db.ctx first, which rolls
+// that transaction back and returns its connection to the pool. Close's final
+// sync then runs a PASSIVE checkpoint because the WAL is over
+// MinCheckpointPageN: the barrier transaction takes the newly freed
+// connection, so the read lock is re-acquired on the other one. That
+// connection is released last and closes last. Without PERSIST_WAL on it,
+// SQLite checkpoints and deletes the -wal and -shm files.
+func TestDB_CloseKeepsWALAfterMonitorCheckpoint(t *testing.T) {
+	ctx := context.Background()
+	dbPath := filepath.Join(t.TempDir(), "db")
+	client := &testReplicaClient{dir: t.TempDir()}
+
+	sqldb, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	for _, q := range []string{
+		`PRAGMA journal_mode = wal;`,
+		`CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB);`,
+		`INSERT INTO t (data) VALUES (randomblob(4096));`,
+	} {
+		if _, err := sqldb.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	db := NewDB(dbPath)
+	db.MonitorInterval = 0
+	db.CheckpointInterval = 0
+	db.MinCheckpointPageN = 10
+	db.ShutdownSyncTimeout = 0
+	db.Replica = NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	// A checkpoint as the monitor issues it, under db.ctx.
+	if _, err := sqldb.Exec(`INSERT INTO t (data) VALUES (randomblob(4096));`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(db.ctx, CheckpointModePassive); err != nil {
+		t.Fatal(err)
+	}
+
+	// Grow the WAL past MinCheckpointPageN so Close's final sync checkpoints.
+	for i := 0; i < 20; i++ {
+		if _, err := sqldb.Exec(`INSERT INTO t (data) VALUES (randomblob(4096));`); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// The application exits before Litestream, as under `replicate -exec`.
+	if err := sqldb.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(db.WALPath()); err != nil {
+		t.Fatalf("WAL removed on close: %v", err)
+	}
+
+	// Restart: a fresh Litestream process must continue from its last LTX
+	// file instead of taking a full snapshot, even when the application writes
+	// before the first sync. The close above checkpointed the WAL, so that
+	// write would restart the WAL unless Open already holds the read lock.
+	db2 := NewDB(dbPath)
+	db2.MonitorInterval = 0
+	db2.CheckpointInterval = 0
+	db2.Replica = NewReplicaWithClient(db2, client)
+	db2.Replica.MonitorEnabled = false
+	if err := db2.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db2.Close(ctx) }()
+
+	sqldb2, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb2.Close()
+	if _, err := sqldb2.Exec(`INSERT INTO t (data) VALUES (randomblob(4096));`); err != nil {
+		t.Fatal(err)
+	}
+
+	info, err := db2.verify(ctx, &db2.syncState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.snapshotting {
+		t.Fatalf("restart requires a full snapshot: reason=%q", info.reason)
 	}
 }
 
