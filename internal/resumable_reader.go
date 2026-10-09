@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/superfly/ltx"
@@ -55,6 +56,7 @@ type ResumableReader struct {
 	// set, Read must not reopen the stream or it would leak the new connection.
 	mu     sync.Mutex
 	rc     io.ReadCloser
+	cancel context.CancelFunc
 	closed bool
 }
 
@@ -79,9 +81,20 @@ const resumableReaderMaxRetries = 3
 // throttle window (e.g. Tigris 408 load shedding), guaranteeing exhaustion.
 const resumableReaderBackoff = 250 * time.Millisecond
 
+// resumableReaderStallTimeout bounds a single Read of an open stream. Nothing
+// else does: the S3 client sets no ResponseHeaderTimeout and no read deadline on
+// the response body, and TCP keepalive does not fire against a peer that is
+// alive but simply sending nothing. It is a var rather than a const only so
+// tests can shorten it.
+var resumableReaderStallTimeout = 30 * time.Second
+
+// ErrReadStalled reports a read that produced nothing for
+// resumableReaderStallTimeout and had its stream cancelled to force a reconnect.
+var ErrReadStalled = errors.New("ltx stream read stalled")
+
 func (r *ResumableReader) Read(p []byte) (int, error) {
 	for {
-		rc, err := r.stream()
+		rc, cancel, err := r.stream()
 		if err != nil {
 			return 0, err
 		}
@@ -92,8 +105,10 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (the stream is nil after a retry).
 		if rc == nil {
-			newRC, err := r.client.OpenLTXFile(r.ctx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+			streamCtx, streamCancel := context.WithCancel(r.ctx)
+			newRC, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
 			if err != nil {
+				streamCancel()
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
 				}
@@ -109,15 +124,16 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 					"offset", r.offset, "error", err, "attempt", r.retryN)
 				continue
 			}
-			if !r.setStream(newRC) {
+			if !r.setStream(newRC, streamCancel) {
 				// Closed while the stream was being reopened.
+				streamCancel()
 				_ = newRC.Close()
 				return 0, os.ErrClosed
 			}
-			rc = newRC
+			rc, cancel = newRC, streamCancel
 		}
 
-		n, err := rc.Read(p)
+		n, err := r.readStream(rc, cancel, p)
 		r.offset += int64(n)
 
 		if err == nil {
@@ -164,6 +180,45 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 	}
 }
 
+// readStream reads from the current stream under a stall timeout. A read that
+// produces nothing before the timeout expires has its stream's request context
+// cancelled, which unblocks the read with an error and sends the caller down the
+// reconnect path that already handles a dropped connection.
+//
+// Cancellation rather than Close: net/http's (*body).Read holds the body mutex
+// for the duration of the network read and (*body).Close wants that same mutex,
+// so a watchdog calling Close would queue behind the very read it is trying to
+// interrupt. Only the request context reaches a parked read.
+func (r *ResumableReader) readStream(rc io.ReadCloser, cancel context.CancelFunc, p []byte) (int, error) {
+	// Captured per stream: by the time the timer fires, r.cancel may already
+	// belong to a healthy replacement, and cancelling that one would be a
+	// self-inflicted drop.
+	timeout, offset := resumableReaderStallTimeout, r.offset
+	if cancel == nil || timeout <= 0 {
+		return rc.Read(p)
+	}
+
+	var stalled atomic.Bool
+	timer := time.AfterFunc(timeout, func() {
+		stalled.Store(true)
+		r.logger.Debug("ltx file read stalled, cancelling stream",
+			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+			"offset", offset, "timeout", timeout)
+		cancel()
+	})
+	defer timer.Stop()
+
+	n, err := rc.Read(p)
+	if err != nil && stalled.Load() {
+		// %v, not %w: the underlying error is context.Canceled, and a stall is
+		// retryable where a cancelled parent context is terminal. Letting
+		// context.Canceled into the chain invites an errors.Is check above to
+		// abandon a restore that only needed to reconnect.
+		err = fmt.Errorf("%w after %s: %v", ErrReadStalled, timeout, err)
+	}
+	return n, err
+}
+
 // Close closes the current underlying stream, if any, and marks the reader as
 // closed. Closing is permanent: subsequent reads fail with os.ErrClosed rather
 // than reopening the remote stream, which would leak the new connection.
@@ -174,10 +229,13 @@ func (r *ResumableReader) Close() error {
 		return nil
 	}
 	r.closed = true
-	rc := r.rc
-	r.rc = nil
+	rc, cancel := r.rc, r.cancel
+	r.rc, r.cancel = nil, nil
 	r.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	if rc != nil {
 		return rc.Close()
 	}
@@ -186,25 +244,25 @@ func (r *ResumableReader) Close() error {
 
 // stream returns the current underlying stream, or nil if the next read should
 // reopen it. Returns os.ErrClosed if the reader has been closed.
-func (r *ResumableReader) stream() (io.ReadCloser, error) {
+func (r *ResumableReader) stream() (io.ReadCloser, context.CancelFunc, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
-		return nil, os.ErrClosed
+		return nil, nil, os.ErrClosed
 	}
-	return r.rc, nil
+	return r.rc, r.cancel, nil
 }
 
 // setStream installs a newly reopened stream. It reports false if the reader
 // was closed while the stream was being opened, in which case the caller must
 // close the new stream itself.
-func (r *ResumableReader) setStream(rc io.ReadCloser) bool {
+func (r *ResumableReader) setStream(rc io.ReadCloser, cancel context.CancelFunc) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.closed {
 		return false
 	}
-	r.rc = rc
+	r.rc, r.cancel = rc, cancel
 	return true
 }
 
@@ -214,10 +272,13 @@ func (r *ResumableReader) setStream(rc io.ReadCloser) bool {
 // debugging.
 func (r *ResumableReader) dropStream() {
 	r.mu.Lock()
-	rc := r.rc
-	r.rc = nil
+	rc, cancel := r.rc, r.cancel
+	r.rc, r.cancel = nil, nil
 	r.mu.Unlock()
 
+	if cancel != nil {
+		cancel()
+	}
 	if rc == nil {
 		return
 	}
