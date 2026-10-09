@@ -448,6 +448,8 @@ type SyncDBResult struct {
 // SyncDB forces an immediate sync for a database. If wait is true, blocks
 // until both WAL-to-LTX and LTX-to-remote sync complete. If wait is false,
 // only performs the WAL-to-LTX sync and lets the replica monitor handle upload.
+// The returned TXID is captured before uploading; later WAL captures do not
+// advance this call's target while the upload is in progress.
 // Lock waits are context-aware: the timeout is honored while waiting for
 // the database sync executor and the replica sync lock.
 func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResult, error) {
@@ -465,19 +467,25 @@ func (s *Store) SyncDB(ctx context.Context, path string, wait bool) (SyncDBResul
 		return SyncDBResult{}, fmt.Errorf("read position before sync: %w", err)
 	}
 
-	if wait {
-		if err := db.SyncAndWait(ctx); err != nil {
-			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
-		}
-	} else {
-		if err := db.Sync(ctx); err != nil {
-			return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
-		}
+	if wait && db.Replica == nil {
+		return SyncDBResult{}, fmt.Errorf("sync database: no replica configured")
+	}
+	if err := db.Sync(ctx); err != nil {
+		return SyncDBResult{}, fmt.Errorf("sync database: %w", err)
 	}
 
+	// Pin the local capture before uploading. WAL monitoring may capture newer
+	// transactions during the upload; those are not part of this sync's target.
+	// Reading MaxLTX after Replica.Sync can otherwise report an unsynced TXID
+	// even though the requested replication completed successfully.
 	_, afterTXID, err := db.MaxLTX()
 	if err != nil {
 		return SyncDBResult{}, fmt.Errorf("read position after sync: %w", err)
+	}
+	if wait {
+		if err := db.Replica.Sync(ctx); err != nil {
+			return SyncDBResult{}, fmt.Errorf("sync database: replica sync: %w", err)
+		}
 	}
 
 	var replicatedTXID uint64
