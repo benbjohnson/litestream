@@ -1797,6 +1797,9 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
+		// A snapshot must hold every frame not yet in the database file,
+		// including those before the stale offset.
+		info.offset = WALHeaderSize
 		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
