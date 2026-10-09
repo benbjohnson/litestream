@@ -108,6 +108,28 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
 	}
+
+	snapInfo, err := c.MaxLTXFileInfo(ctx, SnapshotLevel)
+	if err != nil {
+		return nil, fmt.Errorf("cannot determine snapshot max ltx file: %w", err)
+	}
+
+	// An initial snapshot is required before compaction can begin.
+	if snapInfo.MaxTXID == 0 {
+		return nil, ErrNoCompaction
+	}
+
+	// Snapshots are uploaded directly to the L9 SnapshotLevel, so the ladder
+	// only needs the source files that extend past the newest snapshot.
+	//
+	// Seek from the destination's own progress, which is always a source file
+	// boundary because the destination is built from whole source files, and
+	// skip the source files the snapshot wholly covers. A source file that
+	// straddles the snapshot (compacted before the snapshot landed) is kept, so
+	// its transactions after the snapshot reach this level; the output then
+	// overlaps the snapshot, which restore applies correctly. Seeking from
+	// snapMax+1 instead would skip such a file and leave a hole in this level
+	// that only the source level covers.
 	seekTXID := prevMaxInfo.MaxTXID + 1
 
 	itr, err := c.client.LTXFiles(ctx, srcLevel, seekTXID, false)
@@ -128,6 +150,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
+		if info.MaxTXID <= snapInfo.MaxTXID {
+			continue // wholly covered by the snapshot
+		}
 
 		if minTXID == 0 || info.MinTXID < minTXID {
 			minTXID = info.MinTXID
@@ -201,6 +226,35 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 	}
 	defer itr.Close()
 
+	// A ladder level skips TXIDs covered by a snapshot (Compact skips source
+	// files the latest snapshot wholly covers), so a gap is valid when a
+	// SnapshotLevel file spans the missing range. Loaded lazily on the first gap so the common (gapless)
+	// path makes no extra request.
+	var snapshots []*ltx.FileInfo
+	snapshotsLoaded := false
+	gapCoveredBySnapshot := func(g0, g1 ltx.TXID) (bool, error) {
+		if !snapshotsLoaded {
+			sitr, err := c.client.LTXFiles(ctx, SnapshotLevel, 0, false)
+			if err != nil {
+				return false, fmt.Errorf("fetch snapshot ltx files: %w", err)
+			}
+			for sitr.Next() {
+				s := *sitr.Item()
+				snapshots = append(snapshots, &s)
+			}
+			if err := sitr.Close(); err != nil {
+				return false, fmt.Errorf("close snapshot iterator: %w", err)
+			}
+			snapshotsLoaded = true
+		}
+		for _, s := range snapshots {
+			if s.MinTXID <= g0 && s.MaxTXID >= g1 {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+
 	var prevInfo *ltx.FileInfo
 	for itr.Next() {
 		info := itr.Item()
@@ -215,11 +269,20 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 		expectedMinTXID := prevInfo.MaxTXID + 1
 		if info.MinTXID != expectedMinTXID {
 			if info.MinTXID > expectedMinTXID {
-				return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
-					prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
+				covered, err := gapCoveredBySnapshot(expectedMinTXID, info.MinTXID-1)
+				if err != nil {
+					return err
+				}
+				if !covered {
+					return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
+						prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
+				}
+				// Gap is spanned by a snapshot; restore seeds from it and
+				// extends contiguously. Accept and continue.
+			} else {
+				return fmt.Errorf("TXID overlap detected: prev.MaxTXID=%s, next.MinTXID=%s",
+					prevInfo.MaxTXID, info.MinTXID)
 			}
-			return fmt.Errorf("TXID overlap detected: prev.MaxTXID=%s, next.MinTXID=%s",
-				prevInfo.MaxTXID, info.MinTXID)
 		}
 
 		prevInfo = info
