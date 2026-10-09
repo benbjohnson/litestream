@@ -22,6 +22,63 @@ import (
 	"github.com/benbjohnson/litestream/mock"
 )
 
+func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 2 {
+		if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	dpos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dpos.TXID < 4 {
+		t.Fatalf("expected at least 4 transactions, got %s", dpos.TXID)
+	}
+
+	// Remove an interior L0 file to simulate an upload that never became durable.
+	gapTXID := dpos.TXID - 1
+	if err := db.Replica.Client.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{
+		{Level: 0, MinTXID: gapTXID, MaxTXID: gapTXID},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Replica.InvalidatePos()
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+
+	rd, err := db.Replica.Client.OpenLTXFile(t.Context(), 0, gapTXID, gapTXID, 0, 0)
+	if err != nil {
+		t.Fatalf("missing L0 file was not re-uploaded: %v", err)
+	}
+	_ = rd.Close()
+
+	if got, want := db.Replica.Pos().TXID, dpos.TXID; got != want {
+		t.Fatalf("replica pos=%s, want %s", got, want)
+	}
+}
+
 func TestReplica_Sync(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)

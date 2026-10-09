@@ -358,6 +358,14 @@ func NewDB(path string) *DB {
 		defer db.maxLTXFileInfos.Unlock()
 		db.maxLTXFileInfos.m[level] = info
 	}
+	db.compactor.SourceGapHandler = func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID) {
+		// Only L0 gaps are recoverable: the replica re-uploads the missing
+		// files from disk once its position is invalidated.
+		if srcLevel != 0 || db.Replica == nil {
+			return
+		}
+		db.Replica.InvalidatePos()
+	}
 
 	return db
 }
