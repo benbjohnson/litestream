@@ -829,7 +829,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	}
 
 	// Skip if there are no new files to compact.
-	if srcInfo.MaxTXID <= dstInfo.MinTXID {
+	if srcInfo.MaxTXID <= dstInfo.MaxTXID {
 		return nil, ErrNoCompaction
 	}
 
