@@ -45,12 +45,8 @@ func (c *LTXCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 		internal.InitLog(os.Stdout, "INFO", "text", false)
 	} else {
-		if *configPath == "" {
-			*configPath = DefaultConfigPath()
-		}
-
 		// Load configuration.
-		config, err := ReadConfigFile(*configPath, !*noExpandEnv)
+		config, err := ReadConfig(*configPath, !*noExpandEnv)
 		if err != nil {
 			return err
 		}
@@ -152,7 +148,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-no-expand-env
@@ -169,6 +165,9 @@ Examples:
 
 	# List all LTX files for a database.
 	$ litestream ltx /path/to/db
+
+	# List all LTX files using configuration from standard input.
+	$ cat /path/to/litestream.yml | litestream ltx -config - /path/to/db
 
 	# List all LTX files for replica URL.
 	$ litestream ltx s3://mybkt/db
