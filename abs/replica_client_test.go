@@ -2,6 +2,7 @@ package abs
 
 import (
 	"encoding/xml"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -113,4 +114,37 @@ func newListBlob(name string) listBlob {
 
 func serverURL(r *http.Request) string {
 	return "http://" + r.Host
+}
+
+func TestReplicaClient_OpenLTXFileWithoutContentLength(t *testing.T) {
+	const body = "ltx"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+
+	client, err := azblob.NewClientWithNoCredential(server.URL, nil)
+	if err != nil {
+		t.Fatalf("NewClientWithNoCredential: %v", err)
+	}
+	rc := NewReplicaClient()
+	rc.client = client
+	rc.Bucket = "litestream-test"
+	rc.Path = "integration"
+
+	reader, err := rc.OpenLTXFile(t.Context(), litestream.SnapshotLevel, 1, 2, 0, 0)
+	if err != nil {
+		t.Fatalf("OpenLTXFile: %v", err)
+	}
+	t.Cleanup(func() { _ = reader.Close() })
+	got, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("read %q, want %q", got, body)
+	}
 }
