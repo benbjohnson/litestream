@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -4679,5 +4680,121 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+// mustOpenMetricsDB opens a DB backed by a temp-dir test replica.
+func mustOpenMetricsDB(t *testing.T, path string) *DB {
+	t.Helper()
+	db := NewDB(path)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func mustWriteAndSyncMetricsDB(t *testing.T, db *DB) {
+	t.Helper()
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE IF NOT EXISTS t (x); INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gatherDBSeries returns the names of series in the default registry whose db
+// label is one of values.
+func gatherDBSeries(t *testing.T, values ...string) (names []string) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range families {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "db" && slices.Contains(values, lp.GetValue()) {
+					names = append(names, mf.GetName()+"{db="+lp.GetValue()+"}")
+				}
+			}
+		}
+	}
+	return names
+}
+
+func TestDB_CloseDeletesMetrics(t *testing.T) {
+	dir := t.TempDir()
+
+	var dbs []*DB
+	var values []string
+	for _, name := range []string{"close-metrics-a", "close-metrics-b"} {
+		path := filepath.Join(dir, name)
+		db := mustOpenMetricsDB(t, path)
+		mustWriteAndSyncMetricsDB(t, db)
+		if err := db.Checkpoint(context.Background(), CheckpointModePassive); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.EnforceL0RetentionByTime(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// Only created on error, so touch it directly.
+		db.checkpointErrorNCounterVec.WithLabelValues(CheckpointModePassive).Inc()
+		dbs = append(dbs, db)
+		values = append(values, path, name)
+	}
+
+	// Closing one database must leave the other's series alone.
+	if err := dbs[0].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, values[0], values[1]); len(got) != 0 {
+		t.Fatalf("series remain after close: %v", got)
+	}
+	if got := gatherDBSeries(t, values[2], values[3]); len(got) == 0 {
+		t.Fatal("closing one db deleted the other's series")
+	}
+
+	if err := dbs[1].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, values...); len(got) != 0 {
+		t.Fatalf("series remain after close: %v", got)
+	}
+}
+
+func TestDB_ReopenKeepsMetrics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reopen-metrics")
+	db := mustOpenMetricsDB(t, path)
+	mustWriteAndSyncMetricsDB(t, db)
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	mustWriteAndSyncMetricsDB(t, db)
+
+	// Gather before reading the vec, since reading would recreate the series.
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("no series for reopened db")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got < 1 {
+		t.Fatalf("litestream_sync_count=%v after reopen, want >= 1", got)
 	}
 }
