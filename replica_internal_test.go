@@ -64,7 +64,7 @@ func TestReplica_ApplyNewLTXFiles_FillGapWithOverlappingCompactedFile(t *testing
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	got, err := r.applyNewLTXFiles(context.Background(), f, 150, pageSize, new(ltx.TXID))
+	got, err := r.applyNewLTXFiles(context.Background(), f, 150, pageSize)
 	if err != nil {
 		t.Fatalf("apply new ltx files: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestReplica_ApplyNewLTXFiles_LevelZeroEmptyFallsBackToCompaction(t *testing
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	got, err := r.applyNewLTXFiles(context.Background(), f, 10, pageSize, new(ltx.TXID))
+	got, err := r.applyNewLTXFiles(context.Background(), f, 10, pageSize)
 	if err != nil {
 		t.Fatalf("apply new ltx files: %v", err)
 	}
@@ -133,7 +133,7 @@ func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	f := mustCreateWritableDBFile(t)
 	defer func() { _ = f.Close() }()
 
-	_, err := r.applyNewLTXFiles(context.Background(), f, 10, 4096, new(ltx.TXID))
+	_, err := r.applyNewLTXFiles(context.Background(), f, 10, 4096)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -545,92 +545,155 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 	}
 }
 
-func TestReplica_ApplyNewLTXFiles_UnreachableGapWarnsOnce(t *testing.T) {
-	const pageSize = 4096
-
+func TestReplica_ApplyNewLTXFiles_UnreachableGap(t *testing.T) {
 	for _, tt := range []struct {
-		name         string
-		level0       []*ltx.FileInfo
-		level1       []*ltx.FileInfo
-		cancelled    bool
-		wantWarnings int
+		name   string
+		level0 []*ltx.FileInfo
+		level1 []*ltx.FileInfo
 	}{
-		// The gap is visible in the level 0 listing itself.
-		{
-			name:         "GapInLevel0",
-			level0:       []*ltx.FileInfo{{Level: 0, MinTXID: 200, MaxTXID: 200}},
-			wantWarnings: 1,
-		},
-		// Level 0 has been compacted away entirely; the gap is only visible at
-		// a higher level.
-		{
-			name:         "NoLevel0Files",
-			level1:       []*ltx.FileInfo{{Level: 1, MinTXID: 200, MaxTXID: 250}},
-			wantWarnings: 1,
-		},
-		// Shutdown must stay quiet (see TestReplica_ContextCancellationNoLogs).
-		{
-			name:      "CancelledContext",
-			level0:    []*ltx.FileInfo{{Level: 0, MinTXID: 200, MaxTXID: 200}},
-			cancelled: true,
-		},
+		{name: "GapInLevel0", level0: []*ltx.FileInfo{{Level: 0, MinTXID: 200, MaxTXID: 200}}},
+		{name: "NoLevel0Files", level1: []*ltx.FileInfo{{Level: 1, MinTXID: 200, MaxTXID: 250}}},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			client := &followTestReplicaClient{}
-			client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
-				var all []*ltx.FileInfo
+			client.LTXFilesFunc = func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
 				switch level {
 				case 0:
-					all = tt.level0
+					return ltx.NewFileInfoSliceIterator(tt.level0), nil
 				case 1:
-					all = tt.level1
+					return ltx.NewFileInfoSliceIterator(tt.level1), nil
+				default:
+					return ltx.NewFileInfoSliceIterator(nil), nil
 				}
+			}
+			r := NewReplicaWithClient(nil, client)
+			f := mustCreateWritableDBFile(t)
+			defer func() { _ = f.Close() }()
+			got, err := r.applyNewLTXFiles(context.Background(), f, 100, 4096)
+			var gapErr *followGapError
+			if !errors.As(err, &gapErr) {
+				t.Fatalf("expected follow gap error, got %v", err)
+			}
+			if got != 100 || gapErr.TXID != 100 || gapErr.NextTXID != 200 {
+				t.Fatalf("txid=%s, gap=%+v", got, gapErr)
+			}
+		})
+	}
+}
 
-				infos := make([]*ltx.FileInfo, 0, len(all))
-				for _, info := range all {
-					if info.MinTXID >= seek {
-						infos = append(infos, info)
+func TestReplica_Follow_GapWarnings(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		level        int
+		progress     bool
+		bridged      bool
+		idle         bool
+		cancelled    bool
+		wantWarnings int
+		closeError   bool
+		wantErrors   int
+		wantTXID     ltx.TXID
+	}{
+		{name: "GapInLevel0", wantWarnings: 1, wantTXID: 100},
+		{name: "GapWithCloseError", closeError: true, wantErrors: 4, wantTXID: 100},
+		{name: "NoLevel0Files", level: 1, wantWarnings: 1, wantTXID: 100},
+		{name: "Idle", idle: true, wantTXID: 100},
+		{name: "BridgedGap", bridged: true, wantTXID: 200},
+		{name: "CancelledContext", cancelled: true, wantTXID: 100},
+		{name: "ProgressThenAnotherGap", progress: true, wantWarnings: 2, wantTXID: 102},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			var poll int
+			client := &followTestReplicaClient{}
+			client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				if level == 0 {
+					poll++
+					if poll == 5 || tt.cancelled {
+						cancel()
 					}
+				}
+				if tt.bridged && level == 1 {
+					return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{Level: 1, MinTXID: 101, MaxTXID: 200}}), nil
+				}
+				var infos []*ltx.FileInfo
+				if !tt.idle && level == tt.level {
+					nextTXID := ltx.TXID(200)
+					if tt.progress {
+						txid := ltx.TXID(101)
+						if poll >= 3 {
+							txid = 102
+							nextTXID = 300
+						}
+						if txid >= seek {
+							infos = append(infos, &ltx.FileInfo{Level: level, MinTXID: txid, MaxTXID: txid})
+						}
+					}
+					if nextTXID >= seek {
+						infos = append(infos, &ltx.FileInfo{Level: level, MinTXID: nextTXID, MaxTXID: nextTXID})
+					}
+				}
+				if tt.closeError && level == 0 {
+					return &followCloseErrorIterator{FileIterator: ltx.NewFileInfoSliceIterator(infos)}, nil
 				}
 				return ltx.NewFileInfoSliceIterator(infos), nil
 			}
-
+			data101 := mustBuildIncrementalLTX(t, 101, 101, 4096, 2, 0xA1)
+			dataCompacted := mustBuildIncrementalLTX(t, 101, 200, 4096, 2, 0xC3)
+			data102 := mustBuildIncrementalLTX(t, 102, 102, 4096, 2, 0xB2)
+			client.OpenLTXFileFunc = func(_ context.Context, level int, minTXID, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+				if level == 1 && tt.bridged {
+					return io.NopCloser(bytes.NewReader(dataCompacted)), nil
+				}
+				switch minTXID {
+				case 101:
+					return io.NopCloser(bytes.NewReader(data101)), nil
+				case 102:
+					return io.NopCloser(bytes.NewReader(data102)), nil
+				default:
+					return nil, fmt.Errorf("unexpected open at txid %s", minTXID)
+				}
+			}
 			var logBuf bytes.Buffer
 			db := NewDB(filepath.Join(t.TempDir(), "follower.db"))
-			db.Logger = slog.New(slog.NewTextHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
-
+			db.Logger = slog.New(slog.NewTextHandler(&logBuf, nil))
 			r := NewReplicaWithClient(db, client)
 			f := mustCreateWritableDBFile(t)
-			defer func() { _ = f.Close() }()
-
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
-			if tt.cancelled {
-				cancel()
+			if _, err := f.WriteAt(newSQLiteHeaderPage(4096), 0); err != nil {
+				t.Fatal(err)
 			}
-
-			// Poll several times from the same position, as the follow loop does
-			// on every interval, carrying the same stall state it carries.
-			// Nothing bridges the gap, so the position never advances and the
-			// condition must be reported exactly once.
-			stallTXID := new(ltx.TXID)
-			for i := 0; i < 3; i++ {
-				got, err := r.applyNewLTXFiles(ctx, f, 100, pageSize, stallTXID)
-				if err != nil {
-					t.Fatalf("apply new ltx files: %v", err)
-				}
-				if got != 100 {
-					t.Fatalf("txid=%s, want %s", got, ltx.TXID(100))
-				}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
 			}
-
+			if err := WriteTXIDFile(f.Name(), 100); err != nil {
+				t.Fatal(err)
+			}
+			if err := r.follow(ctx, f.Name(), 100, time.Millisecond); err != nil {
+				t.Fatal(err)
+			}
+			got, err := ReadTXIDFile(f.Name())
+			if err != nil || got != tt.wantTXID {
+				t.Fatalf("saved txid=%s, want %s, err=%v", got, tt.wantTXID, err)
+			}
 			logs := logBuf.String()
 			if n := strings.Count(logs, "level=WARN"); n != tt.wantWarnings {
 				t.Fatalf("warnings=%d, want %d, logs=%q", n, tt.wantWarnings, logs)
+			}
+			if n := strings.Count(logs, "level=ERROR"); n != tt.wantErrors {
+				t.Fatalf("errors=%d, want %d, logs=%q", n, tt.wantErrors, logs)
 			}
 			if tt.wantWarnings > 0 && !strings.Contains(logs, "next_txid=00000000000000c8") {
 				t.Fatalf("expected next txid in warning, logs=%q", logs)
 			}
 		})
 	}
+}
+
+type followCloseErrorIterator struct {
+	ltx.FileIterator
+}
+
+func (itr *followCloseErrorIterator) Close() error {
+	return errors.New("listing close failed")
 }
