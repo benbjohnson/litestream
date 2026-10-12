@@ -843,9 +843,8 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 				r.Logger().Info("follow mode stopped")
 				return nil
 			}
-			var gapErr *followGapError
-			isGap := errors.As(err, &gapErr) && err == gapErr
-			if err != nil && !isGap {
+			gapErr, _ := errors.AsType[*followGapError](err)
+			if err != nil && err != gapErr {
 				consecutiveErrors++
 				r.Logger().Error("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
 				continue
@@ -858,7 +857,7 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 				lastTXID = newTXID
 				consecutiveErrors = 0
 			}
-			if isGap && stallTXID != gapErr.TXID {
+			if gapErr != nil && stallTXID != gapErr.TXID {
 				r.Logger().Warn("follow: no ltx file available at current position, follower is not advancing",
 					"txid", gapErr.TXID, "next_txid", gapErr.NextTXID)
 				stallTXID = gapErr.TXID
