@@ -2925,7 +2925,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if dstLevel == 1 {
 		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 			// Don't log context cancellation errors during shutdown
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if !isShutdownError(ctx, err) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
 		}
@@ -3190,7 +3190,7 @@ func (db *DB) monitor() {
 		// end so checkpointIfNeeded() runs. A single bounded chunk per
 		// tick would cap drain throughput and starve the TruncatePageN
 		// emergency checkpoint while behind, growing the WAL unbounded.
-		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := db.Sync(db.ctx); err != nil && !isShutdownError(db.ctx, err) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
