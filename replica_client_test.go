@@ -228,7 +228,7 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 	})
 }
 
-// RunWithReplicaClient executes fn with each replica specified by the -integration flag
+// RunWithReplicaClient executes fn with each replica type specified by the -replica-clients flag
 func RunWithReplicaClient(t *testing.T, name string, fn func(*testing.T, litestream.ReplicaClient)) {
 	t.Run(name, func(t *testing.T) {
 		for _, typ := range testingutil.ReplicaClientTypes() {

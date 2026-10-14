@@ -27,8 +27,8 @@ go tool cover -html=coverage.out
 go tool cover -func=coverage.out | grep total
 
 # Integration tests (backend-specific)
-go test -v ./replica_client_test.go -integration s3
-go test -v ./replica_client_test.go -integration gcs
+go test -v ./replica_client_test.go -integration -replica-clients=s3
+go test -v ./replica_client_test.go -integration -replica-clients=gs
 ```
 
 ## Lock Page Testing
