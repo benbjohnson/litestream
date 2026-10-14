@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -705,10 +706,11 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
 				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
 		}
+	}
 
-		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
+	for i, body := range r.openRestoreFiles(ctx, infos) {
+		info := infos[i]
+		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, body, r.Logger()))
 	}
 
 	if len(rdrs) == 0 {
@@ -796,6 +798,35 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 
 	return nil
+}
+
+// restoreOpenConcurrency bounds how many restore-plan files are opened at
+// once. The compactor decodes every input's header in plan order before it
+// reads a page, so lazily opened inputs cost one object-store round trip each,
+// in series.
+const restoreOpenConcurrency = 32
+
+// openRestoreFiles opens every file of a restore plan concurrently. A file
+// that fails to open is left nil; its ResumableReader opens and retries it on
+// first read.
+func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) []io.ReadCloser {
+	bodies := make([]io.ReadCloser, len(infos))
+	var g errgroup.Group
+	g.SetLimit(restoreOpenConcurrency)
+	for i, info := range infos {
+		g.Go(func() error {
+			r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+			body, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+			if err != nil {
+				r.Logger().Debug("open ltx file for restore failed; the reader retries it", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "error", err)
+				return nil
+			}
+			bodies[i] = body
+			return nil
+		})
+	}
+	_ = g.Wait()
+	return bodies
 }
 
 // follow enters a continuous restore loop, polling for new LTX files and

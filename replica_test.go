@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2613,4 +2614,65 @@ func verifyRestoredDB(t *testing.T, path string) {
 	if result != "ok" {
 		t.Fatalf("integrity check returned: %s", result)
 	}
+}
+
+func TestReplica_Restore_OpensPlanConcurrently(t *testing.T) {
+	ctx := context.Background()
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (x)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.SyncAndWait(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if _, err := sqldb.ExecContext(ctx, `INSERT INTO t VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.SyncAndWait(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	client := &rendezvousOpenClient{ReplicaClient: db.Replica.Client}
+	restored := filepath.Join(t.TempDir(), "restored.db")
+	if err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, litestream.RestoreOptions{OutputPath: restored}); err != nil {
+		t.Fatal(err)
+	}
+	if peak := client.peak.Load(); peak < 2 {
+		t.Fatalf("restore opened its plan one file at a time (peak %d in flight)", peak)
+	}
+
+	var count int
+	if err := testingutil.MustOpenSQLDB(t, restored).QueryRowContext(ctx, `SELECT COUNT(*) FROM t`).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 3 {
+		t.Fatalf("restored %d rows, want 3", count)
+	}
+}
+
+// rendezvousOpenClient holds each OpenLTXFile until a second open is in
+// flight, so a restore that opens its plan serially never reaches a peak of 2.
+type rendezvousOpenClient struct {
+	litestream.ReplicaClient
+	inflight atomic.Int64
+	peak     atomic.Int64
+}
+
+func (c *rendezvousOpenClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	n := c.inflight.Add(1)
+	defer c.inflight.Add(-1)
+	for {
+		peak := c.peak.Load()
+		if n <= peak || c.peak.CompareAndSwap(peak, n) {
+			break
+		}
+	}
+	for deadline := time.Now().Add(time.Second); c.peak.Load() < 2 && time.Now().Before(deadline); {
+		time.Sleep(time.Millisecond)
+	}
+	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
 }
