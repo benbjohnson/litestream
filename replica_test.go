@@ -41,8 +41,14 @@ func TestReplica_Sync(t *testing.T) {
 
 	t.Logf("position after sync: %s", dpos.String())
 
+	// Reuse db.Replica (swapping in a client this test can inspect directly)
+	// rather than attaching a second, independent Replica to the same DB: only
+	// one Replica is ever meant to walk a DB's local L0 directory forward (see
+	// uploadTarget's local-file cleanup), and db.Replica already exists as a
+	// required field from MustOpenDBs.
 	c := file.NewReplicaClient(t.TempDir())
-	r := litestream.NewReplicaWithClient(db, c)
+	db.Replica.Client = c
+	r := db.Replica
 
 	if err := r.Sync(context.Background()); err != nil {
 		t.Fatal(err)
@@ -50,8 +56,10 @@ func TestReplica_Sync(t *testing.T) {
 
 	t.Logf("second sync")
 
-	// Verify we synced checkpoint page to WAL.
-	rd, err := c.OpenLTXFile(context.Background(), 0, dpos.TXID, dpos.TXID, 0, 0)
+	// Verify we synced checkpoint page to WAL. The initial sync is a
+	// snapshotting write (the base), tagged [1, dpos.TXID] and routed to the
+	// remote snapshot level rather than remote L0.
+	rd, err := c.OpenLTXFile(context.Background(), litestream.SnapshotLevel, 1, dpos.TXID, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2107,9 +2115,15 @@ func TestReplica_Restore_Follow(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Reuse db.Replica (swapping in a client this test can inspect directly)
+	// rather than attaching a second, independent Replica to the same DB: only
+	// one Replica is ever meant to walk a DB's local L0 directory forward (see
+	// uploadTarget's local-file cleanup), and db.Replica already exists as a
+	// required field from MustOpenDBs.
 	replicaDir := t.TempDir()
 	c := file.NewReplicaClient(replicaDir)
-	r := litestream.NewReplicaWithClient(db, c)
+	db.Replica.Client = c
+	r := db.Replica
 
 	if err := r.Sync(ctx); err != nil {
 		t.Fatal(err)
@@ -2266,9 +2280,15 @@ func TestReplica_Restore_Follow_WriteTXIDFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Reuse db.Replica (swapping in a client this test can inspect directly)
+	// rather than attaching a second, independent Replica to the same DB: only
+	// one Replica is ever meant to walk a DB's local L0 directory forward (see
+	// uploadTarget's local-file cleanup), and db.Replica already exists as a
+	// required field from MustOpenDBs.
 	replicaDir := t.TempDir()
 	c := file.NewReplicaClient(replicaDir)
-	r := litestream.NewReplicaWithClient(db, c)
+	db.Replica.Client = c
+	r := db.Replica
 	if err := r.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -2376,9 +2396,15 @@ func TestReplica_Restore_Follow_CrashRecovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// Reuse db.Replica (swapping in a client this test can inspect directly)
+	// rather than attaching a second, independent Replica to the same DB: only
+	// one Replica is ever meant to walk a DB's local L0 directory forward (see
+	// uploadTarget's local-file cleanup), and db.Replica already exists as a
+	// required field from MustOpenDBs.
 	replicaDir := t.TempDir()
 	c := file.NewReplicaClient(replicaDir)
-	r := litestream.NewReplicaWithClient(db, c)
+	db.Replica.Client = c
+	r := db.Replica
 	if err := r.Sync(ctx); err != nil {
 		t.Fatal(err)
 	}

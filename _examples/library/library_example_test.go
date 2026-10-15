@@ -87,6 +87,23 @@ func TestLibraryExampleFileBackend(t *testing.T) {
 	if err := restoreReplica.Restore(ctx, opt); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
+
+	// Verify the restored database contains the replicated row. The write lived
+	// only in the base snapshot (ltx/9), so this exercises the snapshot-level
+	// restore path end to end.
+	restoredDB, err := sql.Open("sqlite", restorePath)
+	if err != nil {
+		t.Fatalf("open restored db: %v", err)
+	}
+	defer restoredDB.Close()
+
+	var message string
+	if err := restoredDB.QueryRowContext(ctx, `SELECT message FROM events WHERE id = 1`).Scan(&message); err != nil {
+		t.Fatalf("query restored row: %v", err)
+	}
+	if message != "hello" {
+		t.Fatalf("restored message = %q, want %q", message, "hello")
+	}
 }
 
 func openAppDB(ctx context.Context, path string) (*sql.DB, error) {
@@ -108,7 +125,10 @@ func openAppDB(ctx context.Context, path string) (*sql.DB, error) {
 func waitForLTXFiles(replicaPath string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		matches, err := filepath.Glob(filepath.Join(replicaPath, "ltx", "0", "*.ltx"))
+		// Match any level: the initial database state is captured as a base
+		// snapshot uploaded directly to the snapshot level (ltx/9), while later
+		// increments land at ltx/0. Either one means replication has occurred.
+		matches, err := filepath.Glob(filepath.Join(replicaPath, "ltx", "*", "*.ltx"))
 		if err != nil {
 			return fmt.Errorf("glob ltx files: %w", err)
 		}
