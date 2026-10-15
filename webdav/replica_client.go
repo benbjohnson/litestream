@@ -15,6 +15,7 @@ import (
 
 	"github.com/studio-b12/gowebdav"
 	"github.com/superfly/ltx"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal"
@@ -29,6 +30,10 @@ const ReplicaClientType = "webdav"
 
 const (
 	DefaultTimeout = 30 * time.Second
+
+	// metadataConcurrency caps concurrent LTX header reads when listing with
+	// useMetadata. It is below S3's 50 because WebDAV servers are often small.
+	metadataConcurrency = 10
 )
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
@@ -133,7 +138,9 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	return nil
 }
 
-func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
+// LTXFiles returns an iterator over all LTX files on the replica for the given level.
+// When useMetadata is true, CreatedAt is read from the LTX header (one ranged GET per file).
+func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (_ ltx.FileIterator, err error) {
 	client, err := c.init(ctx)
 	if err != nil {
 		return nil, err
@@ -170,6 +177,12 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 		})
 	}
 
+	if useMetadata {
+		if err := c.fetchTimestamps(ctx, infos); err != nil {
+			return nil, err
+		}
+	}
+
 	sort.Slice(infos, func(i, j int) bool {
 		if infos[i].MinTXID != infos[j].MinTXID {
 			return infos[i].MinTXID < infos[j].MinTXID
@@ -178,6 +191,36 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	})
 
 	return ltx.NewFileInfoSliceIterator(infos), nil
+}
+
+// fetchTimestamps sets CreatedAt from each file's LTX header. A file whose
+// header cannot be read keeps its ModTime, as in the S3 and OSS clients.
+func (c *ReplicaClient) fetchTimestamps(ctx context.Context, infos []*ltx.FileInfo) error {
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(metadataConcurrency)
+
+	for _, info := range infos {
+		g.Go(func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			hdr, err := litestream.FetchLTXHeader(ctx, c, info)
+			if err != nil {
+				// gowebdav ignores ctx, so report cancellation rather than log it.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				c.logger.Warn("cannot read ltx header timestamp, using modification time",
+					"level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "error", err)
+				return nil
+			}
+			info.CreatedAt = time.UnixMilli(hdr.Timestamp).UTC()
+			return nil
+		})
+	}
+
+	return g.Wait()
 }
 
 // WriteLTXFile writes an LTX file to the WebDAV server.
