@@ -83,6 +83,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 
 	client.Bucket = host
 	client.Path = urlPath
+	client.Endpoint = query.Get("endpoint")
 
 	if client.Bucket == "" {
 		return nil, fmt.Errorf("bucket required for abs replica URL")
