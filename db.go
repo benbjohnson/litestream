@@ -2759,12 +2759,8 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 }
 
 // snapshotWALEndOffset returns the WAL offset a snapshot may read up to for
-// the given position. db.syncState is read without db.mu because every writer
-// mutates it while holding execSem, which the caller also holds.
+// the given position.
 func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
-	if db.syncState.lastSyncedWALOffset > 0 {
-		return db.syncState.lastSyncedWALOffset, nil
-	}
 	if pos.TXID == 0 {
 		return WALHeaderSize, nil
 	}
