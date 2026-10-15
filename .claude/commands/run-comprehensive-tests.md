@@ -39,21 +39,21 @@ echo "=== Running Integration Tests ==="
 
 # S3 (requires AWS credentials)
 AWS_ACCESS_KEY_ID=xxx AWS_SECRET_ACCESS_KEY=yyy \
-  go test -v ./replica_client_test.go -integration s3
+  go test -v ./replica_client_test.go -integration -replica-clients=s3
 
 # Google Cloud Storage (requires credentials)
 GOOGLE_APPLICATION_CREDENTIALS=/path/to/creds.json \
-  go test -v ./replica_client_test.go -integration gcs
+  go test -v ./replica_client_test.go -integration -replica-clients=gs
 
 # Azure Blob Storage
 AZURE_STORAGE_ACCOUNT=xxx AZURE_STORAGE_KEY=yyy \
-  go test -v ./replica_client_test.go -integration abs
+  go test -v ./replica_client_test.go -integration -replica-clients=abs
 
 # SFTP (requires SSH server)
-go test -v ./replica_client_test.go -integration sftp
+go test -v ./replica_client_test.go -integration -replica-clients=sftp
 
 # File system (always available)
-go test -v ./replica_client_test.go -integration file
+go test -v ./replica_client_test.go -integration -replica-clients=file
 ```
 
 ### 4. Large Database Tests (>1GB)

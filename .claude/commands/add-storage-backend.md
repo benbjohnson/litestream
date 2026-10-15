@@ -89,7 +89,7 @@ Create a new storage backend implementation for Litestream with all required com
 
 ```bash
 # Run integration tests
-go test -v ./replica_client_test.go -integration {{backend_name}}
+go test -v ./replica_client_test.go -integration -replica-clients={{backend_name}}
 
 # Test with race detector
 go test -race -v ./{{backend_name}}/...
