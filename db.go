@@ -105,6 +105,7 @@ type DB struct {
 	Done   <-chan struct{}
 
 	// Metrics
+	metricsRegistered           bool
 	dbSizeGauge                 prometheus.Gauge
 	walSizeGauge                prometheus.Gauge
 	totalWALBytesCounter        prometheus.Counter
@@ -353,6 +354,15 @@ func NewDB(path string) *DB {
 // initMetrics creates the per-database Prometheus series.
 // Open calls it again because Close deletes them.
 func (db *DB) initMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = true
+	dbMetricOwners.paths[db.path]++
+	dbMetricOwners.basenames[filepath.Base(db.path)]++
+
 	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
 	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
 	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
@@ -370,6 +380,26 @@ func (db *DB) initMetrics() {
 // deleteMetrics removes every per-database series so a process that opens many
 // databases over its lifetime does not accumulate series forever.
 func (db *DB) deleteMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if !db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = false
+
+	name := filepath.Base(db.path)
+	dbMetricOwners.basenames[name]--
+	if dbMetricOwners.basenames[name] == 0 {
+		delete(dbMetricOwners.basenames, name)
+		internal.L0RetentionGaugeVec.DeletePartialMatch(prometheus.Labels{"db": name})
+	}
+
+	dbMetricOwners.paths[db.path]--
+	if dbMetricOwners.paths[db.path] != 0 {
+		return
+	}
+	delete(dbMetricOwners.paths, db.path)
+
 	labels := prometheus.Labels{"db": db.path}
 	dbSizeGaugeVec.DeletePartialMatch(labels)
 	walSizeGaugeVec.DeletePartialMatch(labels)
@@ -383,9 +413,6 @@ func (db *DB) deleteMetrics() {
 	checkpointNCounterVec.DeletePartialMatch(labels)
 	checkpointErrorNCounterVec.DeletePartialMatch(labels)
 	checkpointSecondsCounterVec.DeletePartialMatch(labels)
-
-	// The L0 retention gauge is labeled by base name, not full path.
-	internal.L0RetentionGaugeVec.DeletePartialMatch(prometheus.Labels{"db": filepath.Base(db.path)})
 }
 
 // SetLogger updates the database logger and propagates to subsystems.
@@ -3387,6 +3414,15 @@ func NewRestoreOptions() RestoreOptions {
 
 // Database metrics.
 var (
+	dbMetricOwners = struct {
+		sync.Mutex
+		paths     map[string]int
+		basenames map[string]int
+	}{
+		paths:     make(map[string]int),
+		basenames: make(map[string]int),
+	}
+
 	dbSizeGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "litestream_db_size",
 		Help: "The current size of the real DB",
