@@ -398,16 +398,17 @@ func (r *Replica) monitor(ctx context.Context) {
 	var backoff time.Duration
 	var lastLogTime time.Time
 	var consecutiveErrs int
+	var waitForInterval bool
 
-	for initial := true; ; initial = false {
-		// Enforce a minimum time between synchronization.
-		if !initial {
+	for {
+		if waitForInterval {
 			select {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
 			}
 		}
+		waitForInterval = true
 
 		// If in backoff mode, wait additional time before retrying.
 		if backoff > 0 {
@@ -439,6 +440,9 @@ func (r *Replica) monitor(ctx context.Context) {
 		// Synchronize the shadow wal into the replication directory.
 		if err := r.sync(ctx, r.MaxSyncLTXFiles); err != nil {
 			if errors.Is(err, errReplicaWaitForData) {
+				backoff = 0
+				consecutiveErrs = 0
+				waitForInterval = false
 				continue
 			}
 
