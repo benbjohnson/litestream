@@ -209,6 +209,17 @@ type Store struct {
 }
 ```
 
+The L0 retention monitor wakes every `L0RetentionCheckInterval`, but each database
+schedules its next remote sweep independently. A successful sweep schedules another
+check in five minutes, or sooner when the first too-recent L0 file becomes eligible.
+Checks run on the first monitor tick at or after that deadline. Consequently, an
+idle sweep can be delayed by five minutes plus less than one monitor interval.
+Configuration changes are observed by the next sweep. Failed sweeps retry on the
+next tick, and resetting local state clears the deadline. Successful L1 compaction
+and explicit `EnforceL0RetentionByTime` calls bypass the delay and update the next
+check time. The deadline affects cleanup timing only; deletion still requires L1
+coverage and the configured retention age, and preserves the newest L0 file.
+
 ## IPC Server & Control Socket
 
 Litestream exposes a Unix socket HTTP server for runtime control (`server.go`).
