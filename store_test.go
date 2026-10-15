@@ -11,6 +11,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
@@ -199,6 +200,69 @@ func TestStore_CompactDB(t *testing.T) {
 		if got, want := client.writeCount(), 1; got != want {
 			t.Fatalf("WriteLTXFile count=%d, want %d", got, want)
 		}
+	})
+
+	// An idle database whose newest L1 file spans more than one transaction
+	// must not list the replica on every L1 tick.
+	t.Run("L1NoProgress", func(t *testing.T) {
+		// The compactor binds its client in Open(), so the wrapper must be
+		// installed before Open rather than swapped in afterwards.
+		client := &listCountingClient{ReplicaClient: testingutil.NewFileReplicaClient(t)}
+		db0 := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+		db0.MonitorInterval = 0
+		db0.ShutdownSyncTimeout = 0
+		db0.Replica = litestream.NewReplica(db0)
+		db0.Replica.Client = client
+		db0.Replica.MonitorEnabled = false
+		if err := db0.Open(); err != nil {
+			t.Fatal(err)
+		}
+		sqldb0 := testingutil.MustOpenSQLDB(t, db0.Path())
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: 1 * time.Second},
+		}
+		s := litestream.NewStore([]*litestream.DB{db0}, levels)
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		for _, query := range []string{`CREATE TABLE t (id INT);`, `INSERT INTO t (id) VALUES (100)`} {
+			if _, err := sqldb0.ExecContext(t.Context(), query); err != nil {
+				t.Fatal(err)
+			} else if err := db0.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			} else if err := db0.Replica.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		info, err := s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+		require.Less(t, info.MinTXID, info.MaxTXID, "L1 file must span more than one transaction")
+
+		time.Sleep(levels[1].Interval)
+		client.reset()
+		_, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.ErrorIs(t, err, litestream.ErrNoCompaction)
+		require.Equal(t, 0, client.listCount(), "LTXFiles calls on idle L1 compaction")
+
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (200)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(levels[1].Interval)
+		info, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+		require.Equal(t, ltx.TXID(3), info.MaxTXID)
 	})
 
 	// Regression test for GitHub issue #877: level 9 compaction fails with

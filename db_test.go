@@ -41,6 +41,31 @@ func (c *snapshotCountingClient) writeCount() int {
 	return c.n
 }
 
+type listCountingClient struct {
+	litestream.ReplicaClient
+	mu sync.Mutex
+	n  int
+}
+
+func (c *listCountingClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+func (c *listCountingClient) listCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+func (c *listCountingClient) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n = 0
+}
+
 func TestDB_Path(t *testing.T) {
 	db := testingutil.NewDB(t, "/tmp/db")
 	if got, want := db.Path(), `/tmp/db`; got != want {
