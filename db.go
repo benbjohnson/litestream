@@ -798,6 +798,18 @@ func (db *DB) Open() (err error) {
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
 
+	// Take the long-running read lock before returning, so an application
+	// started after Open (as by `replicate -exec`) cannot restart the WAL
+	// before Litestream is attached. If the last connection checkpointed the
+	// WAL on close, the application's first write restarts it, overwriting the
+	// frame verify() checks against and forcing a full snapshot. Not fatal:
+	// the next sync retries init.
+	db.mu.Lock()
+	if err := db.init(db.ctx); err != nil {
+		db.Logger.Warn("init on open failed, will retry on sync", "error", err)
+	}
+	db.mu.Unlock()
+
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {
 		db.wg.Add(1)
@@ -996,28 +1008,31 @@ func (db *DB) syncReplicaWithRetry(ctx context.Context) error {
 	}
 }
 
-// setPersistWAL sets the PERSIST_WAL file control on the database connection.
-// This prevents SQLite from removing the WAL file when connections close.
-func (db *DB) setPersistWAL(ctx context.Context) error {
-	conn, err := db.db.Conn(ctx)
-	if err != nil {
-		return fmt.Errorf("get connection: %w", err)
-	}
-	defer conn.Close()
+// persistWALDriverName is a private registration of the SQLite driver that
+// sets PERSIST_WAL on every connection it opens.
+//
+// SQLite checkpoints and deletes the WAL (and -shm) when the last connection
+// to a database closes, unless that connection has PERSIST_WAL set. Which of
+// Litestream's pooled connections closes last depends on pool order: the
+// long-running read transaction can move to any of them across a checkpoint.
+// Setting the flag on one connection is therefore not enough; a deleted WAL
+// makes the next start see "wal truncated by another process" and take a
+// full snapshot.
+const persistWALDriverName = "litestream-sqlite"
 
-	return conn.Raw(func(driverConn interface{}) error {
-		fc, ok := driverConn.(sqlite.FileControl)
+func init() {
+	drv := &sqlite.Driver{}
+	drv.RegisterConnectionHook(func(conn sqlite.ExecQuerierContext, _ string) error {
+		fc, ok := conn.(sqlite.FileControl)
 		if !ok {
 			return fmt.Errorf("driver does not implement FileControl")
 		}
-
-		_, err := fc.FileControlPersistWAL("main", 1)
-		if err != nil {
+		if _, err := fc.FileControlPersistWAL("main", 1); err != nil {
 			return fmt.Errorf("FileControlPersistWAL: %w", err)
 		}
-
 		return nil
 	})
+	sql.Register(persistWALDriverName, drv)
 }
 
 // init initializes the connection to the database.
@@ -1046,13 +1061,8 @@ func (db *DB) init(ctx context.Context) (err error) {
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
 		db.path, db.BusyTimeout.Milliseconds())
 
-	if db.db, err = sql.Open("sqlite", dsn); err != nil {
+	if db.db, err = sql.Open(persistWALDriverName, dsn); err != nil {
 		return err
-	}
-
-	// Set PERSIST_WAL to prevent WAL file removal when database connections close.
-	if err := db.setPersistWAL(ctx); err != nil {
-		return fmt.Errorf("set PERSIST_WAL: %w", err)
 	}
 
 	// Open long-running database file descriptor. Required for non-OFD locks.

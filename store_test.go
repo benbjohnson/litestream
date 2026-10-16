@@ -225,6 +225,42 @@ func TestStore_CompactDB(t *testing.T) {
 			t.Fatalf("expected ErrDBNotReady, got: %v", err)
 		}
 	})
+
+	// Open initializes an existing database, so the page size is known before
+	// the first sync. A snapshot attempted in that window must wait for a
+	// transaction instead of failing to encode a snapshot with TXID 0.
+	t.Run("DBNotReadyBeforeFirstSync", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "db")
+		sqldb := testingutil.MustOpenSQLDB(t, path)
+		defer testingutil.MustCloseSQLDB(t, sqldb)
+		if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
+			t.Fatal(err)
+		}
+
+		db0 := testingutil.MustOpenDBAt(t, path)
+		defer testingutil.MustCloseDB(t, db0)
+		if db0.PageSize() == 0 {
+			t.Fatal("expected Open to initialize an existing database")
+		}
+
+		s := litestream.NewStore([]*litestream.DB{db0}, litestream.CompactionLevels{{Level: 0}})
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrDBNotReady) {
+			t.Fatalf("expected ErrDBNotReady, got: %v", err)
+		}
+
+		if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
+			t.Fatalf("snapshot after first sync: %v", err)
+		}
+	})
 }
 
 func TestStore_Integration(t *testing.T) {
