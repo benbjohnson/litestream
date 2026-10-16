@@ -1591,9 +1591,11 @@ func (db *DB) ensureWALExists(ctx context.Context) (err error) {
 // checkDatabaseBehindReplica detects when a database has been restored to an
 // earlier state and the replica has a higher TXID. This handles issue #781.
 //
-// If detected, it clears local L0 files and fetches the latest L0 LTX file
-// from the replica to establish a baseline. The next DB.sync() will detect
-// the mismatch and trigger a snapshot at the current database state.
+// If detected, it clears local L0 files and takes the highest replicated file
+// at any level as the baseline, so the next sync numbers its transactions
+// above every file a restore can choose. A baseline above L0 is re-encoded to
+// start right after L0's last TXID and uploaded to L0 first, which keeps L0
+// contiguous for compaction.
 func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	// Get database position from local L0 files
 	dbPos, err := db.Pos()
@@ -1602,7 +1604,7 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 	}
 
 	// Get replica position from remote
-	replicaInfo, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+	replicaInfo, err := db.Replica.maxRestorableLTXFileInfo(ctx)
 	if err != nil {
 		return fmt.Errorf("get replica position: %w", err)
 	} else if replicaInfo.MaxTXID == 0 {
@@ -1628,12 +1630,19 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("recreate L0 directory: %w", err)
 	}
 
-	// Fetch latest L0 LTX file from replica
 	minTXID, maxTXID := replicaInfo.MinTXID, replicaInfo.MaxTXID
-	reader, err := db.Replica.Client.OpenLTXFile(ctx, 0, minTXID, maxTXID, 0, 0)
-	if err != nil {
-		return fmt.Errorf("open remote L0 file: %w", err)
+	if replicaInfo.Level != 0 {
+		l0Info, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+		if err != nil {
+			return fmt.Errorf("get replica L0 position: %w", err)
+		}
+		minTXID = max(minTXID, l0Info.MaxTXID+1)
 	}
+	remote, err := db.Replica.Client.OpenLTXFile(ctx, replicaInfo.Level, replicaInfo.MinTXID, maxTXID, 0, 0)
+	if err != nil {
+		return fmt.Errorf("open remote baseline file: %w", err)
+	}
+	reader := rebaseLTX(remote, minTXID)
 	defer func() { _ = reader.Close() }()
 
 	// Write to temp file and atomically rename
@@ -1660,17 +1669,78 @@ func (db *DB) checkDatabaseBehindReplica(ctx context.Context) error {
 		return fmt.Errorf("close L0 file: %w", err)
 	}
 
+	if replicaInfo.Level != 0 {
+		bridge, err := os.Open(tmpPath)
+		if err != nil {
+			return fmt.Errorf("open L0 bridge: %w", err)
+		}
+		_, err = db.Replica.Client.WriteLTXFile(ctx, 0, minTXID, maxTXID, bridge)
+		_ = bridge.Close()
+		if err != nil {
+			return fmt.Errorf("upload L0 bridge: %w", err)
+		}
+	}
+
 	// Atomically rename temp file to final path
 	if err := os.Rename(tmpPath, localPath); err != nil {
 		return fmt.Errorf("rename L0 file: %w", err)
 	}
 	db.invalidatePosCache()
+	db.Replica.SetPos(ltx.Pos{TXID: maxTXID})
 
-	db.Logger.Info("fetched latest L0 file from replica",
+	db.Logger.Info("fetched latest replicated file from replica",
 		"min_txid", minTXID,
 		"max_txid", maxTXID)
 
 	return nil
+}
+
+// rebaseLTX re-encodes an LTX file under a later MinTXID. Applying a file's
+// full page set to any state within its range yields the state at its
+// MaxTXID, so the relabelled file stays a valid step from minTXID-1.
+func rebaseLTX(rd io.ReadCloser, minTXID ltx.TXID) io.ReadCloser {
+	pr, pw := io.Pipe()
+	go func() {
+		err := copyRebasedLTX(pw, rd, minTXID)
+		_ = rd.Close()
+		_ = pw.CloseWithError(err)
+	}()
+	return pr
+}
+
+func copyRebasedLTX(w io.Writer, rd io.Reader, minTXID ltx.TXID) error {
+	dec := ltx.NewDecoder(rd)
+	if err := dec.DecodeHeader(); err != nil {
+		return fmt.Errorf("decode ltx header: %w", err)
+	}
+	hdr := dec.Header()
+	hdr.MinTXID = minTXID
+
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return fmt.Errorf("new ltx encoder: %w", err)
+	}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		return fmt.Errorf("encode rebased ltx header: %w", err)
+	}
+
+	data := make([]byte, hdr.PageSize)
+	for {
+		var pageHdr ltx.PageHeader
+		if err := dec.DecodePage(&pageHdr, data); err == io.EOF {
+			break
+		} else if err != nil {
+			return fmt.Errorf("decode ltx page: %w", err)
+		}
+		if err := enc.EncodePage(pageHdr, data); err != nil {
+			return fmt.Errorf("encode ltx page: %w", err)
+		}
+	}
+	if err := dec.Close(); err != nil {
+		return fmt.Errorf("close ltx decoder: %w", err)
+	}
+	enc.SetPostApplyChecksum(dec.Trailer().PostApplyChecksum)
+	return enc.Close()
 }
 
 // verify ensures the current LTX state matches where it left off from
@@ -1697,7 +1767,11 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	}
 
 	// Determine last WAL offset we save from.
-	ltxPath := db.LTXPath(0, exec.pos.TXID, exec.pos.TXID)
+	minTXID, _, err := db.MaxLTX()
+	if err != nil {
+		return info, fmt.Errorf("max local ltx: %w", err)
+	}
+	ltxPath := db.LTXPath(0, minTXID, exec.pos.TXID)
 	ltxFile, err := os.Open(ltxPath)
 	if err != nil {
 		return info, NewLTXError("open", ltxPath, 0, uint64(exec.pos.TXID), uint64(exec.pos.TXID), err)
@@ -2777,7 +2851,11 @@ func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
 		return WALHeaderSize, nil
 	}
 
-	ltxPath := db.LTXPath(0, pos.TXID, pos.TXID)
+	minTXID, _, err := db.MaxLTX()
+	if err != nil {
+		return 0, fmt.Errorf("max local ltx: %w", err)
+	}
+	ltxPath := db.LTXPath(0, minTXID, pos.TXID)
 	f, err := os.Open(ltxPath)
 	if err != nil {
 		return 0, NewLTXError("open", ltxPath, 0, uint64(pos.TXID), uint64(pos.TXID), err)
