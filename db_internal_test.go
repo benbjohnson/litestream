@@ -4681,3 +4681,81 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	default:
 	}
 }
+
+// Ensures the long-running read transaction outlives the context that was
+// passed to the call that acquired it. The control socket runs sync requests
+// on a request-scoped context that is cancelled when the request returns, and
+// database/sql rolls back a transaction when its BeginTx context is cancelled.
+// Regression test for issue #1578.
+func TestDB_ReadLockSurvivesContextCancel(t *testing.T) {
+	// assertLocked fails if the read transaction was rolled back under us.
+	assertLocked := func(t *testing.T, db *DB) {
+		t.Helper()
+		// database/sql rolls back asynchronously after cancellation, so give
+		// it time to happen before checking.
+		time.Sleep(200 * time.Millisecond)
+		if db.rtx == nil {
+			t.Fatal("expected read transaction")
+		}
+		if _, err := db.rtx.ExecContext(context.Background(), `SELECT COUNT(1) FROM _litestream_seq`); err != nil {
+			t.Fatalf("read lock was lost: %v", err)
+		}
+	}
+
+	setup := func(t *testing.T) (*DB, *sql.DB) {
+		t.Helper()
+		dbPath := filepath.Join(t.TempDir(), "db")
+
+		db := NewDB(dbPath)
+		db.MonitorInterval = 0
+		db.Replica = NewReplica(db)
+		db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+		db.Replica.MonitorEnabled = false
+		if err := db.Open(); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = db.Close(context.Background()) })
+
+		sqldb, err := sql.Open("sqlite", dbPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = sqldb.Close() })
+		sqldb.SetMaxOpenConns(1)
+		if _, err := sqldb.Exec(`PRAGMA journal_mode = wal;`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := sqldb.Exec(`CREATE TABLE t (id INT)`); err != nil {
+			t.Fatal(err)
+		}
+		return db, sqldb
+	}
+
+	t.Run("Init", func(t *testing.T) {
+		db, _ := setup(t)
+
+		// The first sync does the DB setup using the caller's context.
+		ctx, cancel := context.WithCancel(context.Background())
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+
+		assertLocked(t, db)
+	})
+
+	t.Run("Checkpoint", func(t *testing.T) {
+		db, _ := setup(t)
+		if err := db.Sync(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		ctx, cancel := context.WithCancel(context.Background())
+		if _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
+			t.Fatal(err)
+		}
+		cancel()
+
+		assertLocked(t, db)
+	})
+}
