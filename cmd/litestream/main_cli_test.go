@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -93,6 +94,97 @@ func TestMainRequiredArgumentErrorsIncludeTryHints(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestMainFlagPlacement(t *testing.T) {
+	const message = "Error: flags must come after the subcommand\n"
+	const configHint = "Try: litestream <command> -config PATH\n or: LITESTREAM_CONFIG=PATH litestream <command>\n"
+	const genericHint = "Try: litestream <command> [flags]\n"
+
+	t.Run("FlagBeforeCommand", func(t *testing.T) {
+		tests := []struct {
+			name string
+			args []string
+			want string
+		}{
+			{
+				name: "Config",
+				args: []string{"-config", "/etc/litestream.yml", "databases"},
+				want: message + configHint,
+			},
+			{
+				name: "ConfigWithEquals",
+				args: []string{"--config=/etc/litestream.yml", "databases"},
+				want: message + configHint,
+			},
+			{
+				// The invocation from the review: "status" may be the value
+				// of -socket and "info" the intended command, so no hint can
+				// name the command without guessing.
+				name: "Socket",
+				args: []string{"-socket", "status", "info"},
+				want: message + genericHint,
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				stdout, stderr, exitCode := runLitestreamMain(t, tt.args...)
+				if exitCode != 1 {
+					t.Fatalf("exit code=%d, want 1", exitCode)
+				}
+				if stdout != "" {
+					t.Fatalf("expected empty stdout, got:\n%s", stdout)
+				}
+				if stderr != tt.want {
+					t.Fatalf("unexpected stderr:\n%s\nwant:\n%s", stderr, tt.want)
+				}
+			})
+		}
+	})
+
+	// Each help flag starts with "-", so each one has to keep reaching the
+	// help branch rather than falling through to the misplaced-flag branch.
+	t.Run("ExplicitHelp", func(t *testing.T) {
+		for _, arg := range []string{"-h", "-help", "--help"} {
+			t.Run(arg, func(t *testing.T) {
+				stdout, stderr, exitCode := runLitestreamMain(t, arg)
+				if exitCode != 0 {
+					t.Fatalf("exit code=%d, want 0\nstderr:\n%s", exitCode, stderr)
+				}
+				if stderr != "" {
+					t.Fatalf("expected empty stderr, got:\n%s", stderr)
+				}
+				if !strings.Contains(stdout, "litestream <command> [arguments]") {
+					t.Fatalf("expected usage on stdout, got:\n%s", stdout)
+				}
+			})
+		}
+	})
+
+	t.Run("NoArguments", func(t *testing.T) {
+		stdout, stderr, exitCode := runLitestreamMain(t)
+		if exitCode != 1 {
+			t.Fatalf("exit code=%d, want 1", exitCode)
+		}
+		if stderr != "" {
+			t.Fatalf("expected empty stderr, got:\n%s", stderr)
+		}
+		if !strings.Contains(stdout, "litestream <command> [arguments]") {
+			t.Fatalf("expected usage on stdout, got:\n%s", stdout)
+		}
+	})
+
+	t.Run("FlagAfterCommand", func(t *testing.T) {
+		configPath := filepath.Join(t.TempDir(), "missing.yml")
+		_, stderr, exitCode := runLitestreamMain(t, "databases", "-config", configPath)
+		if exitCode != 1 {
+			t.Fatalf("exit code=%d, want 1", exitCode)
+		}
+		if strings.Contains(stderr, "flags must come after the subcommand") {
+			t.Fatalf("correctly positioned flag reported as misplaced:\n%s", stderr)
+		}
+	})
 }
 
 func TestMainHarness(t *testing.T) {
