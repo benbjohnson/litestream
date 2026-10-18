@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -205,6 +206,150 @@ dbs:
 			t.Fatalf("DB.MetaDir=%v, want %v", got, want)
 		}
 	})
+}
+
+// Ensure keys the decoder cannot map to a config field, and duplicate mapping
+// keys, are reported as warnings while the configuration still parses.
+func TestParseConfig_StrictWarnings(t *testing.T) {
+	const warnMsg = `msg="configuration contains unrecognized or duplicate key"`
+
+	for _, tt := range []struct {
+		name   string
+		config string
+		want   []string
+	}{
+		{
+			name: "TopLevel",
+			config: `
+definitely-not-a-setting: true
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+`,
+			want: []string{"line 2: field definitely-not-a-setting not found in type main.Config"},
+		},
+		{
+			name: "UnrecognizedKey",
+			config: `
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+      retention: 72h
+`,
+			want: []string{"line 6: field retention not found in type main.ReplicaConfig"},
+		},
+		{
+			name: "LevelsRetention",
+			config: `
+levels:
+  - interval: 5m
+    retention: 1h
+  - interval: 1h
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+`,
+			want: []string{"line 4: field retention not found in type main.CompactionLevelConfig"},
+		},
+		{
+			name: "MultipleNested",
+			config: `
+dbs:
+  - path: /tmp/x.db
+    snapshot:
+      intervall: 1h
+    replica:
+      path: /tmp/xrep
+  - path: /tmp/y.db
+    replicas:
+      - path: /tmp/yrep
+        typo-here: 1
+logging:
+  lvl: debug
+`,
+			want: []string{
+				"line 5: field intervall not found in type main.SnapshotConfig",
+				"line 11: field typo-here not found in type main.ReplicaConfig",
+				"line 13: field lvl not found in type internal.LoggingConfig",
+			},
+		},
+		{
+			name: "DuplicateKey",
+			config: `
+dbs:
+  - path: /tmp/x.db
+    replica:
+      path: /tmp/xrep
+      path: /tmp/other
+`,
+			want: []string{"line 6: field path already set in type main.ReplicaConfig"},
+		},
+		{
+			// Strict decoding's failure mode is warning about keys that are
+			// in fact valid, so this exercises the shapes the decoder has to
+			// resolve itself: an inline struct, a custom unmarshaler
+			// (part-size), and a nested anonymous struct (age).
+			name: "Valid",
+			config: `
+access-key-id: XXX
+sync-interval: 5s
+levels:
+  - interval: 5m
+snapshot:
+  interval: 1h
+  retention: 24h
+logging:
+  level: info
+dbs:
+  - path: /tmp/x.db
+    snapshot:
+      interval: 2h
+    replica:
+      url: s3://foo/bar
+      part-size: 5MB
+      age:
+        identities: []
+`,
+			want: nil,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var config main.Config
+			output := captureStdout(t, func() {
+				// Unrecognized and duplicate keys warn; they are never errors.
+				var err error
+				if config, err = main.ParseConfig(strings.NewReader(tt.config), false); err != nil {
+					t.Fatalf("ParseConfig: %v", err)
+				}
+			})
+
+			// Parsing continues, so the rest of the config is still applied.
+			if got, want := config.DBs[0].Path, "/tmp/x.db"; got != want {
+				t.Fatalf("DBs[0].Path=%v, want %v", got, want)
+			}
+
+			var got []string
+			for _, line := range strings.Split(output, "\n") {
+				if !strings.Contains(line, warnMsg) {
+					continue
+				}
+				_, detail, ok := strings.Cut(line, " detail=")
+				if !ok {
+					t.Fatalf("warning has no detail attribute: %s", line)
+				}
+				if unquoted, err := strconv.Unquote(detail); err == nil {
+					detail = unquoted
+				}
+				got = append(got, detail)
+			}
+			if !slices.Equal(got, tt.want) {
+				t.Fatalf("warned details=%q, want %q\noutput:\n%s", got, tt.want, output)
+			}
+		})
+	}
 }
 
 func TestNewDBFromConfig_MetaPathExpansion(t *testing.T) {
