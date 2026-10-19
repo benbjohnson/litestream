@@ -104,10 +104,11 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 		return errors.Join(fmt.Errorf("signal received while acquiring lease: %s", sig), releaseLease(leaser, lease))
 	}
 	if err != nil {
-		return err
+		return errors.Join(err, releaseLease(leaser, lease))
 	}
 
 	process := exec.CommandContext(ctx, config.command[0], config.command[1:]...)
+	configureProcess(process)
 	process.Stdin = m.Stdin
 	process.Stdout = m.Stdout
 	process.Stderr = m.Stderr
@@ -133,6 +134,9 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 	}()
 
 	err = waitForProcess(ctx, process, waitCh, renewErrCh, sigCh)
+	if killErr := signalProcess(process, os.Kill); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		err = errors.Join(err, fmt.Errorf("kill command group: %w", killErr))
+	}
 	cancelRenew()
 	<-renewDone
 
@@ -262,6 +266,9 @@ func acquireLease(ctx context.Context, leaser litestream.Leaser, timeout, retryI
 
 		lease, err := leaser.AcquireLease(acquireCtx)
 		if err == nil {
+			if lease.IsExpired() {
+				return lease, fmt.Errorf("acquire lease: %w", litestream.ErrLeaseNotHeld)
+			}
 			return lease, nil
 		}
 
@@ -292,18 +299,31 @@ func renewLease(ctx context.Context, leaser litestream.Leaser, lease *litestream
 	defer ticker.Stop()
 
 	for {
+		renewCtx, cancel := context.WithDeadline(ctx, lease.ExpiresAt)
 		select {
-		case <-ctx.Done():
-			return lease, nil
-		case <-ticker.C:
-		}
-
-		nextLease, err := leaser.RenewLease(ctx, lease)
-		if err != nil {
+		case <-renewCtx.Done():
+			cancel()
 			if ctx.Err() != nil {
 				return lease, nil
 			}
+			return lease, fmt.Errorf("renew lease: %w", litestream.ErrLeaseNotHeld)
+		case <-ticker.C:
+		}
+
+		nextLease, err := leaser.RenewLease(renewCtx, lease)
+		expired := !time.Now().Before(lease.ExpiresAt)
+		cancel()
+		if ctx.Err() != nil {
+			return lease, nil
+		}
+		if expired {
+			return lease, fmt.Errorf("renew lease: %w", litestream.ErrLeaseNotHeld)
+		}
+		if err != nil {
 			return lease, fmt.Errorf("renew lease: %w", err)
+		}
+		if !time.Now().Before(nextLease.ExpiresAt) {
+			return nextLease, fmt.Errorf("renew lease: %w", litestream.ErrLeaseNotHeld)
 		}
 		lease = nextLease
 	}
@@ -322,7 +342,7 @@ func waitForProcess(ctx context.Context, process *exec.Cmd, waitCh <-chan error,
 
 		case err := <-renewCh:
 			if err != nil {
-				if killErr := process.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+				if killErr := signalProcess(process, os.Kill); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
 					return errors.Join(err, fmt.Errorf("kill command: %w", killErr))
 				}
 				<-waitCh
@@ -331,19 +351,19 @@ func waitForProcess(ctx context.Context, process *exec.Cmd, waitCh <-chan error,
 
 		case sig := <-sigCh:
 			if signaled {
-				if err := process.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				if err := signalProcess(process, os.Kill); err != nil && !errors.Is(err, os.ErrProcessDone) {
 					return fmt.Errorf("kill command: %w", err)
 				}
 				<-waitCh
 				return fmt.Errorf("signal received: %s", sig)
 			}
 			signaled = true
-			if err := process.Process.Signal(sig); err != nil {
+			if err := signalProcess(process, sig); err != nil {
 				return fmt.Errorf("signal command: %w", err)
 			}
 
 		case <-ctx.Done():
-			if err := process.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			if err := signalProcess(process, os.Kill); err != nil && !errors.Is(err, os.ErrProcessDone) {
 				return errors.Join(ctx.Err(), fmt.Errorf("kill command: %w", err))
 			}
 			<-waitCh

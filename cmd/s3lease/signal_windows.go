@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"os/exec"
 	"os/signal"
 )
 
@@ -13,4 +14,12 @@ func notifySignals() (<-chan os.Signal, func()) {
 	return ch, func() {
 		signal.Stop(ch)
 	}
+}
+
+func configureProcess(cmd *exec.Cmd) {
+	cmd.Cancel = func() error { return signalProcess(cmd, os.Kill) }
+}
+
+func signalProcess(cmd *exec.Cmd, signal os.Signal) error {
+	return cmd.Process.Signal(signal)
 }
