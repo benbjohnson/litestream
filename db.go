@@ -79,6 +79,9 @@ type DB struct {
 	syncState syncState
 	syncDiag  diagState
 
+	replicaInitialized bool
+	startupVerified    bool
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -664,6 +667,15 @@ func (db *DB) PageSize() int {
 	return db.pageSize
 }
 
+func (db *DB) checkStartupReady() error {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if !db.startupVerified {
+		return &DBNotReadyError{Reason: "startup WAL verification pending"}
+	}
+	return nil
+}
+
 // RecordSuccessfulSync marks the current time as a successful sync.
 // Used by heartbeat monitoring to determine if a ping should be sent.
 func (db *DB) RecordSuccessfulSync() {
@@ -805,7 +817,7 @@ func (db *DB) Open() (err error) {
 	// frame verify() checks against and forcing a full snapshot. Not fatal:
 	// the next sync retries init.
 	db.mu.Lock()
-	if err := db.init(db.ctx); err != nil {
+	if err := db.initLocal(db.ctx); err != nil {
 		db.Logger.Warn("init on open failed, will retry on sync", "error", err)
 	}
 	db.mu.Unlock()
@@ -871,6 +883,9 @@ func (db *DB) Close(ctx context.Context) (err error) {
 	db.db = nil
 	db.f = nil
 	db.opened = false
+	db.replicaInitialized = false
+	db.startupVerified = false
+	db.syncState = syncState{}
 	db.rtx = nil
 	db.mu.Unlock()
 
@@ -1037,7 +1052,40 @@ func init() {
 
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
-func (db *DB) init(ctx context.Context) (err error) {
+func (db *DB) init(ctx context.Context) error {
+	if err := db.initLocal(ctx); err != nil {
+		return err
+	} else if db.db == nil || db.replicaInitialized {
+		return nil
+	}
+
+	// Check if database is behind replica (issue #781).
+	// This must happen before replica.Start() to detect restore scenarios.
+	if db.Replica != nil {
+		if err := db.checkDatabaseBehindReplica(ctx); err != nil {
+			return fmt.Errorf("check database behind replica: %w", err)
+		}
+	}
+
+	// If we have an existing replication files, ensure the headers match.
+	// if err := db.verifyHeadersMatch(); err != nil {
+	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
+	// }
+
+	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
+
+	// Start replication.
+	if db.Replica != nil {
+		if err := db.Replica.Start(db.ctx); err != nil {
+			return err
+		}
+	}
+
+	db.replicaInitialized = true
+	return nil
+}
+
+func (db *DB) initLocal(ctx context.Context) (err error) {
 	// Exit if already initialized.
 	if db.db != nil {
 		return nil
@@ -1104,7 +1152,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 
 	// Start a long-running read transaction to prevent other transactions
 	// from checkpointing.
-	if err := db.acquireReadLock(ctx); err != nil {
+	if err := db.acquireReadLock(db.ctx); err != nil {
 		return fmt.Errorf("acquire read lock: %w", err)
 	}
 
@@ -1123,26 +1171,6 @@ func (db *DB) init(ctx context.Context) (err error) {
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(ctx); err != nil {
 		return fmt.Errorf("ensure wal exists: %w", err)
-	}
-
-	// Check if database is behind replica (issue #781).
-	// This must happen before replica.Start() to detect restore scenarios.
-	if db.Replica != nil {
-		if err := db.checkDatabaseBehindReplica(ctx); err != nil {
-			return fmt.Errorf("check database behind replica: %w", err)
-		}
-	}
-
-	// If we have an existing replication files, ensure the headers match.
-	// if err := db.verifyHeadersMatch(); err != nil {
-	// 	return fmt.Errorf("cannot determine last wal position: %w", err)
-	// }
-
-	// TODO(gen): Generate diff of current LTX snapshot and save as next LTX file.
-
-	// Start replication.
-	if db.Replica != nil {
-		db.Replica.Start(db.ctx)
 	}
 
 	return nil
@@ -1301,7 +1329,14 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		db.Logger.Debug("sync: no database found")
 		return result, nil
 	}
-	defer db.applySyncExecutor(exec, true)
+	defer func() {
+		db.applySyncExecutor(exec, true)
+		if err == nil {
+			db.mu.Lock()
+			db.startupVerified = true
+			db.mu.Unlock()
+		}
+	}()
 
 	// Ensure WAL has at least one frame in it.
 	db.setSyncDiagPhase(diagPhaseEnsureWAL, func(s *diagState) {
@@ -2743,6 +2778,10 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 	}
 	defer db.execSem.Release(1)
 
+	if err := db.checkStartupReady(); err != nil {
+		return nil, err
+	}
+
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
 
@@ -2926,6 +2965,10 @@ func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
 // Returns metadata for the newly written compaction file. Returns ErrNoCompaction
 // if no new files are available to be compacted.
 func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
+	if err := db.checkStartupReady(); err != nil {
+		return nil, err
+	}
+
 	info, err := db.compactor.Compact(ctx, dstLevel)
 	if err != nil {
 		return nil, err
