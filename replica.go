@@ -279,6 +279,20 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 	return ltx.Pos{TXID: info.MaxTXID}, nil
 }
 
+func (r *Replica) maxRestorableLTXFileInfo(ctx context.Context) (ltx.FileInfo, error) {
+	var latest ltx.FileInfo
+	for level := 0; level <= SnapshotLevel; level++ {
+		info, err := r.MaxLTXFileInfo(ctx, level)
+		if err != nil {
+			return ltx.FileInfo{}, err
+		}
+		if info.MaxTXID > latest.MaxTXID {
+			latest = info
+		}
+	}
+	return latest, nil
+}
+
 // MaxLTXFileInfo returns metadata about the last LTX file for a given level.
 // Returns nil if no files exist for the level.
 func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileInfo, err error) {
