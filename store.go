@@ -277,6 +277,11 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
+	// Stop the compaction, snapshot & retention monitors before closing the
+	// databases so no snapshot is still reading a database's file handle.
+	s.cancel()
+	s.wg.Wait()
+
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
@@ -292,10 +297,6 @@ func (s *Store) Close(ctx context.Context) (err error) {
 			}
 		}
 	}
-
-	// Cancel and wait for background tasks to complete.
-	s.cancel()
-	s.wg.Wait()
 
 	return err
 }
@@ -610,13 +611,12 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
-			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
+			case err != nil && !isShutdownError(ctx, err):
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
 			}
 
 			if lvl.Level == SnapshotLevel {
-				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
-					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				if err := s.EnforceSnapshotRetention(ctx, db); err != nil && !isShutdownError(ctx, err) {
 					db.Logger.Error("retention enforcement failed", "error", err)
 				}
 			}
@@ -666,7 +666,7 @@ LOOP:
 				continue // skip disabled DBs
 			}
 			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if isShutdownError(ctx, err) {
 					continue
 				}
 				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
@@ -829,7 +829,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	}
 
 	// Skip if there are no new files to compact.
-	if srcInfo.MaxTXID <= dstInfo.MinTXID {
+	if srcInfo.MaxTXID <= dstInfo.MaxTXID {
 		return nil, ErrNoCompaction
 	}
 
@@ -938,7 +938,7 @@ LOOP:
 
 		result, err := s.Validate(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if isShutdownError(ctx, err) {
 				continue
 			}
 			s.Logger.Error("validation check failed", "error", err)
