@@ -959,8 +959,11 @@ func TestReplica_ContextCancellationNoLogs(t *testing.T) {
 				// Return an empty iterator
 				return ltx.NewFileInfoSliceIterator(nil), nil
 			}
-			// After initial syncs, return context.Canceled to simulate shutdown
-			return nil, context.Canceled
+			// After initial syncs, act like a request in flight at shutdown:
+			// block until the replica's context is cancelled, then return its
+			// error (context.Canceled).
+			<-ctx.Done()
+			return nil, ctx.Err()
 		},
 		WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
 			// Always succeed for writes to allow normal operation

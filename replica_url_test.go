@@ -133,6 +133,23 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 	})
 
+	t.Run("ABS_WithEndpoint", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("abs://devstoreaccount1@mycontainer/path?endpoint=http%3A%2F%2F127.0.0.1%3A10000%2Fdevstoreaccount1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		absClient, ok := client.(*abs.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *abs.ReplicaClient, got %T", client)
+		}
+		if absClient.Endpoint != "http://127.0.0.1:10000/devstoreaccount1" {
+			t.Errorf("expected endpoint 'http://127.0.0.1:10000/devstoreaccount1', got %q", absClient.Endpoint)
+		}
+		if absClient.AccountName != "devstoreaccount1" || absClient.Bucket != "mycontainer" || absClient.Path != "path" {
+			t.Errorf("account, bucket, path = %q, %q, %q", absClient.AccountName, absClient.Bucket, absClient.Path)
+		}
+	})
+
 	t.Run("ABS_MissingBucket", func(t *testing.T) {
 		_, err := litestream.NewReplicaClientFromURL("abs:///path")
 		if err == nil {

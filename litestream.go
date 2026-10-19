@@ -1,6 +1,7 @@
 package litestream
 
 import (
+	"context"
 	"database/sql"
 	"encoding/binary"
 	"errors"
@@ -91,6 +92,14 @@ func NewLTXError(op, path string, level int, minTXID, maxTXID uint64, err error)
 	}
 
 	return ltxErr
+}
+
+// isShutdownError reports whether err is a context error caused by ctx itself
+// being done. Context errors that occur while ctx is still live, such as a
+// replica client whose credentials are bound to a cancelled context, are real
+// failures and must not be silently ignored.
+func isShutdownError(ctx context.Context, err error) bool {
+	return ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded))
 }
 
 // SQLite WAL constants.

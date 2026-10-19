@@ -309,7 +309,18 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	n, err := io.Copy(f, fullReader)
 	if err != nil {
 		return nil, err
-	} else if err := f.Close(); err != nil {
+	}
+
+	// Flush the data to stable storage before the rename so a server crash
+	// cannot leave an empty file at the final path. Servers that do not
+	// advertise fsync@openssh.com are left to their own write-back policy.
+	if _, ok := sftpClient.HasExtension("fsync@openssh.com"); ok {
+		if err := f.Sync(); err != nil {
+			return nil, fmt.Errorf("sftp: cannot sync temporary ltx file %q: %w", tmpFilename, err)
+		}
+	}
+
+	if err := f.Close(); err != nil {
 		return nil, err
 	}
 	f = nil

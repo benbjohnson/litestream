@@ -83,6 +83,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 
 	client.Bucket = host
 	client.Path = urlPath
+	client.Endpoint = query.Get("endpoint")
 
 	if client.Bucket == "" {
 		return nil, fmt.Errorf("bucket required for abs replica URL")
@@ -284,7 +285,9 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
+	if resp.ContentLength != nil {
+		internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
+	}
 
 	return resp.Body, nil
 }
