@@ -17,6 +17,19 @@ import (
 // Putting back the wal-index header from before the commit leaves the same
 // state. Litestream must not replicate the killed writer's transaction.
 func TestDB_WriterKilledBeforeWALIndexUpdate(t *testing.T) {
+	testDBWriterKilledBeforeWALIndexUpdate(t, "")
+}
+
+func TestDB_WriterKilledBeforeWALIndexUpdate_UnusableHeader(t *testing.T) {
+	for _, name := range []string{"copies differ", "uninitialized"} {
+		t.Run(name, func(t *testing.T) {
+			testDBWriterKilledBeforeWALIndexUpdate(t, name)
+		})
+	}
+}
+
+func testDBWriterKilledBeforeWALIndexUpdate(t *testing.T, unusableHeader string) {
+	t.Helper()
 	ctx := t.Context()
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -50,6 +63,35 @@ func TestDB_WriterKilledBeforeWALIndexUpdate(t *testing.T) {
 		t.Fatal(err)
 	} else if n != 1 {
 		t.Fatalf("database has %d rows after the simulated kill, want 1", n)
+	}
+
+	if unusableHeader != "" {
+		pos, err := db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		unstable := append([]byte(nil), hdr...)
+		switch unusableHeader {
+		case "copies differ":
+			unstable[56] ^= 1
+		case "uninitialized":
+			unstable[12], unstable[60] = 0, 0
+		}
+		if _, err := shm.WriteAt(unstable, 0); err != nil {
+			t.Fatal(err)
+		}
+		syncErr := db.Sync(ctx)
+		if _, err := shm.WriteAt(hdr, 0); err != nil {
+			t.Fatal(err)
+		}
+		if syncErr == nil {
+			t.Error("expected sync to reject unusable wal-index header")
+		}
+		if got, err := db.Pos(); err != nil {
+			t.Fatal(err)
+		} else if got != pos {
+			t.Errorf("position advanced with unusable wal-index header: got %v, want %v", got, pos)
+		}
 	}
 
 	// Litestream's next checkpoint copies the WAL, checkpoints and restarts it.

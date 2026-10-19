@@ -1918,29 +1918,37 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 // writer killed after it wrote a commit's frames but before it updated the
 // wal-index leaves such frames. While another connection keeps the wal-index
 // valid, SQLite does not recover the WAL, and the next writer overwrites them.
-//
-// ok is false if the header cannot be used: a writer is updating it, or it is
-// not initialized. Then every valid frame counts, because the update commits
-// them or SQLite recovers the wal-index from the WAL file.
-func (db *DB) walIndexMaxFrame(salt1, salt2 uint32) (n int, ok bool) {
+func (db *DB) walIndexMaxFrame(salt1, salt2 uint32) (int, error) {
 	if db.shm == nil {
-		return 0, false
+		return 0, fmt.Errorf("wal-index file is not open")
 	}
 
 	// The header is stored twice, 48 bytes each; byte 12 is isInit.
 	hdr := make([]byte, 96)
-	if _, err := db.shm.ReadAt(hdr, 0); err != nil {
-		return 0, false
-	} else if !bytes.Equal(hdr[:48], hdr[48:]) || hdr[12] == 0 {
-		return 0, false
-	}
+	const maxAttempts = 10
+	var err error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			time.Sleep(time.Millisecond)
+		}
+		if _, err = db.shm.ReadAt(hdr, 0); err != nil {
+			continue
+		} else if !bytes.Equal(hdr[:48], hdr[48:]) {
+			err = fmt.Errorf("wal-index header copies differ")
+			continue
+		} else if hdr[12] == 0 {
+			err = fmt.Errorf("wal-index header is not initialized")
+			continue
+		}
 
-	// The salts are stored as in the WAL file. If they differ, the WAL has
-	// been restarted and no frame with the given salts is committed.
-	if binary.BigEndian.Uint32(hdr[32:]) != salt1 || binary.BigEndian.Uint32(hdr[36:]) != salt2 {
-		return 0, true
+		// The salts are stored as in the WAL file. If they differ, the WAL has
+		// been restarted and no frame with the given salts is committed.
+		if binary.BigEndian.Uint32(hdr[32:]) != salt1 || binary.BigEndian.Uint32(hdr[36:]) != salt2 {
+			return 0, nil
+		}
+		return int(binary.NativeEndian.Uint32(hdr[16:])), nil
 	}
-	return int(binary.NativeEndian.Uint32(hdr[16:])), true
+	return 0, fmt.Errorf("read wal-index header after %d attempts: %w", maxAttempts, err)
 }
 
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
@@ -2190,9 +2198,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 
 	// Never read past the last frame committed to the wal-index.
-	if n, ok := db.walIndexMaxFrame(rd.salt1, rd.salt2); ok {
-		rd.SetEnd(WALHeaderSize + int64(n)*int64(db.pageSize+WALFrameHeaderSize))
+	n, err := db.walIndexMaxFrame(rd.salt1, rd.salt2)
+	if err != nil {
+		return result, fmt.Errorf("read committed wal boundary: %w", err)
 	}
+	rd.SetEnd(WALHeaderSize + int64(n)*int64(db.pageSize+WALFrameHeaderSize))
 
 	// Build a mapping of changed page numbers and their latest content.
 	db.setSyncDiagPhase(diagPhaseSyncPageMap,
