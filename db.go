@@ -120,6 +120,7 @@ type DB struct {
 	Done   <-chan struct{}
 
 	// Metrics
+	metricsRegistered           bool
 	dbSizeGauge                 prometheus.Gauge
 	walSizeGauge                prometheus.Gauge
 	totalWALBytesCounter        prometheus.Counter
@@ -343,25 +344,13 @@ func NewDB(path string) *DB {
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.openLTXFile = defaultOpenLTXFile
 
-	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
-	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
-	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
-	db.txIDGauge = txIDIndexGaugeVec.WithLabelValues(db.path)
-	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
-	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
-	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
-	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
-	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
-
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 
 	// Initialize compactor with nil client (set once in Open() from Replica.Client).
 	db.compactor = NewCompactor(nil, db.Logger.With(LogKeySubsystem, LogSubsystemCompactor))
 	db.compactor.LocalFileOpener = db.openLocalLTXFile
 	db.compactor.LocalFileDeleter = db.deleteLocalLTXFile
-	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
+	db.initMetrics()
 	db.compactor.CacheGetter = func(level int) (*ltx.FileInfo, bool) {
 		db.maxLTXFileInfos.Lock()
 		defer db.maxLTXFileInfos.Unlock()
@@ -375,6 +364,70 @@ func NewDB(path string) *DB {
 	}
 
 	return db
+}
+
+// initMetrics creates the per-database Prometheus series.
+// Open calls it again because Close deletes them.
+func (db *DB) initMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = true
+	dbMetricOwners.paths[db.path]++
+	dbMetricOwners.basenames[filepath.Base(db.path)]++
+
+	db.dbSizeGauge = dbSizeGaugeVec.WithLabelValues(db.path)
+	db.walSizeGauge = walSizeGaugeVec.WithLabelValues(db.path)
+	db.totalWALBytesCounter = totalWALBytesCounterVec.WithLabelValues(db.path)
+	db.txIDGauge = txIDIndexGaugeVec.WithLabelValues(db.path)
+	db.syncNCounter = syncNCounterVec.WithLabelValues(db.path)
+	db.syncErrorNCounter = syncErrorNCounterVec.WithLabelValues(db.path)
+	db.syncSecondsCounter = syncSecondsCounterVec.WithLabelValues(db.path)
+	db.diskFullGauge = diskFullGaugeVec.WithLabelValues(db.path)
+	db.checkpointNCounterVec = checkpointNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointErrorNCounterVec = checkpointErrorNCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.checkpointSecondsCounterVec = checkpointSecondsCounterVec.MustCurryWith(prometheus.Labels{"db": db.path})
+	db.compactor.CompactionVerifyErrorCounter = compactionVerifyErrorCounterVec.WithLabelValues(db.path)
+}
+
+// deleteMetrics removes every per-database series so a process that opens many
+// databases over its lifetime does not accumulate series forever.
+func (db *DB) deleteMetrics() {
+	dbMetricOwners.Lock()
+	defer dbMetricOwners.Unlock()
+	if !db.metricsRegistered {
+		return
+	}
+	db.metricsRegistered = false
+
+	name := filepath.Base(db.path)
+	dbMetricOwners.basenames[name]--
+	if dbMetricOwners.basenames[name] == 0 {
+		delete(dbMetricOwners.basenames, name)
+		internal.L0RetentionGaugeVec.DeletePartialMatch(prometheus.Labels{"db": name})
+	}
+
+	dbMetricOwners.paths[db.path]--
+	if dbMetricOwners.paths[db.path] != 0 {
+		return
+	}
+	delete(dbMetricOwners.paths, db.path)
+
+	labels := prometheus.Labels{"db": db.path}
+	dbSizeGaugeVec.DeletePartialMatch(labels)
+	walSizeGaugeVec.DeletePartialMatch(labels)
+	totalWALBytesCounterVec.DeletePartialMatch(labels)
+	txIDIndexGaugeVec.DeletePartialMatch(labels)
+	syncNCounterVec.DeletePartialMatch(labels)
+	syncErrorNCounterVec.DeletePartialMatch(labels)
+	syncSecondsCounterVec.DeletePartialMatch(labels)
+	diskFullGaugeVec.DeletePartialMatch(labels)
+	compactionVerifyErrorCounterVec.DeletePartialMatch(labels)
+	checkpointNCounterVec.DeletePartialMatch(labels)
+	checkpointErrorNCounterVec.DeletePartialMatch(labels)
+	checkpointSecondsCounterVec.DeletePartialMatch(labels)
 }
 
 // SetLogger updates the database logger and propagates to subsystems.
@@ -796,6 +849,9 @@ func (db *DB) Open() (err error) {
 	db.ctx, db.cancel = context.WithCancel(context.Background())
 	db.mu.Unlock()
 
+	// Close deletes the per-database series, so recreate them.
+	db.initMetrics()
+
 	// Validate fields on database.
 	if db.Replica == nil {
 		return fmt.Errorf("replica required before opening database")
@@ -892,6 +948,10 @@ func (db *DB) Close(ctx context.Context) (err error) {
 			err = e
 		}
 	}
+
+	// Remove this database's series now that the final sync has recorded
+	// its last values.
+	db.deleteMetrics()
 
 	return err
 }
@@ -1276,6 +1336,14 @@ func (db *DB) lockExec(ctx context.Context) error {
 	return nil
 }
 
+// addDurationToCounter records positive durations without allowing a clock
+// adjustment to panic a Prometheus counter.
+func addDurationToCounter(counter prometheus.Counter, d time.Duration) {
+	if d > 0 {
+		counter.Add(d.Seconds())
+	}
+}
+
 func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syncResult, err error) {
 	db.beginSyncDiag(diagOpSync)
 	defer func() { db.finishSyncDiag(err) }()
@@ -1292,7 +1360,7 @@ func (db *DB) syncLocked(ctx context.Context, maxSyncWALBytes int64) (result syn
 		} else {
 			db.diskFullGauge.Set(0)
 		}
-		db.syncSecondsCounter.Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.syncSecondsCounter, time.Since(t))
 	}()
 
 	exec, err := db.newSyncExecutor(ctx)
@@ -1808,6 +1876,9 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	if err != nil {
 		return info, fmt.Errorf("last page match: %w", err)
 	} else if !lastPageMatch {
+		// A snapshot must hold every frame not yet in the database file,
+		// including those before the stale offset.
+		info.offset = WALHeaderSize
 		info.reason = "last page does not exist in last ltx file, wal overwritten by another process"
 		return info, nil
 	}
@@ -2666,7 +2737,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 		if err != nil {
 			db.checkpointErrorNCounterVec.With(labels).Inc()
 		}
-		db.checkpointSecondsCounterVec.With(labels).Add(float64(time.Since(t).Seconds()))
+		addDurationToCounter(db.checkpointSecondsCounterVec.With(labels), time.Since(t))
 	}()
 
 	// Ensure the read lock has been removed before issuing a checkpoint.
@@ -2936,7 +3007,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	if dstLevel == 1 {
 		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
 			// Don't log context cancellation errors during shutdown
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if !isShutdownError(ctx, err) {
 				db.Logger.Error("enforce L0 time retention", "error", err)
 			}
 		}
@@ -3243,7 +3314,7 @@ func (db *DB) monitor() {
 		// end so checkpointIfNeeded() runs. A single bounded chunk per
 		// tick would cap drain throughput and starve the TruncatePageN
 		// emergency checkpoint while behind, growing the WAL unbounded.
-		if err := db.Sync(db.ctx); err != nil && !errors.Is(err, context.Canceled) {
+		if err := db.Sync(db.ctx); err != nil && !isShutdownError(db.ctx, err) {
 			consecutiveErrs++
 
 			// Exponential backoff: MonitorInterval -> 2x -> 4x -> ... -> max
@@ -3407,6 +3478,15 @@ func NewRestoreOptions() RestoreOptions {
 
 // Database metrics.
 var (
+	dbMetricOwners = struct {
+		sync.Mutex
+		paths     map[string]int
+		basenames map[string]int
+	}{
+		paths:     make(map[string]int),
+		basenames: make(map[string]int),
+	}
+
 	dbSizeGaugeVec = promauto.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "litestream_db_size",
 		Help: "The current size of the real DB",

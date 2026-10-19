@@ -83,6 +83,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 
 	client.Bucket = host
 	client.Path = urlPath
+	client.Endpoint = query.Get("endpoint")
 
 	if client.Bucket == "" {
 		return nil, fmt.Errorf("bucket required for abs replica URL")
@@ -284,7 +285,9 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
-	internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
+	if resp.ContentLength != nil {
+		internal.OperationBytesCounterVec.WithLabelValues(ReplicaClientType, "GET").Add(float64(*resp.ContentLength))
+	}
 
 	return resp.Body, nil
 }
@@ -383,9 +386,6 @@ func newLTXFileIterator(ctx context.Context, client *ReplicaClient, level int, s
 	// Create paginator for listing blobs with level prefix
 	dir := litestream.LTXLevelDir(client.Path, level)
 	prefix := dir + "/"
-	if seek != 0 {
-		prefix += seek.String()
-	}
 
 	itr.pager = client.client.NewListBlobsFlatPager(client.Bucket, &azblob.ListBlobsFlatOptions{
 		Prefix:  &prefix,

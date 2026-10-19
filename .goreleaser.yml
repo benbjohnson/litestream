@@ -91,7 +91,6 @@ brews:
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
     install: |
       bin.install "litestream"
-      etc.install "etc/litestream.yml" => "litestream.yml"
     test: |
       system "#{bin}/litestream", "version"
     commit_author:

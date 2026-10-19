@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/semaphore"
@@ -1110,6 +1112,35 @@ func TestCalcWALSize(t *testing.T) {
 					t.Errorf("calcWALSize(%d, %d) = %d (%.2f GB), suspiciously small, possible overflow",
 						tt.pageSize, tt.pageN, got, float64(got)/(1024*1024*1024))
 				}
+			}
+		})
+	}
+}
+
+// TestAddDurationToCounter ignores negative durations because Prometheus
+// counters cannot decrease. Negative durations can occur when the system clock
+// moves backwards between the start and end of an operation.
+func TestAddDurationToCounter(t *testing.T) {
+	tests := []struct {
+		name     string
+		duration time.Duration
+		want     float64
+	}{
+		{name: "positive", duration: 1500 * time.Millisecond, want: 1.5},
+		{name: "zero", duration: 0, want: 0},
+		{name: "negative", duration: -500 * time.Millisecond, want: 0},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := prometheus.NewCounter(prometheus.CounterOpts{
+				Name: "test_duration_seconds",
+				Help: "Test duration counter.",
+			})
+			addDurationToCounter(counter, tt.duration)
+
+			if got := testutil.ToFloat64(counter); got != tt.want {
+				t.Fatalf("counter value=%v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -4649,5 +4680,240 @@ func TestDB_SnapshotReaderConsistentDuringConcurrentCheckpoints(t *testing.T) {
 	case err := <-errCh:
 		t.Fatal(err)
 	default:
+	}
+}
+
+// mustOpenMetricsDB opens a DB backed by a temp-dir test replica.
+func mustOpenMetricsDB(t *testing.T, path string) *DB {
+	t.Helper()
+	db := NewDB(path)
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	return db
+}
+
+func mustWriteAndSyncMetricsDB(t *testing.T, db *DB) {
+	t.Helper()
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sqldb.Close()
+	if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE IF NOT EXISTS t (x); INSERT INTO t VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// gatherDBSeries returns the names of series in the default registry whose db
+// label is one of values.
+func gatherDBSeries(t *testing.T, values ...string) (names []string) {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, mf := range families {
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "db" && slices.Contains(values, lp.GetValue()) {
+					names = append(names, mf.GetName()+"{db="+lp.GetValue()+"}")
+				}
+			}
+		}
+	}
+	return names
+}
+
+func TestDB_CloseDeletesMetrics(t *testing.T) {
+	dir := t.TempDir()
+
+	var dbs []*DB
+	var values []string
+	for _, name := range []string{"close-metrics-a", "close-metrics-b"} {
+		path := filepath.Join(dir, name)
+		db := mustOpenMetricsDB(t, path)
+		mustWriteAndSyncMetricsDB(t, db)
+		if err := db.Checkpoint(context.Background(), CheckpointModePassive); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.EnforceL0RetentionByTime(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		// Only created on error, so touch it directly.
+		db.checkpointErrorNCounterVec.WithLabelValues(CheckpointModePassive).Inc()
+		dbs = append(dbs, db)
+		values = append(values, path, name)
+	}
+
+	// Closing one database must leave the other's series alone.
+	if err := dbs[0].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, values[0], values[1]); len(got) != 0 {
+		t.Fatalf("series remain after close: %v", got)
+	}
+	if got := gatherDBSeries(t, values[2], values[3]); len(got) == 0 {
+		t.Fatal("closing one db deleted the other's series")
+	}
+
+	if err := dbs[1].Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, values...); len(got) != 0 {
+		t.Fatalf("series remain after close: %v", got)
+	}
+}
+
+func TestDB_ReopenKeepsMetrics(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "reopen-metrics")
+	db := mustOpenMetricsDB(t, path)
+	mustWriteAndSyncMetricsDB(t, db)
+	if err := db.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	mustWriteAndSyncMetricsDB(t, db)
+
+	// Gather before reading the vec, since reading would recreate the series.
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("no series for reopened db")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got < 1 {
+		t.Fatalf("litestream_sync_count=%v after reopen, want >= 1", got)
+	}
+}
+
+func TestDB_ClosePreservesSharedMetrics(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "shared-metrics")
+	active := mustOpenMetricsDB(t, path)
+	t.Cleanup(func() {
+		if err := active.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	duplicate := mustOpenMetricsDB(t, path)
+	t.Cleanup(func() {
+		if err := duplicate.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	if err := duplicate.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := duplicate.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	active.syncNCounter.Inc()
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("closing duplicate deleted active database metrics")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got != 1 {
+		t.Fatalf("sync count=%v, want 1", got)
+	}
+	if err := duplicate.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if err := active.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	duplicate.syncNCounter.Inc()
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("closing original deleted reopened database metrics")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got != 2 {
+		t.Fatalf("sync count=%v, want 2", got)
+	}
+	if err := duplicate.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, path); len(got) != 0 {
+		t.Fatalf("series remain after last close: %v", got)
+	}
+}
+
+func TestDB_ClosePreservesSharedRetentionMetrics(t *testing.T) {
+	ctx := context.Background()
+	name := t.Name()
+	a := mustOpenMetricsDB(t, filepath.Join(t.TempDir(), name))
+	b := mustOpenMetricsDB(t, filepath.Join(t.TempDir(), name))
+	for _, db := range []*DB{a, b} {
+		t.Cleanup(func() {
+			if err := db.Close(ctx); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	if err := b.EnforceL0RetentionByTime(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, name); len(got) != 3 {
+		t.Fatalf("retention series=%v, want three", got)
+	}
+	if err := a.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, name); len(got) != 3 {
+		t.Fatalf("closing same-basename database removed retention series: %v", got)
+	}
+	if err := b.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, name); len(got) != 0 {
+		t.Fatalf("retention series remain after last close: %v", got)
+	}
+}
+
+func TestDB_ConcurrentMetricOwners(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "concurrent-metrics")
+	active := NewDB(path)
+	t.Cleanup(func() {
+		if err := active.Close(ctx); err != nil {
+			t.Error(err)
+		}
+	})
+	var wg sync.WaitGroup
+	for range 20 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 20 {
+				db := NewDB(path)
+				db.syncNCounter.Inc()
+				if err := db.Close(ctx); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := gatherDBSeries(t, path); len(got) == 0 {
+		t.Fatal("concurrent closes deleted active database metrics")
+	}
+	if got := testutil.ToFloat64(syncNCounterVec.WithLabelValues(path)); got != 400 {
+		t.Fatalf("sync count=%v, want 400", got)
+	}
+	if err := active.Close(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := gatherDBSeries(t, path); len(got) != 0 {
+		t.Fatalf("series remain after last close: %v", got)
 	}
 }
