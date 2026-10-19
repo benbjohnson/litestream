@@ -303,15 +303,6 @@ func TestLeaser_RenewLease_Hetzner(t *testing.T) {
 }
 
 func TestLeaser_RenewLease_HetznerExplicitPort(t *testing.T) {
-	// Same as TestLeaser_RenewLease_Hetzner, but the endpoint carries an explicit
-	// port. Hetzner detection currently misses this because extractEndpointHost
-	// returns url.URL.Host, which includes the port, so the suffix match against
-	// ".your-objectstorage.com" fails and the lease takes the generic S3 path.
-	//
-	// That is a pre-existing bug in replica_url.go, not something this PR
-	// introduced. See benbjohnson/litestream#1523. Unskip once it is fixed.
-	t.Skip("blocked on #1523: provider detection drops endpoints with an explicit port")
-
 	oldETag := `"old-etag"`
 	newETag := `"new-etag"`
 	var receivedIfMatch string
