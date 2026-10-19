@@ -286,8 +286,10 @@ func TestResumableReader_CloseWhileReopening(t *testing.T) {
 	continueOpen := make(chan struct{})
 	stream := &closeTrackingReadCloser{Reader: bytes.NewReader(nil)}
 	var openN atomic.Int64
+	var streamCtx context.Context
 	client := &testLTXFileOpener{
-		OpenLTXFileFunc: func(_ context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+		OpenLTXFileFunc: func(requestCtx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			streamCtx = requestCtx
 			if openN.Add(1) == 1 {
 				close(openStarted)
 			}
@@ -324,6 +326,9 @@ func TestResumableReader_CloseWhileReopening(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("timed out waiting for read")
+	}
+	if !errors.Is(streamCtx.Err(), context.Canceled) {
+		t.Fatal("reopened stream context was not canceled")
 	}
 	if !stream.closed.Load() {
 		t.Fatal("reopened stream was not closed")
@@ -597,4 +602,184 @@ func TestResumableReader_ContextCancelDuringReopen(t *testing.T) {
 	if got, want := openN, 1; got != want {
 		t.Errorf("OpenLTXFile() count=%d, want %d", got, want)
 	}
+}
+
+func TestResumableReader_ReconnectsOnStalledStream(t *testing.T) {
+	defer setStallTimeout(50 * time.Millisecond)()
+
+	data := []byte("hello world")
+	var opens atomic.Int32
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			if opens.Add(1) == 1 {
+				// The first stream hands over 5 bytes and then goes quiet.
+				// Only cancelling its request context can free the reader.
+				return io.NopCloser(newSilentAfterN(ctx, data, 5)), nil
+			}
+			return io.NopCloser(bytes.NewReader(data[offset:])), nil
+		},
+	}
+
+	// rc is nil so the reader opens every stream itself, as restore does.
+	r := NewResumableReader(context.Background(), client, 0, 1, 1, int64(len(data)), nil, slog.Default())
+	got, err := readAllWithin(t, r, 5*time.Second)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("got %q, want %q", got, data)
+	}
+	if n := opens.Load(); n != 2 {
+		t.Fatalf("OpenLTXFile calls = %d, want 2 (original + reconnect past the stall)", n)
+	}
+}
+
+func TestResumableReader_StalledReadIsNotAUserCancel(t *testing.T) {
+	// A stall is retryable; a cancelled parent context is terminal. The stall
+	// path cancels a child context, so context.Canceled must not survive into
+	// the returned error where an errors.Is check would confuse the two.
+	defer setStallTimeout(20 * time.Millisecond)()
+
+	data := []byte("hello world")
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			return io.NopCloser(newSilentAfterN(ctx, data, 5)), nil
+		},
+	}
+
+	r := NewResumableReader(context.Background(), client, 0, 1, 1, int64(len(data)), nil, slog.Default())
+	_, err := readAllWithin(t, r, 10*time.Second)
+	if err == nil {
+		t.Fatal("expected the retry budget to be exhausted by repeated stalls")
+	}
+	if !errors.Is(err, ErrReadStalled) {
+		t.Fatalf("error %v does not wrap ErrReadStalled", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("stall error leaks context.Canceled, which callers treat as terminal: %v", err)
+	}
+}
+
+// setStallTimeout shortens the stall bound and returns a func restoring it.
+func setStallTimeout(d time.Duration) func() {
+	prev := resumableReaderStallTimeout
+	resumableReaderStallTimeout = d
+	return func() { resumableReaderStallTimeout = prev }
+}
+
+func readAllWithin(t *testing.T, r io.Reader, d time.Duration) ([]byte, error) {
+	t.Helper()
+	type result struct {
+		b   []byte
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		b, err := io.ReadAll(r)
+		ch <- result{b, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.b, res.err
+	case <-time.After(d):
+		t.Fatalf("read hung for %s: the stalled stream was never abandoned", d)
+		return nil, nil
+	}
+}
+
+// silentAfterN serves n bytes and then blocks until its request context is
+// cancelled, imitating a provider connection that stops delivering bytes
+// without ever closing.
+type silentAfterN struct {
+	ctx  context.Context
+	data []byte
+	n    int
+	off  int
+}
+
+func newSilentAfterN(ctx context.Context, data []byte, n int) *silentAfterN {
+	return &silentAfterN{ctx: ctx, data: data, n: n}
+}
+
+func (s *silentAfterN) Read(p []byte) (int, error) {
+	if s.off < s.n {
+		n := copy(p, s.data[s.off:s.n])
+		s.off += n
+		return n, nil
+	}
+	<-s.ctx.Done()
+	return 0, s.ctx.Err()
+}
+
+func TestResumableReader_CloseUnblocksStalledRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started, done := make(chan struct{}), make(chan struct{})
+	var opens atomic.Int32
+	stream := &blockedReadCloser{started: started, done: done}
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			opens.Add(1)
+			stream.ctx = ctx
+			return stream, nil
+		},
+	}
+	r := NewResumableReader(ctx, client, 0, 1, 1, 1, nil, slog.Default())
+	readErr := make(chan error, 1)
+	go func() {
+		_, err := r.Read(make([]byte, 1))
+		readErr <- err
+	}()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("read did not start")
+	}
+	closeErr := make(chan error, 1)
+	go func() { closeErr <- r.Close() }()
+	select {
+	case err := <-closeErr:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Close did not unblock the stalled read")
+	}
+	select {
+	case err := <-readErr:
+		if !errors.Is(err, os.ErrClosed) {
+			t.Fatalf("read returned %v, want os.ErrClosed", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read did not return after Close")
+	}
+	if !stream.closed.Load() {
+		t.Fatal("stream was not closed")
+	}
+	if _, err := r.Read(make([]byte, 1)); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("read after Close returned %v, want os.ErrClosed", err)
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("OpenLTXFile count=%d, want 1", got)
+	}
+}
+
+type blockedReadCloser struct {
+	ctx     context.Context
+	started chan struct{}
+	done    chan struct{}
+	closed  atomic.Bool
+}
+
+func (r *blockedReadCloser) Read(p []byte) (int, error) {
+	close(r.started)
+	<-r.ctx.Done()
+	close(r.done)
+	return 0, r.ctx.Err()
+}
+
+func (r *blockedReadCloser) Close() error {
+	<-r.done
+	r.closed.Store(true)
+	return nil
 }
