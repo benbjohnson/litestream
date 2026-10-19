@@ -277,6 +277,11 @@ func (s *Store) Open(ctx context.Context) error {
 }
 
 func (s *Store) Close(ctx context.Context) (err error) {
+	// Stop the compaction, snapshot & retention monitors before closing the
+	// databases so no snapshot is still reading a database's file handle.
+	s.cancel()
+	s.wg.Wait()
+
 	s.mu.Lock()
 	dbs := slices.Clone(s.dbs)
 	s.mu.Unlock()
@@ -292,10 +297,6 @@ func (s *Store) Close(ctx context.Context) (err error) {
 			}
 		}
 	}
-
-	// Cancel and wait for background tasks to complete.
-	s.cancel()
-	s.wg.Wait()
 
 	return err
 }
