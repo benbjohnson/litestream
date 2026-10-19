@@ -133,6 +133,23 @@ func TestNewReplicaClientFromURL(t *testing.T) {
 		}
 	})
 
+	t.Run("ABS_WithEndpoint", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("abs://devstoreaccount1@mycontainer/path?endpoint=http%3A%2F%2F127.0.0.1%3A10000%2Fdevstoreaccount1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		absClient, ok := client.(*abs.ReplicaClient)
+		if !ok {
+			t.Fatalf("expected *abs.ReplicaClient, got %T", client)
+		}
+		if absClient.Endpoint != "http://127.0.0.1:10000/devstoreaccount1" {
+			t.Errorf("expected endpoint 'http://127.0.0.1:10000/devstoreaccount1', got %q", absClient.Endpoint)
+		}
+		if absClient.AccountName != "devstoreaccount1" || absClient.Bucket != "mycontainer" || absClient.Path != "path" {
+			t.Errorf("account, bucket, path = %q, %q, %q", absClient.AccountName, absClient.Bucket, absClient.Path)
+		}
+	})
+
 	t.Run("ABS_MissingBucket", func(t *testing.T) {
 		_, err := litestream.NewReplicaClientFromURL("abs:///path")
 		if err == nil {
@@ -574,11 +591,131 @@ func TestBoolQueryValue(t *testing.T) {
 	})
 }
 
+func TestIntQueryValue(t *testing.T) {
+	t.Run("Key present", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{"1048576"}
+		value, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue with present key should be ok")
+		}
+		if value != 1048576 {
+			t.Errorf("IntQueryValue = %d, want 1048576", value)
+		}
+	})
+
+	t.Run("Missing key", func(t *testing.T) {
+		query := make(map[string][]string)
+		value, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if ok {
+			t.Error("IntQueryValue with missing key should not be ok")
+		}
+		if value != 0 {
+			t.Errorf("IntQueryValue = %d, want 0", value)
+		}
+	})
+
+	t.Run("Alias order", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key1"] = []string{"100"}
+		query["key2"] = []string{"200"}
+		value, ok, err := litestream.IntQueryValue(query, "key1", "key2")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue should find first key")
+		}
+		if value != 100 {
+			t.Errorf("IntQueryValue = %d, want 100 (first key wins)", value)
+		}
+	})
+
+	t.Run("Second key used when first absent", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key2"] = []string{"200"}
+		value, ok, err := litestream.IntQueryValue(query, "key1", "key2")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue should find second key")
+		}
+		if value != 200 {
+			t.Errorf("IntQueryValue = %d, want 200", value)
+		}
+	})
+
+	t.Run("Nil query", func(t *testing.T) {
+		value, ok, err := litestream.IntQueryValue(nil, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if ok {
+			t.Error("IntQueryValue with nil query should not be ok")
+		}
+		if value != 0 {
+			t.Errorf("IntQueryValue = %d, want 0", value)
+		}
+	})
+
+	t.Run("Empty value not set", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{""}
+		_, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if ok {
+			t.Error("IntQueryValue with empty value should not be ok")
+		}
+	})
+
+	t.Run("Invalid values return error", func(t *testing.T) {
+		for _, v := range []string{"abc", "0", "-5"} {
+			query := make(map[string][]string)
+			query["key"] = []string{v}
+			_, _, err := litestream.IntQueryValue(query, "key")
+			if err == nil {
+				t.Errorf("IntQueryValue with %q should return error", v)
+			}
+		}
+	})
+
+	t.Run("Large value", func(t *testing.T) {
+		query := make(map[string][]string)
+		query["key"] = []string{"10737418240"}
+		value, ok, err := litestream.IntQueryValue(query, "key")
+		if err != nil {
+			t.Fatalf("IntQueryValue returned error: %v", err)
+		}
+		if !ok {
+			t.Error("IntQueryValue with large value should be ok")
+		}
+		if value != 10737418240 {
+			t.Errorf("IntQueryValue = %d, want 10737418240", value)
+		}
+	})
+}
+
 func TestIsTigrisEndpoint(t *testing.T) {
 	tests := []struct {
 		endpoint string
 		expected bool
 	}{
+		{"https://fly.storage.tigris.dev:443", true},
+		{"http://fly.storage.tigris.dev:8080", true},
+		{"fly.storage.tigris.dev:443", true},
+		{"https://fly.storage.tigris.dev:8443/storage/v1/s3", true},
+		{"https://fly.storage.tigris.dev.example.com:443", false},
+		{"https://user@fly.storage.tigris.dev:443", false},
+		{"https://t3.storage.dev:443", true},
 		{"fly.storage.tigris.dev", true},
 		{"FLY.STORAGE.TIGRIS.DEV", true},
 		{"https://fly.storage.tigris.dev", true},
@@ -599,6 +736,58 @@ func TestIsTigrisEndpoint(t *testing.T) {
 			got := litestream.IsTigrisEndpoint(tt.endpoint)
 			if got != tt.expected {
 				t.Errorf("IsTigrisEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestIsGoogleCloudStorageEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://storage.googleapis.com:443", true},
+		{"http://storage.googleapis.com:8080", true},
+		{"storage.googleapis.com:443", true},
+		{"https://storage.googleapis.com:8443/storage/v1/s3", true},
+		{"https://storage.googleapis.com.example.com:443", false},
+		{"https://user@storage.googleapis.com:443", false},
+		{"storage.googleapis.com", true},
+		{"STORAGE.GOOGLEAPIS.COM", true},
+		{"https://storage.googleapis.com", true},
+		{"https://storage.googleapis.com:443", true},
+		{"https://storage.googleapis.com.", true},
+		{"http://storage.googleapis.com", true},
+		{"https://storage.googleapis.com/path", true},
+		{"https://storage.me-central2.rep.googleapis.com", true},
+		{"https://us-central1-storage.googleapis.com", true},
+		{"https://US-CENTRAL1-STORAGE.GOOGLEAPIS.COM", true},
+		{"https://us-central1-storage.googleapis.com:443", true},
+		{"https://us-central1-storage.googleapis.com.", true},
+		{"https://storage.mtls.googleapis.com", true},
+		{"https://storage-download.googleapis.com", true},
+		{"https://storage-upload.googleapis.com", true},
+		{"https://storage.googleapis.com.evil.com", false},
+		{"https://us-central1-storage.googleapis.com.evil.com", false},
+		{"https://storage.mtls.googleapis.com.evil.com", false},
+		{"https://attacker@storage.googleapis.com", false},
+		{"attacker@storage.googleapis.com", false},
+		{"storage.googleapis.com@evil.com", false},
+		{"https://bucket.storage.googleapis.com", false},
+		{"https://backup-storage.storage.me-central2.rep.googleapis.com", false},
+		{"https://backup-storage.us-central1-storage.googleapis.com", false},
+		{"https://storageinsights.googleapis.com", false},
+		{"https://storage..googleapis.com", false},
+		{"https://example.com", false},
+		{"", false},
+		{"   ", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsGoogleCloudStorageEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsGoogleCloudStorageEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
 			}
 		})
 	}
@@ -768,6 +957,12 @@ func TestIsDigitalOceanEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://sfo3.digitaloceanspaces.com:443", true},
+		{"http://sfo3.digitaloceanspaces.com:8080", true},
+		{"sfo3.digitaloceanspaces.com:443", true},
+		{"https://sfo3.digitaloceanspaces.com:8443/storage/v1/s3", true},
+		{"https://sfo3.digitaloceanspaces.com.example.com:443", false},
+		{"https://user@sfo3.digitaloceanspaces.com:443", false},
 		{"https://sfo3.digitaloceanspaces.com", true},
 		{"https://nyc3.digitaloceanspaces.com", true},
 		{"sfo3.digitaloceanspaces.com", true},
@@ -790,6 +985,12 @@ func TestIsBackblazeEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://s3.us-west-002.backblazeb2.com:443", true},
+		{"http://s3.us-west-002.backblazeb2.com:8080", true},
+		{"s3.us-west-002.backblazeb2.com:443", true},
+		{"https://s3.us-west-002.backblazeb2.com:8443/storage/v1/s3", true},
+		{"https://s3.us-west-002.backblazeb2.com.example.com:443", false},
+		{"https://user@s3.us-west-002.backblazeb2.com:443", false},
 		{"https://s3.us-west-002.backblazeb2.com", true},
 		{"https://s3.eu-central-003.backblazeb2.com", true},
 		{"s3.us-west-002.backblazeb2.com", true},
@@ -812,6 +1013,12 @@ func TestIsFilebaseEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://s3.filebase.com:443", true},
+		{"http://s3.filebase.com:8080", true},
+		{"s3.filebase.com:443", true},
+		{"https://s3.filebase.com:8443/storage/v1/s3", true},
+		{"https://s3.filebase.com.example.com:443", false},
+		{"https://user@s3.filebase.com:443", false},
 		{"https://s3.filebase.com", true},
 		{"http://s3.filebase.com", true},
 		{"s3.filebase.com", true},
@@ -834,6 +1041,12 @@ func TestIsScalewayEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://s3.fr-par.scw.cloud:443", true},
+		{"http://s3.fr-par.scw.cloud:8080", true},
+		{"s3.fr-par.scw.cloud:443", true},
+		{"https://s3.fr-par.scw.cloud:8443/storage/v1/s3", true},
+		{"https://s3.fr-par.scw.cloud.example.com:443", false},
+		{"https://user@s3.fr-par.scw.cloud:443", false},
 		{"https://s3.fr-par.scw.cloud", true},
 		{"https://s3.nl-ams.scw.cloud", true},
 		{"s3.fr-par.scw.cloud", true},
@@ -856,6 +1069,12 @@ func TestIsCloudflareR2Endpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://abcdef123456.r2.cloudflarestorage.com:443", true},
+		{"http://abcdef123456.r2.cloudflarestorage.com:8080", true},
+		{"abcdef123456.r2.cloudflarestorage.com:443", true},
+		{"https://abcdef123456.r2.cloudflarestorage.com:8443/storage/v1/s3", true},
+		{"https://abcdef123456.r2.cloudflarestorage.com.example.com:443", false},
+		{"https://user@abcdef123456.r2.cloudflarestorage.com:443", false},
 		{"https://abcdef123456.r2.cloudflarestorage.com", true},
 		{"https://account-id.r2.cloudflarestorage.com", true},
 		{"abcdef123456.r2.cloudflarestorage.com", true},
@@ -878,6 +1097,12 @@ func TestIsSupabaseEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://myproject.supabase.co:443", true},
+		{"http://myproject.supabase.co:8080", true},
+		{"myproject.supabase.co:443", true},
+		{"https://myproject.supabase.co:8443/storage/v1/s3", true},
+		{"https://myproject.supabase.co.example.com:443", false},
+		{"https://user@myproject.supabase.co:443", false},
 		{"https://myproject.supabase.co/storage/v1/s3", true},
 		{"https://abcdefghij.supabase.co", true},
 		{"myproject.supabase.co", true},
@@ -900,6 +1125,12 @@ func TestIsHetznerEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://fsn1.your-objectstorage.com:443", true},
+		{"http://fsn1.your-objectstorage.com:8080", true},
+		{"fsn1.your-objectstorage.com:443", true},
+		{"https://fsn1.your-objectstorage.com:8443/storage/v1/s3", true},
+		{"https://fsn1.your-objectstorage.com.example.com:443", false},
+		{"https://user@fsn1.your-objectstorage.com:443", false},
 		{"fsn1.your-objectstorage.com", true},
 		{"nbg1.your-objectstorage.com", true},
 		{"https://fsn1.your-objectstorage.com", true},
@@ -924,6 +1155,18 @@ func TestIsMinIOEndpoint(t *testing.T) {
 		endpoint string
 		expected bool
 	}{
+		{"https://minio.example.net:9443", true},
+		{" HTTPS://MINIO.EXAMPLE.NET:9443 ", true},
+		{"http://[::1]:9000", true},
+		{"[::1]:9000", true},
+		{"http://[::1]", false},
+		{"https://minio.example.net", false},
+		{"https://minio.example.net/path:9000", false},
+		{"https://minio.example.net:invalid", false},
+		{"https://user@minio.example.net:9000", false},
+		{"https://sfo3.digitaloceanspaces.com:443", false},
+		{"https://fsn1.your-objectstorage.com:443", false},
+		{"https://storage.googleapis.com:443", false},
 		{"http://localhost:9000", true},
 		{"http://192.168.1.100:9000", true},
 		{"minio.local:9000", true},

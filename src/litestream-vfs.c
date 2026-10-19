@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#define LITESTREAM_MIN_SQLITE_VERSION_NUMBER 3031000
+
 /* sqlite3vfs already called SQLITE_EXTENSION_INIT1 */
 extern const sqlite3_api_routines *sqlite3_api;
 
@@ -25,12 +27,19 @@ static void litestream_time_impl(sqlite3_context* ctx, int argc, sqlite3_value**
 static void litestream_txid_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv);
 static void litestream_lag_impl(sqlite3_context* ctx, int argc, sqlite3_value** argv);
 static void litestream_function_destroy(void* db);
-static void litestream_auto_extension(sqlite3* db, const char** pzErrMsg, const struct sqlite3_api_routines* pApi);
+static int litestream_auto_extension(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi);
 
 /* This routine is called when the extension is loaded. */
 int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_routines *pApi) {
   int rc = SQLITE_OK;
   SQLITE_EXTENSION_INIT2(pApi);
+
+  if (sqlite3_libversion_number() < LITESTREAM_MIN_SQLITE_VERSION_NUMBER) {
+    if (pzErrMsg != NULL) {
+      *pzErrMsg = sqlite3_mprintf("litestream VFS requires SQLite 3.31.0 or later (found %s)", sqlite3_libversion());
+    }
+    return SQLITE_ERROR;
+  }
 
   /* Call into Go to register the VFS and check for errors. */
   char* err = LitestreamVFSRegister();
@@ -47,12 +56,13 @@ int sqlite3_litestreamvfs_init(sqlite3 *db, char **pzErrMsg, const sqlite3_api_r
   return rc;
 }
 
-static void litestream_auto_extension(sqlite3* db, const char** pzErrMsg, const struct sqlite3_api_routines* pApi) {
+/* SQLite fails an open whose auto-extension returns non-zero, so a connection that is not ours must report success. */
+static int litestream_auto_extension(sqlite3* db, char** pzErrMsg, const sqlite3_api_routines* pApi) {
   (void)pzErrMsg;
   (void)pApi;
 
   if (litestream_register_connection(db) != SQLITE_OK) {
-    return;
+    return SQLITE_OK;
   }
 
   /* litestream_set_time(timestamp) - for time travel */
@@ -62,6 +72,8 @@ static void litestream_auto_extension(sqlite3* db, const char** pzErrMsg, const 
   sqlite3_create_function_v2(db, "litestream_time", 0, SQLITE_UTF8, db, litestream_time_impl, 0, 0, 0);
   sqlite3_create_function_v2(db, "litestream_txid", 0, SQLITE_UTF8, db, litestream_txid_impl, 0, 0, 0);
   sqlite3_create_function_v2(db, "litestream_lag", 0, SQLITE_UTF8, db, litestream_lag_impl, 0, 0, 0);
+
+  return SQLITE_OK;
 }
 
 static int litestream_register_connection(sqlite3* db) {

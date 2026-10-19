@@ -73,6 +73,7 @@ func TestParseSnapshotFilenameV3(t *testing.T) {
 			{"00000001.snapshot.lz4", 1},
 			{"000000ff.snapshot.lz4", 255},
 			{"12345678.snapshot.lz4", 0x12345678},
+			{"7fffffff.snapshot.lz4", 0x7fffffff},
 		}
 		for _, tt := range tests {
 			index, err := litestream.ParseSnapshotFilenameV3(tt.filename)
@@ -96,6 +97,9 @@ func TestParseSnapshotFilenameV3(t *testing.T) {
 			"0000000g.snapshot.lz4",  // invalid hex
 			"00000001.SNAPSHOT.lz4",  // uppercase
 			"00000001.snapshot.lz4.bak",
+			"80000000.snapshot.lz4",
+			"f2345678.snapshot.lz4",
+			"ffffffff.snapshot.lz4",
 		}
 		for _, filename := range invalids {
 			_, err := litestream.ParseSnapshotFilenameV3(filename)
@@ -133,6 +137,9 @@ func TestParseWALSegmentFilenameV3(t *testing.T) {
 			{"00000000_00000000.wal.lz4", 0, 0},
 			{"00000001_00001000.wal.lz4", 1, 4096},
 			{"000000ff_12345678.wal.lz4", 255, 0x12345678},
+			{"000000ff_f2345678.wal.lz4", 255, 0xf2345678},
+			{"000000ff_123456789.wal.lz4", 255, 0x123456789},
+			{"000000ff_123456789012345.wal.lz4", 255, 0x123456789012345},
 		}
 		for _, tt := range tests {
 			index, offset, err := litestream.ParseWALSegmentFilenameV3(tt.filename)
@@ -151,10 +158,13 @@ func TestParseWALSegmentFilenameV3(t *testing.T) {
 		invalids := []string{
 			"",
 			"invalid.wal",
-			"00000001.wal.lz4",         // missing offset
-			"00000001_00001000.wal",    // missing .lz4
-			"0000001_00001000.wal.lz4", // 7 chars index
-			"00000001_0001000.wal.lz4", // 7 chars offset
+			"00000001.wal.lz4",                   // missing offset
+			"00000001_00001000.wal",              // missing .lz4
+			"0000001_00001000.wal.lz4",           // 7 chars index
+			"00000001_0001000.wal.lz4",           // 7 chars offset
+			"00000001_12345678123456789.wal.lz4", // 17 chars offset
+			"f2345678_00000001.wal.lz4",          // index out of range
+			"00000001_f234567812345678.wal.lz4",  // offset out of range
 		}
 		for _, filename := range invalids {
 			_, _, err := litestream.ParseWALSegmentFilenameV3(filename)

@@ -13,11 +13,18 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
@@ -94,6 +101,9 @@ func TestReplicaClient_DefaultSignPayload(t *testing.T) {
 	client := NewReplicaClient()
 	if !client.SignPayload {
 		t.Error("expected default SignPayload to be true for AWS S3 compatibility")
+	}
+	if !client.SignAcceptEncoding {
+		t.Error("expected default SignAcceptEncoding to be true")
 	}
 	if !client.RequireContentMD5 {
 		t.Error("expected default RequireContentMD5 to be true for AWS S3 compatibility")
@@ -357,7 +367,9 @@ func TestReplicaClient_MultipartUploadThreshold(t *testing.T) {
 		wantMultipart bool
 	}{
 		{"BelowThreshold_4MB", 4 * mb, false},
-		{"AtThreshold_5MB", 5 * mb, true},
+		// With a seekable body the uploader knows the total size, so an
+		// object of exactly one part is sent as a single PutObject.
+		{"AtThreshold_5MB", 5 * mb, false},
 		{"AboveThreshold_6MB", 6 * mb, true},
 	}
 
@@ -461,6 +473,559 @@ func TestReplicaClient_MultipartUploadThreshold(t *testing.T) {
 				t.Error("aws-chunked encoding detected; this is incompatible with S3-compatible providers")
 			}
 		})
+	}
+}
+
+// TestReplicaClient_WriteLTXFile_SmallUploadAllocations verifies that
+// sub-part-size uploads bypass the multipart upload manager, which allocates
+// a fresh 5 MiB part buffer per call even for tiny objects (issue #1327).
+// TotalAlloc is monotonic, so GC activity cannot skew the measurement.
+func TestReplicaClient_WriteLTXFile_SmallUploadAllocations(t *testing.T) {
+	const (
+		uploads         = 16
+		perUploadBudget = 1 << 20 // well below the 5 MiB part buffer, well above per-request overhead
+	)
+
+	run := func(t *testing.T, newBody func() io.Reader) {
+		t.Helper()
+
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+
+		client := NewReplicaClient()
+		client.Bucket = "test-bucket"
+		client.Path = "replica"
+		client.Region = "us-east-1"
+		client.Endpoint = server.URL
+		client.ForcePathStyle = true
+		client.AccessKeyID = "test-access-key"
+		client.SecretAccessKey = "test-secret-key"
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+
+		upload := func() {
+			if _, err := client.WriteLTXFile(ctx, 0, 2, 2, newBody()); err != nil {
+				t.Fatalf("WriteLTXFile() error: %v", err)
+			}
+		}
+
+		// Warm up one-time allocations (TLS session, middleware stacks, connection pool).
+		upload()
+		upload()
+
+		var before, after runtime.MemStats
+		runtime.ReadMemStats(&before)
+		for range uploads {
+			upload()
+		}
+		runtime.ReadMemStats(&after)
+
+		allocated := after.TotalAlloc - before.TotalAlloc
+		t.Logf("allocated %.2f MiB per upload", float64(allocated)/uploads/(1<<20))
+		if allocated > uploads*perUploadBudget {
+			t.Errorf("allocated %.2f MiB per upload, want < %.2f MiB: small objects must not stream through multipart part buffers",
+				float64(allocated)/uploads/(1<<20), float64(perUploadBudget)/(1<<20))
+		}
+	}
+
+	data := mustLTXWithSize(t, 8192)
+
+	t.Run("KnownSizeFile", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "0000000000000002.ltx")
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		var files []*os.File
+		t.Cleanup(func() {
+			for _, f := range files {
+				_ = f.Close()
+			}
+		})
+
+		run(t, func() io.Reader {
+			f, err := os.Open(path)
+			if err != nil {
+				t.Fatalf("Open: %v", err)
+			}
+			files = append(files, f)
+			return f
+		})
+	})
+
+	t.Run("UnknownSizeStream", func(t *testing.T) {
+		run(t, func() io.Reader {
+			pr, pw := io.Pipe()
+			go func() {
+				_, _ = pw.Write(data)
+				_ = pw.Close()
+			}()
+			return pr
+		})
+	})
+}
+
+// newTestReplicaClient returns a ReplicaClient configured against server with
+// the same defaults the upload tests use.
+func newTestReplicaClient(t *testing.T, server *httptest.Server) *ReplicaClient {
+	t.Helper()
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = server.URL
+	client.ForcePathStyle = true
+	client.AccessKeyID = "test-access-key"
+	client.SecretAccessKey = "test-secret-key"
+	return client
+}
+
+// TestReplicaClient_WriteLTXFile_SinglePutKnownSize verifies the known-size
+// fast path sends one PutObject with an exact Content-Length and intact body.
+func TestReplicaClient_WriteLTXFile_SinglePutKnownSize(t *testing.T) {
+	data := mustLTXWithSize(t, 8192)
+
+	var (
+		mu            sync.Mutex
+		putCount      int
+		gotInitiate   bool
+		contentLength int64
+		gotBody       []byte
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if r.Method == http.MethodPost && r.URL.Query().Has("uploads") {
+			mu.Lock()
+			gotInitiate = true
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test-key</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
+			return
+		}
+
+		if r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			putCount++
+			contentLength = r.ContentLength
+			gotBody = body
+			mu.Unlock()
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := newTestReplicaClient(t, server)
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "0000000000000002.ltx")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+
+	info, err := client.WriteLTXFile(ctx, 0, 2, 2, f)
+	if err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotInitiate {
+		t.Error("did not expect CreateMultipartUpload for small object")
+	}
+	if putCount != 1 {
+		t.Errorf("PUT count = %d, want 1", putCount)
+	}
+	if contentLength != int64(len(data)) {
+		t.Errorf("Content-Length = %d, want %d", contentLength, len(data))
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Errorf("uploaded body does not match source data (%d bytes vs %d bytes)", len(gotBody), len(data))
+	}
+	if info.Size != int64(len(data)) {
+		t.Errorf("info.Size = %d, want %d", info.Size, len(data))
+	}
+}
+
+// TestReplicaClient_WriteLTXFile_SinglePutRetries verifies the single-put body
+// stays seekable so the SDK can replay it after a transient server error.
+func TestReplicaClient_WriteLTXFile_SinglePutRetries(t *testing.T) {
+	data := mustLTXWithSize(t, 8192)
+
+	var (
+		mu        sync.Mutex
+		putBodies [][]byte
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if r.Method != http.MethodPut {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		putBodies = append(putBodies, body)
+		attempt := len(putBodies)
+		mu.Unlock()
+
+		if attempt == 1 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("ETag", `"test-etag"`)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := newTestReplicaClient(t, server)
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	path := filepath.Join(t.TempDir(), "0000000000000002.ltx")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer f.Close()
+
+	info, err := client.WriteLTXFile(ctx, 0, 2, 2, f)
+	if err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(putBodies) != 2 {
+		t.Fatalf("PUT count = %d, want 2 (initial attempt + retry)", len(putBodies))
+	}
+	if !bytes.Equal(putBodies[1], data) {
+		t.Errorf("retried body does not match source data (%d bytes vs %d bytes)", len(putBodies[1]), len(data))
+	}
+	if info.Size != int64(len(data)) {
+		t.Errorf("info.Size = %d, want %d", info.Size, len(data))
+	}
+}
+
+// TestReplicaClient_WriteLTXFile_StreamSmallSinglePut verifies unknown-size
+// readers below the part size are buffered and sent as a single PutObject
+// with an exact Content-Length.
+func TestReplicaClient_WriteLTXFile_StreamSmallSinglePut(t *testing.T) {
+	data := mustLTXWithSize(t, 8192)
+
+	var (
+		mu            sync.Mutex
+		putCount      int
+		gotInitiate   bool
+		contentLength int64
+		gotBody       []byte
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+
+		if r.Method == http.MethodPost && r.URL.Query().Has("uploads") {
+			mu.Lock()
+			gotInitiate = true
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test-key</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
+			return
+		}
+
+		if r.Method == http.MethodPut {
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			putCount++
+			contentLength = r.ContentLength
+			gotBody = body
+			mu.Unlock()
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := newTestReplicaClient(t, server)
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write(data)
+		_ = pw.Close()
+	}()
+
+	info, err := client.WriteLTXFile(ctx, 0, 2, 2, pr)
+	if err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotInitiate {
+		t.Error("did not expect CreateMultipartUpload for small streamed object")
+	}
+	if putCount != 1 {
+		t.Errorf("PUT count = %d, want 1", putCount)
+	}
+	if contentLength != int64(len(data)) {
+		t.Errorf("Content-Length = %d, want %d", contentLength, len(data))
+	}
+	if !bytes.Equal(gotBody, data) {
+		t.Errorf("uploaded body does not match source data (%d bytes vs %d bytes)", len(gotBody), len(data))
+	}
+	if info.Size != int64(len(data)) {
+		t.Errorf("info.Size = %d, want %d", info.Size, len(data))
+	}
+}
+
+// TestReplicaClient_WriteLTXFile_StreamLargeMultipartRoundTrip verifies
+// unknown-size readers above the part size fall back to multipart upload and
+// that the buffered prefix plus streamed remainder reassemble byte-for-byte.
+func TestReplicaClient_WriteLTXFile_StreamLargeMultipartRoundTrip(t *testing.T) {
+	const mb = 1024 * 1024
+	data := mustLTXWithSize(t, 12*mb)
+
+	var (
+		mu          sync.Mutex
+		parts       = make(map[int][]byte)
+		singlePuts  int
+		gotComplete bool
+	)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		query := r.URL.Query()
+
+		if r.Method == http.MethodPost && query.Has("uploads") {
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test-key</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
+			return
+		}
+
+		if r.Method == http.MethodPut && query.Get("partNumber") != "" {
+			partNumber, err := strconv.Atoi(query.Get("partNumber"))
+			if err != nil {
+				t.Errorf("invalid partNumber %q: %v", query.Get("partNumber"), err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			body, _ := io.ReadAll(r.Body)
+			mu.Lock()
+			parts[partNumber] = body
+			mu.Unlock()
+			w.Header().Set("ETag", fmt.Sprintf(`"part-etag-%d"`, partNumber))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodPost && query.Get("uploadId") != "" {
+			mu.Lock()
+			gotComplete = true
+			mu.Unlock()
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Location>http://test-bucket.s3.amazonaws.com/test-key</Location><Bucket>test-bucket</Bucket><Key>test-key</Key><ETag>"complete-etag"</ETag></CompleteMultipartUploadResult>`)
+			return
+		}
+
+		if r.Method == http.MethodPut {
+			mu.Lock()
+			singlePuts++
+			mu.Unlock()
+			w.Header().Set("ETag", `"test-etag"`)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := newTestReplicaClient(t, server)
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		_, _ = pw.Write(data)
+		_ = pw.Close()
+	}()
+
+	info, err := client.WriteLTXFile(ctx, 0, 2, 2, pr)
+	if err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if !gotComplete {
+		t.Error("expected CompleteMultipartUpload but did not receive one")
+	}
+	if singlePuts != 0 {
+		t.Errorf("single PUT count = %d, want 0 for large streamed object", singlePuts)
+	}
+	if len(parts) < 2 {
+		t.Fatalf("part count = %d, want at least 2", len(parts))
+	}
+
+	var assembled []byte
+	for i := 1; i <= len(parts); i++ {
+		part, ok := parts[i]
+		if !ok {
+			t.Fatalf("missing part %d of %d", i, len(parts))
+		}
+		assembled = append(assembled, part...)
+	}
+	if !bytes.Equal(assembled, data) {
+		t.Errorf("reassembled body does not match source data (%d bytes vs %d bytes)", len(assembled), len(data))
+	}
+	if info.Size != int64(len(data)) {
+		t.Errorf("info.Size = %d, want %d", info.Size, len(data))
+	}
+}
+
+// TestReplicaClient_WriteLTXFile_PartSizeBelowMinimum verifies a part size
+// below the SDK minimum still fails for small objects instead of being
+// silently accepted by the single-put path.
+func TestReplicaClient_WriteLTXFile_PartSizeBelowMinimum(t *testing.T) {
+	var requests atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := newTestReplicaClient(t, server)
+	client.PartSize = 1024 * 1024 // below the SDK's 5 MiB minimum
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	_, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(mustLTX(t)))
+	if err == nil {
+		t.Fatal("expected error for part size below minimum, got nil")
+	}
+	if !strings.Contains(err.Error(), "part size must be at least") {
+		t.Errorf("error = %q, want part size validation error", err)
+	}
+	if n := requests.Load(); n != 0 {
+		t.Errorf("request count = %d, want 0", n)
+	}
+}
+
+// TestReplicaClient_WriteLTXFile_MultipartParamParity verifies StorageClass,
+// SSE-C, and timestamp metadata reach the multipart initiate request just
+// like they do on single-put uploads.
+func TestReplicaClient_WriteLTXFile_MultipartParamParity(t *testing.T) {
+	const mb = 1024 * 1024
+
+	validKey := base64.StdEncoding.EncodeToString([]byte("12345678901234567890123456789012"))
+	keyBytes, _ := base64.StdEncoding.DecodeString(validKey)
+	keyMD5Sum := md5.Sum(keyBytes)
+	expectedMD5 := base64.StdEncoding.EncodeToString(keyMD5Sum[:])
+
+	data := mustLTXWithSize(t, 12*mb)
+
+	initiateHeaders := make(chan http.Header, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+		query := r.URL.Query()
+
+		if r.Method == http.MethodPost && query.Has("uploads") {
+			select {
+			case initiateHeaders <- r.Header.Clone():
+			default:
+			}
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>test-key</Key><UploadId>test-upload-id</UploadId></InitiateMultipartUploadResult>`)
+			return
+		}
+
+		if r.Method == http.MethodPut && query.Get("partNumber") != "" {
+			w.Header().Set("ETag", fmt.Sprintf(`"part-etag-%s"`, query.Get("partNumber")))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
+		if r.Method == http.MethodPost && query.Get("uploadId") != "" {
+			w.Header().Set("Content-Type", "application/xml")
+			fmt.Fprint(w, `<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Location>http://test-bucket.s3.amazonaws.com/test-key</Location><Bucket>test-bucket</Bucket><Key>test-key</Key><ETag>"complete-etag"</ETag></CompleteMultipartUploadResult>`)
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	client := newTestReplicaClient(t, server)
+	client.StorageClass = "STANDARD_IA"
+	client.SSECustomerKey = validKey
+
+	ctx := context.Background()
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
+	}
+
+	select {
+	case hdr := <-initiateHeaders:
+		if got := hdr.Get("x-amz-storage-class"); got != "STANDARD_IA" {
+			t.Errorf("storage class header = %q, want STANDARD_IA", got)
+		}
+		if got := hdr.Get("x-amz-server-side-encryption-customer-algorithm"); got != "AES256" {
+			t.Errorf("SSE-C algorithm header = %q, want AES256", got)
+		}
+		if got := hdr.Get("x-amz-server-side-encryption-customer-key"); got != validKey {
+			t.Errorf("SSE-C key header = %q, want %q", got, validKey)
+		}
+		if got := hdr.Get("x-amz-server-side-encryption-customer-key-md5"); got != expectedMD5 {
+			t.Errorf("SSE-C key MD5 header = %q, want %q", got, expectedMD5)
+		}
+		if got := hdr.Get("x-amz-meta-litestream-timestamp"); got == "" {
+			t.Error("timestamp metadata header missing on multipart initiate")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timeout waiting for CreateMultipartUpload request")
 	}
 }
 
@@ -1351,6 +1916,163 @@ func TestReplicaClient_TigrisConsistentHeader(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_AcceptEncodingSigning(t *testing.T) {
+	tests := []struct {
+		name                     string
+		endpoint                 string
+		disableSigning           bool
+		wantAcceptEncodingSigned bool
+	}{
+		{
+			name:     "GoogleCloudStorageGlobal",
+			endpoint: "https://storage.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageExplicitPort",
+			endpoint: "https://storage.googleapis.com:443",
+		},
+		{
+			name:     "GoogleCloudStorageTrailingDot",
+			endpoint: "https://storage.googleapis.com.",
+		},
+		{
+			name:     "GoogleCloudStorageRegional",
+			endpoint: "https://storage.me-central2.rep.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageLocational",
+			endpoint: "https://us-central1-storage.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageMTLS",
+			endpoint: "https://storage.mtls.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageLegacyDownload",
+			endpoint: "https://storage-download.googleapis.com",
+		},
+		{
+			name:     "GoogleCloudStorageLegacyUpload",
+			endpoint: "https://storage-upload.googleapis.com",
+		},
+		{
+			name:                     "GoogleCloudStorageLookalike",
+			endpoint:                 "https://storage.googleapis.com.evil.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageMTLSLookalike",
+			endpoint:                 "https://storage.mtls.googleapis.com.evil.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageVirtualHostedBase",
+			endpoint:                 "https://bucket.storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageUserinfo",
+			endpoint:                 "attacker@storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageRegionalVirtualHostedBase",
+			endpoint:                 "https://backup-storage.storage.me-central2.rep.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "GoogleCloudStorageLocationalVirtualHostedBase",
+			endpoint:                 "https://backup-storage.us-central1-storage.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "UnrelatedGoogleAPI",
+			endpoint:                 "https://storageinsights.googleapis.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:                     "OtherS3CompatibleProvider",
+			endpoint:                 "https://s3.example.com",
+			wantAcceptEncodingSigned: true,
+		},
+		{
+			name:           "ExplicitOptOut",
+			endpoint:       "https://s3.example.com",
+			disableSigning: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			httpClient := smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+				authorization := r.Header.Get("Authorization")
+				if authorization == "" {
+					t.Fatal("Authorization header is empty")
+				}
+
+				got := strings.Contains(authorization, "SignedHeaders=accept-encoding;")
+				if got != tt.wantAcceptEncodingSigned {
+					t.Fatalf("Accept-Encoding signed = %v, want %v: %s", got, tt.wantAcceptEncodingSigned, authorization)
+				}
+
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"application/xml"}},
+					Body: io.NopCloser(strings.NewReader(
+						`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>test-bucket</Name><IsTruncated>false</IsTruncated></ListBucketResult>`,
+					)),
+				}, nil
+			})
+
+			cfg := aws.Config{
+				Region:      "us-east-1",
+				Credentials: aws.NewCredentialsCache(credentials.NewStaticCredentialsProvider("test-access-key", "test-secret-key", "")),
+				HTTPClient:  httpClient,
+			}
+
+			c := NewReplicaClient()
+			c.Endpoint = tt.endpoint
+			c.SignAcceptEncoding = !tt.disableSigning
+			c.logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			client := s3.NewFromConfig(cfg, func(o *s3.Options) {
+				o.BaseEndpoint = aws.String("https://example.com")
+				o.UsePathStyle = true
+				o.APIOptions = append(o.APIOptions, c.middlewareOption())
+			})
+
+			if _, err := client.ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+				Bucket: aws.String("test-bucket"),
+			}); err != nil {
+				t.Fatalf("ListObjectsV2() error: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewReplicaClientFromURL_SignAcceptEncoding(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want bool
+	}{
+		{name: "Default", url: "s3://mybucket/path", want: true},
+		{name: "CamelCase", url: "s3://mybucket/path?signAcceptEncoding=false"},
+		{name: "Hyphenated", url: "s3://mybucket/path?sign-accept-encoding=false"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.(*ReplicaClient).SignAcceptEncoding; got != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
 // TestReplicaClient_SSE_C_Validation tests SSE-C configuration validation
 func TestReplicaClient_SSE_C_Validation(t *testing.T) {
 	// Generate a valid 256-bit key (32 bytes)
@@ -2094,6 +2816,38 @@ func TestNewReplicaClientFromURL_QueryParamAliases(t *testing.T) {
 	}
 }
 
+func TestNewReplicaClientFromURL_InvalidUploadParams(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+	}{
+		{
+			name: "part-size_non_numeric",
+			url:  "s3://mybucket/path?part-size=abc",
+		},
+		{
+			name: "part-size_zero",
+			url:  "s3://mybucket/path?part-size=0",
+		},
+		{
+			name: "concurrency_negative",
+			url:  "s3://mybucket/path?concurrency=-1",
+		},
+		{
+			name: "concurrency_non_numeric",
+			url:  "s3://mybucket/path?concurrency=abc",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := litestream.NewReplicaClientFromURL(tt.url); err == nil {
+				t.Fatalf("NewReplicaClientFromURL(%q) expected error, got nil", tt.url)
+			}
+		})
+	}
+}
+
 func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 	tests := []struct {
 		name               string
@@ -2210,5 +2964,37 @@ func TestReplicaClient_RetryerSurvivesSustainedFailures(t *testing.T) {
 		if err := release(io.ErrUnexpectedEOF); err != nil {
 			t.Fatalf("release after failure %d: %v", i, err)
 		}
+	}
+}
+
+// TestTransportRetryer_RetriesProviderThrottleResponses covers S3-compatible
+// providers that load-shed with HTTP 408 / api error "RequestCanceled"
+// (observed from Tigris during soak testing). The SDK defaults treat neither
+// as retryable, so restores failed after effectively zero patience.
+func TestTransportRetryer_RetriesProviderThrottleResponses(t *testing.T) {
+	retryer := newTransportRetryer()
+
+	status408 := &smithyhttp.ResponseError{Response: &smithyhttp.Response{Response: &http.Response{StatusCode: http.StatusRequestTimeout}}, Err: fmt.Errorf("request timeout")}
+	if !retryer.IsErrorRetryable(status408) {
+		t.Fatal("HTTP 408 must be retryable for S3-compatible providers")
+	}
+
+	canceledCode := &smithy.GenericAPIError{Code: "RequestCanceled", Message: "Request is canceled."}
+	if !retryer.IsErrorRetryable(canceledCode) {
+		t.Fatal(`api error code "RequestCanceled" (server-side load shed) must be retryable`)
+	}
+
+	// A bare wrapped context.Canceled proves little: every classifier returns
+	// "unknown" for it, so it would come back non-retryable even without the
+	// canceled-error guard. Wrapping a RequestCanceled API error in a real
+	// smithy.CanceledError is the case that actually exercises precedence --
+	// the guard must win over the RequestCanceled classifier added above.
+	clientCanceled := &smithy.CanceledError{Err: &smithy.GenericAPIError{Code: "RequestCanceled", Message: "Request is canceled."}}
+	if retryer.IsErrorRetryable(clientCanceled) {
+		t.Fatal("genuine client-side cancellation must NOT be retryable, even wrapping a RequestCanceled api error")
+	}
+
+	if retryer.IsErrorRetryable(fmt.Errorf("wrapped: %w", context.Canceled)) {
+		t.Fatal("genuine client-side context cancellation must NOT be retryable")
 	}
 }

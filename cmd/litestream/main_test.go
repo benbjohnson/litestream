@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ import (
 	main "github.com/benbjohnson/litestream/cmd/litestream"
 	"github.com/benbjohnson/litestream/file"
 	"github.com/benbjohnson/litestream/gs"
+	"github.com/benbjohnson/litestream/nats"
 	"github.com/benbjohnson/litestream/s3"
 	"github.com/benbjohnson/litestream/sftp"
 )
@@ -424,6 +426,128 @@ func TestNewGSReplicaFromConfig(t *testing.T) {
 	}
 }
 
+func TestNewNATSReplicaFromConfig_TLS(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: true
+      root-cas: [ca.pem]
+      client-cert: client.pem
+      client-key: client-key.pem
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err := main.NewReplicaFromConfig(config.DBs[0].Replica, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client, ok := r.Client.(*nats.ReplicaClient)
+	if !ok {
+		t.Fatal("unexpected replica type")
+	}
+	if !client.TLS {
+		t.Fatal("TLS=false, want true")
+	}
+	if got, want := client.RootCAs, []string{"ca.pem"}; !slices.Equal(got, want) {
+		t.Fatalf("RootCAs=%v, want %v", got, want)
+	}
+	if got, want := client.ClientCert, "client.pem"; got != want {
+		t.Fatalf("ClientCert=%q, want %q", got, want)
+	}
+	if got, want := client.ClientKey, "client-key.pem"; got != want {
+		t.Fatalf("ClientKey=%q, want %q", got, want)
+	}
+}
+
+func TestNewNATSReplicaFromConfig_TLSOverridesGlobalDefault(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+tls: true
+dbs:
+  - path: /tmp/db
+    replica:
+      type: nats
+      bucket: bucket
+      tls: false
+  - path: /tmp/db-inherits
+    replica:
+      type: nats
+      bucket: bucket
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "ExplicitFalse", index: 0, want: false},
+		{name: "InheritedTrue", index: 1, want: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			r, err := main.NewReplicaFromConfig(config.DBs[test.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, ok := r.Client.(*nats.ReplicaClient)
+			if !ok {
+				t.Fatal("unexpected replica type")
+			}
+			if client.TLS != test.want {
+				t.Fatalf("TLS=%v, want %v", client.TLS, test.want)
+			}
+		})
+	}
+}
+
+func TestNewS3ReplicaFromConfig_SignAcceptEncodingInheritance(t *testing.T) {
+	config, err := main.ParseConfig(strings.NewReader(`
+sign-accept-encoding: false
+dbs:
+  - path: /tmp/db-inherits
+    replica:
+      type: s3
+      bucket: bucket
+      path: db
+  - path: /tmp/db-overrides
+    replica:
+      type: s3
+      bucket: bucket
+      path: db
+      sign-accept-encoding: true
+`), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name  string
+		index int
+		want  bool
+	}{
+		{name: "InheritedFalse", index: 0},
+		{name: "ExplicitTrue", index: 1, want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := main.NewS3ReplicaClientFromConfig(config.DBs[tt.index].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.SignAcceptEncoding != tt.want {
+				t.Fatalf("SignAcceptEncoding=%v, want %v", client.SignAcceptEncoding, tt.want)
+			}
+		})
+	}
+}
+
 func TestNewSFTPReplicaFromConfig(t *testing.T) {
 	hostKey := "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAnK0+GdwOelXlAXdqLx/qvS7WHMr3rH7zW2+0DtmK5r"
 	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{
@@ -792,7 +916,7 @@ func TestParseReplicaURL_AccessPoint(t *testing.T) {
 }
 
 func TestConfig_Validate_L0Retention(t *testing.T) {
-	t.Run("ZeroRetention", func(t *testing.T) {
+	t.Run("ZeroRetentionDisables", func(t *testing.T) {
 		yaml := `
 l0-retention: 0s
 dbs:
@@ -800,9 +924,29 @@ dbs:
     replica:
       url: file:///tmp/replica
 `
+		config, err := main.ParseConfig(strings.NewReader(yaml), false)
+		if err != nil {
+			t.Fatalf("expected zero l0 retention to be accepted: %v", err)
+		}
+		if config.L0Retention == nil {
+			t.Fatal("expected l0 retention to be set")
+		}
+		if *config.L0Retention != 0 {
+			t.Errorf("expected l0 retention of 0, got %v", *config.L0Retention)
+		}
+	})
+
+	t.Run("NegativeRetention", func(t *testing.T) {
+		yaml := `
+l0-retention: -1s
+dbs:
+  - path: /tmp/test.db
+    replica:
+      url: file:///tmp/replica
+`
 		_, err := main.ParseConfig(strings.NewReader(yaml), false)
 		if err == nil {
-			t.Fatal("expected error for zero l0 retention")
+			t.Fatal("expected error for negative l0 retention")
 		}
 		if !errors.Is(err, main.ErrInvalidL0Retention) {
 			t.Errorf("expected ErrInvalidL0Retention, got %v", err)
@@ -2203,6 +2347,56 @@ func TestDBConfigValidation(t *testing.T) {
 		}
 	})
 
+	t.Run("duplicate path", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/db.sqlite", Replica: &main.ReplicaConfig{Path: "/path/to/rep-a"}},
+			{Path: "/path/to/db.sqlite", Replica: &main.ReplicaConfig{Path: "/path/to/rep-b"}},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when the same path is listed twice")
+		}
+		if !strings.Contains(err.Error(), `database config #2: duplicate path "/path/to/db.sqlite"`) {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+		if !strings.Contains(err.Error(), "already used by database config #1") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("duplicate path after cleaning", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/db.sqlite"},
+			{Path: "/path/to/../to/db.sqlite"},
+		}
+
+		err := config.Validate()
+		if err == nil {
+			t.Fatal("expected validation error when the same path is listed twice in different spellings")
+		}
+		if !strings.Contains(err.Error(), "duplicate path") {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("distinct paths", func(t *testing.T) {
+		config := main.DefaultConfig()
+		config.DBs = []*main.DBConfig{
+			{Path: "/path/to/a.sqlite"},
+			{Path: "/path/to/b.sqlite"},
+			{Dir: "/path/to/dir", Pattern: "*.db"},
+			{Dir: "/path/to/dir", Pattern: "*.sqlite"},
+		}
+
+		err := config.Validate()
+		if err != nil {
+			t.Errorf("unexpected validation error for distinct paths: %v", err)
+		}
+	})
+
 	t.Run("valid directory configuration", func(t *testing.T) {
 		config := main.DefaultConfig()
 		config.DBs = []*main.DBConfig{
@@ -3046,6 +3240,12 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false for Tigris")
 		}
+		if client.Concurrency != s3.DefaultTigrisConcurrency {
+			t.Errorf("expected Tigris concurrency %d, got %d", s3.DefaultTigrisConcurrency, client.Concurrency)
+		}
+		if client.PartSize != s3.DefaultTigrisPartSize {
+			t.Errorf("expected Tigris part size %d, got %d", s3.DefaultTigrisPartSize, client.PartSize)
+		}
 	})
 
 	t.Run("TigrisConfigEndpoint", func(t *testing.T) {
@@ -3067,6 +3267,12 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false for config-based Tigris endpoint")
+		}
+		if client.Concurrency != s3.DefaultTigrisConcurrency {
+			t.Errorf("expected config-based Tigris concurrency %d, got %d", s3.DefaultTigrisConcurrency, client.Concurrency)
+		}
+		if client.PartSize != s3.DefaultTigrisPartSize {
+			t.Errorf("expected config-based Tigris part size %d, got %d", s3.DefaultTigrisPartSize, client.PartSize)
 		}
 	})
 
@@ -3090,7 +3296,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 	t.Run("QuerySigningOptions", func(t *testing.T) {
 		config := &main.ReplicaConfig{
-			URL: "s3://bucket/db?sign-payload=true&require-content-md5=false",
+			URL: "s3://bucket/db?sign-payload=true&sign-accept-encoding=false&require-content-md5=false",
 		}
 
 		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
@@ -3100,19 +3306,40 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		if !client.SignPayload {
 			t.Error("expected SignPayload to be true when query parameter is set")
 		}
+		if client.SignAcceptEncoding {
+			t.Error("expected SignAcceptEncoding to be false when disabled via query")
+		}
 		if client.RequireContentMD5 {
 			t.Error("expected RequireContentMD5 to be false when disabled via query")
 		}
 	})
 
+	t.Run("QuerySignAcceptEncodingAliases", func(t *testing.T) {
+		for _, param := range []string{"signAcceptEncoding", "sign-accept-encoding"} {
+			t.Run(param, func(t *testing.T) {
+				client, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+					URL: "s3://bucket/db?" + param + "=false",
+				}, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if client.SignAcceptEncoding {
+					t.Error("expected SignAcceptEncoding to be false")
+				}
+			})
+		}
+	})
+
 	t.Run("ConfigOverridesQuerySigning", func(t *testing.T) {
 		signTrue := true
+		signAcceptEncodingTrue := true
 		requireFalse := false
 		config := &main.ReplicaConfig{
-			URL: "s3://bucket/db?sign-payload=false&require-content-md5=true",
+			URL: "s3://bucket/db?sign-payload=false&sign-accept-encoding=false&require-content-md5=true",
 			ReplicaSettings: main.ReplicaSettings{
-				SignPayload:       &signTrue,
-				RequireContentMD5: &requireFalse,
+				SignPayload:        &signTrue,
+				SignAcceptEncoding: &signAcceptEncodingTrue,
+				RequireContentMD5:  &requireFalse,
 			},
 		}
 
@@ -3122,6 +3349,9 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 		}
 		if !client.SignPayload {
 			t.Error("expected config SignPayload to override query parameter")
+		}
+		if !client.SignAcceptEncoding {
+			t.Error("expected config SignAcceptEncoding to override query parameter")
 		}
 		if client.RequireContentMD5 {
 			t.Error("expected config RequireContentMD5=false to override query parameter")
@@ -3164,6 +3394,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			{"CloudflareR2", "https://accountid.r2.cloudflarestorage.com"},
 			{"MinIO", "http://localhost:9000"},
 			{"Supabase", "https://myproject.supabase.co/storage/v1/s3"},
+			{"Hetzner", "https://fsn1.your-objectstorage.com"},
 		}
 
 		for _, tt := range tests {
@@ -3222,6 +3453,139 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 
 		if client.SignPayload {
 			t.Error("expected explicit SignPayload=false to override R2 default")
+		}
+	})
+
+	t.Run("URLWithUploadParams", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?part-size=10485760&concurrency=4",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 10485760 {
+			t.Errorf("expected PartSize 10485760, got %d", client.PartSize)
+		}
+		if client.Concurrency != 4 {
+			t.Errorf("expected Concurrency 4, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("URLWithUploadParamsCamelCase", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?partSize=8388608",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 8388608 {
+			t.Errorf("expected PartSize 8388608, got %d", client.PartSize)
+		}
+
+		config = &main.ReplicaConfig{
+			URL: "s3://mybucket/path?partSize=8388608&part-size=1048576",
+		}
+
+		client, err = main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != 8388608 {
+			t.Errorf("expected camelCase partSize to win, got %d", client.PartSize)
+		}
+	})
+
+	t.Run("ConfigOverridesQueryUploadParams", func(t *testing.T) {
+		partSize := main.ByteSize(5 * 1024 * 1024)
+		concurrency := 8
+		config := &main.ReplicaConfig{
+			URL: "s3://mybucket/path?part-size=1048576&concurrency=2",
+			ReplicaSettings: main.ReplicaSettings{
+				PartSize:    &partSize,
+				Concurrency: &concurrency,
+			},
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.PartSize != int64(5*1024*1024) {
+			t.Errorf("expected config PartSize %d to override query, got %d", int64(5*1024*1024), client.PartSize)
+		}
+		if client.Concurrency != 8 {
+			t.Errorf("expected config Concurrency 8 to override query, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("InvalidUploadParams", func(t *testing.T) {
+		tests := []struct {
+			name  string
+			url   string
+			param string
+		}{
+			{"part-size_non_numeric", "s3://mybucket/path?part-size=abc", "part-size"},
+			{"part-size_zero", "s3://mybucket/path?part-size=0", "part-size"},
+			{"part-size_negative", "s3://mybucket/path?part-size=-1", "part-size"},
+			{"concurrency_non_numeric", "s3://mybucket/path?concurrency=abc", "concurrency"},
+			{"concurrency_zero", "s3://mybucket/path?concurrency=0", "concurrency"},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				_, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: tt.url}, nil)
+				if err == nil {
+					t.Fatalf("expected error for %q, got nil", tt.url)
+				}
+				if !strings.Contains(err.Error(), tt.param) {
+					t.Errorf("expected error to name parameter %q, got %q", tt.param, err.Error())
+				}
+			})
+		}
+	})
+
+	t.Run("R2QueryConcurrencyOverride", func(t *testing.T) {
+		config := &main.ReplicaConfig{
+			URL: "s3://bucket/db?endpoint=https://accountid.r2.cloudflarestorage.com&concurrency=5",
+		}
+
+		client, err := main.NewS3ReplicaClientFromConfig(config, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if client.Concurrency != 5 {
+			t.Errorf("expected query concurrency 5 to override R2 default, got %d", client.Concurrency)
+		}
+	})
+
+	t.Run("UploadParamsParity", func(t *testing.T) {
+		url := "s3://mybucket/path?endpoint=http://localhost:9000&part-size=8388608&concurrency=4"
+
+		urlClient, err := litestream.NewReplicaClientFromURL(url)
+		if err != nil {
+			t.Fatalf("URL factory error: %v", err)
+		}
+		uc := urlClient.(*s3.ReplicaClient)
+
+		cc, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: url}, nil)
+		if err != nil {
+			t.Fatalf("Config factory error: %v", err)
+		}
+
+		if uc.PartSize != cc.PartSize {
+			t.Errorf("PartSize: URL=%d, Config=%d", uc.PartSize, cc.PartSize)
+		}
+		if uc.Concurrency != cc.Concurrency {
+			t.Errorf("Concurrency: URL=%d, Config=%d", uc.Concurrency, cc.Concurrency)
 		}
 	})
 }

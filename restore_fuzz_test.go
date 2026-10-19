@@ -34,12 +34,6 @@ func FuzzRestoreWithMissingCompactedFile(f *testing.F) {
 		client := file.NewReplicaClient(t.TempDir())
 		db.Replica.Client = client
 
-		if err := db.Open(); err != nil {
-			t.Fatal(err)
-		}
-		sqldb := testingutil.MustOpenSQLDB(t, db.Path())
-		defer testingutil.MustCloseDBs(t, db, sqldb)
-
 		store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
 			{Level: 0},
 			{Level: 1, Interval: 50 * time.Millisecond},
@@ -50,6 +44,9 @@ func FuzzRestoreWithMissingCompactedFile(f *testing.F) {
 			t.Fatal(err)
 		}
 		defer store.Close(ctx)
+
+		sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+		defer testingutil.MustCloseSQLDB(t, sqldb)
 
 		if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT);`); err != nil {
 			t.Fatal(err)

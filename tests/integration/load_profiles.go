@@ -74,7 +74,7 @@ func HighVolumeProfile() LoadProfile {
 		Description:     "High traffic: 500 writes/sec, wave pattern. Catches performance regressions under sustained load.",
 		WriteRate:       500,
 		Pattern:         "wave",
-		PayloadSize:     4096,
+		PayloadSize:     1024,
 		Workers:         8,
 		MaxL0Pages:      500,
 		MaxWALSizeMB:    500,

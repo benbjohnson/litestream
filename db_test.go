@@ -1,10 +1,12 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"hash/crc64"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,6 +41,31 @@ func (c *snapshotCountingClient) writeCount() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.n
+}
+
+type listCountingClient struct {
+	litestream.ReplicaClient
+	mu sync.Mutex
+	n  int
+}
+
+func (c *listCountingClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	c.mu.Lock()
+	c.n++
+	c.mu.Unlock()
+	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+func (c *listCountingClient) listCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
+func (c *listCountingClient) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.n = 0
 }
 
 func TestDB_Path(t *testing.T) {
@@ -1483,37 +1510,27 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
 
-	// Use a longer checkpoint interval so we can control when it triggers
-	db.CheckpointInterval = 100 * time.Millisecond
+	db.CheckpointInterval = time.Hour
 
-	// Create table and initial sync
 	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, data TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-
-	// Wait for interval to pass and sync to trigger initial checkpoint
-	time.Sleep(150 * time.Millisecond)
-	if err := db.Sync(t.Context()); err != nil {
+	if err := db.Checkpoint(t.Context(), litestream.CheckpointModePassive); err != nil {
 		t.Fatal(err)
 	}
 
-	// Record TXID after first checkpoint
 	posAfterFirstCheckpoint, err := db.Pos()
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("TXID after first checkpoint: %d", posAfterFirstCheckpoint.TXID)
 
-	// Insert data immediately (before interval elapses)
 	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (data) VALUES ('delayed checkpoint test')`); err != nil {
 		t.Fatal(err)
 	}
-
-	// Sync immediately - this should NOT trigger a checkpoint (interval hasn't elapsed)
-	// but should set syncedSinceCheckpoint = true
 	if err := db.Sync(t.Context()); err != nil {
 		t.Fatal(err)
 	}
@@ -1523,26 +1540,32 @@ func TestDB_DelayedCheckpointAfterWrite(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("TXID after insert+sync: %d", posAfterInsert.TXID)
-
-	// Now wait for the interval to pass and sync again (no new data)
-	time.Sleep(150 * time.Millisecond)
-	if err := db.Sync(t.Context()); err != nil {
-		t.Fatal(err)
+	if posAfterInsert.TXID <= posAfterFirstCheckpoint.TXID {
+		t.Fatalf("expected insert sync to advance TXID: checkpoint=%d insert=%d",
+			posAfterFirstCheckpoint.TXID, posAfterInsert.TXID)
 	}
 
-	// A checkpoint should have been triggered because syncedSinceCheckpoint was true
-	// The TXID should have advanced due to the checkpoint
-	posAfterDelayedCheckpoint, err := db.Pos()
-	if err != nil {
-		t.Fatal(err)
+	db.CheckpointInterval = time.Nanosecond
+	deadline := time.Now().Add(5 * time.Second)
+	posAfterDelayedCheckpoint := posAfterInsert
+	for {
+		if err := db.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		posAfterDelayedCheckpoint, err = db.Pos()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if posAfterDelayedCheckpoint.TXID > posAfterInsert.TXID {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for delayed checkpoint: insert=%d current=%d",
+				posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
+		}
+		time.Sleep(time.Millisecond)
 	}
 	t.Logf("TXID after delayed checkpoint: %d", posAfterDelayedCheckpoint.TXID)
-
-	// The TXID should have advanced from the insert position, indicating the checkpoint ran
-	if posAfterDelayedCheckpoint.TXID <= posAfterInsert.TXID {
-		t.Fatalf("expected TXID to advance after delayed checkpoint (syncedSinceCheckpoint should persist), got insert=%d delayed=%d",
-			posAfterInsert.TXID, posAfterDelayedCheckpoint.TXID)
-	}
 }
 
 func TestDB_SyncStatus(t *testing.T) {
@@ -1899,5 +1922,55 @@ func TestDB_ResetLocalState(t *testing.T) {
 	}
 	if posAfter.TXID != 0 {
 		t.Fatalf("expected zero TXID after reset, got %d", posAfter.TXID)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer that is safe for concurrent log writes.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Context errors returned by a replica client while the DB is still running
+// are real failures (e.g. a token refresh bound to an expired context) and
+// must be logged rather than mistaken for shutdown. See issue #1512.
+func TestDB_Monitor_LogsContextErrorFromReplicaClient(t *testing.T) {
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+
+	var logs lockedBuffer
+	db.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	db.MonitorInterval = 10 * time.Millisecond
+	db.ShutdownSyncTimeout = 0
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		LTXFilesFunc: func(context.Context, int, ltx.TXID, bool) (ltx.FileIterator, error) {
+			return nil, fmt.Errorf("refresh token: %w", context.Canceled)
+		},
+	})
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "sync error") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected sync error to be logged; logs:\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }
