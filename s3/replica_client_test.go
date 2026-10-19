@@ -1683,6 +1683,22 @@ func TestParseHost(t *testing.T) {
 			wantForcePathStyle: true,
 		},
 		{
+			name:               "Neon branch endpoint",
+			host:               "mybucket.br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech",
+			wantBucket:         "mybucket",
+			wantRegion:         "us-east-2",
+			wantEndpoint:       "https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "Neon bucket name with dots",
+			host:               "my.bucket.br-cool-darkness-a1b2c3d4.storage.c-2.eu-central-1.aws.neon.tech",
+			wantBucket:         "my.bucket",
+			wantRegion:         "eu-central-1",
+			wantEndpoint:       "https://br-cool-darkness-a1b2c3d4.storage.c-2.eu-central-1.aws.neon.tech",
+			wantForcePathStyle: true,
+		},
+		{
 			name:               "MinIO with port",
 			host:               "mybucket.localhost:9000",
 			wantBucket:         "mybucket",

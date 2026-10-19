@@ -258,6 +258,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
+	isNeon := litestream.IsNeonEndpoint(endpoint)
 
 	// Apply provider-specific defaults for S3-compatible providers.
 	if isTigris {
@@ -275,15 +276,15 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 			client.PartSize = DefaultTigrisPartSize
 		}
 	}
-	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase || isNeon {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		if !signPayloadSet {
 			signPayload, signPayloadSet = true, true
 		}
 	}
 	if !forcePathStyleSet {
-		// Filebase, Backblaze B2, MinIO, and Supabase require path-style URLs
-		if isFilebase || isBackblaze || isMinIO || isSupabase {
+		// Filebase, Backblaze B2, MinIO, Supabase, and Neon require path-style URLs
+		if isFilebase || isBackblaze || isMinIO || isSupabase || isNeon {
 			forcePathStyle = true
 		}
 	}
@@ -1823,6 +1824,13 @@ func ParseHost(host string) (bucket, region, endpoint string, forcePathStyle boo
 		bucket = a[1]
 		endpoint = fmt.Sprintf("s3.%s.scw.cloud", region)
 		return bucket, region, endpoint, false
+	} else if a := neonRegex.FindStringSubmatch(host); len(a) > 1 {
+		// Neon endpoints are per-branch, so the bucket is prefixed to the
+		// branch endpoint host and requests must use path-style URLs.
+		bucket = a[1]
+		region = a[3]
+		endpoint = "https://" + a[2]
+		return bucket, region, endpoint, true
 	}
 
 	// For standard S3, the host is the bucket name
@@ -1835,6 +1843,7 @@ var (
 	backblazeRegex    = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.backblazeb2.com$`)
 	filebaseRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.filebase.com$`)
 	scalewayRegex     = regexp.MustCompile(`^(?:(.+)\.)?s3.([^.]+)\.scw\.cloud$`)
+	neonRegex         = regexp.MustCompile(`^(.+)\.(br-[^.]+\.storage\.[^.]+\.([^.]+)\.[^.]+\.neon\.tech)$`)
 )
 
 func isNotExists(err error) bool {
