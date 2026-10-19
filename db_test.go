@@ -1,10 +1,12 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"hash/crc64"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1920,5 +1922,55 @@ func TestDB_ResetLocalState(t *testing.T) {
 	}
 	if posAfter.TXID != 0 {
 		t.Fatalf("expected zero TXID after reset, got %d", posAfter.TXID)
+	}
+}
+
+// lockedBuffer is a bytes.Buffer that is safe for concurrent log writes.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// Context errors returned by a replica client while the DB is still running
+// are real failures (e.g. a token refresh bound to an expired context) and
+// must be logged rather than mistaken for shutdown. See issue #1512.
+func TestDB_Monitor_LogsContextErrorFromReplicaClient(t *testing.T) {
+	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+
+	var logs lockedBuffer
+	db.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	db.MonitorInterval = 10 * time.Millisecond
+	db.ShutdownSyncTimeout = 0
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		LTXFilesFunc: func(context.Context, int, ltx.TXID, bool) (ltx.FileIterator, error) {
+			return nil, fmt.Errorf("refresh token: %w", context.Canceled)
+		},
+	})
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = db.Close(context.Background()) }()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(logs.String(), "sync error") {
+		if time.Now().After(deadline) {
+			t.Fatalf("expected sync error to be logged; logs:\n%s", logs.String())
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

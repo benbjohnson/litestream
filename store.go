@@ -610,13 +610,12 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			case errors.Is(err, ErrDBNotReady):
 				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
-			case err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded):
+			case err != nil && !isShutdownError(ctx, err):
 				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
 			}
 
 			if lvl.Level == SnapshotLevel {
-				if err := s.EnforceSnapshotRetention(ctx, db); err != nil &&
-					!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				if err := s.EnforceSnapshotRetention(ctx, db); err != nil && !isShutdownError(ctx, err) {
 					db.Logger.Error("retention enforcement failed", "error", err)
 				}
 			}
@@ -666,7 +665,7 @@ LOOP:
 				continue // skip disabled DBs
 			}
 			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				if isShutdownError(ctx, err) {
 					continue
 				}
 				db.Logger.Error("l0 retention enforcement failed", "path", db.Path(), "error", err)
@@ -938,7 +937,7 @@ LOOP:
 
 		result, err := s.Validate(ctx)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if isShutdownError(ctx, err) {
 				continue
 			}
 			s.Logger.Error("validation check failed", "error", err)
