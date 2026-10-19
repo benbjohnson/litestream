@@ -19,6 +19,7 @@ import (
 type WALReader struct {
 	r      io.ReaderAt
 	frameN int
+	end    int64 // if non-zero, offset at which frames stop
 
 	bo       binary.ByteOrder
 	pageSize uint32
@@ -77,6 +78,9 @@ func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, s
 
 	return r, nil
 }
+
+// SetEnd makes the reader stop at offset end, as if the WAL file ended there.
+func (r *WALReader) SetEnd(end int64) { r.end = end }
 
 // PageSize returns the page size from the header. Must call ReadHeader() first.
 func (r *WALReader) PageSize() uint32 { return r.pageSize }
@@ -151,6 +155,9 @@ func (r *WALReader) readFrame(ctx context.Context, data []byte, verifyChecksum b
 
 	frameSize := r.pageSize + WALFrameHeaderSize
 	offset := WALHeaderSize + (int64(r.frameN) * int64(frameSize))
+	if r.end > 0 && offset+int64(frameSize) > r.end {
+		return 0, 0, io.EOF
+	}
 
 	// Read WAL frame header.
 	hdr := make([]byte, WALFrameHeaderSize)
