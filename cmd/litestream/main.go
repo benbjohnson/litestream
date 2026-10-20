@@ -50,18 +50,17 @@ var errStop = errors.New("stop")
 
 // Sentinel errors for configuration validation
 var (
-	ErrInvalidSnapshotInterval          = errors.New("snapshot interval must be greater than 0")
-	ErrInvalidSnapshotRetention         = errors.New("snapshot retention must be greater than 0")
-	ErrInvalidSnapshotRetentionInterval = errors.New("snapshot retention must not be shorter than snapshot interval")
-	ErrInvalidCompactionInterval        = errors.New("compaction interval must be greater than 0")
-	ErrInvalidSyncInterval              = errors.New("sync interval must be greater than 0")
-	ErrInvalidL0Retention               = errors.New("l0 retention must not be negative")
-	ErrInvalidL0RetentionCheckInterval  = errors.New("l0 retention check interval must be greater than 0")
-	ErrInvalidShutdownSyncTimeout       = errors.New("shutdown-sync-timeout must be >= 0")
-	ErrInvalidShutdownSyncInterval      = errors.New("shutdown sync interval must be greater than 0")
-	ErrInvalidHeartbeatURL              = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
-	ErrInvalidHeartbeatInterval         = errors.New("heartbeat interval must be at least 1 minute")
-	ErrConfigFileNotFound               = errors.New("config file not found")
+	ErrInvalidSnapshotInterval         = errors.New("snapshot interval must be greater than 0")
+	ErrInvalidSnapshotRetention        = errors.New("snapshot retention must be greater than 0")
+	ErrInvalidCompactionInterval       = errors.New("compaction interval must be greater than 0")
+	ErrInvalidSyncInterval             = errors.New("sync interval must be greater than 0")
+	ErrInvalidL0Retention              = errors.New("l0 retention must not be negative")
+	ErrInvalidL0RetentionCheckInterval = errors.New("l0 retention check interval must be greater than 0")
+	ErrInvalidShutdownSyncTimeout      = errors.New("shutdown-sync-timeout must be >= 0")
+	ErrInvalidShutdownSyncInterval     = errors.New("shutdown sync interval must be greater than 0")
+	ErrInvalidHeartbeatURL             = errors.New("heartbeat URL must be a valid HTTP or HTTPS URL")
+	ErrInvalidHeartbeatInterval        = errors.New("heartbeat interval must be at least 1 minute")
+	ErrConfigFileNotFound              = errors.New("config file not found")
 )
 
 // ConfigValidationError wraps a validation error with additional context
@@ -434,11 +433,10 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.Snapshot.Interval != nil && c.Snapshot.Retention != nil && *c.Snapshot.Retention < *c.Snapshot.Interval {
-		return &ConfigValidationError{
-			Err:   ErrInvalidSnapshotRetentionInterval,
-			Field: "snapshot.retention",
-			Value: *c.Snapshot.Retention,
-		}
+		slog.Warn("snapshot retention is shorter than snapshot interval",
+			"field", "snapshot.retention",
+			"retention", *c.Snapshot.Retention,
+			"interval", *c.Snapshot.Interval)
 	}
 	if c.L0Retention != nil && *c.L0Retention < 0 {
 		return &ConfigValidationError{
@@ -553,11 +551,10 @@ func (c *Config) Validate() error {
 			}
 		}
 		if db.Snapshot.Interval != nil && db.Snapshot.Retention != nil && *db.Snapshot.Retention < *db.Snapshot.Interval {
-			return &ConfigValidationError{
-				Err:   ErrInvalidSnapshotRetentionInterval,
-				Field: fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
-				Value: *db.Snapshot.Retention,
-			}
+			slog.Warn("snapshot retention is shorter than snapshot interval",
+				"field", fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
+				"retention", *db.Snapshot.Retention,
+				"interval", *db.Snapshot.Interval)
 		}
 
 		// Validate sync intervals for replicas
