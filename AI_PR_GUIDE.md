@@ -73,7 +73,7 @@ Added leasing support and also fixed a checkpoint bug I noticed.
 go test -race -v -run TestDB_CheckpointDoesNotTriggerSnapshot ./...
 
 # Integration test with file backend
-go test -v ./replica_client_test.go -integration file
+go test -v ./replica_client_test.go -integration -replica-clients=file
 ```
 
 **Bad:** Vague descriptions like "Manual testing with file backend" or "Verified it works"
