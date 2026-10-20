@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"sort"
 	"strings"
@@ -17,12 +18,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/psanford/sqlite3vfs"
 	"github.com/superfly/ltx"
+
+	"github.com/psanford/sqlite3vfs"
 )
 
 // writeTestReplicaClient is a mock ReplicaClient for testing write functionality.
 type writeTestReplicaClient struct {
+	vfsTestLogger
 	mu       sync.Mutex
 	ltxFiles map[int][]*ltx.FileInfo // level -> files
 	ltxData  map[string][]byte       // "level/minTXID-maxTXID" -> data
@@ -108,6 +111,8 @@ func (c *writeTestReplicaClient) DeleteAll(ctx context.Context) error {
 	c.ltxData = make(map[string][]byte)
 	return nil
 }
+
+func (c *writeTestReplicaClient) SetLogger(*slog.Logger) {}
 
 func ltxKey(level int, minTXID, maxTXID ltx.TXID) string {
 	return string(rune(level)) + "/" + minTXID.String() + "-" + maxTXID.String()
@@ -346,6 +351,56 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 		t.Errorf("expected 2 LTX files, got %d", len(client.ltxFiles[0]))
 	}
 	client.mu.Unlock()
+}
+
+func TestVFSFile_WriteModeCompactionPollKeepsNewerPage(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	page := bytes.Repeat([]byte{'a'}, int(pageSize))
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: page})
+
+	f := setupWriteableVFSFile(t, client)
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	compactor := NewCompactor(client, slog.Default())
+	if _, err := compactor.Compact(context.Background(), 1); err != nil {
+		t.Fatalf("compact L0 to L1: %v", err)
+	}
+
+	newer := bytes.Repeat([]byte{'b'}, int(pageSize))
+	if _, err := f.WriteAt(newer, 0); err != nil {
+		t.Fatalf("write newer page: %v", err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatalf("sync newer page: %v", err)
+	}
+	f.mu.Lock()
+	elem := f.index[1]
+	f.mu.Unlock()
+	if elem.Level != 0 || elem.MaxTXID != 2 {
+		t.Fatalf("synced page index = %+v, want level 0 at TXID 2", elem)
+	}
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatalf("poll compacted L1: %v", err)
+	}
+	f.mu.Lock()
+	elem = f.index[1]
+	f.mu.Unlock()
+	if elem.Level != 0 || elem.MaxTXID != 2 {
+		t.Fatalf("polled page index = %+v, want level 0 at TXID 2", elem)
+	}
+	f.cache.Purge()
+
+	buf := make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatalf("read page: %v", err)
+	}
+	if buf[0] != 'b' {
+		t.Fatalf("L1 poll regressed writer page to %q, want 'b'", buf[0])
+	}
 }
 
 func TestVFSFile_ConflictDetection(t *testing.T) {
@@ -1773,7 +1828,7 @@ func TestLock_BlocksDuringDisable_MultipleWaiters(t *testing.T) {
 
 func openWriteVFSFile(t *testing.T, vfs *VFS) *VFSFile {
 	t.Helper()
-	file, _, err := vfs.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+	file, _, err := vfs.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1833,6 +1888,104 @@ func TestVFS_MultipleConnections_NoFalseConflict(t *testing.T) {
 	}
 }
 
+func TestVFS_MultipleReplicas_IndependentTXIDs(t *testing.T) {
+	for _, tt := range []struct {
+		name          string
+		initialTXID   ltx.TXID
+		defaultClient bool
+	}{
+		{name: "NewReplicas"},
+		{name: "ExistingReplica", initialTXID: 2},
+		{name: "DefaultClient", defaultClient: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			clients := map[string]*writeTestReplicaClient{
+				"first":  newWriteTestReplicaClient(),
+				"second": newWriteTestReplicaClient(),
+			}
+			registerTestReplicaClientFactory(t, "vfs-txid", func(_, host, _ string, _ url.Values, _ *url.Userinfo) (ReplicaClient, error) {
+				return &struct{ ReplicaClient }{clients[host]}, nil
+			})
+			for txid := ltx.TXID(1); txid <= tt.initialTXID; txid++ {
+				createTestLTXFile(t, clients["first"], txid, DefaultPageSize, 1, map[uint32][]byte{1: make([]byte, DefaultPageSize)})
+			}
+
+			v := NewVFS(clients["first"], slog.Default())
+			v.WriteSyncInterval = time.Hour
+			v.PollInterval = time.Hour
+
+			open := func(name, replica string, writeEnabled bool) *VFSFile {
+				t.Helper()
+				params := map[string]string{
+					"replica_url":   "vfs-txid://" + replica + "/db",
+					"write_enabled": fmt.Sprint(writeEnabled),
+				}
+				if tt.defaultClient && replica == "first" {
+					delete(params, "replica_url")
+				}
+				file, _, err := v.OpenURI(name, params, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+				if err != nil {
+					t.Fatal(err)
+				}
+				f := file.(*VFSFile)
+				t.Cleanup(func() {
+					if err := f.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+				return f
+			}
+			write := func(f *VFSFile, replica string, txid ltx.TXID) {
+				t.Helper()
+				if err := f.Lock(sqlite3vfs.LockReserved); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := f.WriteAt([]byte(replica), 100); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Unlock(sqlite3vfs.LockShared); err != nil {
+					t.Fatal(err)
+				}
+				if err := f.Sync(0); err != nil {
+					t.Fatal(err)
+				}
+				client := clients[replica]
+				client.mu.Lock()
+				defer client.mu.Unlock()
+				files := client.ltxFiles[0]
+				if len(files) != int(txid) {
+					t.Fatalf("%s: expected %d LTX files, got %d", replica, txid, len(files))
+				}
+				info := files[len(files)-1]
+				if info.MinTXID != txid || info.MaxTXID != txid {
+					t.Fatalf("%s: expected LTX TXID %d, got %d-%d", replica, txid, info.MinTXID, info.MaxTXID)
+				}
+			}
+
+			first := open("test.db", "first", true)
+			write(first, "first", tt.initialTXID+1)
+			second := open("test.db", "second", true)
+			write(second, "second", 1)
+			write(first, "first", tt.initialTXID+2)
+			write(second, "second", 2)
+			alias := open("alias.db", "first", true)
+			write(first, "first", tt.initialTXID+3)
+			write(alias, "first", tt.initialTXID+4)
+
+			for _, replica := range []string{"first", "second"} {
+				reader := open("reader.db", replica, false)
+				data := make([]byte, len(replica))
+				if _, err := reader.ReadAt(data, 100); err != nil {
+					t.Fatal(err)
+				}
+				if string(data) != replica {
+					t.Fatalf("%s: unexpected replica data %q", replica, data)
+				}
+			}
+		})
+	}
+}
+
 func TestVFS_WriteLockBlocksConcurrentWriters(t *testing.T) {
 	client := newWriteTestReplicaClient()
 	pageSize := uint32(4096)
@@ -1888,7 +2041,7 @@ func TestVFS_ConcurrentOpenAllSucceed(t *testing.T) {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			f, _, err := v.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+			f, _, err := v.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
 			errs[idx] = err
 			files[idx] = f
 		}(i)
@@ -1966,7 +2119,7 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 	v.WriteEnabled = true
 
 	// Open and acquire RESERVED
-	file1, _, err := v.openMainDB("test.db", sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
+	file1, _, err := v.openMainDB("test.db", nil, sqlite3vfs.OpenMainDB|sqlite3vfs.OpenReadWrite)
 	if err != nil {
 		t.Fatal(err)
 	}

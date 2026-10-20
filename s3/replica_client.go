@@ -2,6 +2,7 @@ package s3
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"crypto/md5"
 	"crypto/tls"
@@ -68,6 +69,13 @@ const DefaultMetadataConcurrency = 50
 // parts for Cloudflare R2, which has strict concurrent upload limits.
 const DefaultR2Concurrency = 2
 
+// DefaultTigrisConcurrency is the default number of concurrent multipart
+// upload parts for Tigris, which has strict concurrent upload limits.
+const DefaultTigrisConcurrency = 2
+
+// DefaultTigrisPartSize is the default multipart upload part size for Tigris.
+const DefaultTigrisPartSize = 16 * 1024 * 1024
+
 // contentMD5StackKey is used to pass the precomputed Content-MD5 checksum
 // through the middleware stack from Serialize to Finalize phase.
 type contentMD5StackKey struct{}
@@ -87,15 +95,16 @@ type ReplicaClient struct {
 	SecretAccessKey string
 
 	// S3 bucket information
-	Region            string
-	Bucket            string
-	Path              string
-	Endpoint          string
-	ForcePathStyle    bool
-	SkipVerify        bool
-	SignPayload       bool
-	RequireContentMD5 bool
-	StorageClass      string
+	Region             string
+	Bucket             string
+	Path               string
+	Endpoint           string
+	ForcePathStyle     bool
+	SkipVerify         bool
+	SignPayload        bool
+	SignAcceptEncoding bool
+	RequireContentMD5  bool
+	StorageClass       string
 
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
@@ -120,9 +129,10 @@ type ReplicaClient struct {
 // NewReplicaClient returns a new instance of ReplicaClient.
 func NewReplicaClient() *ReplicaClient {
 	return &ReplicaClient{
-		logger:            slog.Default().WithGroup(ReplicaClientType),
-		RequireContentMD5: true,
-		SignPayload:       true,
+		logger:             slog.Default().WithGroup(ReplicaClientType),
+		RequireContentMD5:  true,
+		SignPayload:        true,
+		SignAcceptEncoding: true,
 	}
 }
 
@@ -136,19 +146,21 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client := NewReplicaClient()
 
 	var (
-		bucket         string
-		region         string
-		endpoint       string
-		forcePathStyle bool
-		skipVerify     bool
-		signPayload    bool
-		signPayloadSet bool
-		requireMD5     bool
-		requireMD5Set  bool
-		concurrency    int
-		concurrencySet bool
-		partSize       int64
-		storageClass   string
+		bucket                string
+		region                string
+		endpoint              string
+		forcePathStyle        bool
+		skipVerify            bool
+		signPayload           bool
+		signPayloadSet        bool
+		signAcceptEncoding    bool
+		signAcceptEncodingSet bool
+		requireMD5            bool
+		requireMD5Set         bool
+		concurrency           int
+		concurrencySet        bool
+		partSize              int64
+		storageClass          string
 	)
 
 	// Parse host for bucket and region
@@ -181,6 +193,10 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
 		signPayload = v
 		signPayloadSet = true
+	}
+	if v, ok := litestream.BoolQueryValue(query, "signAcceptEncoding", "sign-accept-encoding"); ok {
+		signAcceptEncoding = v
+		signAcceptEncodingSet = true
 	}
 	if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 		requireMD5 = v
@@ -252,6 +268,12 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		if !requireMD5Set {
 			requireMD5, requireMD5Set = false, true
 		}
+		if !concurrencySet {
+			client.Concurrency = DefaultTigrisConcurrency
+		}
+		if partSize == 0 {
+			client.PartSize = DefaultTigrisPartSize
+		}
 	}
 	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
@@ -279,6 +301,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 
 	if signPayloadSet {
 		client.SignPayload = signPayload
+	}
+	if signAcceptEncodingSet {
+		client.SignAcceptEncoding = signAcceptEncoding
 	}
 	if requireMD5Set {
 		client.RequireContentMD5 = requireMD5
@@ -935,10 +960,10 @@ func (c *ReplicaClient) middlewareOption() func(*middleware.Stack) error {
 			}
 		}
 
-		if litestream.IsGoogleCloudStorageEndpoint(c.Endpoint) {
+		if !c.SignAcceptEncoding || litestream.IsGoogleCloudStorageEndpoint(c.Endpoint) {
 			if err := stack.Finalize.Insert(
 				middleware.FinalizeMiddlewareFunc(
-					"LitestreamGCSRemoveAcceptEncoding",
+					"LitestreamRemoveAcceptEncoding",
 					func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (
 						out middleware.FinalizeOutput, metadata middleware.Metadata, err error,
 					) {
@@ -1420,7 +1445,7 @@ func (c *ReplicaClient) WALSegmentsV3(ctx context.Context, generation string) ([
 		if a.Index != b.Index {
 			return a.Index - b.Index
 		}
-		return int(a.Offset - b.Offset)
+		return cmp.Compare(a.Offset, b.Offset)
 	})
 	return segments, nil
 }

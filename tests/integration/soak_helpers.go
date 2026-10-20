@@ -138,7 +138,7 @@ func StartMinIOContainer(t *testing.T) (containerID string, endpoint string, vol
 		"-v", volumeName+":/data",
 		"-e", "MINIO_ROOT_USER=minioadmin",
 		"-e", "MINIO_ROOT_PASSWORD=minioadmin",
-		"minio/minio", "server", "/data", "--console-address", ":9001")
+		RequireMinIOImage(t), "server", "/data", "--console-address", ":9001")
 
 	_, stdoutBuf, stderrBuf := configureCmdIO(cmd)
 	if err := cmd.Run(); err != nil {
@@ -226,7 +226,8 @@ func minioClientCommand(containerID string, args ...string) *exec.Cmd {
 		"run", "--rm",
 		"--network", "container:" + containerID,
 		"-e", "MC_HOST_minio=http://minioadmin:minioadmin@localhost:9000",
-		"minio/mc",
+		"--entrypoint", "mc",
+		minioImage(),
 	}
 	return exec.Command("docker", append(dockerArgs, args...)...)
 }

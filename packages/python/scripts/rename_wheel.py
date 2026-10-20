@@ -7,6 +7,7 @@ Usage: python rename_wheel.py <wheel_dir> <platform_tag>
 """
 import glob
 import os
+import subprocess
 import sys
 
 
@@ -20,15 +21,14 @@ def main():
         sys.exit(1)
 
     for wheel in wheels:
-        parts = os.path.basename(wheel).split("-")
-        # Wheel filename: {name}-{ver}-{python}-{abi}-{platform}.whl
-        parts[-1] = f"{platform_tag}.whl"
-        parts[-2] = "none"
-        parts[-3] = "cp38.cp39.cp310.cp311.cp312.cp313"
-        new_name = "-".join(parts)
-        new_path = os.path.join(wheel_dir, new_name)
-        os.rename(wheel, new_path)
-        print(f"Renamed: {os.path.basename(wheel)} -> {new_name}")
+        subprocess.run(
+            [
+                sys.executable, "-m", "wheel", "tags",
+                "--python-tag=py3", "--abi-tag=none",
+                f"--platform-tag={platform_tag}", "--remove", wheel,
+            ],
+            check=True,
+        )
 
 
 if __name__ == "__main__":

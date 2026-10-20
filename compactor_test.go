@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -116,6 +118,50 @@ func TestCompactor_CompactClosesPipeOnWriteError(t *testing.T) {
 			t.Fatalf("compactor goroutine leaked: got %d, want <= %d", countCompactorPipeWriters(), before)
 		case <-ticker.C:
 		}
+	}
+}
+
+// TestCompactor_CompactDoesNotReopenSourcesAfterClose verifies that no source
+// stream is left open once Compact and its compaction goroutine have finished,
+// even when the destination write fails while the goroutine is still reading.
+//
+// Compact does not wait for the compaction goroutine before returning. When
+// WriteLTXFile fails first, Compact returns and closes every source stream
+// while the goroutine may still be reading them. Each subsequent read then
+// fails, which the resumable reader treats as a transient connection failure:
+// it reopens the source from the current offset and keeps going until the
+// goroutine finally hits the closed pipe. Nothing ever closes those reopened
+// streams. Against an S3 replica each one pins an HTTP response body, so a
+// wedged compaction leaks one connection per source file on every attempt.
+func TestCompactor_CompactDoesNotReopenSourcesAfterClose(t *testing.T) {
+	client := newLeakCheckCompactionClient(t.TempDir())
+	compactor := litestream.NewCompactor(client, slog.Default())
+
+	createTestLTXFile(t, client, 0, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
+	createTestLTXFile(t, client, 0, 3, 3)
+	client.failWrites = true
+
+	if _, err := compactor.Compact(context.Background(), 1); err == nil {
+		t.Fatal("expected error")
+	}
+
+	// Compact has returned and closed the streams it opened. Wait for the
+	// detached compaction goroutine to finish before checking for leaks.
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for countCompactorPipeWriters() > 0 {
+		select {
+		case <-deadline.C:
+			t.Fatal("compactor goroutine did not exit")
+		case <-ticker.C:
+		}
+	}
+
+	if total, open, labels := client.streamStats(); open > 0 {
+		t.Fatalf("%d of %d source streams still open after Compact: %v", open, total, labels)
 	}
 }
 
@@ -730,6 +776,122 @@ func (r *disconnectingReadCloser) Read(p []byte) (int, error) {
 		return n, io.EOF
 	}
 	return n, nil
+}
+
+// leakCheckCompactionClient tracks every stream opened via OpenLTXFile and
+// whether it was closed. The first read of the first source stream parks until
+// that stream is closed, holding the compaction goroutine inside a source read
+// while WriteLTXFile fails. This pins down the ordering seen in production
+// when an upload to a remote replica fails mid-compaction.
+type leakCheckCompactionClient struct {
+	litestream.ReplicaClient
+	failWrites bool
+	parked     chan struct{} // closed once a source read is parked
+
+	mu      sync.Mutex
+	gated   bool // whether the parking stream has been handed out
+	streams []*leakCheckStream
+}
+
+func newLeakCheckCompactionClient(path string) *leakCheckCompactionClient {
+	return &leakCheckCompactionClient{
+		ReplicaClient: file.NewReplicaClient(path),
+		parked:        make(chan struct{}),
+	}
+}
+
+func (c *leakCheckCompactionClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	s := &leakCheckStream{
+		rc:    rc,
+		label: fmt.Sprintf("level=%d txid=%s-%s offset=%d", level, minTXID, maxTXID, offset),
+		done:  make(chan struct{}),
+	}
+	if !c.gated {
+		c.gated = true
+		s.parked = c.parked
+	}
+	c.streams = append(c.streams, s)
+	return s, nil
+}
+
+func (c *leakCheckCompactionClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if !c.failWrites {
+		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	}
+
+	// Fail the upload only once the compaction goroutine is inside a read of
+	// its first source stream.
+	select {
+	case <-c.parked:
+	case <-time.After(5 * time.Second):
+		return nil, fmt.Errorf("timeout waiting for compaction goroutine to park")
+	}
+	return nil, fmt.Errorf("simulated upload failure")
+}
+
+func (c *leakCheckCompactionClient) streamStats() (total, open int, labels []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, s := range c.streams {
+		total++
+		if !s.isClosed() {
+			open++
+			labels = append(labels, s.label)
+		}
+	}
+	return total, open, labels
+}
+
+type leakCheckStream struct {
+	rc     io.ReadCloser
+	label  string
+	parked chan struct{} // if non-nil, the first read parks until close
+	once   sync.Once
+	done   chan struct{} // closed when the stream is closed
+
+	mu     sync.Mutex
+	closed bool
+}
+
+func (s *leakCheckStream) Read(p []byte) (int, error) {
+	if s.parked != nil {
+		s.once.Do(func() { close(s.parked) })
+		<-s.done
+	}
+
+	s.mu.Lock()
+	closed := s.closed
+	s.mu.Unlock()
+	if closed {
+		return 0, os.ErrClosed
+	}
+	return s.rc.Read(p)
+}
+
+func (s *leakCheckStream) Close() error {
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return nil
+	}
+	s.closed = true
+	s.mu.Unlock()
+
+	close(s.done)
+	return s.rc.Close()
+}
+
+func (s *leakCheckStream) isClosed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.closed
 }
 
 func countCompactorPipeWriters() int {

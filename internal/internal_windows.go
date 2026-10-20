@@ -12,6 +12,10 @@ func Fileinfo(fi os.FileInfo) (uid, gid int) {
 	return -1, -1
 }
 
+func FsyncDir(path string) error {
+	return nil
+}
+
 // fixRootDirectory is copied from the standard library for use with mkdirAll()
 func fixRootDirectory(p string) string {
 	if len(p) == len(`\\?\c:`) {
