@@ -92,6 +92,25 @@ var resumableReaderStallTimeout = 30 * time.Second
 // resumableReaderStallTimeout and had its stream cancelled to force a reconnect.
 var ErrReadStalled = errors.New("ltx stream read stalled")
 
+func (r *ResumableReader) Open() error {
+	rc, _, err := r.stream()
+	if err != nil || rc != nil {
+		return err
+	}
+	streamCtx, streamCancel := context.WithCancel(r.ctx)
+	rc, err = r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
+	if err != nil {
+		streamCancel()
+		return err
+	}
+	if !r.setStream(rc, streamCancel) {
+		streamCancel()
+		_ = rc.Close()
+		return os.ErrClosed
+	}
+	return nil
+}
+
 func (r *ResumableReader) Read(p []byte) (int, error) {
 	for {
 		rc, cancel, err := r.stream()
@@ -105,11 +124,8 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// Reopen the stream from the current offset if the previous
 		// connection was closed (the stream is nil after a retry).
 		if rc == nil {
-			streamCtx, streamCancel := context.WithCancel(r.ctx)
-			newRC, err := r.client.OpenLTXFile(streamCtx, r.level, r.minTXID, r.maxTXID, r.offset, 0)
-			if err != nil {
-				streamCancel()
-				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if err := r.Open(); err != nil {
+				if errors.Is(err, os.ErrClosed) || errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 					return 0, fmt.Errorf("reopen ltx file at offset %d: %w", r.offset, err)
 				}
 				if ctxErr := r.ctx.Err(); ctxErr != nil {
@@ -124,13 +140,10 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 					"offset", r.offset, "error", err, "attempt", r.retryN)
 				continue
 			}
-			if !r.setStream(newRC, streamCancel) {
-				// Closed while the stream was being reopened.
-				streamCancel()
-				_ = newRC.Close()
-				return 0, os.ErrClosed
+			rc, cancel, err = r.stream()
+			if err != nil {
+				return 0, err
 			}
-			rc, cancel = newRC, streamCancel
 		}
 
 		n, err := r.readStream(rc, cancel, p)

@@ -783,3 +783,35 @@ func (r *blockedReadCloser) Close() error {
 	r.closed.Store(true)
 	return nil
 }
+
+func TestResumableReader_PreopenedStreamStalls(t *testing.T) {
+	defer setStallTimeout(20 * time.Millisecond)()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var opens atomic.Int32
+	client := &testLTXFileOpener{
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			opens.Add(1)
+			return io.NopCloser(newSilentAfterN(ctx, nil, 0)), nil
+		},
+	}
+	r := NewResumableReader(ctx, client, 0, 1, 1, 1, nil, slog.Default())
+	defer r.Close()
+	if err := r.Open(); err != nil {
+		t.Fatal(err)
+	}
+	if got := opens.Load(); got != 1 {
+		t.Fatalf("opens before Read = %d, want 1", got)
+	}
+	_, err := io.ReadAll(r)
+	if !errors.Is(err, ErrReadStalled) {
+		t.Fatalf("Read error = %v, want ErrReadStalled", err)
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("parent context ended before stall recovery: %v", err)
+	}
+	if got := opens.Load(); got != resumableReaderMaxRetries+1 {
+		t.Fatalf("opens = %d, want %d", got, resumableReaderMaxRetries+1)
+	}
+}
