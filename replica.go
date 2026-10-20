@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/superfly/ltx"
-	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
 
 	"github.com/benbjohnson/litestream/internal"
@@ -708,7 +707,11 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		}
 	}
 
-	for _, rd := range r.openRestoreFiles(ctx, infos) {
+	readers, err := r.openRestoreFiles(ctx, infos)
+	if err != nil {
+		return err
+	}
+	for _, rd := range readers {
 		rdrs = append(rdrs, rd)
 	}
 
@@ -808,24 +811,30 @@ const restoreOpenConcurrency = 32
 // openRestoreFiles opens every file of a restore plan concurrently. A file
 // that fails to open has a nil stream; its ResumableReader retries it on
 // first read.
-func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) []*internal.ResumableReader {
-	readers := make([]*internal.ResumableReader, len(infos))
-	var g errgroup.Group
-	g.SetLimit(restoreOpenConcurrency)
-	for i, info := range infos {
-		g.Go(func() error {
+func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) ([]*internal.ResumableReader, error) {
+	readers := make([]*internal.ResumableReader, 0, len(infos))
+	sem := semaphore.NewWeighted(restoreOpenConcurrency)
+	var wg sync.WaitGroup
+	for _, info := range infos {
+		rd := internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
+		readers = append(readers, rd)
+		if err := sem.Acquire(ctx, 1); err != nil {
+			wg.Wait()
+			for _, rd := range readers {
+				_ = rd.Close()
+			}
+			return nil, err
+		}
+		wg.Go(func() {
+			defer sem.Release(1)
 			r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-			rd := internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
-			readers[i] = rd
 			if err := rd.Open(); err != nil {
 				r.Logger().Debug("open ltx file for restore failed; the reader retries it", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "error", err)
-				return nil
 			}
-			return nil
 		})
 	}
-	_ = g.Wait()
-	return readers
+	wg.Wait()
+	return readers, nil
 }
 
 // follow enters a continuous restore loop, polling for new LTX files and

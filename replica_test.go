@@ -2619,6 +2619,61 @@ func verifyRestoredDB(t *testing.T, path string) {
 	}
 }
 
+func TestReplica_Restore_CancelledOpenClosesBodies(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	infos := make([]*ltx.FileInfo, 64)
+	for i := range infos {
+		infos[i] = &ltx.FileInfo{
+			Level:   0,
+			MinTXID: ltx.TXID(i + 1),
+			MaxTXID: ltx.TXID(i + 1),
+			Size:    ltx.HeaderSize,
+		}
+	}
+
+	var opened, closed atomic.Int32
+	client := &mock.ReplicaClient{
+		LTXFilesFunc: func(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+			if level == 0 {
+				return ltx.NewFileInfoSliceIterator(infos), nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		},
+		OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+			if opened.Add(1) == 32 {
+				cancel()
+			}
+			<-ctx.Done()
+			return &cancelledRestoreBody{Reader: bytes.NewReader(nil), closed: &closed}, nil
+		},
+	}
+
+	err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, litestream.RestoreOptions{
+		OutputPath: filepath.Join(t.TempDir(), "restored.db"),
+	})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Restore() error = %v, want context.Canceled", err)
+	}
+	if got := opened.Load(); got != 32 {
+		t.Fatalf("opened %d bodies, want 32", got)
+	}
+	if got, want := closed.Load(), opened.Load(); got != want {
+		t.Fatalf("closed %d bodies, want %d", got, want)
+	}
+}
+
+type cancelledRestoreBody struct {
+	io.Reader
+	closed *atomic.Int32
+}
+
+func (r *cancelledRestoreBody) Close() error {
+	r.closed.Add(1)
+	return nil
+}
+
 func TestReplica_Restore_OpensPlanConcurrently(t *testing.T) {
 	ctx := context.Background()
 	db, sqldb := testingutil.MustOpenDBs(t)
