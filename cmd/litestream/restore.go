@@ -296,6 +296,16 @@ func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
 	return nil
 }
 
+type manifestEnabler interface {
+	SetManifestEnabled(bool)
+}
+
+func enableManifest(client litestream.ReplicaClient) {
+	if client, ok := client.(manifestEnabler); ok {
+		client.SetManifestEnabled(true)
+	}
+}
+
 // loadFromURL creates a replica & updates the restore options from a replica URL.
 func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifDBNotExists bool, opt *litestream.RestoreOptions) (*litestream.Replica, error) {
 	if opt.OutputPath == "" {
@@ -320,6 +330,7 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	if err != nil {
 		return nil, err
 	}
+	enableManifest(r.Client)
 	_, err = r.CalcRestoreTarget(ctx, *opt)
 	return r, err
 }
@@ -355,6 +366,7 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 		return nil, errSkipDBExists
 	}
 
+	enableManifest(db.Replica.Client)
 	return db.Replica, nil
 }
 
