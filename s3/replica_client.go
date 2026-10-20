@@ -169,6 +169,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		region = litestream.RegionFromS3ARN(host)
 	} else {
 		bucket, region, endpoint, forcePathStyle = ParseHost(host)
+		if litestream.IsNeonEndpoint(endpoint) && (query.Get("endpoint") != "" || os.Getenv("LITESTREAM_S3_ENDPOINT") != "") {
+			bucket, region, endpoint, forcePathStyle = host, "", "", false
+		}
 	}
 
 	// Override with query parameters if provided
