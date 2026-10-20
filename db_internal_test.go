@@ -4995,3 +4995,36 @@ func TestDB_ConcurrentMetricOwners(t *testing.T) {
 		t.Fatalf("series remain after last close: %v", got)
 	}
 }
+
+func TestDB_WALIndexMaxFrame_ReadError(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		closed bool
+		want   error
+	}{
+		{name: "short header", want: io.EOF},
+		{name: "closed file", closed: true, want: os.ErrClosed},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f, err := os.CreateTemp(t.TempDir(), "shm")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tt.closed {
+				if err := f.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				t.Cleanup(func() {
+					if err := f.Close(); err != nil {
+						t.Error(err)
+					}
+				})
+			}
+			db := &DB{shm: f}
+			if _, err := db.walIndexMaxFrame(1, 2); !errors.Is(err, tt.want) {
+				t.Fatalf("got error %v, want %v", err, tt.want)
+			}
+		})
+	}
+}

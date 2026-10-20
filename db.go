@@ -71,6 +71,7 @@ type DB struct {
 	metaPath  string        // Path to the database metadata.
 	db        *sql.DB       // target database
 	f         *os.File      // long-running db file descriptor
+	shm       *os.File      // long-running -shm file descriptor
 	rtx       *sql.Tx       // long running read transaction
 	pageSize  int           // page size, in bytes
 	notify    chan struct{} // closes on WAL change
@@ -911,9 +912,9 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	db.mu.Lock()
 	sqlDB := db.db
-	f := db.f
+	f, shm := db.f, db.shm
 	db.db = nil
-	db.f = nil
+	db.f, db.shm = nil, nil
 	db.opened = false
 	db.rtx = nil
 	db.mu.Unlock()
@@ -926,6 +927,12 @@ func (db *DB) Close(ctx context.Context) (err error) {
 
 	if f != nil {
 		if e := f.Close(); e != nil && err == nil {
+			err = e
+		}
+	}
+
+	if shm != nil {
+		if e := shm.Close(); e != nil && err == nil {
 			err = e
 		}
 	}
@@ -1127,7 +1134,10 @@ func (db *DB) init(ctx context.Context) (err error) {
 			_ = db.releaseReadLock()
 			db.db.Close()
 			db.f.Close()
-			db.db, db.f = nil, nil
+			if db.shm != nil {
+				db.shm.Close()
+			}
+			db.db, db.f, db.shm = nil, nil, nil
 		}
 	}()
 
@@ -1156,6 +1166,14 @@ func (db *DB) init(ctx context.Context) (err error) {
 	// from checkpointing.
 	if err := db.acquireReadLock(ctx); err != nil {
 		return fmt.Errorf("acquire read lock: %w", err)
+	}
+
+	// Open long-running -shm file descriptor to read the wal-index header.
+	// It exists once a read transaction has started. Like db.f, it must stay
+	// open: closing any descriptor of a file drops this process's non-OFD
+	// locks on it, including those of SQLite's connections.
+	if db.shm, err = os.Open(db.path + "-shm"); err != nil {
+		return fmt.Errorf("open shm file descriptor: %w", err)
 	}
 
 	// Read page size.
@@ -1895,6 +1913,47 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	return info, nil
 }
 
+// walIndexMaxFrame returns the number of WAL frames SQLite has committed, from
+// the wal-index header at the start of the -shm file. See "2.1. The WAL-Index
+// Header" in https://sqlite.org/walformat.html.
+//
+// Frames past it are not part of the database, even with valid checksums. A
+// writer killed after it wrote a commit's frames but before it updated the
+// wal-index leaves such frames. While another connection keeps the wal-index
+// valid, SQLite does not recover the WAL, and the next writer overwrites them.
+func (db *DB) walIndexMaxFrame(salt1, salt2 uint32) (int, error) {
+	if db.shm == nil {
+		return 0, fmt.Errorf("wal-index file is not open")
+	}
+
+	// The header is stored twice, 48 bytes each; byte 12 is isInit.
+	hdr := make([]byte, 96)
+	const maxAttempts = 10
+	var err error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			time.Sleep(time.Millisecond)
+		}
+		if _, err = db.shm.ReadAt(hdr, 0); err != nil {
+			continue
+		} else if !bytes.Equal(hdr[:48], hdr[48:]) {
+			err = fmt.Errorf("wal-index header copies differ")
+			continue
+		} else if hdr[12] == 0 {
+			err = fmt.Errorf("wal-index header is not initialized")
+			continue
+		}
+
+		// The salts are stored as in the WAL file. If they differ, the WAL has
+		// been restarted and no frame with the given salts is committed.
+		if binary.BigEndian.Uint32(hdr[32:]) != salt1 || binary.BigEndian.Uint32(hdr[36:]) != salt2 {
+			return 0, nil
+		}
+		return int(binary.NativeEndian.Uint32(hdr[16:])), nil
+	}
+	return 0, fmt.Errorf("read wal-index header after %d attempts: %w", maxAttempts, err)
+}
+
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
 func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
 	if prevWALOffset <= WALHeaderSize {
@@ -2140,6 +2199,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			return result, fmt.Errorf("new wal reader with offset: %w", err)
 		}
 	}
+
+	// Never read past the last frame committed to the wal-index.
+	n, err := db.walIndexMaxFrame(rd.salt1, rd.salt2)
+	if err != nil {
+		return result, fmt.Errorf("read committed wal boundary: %w", err)
+	}
+	rd.SetEnd(WALHeaderSize + int64(n)*int64(db.pageSize+WALFrameHeaderSize))
 
 	// Build a mapping of changed page numbers and their latest content.
 	db.setSyncDiagPhase(diagPhaseSyncPageMap,
