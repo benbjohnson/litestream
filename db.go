@@ -1246,8 +1246,11 @@ func (db *DB) acquireReadLock(ctx context.Context) error {
 		return nil
 	}
 
-	// Start long running read-transaction to prevent checkpoints.
-	tx, err := db.db.BeginTx(ctx, nil)
+	// Start long running read-transaction to prevent checkpoints. The
+	// transaction outlives this call, and database/sql rolls it back when its
+	// BeginTx context is cancelled, so detach it from the caller's context
+	// (e.g. a control socket request that is cancelled when it returns).
+	tx, err := db.db.BeginTx(context.WithoutCancel(ctx), nil)
 	if err != nil {
 		return err
 	}
