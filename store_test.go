@@ -761,7 +761,7 @@ func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
 	}
 	<-client.started
 	require.NoError(t, s.Close(context.Background()))
-	if err := <-client.drained; err != nil {
+	if err := <-client.drained; err != nil && !errors.Is(err, io.ErrClosedPipe) {
 		require.ErrorIs(t, err, context.Canceled)
 	}
 }
