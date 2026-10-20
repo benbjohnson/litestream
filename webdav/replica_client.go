@@ -193,8 +193,6 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
-// fetchTimestamps sets CreatedAt from each file's LTX header. A file whose
-// header cannot be read keeps its ModTime, as in the S3 and OSS clients.
 func (c *ReplicaClient) fetchTimestamps(ctx context.Context, infos []*ltx.FileInfo) error {
 	g, ctx := errgroup.WithContext(ctx)
 	g.SetLimit(metadataConcurrency)
@@ -207,13 +205,10 @@ func (c *ReplicaClient) fetchTimestamps(ctx context.Context, infos []*ltx.FileIn
 
 			hdr, err := litestream.FetchLTXHeader(ctx, c, info)
 			if err != nil {
-				// gowebdav ignores ctx, so report cancellation rather than log it.
 				if ctxErr := ctx.Err(); ctxErr != nil {
 					return ctxErr
 				}
-				c.logger.Warn("cannot read ltx header timestamp, using modification time",
-					"level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "error", err)
-				return nil
+				return fmt.Errorf("read ltx header timestamp for level %d file %s: %w", info.Level, ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
 			}
 			info.CreatedAt = time.UnixMilli(hdr.Timestamp).UTC()
 			return nil

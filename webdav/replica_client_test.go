@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path"
@@ -168,25 +169,64 @@ func TestReplicaClient_LTXFiles_UseMetadata(t *testing.T) {
 				}
 			}
 
-			// A file with an unreadable header keeps its modification time.
-			srv.mu.Lock()
-			srv.files["/db/ltx/0/0000000000000003-0000000000000003.ltx"] = bytes.Repeat([]byte("x"), ltx.HeaderSize)
-			srv.mu.Unlock()
-
 			infos, err := litestream.FindLTXFiles(context.Background(), c, 0, true, func(*ltx.FileInfo) (bool, error) { return true, nil })
 			if err != nil {
 				t.Fatal(err)
-			} else if got, want := len(infos), 3; got != want {
+			} else if got, want := len(infos), 2; got != want {
 				t.Fatalf("len=%d, want %d", got, want)
 			}
-			for _, info := range infos[:2] {
+			for _, info := range infos {
 				want := wantAt.Add(time.Duration(info.MaxTXID) * time.Minute)
 				if got := info.CreatedAt; !got.Equal(want) {
 					t.Fatalf("TXID %d: CreatedAt=%v, want %v", info.MaxTXID, got, want)
 				}
 			}
-			if d := time.Since(infos[2].CreatedAt); d < 0 || d > time.Minute {
-				t.Fatalf("invalid header: CreatedAt=%v, want server modification time", infos[2].CreatedAt)
+		})
+	}
+}
+
+func TestReplicaClient_MetadataFailure(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := newFakeWebDAVServer()
+			filename := "/db/ltx/0/0000000000000002-0000000000000002.ltx"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == filename {
+					w.WriteHeader(status)
+					_, _ = w.Write(bytes.Repeat([]byte("x"), ltx.HeaderSize))
+					return
+				}
+				srv.ServeHTTP(w, r)
+			}))
+			defer ts.Close()
+
+			c := newTestReplicaClient(ts.URL)
+			c.Path = "/db"
+			base := time.Now().Add(-time.Hour)
+			for i := ltx.TXID(1); i <= 2; i++ {
+				data := buildLTXPayloadAt(i, i, base.Add(time.Duration(i)*time.Minute), []byte("payload"))
+				if _, err := c.WriteLTXFile(context.Background(), 0, i, i, bytes.NewReader(data)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			infos, err := litestream.FindLTXFiles(context.Background(), c, 0, false, func(*ltx.FileInfo) (bool, error) { return true, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(infos) != 2 {
+				t.Fatalf("len=%d, want 2", len(infos))
+			}
+
+			if _, err := litestream.FindLTXFiles(context.Background(), c, 0, true, func(*ltx.FileInfo) (bool, error) { return true, nil }); err == nil {
+				t.Fatal("expected metadata error")
+			}
+			infos, err = litestream.CalcRestorePlan(context.Background(), c, 0, base.Add(3*time.Minute), slog.Default())
+			if err == nil {
+				t.Fatalf("expected metadata error, got restore plan: %v", infos)
+			}
+			if infos != nil {
+				t.Fatalf("expected no restore plan, got %v", infos)
 			}
 		})
 	}
