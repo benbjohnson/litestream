@@ -60,6 +60,129 @@ test('ignores successful and notifier jobs', () => {
   assert.deepEqual(failures, []);
 });
 
+test('retains failed steps when another step has no conclusion', () => {
+  const failures = classifyJobs([
+    {
+      id: 1,
+      name: 'LTX Behavioral Soak (high-volume)',
+      conclusion: 'failure',
+      steps: [
+        { name: 'Run LTX behavioral test', status: 'completed', conclusion: 'failure' },
+        { name: 'Upload test artifacts', status: 'queued', conclusion: null },
+      ],
+    },
+  ]);
+
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].classificationError, '');
+  assert.deepEqual(failures[0].failedSteps, ['Run LTX behavioral test']);
+});
+
+test('reports cancelled jobs whose steps have no conclusion', () => {
+  const failures = classifyJobs([
+    {
+      id: 1,
+      name: 'MinIO Soak',
+      conclusion: 'cancelled',
+      steps: [{ name: 'Run MinIO soak test', status: 'in_progress', conclusion: null }],
+    },
+  ]);
+
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].classificationError, '');
+  assert.deepEqual(failures[0].failedSteps, []);
+});
+
+test('continues to reject missing or invalid step conclusions', () => {
+  for (const conclusion of [undefined, '', ' ', false, 0, {}, []]) {
+    const failures = classifyJobs([
+      {
+        id: 1,
+        name: 'MinIO Soak',
+        conclusion: 'failure',
+        steps: [{ name: 'Run MinIO soak test', conclusion }],
+      },
+    ]);
+
+    assert.equal(failures.length, 1);
+    assert.match(failures[0].classificationError, /steps\[0\].conclusion/);
+  }
+});
+
+test('null step conclusions do not hide malformed job conclusions', () => {
+  const failures = classifyJobs([
+    {
+      id: 1,
+      name: 'MinIO Soak',
+      conclusion: null,
+      steps: [{ name: 'Run MinIO soak test', conclusion: null }],
+    },
+  ]);
+
+  assert.equal(failures.length, 1);
+  assert.match(failures[0].classificationError, /: conclusion must be a non-empty string/);
+});
+
+test('downloads failure logs when a later step has a null conclusion', async () => {
+  const jobs = [
+    {
+      id: 1,
+      name: 'LTX Behavioral Soak (high-volume)',
+      conclusion: 'failure',
+      steps: [
+        { name: 'Run LTX behavioral test', status: 'completed', conclusion: 'failure' },
+        { name: 'Upload test artifacts', status: 'queued', conclusion: null },
+      ],
+    },
+  ];
+  const createdIssues = [];
+  const logURLs = [];
+  const github = {
+    paginate: async route => (typeof route === 'string' ? jobs : []),
+    rest: {
+      issues: {
+        listForRepo: () => {},
+        create: async input => {
+          createdIssues.push(input);
+          return { data: { number: 123, html_url: 'https://github.com/benbjohnson/litestream/issues/123' } };
+        },
+      },
+    },
+  };
+
+  const originalWorkspace = process.env.GITHUB_WORKSPACE;
+  process.env.GITHUB_WORKSPACE = process.cwd();
+  try {
+    await runNotifierScript({
+      context: {
+        repo: { owner: 'benbjohnson', repo: 'litestream' },
+        runId: 456,
+        serverUrl: 'https://github.com',
+        ref: 'refs/heads/test',
+        sha: '1234567890abcdef',
+      },
+      github,
+      core: {},
+      fetch: async url => {
+        logURLs.push(url);
+        return { ok: true, text: async () => '--- FAIL: TestLTXBehavior (1.00s)' };
+      },
+    });
+  } finally {
+    if (originalWorkspace === undefined) {
+      delete process.env.GITHUB_WORKSPACE;
+    } else {
+      process.env.GITHUB_WORKSPACE = originalWorkspace;
+    }
+  }
+
+  assert.deepEqual(logURLs, ['https://api.github.com/repos/benbjohnson/litestream/actions/jobs/1/logs']);
+  assert.equal(createdIssues.length, 1);
+  assert.match(createdIssues[0].body, /Run LTX behavioral test/);
+  assert.match(createdIssues[0].body, /--- FAIL: TestLTXBehavior/);
+  assert.doesNotMatch(createdIssues[0].body, /Malformed job record/);
+});
+
 test('creates a tracking issue for malformed job objects', async () => {
   const jobs = [
     {
