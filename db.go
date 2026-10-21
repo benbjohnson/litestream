@@ -79,6 +79,8 @@ type DB struct {
 	syncState syncState
 	syncDiag  diagState
 
+	lastLTXPage *verifiedLTXPage
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -190,6 +192,33 @@ type DB struct {
 
 	// Where to send log messages, defaults to global slog with database epath.
 	Logger *slog.Logger
+}
+
+type verifiedLTXPage struct {
+	header ltx.Header
+	pgno   uint32
+	data   []byte
+}
+
+type ltxPageEncoder interface {
+	Header() ltx.Header
+	EncodePage(ltx.PageHeader, []byte) error
+}
+
+type verifyingLTXEncoder struct {
+	*ltx.Encoder
+	page verifiedLTXPage
+}
+
+func (enc *verifyingLTXEncoder) EncodePage(hdr ltx.PageHeader, data []byte) error {
+	if err := enc.Encoder.EncodePage(hdr, data); err != nil {
+		return err
+	}
+	if hdr.Pgno == enc.page.pgno {
+		enc.page.header = enc.Header()
+		enc.page.data = bytes.Clone(data)
+	}
+	return nil
 }
 
 // syncState holds mutable sync-tracking fields extracted from DB.
@@ -1914,9 +1943,16 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 		return false, nil
 	}
 
+	if page := db.lastLTXPage; page != nil && page.header == dec.Header() && page.pgno == pgno {
+		return bytes.Equal(data, page.data), nil
+	}
+
 	// Verify that the last page in the WAL exists in the last LTX file.
 	buf := make([]byte, dec.Header().PageSize)
 	for {
+		if err := context.Cause(ctx); err != nil {
+			return false, err
+		}
 		var hdr ltx.PageHeader
 		if err := dec.DecodePage(&hdr, buf); errors.Is(err, io.EOF) {
 			return false, nil // page not found in LTX file
@@ -1930,6 +1966,7 @@ func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset
 		if !bytes.Equal(data, buf) {
 			continue // page data doesn't match
 		}
+		db.lastLTXPage = &verifiedLTXPage{header: dec.Header(), pgno: pgno, data: bytes.Clone(buf)}
 		return true, nil // Page matches
 	}
 }
@@ -2236,6 +2273,17 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		return result, fmt.Errorf("encode ltx header: %w", err)
 	}
 
+	pageEncoder := &verifyingLTXEncoder{Encoder: enc}
+	if sz > 0 {
+		lastFrameOffset := info.offset + sz - int64(WALFrameHeaderSize+db.pageSize)
+		for pgno, offset := range pageMap {
+			if offset == lastFrameOffset {
+				pageEncoder.page.pgno = pgno
+				break
+			}
+		}
+	}
+
 	// If we need a full snapshot, then copy from the database & WAL.
 	// Otherwise, just copy incrementally from the WAL.
 	if info.snapshotting {
@@ -2246,7 +2294,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = true
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
+		if err := db.writeLTXFromDB(ctx, pageEncoder, walFile, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
@@ -2260,7 +2308,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 				s.snapshotting = false
 				s.reason = info.reason
 			})
-		if err := db.writeLTXFromWAL(ctx, enc, walFile, info.prevCommit, commit, pageMap); err != nil {
+		if err := db.writeLTXFromWAL(ctx, pageEncoder, walFile, info.prevCommit, commit, pageMap); err != nil {
 			if isDiskFullError(err) {
 				return result, NewLTXError("stage-write", tmpFilename, 0, uint64(txID), uint64(txID), fmt.Errorf("%w: %w", ErrDiskFull, err))
 			}
@@ -2318,6 +2366,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		return result, fmt.Errorf("sync ltx dir: %w", err)
 	}
 
+	db.lastLTXPage = nil
+	if pageEncoder.page.data != nil {
+		db.lastLTXPage = &pageEncoder.page
+	}
+
 	result.synced = true
 	result.l0FileInfo = &ltx.FileInfo{
 		Level:     0,
@@ -2359,7 +2412,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	return result, nil
 }
 
-func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromDB(ctx context.Context, enc ltxPageEncoder, walFile *os.File, commit uint32, pageMap map[uint32]int64) error {
 	lockPgno := ltx.LockPgno(uint32(db.pageSize))
 	data := make([]byte, db.pageSize)
 
@@ -2406,7 +2459,7 @@ func (db *DB) writeLTXFromDB(ctx context.Context, enc *ltx.Encoder, walFile *os.
 	return nil
 }
 
-func (db *DB) writeLTXFromWAL(ctx context.Context, enc *ltx.Encoder, walFile *os.File, prevCommit, commit uint32, pageMap map[uint32]int64) error {
+func (db *DB) writeLTXFromWAL(ctx context.Context, enc ltxPageEncoder, walFile *os.File, prevCommit, commit uint32, pageMap map[uint32]int64) error {
 	// Create an ordered list of page numbers since the LTX encoder requires it.
 	pgnos := make([]uint32, 0, len(pageMap))
 	for pgno := range pageMap {
