@@ -2350,7 +2350,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		Checksum1: checksum1,
 		Checksum2: checksum2,
 	}); err != nil {
-		return result, err
+		db.Logger.Warn("failed to persist wal continuity checksum", "error", err)
 	}
 
 	result.synced = true

@@ -85,9 +85,6 @@ func (db *DB) writeWALContinuityChecksum(checksum walContinuityChecksum) error {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("rename wal continuity checksum: %w", err)
 	}
-	if err := internal.FsyncDir(dir); err != nil {
-		return fmt.Errorf("sync wal continuity checksum directory: %w", err)
-	}
 	return nil
 }
 
