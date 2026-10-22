@@ -688,33 +688,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return fmt.Errorf("cannot calc restore plan: %w", err)
 	}
 
-	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
-
-	rdrs := make([]io.Reader, 0, len(infos))
-	defer func() {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-	}()
-
-	for _, info := range infos {
-		// Validate file size - must be at least header size to be readable
-		if info.Size < ltx.HeaderSize {
-			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
-				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
-		}
-
-		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
-
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
-	}
-
-	if len(rdrs) == 0 {
-		return fmt.Errorf("no matching backup files available")
-	}
-
 	// Create parent directory if it doesn't exist.
 	var dirInfo os.FileInfo
 	if db := r.DB(); db != nil {
@@ -726,7 +699,7 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Output to temp file & atomically rename.
 	tmpOutputPath := opt.OutputPath + ".tmp"
-	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(rdrs))
+	r.Logger().Debug("compacting into database", "path", tmpOutputPath, "n", len(infos))
 	defer func() { _ = os.Remove(tmpOutputPath) }()
 
 	f, err := os.Create(tmpOutputPath)
@@ -735,21 +708,32 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 	}
 	defer func() { _ = f.Close() }()
 
-	pr, pw := io.Pipe()
-
-	go func() {
-		c, err := ltx.NewCompactor(pw, rdrs)
-		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
-			return
+	targetTXID := infos[len(infos)-1].MaxTXID
+	for attempt := 0; ; attempt++ {
+		err := r.restorePlan(ctx, f, infos)
+		if err == nil {
+			break
 		}
-		c.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(c.Compact(ctx))
-	}()
-
-	dec := ltx.NewDecoder(pr)
-	if err := dec.DecodeDatabaseTo(f); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if attempt >= 3 {
+			return fmt.Errorf("restore plan retries exhausted for txid %s: %w", targetTXID, err)
+		}
+		r.Logger().Debug("restore file disappeared, recalculating plan", "target", targetTXID, "attempt", attempt+1, "error", err)
+		infos, err = CalcRestorePlan(ctx, r.Client, targetTXID, time.Time{}, r.Logger())
+		if err != nil {
+			return fmt.Errorf("cannot recalculate restore plan for txid %s: %w", targetTXID, err)
+		}
+		if err := f.Truncate(0); err != nil {
+			return err
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
 	}
 
 	if err := f.Sync(); err != nil {
@@ -781,13 +765,6 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 
 	// Enter follow mode if enabled, continuously applying new LTX files.
 	if opt.Follow {
-		for _, rd := range rdrs {
-			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
-			}
-		}
-		rdrs = nil
-
 		maxTXID := infos[len(infos)-1].MaxTXID
 		if err := WriteTXIDFile(opt.OutputPath, maxTXID); err != nil {
 			return fmt.Errorf("write initial txid file: %w", err)
@@ -795,6 +772,59 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
 	}
 
+	return nil
+}
+
+func (r *Replica) restorePlan(ctx context.Context, f *os.File, infos []*ltx.FileInfo) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	r.Logger().Debug("restore plan", "n", len(infos), "txid", infos[len(infos)-1].MaxTXID, "timestamp", infos[len(infos)-1].CreatedAt)
+
+	rdrs := make([]io.Reader, 0, len(infos))
+	defer func() {
+		for _, rd := range rdrs {
+			if closer, ok := rd.(io.Closer); ok {
+				_ = closer.Close()
+			}
+		}
+	}()
+
+	for _, info := range infos {
+		// Validate file size - must be at least header size to be readable
+		if info.Size < ltx.HeaderSize {
+			return fmt.Errorf("invalid ltx file: level=%d min=%s max=%s has size %d bytes (minimum %d)",
+				info.Level, info.MinTXID, info.MaxTXID, info.Size, ltx.HeaderSize)
+		}
+
+		r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+
+		rdrs = append(rdrs, internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger()))
+	}
+
+	if len(rdrs) == 0 {
+		return fmt.Errorf("no matching backup files available")
+	}
+
+	pr, pw := io.Pipe()
+	done := make(chan struct{})
+	defer func() {
+		cancel()
+		_ = pr.Close()
+		<-done
+	}()
+	go func() {
+		defer close(done)
+		c, err := ltx.NewCompactor(pw, rdrs)
+		if err != nil {
+			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
+			return
+		}
+		c.HeaderFlags = ltx.HeaderFlagNoChecksum
+		_ = pw.CloseWithError(c.Compact(ctx))
+	}()
+	if err := ltx.NewDecoder(pr).DecodeDatabaseTo(f); err != nil {
+		return fmt.Errorf("decode database: %w", err)
+	}
 	return nil
 }
 
