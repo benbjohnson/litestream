@@ -724,10 +724,18 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			return fmt.Errorf("restore plan retries exhausted for txid %s: %w", targetTXID, err)
 		}
 		r.Logger().Debug("restore file disappeared, recalculating plan", "target", targetTXID, "attempt", attempt+1, "error", err)
-		infos, err = CalcRestorePlan(ctx, r.Client, targetTXID, time.Time{}, r.Logger())
+		replanTXID := targetTXID
+		if opt.TXID == 0 && opt.Timestamp.IsZero() {
+			replanTXID = 0
+		}
+		infos, err = CalcRestorePlan(ctx, r.Client, replanTXID, time.Time{}, r.Logger())
 		if err != nil {
+			if replanTXID != 0 && errors.Is(err, ErrTxNotAvailable) {
+				return fmt.Errorf("restore target txid %s is no longer available: %w", targetTXID, err)
+			}
 			return fmt.Errorf("cannot recalculate restore plan for txid %s: %w", targetTXID, err)
 		}
+		targetTXID = infos[len(infos)-1].MaxTXID
 		if err := f.Truncate(0); err != nil {
 			return err
 		}
@@ -1552,6 +1560,7 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	// Start with latest snapshot before target TXID or timestamp.
 	// Pass useMetadata flag to enable accurate timestamp fetching for timestamp-based restore.
 	var snapshot *ltx.FileInfo
+	var nearestAfter ltx.TXID
 	snapshotItr, err := client.LTXFiles(ctx, SnapshotLevel, 0, !timestamp.IsZero())
 	if err != nil {
 		return nil, err
@@ -1560,6 +1569,9 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 		info := snapshotItr.Item()
 		logger.Debug("finding snapshot before target TXID or timestamp", "snapshot", info.MaxTXID)
 		if txID != 0 && info.MaxTXID > txID {
+			if nearestAfter == 0 || info.MaxTXID < nearestAfter {
+				nearestAfter = info.MaxTXID
+			}
 			continue
 		}
 		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
@@ -1649,10 +1661,22 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 		}
 	}
 
-	if len(infos) == 0 {
-		return nil, ErrTxNotAvailable
+	if txID != 0 && currentMax < txID {
+		for _, cursor := range cursors {
+			if cursor.nearestAfter != 0 && (nearestAfter == 0 || cursor.nearestAfter < nearestAfter) {
+				nearestAfter = cursor.nearestAfter
+			}
+		}
+		before, after := "none", "none"
+		if currentMax != 0 {
+			before = currentMax.String()
+		}
+		if nearestAfter != 0 {
+			after = nearestAfter.String()
+		}
+		return nil, fmt.Errorf("txid %s unavailable (nearest covered TXIDs: before=%s, after=%s): %w", txID, before, after, ErrTxNotAvailable)
 	}
-	if txID != 0 && infos.MaxTXID() < txID {
+	if len(infos) == 0 {
 		return nil, ErrTxNotAvailable
 	}
 
@@ -1660,6 +1684,7 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 }
 
 type restoreLevelCursor struct {
+	nearestAfter ltx.TXID
 	// itr streams LTX file infos for a single level in filename order.
 	itr ltx.FileIterator
 	// current holds the last item read from itr but not yet evaluated.
@@ -1698,6 +1723,9 @@ func (c *restoreLevelCursor) refresh(currentMax, txID ltx.TXID, timestamp time.T
 			continue
 		}
 		if txID != 0 && info.MaxTXID > txID {
+			if c.nearestAfter == 0 || info.MaxTXID < c.nearestAfter {
+				c.nearestAfter = info.MaxTXID
+			}
 			continue
 		}
 		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
