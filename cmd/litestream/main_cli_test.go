@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -106,6 +107,7 @@ func TestMainHarness(t *testing.T) {
 	}
 	os.Args = append([]string{"litestream"}, args...)
 	main()
+	os.Exit(0)
 }
 
 func TestMainSubcommandExplicitHelpExitsZero(t *testing.T) {
@@ -162,4 +164,79 @@ func runLitestreamMain(t *testing.T, args ...string) (stdout, stderr string, exi
 		t.Fatalf("unexpected command error: %v", err)
 	}
 	return out.String(), errOut.String(), exitErr.ExitCode()
+}
+
+func TestConfig_SnapshotWarningLogging(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "")
+	for _, tt := range []struct {
+		name        string
+		level       string
+		wantWarning bool
+	}{
+		{name: "JSONStderr", level: "info", wantWarning: true},
+		{name: "ErrorLevel", level: "error"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			configPath := filepath.Join(dir, "litestream.yml")
+			config := "snapshot:\n  interval: 1h\n  retention: 30m\nlogging:\n  type: json\n  stderr: true\n  level: " + tt.level + "\n"
+			if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
+				t.Fatal(err)
+			}
+			stdout, err := os.Create(filepath.Join(dir, "stdout"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { stdout.Close() })
+			stderr, err := os.Create(filepath.Join(dir, "stderr"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { stderr.Close() })
+
+			args, err := json.Marshal([]string{"databases", "-config", configPath, "-json"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			cmd := exec.Command(os.Args[0], "-test.run=^TestMainHarness$")
+			cmd.Env = append(os.Environ(), "LITESTREAM_TEST_MAIN=1", "LITESTREAM_TEST_ARGS="+string(args))
+			cmd.Stdout, cmd.Stderr = stdout, stderr
+			if err := cmd.Run(); err != nil {
+				t.Fatal(err)
+			}
+			output, err := os.ReadFile(stdout.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			var databases []DatabaseInfo
+			if err := json.Unmarshal(output, &databases); err != nil {
+				t.Errorf("expected valid JSON stdout, got %q: %v", output, err)
+			}
+			logOutput, err := os.ReadFile(stderr.Name())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !tt.wantWarning {
+				if len(logOutput) != 0 {
+					t.Errorf("expected no warning at error level, got %q", logOutput)
+				}
+				return
+			}
+			var warning map[string]any
+			if err := json.Unmarshal(logOutput, &warning); err != nil {
+				t.Fatalf("expected JSON warning on stderr, got %q: %v", logOutput, err)
+			}
+			for key, want := range map[string]any{
+				"level":     "WARN",
+				"msg":       "snapshot retention is shorter than snapshot interval",
+				"field":     "snapshot.retention",
+				"retention": float64(30 * 60 * 1e9),
+				"interval":  float64(60 * 60 * 1e9),
+			} {
+				if got := warning[key]; got != want {
+					t.Errorf("warning[%s] = %v, want %v", key, got, want)
+				}
+			}
+		})
+	}
 }
