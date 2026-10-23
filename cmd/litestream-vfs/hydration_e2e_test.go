@@ -281,10 +281,10 @@ func setupTestReplica(t *testing.T, client litestream.ReplicaClient) {
 
 	dbDir := t.TempDir()
 	db := testingutil.NewDB(t, filepath.Join(dbDir, "source.db"))
-	db.MonitorInterval = 100 * time.Millisecond
+	db.MonitorInterval = 0
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
-	db.Replica.SyncInterval = 100 * time.Millisecond
+	db.Replica.MonitorEnabled = false
 	require.NoError(t, db.Open())
 
 	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
@@ -294,9 +294,7 @@ func setupTestReplica(t *testing.T, client litestream.ReplicaClient) {
 	_, err = sqldb.Exec("INSERT INTO users (id, name) VALUES (1, 'Alice')")
 	require.NoError(t, err)
 
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-
-	require.NoError(t, db.Replica.Stop(false))
+	forceReplicaSync(t, db)
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }
@@ -307,10 +305,10 @@ func setupTestReplicaWithMoreData(t *testing.T, client litestream.ReplicaClient)
 
 	dbDir := t.TempDir()
 	db := testingutil.NewDB(t, filepath.Join(dbDir, "source.db"))
-	db.MonitorInterval = 100 * time.Millisecond
+	db.MonitorInterval = 0
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
-	db.Replica.SyncInterval = 100 * time.Millisecond
+	db.Replica.MonitorEnabled = false
 	require.NoError(t, db.Open())
 
 	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
@@ -326,9 +324,7 @@ func setupTestReplicaWithMoreData(t *testing.T, client litestream.ReplicaClient)
 		require.NoError(t, err)
 	}
 
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-
-	require.NoError(t, db.Replica.Stop(false))
+	forceReplicaSync(t, db)
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }

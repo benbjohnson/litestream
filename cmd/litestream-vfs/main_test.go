@@ -196,7 +196,7 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 	}
 
 	// Wait for replication to sync
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
 
 	t.Log("opening vfs replica")
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/test-txn.db?vfs=litestream-txn")
@@ -267,16 +267,18 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 
 	// Verify multiple rows across different pages
 	t.Log("verifying multiple rows across pages")
-	for _, id := range []int{0, 2500, 5000, 7500, 9999} {
-		var data string
-		if err := sqldb1.QueryRow("SELECT data FROM t WHERE id = ?", id).Scan(&data); err != nil {
-			t.Fatalf("failed to query id %d: %v", id, err)
+	require.Eventually(t, func() bool {
+		for _, id := range []int{0, 2500, 5000, 7500, 9999} {
+			var data string
+			if err := sqldb1.QueryRow("SELECT data FROM t WHERE id = ?", id).Scan(&data); err != nil {
+				return false
+			}
+			if !strings.HasPrefix(data, fmt.Sprintf("updated_data_%d", id)) {
+				return false
+			}
 		}
-		expected := fmt.Sprintf("updated_data_%d", id)
-		if !strings.HasPrefix(data, expected) {
-			t.Fatalf("id %d: expected prefix %s, got: %s", id, expected, data)
-		}
-	}
+		return true
+	}, 10*time.Second, db.MonitorInterval, "pooled replica connections should observe updates after commit")
 }
 
 func TestVFS_PollsL1Files(t *testing.T) {
@@ -1208,21 +1210,21 @@ func TestVFS_MultiplePageSizes(t *testing.T) {
 		const monitorInterval = 50 * time.Millisecond
 		t.Run(fmt.Sprintf("page_%d", pageSize), func(t *testing.T) {
 			client := file.NewReplicaClient(t.TempDir())
-			_, primary := openReplicatedPrimary(t, client, monitorInterval, 50*time.Millisecond)
+			_, primary := openReplicatedPrimary(t, client, monitorInterval, 50*time.Millisecond, func(primary *sql.DB) {
+				if _, err := primary.Exec("PRAGMA journal_mode=DELETE"); err != nil {
+					t.Fatalf("disable wal: %v", err)
+				}
+				if _, err := primary.Exec(fmt.Sprintf("PRAGMA page_size = %d", pageSize)); err != nil {
+					t.Fatalf("set page size: %v", err)
+				}
+				if _, err := primary.Exec("VACUUM"); err != nil {
+					t.Fatalf("vacuum: %v", err)
+				}
+				if _, err := primary.Exec("PRAGMA journal_mode=WAL"); err != nil {
+					t.Fatalf("enable wal: %v", err)
+				}
+			})
 			defer testingutil.MustCloseSQLDB(t, primary)
-
-			if _, err := primary.Exec("PRAGMA journal_mode=DELETE"); err != nil {
-				t.Fatalf("disable wal: %v", err)
-			}
-			if _, err := primary.Exec(fmt.Sprintf("PRAGMA page_size = %d", pageSize)); err != nil {
-				t.Fatalf("set page size: %v", err)
-			}
-			if _, err := primary.Exec("VACUUM"); err != nil {
-				t.Fatalf("vacuum: %v", err)
-			}
-			if _, err := primary.Exec("PRAGMA journal_mode=WAL"); err != nil {
-				t.Fatalf("enable wal: %v", err)
-			}
 
 			if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT)"); err != nil {
 				t.Fatalf("create table: %v", err)
@@ -2081,17 +2083,20 @@ func registerTestVFS(tb testing.TB, vfs sqlite3vfs.VFS) string {
 	return name
 }
 
-func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monitorInterval, syncInterval time.Duration) (*litestream.DB, *sql.DB) {
+func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monitorInterval, syncInterval time.Duration, initialize ...func(*sql.DB)) (*litestream.DB, *sql.DB) {
 	tb.Helper()
 	db := testingutil.NewDB(tb, filepath.Join(tb.TempDir(), "primary.db"))
 	db.MonitorInterval = monitorInterval
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
 	db.Replica.SyncInterval = syncInterval
+	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
+	for _, fn := range initialize {
+		fn(sqldb)
+	}
 	if err := db.Open(); err != nil {
 		tb.Fatalf("open db: %v", err)
 	}
-	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
 	tb.Cleanup(func() { _ = db.Close(context.Background()) })
 	return db, sqldb
 }

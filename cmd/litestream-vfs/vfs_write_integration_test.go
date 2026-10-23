@@ -37,10 +37,10 @@ func TestVFS_WriteAndSync_FileBackend(t *testing.T) {
 
 	// First, create initial data using standard litestream replication
 	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "source.db"))
-	db.MonitorInterval = 100 * time.Millisecond
+	db.MonitorInterval = 0
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
-	db.Replica.SyncInterval = 100 * time.Millisecond
+	db.Replica.MonitorEnabled = false
 	require.NoError(t, db.Open())
 
 	sqldb0 := testingutil.MustOpenSQLDB(t, db.Path())
@@ -51,8 +51,7 @@ func TestVFS_WriteAndSync_FileBackend(t *testing.T) {
 	_, err = sqldb0.Exec("INSERT INTO users (id, name) VALUES (1, 'Alice')")
 	require.NoError(t, err)
 
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
+	forceReplicaSync(t, db)
 	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
 
@@ -941,9 +940,10 @@ func TestVFS_InvalidPageSize(t *testing.T) {
 
 	// Create database with different page size
 	db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "source.db"))
-	db.MonitorInterval = 100 * time.Millisecond
+	db.MonitorInterval = 0
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
+	db.Replica.MonitorEnabled = false
 	require.NoError(t, db.Open())
 
 	sqldb0 := testingutil.MustOpenSQLDB(t, db.Path())
@@ -952,8 +952,7 @@ func TestVFS_InvalidPageSize(t *testing.T) {
 	_, err := sqldb0.Exec("CREATE TABLE test (x)")
 	require.NoError(t, err)
 
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
+	forceReplicaSync(t, db)
 	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
 
@@ -1248,10 +1247,10 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 
 	dbDir := t.TempDir()
 	db := testingutil.NewDB(t, filepath.Join(dbDir, "source.db"))
-	db.MonitorInterval = 50 * time.Millisecond
+	db.MonitorInterval = 0
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
-	db.Replica.SyncInterval = 50 * time.Millisecond
+	db.Replica.MonitorEnabled = false
 	require.NoError(t, db.Open())
 
 	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
@@ -1262,13 +1261,12 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	require.NoError(t, err)
 
 	// Wait for initial LTX file
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
 
 	// Force a DB sync and then replica sync to ensure all data is uploaded
 	require.NoError(t, db.Sync(context.Background()))
 	require.NoError(t, db.Replica.Sync(context.Background()))
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }

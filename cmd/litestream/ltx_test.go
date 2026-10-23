@@ -182,21 +182,33 @@ func captureLTXCommandStdout(t *testing.T, fn func()) string {
 	os.Stdout = w
 	t.Cleanup(func() {
 		os.Stdout = orig
+		_ = w.Close()
+		_ = r.Close()
 	})
+
+	type captureResult struct {
+		output []byte
+		err    error
+	}
+	readResult := make(chan captureResult, 1)
+	go func() {
+		output, err := io.ReadAll(r)
+		readResult <- captureResult{output: output, err: err}
+	}()
 
 	fn()
 
 	if err := w.Close(); err != nil {
 		t.Fatal(err)
 	}
-	output, err := io.ReadAll(r)
-	if err != nil {
-		t.Fatal(err)
+	result := <-readResult
+	if result.err != nil {
+		t.Fatal(result.err)
 	}
 	if err := r.Close(); err != nil {
 		t.Fatal(err)
 	}
-	return string(output)
+	return string(result.output)
 }
 
 func TestTXIDVarString(t *testing.T) {
