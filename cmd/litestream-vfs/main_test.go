@@ -1210,21 +1210,21 @@ func TestVFS_MultiplePageSizes(t *testing.T) {
 		const monitorInterval = 50 * time.Millisecond
 		t.Run(fmt.Sprintf("page_%d", pageSize), func(t *testing.T) {
 			client := file.NewReplicaClient(t.TempDir())
-			_, primary := openReplicatedPrimary(t, client, monitorInterval, 50*time.Millisecond)
+			_, primary := openReplicatedPrimary(t, client, monitorInterval, 50*time.Millisecond, func(primary *sql.DB) {
+				if _, err := primary.Exec("PRAGMA journal_mode=DELETE"); err != nil {
+					t.Fatalf("disable wal: %v", err)
+				}
+				if _, err := primary.Exec(fmt.Sprintf("PRAGMA page_size = %d", pageSize)); err != nil {
+					t.Fatalf("set page size: %v", err)
+				}
+				if _, err := primary.Exec("VACUUM"); err != nil {
+					t.Fatalf("vacuum: %v", err)
+				}
+				if _, err := primary.Exec("PRAGMA journal_mode=WAL"); err != nil {
+					t.Fatalf("enable wal: %v", err)
+				}
+			})
 			defer testingutil.MustCloseSQLDB(t, primary)
-
-			if _, err := primary.Exec("PRAGMA journal_mode=DELETE"); err != nil {
-				t.Fatalf("disable wal: %v", err)
-			}
-			if _, err := primary.Exec(fmt.Sprintf("PRAGMA page_size = %d", pageSize)); err != nil {
-				t.Fatalf("set page size: %v", err)
-			}
-			if _, err := primary.Exec("VACUUM"); err != nil {
-				t.Fatalf("vacuum: %v", err)
-			}
-			if _, err := primary.Exec("PRAGMA journal_mode=WAL"); err != nil {
-				t.Fatalf("enable wal: %v", err)
-			}
 
 			if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT)"); err != nil {
 				t.Fatalf("create table: %v", err)
@@ -2083,7 +2083,7 @@ func registerTestVFS(tb testing.TB, vfs sqlite3vfs.VFS) string {
 	return name
 }
 
-func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monitorInterval, syncInterval time.Duration) (*litestream.DB, *sql.DB) {
+func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monitorInterval, syncInterval time.Duration, initialize ...func(*sql.DB)) (*litestream.DB, *sql.DB) {
 	tb.Helper()
 	db := testingutil.NewDB(tb, filepath.Join(tb.TempDir(), "primary.db"))
 	db.MonitorInterval = monitorInterval
@@ -2091,6 +2091,9 @@ func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monit
 	db.Replica.Client = client
 	db.Replica.SyncInterval = syncInterval
 	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
+	for _, fn := range initialize {
+		fn(sqldb)
+	}
 	if err := db.Open(); err != nil {
 		tb.Fatalf("open db: %v", err)
 	}
