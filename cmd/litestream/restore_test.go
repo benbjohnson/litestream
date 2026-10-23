@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -445,5 +446,76 @@ func (c *advancingRestoreCommandClient) writeLTX(t *testing.T, ctx context.Conte
 	}
 	if _, err := c.WriteLTXFile(ctx, litestream.SnapshotLevel, minTXID, maxTXID, &buf); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRestoreCommand_ParallelismDeprecated(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		args []string
+		warn bool
+	}{
+		{name: "omitted"},
+		{name: "default", args: []string{"-parallelism", "8"}, warn: true},
+		{name: "custom", args: []string{"-parallelism=2"}, warn: true},
+		{name: "zero", args: []string{"-parallelism", "0"}, warn: true},
+		{name: "negative", args: []string{"-parallelism", "-1"}, warn: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, jsonOutput := range []bool{false, true} {
+				t.Run(fmt.Sprint(jsonOutput), func(t *testing.T) {
+					stdout, err := os.CreateTemp(t.TempDir(), "stdout")
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer stdout.Close()
+					stderr, err := os.CreateTemp(t.TempDir(), "stderr")
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer stderr.Close()
+					oldStdout, oldStderr, oldLogger := os.Stdout, os.Stderr, slog.Default()
+					defer func() { os.Stdout, os.Stderr = oldStdout, oldStderr; slog.SetDefault(oldLogger) }()
+					ctx := context.Background()
+					replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+					os.Stdout, os.Stderr = stdout, stderr
+					args := append([]string{}, tt.args...)
+					if jsonOutput {
+						args = append(args, "-json")
+					}
+					args = append(args, "-o", restorePath, "file://"+replicaPath)
+					if err := (&RestoreCommand{}).Run(ctx, args); err != nil {
+						t.Fatal(err)
+					}
+					out, err := os.ReadFile(stdout.Name())
+					if err != nil {
+						t.Fatal(err)
+					}
+					errOut, err := os.ReadFile(stderr.Name())
+					if err != nil {
+						t.Fatal(err)
+					}
+					logs := string(out)
+					if jsonOutput {
+						logs = string(errOut)
+						var result RestoreResult
+						if err := json.Unmarshal(out, &result); err != nil {
+							t.Fatalf("invalid JSON: %v: %s", err, out)
+						}
+					}
+					const warning = "-parallelism is deprecated and has no effect"
+					wantWarnings := 0
+					if tt.warn {
+						wantWarnings = 1
+					}
+					if got := strings.Count(logs, warning); got != wantWarnings {
+						t.Fatalf("warning count=%d, want warning=%v: %s", got, tt.warn, logs)
+					}
+					if tt.warn && !strings.Contains(logs, "WARN") {
+						t.Fatalf("missing WARN level: %s", logs)
+					}
+				})
+			}
+		})
 	}
 }

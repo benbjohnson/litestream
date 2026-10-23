@@ -104,6 +104,12 @@ Outputs LTX file metadata for the selected database or replica URL.
 Outputs a final summary object after a restore completes. Restore logs are
 written to stderr so stdout remains parseable JSON.
 
+The `-parallelism NUM` flag is deprecated and has no effect in 0.5.x. It is
+still accepted for compatibility; explicitly setting it emits a WARN log
+(including when set to the historical default of `8`). With `-json`, this
+warning goes to stderr. Omit the flag from new commands. The MCP restore
+tool also accepts the deprecated `parallelism` argument with the same behavior.
+
 ```json
 {
   "db_path": "/var/lib/app.db",

@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strconv"
 	"text/tabwriter"
 	"time"
 
@@ -29,7 +28,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	configPath, noExpandEnv := registerConfigFlag(fs)
 	fs.StringVar(&opt.OutputPath, "o", "", "output path")
 	fs.Var((*txidVar)(&opt.TXID), "txid", "transaction ID")
-	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "parallelism")
+	fs.IntVar(&opt.Parallelism, "parallelism", opt.Parallelism, "deprecated; accepted for compatibility but has no effect")
 	ifDBNotExists := fs.Bool("if-db-not-exists", false, "")
 	ifReplicaExists := fs.Bool("if-replica-exists", false, "")
 	timestampStr := fs.String("timestamp", "", "timestamp")
@@ -56,6 +55,11 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		logOutput = os.Stderr
 	}
 	internal.InitLog(logOutput, "INFO", "text", false)
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "parallelism" {
+			slog.Warn("-parallelism is deprecated and has no effect; accepted for compatibility only")
+		}
+	})
 
 	// When follow mode is enabled, set up signal handling so Ctrl+C stops
 	// the follow loop cleanly.
@@ -410,8 +414,8 @@ Arguments:
 	    Defaults to 1s.
 
 	-parallelism NUM
-	    Determines the number of WAL files downloaded in parallel.
-	    Defaults to `+strconv.Itoa(litestream.DefaultRestoreParallelism)+`.
+	    Deprecated. Accepted for compatibility but has no effect in 0.5.x.
+	    Logs a warning when explicitly set.
 
 	-integrity-check MODE
 	    Run a post-restore integrity check on the database.
