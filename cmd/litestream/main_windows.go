@@ -82,8 +82,11 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 		case req := <-r:
 			switch req.Cmd {
 			case svc.Stop:
-				c.Close(s.ctx)
 				statusCh <- svc.Status{State: svc.StopPending}
+				if err := c.Close(s.ctx); err != nil {
+					slog.Error("cannot close replication", "error", err)
+					return true, 3
+				}
 				return false, windows.NO_ERROR
 			case svc.Interrogate:
 				statusCh <- req.CurrentStatus
