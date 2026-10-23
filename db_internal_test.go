@@ -1031,7 +1031,7 @@ func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 1)
+	pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 1, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1046,6 +1046,187 @@ func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 	}
 	if got, want := len(pageMap), 2; got != want {
 		t.Fatalf("len(pageMap)=%d, want %d", got, want)
+	}
+}
+
+// TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction verifies that
+// a hard end offset is never read past, even when a transaction straddles it.
+// Regression test for #1490: the commit-frame break used to read a straddling
+// transaction through to its commit frame past the bound, which snapshotReader
+// then rejected with "snapshot wal read exceeded bound".
+func TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction(t *testing.T) {
+	// The fixture WAL holds two transactions: frames at offsets 32 and 4152
+	// committing at offset 8272, and one frame at offset 8272 committing at
+	// offset 12392.
+	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("MidTransaction", func(t *testing.T) {
+		r, err := NewWALReader(bytes.NewReader(b), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Bound inside the first transaction: the partial transaction must be
+		// discarded, not read through to its commit frame at offset 8272.
+		pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 0, 4152)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !limited {
+			t.Fatal("expected page map to stop at end offset")
+		}
+		if got, want := maxOffset, int64(0); got != want {
+			t.Fatalf("maxOffset=%d, want %d", got, want)
+		}
+		if got, want := commit, uint32(0); got != want {
+			t.Fatalf("commit=%d, want %d", got, want)
+		}
+		if got, want := len(pageMap), 0; got != want {
+			t.Fatalf("len(pageMap)=%d, want %d", got, want)
+		}
+	})
+
+	t.Run("AtCommitBoundary", func(t *testing.T) {
+		r, err := NewWALReader(bytes.NewReader(b), slog.Default())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		// Bound exactly at the first transaction's commit frame end: the
+		// transaction must still be included.
+		pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 0, 8272)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !limited {
+			t.Fatal("expected page map to stop at end offset")
+		}
+		if got, want := maxOffset, int64(8272); got != want {
+			t.Fatalf("maxOffset=%d, want %d", got, want)
+		}
+		if got, want := commit, uint32(2); got != want {
+			t.Fatalf("commit=%d, want %d", got, want)
+		}
+		if got, want := len(pageMap), 2; got != want {
+			t.Fatalf("len(pageMap)=%d, want %d", got, want)
+		}
+	})
+}
+
+func TestDB_SnapshotReaderStaleWALOffset(t *testing.T) {
+	for _, restart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Restart=%t", restart), func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "db")
+			db := NewDB(dbPath)
+			db.MonitorInterval = 0
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := db.Close(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}()
+
+			sqldb, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+			for _, query := range []string{
+				"PRAGMA journal_mode = wal",
+				"CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)",
+				"INSERT INTO t(data) VALUES (zeroblob(100))",
+			} {
+				if _, err := sqldb.Exec(query); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec("INSERT INTO t(data) VALUES (zeroblob(8000))"); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			syncedPos, err := db.Pos()
+			if err != nil {
+				t.Fatal(err)
+			}
+			frameSize := int64(WALFrameHeaderSize) + int64(db.PageSize())
+			wantEndOffset := db.syncState.lastSyncedWALOffset
+			if restart {
+				if err := db.releaseReadLock(); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := sqldb.Exec("PRAGMA wal_checkpoint(TRUNCATE)"); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.acquireReadLock(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+				for _, query := range []string{
+					"UPDATE t SET data = zeroblob(200) WHERE id = 1",
+					"INSERT INTO t(data) VALUES (zeroblob(80000))",
+				} {
+					if _, err := sqldb.Exec(query); err != nil {
+						t.Fatal(err)
+					}
+				}
+				wantEndOffset = WALHeaderSize
+			} else {
+				db.syncState.lastSyncedWALOffset -= frameSize
+			}
+			wal, err := os.ReadFile(db.WALPath())
+			if err != nil {
+				t.Fatal(err)
+			}
+			staleOffset := db.syncState.lastSyncedWALOffset
+			if commit := binary.BigEndian.Uint32(wal[staleOffset-frameSize+4:]); commit != 0 {
+				t.Fatalf("precondition: stale offset %d must land inside a transaction", staleOffset)
+			}
+
+			pos, r, err := db.SnapshotReader(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			var restored bytes.Buffer
+			dec := ltx.NewDecoder(r)
+			if err := dec.DecodeDatabaseTo(&restored); err != nil {
+				t.Fatal(err)
+			}
+			if pos.TXID != syncedPos.TXID || dec.Header().MaxTXID != syncedPos.TXID {
+				t.Fatalf("snapshot TXID=%s, header=%s, want %s", pos.TXID, dec.Header().MaxTXID, syncedPos.TXID)
+			}
+			if got := dec.Header().WALOffset + dec.Header().WALSize; got != wantEndOffset {
+				t.Fatalf("snapshot WAL end=%d, want %d", got, wantEndOffset)
+			}
+			restoredPath := filepath.Join(t.TempDir(), "restored.db")
+			if err := os.WriteFile(restoredPath, restored.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			restoredDB, err := sql.Open("sqlite", restoredPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restoredDB.Close()
+			var count, size int
+			if err := restoredDB.QueryRow("SELECT COUNT(*), SUM(length(data)) FROM t").Scan(&count, &size); err != nil {
+				t.Fatal(err)
+			}
+			if count != 2 || size != 8100 {
+				t.Fatalf("snapshot restored %d rows, %d blob bytes; want 2 rows, 8100 bytes", count, size)
+			}
+		})
 	}
 }
 
