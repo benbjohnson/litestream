@@ -964,28 +964,40 @@ const restoreOpenConcurrency = 32
 // that fails to open has a nil stream; its ResumableReader retries it on
 // first read.
 func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) ([]*internal.ResumableReader, error) {
+	launchCtx, stopLaunching := context.WithCancelCause(ctx)
+	defer stopLaunching(nil)
 	readers := make([]*internal.ResumableReader, 0, len(infos))
 	sem := semaphore.NewWeighted(restoreOpenConcurrency)
 	var wg sync.WaitGroup
 	for _, info := range infos {
+		if err := sem.Acquire(launchCtx, 1); err != nil {
+			break
+		}
+		if launchCtx.Err() != nil {
+			sem.Release(1)
+			break
+		}
 		rd := internal.NewResumableReader(ctx, r.Client, info.Level, info.MinTXID, info.MaxTXID, info.Size, nil, r.Logger())
 		readers = append(readers, rd)
-		if err := sem.Acquire(ctx, 1); err != nil {
-			wg.Wait()
-			for _, rd := range readers {
-				_ = rd.Close()
-			}
-			return nil, err
-		}
 		wg.Go(func() {
 			defer sem.Release(1)
 			r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 			if err := rd.Open(); err != nil {
+				if errors.Is(err, os.ErrNotExist) || errors.Is(err, context.Canceled) {
+					stopLaunching(err)
+					return
+				}
 				r.Logger().Debug("open ltx file for restore failed; the reader retries it", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "error", err)
 			}
 		})
 	}
 	wg.Wait()
+	if err := context.Cause(launchCtx); err != nil {
+		for _, rd := range readers {
+			_ = rd.Close()
+		}
+		return nil, err
+	}
 	return readers, nil
 }
 
