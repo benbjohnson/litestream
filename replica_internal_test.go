@@ -543,3 +543,66 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 		}
 	}
 }
+
+func TestReplica_CalcPos(t *testing.T) {
+	l0 := func(txIDs ...ltx.TXID) []*ltx.FileInfo {
+		infos := make([]*ltx.FileInfo, 0, len(txIDs))
+		for _, txID := range txIDs {
+			infos = append(infos, &ltx.FileInfo{Level: 0, MinTXID: txID, MaxTXID: txID})
+		}
+		return infos
+	}
+
+	for _, tt := range []struct {
+		name string
+		l1   []*ltx.FileInfo
+		l0   []*ltx.FileInfo
+		want ltx.TXID
+	}{
+		{name: "Empty", want: 0},
+		{name: "NoGapResumesAtMax", l0: l0(1, 2, 3), want: 3},
+		{name: "EmptyL1InteriorGapStopsBeforeGap", l0: l0(1, 2, 4, 5), want: 2},
+		{name: "EmptyL1LeadingFilesAcceptedAsIs", l0: l0(3, 4, 5), want: 5},
+		{name: "L0BelowL1Ignored", l1: []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 3}}, l0: l0(1, 2, 3), want: 3},
+		{name: "GapAboveL1BoundaryResumesAtL1", l1: []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 3}}, l0: l0(1, 2, 3, 5, 6), want: 3},
+		{name: "InteriorGapAboveL1StopsBeforeGap", l1: []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: 3}}, l0: l0(4, 5, 7), want: 5},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &followTestReplicaClient{}
+			client.LTXFilesFunc = func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				switch level {
+				case 0:
+					return ltx.NewFileInfoSliceIterator(tt.l0), nil
+				case 1:
+					return ltx.NewFileInfoSliceIterator(tt.l1), nil
+				default:
+					return ltx.NewFileInfoSliceIterator(nil), nil
+				}
+			}
+
+			r := NewReplicaWithClient(nil, client)
+			pos, err := r.calcPos(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := pos.TXID; got != tt.want {
+				t.Fatalf("pos=%s, want %s", got, tt.want)
+			}
+		})
+	}
+
+	t.Run("L0ListingErrorPropagates", func(t *testing.T) {
+		client := &followTestReplicaClient{}
+		client.LTXFilesFunc = func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+			if level == 0 {
+				return &errorFileIterator{closeErr: fmt.Errorf("level 0 listing failed")}, nil
+			}
+			return ltx.NewFileInfoSliceIterator(nil), nil
+		}
+
+		r := NewReplicaWithClient(nil, client)
+		if _, err := r.calcPos(context.Background()); err == nil || !bytes.Contains([]byte(err.Error()), []byte("level 0 listing failed")) {
+			t.Fatalf("err=%v, want level 0 listing failure", err)
+		}
+	})
+}
