@@ -605,7 +605,17 @@ func (r *Replica) CalcRestoreTarget(ctx context.Context, opt RestoreOptions) (up
 // compares snapshots from both formats and uses whichever has the better backup:
 // - With timestamp: uses the format with the most recent snapshot before timestamp
 // - Without timestamp: uses the format with the most recent backup overall
-func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
+func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) error {
+	return r.restore(ctx, opt, nil)
+}
+
+func (r *Replica) RestoreWithTXID(ctx context.Context, opt RestoreOptions) (ltx.TXID, error) {
+	var txid ltx.TXID
+	err := r.restore(ctx, opt, &txid)
+	return txid, err
+}
+
+func (r *Replica) restore(ctx context.Context, opt RestoreOptions, restoredTXID *ltx.TXID) (err error) {
 	// Validate options.
 	if opt.OutputPath == "" {
 		return fmt.Errorf("output path required")
@@ -778,6 +788,10 @@ func (r *Replica) Restore(ctx context.Context, opt RestoreOptions) (err error) {
 			return fmt.Errorf("write initial txid file: %w", err)
 		}
 		return r.follow(ctx, opt.OutputPath, maxTXID, opt.FollowInterval)
+	}
+
+	if restoredTXID != nil {
+		*restoredTXID = targetTXID
 	}
 
 	return nil

@@ -387,8 +387,11 @@ func TestReplica_RestoreReplanPastTarget(t *testing.T) {
 					case "timestamp":
 						opt.Timestamp = time.Now().Add(time.Hour)
 					}
-					err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, opt)
+					restoredTXID, err := litestream.NewReplicaWithClient(nil, client).RestoreWithTXID(ctx, opt)
 					if mode == "latest" {
+						if restoredTXID != 3 {
+							t.Fatalf("restored TXID=%s, want 3", restoredTXID)
+						}
 						if err != nil {
 							t.Fatal(err)
 						}
@@ -397,6 +400,9 @@ func TestReplica_RestoreReplanPastTarget(t *testing.T) {
 							t.Fatalf("restored data mismatch: size=%d err=%v", len(data), err)
 						}
 					} else {
+						if restoredTXID != 0 {
+							t.Fatalf("failed restore reported TXID %s", restoredTXID)
+						}
 						if !errors.Is(err, litestream.ErrTxNotAvailable) {
 							t.Fatalf("error=%v, want unavailable target", err)
 						}
