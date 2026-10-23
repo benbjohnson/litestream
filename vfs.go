@@ -793,7 +793,7 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 
 	// Compact and decode using io.Pipe pattern
 	pr, pw := io.Pipe()
-	c, err := newRestoreCompactor(pw, rdrs)
+	c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(h.path))
 	if err != nil {
 		return fmt.Errorf("new ltx compactor: %w", err)
 	}
@@ -812,7 +812,7 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	dec := ltx.NewDecoder(pr)
+	dec := newRestoreDecoder(pr)
 	decodeErr := dec.DecodeDatabaseTo(h.file)
 	_ = pr.CloseWithError(decodeErr)
 	if decodeErr != nil {
