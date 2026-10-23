@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -541,5 +542,200 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
 			t.Fatalf("page %d data mismatch", i+1)
 		}
+	}
+}
+
+func TestReplica_ApplyNewLTXFiles_PartialGapProgress(t *testing.T) {
+	for _, emptyLevelZero := range []bool{false, true} {
+		t.Run(fmt.Sprintf("empty_level_zero=%t", emptyLevelZero), func(t *testing.T) {
+			const pageSize = 4096
+			applyErr := errors.New("open failed")
+			closeErr := errors.New("close failed")
+			data := mustBuildIncrementalLTX(t, 11, 12, pageSize, 2, 0xC3)
+			client := &followTestReplicaClient{}
+			client.LTXFilesFunc = func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				switch level {
+				case 0:
+					if emptyLevelZero {
+						return ltx.NewFileInfoSliceIterator(nil), nil
+					}
+					return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{Level: 0, MinTXID: 15, MaxTXID: 15}}), nil
+				case 1:
+					itr := ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+						{Level: 1, MinTXID: 11, MaxTXID: 12},
+						{Level: 1, MinTXID: 13, MaxTXID: 14},
+					})
+					if emptyLevelZero {
+						return &followCloseErrorIterator{FileIterator: itr, err: closeErr}, nil
+					}
+					return itr, nil
+				default:
+					t.Fatalf("unexpected level: %d", level)
+					return nil, nil
+				}
+			}
+			client.OpenLTXFileFunc = func(_ context.Context, _ int, minTXID, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+				if minTXID == 11 {
+					return io.NopCloser(bytes.NewReader(data)), nil
+				}
+				return nil, applyErr
+			}
+			r := NewReplicaWithClient(nil, client)
+			f := mustCreateWritableDBFile(t)
+			defer f.Close()
+			got, err := r.applyNewLTXFiles(context.Background(), f, 10, pageSize)
+			wantErr := applyErr
+			if emptyLevelZero {
+				wantErr = closeErr
+			}
+			if !errors.Is(err, wantErr) {
+				t.Fatalf("error=%v, want %v", err, wantErr)
+			}
+			if got != 12 {
+				t.Fatalf("txid=%s, want %s", got, ltx.TXID(12))
+			}
+			page := make([]byte, pageSize)
+			if _, err := f.ReadAt(page, pageSize); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(page, bytes.Repeat([]byte{0xC3}, pageSize)) {
+				t.Fatal("applied page does not match saved progress")
+			}
+		})
+	}
+}
+
+type followCloseErrorIterator struct {
+	ltx.FileIterator
+	err error
+}
+
+func (itr *followCloseErrorIterator) Close() error {
+	return errors.Join(itr.FileIterator.Close(), itr.err)
+}
+
+func TestReplica_Follow_PartialProgressOnCancellation(t *testing.T) {
+	const pageSize = 4096
+	f := mustCreateWritableDBFile(t)
+	if _, err := f.WriteAt(newSQLiteHeaderPage(pageSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteTXIDFile(f.Name(), 10); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	data := mustBuildIncrementalLTX(t, 11, 11, pageSize, 2, 0xC3)
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{
+			{Level: 0, MinTXID: 11, MaxTXID: 11},
+			{Level: 0, MinTXID: 12, MaxTXID: 12},
+		}), nil
+	}
+	client.OpenLTXFileFunc = func(_ context.Context, _ int, minTXID, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		if minTXID == 11 {
+			return io.NopCloser(bytes.NewReader(data)), nil
+		}
+		cancel()
+		return nil, context.Canceled
+	}
+	r := NewReplicaWithClient(nil, client)
+	if err := r.follow(ctx, f.Name(), 10, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadTXIDFile(f.Name()); err != nil || got != 11 {
+		t.Fatalf("saved txid=%s, err=%v, want %s", got, err, ltx.TXID(11))
+	}
+}
+
+func TestReplica_Follow_RetryPartialProgress(t *testing.T) {
+	for _, failSidecar := range []bool{false, true} {
+		t.Run(fmt.Sprintf("fail_sidecar=%t", failSidecar), func(t *testing.T) {
+			const pageSize = 4096
+			f := mustCreateWritableDBFile(t)
+			if _, err := f.WriteAt(newSQLiteHeaderPage(pageSize), 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := WriteTXIDFile(f.Name(), 10); err != nil {
+				t.Fatal(err)
+			}
+			if failSidecar {
+				if err := os.Mkdir(TXIDPath(f.Name())+".tmp", 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			data := mustBuildIncrementalLTX(t, 11, 11, pageSize, 2, 0xC3)
+			applyErr := errors.New("temporary open failure")
+			var polls, applied, failures int
+			client := &followTestReplicaClient{}
+			client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
+				if level != 0 {
+					t.Fatalf("unexpected level: %d", level)
+				}
+				polls++
+				want := ltx.TXID(11)
+				if polls > 1 {
+					want = 12
+					if got, err := ReadTXIDFile(f.Name()); err != nil || got != 11 {
+						t.Fatalf("saved txid=%s, err=%v, want 11", got, err)
+					}
+				}
+				if seek != want {
+					t.Fatalf("poll %d: seek=%s, want %s", polls, seek, want)
+				}
+				if polls == 3 {
+					cancel()
+					return nil, context.Canceled
+				}
+				var infos []*ltx.FileInfo
+				for txid := seek; txid <= 12; txid++ {
+					infos = append(infos, &ltx.FileInfo{Level: 0, MinTXID: txid, MaxTXID: txid})
+				}
+				return ltx.NewFileInfoSliceIterator(infos), nil
+			}
+			client.OpenLTXFileFunc = func(_ context.Context, _ int, minTXID, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+				if minTXID == 11 {
+					applied++
+					return io.NopCloser(bytes.NewReader(data)), nil
+				}
+				failures++
+				return nil, applyErr
+			}
+			var logs bytes.Buffer
+			db := NewDB(f.Name())
+			db.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+			r := NewReplicaWithClient(db, client)
+			err := r.follow(ctx, f.Name(), 10, time.Millisecond)
+			if failSidecar {
+				if err == nil || !strings.Contains(err.Error(), "write txid file") {
+					t.Fatalf("expected sidecar error, got %v", err)
+				}
+				if polls != 1 {
+					t.Fatalf("retried terminal sidecar error: polls=%d", polls)
+				}
+				if got, err := ReadTXIDFile(f.Name()); err != nil || got != 10 {
+					t.Fatalf("saved txid=%s, err=%v, want 10", got, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if applied != 1 || failures != 2 {
+				t.Fatalf("applied=%d, failures=%d, want 1 and 2", applied, failures)
+			}
+			if !strings.Contains(logs.String(), "level=WARN") || !strings.Contains(logs.String(), applyErr.Error()) {
+				t.Fatalf("missing warning with apply error: %s", logs.String())
+			}
+		})
 	}
 }
