@@ -2103,10 +2103,10 @@ func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monit
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
 	db.Replica.SyncInterval = syncInterval
+	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
 	if err := db.Open(); err != nil {
 		tb.Fatalf("open db: %v", err)
 	}
-	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
 	tb.Cleanup(func() { _ = db.Close(context.Background()) })
 	return db, sqldb
 }
