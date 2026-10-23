@@ -432,12 +432,6 @@ func (c *Config) Validate() error {
 			Value: *c.Snapshot.Retention,
 		}
 	}
-	if c.Snapshot.Interval != nil && c.Snapshot.Retention != nil && *c.Snapshot.Retention < *c.Snapshot.Interval {
-		slog.Warn("snapshot retention is shorter than snapshot interval",
-			"field", "snapshot.retention",
-			"retention", *c.Snapshot.Retention,
-			"interval", *c.Snapshot.Interval)
-	}
 	if c.L0Retention != nil && *c.L0Retention < 0 {
 		return &ConfigValidationError{
 			Err:   ErrInvalidL0Retention,
@@ -550,12 +544,6 @@ func (c *Config) Validate() error {
 				Value: *db.Snapshot.Retention,
 			}
 		}
-		if db.Snapshot.Interval != nil && db.Snapshot.Retention != nil && *db.Snapshot.Retention < *db.Snapshot.Interval {
-			slog.Warn("snapshot retention is shorter than snapshot interval",
-				"field", fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
-				"retention", *db.Snapshot.Retention,
-				"interval", *db.Snapshot.Interval)
-		}
 
 		// Validate sync intervals for replicas
 		if db.Replica != nil && db.Replica.SyncInterval != nil && *db.Replica.SyncInterval <= 0 {
@@ -577,6 +565,25 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func (c *Config) warnSnapshotRetention() {
+	warn := func(field string, snapshot SnapshotConfig) {
+		if snapshot.Interval != nil && snapshot.Retention != nil && *snapshot.Retention < *snapshot.Interval {
+			slog.Warn("snapshot retention is shorter than snapshot interval",
+				"field", field,
+				"retention", *snapshot.Retention,
+				"interval", *snapshot.Interval)
+		}
+	}
+	warn("snapshot.retention", c.Snapshot)
+	for _, db := range c.DBs {
+		dbIdentifier := db.Path
+		if dbIdentifier == "" {
+			dbIdentifier = db.Dir
+		}
+		warn(fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier), db.Snapshot)
+	}
 }
 
 // CompactionLevels returns a full list of compaction levels include L0.
@@ -721,6 +728,7 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		config.Logging.Level = v
 	}
 	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	config.warnSnapshotRetention()
 
 	return config, nil
 }
