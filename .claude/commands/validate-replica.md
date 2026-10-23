@@ -71,5 +71,5 @@ Key validation points:
 
 Run integration tests:
 ```bash
-go test -v ./[backend]/replica_client_test.go -integration
+go test -v ./replica_client_test.go -integration -replica-clients=[backend]
 ```
