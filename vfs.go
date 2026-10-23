@@ -2753,8 +2753,10 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 
 	if level0.maxTXID > level1.maxTXID {
 		f.pos.TXID = level0.maxTXID
+		f.latestLTXTime = latestTime(f.latestLTXTime, level0.createdAt)
 	} else {
 		f.pos.TXID = level1.maxTXID
+		f.latestLTXTime = latestTime(f.latestLTXTime, level1.createdAt)
 	}
 
 	f.maxTXID1 = level1.maxTXID
@@ -2773,6 +2775,13 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	return nil
 }
 
+func latestTime(a, b time.Time) time.Time {
+	if a.After(b) {
+		return a
+	}
+	return b
+}
+
 type pollLevelResult struct {
 	maxTXID      ltx.TXID
 	index        map[uint32]ltx.PageIndexElem
@@ -2780,6 +2789,8 @@ type pollLevelResult struct {
 	replaceIndex bool
 	anchored     bool
 	coveredTXID  ltx.TXID
+	// createdAt is the CreatedAt of the newest LTX file applied; zero if none.
+	createdAt time.Time
 }
 
 // pollLevel fetches LTX files for a specific level and returns the highest TXID seen,
@@ -2853,6 +2864,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 			}
 			mergePageIndexes(result.index, nil, idx, nil)
 			result.maxTXID = info.MaxTXID
+			result.createdAt = info.CreatedAt
 			if level >= 1 {
 				result.anchored = true
 				result.coveredTXID = info.MaxTXID
