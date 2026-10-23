@@ -1102,16 +1102,6 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 			return nil
 		case <-ticker.C:
 			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
-			if ctx.Err() != nil {
-				r.Logger().Info("follow mode stopped")
-				return nil
-			}
-			gapErr, _ := errors.AsType[*followGapError](err)
-			if err != nil && err != gapErr {
-				consecutiveErrors++
-				r.Logger().Error("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
-				continue
-			}
 			if newTXID > lastTXID {
 				if err := WriteTXIDFile(outputPath, newTXID); err != nil {
 					return fmt.Errorf("write txid file: %w", err)
@@ -1119,6 +1109,16 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
 				lastTXID = newTXID
 				consecutiveErrors = 0
+			}
+			if ctx.Err() != nil {
+				r.Logger().Info("follow mode stopped")
+				return nil
+			}
+			gapErr, _ := errors.AsType[*followGapError](err)
+			if err != nil && err != gapErr {
+				consecutiveErrors++
+				r.Logger().Warn("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
+				continue
 			}
 			if gapErr != nil && stallTXID != gapErr.TXID {
 				r.Logger().Warn("follow: no ltx file available at current position, follower is not advancing",
@@ -1159,10 +1159,10 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 		// If there's a gap, try to fill it from higher compaction levels.
 		if info.MinTXID > currentTXID+1 {
 			bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, info.MinTXID, pageSize)
+			currentTXID = bridgedTXID
 			if err != nil {
 				return closeLevel0(err)
 			}
-			currentTXID = bridgedTXID
 
 			// Re-check if this file is still needed after bridging.
 			if info.MaxTXID <= currentTXID {
@@ -1196,10 +1196,10 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 
 	if !sawLevel0 {
 		bridgedTXID, err := r.fillFollowGap(ctx, f, currentTXID, currentTXID+1, pageSize)
+		currentTXID = bridgedTXID
 		if err != nil {
 			return currentTXID, err
 		}
-		currentTXID = bridgedTXID
 	}
 
 	return currentTXID, nil
