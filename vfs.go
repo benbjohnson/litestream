@@ -2695,18 +2695,16 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 // pollReplicaClient fetches new LTX files from the replica client and updates
 // the page index & the current position.
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
-	pos := f.Pos()
-	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
-
-	combined := make(map[uint32]ltx.PageIndexElem)
-
 	f.mu.Lock()
+	pos := f.pos
 	baseCommit := f.commit
 	maxTXID1Snapshot := f.maxTXID1
 	maxTXID1AnchoredSnapshot := f.maxTXID1Anchored
 	maxTXID1CoveredSnapshot := f.maxTXID1Covered
 	f.mu.Unlock()
 
+	f.logger.Debug("polling replica client", "txid", pos.TXID.String())
+	combined := make(map[uint32]ltx.PageIndexElem)
 	newCommit := baseCommit
 	replaceIndex := false
 
@@ -2784,6 +2782,10 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	// Send updates to a pending list if there are active readers.
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if f.pos != pos {
+		return nil
+	}
 
 	if f.targetTime != nil {
 		// Skip applying updates while time travel is active to avoid
