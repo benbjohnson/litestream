@@ -4995,3 +4995,199 @@ func TestDB_ConcurrentMetricOwners(t *testing.T) {
 		t.Fatalf("series remain after last close: %v", got)
 	}
 }
+
+func TestDB_LastPageMatch_ReusesVerifiedPage(t *testing.T) {
+	const pageSize = 512
+	const frameSize = WALFrameHeaderSize + pageSize
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	data := bytes.Repeat([]byte{3}, pageSize)
+	frame := make([]byte, frameSize)
+	binary.BigEndian.PutUint32(frame, 3)
+	binary.BigEndian.PutUint32(frame[8:], 1)
+	binary.BigEndian.PutUint32(frame[12:], 2)
+	copy(frame[WALFrameHeaderSize:], data)
+	wal := make([]byte, WALHeaderSize+2*frameSize)
+	copy(wal[WALHeaderSize+frameSize:], frame)
+	if err := os.WriteFile(db.WALPath(), wal, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: pageSize, Commit: 3, MinTXID: 1, MaxTXID: 1, WALOffset: WALHeaderSize, WALSize: 2 * frameSize, WALSalt1: 1, WALSalt2: 2}); err != nil {
+		t.Fatal(err)
+	}
+	for pgno := uint32(1); pgno <= 3; pgno++ {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range [][]byte{buf.Bytes(), buf.Bytes()[:ltx.HeaderSize]} {
+		dec := ltx.NewDecoder(bytes.NewReader(input))
+		if err := dec.DecodeHeader(); err != nil {
+			t.Fatal(err)
+		}
+		if match, err := db.lastPageMatch(t.Context(), dec, WALHeaderSize+frameSize, frameSize); err != nil || !match {
+			t.Fatalf("lastPageMatch = %v, %v", match, err)
+		}
+	}
+}
+
+func TestDB_LastPageMatch_RejectsChangedWAL(t *testing.T) {
+	const pageSize = 512
+	const frameSize = WALFrameHeaderSize + pageSize
+	for _, field := range []string{"data", "page", "salt", "txid", "offset"} {
+		t.Run(field, func(t *testing.T) {
+			db := NewDB(filepath.Join(t.TempDir(), "db"))
+			header := ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: pageSize, Commit: 3, MinTXID: 1, MaxTXID: 1, WALOffset: WALHeaderSize, WALSize: 2 * frameSize, WALSalt1: 1, WALSalt2: 2}
+			data := bytes.Repeat([]byte{3}, pageSize)
+			db.lastLTXPage = &verifiedLTXPage{header: header, pgno: 3, data: bytes.Clone(data)}
+			frame := make([]byte, frameSize)
+			binary.BigEndian.PutUint32(frame, 3)
+			binary.BigEndian.PutUint32(frame[8:], 1)
+			binary.BigEndian.PutUint32(frame[12:], 2)
+			copy(frame[WALFrameHeaderSize:], data)
+			switch field {
+			case "data":
+				frame[WALFrameHeaderSize]++
+			case "page":
+				binary.BigEndian.PutUint32(frame, 2)
+			case "salt":
+				frame[8]++
+			case "txid":
+				header.MinTXID, header.MaxTXID = 2, 2
+			case "offset":
+				header.WALOffset += frameSize
+			}
+			wal := make([]byte, WALHeaderSize+2*frameSize)
+			copy(wal[WALHeaderSize+frameSize:], frame)
+			if err := os.WriteFile(db.WALPath(), wal, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			b, err := header.MarshalBinary()
+			if err != nil {
+				t.Fatal(err)
+			}
+			dec := ltx.NewDecoder(bytes.NewReader(b))
+			if err := dec.DecodeHeader(); err != nil {
+				t.Fatal(err)
+			}
+			if match, err := db.lastPageMatch(t.Context(), dec, WALHeaderSize+frameSize, frameSize); err != nil || match {
+				t.Fatalf("lastPageMatch = %v, %v", match, err)
+			}
+		})
+	}
+}
+
+type verificationLogHandler struct {
+	slog.Handler
+	verify func()
+}
+
+func (h *verificationLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	if record.Message == "verify" {
+		h.verify()
+	}
+	return h.Handler.Handle(ctx, record)
+}
+
+func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
+	for _, cold := range []bool{false, true} {
+		t.Run(fmt.Sprintf("cold=%v", cold), func(t *testing.T) {
+			ctx := t.Context()
+			path := filepath.Join(t.TempDir(), "db")
+			sqldb, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer sqldb.Close()
+			sqldb.SetMaxOpenConns(1)
+			if _, err := sqldb.Exec(`PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE t (data BLOB); INSERT INTO t VALUES (zeroblob(4194304)); PRAGMA wal_checkpoint(TRUNCATE);`); err != nil {
+				t.Fatal(err)
+			}
+			db := NewDB(path)
+			db.MonitorInterval = 0
+			db.CheckpointInterval = 0
+			db.MinCheckpointPageN = 1 << 30
+			db.TruncatePageN = 1 << 30
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+				if err := db.Close(context.Background()); err != nil {
+					t.Error(err)
+				}
+			}()
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertCached := func() {
+				t.Helper()
+				page := db.lastLTXPage
+				if page == nil {
+					t.Fatal("last LTX page not cached")
+				}
+				f, err := os.Open(db.LTXPath(0, page.header.MinTXID, page.header.MaxTXID))
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer f.Close()
+				dec := ltx.NewDecoder(io.LimitReader(f, ltx.HeaderSize))
+				if err := dec.DecodeHeader(); err != nil {
+					t.Fatal(err)
+				}
+				if dec.Header() != page.header {
+					t.Fatal("cached header differs from persisted LTX header")
+				}
+				frameSize := int64(WALFrameHeaderSize + db.pageSize)
+				offset := page.header.WALOffset + page.header.WALSize - frameSize
+				if match, err := db.lastPageMatch(ctx, dec, offset, frameSize); err != nil || !match {
+					t.Fatalf("cached match = %v, %v", match, err)
+				}
+			}
+			assertCached()
+			if cold {
+				db.lastLTXPage = nil
+			}
+			barriers := 0
+			db.Logger = slog.New(&verificationLogHandler{
+				Handler: slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelDebug}),
+				verify: func() {
+					if _, err := sqldb.Exec(`BEGIN IMMEDIATE`); err == nil {
+						if _, err := sqldb.Exec(`ROLLBACK`); err != nil {
+							t.Fatal(err)
+						}
+						return
+					} else if !isSQLiteBusyError(err) {
+						t.Fatal(err)
+					}
+					barriers++
+					assertCached()
+				},
+			})
+			if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+				t.Fatal(err)
+			}
+			if barriers == 0 {
+				t.Fatal("did not observe verification under the write barrier")
+			}
+			db.Logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+			if _, err := sqldb.Exec(`INSERT INTO t VALUES (zeroblob(8192))`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			assertCached()
+		})
+	}
+}
