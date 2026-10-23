@@ -640,7 +640,7 @@ jobs:
 
       - run: go install ./cmd/litestream
 
-      - run: go test -v ./replica_client_test.go -integration webdav
+      - run: go test -v ./replica_client_test.go -integration -replica-clients=webdav
         env:
           LITESTREAM_WEBDAV_URL:      "http://localhost:8080"
           LITESTREAM_WEBDAV_USERNAME: "testuser"

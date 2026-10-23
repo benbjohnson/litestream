@@ -3,10 +3,13 @@ package webdav_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,6 +18,7 @@ import (
 
 	"github.com/superfly/ltx"
 
+	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/webdav"
 )
 
@@ -138,6 +142,118 @@ func TestReplicaClient_OpenLTXFile_OffsetOnly(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_LTXFiles_UseMetadata(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		ignoreRange bool
+	}{
+		{"RangeSupported", false},
+		{"RangeIgnored", true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			srv := newFakeWebDAVServer()
+			srv.ignoreRange = tt.ignoreRange
+
+			ts := httptest.NewServer(srv)
+			defer ts.Close()
+
+			c := newTestReplicaClient(ts.URL)
+			c.Path = "/db"
+
+			// The server stamps files with the upload time; the header has the real one.
+			wantAt := time.Now().Add(-time.Hour).Truncate(time.Millisecond)
+			for i := ltx.TXID(1); i <= 2; i++ {
+				data := buildLTXPayloadAt(i, i, wantAt.Add(time.Duration(i)*time.Minute), []byte("payload"))
+				if _, err := c.WriteLTXFile(context.Background(), 0, i, i, bytes.NewReader(data)); err != nil {
+					t.Fatalf("WriteLTXFile failed: %v", err)
+				}
+			}
+
+			infos, err := litestream.FindLTXFiles(context.Background(), c, 0, true, func(*ltx.FileInfo) (bool, error) { return true, nil })
+			if err != nil {
+				t.Fatal(err)
+			} else if got, want := len(infos), 2; got != want {
+				t.Fatalf("len=%d, want %d", got, want)
+			}
+			for _, info := range infos {
+				want := wantAt.Add(time.Duration(info.MaxTXID) * time.Minute)
+				if got := info.CreatedAt; !got.Equal(want) {
+					t.Fatalf("TXID %d: CreatedAt=%v, want %v", info.MaxTXID, got, want)
+				}
+			}
+		})
+	}
+}
+
+func TestReplicaClient_MetadataFailure(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusServiceUnavailable} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			srv := newFakeWebDAVServer()
+			filename := "/db/ltx/0/0000000000000002-0000000000000002.ltx"
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodGet && r.URL.Path == filename {
+					w.WriteHeader(status)
+					_, _ = w.Write(bytes.Repeat([]byte("x"), ltx.HeaderSize))
+					return
+				}
+				srv.ServeHTTP(w, r)
+			}))
+			defer ts.Close()
+
+			c := newTestReplicaClient(ts.URL)
+			c.Path = "/db"
+			base := time.Now().Add(-time.Hour)
+			for i := ltx.TXID(1); i <= 2; i++ {
+				data := buildLTXPayloadAt(i, i, base.Add(time.Duration(i)*time.Minute), []byte("payload"))
+				if _, err := c.WriteLTXFile(context.Background(), 0, i, i, bytes.NewReader(data)); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			infos, err := litestream.FindLTXFiles(context.Background(), c, 0, false, func(*ltx.FileInfo) (bool, error) { return true, nil })
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(infos) != 2 {
+				t.Fatalf("len=%d, want 2", len(infos))
+			}
+
+			if _, err := litestream.FindLTXFiles(context.Background(), c, 0, true, func(*ltx.FileInfo) (bool, error) { return true, nil }); err == nil {
+				t.Fatal("expected metadata error")
+			}
+			infos, err = litestream.CalcRestorePlan(context.Background(), c, 0, base.Add(3*time.Minute), slog.Default())
+			if err == nil {
+				t.Fatalf("expected metadata error, got restore plan: %v", infos)
+			}
+			if infos != nil {
+				t.Fatalf("expected no restore plan, got %v", infos)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_LTXFiles_UseMetadata_ContextCanceled(t *testing.T) {
+	srv := newFakeWebDAVServer()
+
+	ts := httptest.NewServer(srv)
+	defer ts.Close()
+
+	c := newTestReplicaClient(ts.URL)
+	c.Path = "/db"
+
+	data := buildLTXPayload(1, 1, []byte("payload"))
+	if _, err := c.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(data)); err != nil {
+		t.Fatalf("WriteLTXFile failed: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := c.LTXFiles(ctx, 0, 0, true); !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want %v", err, context.Canceled)
+	}
+}
+
 // newTestReplicaClient returns a replica client pointed at a test server.
 func newTestReplicaClient(baseURL string) *webdav.ReplicaClient {
 	c := webdav.NewReplicaClient()
@@ -148,13 +264,18 @@ func newTestReplicaClient(baseURL string) *webdav.ReplicaClient {
 
 // buildLTXPayload constructs a minimal valid LTX file with payload data.
 func buildLTXPayload(minTXID, maxTXID ltx.TXID, payload []byte) []byte {
+	return buildLTXPayloadAt(minTXID, maxTXID, time.Now(), payload)
+}
+
+// buildLTXPayloadAt is buildLTXPayload with a given header timestamp.
+func buildLTXPayloadAt(minTXID, maxTXID ltx.TXID, timestamp time.Time, payload []byte) []byte {
 	hdr := ltx.Header{
 		Version:   1,
 		PageSize:  4096,
 		Commit:    1,
 		MinTXID:   minTXID,
 		MaxTXID:   maxTXID,
-		Timestamp: time.Now().UnixMilli(),
+		Timestamp: timestamp.UnixMilli(),
 	}
 	headerBytes, _ := hdr.MarshalBinary()
 	return append(headerBytes, payload...)
@@ -249,6 +370,16 @@ func (s *fakeWebDAVServer) handlePropfind(w http.ResponseWriter, r *http.Request
 		return
 	}
 
+	// List the files directly under the path, stamped with the current time
+	// like a server that records when it received them.
+	now := time.Now().UTC().Format(http.TimeFormat)
+	var children strings.Builder
+	for name, data := range s.files {
+		if path.Dir(name) == trimmed {
+			fmt.Fprintf(&children, `<d:response><d:href>%s</d:href><d:propstat><d:prop><d:getcontentlength>%d</d:getcontentlength><d:getlastmodified>%s</d:getlastmodified></d:prop><d:status>HTTP/1.1 200 OK</d:status></d:propstat></d:response>`, name, len(data), now)
+		}
+	}
+
 	response := fmt.Sprintf(`<?xml version="1.0" encoding="utf-8"?>
 <d:multistatus xmlns:d="DAV:">
   <d:response>
@@ -261,8 +392,8 @@ func (s *fakeWebDAVServer) handlePropfind(w http.ResponseWriter, r *http.Request
       </d:prop>
       <d:status>HTTP/1.1 200 OK</d:status>
     </d:propstat>
-  </d:response>
-</d:multistatus>`, trimmed, time.Now().UTC().Format(http.TimeFormat))
+  </d:response>%s
+</d:multistatus>`, trimmed, now, children.String())
 
 	w.Header().Set("Content-Type", "application/xml; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(response)))
