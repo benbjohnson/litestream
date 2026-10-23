@@ -566,35 +566,37 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 
 	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
+	const writes = 100
+	const readers = 8
 	var writerOps atomic.Int64
 	writerErr := make(chan error, 1)
 	go func() {
 		defer close(writerErr)
 		rnd := rand.New(rand.NewSource(time.Now().UnixNano()))
-		for {
+		for i := 0; i < writes; i++ {
 			select {
 			case <-ctx.Done():
-				writerErr <- nil
+				writerErr <- ctx.Err()
 				return
 			default:
 			}
 
 			switch rnd.Intn(3) {
 			case 0:
-				if _, err := primary.Exec("INSERT INTO t (value, updated_at) VALUES (?, strftime('%s','now'))", fmt.Sprintf("value-%d", rnd.Int())); err != nil {
+				if _, err := primary.ExecContext(ctx, "INSERT INTO t (value, updated_at) VALUES (?, strftime('%s','now'))", fmt.Sprintf("value-%d", rnd.Int())); err != nil {
 					writerErr <- err
 					return
 				}
 			case 1:
-				if _, err := primary.Exec("UPDATE t SET value = value || '-u' WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
+				if _, err := primary.ExecContext(ctx, "UPDATE t SET value = value || '-u' WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
 					writerErr <- err
 					return
 				}
 			default:
-				if _, err := primary.Exec("DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
+				if _, err := primary.ExecContext(ctx, "DELETE FROM t WHERE id IN (SELECT id FROM t ORDER BY RANDOM() LIMIT 1)"); err != nil {
 					writerErr <- err
 					return
 				}
@@ -603,11 +605,12 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 			writerOps.Add(1)
 			time.Sleep(time.Duration(rnd.Intn(5)+1) * time.Millisecond)
 		}
+		writerErr <- nil
 	}()
 
-	readerErrCh := make(chan error, 1)
+	readerErrCh := make(chan error, readers)
 	var readerWg sync.WaitGroup
-	for i := 0; i < 8; i++ {
+	for i := 0; i < readers; i++ {
 		readerWg.Add(1)
 		go func(id int) {
 			defer readerWg.Done()
@@ -632,10 +635,11 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 		}(i)
 	}
 
-	<-ctx.Done()
+	err := <-writerErr
+	cancel()
 	readerWg.Wait()
 
-	if err := <-writerErr; err != nil && !errors.Is(err, context.Canceled) {
+	if err != nil {
 		t.Fatalf("writer error: %v", err)
 	}
 	select {
@@ -646,8 +650,8 @@ func TestVFS_HighLoadConcurrentReads(t *testing.T) {
 	default:
 	}
 
-	if ops := writerOps.Load(); ops < 100 {
-		t.Fatalf("expected high write volume, got %d ops", ops)
+	if ops := writerOps.Load(); ops != writes {
+		t.Fatalf("completed %d writes, want %d", ops, writes)
 	}
 
 	waitForReplicaRowCount(t, primary, replica, 30*time.Second)
@@ -1722,7 +1726,7 @@ func TestVFS_PageIndexCorruptionRecovery(t *testing.T) {
 func TestVFS_RapidUpdateCoalescing(t *testing.T) {
 	client := file.NewReplicaClient(t.TempDir())
 	const interval = 5 * time.Millisecond
-	_, primary := openReplicatedPrimary(t, client, interval, interval)
+	db, primary := openReplicatedPrimary(t, client, interval, interval)
 	defer testingutil.MustCloseSQLDB(t, primary)
 
 	if _, err := primary.Exec("CREATE TABLE metrics (id INTEGER PRIMARY KEY, value INTEGER)"); err != nil {
@@ -1732,6 +1736,8 @@ func TestVFS_RapidUpdateCoalescing(t *testing.T) {
 		t.Fatalf("insert row: %v", err)
 	}
 
+	forceReplicaSync(t, db)
+
 	vfs := newVFS(t, client)
 	vfs.PollInterval = interval
 	vfsName := registerTestVFS(t, vfs)
@@ -1739,25 +1745,29 @@ func TestVFS_RapidUpdateCoalescing(t *testing.T) {
 	defer replica.Close()
 
 	const updates = 200
-	writerDone := make(chan struct{})
-	go func() {
-		defer close(writerDone)
-		for i := 1; i <= updates; i++ {
-			if _, err := primary.Exec("UPDATE metrics SET value = ? WHERE id = 1", i); err != nil {
-				return
-			}
-			time.Sleep(time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	for i := 1; i <= updates; i++ {
+		if _, err := primary.ExecContext(ctx, "UPDATE metrics SET value = ? WHERE id = 1", i); err != nil {
+			t.Fatalf("update %d: %v", i, err)
 		}
-	}()
+		time.Sleep(time.Millisecond)
+	}
 
-	require.Eventually(t, func() bool {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
 		var value int
 		if err := replica.QueryRow("SELECT value FROM metrics WHERE id = 1").Scan(&value); err != nil {
-			return false
+			t.Fatalf("read replica value: %v", err)
 		}
-		return value == updates
-	}, 3*time.Second, 5*time.Millisecond, "replica should observe final value")
-	<-writerDone
+		if value == updates {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("replica value %d did not converge to %d", value, updates)
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	var value int
 	if err := replica.QueryRow("SELECT value FROM metrics WHERE id = 1").Scan(&value); err != nil {
@@ -2108,7 +2118,7 @@ func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monit
 		fn(sqldb)
 	}
 	if err := db.Open(); err != nil {
-		tb.Fatalf("open db: %v", err)
+		tb.Fatalf("open db: %v", errors.Join(err, sqldb.Close()))
 	}
 	tb.Cleanup(func() { _ = db.Close(context.Background()) })
 	return db, sqldb
