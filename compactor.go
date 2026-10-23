@@ -2,10 +2,13 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -18,8 +21,9 @@ import (
 // It operates solely through the ReplicaClient interface, making it
 // suitable for both DB (with local file caching) and VFS (remote-only).
 type Compactor struct {
-	client ReplicaClient
-	logger *slog.Logger
+	client              ReplicaClient
+	logger              *slog.Logger
+	snapshotTransitions snapshotTransitionLog
 
 	// VerifyCompaction enables post-compaction TXID consistency verification.
 	// When enabled, verifies that files at the destination level have
@@ -58,6 +62,30 @@ type Compactor struct {
 	SourceGapHandler func(srcLevel int, expectedMinTXID, actualMinTXID ltx.TXID)
 }
 
+type snapshotTransitionLog struct {
+	mu        sync.Mutex
+	baselines map[int]ltx.TXID
+}
+
+func (l *snapshotTransitionLog) warn(ctx context.Context, logger *slog.Logger, srcLevel, dstLevel int, expected, actual, snapshot, retiredMin ltx.TXID) {
+	l.mu.Lock()
+	if l.baselines[srcLevel] >= snapshot {
+		l.mu.Unlock()
+		return
+	}
+	if l.baselines == nil {
+		l.baselines = make(map[int]ltx.TXID)
+	}
+	l.baselines[srcLevel] = snapshot
+	l.mu.Unlock()
+	logger.WarnContext(ctx, "snapshot baseline adopted; historical continuity abandoned",
+		"src_level", srcLevel, "dst_level", dstLevel,
+		"expected_txid", expected.String(), "actual_txid", actual.String(),
+		"snapshot_max_txid", snapshot.String(),
+		"retired_min_txid", retiredMin.String(), "retired_max_txid", snapshot.String(),
+		"reason", "local healing unavailable")
+}
+
 // NewCompactor creates a new Compactor with the given client and logger.
 func NewCompactor(client ReplicaClient, logger *slog.Logger) *Compactor {
 	if logger == nil {
@@ -77,7 +105,7 @@ func (c *Compactor) setLogger(logger *slog.Logger) {
 // MaxLTXFileInfo returns metadata for the last LTX file in a level.
 // Uses cache if available, otherwise fetches from remote.
 func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo, error) {
-	if c.CacheGetter != nil {
+	if c.CacheGetter != nil && level != SnapshotLevel {
 		if info, ok := c.CacheGetter(level); ok {
 			return *info, nil
 		}
@@ -130,37 +158,76 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		}
 	}()
 
-	// When L1 already has files, L0 must continue exactly at seekTXID or L1
-	// would become non-contiguous: L0 retention only deletes files already
-	// compacted into L1, so a missing seek file is always a real gap. Above
-	// L0 the check must not apply — snapshot retention legitimately deletes
-	// source files past a lagging destination level, and the snapshot covers
-	// the missing range. Without a destination file the first source file is
-	// accepted as-is since earlier files may have been removed by retention.
 	var expectedMinTXID ltx.TXID
 	if srcLevel == 0 && prevMaxInfo.MaxTXID > 0 {
 		expectedMinTXID = seekTXID
 	}
 
-	var minTXID, maxTXID ltx.TXID
+	var minTXID, maxTXID, baselineTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
+		if info.MaxTXID <= baselineTXID {
+			continue
+		}
 
-		if expectedMinTXID != 0 && info.MinTXID != expectedMinTXID {
+		straddlesBaseline := baselineTXID != 0 && len(rdrs) == 0 && info.MinTXID <= baselineTXID+1
+		if expectedMinTXID != 0 && info.MinTXID != expectedMinTXID && !straddlesBaseline {
 			if info.MinTXID < expectedMinTXID {
 				return nil, fmt.Errorf("overlapping transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
 			}
-			if srcLevel != 0 {
-				return nil, fmt.Errorf("non-contiguous transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
+			localUnavailable := true
+			if srcLevel == 0 && c.LocalFileOpener != nil {
+				f, err := c.LocalFileOpener(0, expectedMinTXID, expectedMinTXID)
+				switch {
+				case err == nil:
+					if err := f.Close(); err != nil {
+						return nil, fmt.Errorf("close local gap probe: %w", err)
+					}
+					localUnavailable = false
+				case !errors.Is(err, fs.ErrNotExist):
+					return nil, fmt.Errorf("probe local gap file: %w", err)
+				}
 			}
-			c.logger.Warn("stopping compaction at TXID gap",
-				"level", srcLevel,
-				"expected_min_txid", expectedMinTXID,
-				"actual_min_txid", info.MinTXID)
-			if c.SourceGapHandler != nil {
-				c.SourceGapHandler(srcLevel, expectedMinTXID, info.MinTXID)
+			var snapshot ltx.FileInfo
+			if localUnavailable {
+				snapshot, err = c.MaxLTXFileInfo(ctx, SnapshotLevel)
+				if err != nil {
+					return nil, fmt.Errorf("snapshot baseline: %w", err)
+				}
 			}
-			break
+			if snapshot.MaxTXID >= info.MinTXID-1 {
+				retiredMin := expectedMinTXID
+				if minTXID != 0 {
+					retiredMin = minTXID
+				}
+				baselineTXID = snapshot.MaxTXID
+				for _, rd := range rdrs {
+					if closer, ok := rd.(io.Closer); ok {
+						if err := closer.Close(); err != nil {
+							return nil, fmt.Errorf("close retired source: %w", err)
+						}
+					}
+				}
+				c.snapshotTransitions.warn(ctx, c.logger, srcLevel, dstLevel, expectedMinTXID, info.MinTXID, snapshot.MaxTXID, retiredMin)
+				rdrs = nil
+				minTXID, maxTXID = 0, 0
+				expectedMinTXID = baselineTXID + 1
+				if info.MaxTXID <= baselineTXID {
+					continue
+				}
+			} else {
+				if srcLevel != 0 {
+					return nil, fmt.Errorf("non-contiguous transaction ids in source files at level %d: expected min %s, got %s", srcLevel, expectedMinTXID, info.MinTXID)
+				}
+				c.logger.Warn("stopping compaction at TXID gap",
+					"level", srcLevel,
+					"expected_min_txid", expectedMinTXID,
+					"actual_min_txid", info.MinTXID)
+				if c.SourceGapHandler != nil {
+					c.SourceGapHandler(srcLevel, expectedMinTXID, info.MinTXID)
+				}
+				break
+			}
 		}
 
 		if minTXID == 0 || info.MinTXID < minTXID {
@@ -251,6 +318,14 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 		expectedMinTXID := prevInfo.MaxTXID + 1
 		if info.MinTXID != expectedMinTXID {
 			if info.MinTXID > expectedMinTXID {
+				snapshot, err := c.MaxLTXFileInfo(ctx, SnapshotLevel)
+				if err != nil {
+					return fmt.Errorf("snapshot baseline: %w", err)
+				}
+				if snapshot.MaxTXID >= info.MinTXID-1 {
+					prevInfo = info
+					continue
+				}
 				return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
 					prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
 			}
