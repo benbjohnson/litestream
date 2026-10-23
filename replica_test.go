@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -449,6 +450,53 @@ func testReplicaMissingLocalSnapshotLifecycle(t *testing.T, scheduler bool) {
 	}
 	if rowN != 10 || idSum != 45 {
 		t.Fatalf("later restore count=%d sum=%d", rowN, idSum)
+	}
+}
+
+func TestReplica_StartStopConcurrent(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	r := litestream.NewReplicaWithClient(db, file.NewReplicaClient(t.TempDir()))
+	defer func() {
+		if err := r.Stop(true); err != nil {
+			t.Error(err)
+		}
+	}()
+
+	var wg sync.WaitGroup
+	ready := make(chan struct{})
+	for range 4 {
+		wg.Go(func() {
+			<-ready
+			for range 100 {
+				if err := r.Start(t.Context()); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+		wg.Go(func() {
+			<-ready
+			for range 100 {
+				if err := r.Stop(false); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		})
+	}
+	close(ready)
+	wg.Wait()
+
+	if err := r.Stop(false); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Start(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Stop(false); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -49,8 +49,9 @@ type Replica struct {
 	muf sync.Mutex
 	f   *os.File // long-running file descriptor to avoid non-OFD lock issues
 
-	wg     sync.WaitGroup
-	cancel func()
+	lifecycleMu sync.Mutex
+	wg          sync.WaitGroup
+	cancel      func()
 
 	// Client used to connect to the remote replica.
 	Client ReplicaClient
@@ -107,13 +108,18 @@ func (r *Replica) DB() *DB { return r.db }
 
 // Starts replicating in a background goroutine.
 func (r *Replica) Start(ctx context.Context) error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+
 	// Ignore if replica is being used sychronously.
 	if !r.MonitorEnabled {
 		return nil
 	}
 
 	// Stop previous replication.
-	r.Stop(false)
+	if err := r.stop(false); err != nil {
+		return err
+	}
 
 	// Wrap context with cancelation.
 	ctx, r.cancel = context.WithCancel(ctx)
@@ -130,7 +136,13 @@ func (r *Replica) Start(ctx context.Context) error {
 // Performing a hard stop will close the DB file descriptor which could release
 // locks on per-process locks. Hard stops should only be performed when
 // stopping the entire process.
-func (r *Replica) Stop(hard bool) (err error) {
+func (r *Replica) Stop(hard bool) error {
+	r.lifecycleMu.Lock()
+	defer r.lifecycleMu.Unlock()
+	return r.stop(hard)
+}
+
+func (r *Replica) stop(hard bool) (err error) {
 	r.cancel()
 	r.wg.Wait()
 
