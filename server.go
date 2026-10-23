@@ -418,13 +418,16 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx := s.ctx
+	ctx, cancel := context.WithCancel(r.Context())
+	defer cancel()
+	stop := context.AfterFunc(s.ctx, cancel)
+	defer stop()
 	if req.Wait && req.Timeout == 0 {
 		req.Timeout = 30
 	}
 	if req.Timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(s.ctx, time.Duration(req.Timeout)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(req.Timeout)*time.Second)
 		defer cancel()
 	}
 
