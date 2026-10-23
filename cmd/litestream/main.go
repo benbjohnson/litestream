@@ -1659,7 +1659,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if storageClass == "" {
 			storageClass = ustorageClass
 		}
-		if !forcePathStyle {
+		if c.ForcePathStyle == nil && !forcePathStyle {
 			forcePathStyle = uforcePathStyle
 		}
 		if !signSetting.set && usignPayloadSet {

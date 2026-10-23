@@ -4169,6 +4169,20 @@ func TestNewS3ReplicaClientFromConfig_NeonExplicitOverrideParity(t *testing.T) {
 	}
 }
 
+func TestNewS3ReplicaClientFromConfig_NeonYAMLOverride(t *testing.T) {
+	forcePathStyle := false
+	client, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+		URL:             "s3://backup.br-demo.storage.c-6.us-east-2.aws.neon.tech/path",
+		ReplicaSettings: main.ReplicaSettings{ForcePathStyle: &forcePathStyle},
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if client.ForcePathStyle {
+		t.Fatal("expected explicit YAML ForcePathStyle=false to override the host default")
+	}
+}
+
 func TestNewS3ReplicaClientFromConfig_NeonExplicitEndpoint(t *testing.T) {
 	const bucket = "backup.br-demo.storage.c-6.us-east-2.aws.neon.tech"
 	const endpoint = "https://s3.us-west-2.amazonaws.com"
