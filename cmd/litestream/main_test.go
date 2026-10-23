@@ -838,10 +838,18 @@ snapshot:
 	})
 
 	t.Run("RetentionShorterThanInterval", func(t *testing.T) {
-		var logOutput bytes.Buffer
-		originalLogger := slog.Default()
-		t.Cleanup(func() { slog.SetDefault(originalLogger) })
-		slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, nil)))
+		t.Setenv("LOG_LEVEL", "")
+		logOutput, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		originalStdout, originalLogger := os.Stdout, slog.Default()
+		t.Cleanup(func() {
+			os.Stdout = originalStdout
+			slog.SetDefault(originalLogger)
+			logOutput.Close()
+		})
+		os.Stdout = logOutput
 
 		yaml := `
 snapshot:
@@ -855,6 +863,10 @@ snapshot:
 		if got := *config.Snapshot.Retention; got != 30*time.Minute {
 			t.Fatalf("expected retention to remain 30m, got %v", got)
 		}
+		output, err := os.ReadFile(logOutput.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, want := range []string{
 			"level=WARN",
 			"snapshot retention is shorter than snapshot interval",
@@ -862,17 +874,25 @@ snapshot:
 			"retention=30m0s",
 			"interval=1h0m0s",
 		} {
-			if !strings.Contains(logOutput.String(), want) {
-				t.Errorf("expected warning containing %q, got %q", want, logOutput.String())
+			if !strings.Contains(string(output), want) {
+				t.Errorf("expected warning containing %q, got %q", want, string(output))
 			}
 		}
 	})
 
 	t.Run("DBRetentionShorterThanInterval", func(t *testing.T) {
-		var logOutput bytes.Buffer
-		originalLogger := slog.Default()
-		t.Cleanup(func() { slog.SetDefault(originalLogger) })
-		slog.SetDefault(slog.New(slog.NewTextHandler(&logOutput, nil)))
+		t.Setenv("LOG_LEVEL", "")
+		logOutput, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		originalStdout, originalLogger := os.Stdout, slog.Default()
+		t.Cleanup(func() {
+			os.Stdout = originalStdout
+			slog.SetDefault(originalLogger)
+			logOutput.Close()
+		})
+		os.Stdout = logOutput
 
 		yaml := `
  dbs:
@@ -888,6 +908,10 @@ snapshot:
 		if got := *config.DBs[0].Snapshot.Retention; got != 30*time.Minute {
 			t.Fatalf("expected retention to remain 30m, got %v", got)
 		}
+		output, err := os.ReadFile(logOutput.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
 		for _, want := range []string{
 			"level=WARN",
 			"snapshot retention is shorter than snapshot interval",
@@ -895,8 +919,8 @@ snapshot:
 			"retention=30m0s",
 			"interval=1h0m0s",
 		} {
-			if !strings.Contains(logOutput.String(), want) {
-				t.Errorf("expected warning containing %q, got %q", want, logOutput.String())
+			if !strings.Contains(string(output), want) {
+				t.Errorf("expected warning containing %q, got %q", want, string(output))
 			}
 		}
 	})
