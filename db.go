@@ -2729,7 +2729,11 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 	if err := db.releaseReadLock(); err != nil {
 		return 0, fmt.Errorf("release read lock: %w", err)
 	}
-	defer func() { _ = db.acquireReadLock(ctx) }()
+	defer func() {
+		if e := db.acquireReadLock(context.WithoutCancel(ctx)); e != nil {
+			err = errors.Join(err, fmt.Errorf("reacquire read lock: %w", e))
+		}
+	}()
 
 	// A non-forced checkpoint is issued as "PASSIVE". This will only checkpoint
 	// if there are not pending transactions. A forced checkpoint ("RESTART")
