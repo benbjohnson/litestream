@@ -88,8 +88,8 @@ function validateJob(job) {
       if (typeof step.name !== 'string' || step.name.trim() === '') {
         problems.push(`steps[${index}].name must be a non-empty string`);
       }
-      if (typeof step.conclusion !== 'string' || step.conclusion.trim() === '') {
-        problems.push(`steps[${index}].conclusion must be a non-empty string`);
+      if (step.conclusion !== null && (typeof step.conclusion !== 'string' || step.conclusion.trim() === '')) {
+        problems.push(`steps[${index}].conclusion must be a non-empty string or null`);
       }
     });
   }
