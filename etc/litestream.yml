@@ -15,6 +15,8 @@
 #      url:  s3://my.bucket.com/db        # S3-based replication
 #      # Example Fly.io Tigris setup (signing/no-Content-MD5 are auto-enabled for this endpoint)
 #      # url: s3://my-tigris-bucket/db.sqlite?endpoint=fly.storage.tigris.dev&region=auto
+#      # Example Neon Object Storage setup (signing/path-style are auto-enabled for this endpoint)
+#      # url: s3://my-neon-bucket.br-example-123456.storage.c-6.us-east-2.aws.neon.tech/db.sqlite
 #      # Disable Accept-Encoding signing for proxies that rewrite the header (default: true)
 #      # sign-accept-encoding: false
 #      type: nats                         # NATS JetStream replication

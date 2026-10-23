@@ -81,6 +81,14 @@ var (
 	b2Bucket         = flag.String("b2-bucket", os.Getenv("LITESTREAM_B2_BUCKET"), "")
 )
 
+// Neon Object Storage settings (S3-compatible)
+var (
+	neonAccessKeyID     = flag.String("neon-access-key-id", os.Getenv("LITESTREAM_NEON_ACCESS_KEY_ID"), "")
+	neonSecretAccessKey = flag.String("neon-secret-access-key", os.Getenv("LITESTREAM_NEON_SECRET_ACCESS_KEY"), "")
+	neonEndpoint        = flag.String("neon-endpoint", os.Getenv("LITESTREAM_NEON_ENDPOINT"), "")
+	neonBucket          = flag.String("neon-bucket", os.Getenv("LITESTREAM_NEON_BUCKET"), "")
+)
+
 // Google cloud storage settings
 var (
 	gsBucket = flag.String("gs-bucket", os.Getenv("LITESTREAM_GS_BUCKET"), "")
@@ -252,6 +260,8 @@ func NewReplicaClient(tb testing.TB, typ string) litestream.ReplicaClient {
 		return NewR2ReplicaClient(tb)
 	case "b2":
 		return NewB2ReplicaClient(tb)
+	case "neon":
+		return NewNeonReplicaClient(tb)
 	default:
 		tb.Fatalf("invalid replica client type: %q", typ)
 		return nil
@@ -349,6 +359,32 @@ func NewB2ReplicaClient(tb testing.TB) *s3.ReplicaClient {
 	c.Bucket = *b2Bucket
 	c.Path = path.Join("integration-tests", fmt.Sprintf("%016x", rand.Uint64()))
 	c.Endpoint = *b2Endpoint
+	c.ForcePathStyle = true
+	c.SignPayload = true
+	return c
+}
+
+// NewNeonReplicaClient returns an S3 client configured for Neon Object Storage.
+// Neon uses per-branch endpoints with path-style URLs and signed payloads.
+func NewNeonReplicaClient(tb testing.TB) *s3.ReplicaClient {
+	tb.Helper()
+
+	if *neonAccessKeyID == "" || *neonSecretAccessKey == "" {
+		tb.Skip("neon credentials not configured (set LITESTREAM_NEON_ACCESS_KEY_ID/SECRET_ACCESS_KEY)")
+	}
+	if *neonEndpoint == "" {
+		tb.Skip("neon endpoint not configured (set LITESTREAM_NEON_ENDPOINT)")
+	}
+	if *neonBucket == "" {
+		tb.Skip("neon bucket not configured (set LITESTREAM_NEON_BUCKET)")
+	}
+
+	c := s3.NewReplicaClient()
+	c.AccessKeyID = *neonAccessKeyID
+	c.SecretAccessKey = *neonSecretAccessKey
+	c.Bucket = *neonBucket
+	c.Path = path.Join("integration-tests", fmt.Sprintf("%016x", rand.Uint64()))
+	c.Endpoint = *neonEndpoint
 	c.ForcePathStyle = true
 	c.SignPayload = true
 	return c

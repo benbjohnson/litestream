@@ -253,6 +253,46 @@ replicas:
 
 Related issues: #1133
 
+### Neon Object Storage
+
+**Status**: Supported (auto-detected)
+
+**Known Limitations**:
+
+- Requires path-style URLs (`force-path-style=true`)
+- Each Neon branch has its own storage endpoint, so the endpoint selects the branch Litestream writes to
+
+**Configuration**:
+
+```yaml
+replicas:
+  - url: s3://bucket-name.BRANCH_ID.storage.CELL.REGION.CLOUD.neon.tech/path
+    access-key-id: your-access-key-id
+    secret-access-key: your-secret-access-key
+```
+
+Or pass the branch endpoint explicitly:
+
+```yaml
+replicas:
+  - url: s3://bucket-name/path?endpoint=https://BRANCH_ID.storage.CELL.REGION.CLOUD.neon.tech
+    access-key-id: your-access-key-id
+    secret-access-key: your-secret-access-key
+```
+
+**Automatic Defaults** (applied when a Neon storage endpoint is detected):
+
+- `sign-payload=true` - Signed payloads
+- `force-path-style=true` - Path-style URLs required
+- `region` - Taken from the host when the bucket is prefixed to the branch endpoint
+
+**Notes**:
+
+- Endpoint format: `https://<BRANCH_ID>.storage.<CELL>.<REGION>.<CLOUD>.neon.tech`, for example `https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech`
+- Create a bucket with `neon buckets create <name> --project-id <project> --branch <branch>`
+- Create S3 credentials with `neon credentials create --project-id <project> --branch <branch> --scope storage:read --scope storage:write`. The credential's token ID (`nak_...`) is the access key ID and `s3_secret_access_key` is the secret.
+- A child branch gets its own copy of the parent's buckets, so `litestream restore` against a child branch endpoint reads the replica as it was when the branch was created, and writes on either branch stay isolated.
+
 ### Wasabi
 
 **Status**: Supported
@@ -394,6 +434,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false`, `concurrency=2`, `part-size=16MiB` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
 | Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
+| Neon | `*.storage.*.neon.tech` | `sign-payload=true`, `force-path-style=true` |
 | Google Cloud Storage | Exact `googleapis.com` suffix with a first-label `storage` segment | Excludes `Accept-Encoding` from SigV4 signatures |
 
 ## Troubleshooting

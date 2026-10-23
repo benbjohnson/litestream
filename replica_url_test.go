@@ -1120,6 +1120,31 @@ func TestIsSupabaseEndpoint(t *testing.T) {
 	}
 }
 
+func TestIsNeonEndpoint(t *testing.T) {
+	tests := []struct {
+		endpoint string
+		expected bool
+	}{
+		{"https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech", true},
+		{"br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech", true},
+		{"https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech:443", true},
+		{"https://mybucket.br-cool-darkness-a1b2c3d4.storage.c-2.eu-central-1.aws.neon.tech", true},
+		{"https://ep-cool-darkness-a1b2c3d4.us-east-2.aws.neon.tech", false},
+		{"https://br-x.storage.c-6.us-east-2.aws.neon.tech.example.com", false},
+		{"https://console.neon.tech", false},
+		{"https://s3.amazonaws.com", false},
+		{"", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.endpoint, func(t *testing.T) {
+			got := litestream.IsNeonEndpoint(tt.endpoint)
+			if got != tt.expected {
+				t.Errorf("IsNeonEndpoint(%q) = %v, want %v", tt.endpoint, got, tt.expected)
+			}
+		})
+	}
+}
+
 func TestIsHetznerEndpoint(t *testing.T) {
 	tests := []struct {
 		endpoint string

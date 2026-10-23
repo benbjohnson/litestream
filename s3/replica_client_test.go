@@ -1683,6 +1683,22 @@ func TestParseHost(t *testing.T) {
 			wantForcePathStyle: true,
 		},
 		{
+			name:               "Neon branch endpoint",
+			host:               "mybucket.br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech",
+			wantBucket:         "mybucket",
+			wantRegion:         "us-east-2",
+			wantEndpoint:       "https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech",
+			wantForcePathStyle: true,
+		},
+		{
+			name:               "Neon bucket name with dots",
+			host:               "my.bucket.br-cool-darkness-a1b2c3d4.storage.c-2.eu-central-1.aws.neon.tech",
+			wantBucket:         "my.bucket",
+			wantRegion:         "eu-central-1",
+			wantEndpoint:       "https://br-cool-darkness-a1b2c3d4.storage.c-2.eu-central-1.aws.neon.tech",
+			wantForcePathStyle: true,
+		},
+		{
 			name:               "MinIO with port",
 			host:               "mybucket.localhost:9000",
 			wantBucket:         "mybucket",
@@ -2996,5 +3012,35 @@ func TestTransportRetryer_RetriesProviderThrottleResponses(t *testing.T) {
 
 	if retryer.IsErrorRetryable(fmt.Errorf("wrapped: %w", context.Canceled)) {
 		t.Fatal("genuine client-side context cancellation must NOT be retryable")
+	}
+}
+
+func TestNewReplicaClientFromURL_NeonExplicitEndpoint(t *testing.T) {
+	const bucket = "backup.br-demo.storage.c-6.us-east-2.aws.neon.tech"
+	const awsEndpoint = "https://s3.us-west-2.amazonaws.com"
+	const neonEndpoint = "https://br-demo.storage.c-6.us-east-2.aws.neon.tech"
+	for _, tt := range []struct {
+		name        string
+		query       string
+		envEndpoint string
+		endpoint    string
+		region      string
+	}{
+		{name: "Query", query: "?endpoint=" + awsEndpoint, endpoint: awsEndpoint},
+		{name: "Environment", envEndpoint: awsEndpoint, endpoint: awsEndpoint},
+		{name: "NeonEndpoint", query: "?endpoint=" + neonEndpoint, endpoint: neonEndpoint},
+		{name: "ExplicitRegion", query: "?endpoint=" + awsEndpoint + "&region=us-west-2", endpoint: awsEndpoint, region: "us-west-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("LITESTREAM_S3_ENDPOINT", tt.envEndpoint)
+			rc, err := litestream.NewReplicaClientFromURL("s3://" + bucket + "/path" + tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := rc.(*ReplicaClient)
+			if client.Bucket != bucket || client.Endpoint != tt.endpoint || client.Region != tt.region || client.Path != "path" || !client.ForcePathStyle {
+				t.Fatalf("Bucket=%q Endpoint=%q Region=%q Path=%q ForcePathStyle=%v", client.Bucket, client.Endpoint, client.Region, client.Path, client.ForcePathStyle)
+			}
+		})
 	}
 }
