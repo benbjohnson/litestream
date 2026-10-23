@@ -2,27 +2,31 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
-	"path/filepath"
-	"runtime"
-	"syscall"
-	"time"
-
-	"encoding/json"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/benbjohnson/litestream"
+	"github.com/benbjohnson/litestream/internal/testingutil"
 )
 
 func TestMainRequiredArgumentErrorsIncludeTryHints(t *testing.T) {
@@ -443,5 +447,29 @@ func TestShutdownExecHelper(t *testing.T) {
 	fmt.Println("shutdown exec ready")
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+func TestReplicateCommandCloseReturnsError(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	if _, err := sqldb.Exec("CREATE TABLE test (id INTEGER PRIMARY KEY)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	c := NewReplicateCommand()
+	c.Store = litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
+	c.Store.CompactionMonitorEnabled = false
+	c.Store.RetentionEnabled = false
+	if err := c.Store.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	c.Store.SetDone(done)
+	close(done)
+	if err := c.Close(context.Background()); !errors.Is(err, litestream.ErrShutdownInterrupted) {
+		t.Fatalf("Close error=%v, want shutdown interruption", err)
 	}
 }
