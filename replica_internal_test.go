@@ -692,26 +692,29 @@ func mustBuildChecksummedSnapshotLTX(tb testing.TB, pageSize uint32, pages [][]b
 
 func TestNewRestoreCompactor(t *testing.T) {
 	const pageSize = 4096
-	pages := [][]byte{
-		newSQLiteHeaderPage(pageSize),
-		bytes.Repeat([]byte{0xE5}, pageSize),
-	}
+	pages := [][]byte{newSQLiteHeaderPage(pageSize), bytes.Repeat([]byte{0xE5}, pageSize)}
 	snapshot := mustBuildSnapshotLTX(t, 1, 1, pageSize, pages)
 	update := mustBuildIncrementalLTX(t, 2, 2, pageSize, 2, 0xF6)
-
 	spillDir := t.TempDir()
-	pr, pw := io.Pipe()
-	c, err := newRestoreCompactor(pw, []io.Reader{bytes.NewReader(snapshot), bytes.NewReader(update)}, spillDir)
+	var output bytes.Buffer
+	writer := &spillObservingWriter{Writer: &output, dir: spillDir}
+	c, err := newRestoreCompactor(writer, []io.Reader{bytes.NewReader(snapshot), bytes.NewReader(update)}, spillDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = c.Cleanup() }()
-
-	go func() {
-		_ = pw.CloseWithError(c.Compact(context.Background()))
-	}()
-
-	dec := newRestoreDecoder(pr)
+	t.Cleanup(func() {
+		if err := c.Cleanup(); err != nil {
+			t.Error(err)
+		}
+	})
+	c.SetSpillThreshold(1)
+	if err := c.Compact(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if !writer.observed {
+		t.Fatal("compactor never created a spill file in the configured directory")
+	}
+	dec := newRestoreDecoder(bytes.NewReader(output.Bytes()))
 	var db bytes.Buffer
 	if err := dec.DecodeDatabaseTo(&db); err != nil {
 		t.Fatal(err)
@@ -722,7 +725,6 @@ func TestNewRestoreCompactor(t *testing.T) {
 	if !bytes.Equal(db.Bytes()[pageSize:], bytes.Repeat([]byte{0xF6}, pageSize)) {
 		t.Fatal("page 2 does not contain compacted update")
 	}
-
 	if err := c.Cleanup(); err != nil {
 		t.Fatal(err)
 	}
@@ -737,41 +739,31 @@ func TestNewRestoreCompactor(t *testing.T) {
 
 func TestNewRestoreCompactor_ConsumerAbort(t *testing.T) {
 	const pageSize = 4096
-	pages := [][]byte{
-		newSQLiteHeaderPage(pageSize),
-		bytes.Repeat([]byte{0xA7}, pageSize),
-	}
+	pages := [][]byte{newSQLiteHeaderPage(pageSize), bytes.Repeat([]byte{0xA7}, pageSize)}
 	snapshot := mustBuildSnapshotLTX(t, 1, 1, pageSize, pages)
-
 	spillDir := t.TempDir()
 	pr, pw := io.Pipe()
-	c, err := newRestoreCompactor(pw, []io.Reader{bytes.NewReader(snapshot)}, spillDir)
+	abortErr := errors.New("consumer aborted")
+	writer := &spillObservingWriter{Writer: pw, dir: spillDir, onSpill: func() { _ = pr.CloseWithError(abortErr) }}
+	c, err := newRestoreCompactor(writer, []io.Reader{bytes.NewReader(snapshot)}, spillDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-
+	c.SetSpillThreshold(1)
 	done := make(chan error, 1)
-	go func() {
-		err := c.Compact(context.Background())
-		_ = pw.CloseWithError(err)
-		done <- err
-	}()
-
-	hdr := make([]byte, ltx.HeaderSize)
-	if _, err := io.ReadFull(pr, hdr); err != nil {
-		t.Fatal(err)
-	}
-	_ = pr.CloseWithError(errors.New("consumer aborted"))
-
+	go func() { err := c.Compact(t.Context()); _ = pw.CloseWithError(err); done <- err }()
+	_, _ = io.Copy(io.Discard, pr)
 	select {
 	case err := <-done:
-		if err == nil {
-			t.Fatal("expected compact error after consumer abort")
+		if !errors.Is(err, abortErr) {
+			t.Fatalf("expected consumer abort, got %v", err)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("compactor still blocked after pipe reader closed")
 	}
-
+	if !writer.observed {
+		t.Fatal("consumer aborted without an existing spill file")
+	}
 	if err := c.Cleanup(); err != nil {
 		t.Fatal(err)
 	}
@@ -782,4 +774,45 @@ func TestNewRestoreCompactor_ConsumerAbort(t *testing.T) {
 	if len(ents) != 0 {
 		t.Fatalf("spill dir not empty after cleanup: %d entries", len(ents))
 	}
+}
+
+func TestNewRestoreCompactor_InvalidSpillDir(t *testing.T) {
+	const pageSize = 4096
+	snapshot := mustBuildSnapshotLTX(t, 1, 1, pageSize, [][]byte{newSQLiteHeaderPage(pageSize), make([]byte, pageSize)})
+	c, err := newRestoreCompactor(io.Discard, []io.Reader{bytes.NewReader(snapshot)}, filepath.Join(t.TempDir(), "missing"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := c.Cleanup(); err != nil {
+			t.Error(err)
+		}
+	})
+	c.SetSpillThreshold(1)
+	if err := c.Compact(t.Context()); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("expected spill directory error, got %v", err)
+	}
+}
+
+type spillObservingWriter struct {
+	io.Writer
+	dir      string
+	observed bool
+	onSpill  func()
+}
+
+func (w *spillObservingWriter) Write(p []byte) (int, error) {
+	if !w.observed {
+		entries, err := os.ReadDir(w.dir)
+		if err != nil {
+			return 0, err
+		}
+		if len(entries) > 0 {
+			w.observed = true
+			if w.onSpill != nil {
+				w.onSpill()
+			}
+		}
+	}
+	return w.Writer.Write(p)
 }

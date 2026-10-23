@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"github.com/superfly/ltx"
 
@@ -203,6 +204,69 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 	})
 
+	// An idle database whose newest L1 file spans more than one transaction
+	// must not list the replica on every L1 tick.
+	t.Run("L1NoProgress", func(t *testing.T) {
+		// The compactor binds its client in Open(), so the wrapper must be
+		// installed before Open rather than swapped in afterwards.
+		client := &listCountingClient{ReplicaClient: testingutil.NewFileReplicaClient(t)}
+		db0 := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+		db0.MonitorInterval = 0
+		db0.ShutdownSyncTimeout = 0
+		db0.Replica = litestream.NewReplica(db0)
+		db0.Replica.Client = client
+		db0.Replica.MonitorEnabled = false
+		if err := db0.Open(); err != nil {
+			t.Fatal(err)
+		}
+		sqldb0 := testingutil.MustOpenSQLDB(t, db0.Path())
+		defer testingutil.MustCloseDBs(t, db0, sqldb0)
+
+		levels := litestream.CompactionLevels{
+			{Level: 0},
+			{Level: 1, Interval: 1 * time.Second},
+		}
+		s := litestream.NewStore([]*litestream.DB{db0}, levels)
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		for _, query := range []string{`CREATE TABLE t (id INT);`, `INSERT INTO t (id) VALUES (100)`} {
+			if _, err := sqldb0.ExecContext(t.Context(), query); err != nil {
+				t.Fatal(err)
+			} else if err := db0.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			} else if err := db0.Replica.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+		}
+
+		info, err := s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+		require.Less(t, info.MinTXID, info.MaxTXID, "L1 file must span more than one transaction")
+
+		time.Sleep(levels[1].Interval)
+		client.reset()
+		_, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.ErrorIs(t, err, litestream.ErrNoCompaction)
+		require.Equal(t, 0, client.listCount(), "LTXFiles calls on idle L1 compaction")
+
+		if _, err := sqldb0.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (200)`); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		} else if err := db0.Replica.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+
+		time.Sleep(levels[1].Interval)
+		info, err = s.CompactDB(t.Context(), db0, levels[1])
+		require.NoError(t, err)
+		require.Equal(t, ltx.TXID(3), info.MaxTXID)
+	})
+
 	// Regression test for GitHub issue #877: level 9 compaction fails with
 	// "page size not initialized yet" error when attempted before DB initialization.
 	t.Run("DBNotReady", func(t *testing.T) {
@@ -377,10 +441,61 @@ func TestStore_SnapshotInterval_Default(t *testing.T) {
 }
 
 func TestStore_Validate(t *testing.T) {
+	startedAt := float64(time.Now().UnixNano()) / 1e9
+	assertMetrics := func(t *testing.T, db *litestream.DB, level, result string) {
+		t.Helper()
+		families, err := prometheus.DefaultGatherer.Gather()
+		require.NoError(t, err)
+		got := make(map[string]float64)
+		for _, family := range families {
+			name := family.GetName()
+			switch name {
+			case "litestream_validation_checks_total", "litestream_last_validation_success", "litestream_last_validation_success_timestamp_seconds":
+			default:
+				continue
+			}
+			for _, metric := range family.Metric {
+				labels := make(map[string]string)
+				for _, label := range metric.Label {
+					labels[label.GetName()] = label.GetValue()
+				}
+				if labels["db"] != db.Path() || labels["level"] != level {
+					continue
+				}
+				if name == "litestream_validation_checks_total" {
+					require.Len(t, labels, 3)
+					require.NotNil(t, metric.Counter)
+					got[name+":"+labels["result"]] = metric.GetCounter().GetValue()
+				} else {
+					require.Len(t, labels, 2)
+					require.NotNil(t, metric.Gauge)
+					got[name] = metric.GetGauge().GetValue()
+				}
+			}
+		}
+		if result == "" {
+			require.Empty(t, got)
+			return
+		}
+		want := map[string]float64{
+			"litestream_validation_checks_total:" + result:         1,
+			"litestream_last_validation_success":                   0,
+			"litestream_last_validation_success_timestamp_seconds": 0,
+		}
+		if result == "success" {
+			lastSuccess := got["litestream_last_validation_success_timestamp_seconds"]
+			require.GreaterOrEqual(t, lastSuccess, startedAt)
+			require.LessOrEqual(t, lastSuccess, float64(time.Now().UnixNano())/1e9)
+			want["litestream_last_validation_success"] = 1
+			want["litestream_last_validation_success_timestamp_seconds"] = lastSuccess
+		}
+		require.Equal(t, want, got)
+	}
+
 	t.Run("AllLevelsValid", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 
-		db := &litestream.DB{}
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db.Replica = litestream.NewReplicaWithClient(db, client)
 
 		levels := litestream.CompactionLevels{
@@ -402,12 +517,14 @@ func TestStore_Validate(t *testing.T) {
 		if !result.Valid {
 			t.Errorf("expected valid result, got errors: %v", result.Errors)
 		}
+		assertMetrics(t, db, "0", "success")
+		assertMetrics(t, db, "1", "success")
 	})
 
 	t.Run("ErrorAtMultipleLevels", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 
-		db := &litestream.DB{}
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db.Replica = litestream.NewReplicaWithClient(db, client)
 
 		levels := litestream.CompactionLevels{
@@ -434,11 +551,13 @@ func TestStore_Validate(t *testing.T) {
 		if len(result.Errors) != 2 {
 			t.Errorf("expected 2 errors, got %d", len(result.Errors))
 		}
+		assertMetrics(t, db, "0", "invalid")
+		assertMetrics(t, db, "1", "invalid")
 	})
 
 	t.Run("NilReplica", func(t *testing.T) {
 		// DB with nil replica should be skipped
-		db := &litestream.DB{}
+		db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		// db.Replica is nil
 
 		levels := litestream.CompactionLevels{
@@ -453,16 +572,17 @@ func TestStore_Validate(t *testing.T) {
 		if !result.Valid {
 			t.Errorf("expected valid result for nil replica, got errors: %v", result.Errors)
 		}
+		assertMetrics(t, db, "0", "")
 	})
 
 	t.Run("MultipleDBs", func(t *testing.T) {
 		client1 := file.NewReplicaClient(t.TempDir())
 		client2 := file.NewReplicaClient(t.TempDir())
 
-		db1 := &litestream.DB{}
+		db1 := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db1.Replica = litestream.NewReplicaWithClient(db1, client1)
 
-		db2 := &litestream.DB{}
+		db2 := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
 		db2.Replica = litestream.NewReplicaWithClient(db2, client2)
 
 		levels := litestream.CompactionLevels{
@@ -488,6 +608,8 @@ func TestStore_Validate(t *testing.T) {
 		if len(result.Errors) != 1 {
 			t.Errorf("expected 1 error from db2, got %d", len(result.Errors))
 		}
+		assertMetrics(t, db1, "0", "success")
+		assertMetrics(t, db2, "0", "invalid")
 	})
 }
 
@@ -700,4 +822,67 @@ func (c *blockingSnapshotClient) WriteLTXFile(ctx context.Context, level int, mi
 		}
 	}
 	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
+// slowSnapshotClient drains every snapshot upload a page at a time, so the
+// snapshot's page reader is still running when the store closes.
+type slowSnapshotClient struct {
+	litestream.ReplicaClient
+	started chan struct{}
+	drained chan error
+}
+
+func (c *slowSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level != litestream.SnapshotLevel {
+		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	}
+	c.started <- struct{}{}
+	buf := make([]byte, 4096)
+	var err error
+	for err == nil {
+		_, err = io.ReadFull(r, buf)
+		time.Sleep(200 * time.Microsecond)
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		err = nil
+	}
+	c.drained <- err
+	if err != nil {
+		return nil, err
+	}
+	return &ltx.FileInfo{Level: level, MinTXID: minTXID, MaxTXID: maxTXID}, nil
+}
+
+func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
+	db, sqldb := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+	client := &slowSnapshotClient{
+		ReplicaClient: db.Replica.Client,
+		started:       make(chan struct{}),
+		drained:       make(chan error, 1),
+	}
+	db.Replica.Client = client
+
+	if _, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INTEGER PRIMARY KEY, v BLOB);`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqldb.ExecContext(t.Context(), `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 2000) INSERT INTO t (v) SELECT randomblob(4000) FROM n;`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate); err != nil {
+		t.Fatal(err)
+	}
+
+	s := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
+	if err := s.Open(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	<-client.started
+	require.NoError(t, s.Close(context.Background()))
+	if err := <-client.drained; err != nil {
+		require.ErrorIs(t, err, context.Canceled)
+	}
 }

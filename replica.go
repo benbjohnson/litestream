@@ -443,7 +443,7 @@ func (r *Replica) monitor(ctx context.Context) {
 			}
 
 			// Don't log context cancellation errors during shutdown
-			if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			if !isShutdownError(ctx, err) {
 				consecutiveErrs++
 
 				// Exponential backoff: SyncInterval -> 2x -> 4x -> ... -> max
