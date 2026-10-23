@@ -432,6 +432,12 @@ func (c *Config) Validate() error {
 			Value: *c.Snapshot.Retention,
 		}
 	}
+	if c.Snapshot.Interval != nil && c.Snapshot.Retention != nil && *c.Snapshot.Retention < *c.Snapshot.Interval {
+		slog.Warn("snapshot retention is shorter than snapshot interval",
+			"field", "snapshot.retention",
+			"retention", *c.Snapshot.Retention,
+			"interval", *c.Snapshot.Interval)
+	}
 	if c.L0Retention != nil && *c.L0Retention < 0 {
 		return &ConfigValidationError{
 			Err:   ErrInvalidL0Retention,
@@ -543,6 +549,12 @@ func (c *Config) Validate() error {
 				Field: fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
 				Value: *db.Snapshot.Retention,
 			}
+		}
+		if db.Snapshot.Interval != nil && db.Snapshot.Retention != nil && *db.Snapshot.Retention < *db.Snapshot.Interval {
+			slog.Warn("snapshot retention is shorter than snapshot interval",
+				"field", fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier),
+				"retention", *db.Snapshot.Retention,
+				"interval", *db.Snapshot.Interval)
 		}
 
 		// Validate sync intervals for replicas
