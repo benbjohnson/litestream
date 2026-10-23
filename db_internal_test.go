@@ -5815,3 +5815,45 @@ func TestDB_WALIndexMaxFrame_ReadError(t *testing.T) {
 		})
 	}
 }
+
+func TestDB_NewEncoderSpills(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	if err := os.MkdirAll(db.MetaPath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	enc, err := db.newEncoder(io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := enc.Cleanup(); err != nil {
+			t.Error(err)
+		}
+	})
+	enc.SetSpillThreshold(1)
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 512, Commit: 3, MinTXID: 1, MaxTXID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	for pgno := uint32(1); pgno <= 3; pgno++ {
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, make([]byte, 512)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := os.ReadDir(db.MetaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) == 0 {
+		t.Fatal("encoder did not spill into database metadata directory")
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	entries, err = os.ReadDir(db.MetaPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("encoder left %d spill files after close", len(entries))
+	}
+}

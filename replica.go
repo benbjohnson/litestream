@@ -980,6 +980,7 @@ func (r *Replica) restorePlan(ctx context.Context, f *os.File, infos []*ltx.File
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
+		defer func() { _ = c.Cleanup() }()
 		_ = pw.CloseWithError(c.Compact(ctx))
 	}()
 	if err := ltx.NewDecoder(pr).DecodeDatabaseTo(f); err != nil {
