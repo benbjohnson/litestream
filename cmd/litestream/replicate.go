@@ -434,31 +434,28 @@ func (c *ReplicateCommand) runOnce(ctx context.Context) {
 
 // Close closes all open databases.
 func (c *ReplicateCommand) Close(ctx context.Context) error {
+	var err error
 	for _, monitor := range c.directoryMonitors {
 		monitor.Close()
 	}
 	c.directoryMonitors = nil
 
 	if c.Server != nil {
-		if err := c.Server.Close(); err != nil {
-			slog.Error("error closing control server", "error", err)
+		if e := c.Server.Close(); e != nil {
+			err = errors.Join(err, fmt.Errorf("close control server: %w", e))
 		}
 	}
 	if c.Store != nil {
-		if err := c.Store.Close(ctx); err != nil {
-			if errors.Is(err, litestream.ErrShutdownInterrupted) {
-				slog.Warn("shutdown sync skipped by user interrupt", "error", err)
-			} else {
-				slog.Error("failed to close database", "error", err)
-			}
+		if e := c.Store.Close(ctx); e != nil {
+			err = errors.Join(err, fmt.Errorf("close store: %w", e))
 		}
 	}
 	if c.Config.MCPAddr != "" && c.MCP != nil {
-		if err := c.MCP.Close(); err != nil {
-			slog.Error("error closing MCP server", "error", err)
+		if e := c.MCP.Close(); e != nil {
+			err = errors.Join(err, fmt.Errorf("close MCP server: %w", e))
 		}
 	}
-	return nil
+	return err
 }
 
 // SetDone sets the done channel used for interrupt handling during shutdown.
