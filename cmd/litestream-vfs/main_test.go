@@ -196,7 +196,7 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 	}
 
 	// Wait for replication to sync
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
 
 	t.Log("opening vfs replica")
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/test-txn.db?vfs=litestream-txn")
@@ -267,16 +267,18 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 
 	// Verify multiple rows across different pages
 	t.Log("verifying multiple rows across pages")
-	for _, id := range []int{0, 2500, 5000, 7500, 9999} {
-		var data string
-		if err := sqldb1.QueryRow("SELECT data FROM t WHERE id = ?", id).Scan(&data); err != nil {
-			t.Fatalf("failed to query id %d: %v", id, err)
+	require.Eventually(t, func() bool {
+		for _, id := range []int{0, 2500, 5000, 7500, 9999} {
+			var data string
+			if err := sqldb1.QueryRow("SELECT data FROM t WHERE id = ?", id).Scan(&data); err != nil {
+				return false
+			}
+			if !strings.HasPrefix(data, fmt.Sprintf("updated_data_%d", id)) {
+				return false
+			}
 		}
-		expected := fmt.Sprintf("updated_data_%d", id)
-		if !strings.HasPrefix(data, expected) {
-			t.Fatalf("id %d: expected prefix %s, got: %s", id, expected, data)
-		}
-	}
+		return true
+	}, 10*time.Second, db.MonitorInterval, "pooled replica connections should observe updates after commit")
 }
 
 func TestVFS_PollsL1Files(t *testing.T) {
@@ -2088,10 +2090,10 @@ func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monit
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
 	db.Replica.SyncInterval = syncInterval
+	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
 	if err := db.Open(); err != nil {
 		tb.Fatalf("open db: %v", err)
 	}
-	sqldb := testingutil.MustOpenSQLDB(tb, db.Path())
 	tb.Cleanup(func() { _ = db.Close(context.Background()) })
 	return db, sqldb
 }
