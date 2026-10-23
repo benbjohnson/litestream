@@ -795,14 +795,17 @@ func TestReplica_RestoreReplansDeletedFile(t *testing.T) {
 			if !client.deleted || !client.openedHigher {
 				t.Fatalf("deletion=%t higher-level read=%t", client.deleted, client.openedHigher)
 			}
-			if client.openedLater {
+			wantValue := byte(2)
+			if tc.txid == 0 && tc.timestamp.IsZero() {
+				wantValue = 3
+			} else if client.openedLater {
 				t.Fatal("restore advanced beyond the original target")
 			}
 			if tc.duringRead && client.reopenOffset <= ltx.HeaderSize {
 				t.Fatalf("reopen offset=%d, expected a partial page read", client.reopenOffset)
 			}
 			data, err := os.ReadFile(output)
-			if err != nil || !bytes.Equal(data, bytes.Repeat([]byte{2}, 4096)) {
+			if err != nil || !bytes.Equal(data, bytes.Repeat([]byte{wantValue}, 4096)) {
 				t.Fatalf("restored data mismatch: size=%d err=%v", len(data), err)
 			}
 		})
@@ -828,26 +831,73 @@ func restoreReplanLTX(t *testing.T, minTXID, maxTXID ltx.TXID, value byte) []byt
 	return buf.Bytes()
 }
 
-func TestReplica_RestoreReplanUnavailableTarget(t *testing.T) {
-	ctx := context.Background()
-	client := &deletingRestoreClient{ReplicaClient: file.NewReplicaClient(t.TempDir()), duringRead: true}
-	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
-	createTestLTXFile(t, client, 0, 2, 2)
-	compacted := restoreReplanLTX(t, 2, 3, 3)
-	client.promote = func() error {
-		if _, err := client.WriteLTXFile(ctx, 1, 2, 3, bytes.NewReader(compacted)); err != nil {
-			return err
-		}
-		return client.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: 0, MinTXID: 2, MaxTXID: 2}})
-	}
-	output := filepath.Join(t.TempDir(), "restore.db")
-	err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, litestream.RestoreOptions{OutputPath: output, TXID: 2})
-	if !errors.Is(err, litestream.ErrTxNotAvailable) {
-		t.Fatalf("error=%v, want unavailable target", err)
-	}
-	for _, path := range []string{output, output + ".tmp"} {
-		if _, err := os.Stat(path); !os.IsNotExist(err) {
-			t.Fatalf("partial output remains: %s: %v", path, err)
+func TestReplica_RestoreReplanPastTarget(t *testing.T) {
+	for _, layout := range []string{"compacted_delta", "replacement_snapshot"} {
+		for _, duringRead := range []bool{false, true} {
+			for _, mode := range []string{"latest", "txid", "timestamp"} {
+				t.Run(fmt.Sprintf("%s/read=%t/%s", layout, duringRead, mode), func(t *testing.T) {
+					ctx := context.Background()
+					client := &deletingRestoreClient{ReplicaClient: file.NewReplicaClient(t.TempDir()), duringRead: duringRead}
+					createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+					createTestLTXFile(t, client, 0, 2, 2)
+					level, minTXID := 1, ltx.TXID(2)
+					before := "0000000000000001"
+					if layout == "replacement_snapshot" {
+						level, minTXID = litestream.SnapshotLevel, 1
+						before = "none"
+					}
+					compacted := restoreReplanLTX(t, minTXID, 3, 3)
+					client.promote = func() error {
+						if _, err := client.WriteLTXFile(ctx, level, minTXID, 3, bytes.NewReader(compacted)); err != nil {
+							return err
+						}
+						deleted := []*ltx.FileInfo{{Level: 0, MinTXID: 2, MaxTXID: 2}}
+						if layout == "replacement_snapshot" {
+							deleted = append(deleted, &ltx.FileInfo{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 1})
+						}
+						return client.DeleteLTXFiles(ctx, deleted)
+					}
+					output := filepath.Join(t.TempDir(), "restore.db")
+					opt := litestream.RestoreOptions{OutputPath: output}
+					switch mode {
+					case "txid":
+						opt.TXID = 2
+					case "timestamp":
+						opt.Timestamp = time.Now().Add(time.Hour)
+					}
+					restoredTXID, err := litestream.NewReplicaWithClient(nil, client).RestoreWithTXID(ctx, opt)
+					if mode == "latest" {
+						if restoredTXID != 3 {
+							t.Fatalf("restored TXID=%s, want 3", restoredTXID)
+						}
+						if err != nil {
+							t.Fatal(err)
+						}
+						data, err := os.ReadFile(output)
+						if err != nil || !bytes.Equal(data, bytes.Repeat([]byte{3}, 4096)) {
+							t.Fatalf("restored data mismatch: size=%d err=%v", len(data), err)
+						}
+					} else {
+						if restoredTXID != 0 {
+							t.Fatalf("failed restore reported TXID %s", restoredTXID)
+						}
+						if !errors.Is(err, litestream.ErrTxNotAvailable) {
+							t.Fatalf("error=%v, want unavailable target", err)
+						}
+						for _, text := range []string{"txid 0000000000000002 is no longer available", "before=" + before, "after=0000000000000003"} {
+							if !strings.Contains(err.Error(), text) {
+								t.Errorf("error=%v, want %q", err, text)
+							}
+						}
+						if _, err := os.Stat(output); !os.IsNotExist(err) {
+							t.Fatalf("partial output remains: %v", err)
+						}
+					}
+					if _, err := os.Stat(output + ".tmp"); !os.IsNotExist(err) {
+						t.Fatalf("temporary output remains: %v", err)
+					}
+				})
+			}
 		}
 	}
 }

@@ -115,7 +115,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 	if *dryRun {
 		plan, err := c.dryRunPlan(ctx, fs.Arg(0), r, opt)
 		if errors.Is(err, litestream.ErrTxNotAvailable) {
-			return fmt.Errorf("no matching backup files available")
+			return fmt.Errorf("no matching backup files available: %w", err)
 		} else if err != nil {
 			return err
 		}
@@ -137,25 +137,18 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		}
 	}
 
-	txid := c.restoreTXID(ctx, r, opt)
-	start := time.Now()
-	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) {
+	result, err := c.restore(ctx, r, opt, *integrityCheck)
+	if errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
 			return nil
 		}
-		return fmt.Errorf("no matching backup files available")
+		return fmt.Errorf("no matching backup files available: %w", err)
 	} else if err != nil {
 		return err
 	}
 	if *jsonOutput {
-		output, err := json.MarshalIndent(RestoreResult{
-			DBPath:         opt.OutputPath,
-			Replica:        r.Client.Type(),
-			TXID:           txid,
-			DurationMS:     time.Since(start).Milliseconds(),
-			IntegrityCheck: *integrityCheck,
-		}, "", "  ")
+		output, err := json.MarshalIndent(result, "", "  ")
 		if err != nil {
 			return fmt.Errorf("failed to format response: %w", err)
 		}
@@ -248,18 +241,22 @@ func (c *RestoreCommand) printDryRunPlan(plan RestorePlan) {
 	}
 }
 
-func (c *RestoreCommand) restoreTXID(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions) string {
-	if opt.TXID != 0 {
-		return opt.TXID.String()
+func (c *RestoreCommand) restore(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions, integrityCheck string) (RestoreResult, error) {
+	start := time.Now()
+	txid, err := r.RestoreWithTXID(ctx, opt)
+	if err != nil {
+		return RestoreResult{}, err
 	}
-	if opt.Follow {
-		return ""
+	result := RestoreResult{
+		DBPath:         opt.OutputPath,
+		Replica:        r.Client.Type(),
+		DurationMS:     time.Since(start).Milliseconds(),
+		IntegrityCheck: integrityCheck,
 	}
-	infos, err := litestream.CalcRestorePlan(ctx, r.Client, opt.TXID, opt.Timestamp, r.Logger())
-	if err != nil || len(infos) == 0 {
-		return ""
+	if txid != 0 {
+		result.TXID = txid.String()
 	}
-	return infos[len(infos)-1].MaxTXID.String()
+	return result, nil
 }
 
 func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
