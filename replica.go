@@ -973,7 +973,7 @@ func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) (
 		if err := sem.Acquire(launchCtx, 1); err != nil {
 			break
 		}
-		if launchCtx.Err() != nil {
+		if launchCtx.Err() != nil || ctx.Err() != nil {
 			sem.Release(1)
 			break
 		}
