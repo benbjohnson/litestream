@@ -342,6 +342,18 @@ func IsSupabaseEndpoint(endpoint string) bool {
 	return strings.HasSuffix(host, ".supabase.co")
 }
 
+// IsNeonEndpoint returns true if the endpoint is Neon Object Storage.
+// Neon storage endpoints are per-branch, e.g.
+// br-example-123456.storage.c-6.us-east-2.aws.neon.tech.
+func IsNeonEndpoint(endpoint string) bool {
+	u, err := parseEndpoint(endpoint)
+	if err != nil {
+		return false
+	}
+	host := u.Hostname()
+	return strings.HasSuffix(host, ".neon.tech") && strings.Contains(host, ".storage.")
+}
+
 // IsMinIOEndpoint returns true if the endpoint appears to be MinIO or similar
 // (a custom endpoint with a port number that is not a known cloud provider).
 func IsMinIOEndpoint(endpoint string) bool {
@@ -363,6 +375,7 @@ func IsMinIOEndpoint(endpoint string) bool {
 		strings.Contains(host, "tigris.dev") ||
 		strings.Contains(host, "t3.storage.dev") ||
 		strings.Contains(host, ".supabase.co") ||
+		strings.HasSuffix(host, ".neon.tech") ||
 		strings.HasSuffix(host, ".your-objectstorage.com") ||
 		strings.HasSuffix(host, ".googleapis.com") {
 		return false

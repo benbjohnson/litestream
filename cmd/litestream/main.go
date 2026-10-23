@@ -1505,6 +1505,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	// Use path style if an endpoint is explicitly set. This works because the
 	// only service to not use path style is AWS which does not use an endpoint.
 	forcePathStyle := (endpoint != "")
+	forcePathStyleSet := c.ForcePathStyle != nil
 	if v := c.ForcePathStyle; v != nil {
 		forcePathStyle = *v
 	}
@@ -1546,6 +1547,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 			uregion = litestream.RegionFromS3ARN(host)
 		} else {
 			ubucket, uregion, uendpoint, uforcePathStyle = s3.ParseHost(host)
+			if litestream.IsNeonEndpoint(uendpoint) && (endpoint != "" || query.Get("endpoint") != "") {
+				ubucket, uregion, uendpoint, uforcePathStyle = host, "", "", false
+			}
 		}
 
 		// Override with query parameters if provided
@@ -1562,8 +1566,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if qRegion := query.Get("region"); qRegion != "" {
 			uregion = qRegion
 		}
-		if qForcePathStyle := query.Get("forcePathStyle"); qForcePathStyle != "" {
-			uforcePathStyle = qForcePathStyle == "true"
+		if v, ok := litestream.BoolQueryValue(query, "forcePathStyle", "force-path-style"); ok {
+			uforcePathStyle = v
+			forcePathStyleSet = true
 		}
 		if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
 			skipVerify = qSkipVerify == "true"
@@ -1647,9 +1652,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	isMinIO := litestream.IsMinIOEndpoint(endpoint)
 	isCloudflareR2 := litestream.IsCloudflareR2Endpoint(endpoint)
 	isSupabase := litestream.IsSupabaseEndpoint(endpoint)
-
-	// Track if forcePathStyle was explicitly set by user (config or URL query param).
-	forcePathStyleSet := c.ForcePathStyle != nil
+	isNeon := litestream.IsNeonEndpoint(endpoint)
 
 	// Apply provider-specific defaults for S3-compatible providers.
 	// These settings ensure compatibility with each provider's S3 implementation.
@@ -1658,13 +1661,13 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		signSetting.ApplyDefault(true)
 		requireSetting.ApplyDefault(false)
 	}
-	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase {
+	if isHetzner || isDigitalOcean || isBackblaze || isFilebase || isScaleway || isCloudflareR2 || isMinIO || isSupabase || isNeon {
 		// All these providers require signed payloads (don't support UNSIGNED-PAYLOAD)
 		signSetting.ApplyDefault(true)
 	}
 	if !forcePathStyleSet {
-		// Filebase, Backblaze B2, MinIO, and Supabase require path-style URLs
-		if isFilebase || isBackblaze || isMinIO || isSupabase {
+		// Filebase, Backblaze B2, MinIO, Supabase, and Neon require path-style URLs
+		if isFilebase || isBackblaze || isMinIO || isSupabase || isNeon {
 			forcePathStyle = true
 		}
 	}

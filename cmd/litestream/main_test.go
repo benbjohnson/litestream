@@ -422,6 +422,27 @@ func TestNewS3ReplicaFromConfig(t *testing.T) {
 		}
 	})
 
+	t.Run("Neon", func(t *testing.T) {
+		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "s3://foo.br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech/bar"}, nil)
+		if err != nil {
+			t.Fatal(err)
+		} else if client, ok := r.Client.(*s3.ReplicaClient); !ok {
+			t.Fatal("unexpected replica type")
+		} else if got, want := client.Bucket, "foo"; got != want {
+			t.Fatalf("Bucket=%s, want %s", got, want)
+		} else if got, want := client.Path, "bar"; got != want {
+			t.Fatalf("Path=%s, want %s", got, want)
+		} else if got, want := client.Region, "us-east-2"; got != want {
+			t.Fatalf("Region=%s, want %s", got, want)
+		} else if got, want := client.Endpoint, "https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech"; got != want {
+			t.Fatalf("Endpoint=%s, want %s", got, want)
+		} else if got, want := client.ForcePathStyle, true; got != want {
+			t.Fatalf("ForcePathStyle=%v, want %v", got, want)
+		} else if got, want := client.SignPayload, true; got != want {
+			t.Fatalf("SignPayload=%v, want %v", got, want)
+		}
+	})
+
 	t.Run("AccessPointARN", func(t *testing.T) {
 		url := "s3://arn:aws:s3:us-east-2:123456789012:accesspoint/stream-replica"
 		r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: url}, nil)
@@ -3522,6 +3543,7 @@ func TestNewS3ReplicaClientFromConfig(t *testing.T) {
 			{"CloudflareR2", "https://accountid.r2.cloudflarestorage.com"},
 			{"MinIO", "http://localhost:9000"},
 			{"Supabase", "https://myproject.supabase.co/storage/v1/s3"},
+			{"Neon", "https://br-cool-darkness-a1b2c3d4.storage.c-6.us-east-2.aws.neon.tech"},
 			{"Hetzner", "https://fsn1.your-objectstorage.com"},
 		}
 
@@ -4101,5 +4123,52 @@ func waitForCondition(timeout time.Duration, fn func() bool) bool {
 			return fn()
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestNewS3ReplicaClientFromConfig_NeonExplicitOverrideParity(t *testing.T) {
+	for _, key := range []string{"forcePathStyle", "force-path-style"} {
+		t.Run(key, func(t *testing.T) {
+			rawURL := "s3://backup/path?endpoint=https://br-demo.storage.c-6.us-east-2.aws.neon.tech&" + key + "=false"
+			urlClient, err := litestream.NewReplicaClientFromURL(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configClient, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{URL: rawURL}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if urlClient.(*s3.ReplicaClient).ForcePathStyle || configClient.ForcePathStyle {
+				t.Fatalf("ForcePathStyle: URL=%v, config=%v, want false for both", urlClient.(*s3.ReplicaClient).ForcePathStyle, configClient.ForcePathStyle)
+			}
+		})
+	}
+}
+
+func TestNewS3ReplicaClientFromConfig_NeonExplicitEndpoint(t *testing.T) {
+	const bucket = "backup.br-demo.storage.c-6.us-east-2.aws.neon.tech"
+	const endpoint = "https://s3.us-west-2.amazonaws.com"
+	for _, tt := range []struct {
+		name           string
+		query          string
+		configEndpoint string
+		region         string
+	}{
+		{name: "Query", query: "?endpoint=" + endpoint},
+		{name: "Config", configEndpoint: endpoint},
+		{name: "ExplicitRegion", query: "?endpoint=" + endpoint + "&region=us-west-2", region: "us-west-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client, err := main.NewS3ReplicaClientFromConfig(&main.ReplicaConfig{
+				URL:             "s3://" + bucket + "/path" + tt.query,
+				ReplicaSettings: main.ReplicaSettings{Endpoint: tt.configEndpoint},
+			}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.Bucket != bucket || client.Endpoint != endpoint || client.Region != tt.region || client.Path != "path" || !client.ForcePathStyle {
+				t.Fatalf("Bucket=%q Endpoint=%q Region=%q Path=%q ForcePathStyle=%v", client.Bucket, client.Endpoint, client.Region, client.Path, client.ForcePathStyle)
+			}
+		})
 	}
 }
