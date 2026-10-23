@@ -477,6 +477,24 @@ func TestStore_Integration(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	if _, err := sqldb.ExecContext(t.Context(), `INSERT INTO t (val) VALUES ('initial')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	initialPos, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for db.Replica.Pos().TXID < initialPos.TXID {
+		if time.Now().After(deadline) {
+			t.Fatalf("initial row not replicated: local=%s remote=%s", initialPos.TXID, db.Replica.Pos().TXID)
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 	// Run test for a fixed duration.
 	done := make(chan struct{})
 	time.AfterFunc(10*time.Second, func() { close(done) })
