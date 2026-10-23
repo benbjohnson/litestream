@@ -136,6 +136,8 @@ func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo
 // Returns ErrNoCompaction if there are no files to compact.
 func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
 	srcLevel := dstLevel - 1
+	producerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	prevMaxInfo, err := c.MaxLTXFileInfo(ctx, dstLevel)
 	if err != nil {
@@ -150,11 +152,16 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	defer itr.Close()
 
 	var rdrs []io.Reader
+	var done chan struct{}
 	defer func() {
+		cancel()
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
 				_ = closer.Close()
 			}
+		}
+		if done != nil {
+			<-done
 		}
 	}()
 
@@ -247,11 +254,11 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			}
 		}
 
-		f, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+		f, err := c.client.OpenLTXFile(producerCtx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
+		rdrs = append(rdrs, internal.NewResumableReader(producerCtx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
 		expectedMinTXID = info.MaxTXID + 1
 	}
 	if len(rdrs) == 0 {
@@ -259,14 +266,16 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	}
 
 	pr, pw := io.Pipe()
+	done = make(chan struct{})
 	go func() {
+		defer close(done)
 		comp, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(comp.Compact(ctx))
+		_ = pw.CloseWithError(comp.Compact(producerCtx))
 	}()
 
 	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
