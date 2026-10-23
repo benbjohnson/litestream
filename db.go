@@ -87,6 +87,11 @@ type DB struct {
 		m map[int]*ltx.FileInfo
 	}
 
+	l0Retention struct {
+		sync.Mutex
+		nextCheckAt time.Time
+	}
+
 	// Cached position from the latest L0 LTX file.
 	// nil means cache is invalid; non-nil is the cached position.
 	pos struct {
@@ -613,6 +618,10 @@ func (db *DB) LTXDir() string {
 // This is useful for recovering from corrupted or missing LTX files.
 // The database file itself is not modified.
 func (db *DB) ResetLocalState(ctx context.Context) error {
+	db.l0Retention.Lock()
+	defer db.l0Retention.Unlock()
+	db.l0Retention.nextCheckAt = time.Time{}
+
 	db.Logger.Info("resetting local litestream state",
 		"meta_path", db.metaPath,
 		"ltx_dir", db.LTXDir())
@@ -3147,11 +3156,32 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	return minSnapshotTXID, nil
 }
 
+const l0RetentionIdleInterval = 5 * time.Minute
+
 // EnforceL0RetentionByTime retains L0 files until they have been compacted into
 // L1 and have existed for at least L0Retention.
 func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
-	if db.L0Retention <= 0 {
+	return db.enforceL0Retention(ctx, true)
+}
+
+func (db *DB) enforceL0Retention(ctx context.Context, force bool) error {
+	db.l0Retention.Lock()
+	defer db.l0Retention.Unlock()
+
+	now := time.Now()
+	if !force && now.Before(db.l0Retention.nextCheckAt) {
 		return nil
+	}
+
+	nextCheckAt, err := db.sweepL0Retention(ctx, now)
+	db.l0Retention.nextCheckAt = nextCheckAt
+	return err
+}
+
+func (db *DB) sweepL0Retention(ctx context.Context, now time.Time) (time.Time, error) {
+	nextCheckAt := now.Add(l0RetentionIdleInterval)
+	if db.L0Retention <= 0 {
+		return nextCheckAt, nil
 	}
 
 	db.Logger.Debug("starting l0 retention enforcement", "retention", db.L0Retention)
@@ -3159,31 +3189,22 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	dbName := filepath.Base(db.Path())
 
 	// Determine the highest TXID that has been compacted into L1.
-	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	info, err := db.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
-		return fmt.Errorf("fetch l1 files: %w", err)
+		return time.Time{}, fmt.Errorf("fetch l1 files: %w", err)
 	}
-	var maxL1TXID ltx.TXID
-	for itr.Next() {
-		info := itr.Item()
-		if info.MaxTXID > maxL1TXID {
-			maxL1TXID = info.MaxTXID
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return fmt.Errorf("close l1 iterator: %w", err)
-	}
+	maxL1TXID := info.MaxTXID
 	if maxL1TXID == 0 {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "too_recent").Set(0)
-		return nil
+		return nextCheckAt, nil
 	}
 
-	threshold := time.Now().Add(-db.L0Retention)
-	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	threshold := now.Add(-db.L0Retention)
+	itr, err := db.Replica.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
-		return fmt.Errorf("fetch l0 files: %w", err)
+		return time.Time{}, fmt.Errorf("fetch l0 files: %w", err)
 	}
 	defer itr.Close()
 
@@ -3214,6 +3235,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			// create gaps between retained files. VFS expects contiguous coverage.
 			processedAll = false
 			tooRecentCount++
+			if eligibleAt := createdAt.Add(db.L0Retention); eligibleAt.Before(nextCheckAt) {
+				nextCheckAt = eligibleAt
+			}
 			break
 		}
 
@@ -3229,6 +3253,10 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		for itr.Next() {
 			tooRecentCount++
 		}
+	}
+
+	if err := itr.Close(); err != nil {
+		return time.Time{}, fmt.Errorf("close l0 iterator: %w", err)
 	}
 
 	// Ensure we do not delete the newest L0 file only if we processed the entire level.
@@ -3248,13 +3276,13 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		"max_l1_txid", maxL1TXID)
 
 	if len(deleted) == 0 {
-		return nil
+		return nextCheckAt, nil
 	}
 
 	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
-		return fmt.Errorf("remove expired l0 files: %w", err)
+		return time.Time{}, fmt.Errorf("remove expired l0 files: %w", err)
 	}
 
 	for _, info := range deleted {
@@ -3270,7 +3298,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)
 
-	return nil
+	return nextCheckAt, nil
 }
 
 // EnforceRetentionByTXID enforces retention so that any LTX files below
