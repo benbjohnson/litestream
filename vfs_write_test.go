@@ -15,6 +15,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -351,6 +352,111 @@ func TestVFSFile_SyncToRemote(t *testing.T) {
 		t.Errorf("expected 2 LTX files, got %d", len(client.ltxFiles[0]))
 	}
 	client.mu.Unlock()
+}
+
+type pausedPollReplicaClient struct {
+	*writeTestReplicaClient
+	armed   atomic.Bool
+	started chan struct{}
+	resume  chan struct{}
+}
+
+func (c *pausedPollReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	itr, err := c.writeTestReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+	if err != nil {
+		return nil, err
+	}
+	if level == 1 && c.armed.CompareAndSwap(true, false) {
+		close(c.started)
+		select {
+		case <-c.resume:
+		case <-ctx.Done():
+			return nil, errors.Join(ctx.Err(), itr.Close())
+		}
+	}
+	return itr, nil
+}
+
+func TestVFSFile_PollDoesNotRegressLocalSync(t *testing.T) {
+	client := &pausedPollReplicaClient{
+		writeTestReplicaClient: newWriteTestReplicaClient(),
+		started:                make(chan struct{}),
+		resume:                 make(chan struct{}),
+	}
+	const pageSize = 4096
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 4; pgno++ {
+		pages[pgno] = bytes.Repeat([]byte{byte(pgno)}, pageSize)
+	}
+	createTestLTXFile(t, client.writeTestReplicaClient, 1, pageSize, 4, pages)
+
+	f := setupWriteableVFSFile(t, client.writeTestReplicaClient)
+	f.client = client
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client.armed.Store(true)
+	pollDone := make(chan struct{})
+	var pollErr error
+	go func() {
+		pollErr = f.pollReplicaClient(ctx)
+		close(pollDone)
+	}()
+	defer func() {
+		cancel()
+		<-pollDone
+	}()
+	select {
+	case <-client.started:
+	case <-ctx.Done():
+		t.Fatal("poll did not reach the L1 listing")
+	}
+
+	if _, err := f.WriteAt(bytes.Repeat([]byte{'x'}, pageSize), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{'y'}, pageSize), 4*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	close(client.resume)
+	<-pollDone
+	if pollErr != nil {
+		t.Fatal(pollErr)
+	}
+	if got := f.Pos().TXID; got != 2 {
+		t.Errorf("poll regressed local sync TXID: got %s, want 2", got)
+	}
+
+	if err := f.pollReplicaClient(ctx); err != nil {
+		t.Fatal(err)
+	}
+	f.cache.Purge()
+	buf := make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, 2*pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(buf, pages[3]) {
+		t.Error("poll discarded an unchanged page after local growth")
+	}
+	if size, err := f.FileSize(); err != nil {
+		t.Fatal(err)
+	} else if size != 5*pageSize {
+		t.Errorf("poll changed local size: got %d, want %d", size, 5*pageSize)
+	}
+	if err := f.Truncate(5 * pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestVFSFile_WriteModeCompactionPollKeepsNewerPage(t *testing.T) {
