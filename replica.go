@@ -1048,6 +1048,7 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 	defer ticker.Stop()
 
 	var consecutiveErrors int
+	var stallTXID ltx.TXID
 	for {
 		select {
 		case <-ctx.Done():
@@ -1055,11 +1056,12 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 			return nil
 		case <-ticker.C:
 			newTXID, err := r.applyNewLTXFiles(ctx, f, lastTXID, pageSize)
-			if err != nil {
-				if ctx.Err() != nil {
-					r.Logger().Info("follow mode stopped")
-					return nil
-				}
+			if ctx.Err() != nil {
+				r.Logger().Info("follow mode stopped")
+				return nil
+			}
+			gapErr, _ := errors.AsType[*followGapError](err)
+			if err != nil && err != gapErr {
 				consecutiveErrors++
 				r.Logger().Error("follow: error applying updates", "err", err, "consecutive_errors", consecutiveErrors)
 				continue
@@ -1071,6 +1073,11 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 				r.Logger().Info("follow: applied updates", "from_txid", lastTXID, "to_txid", newTXID)
 				lastTXID = newTXID
 				consecutiveErrors = 0
+			}
+			if gapErr != nil && stallTXID != gapErr.TXID {
+				r.Logger().Warn("follow: no ltx file available at current position, follower is not advancing",
+					"txid", gapErr.TXID, "next_txid", gapErr.NextTXID)
+				stallTXID = gapErr.TXID
 			}
 		}
 	}
@@ -1116,7 +1123,7 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 				continue
 			}
 			if info.MinTXID > currentTXID+1 {
-				return closeLevel0(nil)
+				return closeLevel0(&followGapError{TXID: currentTXID, NextTXID: info.MinTXID})
 			}
 		}
 
@@ -1220,6 +1227,7 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 // higher compaction levels for a file that covers the missing TXID range.
 func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.TXID, gapMinTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
 	currentTXID := afterTXID
+	var unreachableTXID ltx.TXID
 
 	for level := 1; level < SnapshotLevel; level++ {
 		itr, err := r.Client.LTXFiles(ctx, level, 0, false)
@@ -1242,6 +1250,9 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 
 			// Skip if there's a gap at this level too.
 			if info.MinTXID > currentTXID+1 {
+				if unreachableTXID == 0 {
+					unreachableTXID = info.MinTXID
+				}
 				break
 			}
 
@@ -1277,7 +1288,20 @@ func (r *Replica) fillFollowGap(ctx context.Context, f *os.File, afterTXID ltx.T
 		}
 	}
 
+	if unreachableTXID != 0 {
+		return currentTXID, &followGapError{TXID: currentTXID, NextTXID: unreachableTXID}
+	}
+
 	return currentTXID, nil
+}
+
+type followGapError struct {
+	TXID     ltx.TXID
+	NextTXID ltx.TXID
+}
+
+func (e *followGapError) Error() string {
+	return fmt.Sprintf("no ltx file available after txid %s (next txid %s)", e.TXID, e.NextTXID)
 }
 
 // RestoreV3 restores from a v0.3.x format backup.
