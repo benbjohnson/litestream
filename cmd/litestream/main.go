@@ -157,11 +157,14 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		done := make(chan struct{})
 		c.SetDone(done)
 
-		if err := c.Run(ctx); err != nil {
+		runCtx, cancelRun := context.WithCancel(ctx)
+		defer cancelRun()
+		if err := c.Run(runCtx); err != nil {
 			return err
 		}
 
 		// Wait for signal to stop program.
+		var sig os.Signal
 		select {
 		case err = <-c.execCh:
 			if c.cmd != nil {
@@ -169,34 +172,51 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 			} else {
 				slog.Info("replication complete, litestream shutting down")
 			}
-		case sig := <-signalCh:
+		case sig = <-signalCh:
 			slog.Info("signal received, litestream shutting down", "signal", sig)
+		}
 
-			if c.cmd != nil {
+		shutdownCtx, cancelShutdown := context.WithTimeout(ctx, c.Config.ShutdownTimeout)
+		defer cancelShutdown()
+		closed := make(chan error, 1)
+		go func() {
+			var shutdownErr error
+			if sig != nil && c.cmd != nil {
 				slog.Info("sending signal to exec process")
-				if err := c.cmd.Process.Signal(sig); err != nil {
-					return fmt.Errorf("cannot signal exec process: %w", err)
-				}
-
-				slog.Info("waiting for exec process to close")
-				if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
-					return fmt.Errorf("cannot wait for exec process: %w", err)
+				if e := c.cmd.Process.Signal(sig); e != nil {
+					shutdownErr = fmt.Errorf("cannot signal exec process: %w", e)
+				} else {
+					slog.Info("waiting for exec process to close")
+					if e := <-c.execCh; e != nil && !strings.HasPrefix(e.Error(), "signal:") {
+						shutdownErr = fmt.Errorf("cannot wait for exec process: %w", e)
+					}
 				}
 			}
+			closed <- errors.Join(shutdownErr, c.Close(shutdownCtx))
+		}()
 
-			// Listen for a second signal to close done and interrupt retry loops.
-			go func() {
-				<-signalCh
-				close(done)
-			}()
+		interrupt := func(cause error) error {
+			close(done)
+			if c.cmd != nil {
+				if e := c.cmd.Process.Kill(); e != nil && !errors.Is(e, os.ErrProcessDone) {
+					cause = errors.Join(cause, fmt.Errorf("kill exec process: %w", e))
+				}
+			}
+			return errors.Join(err, cause)
 		}
 
-		// Gracefully close.
-		if e := c.Close(ctx); e != nil && err == nil {
-			err = e
+		select {
+		case e := <-closed:
+			if err = errors.Join(err, e); err != nil {
+				return err
+			}
+			slog.Info("litestream shut down")
+			return nil
+		case sig := <-signalCh:
+			return interrupt(fmt.Errorf("shutdown interrupted by %s: %w", sig, litestream.ErrShutdownInterrupted))
+		case <-shutdownCtx.Done():
+			return interrupt(fmt.Errorf("shutdown timed out after %s: %w", c.Config.ShutdownTimeout, shutdownCtx.Err()))
 		}
-		slog.Info("litestream shut down")
-		return err
 
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
@@ -316,6 +336,7 @@ type Config struct {
 	MCPAddr string `yaml:"mcp-addr"`
 
 	// Shutdown sync retry settings
+	ShutdownTimeout      time.Duration  `yaml:"-"`
 	ShutdownSyncTimeout  *time.Duration `yaml:"shutdown-sync-timeout"`
 	ShutdownSyncInterval *time.Duration `yaml:"shutdown-sync-interval"`
 
@@ -410,6 +431,7 @@ func DefaultConfig() Config {
 		Socket:                   litestream.DefaultSocketConfig(),
 		L0Retention:              &defaultL0Retention,
 		L0RetentionCheckInterval: &defaultL0RetentionCheckInterval,
+		ShutdownTimeout:          30 * time.Second,
 		ShutdownSyncTimeout:      &defaultShutdownSyncTimeout,
 		ShutdownSyncInterval:     &defaultShutdownSyncInterval,
 	}
@@ -666,7 +688,8 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 
 	var raw struct {
-		Snapshot *SnapshotConfig `yaml:"snapshot"`
+		Snapshot        *SnapshotConfig `yaml:"snapshot"`
+		ShutdownTimeout interface{}     `yaml:"shutdown-timeout"`
 	}
 	if err := yaml.Unmarshal(buf, &raw); err != nil {
 		return config, err
@@ -729,6 +752,15 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	}
 	internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 	config.warnSnapshotRetention()
+	if raw.ShutdownTimeout != nil {
+		value, ok := raw.ShutdownTimeout.(string)
+		timeout, err := time.ParseDuration(value)
+		if !ok || err != nil || timeout <= 0 {
+			slog.Warn("invalid shutdown-timeout; using default", "value", raw.ShutdownTimeout, "default", config.ShutdownTimeout)
+		} else {
+			config.ShutdownTimeout = timeout
+		}
+	}
 	if logOutput != os.Stderr {
 		internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 	}
