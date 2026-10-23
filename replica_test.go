@@ -22,6 +22,18 @@ import (
 	"github.com/benbjohnson/litestream/mock"
 )
 
+type l0WriteRecordingClient struct {
+	litestream.ReplicaClient
+	txIDs []ltx.TXID
+}
+
+func (c *l0WriteRecordingClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	if level == 0 {
+		c.txIDs = append(c.txIDs, minTXID)
+	}
+	return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+}
+
 func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
 	db, sqldb := testingutil.MustOpenDBs(t)
 	defer testingutil.MustCloseDBs(t, db, sqldb)
@@ -63,6 +75,8 @@ func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	client := &l0WriteRecordingClient{ReplicaClient: db.Replica.Client}
+	db.Replica.Client = client
 	db.Replica.InvalidatePos()
 	if err := db.Replica.Sync(t.Context()); err != nil {
 		t.Fatal(err)
@@ -76,6 +90,12 @@ func TestReplica_InvalidatePos_HealsL0Gap(t *testing.T) {
 
 	if got, want := db.Replica.Pos().TXID, dpos.TXID; got != want {
 		t.Fatalf("replica pos=%s, want %s", got, want)
+	}
+	if got, want := len(client.txIDs), 1; got != want {
+		t.Fatalf("L0 write count=%d, want %d; txids=%v", got, want, client.txIDs)
+	}
+	if got, want := client.txIDs[0], gapTXID; got != want {
+		t.Fatalf("L0 write TXID=%s, want %s", got, want)
 	}
 }
 
