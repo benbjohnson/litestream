@@ -46,9 +46,10 @@ func (db *DB) readWALContinuityChecksum() (*walContinuityChecksum, error) {
 	return &checksum, nil
 }
 
-// writeWALContinuityChecksum atomically persists checksum metadata for an LTX
-// file that has already been durably published. A crash before this write
-// leaves a TXID mismatch that forces a safe resnapshot on the next open.
+// writeWALContinuityChecksum atomically writes checksum metadata for an LTX
+// file that has already been durably published. The metadata is advisory: if
+// it is missing, stale, or corrupt after a crash, verification forces a safe
+// resnapshot on the next open.
 func (db *DB) writeWALContinuityChecksum(checksum walContinuityChecksum) error {
 	path := db.walContinuityChecksumPath()
 	dir := filepath.Dir(path)
@@ -74,10 +75,6 @@ func (db *DB) writeWALContinuityChecksum(checksum walContinuityChecksum) error {
 	} else if n != len(b) {
 		_ = f.Close()
 		return io.ErrShortWrite
-	}
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("sync wal continuity checksum: %w", err)
 	}
 	if err := f.Close(); err != nil {
 		return fmt.Errorf("close wal continuity checksum: %w", err)
