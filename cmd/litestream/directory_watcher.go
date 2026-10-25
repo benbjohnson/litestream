@@ -370,6 +370,7 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 
 		if err != nil {
 			dm.logger.Error("unregister database from store", "path", db.Path(), "error", err)
+			continue
 		}
 	}
 }
