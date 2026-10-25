@@ -327,14 +327,16 @@ func (dm *DirectoryMonitor) removeDatabase(path string) {
 		return
 	}
 
-	if err := dm.store.UnregisterDB(dm.ctx, db.Path()); err != nil {
-		dm.logger.Error("unregister database from store", "path", path, "error", err)
-		return
-	}
+	err := dm.store.UnregisterDB(dm.ctx, db.Path())
 
 	dm.mu.Lock()
 	delete(dm.dbs, path)
 	dm.mu.Unlock()
+
+	if err != nil {
+		dm.logger.Error("unregister database from store", "path", path, "error", err)
+		return
+	}
 
 	dm.logger.Info("removed database from replication", "path", path)
 }
@@ -360,14 +362,15 @@ func (dm *DirectoryMonitor) removeDatabasesUnder(dir string) {
 			dm.mu.Unlock()
 			continue
 		}
-		if err := dm.store.UnregisterDB(dm.ctx, db.Path()); err != nil {
-			dm.logger.Error("unregister database from store", "path", db.Path(), "error", err)
-			continue
-		}
+		err := dm.store.UnregisterDB(dm.ctx, db.Path())
 
 		dm.mu.Lock()
 		delete(dm.dbs, toClosePaths[i])
 		dm.mu.Unlock()
+
+		if err != nil {
+			dm.logger.Error("unregister database from store", "path", db.Path(), "error", err)
+		}
 	}
 }
 
