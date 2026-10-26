@@ -169,10 +169,12 @@ func runLitestreamMain(t *testing.T, args ...string) (stdout, stderr string, exi
 func TestConfig_SnapshotWarningLogging(t *testing.T) {
 	t.Setenv("LOG_LEVEL", "")
 	for _, tt := range []struct {
-		name        string
-		level       string
-		wantWarning bool
+		name           string
+		level          string
+		defaultLogging bool
+		wantWarning    bool
 	}{
+		{name: "DefaultLogging", defaultLogging: true, wantWarning: true},
 		{name: "JSONStderr", level: "info", wantWarning: true},
 		{name: "ErrorLevel", level: "error"},
 	} {
@@ -180,6 +182,9 @@ func TestConfig_SnapshotWarningLogging(t *testing.T) {
 			dir := t.TempDir()
 			configPath := filepath.Join(dir, "litestream.yml")
 			config := "snapshot:\n  interval: 1h\n  retention: 30m\nlogging:\n  type: json\n  stderr: true\n  level: " + tt.level + "\n"
+			if tt.defaultLogging {
+				config = "snapshot:\n  interval: 1h\n  retention: 30m\n"
+			}
 			if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 				t.Fatal(err)
 			}
@@ -223,6 +228,14 @@ func TestConfig_SnapshotWarningLogging(t *testing.T) {
 				return
 			}
 			var warning map[string]any
+			if tt.defaultLogging {
+				for _, want := range []string{"level=WARN", "snapshot retention is shorter than snapshot interval", "field=snapshot.retention", "retention=30m0s", "interval=1h0m0s"} {
+					if !strings.Contains(string(logOutput), want) {
+						t.Errorf("expected stderr warning containing %q, got %q", want, logOutput)
+					}
+				}
+				return
+			}
 			if err := json.Unmarshal(logOutput, &warning); err != nil {
 				t.Fatalf("expected JSON warning on stderr, got %q: %v", logOutput, err)
 			}

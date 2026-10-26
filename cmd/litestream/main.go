@@ -727,8 +727,11 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 	config.warnSnapshotRetention()
+	if logOutput != os.Stderr {
+		internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	}
 
 	return config, nil
 }

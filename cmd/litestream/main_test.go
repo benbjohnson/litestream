@@ -755,17 +755,17 @@ snapshot:
 
 	t.Run("RetentionShorterThanInterval", func(t *testing.T) {
 		t.Setenv("LOG_LEVEL", "")
-		logOutput, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+		logOutput, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		originalStdout, originalLogger := os.Stdout, slog.Default()
+		originalStderr, originalLogger := os.Stderr, slog.Default()
 		t.Cleanup(func() {
-			os.Stdout = originalStdout
+			os.Stderr = originalStderr
 			slog.SetDefault(originalLogger)
 			logOutput.Close()
 		})
-		os.Stdout = logOutput
+		os.Stderr = logOutput
 
 		yaml := `
 snapshot:
@@ -798,17 +798,17 @@ snapshot:
 
 	t.Run("DBRetentionShorterThanInterval", func(t *testing.T) {
 		t.Setenv("LOG_LEVEL", "")
-		logOutput, err := os.Create(filepath.Join(t.TempDir(), "stdout"))
+		logOutput, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
 		if err != nil {
 			t.Fatal(err)
 		}
-		originalStdout, originalLogger := os.Stdout, slog.Default()
+		originalStderr, originalLogger := os.Stderr, slog.Default()
 		t.Cleanup(func() {
-			os.Stdout = originalStdout
+			os.Stderr = originalStderr
 			slog.SetDefault(originalLogger)
 			logOutput.Close()
 		})
-		os.Stdout = logOutput
+		os.Stderr = logOutput
 
 		yaml := `
  dbs:
