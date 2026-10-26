@@ -254,6 +254,38 @@ func TestReplicaClient_LTXFiles_UseMetadata_ContextCanceled(t *testing.T) {
 	}
 }
 
+func TestReplicaClient_LTXFiles_UseMetadata_ContextCanceledDuringRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	srv := newFakeWebDAVServer()
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			cancel()
+		}
+		srv.ServeHTTP(w, r)
+	}))
+	defer ts.Close()
+
+	c := newTestReplicaClient(ts.URL)
+	c.Path = "/db"
+	data := buildLTXPayload(1, 1, []byte("payload"))
+	if _, err := c.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+
+	itr, err := c.LTXFiles(ctx, 0, 0, true)
+	if itr != nil {
+		defer itr.Close()
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v, want %v", err, context.Canceled)
+	}
+	if itr != nil {
+		t.Fatal("expected no iterator after cancellation")
+	}
+}
+
 // newTestReplicaClient returns a replica client pointed at a test server.
 func newTestReplicaClient(baseURL string) *webdav.ReplicaClient {
 	c := webdav.NewReplicaClient()

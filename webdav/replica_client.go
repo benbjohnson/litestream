@@ -194,18 +194,18 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 }
 
 func (c *ReplicaClient) fetchTimestamps(ctx context.Context, infos []*ltx.FileInfo) error {
-	g, ctx := errgroup.WithContext(ctx)
+	g, groupCtx := errgroup.WithContext(ctx)
 	g.SetLimit(metadataConcurrency)
 
 	for _, info := range infos {
 		g.Go(func() error {
-			if err := ctx.Err(); err != nil {
+			if err := groupCtx.Err(); err != nil {
 				return err
 			}
 
-			hdr, err := litestream.FetchLTXHeader(ctx, c, info)
+			hdr, err := litestream.FetchLTXHeader(groupCtx, c, info)
 			if err != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
+				if ctxErr := groupCtx.Err(); ctxErr != nil {
 					return ctxErr
 				}
 				return fmt.Errorf("read ltx header timestamp for level %d file %s: %w", info.Level, ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
@@ -215,7 +215,10 @@ func (c *ReplicaClient) fetchTimestamps(ctx context.Context, infos []*ltx.FileIn
 		})
 	}
 
-	return g.Wait()
+	if err := g.Wait(); err != nil {
+		return err
+	}
+	return ctx.Err()
 }
 
 // WriteLTXFile writes an LTX file to the WebDAV server.
