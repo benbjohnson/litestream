@@ -188,7 +188,7 @@ func RestoreTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		mcp.WithString("config", mcp.Description("Path to the Litestream config file. Optional.")),
 		mcp.WithString("txid", mcp.Description("Restore up to a specific transaction ID. Optional.")),
 		mcp.WithString("timestamp", mcp.Description("Restore to a specific point-in-time (RFC3339). Optional.")),
-		mcp.WithString("parallelism", mcp.Description("Number of WAL files to download in parallel. Optional.")),
+		mcp.WithString("parallelism", mcp.Description("Deprecated. Accepted for compatibility but has no effect in 0.5.x. Logs a warning when set. Optional.")),
 		mcp.WithBoolean("if_db_not_exists", mcp.Description("Return 0 if the database already exists. Optional.")),
 		mcp.WithBoolean("if_replica_exists", mcp.Description("Return 0 if no backups found. Optional.")),
 	)
