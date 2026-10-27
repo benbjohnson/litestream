@@ -90,7 +90,7 @@ See `v3.go` for type definitions and `s3/replica_client.go` for reference implem
 
 ```bash
 # Integration test
-go test -v ./replica_client_test.go -integration [backend]
+go test -v ./replica_client_test.go -integration -replica-clients=[backend]
 
 # Race conditions
 go test -race -v ./[backend]/...

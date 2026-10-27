@@ -228,7 +228,7 @@ func TestReplicaClient_DeleteWALSegments(t *testing.T) {
 	})
 }
 
-// RunWithReplicaClient executes fn with each replica specified by the -integration flag
+// RunWithReplicaClient executes fn with each replica type specified by the -replica-clients flag
 func RunWithReplicaClient(t *testing.T, name string, fn func(*testing.T, litestream.ReplicaClient)) {
 	t.Run(name, func(t *testing.T) {
 		for _, typ := range testingutil.ReplicaClientTypes() {
@@ -418,58 +418,43 @@ func TestReplicaClient_S3_BucketValidation(t *testing.T) {
 	}
 }
 
-// TestReplicaClient_S3_UnsignedPayloadRejected verifies that unsigned payloads
-// are rejected by real AWS S3. This is a negative test that documents the
-// expected behavior and ensures we don't accidentally ship unsigned payload
-// support for AWS S3.
-//
-// See issue #911 - AWS S3 requires signed payloads and returns
-// SignatureDoesNotMatch for unsigned payload requests.
-func TestReplicaClient_S3_UnsignedPayloadRejected(t *testing.T) {
-	// Only run for S3 integration tests
+func TestReplicaClient_S3_UnsignedPayloadRoundTrip(t *testing.T) {
 	if !slices.Contains(testingutil.ReplicaClientTypes(), "s3") {
 		t.Skip("Skipping S3-specific test")
 	}
-
-	// Skip if using mock endpoint (moto accepts unsigned payloads)
+	if !testingutil.Integration() {
+		t.Skip("skipping integration test, use -integration flag to run")
+	}
 	if endpoint := os.Getenv("LITESTREAM_S3_ENDPOINT"); endpoint != "" {
-		t.Skip("Skipping negative test with mock endpoint (moto accepts unsigned)")
+		t.Skip("Skipping AWS-specific test with custom endpoint")
 	}
 
-	// Create client directly (not via test helper) to control SignPayload
-	c := s3.NewReplicaClient()
-	c.AccessKeyID = os.Getenv("LITESTREAM_S3_ACCESS_KEY_ID")
-	c.SecretAccessKey = os.Getenv("LITESTREAM_S3_SECRET_ACCESS_KEY")
-	c.Region = os.Getenv("LITESTREAM_S3_REGION")
+	c := testingutil.NewS3ReplicaClient(t)
 	if c.Region == "" {
 		c.Region = "us-east-1"
 	}
-	c.Bucket = os.Getenv("LITESTREAM_S3_BUCKET")
-	c.Path = fmt.Sprintf("negative-test/%016x", rand.Uint64())
-
-	// Force unsigned payloads - this should fail with real AWS
 	c.SignPayload = false
+	defer testingutil.MustDeleteAll(t, c)
 
 	ctx := context.Background()
-	if err := c.Init(ctx); err != nil {
-		t.Fatalf("Init failed: %v", err)
-	}
-
-	// Attempt to write - should fail with signature error
 	ltxData := createLTXData(1, 1, []byte("test"))
-	_, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(1), bytes.NewReader(ltxData))
-
-	if err == nil {
-		t.Fatal("expected unsigned payload to be rejected by AWS S3, but upload succeeded")
+	if _, err := c.WriteLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(1), bytes.NewReader(ltxData)); err != nil {
+		t.Fatalf("WriteLTXFile() error: %v", err)
 	}
 
-	// Verify it's a signature-related error
-	errStr := strings.ToLower(err.Error())
-	if !strings.Contains(errStr, "signature") && !strings.Contains(errStr, "accessdenied") {
-		t.Errorf("expected signature-related error, got: %v", err)
+	r, err := c.OpenLTXFile(ctx, 0, ltx.TXID(1), ltx.TXID(1), 0, 0)
+	if err != nil {
+		t.Fatalf("OpenLTXFile() error: %v", err)
 	}
+	defer r.Close()
 
-	t.Logf("Correctly rejected unsigned payload with error: %v", err)
+	buf, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatalf("ReadAll() error: %v", err)
+	}
+	if !bytes.Equal(buf, ltxData) {
+		t.Fatal("data mismatch: uploaded and downloaded data do not match")
+	}
 }
 
 func TestReplicaClient_SFTP_HostKeyValidation(t *testing.T) {
