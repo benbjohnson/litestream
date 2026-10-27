@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/x509"
+	"database/sql"
 	"errors"
 	"flag"
 	"log/slog"
@@ -3119,6 +3120,154 @@ func TestDirectoryMonitor_DetectsDatabaseLifecycle(t *testing.T) {
 	}
 }
 
+func TestDirectoryMonitor_DetectsRecreatedDatabase(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+	metaDir := filepath.Join(t.TempDir(), "meta")
+	dbPath := filepath.Join(rootDir, "app.db")
+	createWALSQLiteDB(t, dbPath, "old")
+
+	config := &main.DBConfig{
+		Dir:     rootDir,
+		Pattern: "*.db",
+		Watch:   true,
+		MetaDir: &metaDir,
+		Replica: &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(dbs, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Errorf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, dbs)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	if err := store.FindDB(dbPath).SyncAndWait(ctx); err != nil {
+		t.Fatalf("failed to replicate original database: %v", err)
+	}
+
+	// Remove the WAL first so the sync that runs inside Close must
+	// recreate it through the connection to the deleted database, causing
+	// close to fail.
+	for _, suffix := range []string{"-wal", "-shm", ""} {
+		if err := os.Remove(dbPath + suffix); err != nil {
+			t.Fatalf("failed to remove database file %s: %v", dbPath+suffix, err)
+		}
+	}
+	if !waitForCondition(5*time.Second, func() bool { return !hasDBPath(store.DBs(), dbPath) }) {
+		t.Fatalf("expected deleted database %s to be removed", dbPath)
+	}
+
+	createWALSQLiteDB(t, dbPath, "new")
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), dbPath) }) {
+		t.Fatalf("expected recreated database %s to be detected", dbPath)
+	}
+
+	db := store.FindDB(dbPath)
+	if err := db.SyncAndWait(ctx); err != nil {
+		t.Fatalf("failed to replicate recreated database: %v", err)
+	}
+	opt := litestream.NewRestoreOptions()
+	opt.OutputPath = filepath.Join(t.TempDir(), "restored.db")
+	if err := litestream.NewReplicaWithClient(nil, db.Replica.Client).Restore(ctx, opt); err != nil {
+		t.Fatalf("failed to restore recreated database: %v", err)
+	}
+
+	restored, err := sql.Open("sqlite", opt.OutputPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restored.Close()
+	var value string
+	if err := restored.QueryRow("SELECT value FROM test").Scan(&value); err != nil {
+		t.Fatalf("failed to query restored database: %v", err)
+	}
+	if value != "new" {
+		t.Fatalf("restored value = %q, want %q", value, "new")
+	}
+}
+
+func TestDirectoryMonitor_RecursiveDetectsReplacedDirectory(t *testing.T) {
+	ctx := context.Background()
+	rootDir := t.TempDir()
+	replicaDir := filepath.Join(t.TempDir(), "replicas")
+	metaDir := filepath.Join(t.TempDir(), "meta")
+	tenantDir := filepath.Join(rootDir, "tenant")
+	if err := os.Mkdir(tenantDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	dbPath := filepath.Join(tenantDir, "app.db")
+	createWALSQLiteDB(t, dbPath, "old")
+
+	config := &main.DBConfig{
+		Dir:       rootDir,
+		Pattern:   "*.db",
+		Watch:     true,
+		Recursive: true,
+		MetaDir:   &metaDir,
+		Replica:   &main.ReplicaConfig{Type: "file", Path: replicaDir},
+	}
+	dbs, err := main.NewDBsFromDirectoryConfig(config)
+	if err != nil {
+		t.Fatalf("NewDBsFromDirectoryConfig failed: %v", err)
+	}
+
+	storeConfig := main.DefaultConfig()
+	store := litestream.NewStore(dbs, storeConfig.CompactionLevels())
+	store.CompactionMonitorEnabled = false
+	if err := store.Open(ctx); err != nil {
+		t.Fatalf("unexpected error opening store: %v", err)
+	}
+	defer func() {
+		if err := store.Close(context.Background()); err != nil {
+			t.Errorf("unexpected error closing store: %v", err)
+		}
+	}()
+
+	monitor, err := main.NewDirectoryMonitor(ctx, store, config, dbs)
+	if err != nil {
+		t.Fatalf("failed to initialize directory monitor: %v", err)
+	}
+	defer monitor.Close()
+
+	if err := store.FindDB(dbPath).SyncAndWait(ctx); err != nil {
+		t.Fatalf("failed to replicate original database: %v", err)
+	}
+	if err := os.Rename(tenantDir, filepath.Join(t.TempDir(), "moved")); err != nil {
+		t.Fatalf("failed to move directory out of watched tree: %v", err)
+	}
+	if !waitForCondition(5*time.Second, func() bool { return !hasDBPath(store.DBs(), dbPath) }) {
+		t.Fatalf("expected moved database %s to be removed", dbPath)
+	}
+
+	// Stage the replacement outside the watched tree so discovery also works
+	// with fsnotify's kqueue backend when the directory path is reused.
+	stagedDir := t.TempDir()
+	createWALSQLiteDB(t, filepath.Join(stagedDir, "app.db"), "new")
+	if err := os.Rename(stagedDir, tenantDir); err != nil {
+		t.Fatalf("failed to move replacement directory into watched tree: %v", err)
+	}
+	if !waitForCondition(5*time.Second, func() bool { return hasDBPath(store.DBs(), dbPath) }) {
+		t.Fatalf("expected database %s in replacement directory to be detected", dbPath)
+	}
+}
+
 func TestDirectoryMonitor_RecursiveDetectsNestedDatabases(t *testing.T) {
 	ctx := context.Background()
 	rootDir := t.TempDir()
@@ -3213,6 +3362,25 @@ func TestDirectoryMonitor_MetaDir(t *testing.T) {
 		return
 	}
 	t.Fatalf("database %s not found", dbPath)
+}
+
+func createWALSQLiteDB(t *testing.T, path, value string) {
+	t.Helper()
+
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
+		t.Fatalf("failed to enable WAL: %v", err)
+	}
+	if _, err := db.Exec("CREATE TABLE test (value TEXT)"); err != nil {
+		t.Fatalf("failed to create table: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO test (value) VALUES (?)", value); err != nil {
+		t.Fatalf("failed to insert value: %v", err)
+	}
 }
 
 // createSQLiteDB creates a minimal SQLite database file for testing
