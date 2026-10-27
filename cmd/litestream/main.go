@@ -567,6 +567,25 @@ func (c *Config) Validate() error {
 	return nil
 }
 
+func (c *Config) warnSnapshotRetention() {
+	warn := func(field string, snapshot SnapshotConfig) {
+		if snapshot.Interval != nil && snapshot.Retention != nil && *snapshot.Retention < *snapshot.Interval {
+			slog.Warn("snapshot retention is shorter than snapshot interval",
+				"field", field,
+				"retention", *snapshot.Retention,
+				"interval", *snapshot.Interval)
+		}
+	}
+	warn("snapshot.retention", c.Snapshot)
+	for _, db := range c.DBs {
+		dbIdentifier := db.Path
+		if dbIdentifier == "" {
+			dbIdentifier = db.Dir
+		}
+		warn(fmt.Sprintf("dbs[%s].snapshot.retention", dbIdentifier), db.Snapshot)
+	}
+}
+
 // CompactionLevels returns a full list of compaction levels include L0.
 func (c *Config) CompactionLevels() litestream.CompactionLevels {
 	levels := litestream.CompactionLevels{
@@ -708,7 +727,11 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	config.warnSnapshotRetention()
+	if logOutput != os.Stderr {
+		internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	}
 
 	return config, nil
 }
