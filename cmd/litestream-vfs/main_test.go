@@ -195,8 +195,7 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for replication to sync
-	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
+	forceReplicaSync(t, db)
 
 	t.Log("opening vfs replica")
 	sqldb1, err := sql.Open("sqlite3", "file:/tmp/test-txn.db?vfs=litestream-txn")
@@ -205,9 +204,15 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 	}
 	defer sqldb1.Close()
 
+	conn, err := sqldb1.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("get replica connection: %v", err)
+	}
+	defer conn.Close()
+
 	// Start a read transaction on the replica
 	t.Log("starting read transaction on replica")
-	tx, err := sqldb1.Begin()
+	tx, err := conn.BeginTx(context.Background(), nil)
 	if err != nil {
 		t.Fatalf("failed to begin transaction: %v", err)
 	}
@@ -237,17 +242,27 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Wait for replication to sync the updates - verify new data is available
-	// by checking from a fresh connection (not the transaction's snapshot)
-	t.Log("waiting for replication sync")
-	require.Eventually(t, func() bool {
-		var data string
-		// Use a new query to check if updates have replicated
-		if err := sqldb1.QueryRow("SELECT data FROM t WHERE id = 5000").Scan(&data); err != nil {
-			return false
+	forceReplicaSync(t, db)
+	pos, err := db.Pos()
+	if err != nil {
+		t.Fatalf("source position: %v", err)
+	}
+
+	t.Log("waiting for transaction connection to observe replicated updates")
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var txid string
+		if err := tx.QueryRow("PRAGMA litestream_txid").Scan(&txid); err != nil {
+			t.Fatalf("query transaction connection position: %v", err)
 		}
-		return strings.HasPrefix(data, "updated_data_5000")
-	}, 10*time.Second, db.MonitorInterval, "updates should replicate")
+		if txid == pos.TXID.String() {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("transaction connection observed TXID %s, want %s", txid, pos.TXID)
+		}
+		time.Sleep(time.Millisecond)
+	}
 
 	// The active read transaction should still see old data (snapshot isolation)
 	t.Log("verifying read transaction still sees old data")
@@ -269,7 +284,7 @@ func TestVFS_ActiveReadTransaction(t *testing.T) {
 	t.Log("verifying multiple rows across pages")
 	for _, id := range []int{0, 2500, 5000, 7500, 9999} {
 		var data string
-		if err := sqldb1.QueryRow("SELECT data FROM t WHERE id = ?", id).Scan(&data); err != nil {
+		if err := conn.QueryRowContext(context.Background(), "SELECT data FROM t WHERE id = ?", id).Scan(&data); err != nil {
 			t.Fatalf("failed to query id %d: %v", id, err)
 		}
 		expected := fmt.Sprintf("updated_data_%d", id)
