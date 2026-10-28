@@ -108,7 +108,7 @@ func (w *eventlogWriter) Write(p []byte) (n int, err error) {
 	return 0, elog.Info(1, string(p))
 }
 
-func signalChan() <-chan os.Signal {
+func signalChan() chan os.Signal {
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt)
 	return ch

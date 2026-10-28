@@ -11,6 +11,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 
 	"github.com/mattn/go-shellwords"
@@ -58,8 +59,101 @@ type ReplicateCommand struct {
 
 func NewReplicateCommand() *ReplicateCommand {
 	return &ReplicateCommand{
-		execCh: make(chan error),
+		execCh: make(chan error, 1),
 	}
+}
+
+func (m *Main) runReplicate(ctx context.Context, args []string) error {
+	c := NewReplicateCommand()
+	if err := c.ParseFlags(ctx, args); err != nil {
+		return err
+	}
+	signals := signalChan()
+	defer signal.Stop(signals)
+	return c.runUntilStopped(ctx, signals)
+}
+
+func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan os.Signal) error {
+	runCtx, cancelRun := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelRun()
+	ready := make(chan struct{})
+	var startupErr error
+	go func() {
+		startupErr = c.Run(runCtx)
+		close(ready)
+	}()
+
+	var result error
+	var sig os.Signal
+	select {
+	case <-ready:
+		if startupErr == nil {
+			select {
+			case result = <-c.execCh:
+				if c.cmd != nil {
+					slog.Info("subprocess exited, litestream shutting down")
+				} else {
+					slog.Info("replication complete, litestream shutting down")
+				}
+			case sig = <-signals:
+			case <-ctx.Done():
+				result, sig = ctx.Err(), os.Interrupt
+			}
+		}
+	case sig = <-signals:
+		cancelRun()
+	case <-ctx.Done():
+		result, sig = ctx.Err(), os.Interrupt
+		cancelRun()
+	}
+	if sig != nil {
+		slog.Info("signal received, litestream shutting down", "signal", sig)
+	}
+
+	shutdownCtx, cancelShutdown := context.WithTimeout(context.WithoutCancel(ctx), c.Config.ShutdownTimeout)
+	defer cancelShutdown()
+	closed := make(chan error, 1)
+	go func() {
+		<-ready
+		closed <- errors.Join(startupErr, c.shutdown(shutdownCtx, sig))
+	}()
+
+	select {
+	case err := <-closed:
+		if err = errors.Join(result, err); err != nil {
+			return err
+		}
+		slog.Info("litestream shut down")
+		return nil
+	case sig := <-signals:
+		result = errors.Join(result, fmt.Errorf("shutdown interrupted by %s: %w", sig, litestream.ErrShutdownInterrupted))
+	case <-shutdownCtx.Done():
+		result = errors.Join(result, fmt.Errorf("shutdown timed out after %s: %w", c.Config.ShutdownTimeout, shutdownCtx.Err()))
+	}
+
+	cancelRun()
+	select {
+	case <-ready:
+		if c.cmd != nil && c.cmd.Process != nil {
+			if err := c.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+				result = errors.Join(result, fmt.Errorf("kill exec process: %w", err))
+			}
+		}
+	default:
+	}
+	return result
+}
+
+func (c *ReplicateCommand) shutdown(ctx context.Context, sig os.Signal) error {
+	var result error
+	if sig != nil && c.cmd != nil && c.cmd.Process != nil {
+		if err := c.cmd.Process.Signal(sig); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			result = fmt.Errorf("cannot signal exec process: %w", err)
+		} else if err := <-c.execCh; err != nil && !strings.HasPrefix(err.Error(), "signal:") {
+			result = fmt.Errorf("cannot wait for exec process: %w", err)
+		}
+	}
+	return errors.Join(result, c.Close(ctx))
 }
 
 // ParseFlags parses the CLI flags and loads the configuration file.

@@ -125,6 +125,28 @@ func TestMainHarness(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Args = append([]string{"litestream"}, args...)
+	if filename := os.Getenv("LITESTREAM_TEST_CANCEL_FILE"); filename != "" {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		go func() {
+			for {
+				if _, err := os.Stat(filename); err == nil {
+					cancel()
+					return
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
+			}
+		}()
+		if err := NewMain().Run(ctx, args); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 	main()
 	os.Exit(0)
 }
@@ -190,21 +212,28 @@ func TestReplicateShutdown(t *testing.T) {
 		t.Skip("requires Unix signals")
 	}
 	for _, tt := range []struct {
-		name, timeout, want string
-		second              bool
-		mode                string
+		name, timeout, want, mode string
+		second, parent            bool
 	}{
-		{"SFTPTimeout", "250ms", "shutdown timed out", false, "sftp"},
-		{"SFTPSecondSignal", "1m", "shutdown interrupted", true, "sftp"},
-		{"Graceful", "5s", "litestream shut down", false, "file"},
-		{"ExecTimeout", "250ms", "shutdown timed out", false, "exec"},
-		{"ExecSecondSignal", "1m", "shutdown interrupted", true, "exec"},
+		{name: "SFTPTimeout", timeout: "250ms", want: "shutdown timed out", mode: "sftp"},
+		{name: "SFTPSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "sftp", second: true},
+		{name: "SSHStartupTimeout", timeout: "250ms", want: "shutdown timed out", mode: "sftp-ssh"},
+		{name: "SSHStartupSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "sftp-ssh", second: true},
+		{name: "SFTPStartupTimeout", timeout: "250ms", want: "shutdown timed out", mode: "sftp-init"},
+		{name: "SFTPStartupSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "sftp-init", second: true},
+		{name: "StartupParentCancellation", timeout: "250ms", want: "shutdown timed out", mode: "sftp-ssh", parent: true},
+		{name: "Graceful", timeout: "5s", want: "litestream shut down", mode: "file"},
+		{name: "ParentCancellation", timeout: "5s", want: "context canceled", mode: "file", parent: true},
+		{name: "ExecTimeout", timeout: "250ms", want: "shutdown timed out", mode: "exec"},
+		{name: "ExecSecondSignal", timeout: "1m", want: "shutdown interrupted", mode: "exec", second: true},
+		{name: "ExecGraceful", timeout: "5s", want: "litestream shut down", mode: "exec-graceful"},
+		{name: "ExecParentCancellation", timeout: "5s", want: "context canceled", mode: "exec-graceful", parent: true},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var host string
 			var stalled <-chan struct{}
-			if tt.mode == "sftp" {
-				host, stalled = startStalledSFTP(t)
+			if strings.HasPrefix(tt.mode, "sftp") {
+				host, stalled = startStalledSFTP(t, tt.mode)
 			}
 			dir := t.TempDir()
 			dbPath := filepath.Join(dir, "db")
@@ -220,10 +249,10 @@ func TestReplicateShutdown(t *testing.T) {
 			}
 			configPath := filepath.Join(dir, "litestream.yml")
 			config := fmt.Sprintf("shutdown-timeout: %s\ndbs:\n  - path: %q\n    replica:\n      type: sftp\n      host: %q\n      user: test\n      path: /replica\n", tt.timeout, dbPath, host)
-			if tt.mode != "sftp" {
+			if !strings.HasPrefix(tt.mode, "sftp") {
 				config = fmt.Sprintf("shutdown-timeout: %s\ndbs:\n  - path: %q\n    replica:\n      type: file\n      path: %q\n", tt.timeout, dbPath, filepath.Join(dir, "replica"))
 			}
-			if tt.mode == "exec" {
+			if strings.HasPrefix(tt.mode, "exec") {
 				config += fmt.Sprintf("exec: %q\n", fmt.Sprintf("%q -test.run=^TestShutdownExecHelper$", os.Args[0]))
 			}
 			if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
@@ -240,6 +269,12 @@ func TestReplicateShutdown(t *testing.T) {
 			defer output.Close()
 			cmd := exec.Command(os.Args[0], "-test.run=^TestMainHarness$")
 			cmd.Env = append(os.Environ(), "LITESTREAM_TEST_MAIN=1", "LITESTREAM_TEST_ARGS="+string(args), "LITESTREAM_TEST_SHUTDOWN_EXEC_PID="+filepath.Join(dir, "child-pid"), "LOG_LEVEL=INFO")
+			if tt.parent {
+				cmd.Env = append(cmd.Env, "LITESTREAM_TEST_CANCEL_FILE="+filepath.Join(dir, "cancel"))
+			}
+			if tt.mode == "exec-graceful" {
+				cmd.Env = append(cmd.Env, "LITESTREAM_TEST_GRACEFUL_EXEC=1")
+			}
 			cmd.Stdout, cmd.Stderr = output, output
 			if err := cmd.Start(); err != nil {
 				t.Fatal(err)
@@ -247,7 +282,7 @@ func TestReplicateShutdown(t *testing.T) {
 			exited := make(chan error, 1)
 			go func() { exited <- cmd.Wait() }()
 			defer func() { _ = cmd.Process.Kill() }()
-			if tt.mode == "sftp" {
+			if strings.HasPrefix(tt.mode, "sftp") {
 				select {
 				case <-stalled:
 				case err := <-exited:
@@ -257,13 +292,13 @@ func TestReplicateShutdown(t *testing.T) {
 				}
 			} else {
 				ready := "initialized db"
-				if tt.mode == "exec" {
+				if strings.HasPrefix(tt.mode, "exec") {
 					ready = "shutdown exec ready"
 				}
 				waitForShutdownOutput(t, output.Name(), ready)
 			}
 			var child *os.Process
-			if tt.mode == "exec" {
+			if strings.HasPrefix(tt.mode, "exec") {
 				buf, err := os.ReadFile(filepath.Join(dir, "child-pid"))
 				if err != nil {
 					t.Fatal(err)
@@ -280,7 +315,37 @@ func TestReplicateShutdown(t *testing.T) {
 				defer child.Kill()
 			}
 
-			if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+			if !strings.HasPrefix(tt.mode, "sftp") {
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					files, err := filepath.Glob(filepath.Join(litestream.LTXLevelDir(filepath.Join(dir, "replica"), 0), "*.ltx"))
+					if err != nil {
+						t.Fatal(err)
+					}
+					if len(files) > 0 {
+						break
+					}
+					if time.Now().After(deadline) {
+						t.Fatal("initial replication did not finish")
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+				db, err := sql.Open("sqlite", dbPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := db.Exec("INSERT INTO test (id) VALUES (1555)"); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tt.parent {
+				if err := os.WriteFile(filepath.Join(dir, "cancel"), nil, 0600); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
 				t.Fatal(err)
 			}
 			if tt.second {
@@ -291,9 +356,9 @@ func TestReplicateShutdown(t *testing.T) {
 			}
 			select {
 			case err := <-exited:
-				if tt.mode == "file" && err != nil {
+				if (tt.mode == "file" || tt.mode == "exec-graceful") && !tt.parent && err != nil {
 					t.Errorf("graceful shutdown failed: %v", err)
-				} else if tt.mode != "file" && err == nil {
+				} else if (tt.parent || (tt.mode != "file" && tt.mode != "exec-graceful")) && err == nil {
 					t.Error("incomplete shutdown must return an error")
 				}
 			case <-time.After(3 * time.Second):
@@ -318,11 +383,32 @@ func TestReplicateShutdown(t *testing.T) {
 			if !bytes.Contains(buf, []byte(tt.want)) {
 				t.Errorf("missing %q in output:\n%s", tt.want, buf)
 			}
+			if tt.mode == "exec-graceful" && !bytes.Contains(buf, []byte("exec stopped gracefully")) {
+				t.Errorf("exec child did not finish gracefully: %s", buf)
+			}
+			if tt.mode == "file" || tt.mode == "exec-graceful" {
+				restored := filepath.Join(dir, "restored.db")
+				if err := (&RestoreCommand{}).Run(t.Context(), []string{"-o", restored, "file://" + filepath.Join(dir, "replica")}); err != nil {
+					t.Fatal(err)
+				}
+				db, err := sql.Open("sqlite", restored)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer db.Close()
+				var count int
+				if err := db.QueryRow("SELECT count(*) FROM test WHERE id = 1555").Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != 1 {
+					t.Fatalf("restored row count=%d, want 1", count)
+				}
+			}
 		})
 	}
 }
 
-func startStalledSFTP(t *testing.T) (string, <-chan struct{}) {
+func startStalledSFTP(t *testing.T, phase string) (string, <-chan struct{}) {
 	t.Helper()
 	_, key, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -347,6 +433,11 @@ func startStalledSFTP(t *testing.T) (string, <-chan struct{}) {
 			return
 		}
 		defer conn.Close()
+		if phase == "sftp-ssh" {
+			close(stalled)
+			<-stopped
+			return
+		}
 		go func() { <-stopped; conn.Close() }()
 		server, channels, requests, err := ssh.NewServerConn(conn, config)
 		if err != nil {
@@ -381,6 +472,11 @@ func startStalledSFTP(t *testing.T) (string, <-chan struct{}) {
 				return err
 			}
 			if err := readPacket(); err != nil {
+				return
+			}
+			if phase == "sftp-init" {
+				close(stalled)
+				<-stopped
 				return
 			}
 			if _, err := channel.Write([]byte{0, 0, 0, 5, 2, 0, 0, 0, 3}); err != nil {
@@ -441,11 +537,22 @@ func TestShutdownExecHelper(t *testing.T) {
 	if filename == "" {
 		t.Skip("helper process only")
 	}
-	signal.Ignore(syscall.SIGINT, syscall.SIGTERM)
+	signals := make(chan os.Signal, 1)
+	if os.Getenv("LITESTREAM_TEST_GRACEFUL_EXEC") == "1" {
+		signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+		defer signal.Stop(signals)
+	} else {
+		signal.Ignore(syscall.SIGINT, syscall.SIGTERM)
+	}
 	if err := os.WriteFile(filename, []byte(strconv.Itoa(os.Getpid())), 0600); err != nil {
 		t.Fatal(err)
 	}
 	fmt.Println("shutdown exec ready")
+	if os.Getenv("LITESTREAM_TEST_GRACEFUL_EXEC") == "1" {
+		<-signals
+		fmt.Println("exec stopped gracefully")
+		return
+	}
 	for {
 		time.Sleep(time.Hour)
 	}

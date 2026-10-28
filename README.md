@@ -43,13 +43,16 @@ Stopping replication
 
 `litestream replicate` attempts a graceful shutdown on SIGINT or SIGTERM.
 The top-level `shutdown-timeout` configuration setting limits the entire shutdown,
-including waiting for an `exec` process and closing databases and replicas. It
-defaults to `30s`; set a longer duration when final replication needs more time.
+including waiting for startup, an `exec` process, and closing databases and
+replicas. It defaults to `30s`; set a longer duration when final replication needs
+more time.
 Invalid or nonpositive values produce a warning and use the default.
 
 A second SIGINT or SIGTERM interrupts shutdown immediately. A timeout or
 interruption exits with an error because the final replica sync may be incomplete.
-This process-level bound also applies when a replica connection stops responding.
+This process-level bound also applies when a replica connection stops responding
+during startup. Cancellation of the calling context also starts a bounded graceful
+shutdown, using a fresh context for final replication.
 The existing `shutdown-sync-timeout` setting still controls each database's final
 replica sync retries within this overall limit. The process-level bound does not
 apply to callers of the Go library.
