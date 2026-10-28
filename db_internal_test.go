@@ -1785,7 +1785,7 @@ func TestDB_Checkpoint_ErrorMetrics(t *testing.T) {
 
 	db.db.Close()
 
-	if _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
+	if _, _, err := db.execCheckpoint(context.Background(), "PASSIVE"); err == nil {
 		t.Fatal("expected error from checkpoint with closed db")
 	}
 
@@ -4752,7 +4752,7 @@ func TestDB_ReadLockSurvivesContextCancel(t *testing.T) {
 		}
 
 		ctx, cancel := context.WithCancel(context.Background())
-		if _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
+		if _, _, err := db.execCheckpoint(ctx, CheckpointModePassive); err != nil {
 			t.Fatal(err)
 		}
 		cancel()
@@ -4993,5 +4993,122 @@ func TestDB_ConcurrentMetricOwners(t *testing.T) {
 	}
 	if got := gatherDBSeries(t, path); len(got) != 0 {
 		t.Fatalf("series remain after last close: %v", got)
+	}
+}
+
+// An application write between the PASSIVE barrier rollback and the
+// _litestream_seq bump restarts the WAL itself. It must not force a snapshot.
+func TestDB_PassiveCheckpoint_AppWriteBeforeSeqBump(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		walRows      int
+		hook         func(t *testing.T, db *DB, app *sql.DB)
+		wantSnapshot bool
+	}{
+		{"WriteWithinOldWAL", 20, func(t *testing.T, db *DB, app *sql.DB) {
+			mustExecApp(t, app, `INSERT INTO t (data) VALUES (x'02')`)
+		}, false},
+		{"WriteOverwritesOldWAL", 1, func(t *testing.T, db *DB, app *sql.DB) {
+			mustExecApp(t, app, `INSERT INTO t (data) SELECT randomblob(4000) FROM t LIMIT 20`)
+		}, false},
+		{"SecondRestartSnapshots", 1, func(t *testing.T, db *DB, app *sql.DB) {
+			mustExecApp(t, app, `INSERT INTO t (data) SELECT randomblob(4000) FROM t LIMIT 20`)
+			if err := db.releaseReadLock(); err != nil {
+				t.Fatal(err)
+			}
+			mustExecApp(t, app, `PRAGMA wal_checkpoint(PASSIVE)`)
+			mustExecApp(t, app, `INSERT INTO t (data) SELECT randomblob(4000) FROM t LIMIT 5`)
+			if err := db.acquireReadLock(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+		}, true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			dbPath := filepath.Join(t.TempDir(), "db")
+			var logs bytes.Buffer
+			db := NewDB(dbPath)
+			db.Logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+			db.MonitorInterval, db.CheckpointInterval = 0, 0
+			db.Replica = NewReplica(db)
+			db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+			db.Replica.MonitorEnabled = false
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = db.Close(ctx) }()
+
+			app, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer app.Close()
+			app.SetMaxOpenConns(1)
+			mustExecApp(t, app, `PRAGMA wal_autocheckpoint = 0`)
+			mustExecApp(t, app, `PRAGMA busy_timeout = 5000`)
+			mustExecApp(t, app, `CREATE TABLE t (id INTEGER PRIMARY KEY, data BLOB)`)
+			for i := 0; i < 50; i++ {
+				mustExecApp(t, app, `INSERT INTO t (data) VALUES (randomblob(500))`)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+				t.Fatal(err)
+			}
+			for i := 0; i < tt.walRows; i++ {
+				mustExecApp(t, app, `INSERT INTO t (data) VALUES (x'01')`)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+
+			db.afterPassiveBarrierRelease = func() {
+				db.afterPassiveBarrierRelease = nil
+				tt.hook(t, db, app)
+			}
+			logs.Reset()
+			if err := db.Checkpoint(ctx, CheckpointModePassive); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if got := strings.Contains(logs.String(), "snap=true"); got != tt.wantSnapshot {
+				t.Fatalf("snapshot=%v, want %v\n%s", got, tt.wantSnapshot, logs.String())
+			}
+
+			if err := db.Replica.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			opt := NewRestoreOptions()
+			opt.OutputPath = filepath.Join(t.TempDir(), "restored.db")
+			opt.IntegrityCheck = IntegrityCheckFull
+			if err := db.Replica.Restore(ctx, opt); err != nil {
+				t.Fatal(err)
+			}
+			restored, err := sql.Open("sqlite", opt.OutputPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restored.Close()
+			var want, got int
+			if err := app.QueryRow(`SELECT count(*) FROM t`).Scan(&want); err != nil {
+				t.Fatal(err)
+			}
+			if err := restored.QueryRow(`SELECT count(*) FROM t`).Scan(&got); err != nil {
+				t.Fatal(err)
+			}
+			if got != want {
+				t.Fatalf("restored %d rows, want %d", got, want)
+			}
+		})
+	}
+}
+
+func mustExecApp(t *testing.T, db *sql.DB, query string) {
+	t.Helper()
+	if _, err := db.Exec(query); err != nil {
+		t.Fatal(err)
 	}
 }
