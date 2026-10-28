@@ -83,7 +83,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return nil
 	}
 
-	if c.client, err = storage.NewClient(ctx); err != nil {
+	if c.client, err = storage.NewClient(context.WithoutCancel(ctx)); err != nil {
 		return fmt.Errorf("failed to create GCS client (bucket: %s): %w", c.Bucket, err)
 	}
 	c.bkt = c.client.Bucket(c.Bucket)
