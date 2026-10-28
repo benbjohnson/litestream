@@ -82,8 +82,11 @@ func (s *windowsService) Execute(args []string, r <-chan svc.ChangeRequest, stat
 		case req := <-r:
 			switch req.Cmd {
 			case svc.Stop:
-				c.Close(s.ctx)
 				statusCh <- svc.Status{State: svc.StopPending}
+				if err := c.Close(s.ctx); err != nil {
+					slog.Error("cannot close replication", "error", err)
+					return true, 3
+				}
 				return false, windows.NO_ERROR
 			case svc.Interrogate:
 				statusCh <- req.CurrentStatus
@@ -105,7 +108,7 @@ func (w *eventlogWriter) Write(p []byte) (n int, err error) {
 	return 0, elog.Info(1, string(p))
 }
 
-func signalChan() <-chan os.Signal {
+func signalChan() chan os.Signal {
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, os.Interrupt)
 	return ch

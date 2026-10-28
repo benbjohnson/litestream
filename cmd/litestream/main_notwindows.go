@@ -19,7 +19,7 @@ func runWindowsService(ctx context.Context) error {
 	panic("cannot run windows service as unix process")
 }
 
-func signalChan() <-chan os.Signal {
+func signalChan() chan os.Signal {
 	ch := make(chan os.Signal, 2)
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	return ch
