@@ -114,11 +114,6 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		return nil, fmt.Errorf("cannot determine snapshot max ltx file: %w", err)
 	}
 
-	// An initial snapshot is required before compaction can begin.
-	if snapInfo.MaxTXID == 0 {
-		return nil, ErrNoCompaction
-	}
-
 	// Snapshots are uploaded directly to the L9 SnapshotLevel, so the ladder
 	// only needs the source files that extend past the newest snapshot.
 	//

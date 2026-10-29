@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -285,7 +286,7 @@ func TestStore_CompactDB(t *testing.T) {
 		}
 		defer s.Close(t.Context())
 
-		for _, query := range []string{`CREATE TABLE t (id INT);`, `INSERT INTO t (id) VALUES (100)`} {
+		for _, query := range []string{`CREATE TABLE t (id INT);`, `INSERT INTO t (id) VALUES (100)`, `INSERT INTO t (id) VALUES (150)`} {
 			if _, err := sqldb0.ExecContext(t.Context(), query); err != nil {
 				t.Fatal(err)
 			} else if err := db0.Sync(t.Context()); err != nil {
@@ -316,7 +317,7 @@ func TestStore_CompactDB(t *testing.T) {
 		time.Sleep(levels[1].Interval)
 		info, err = s.CompactDB(t.Context(), db0, levels[1])
 		require.NoError(t, err)
-		require.Equal(t, ltx.TXID(3), info.MaxTXID)
+		require.Equal(t, ltx.TXID(4), info.MaxTXID)
 	})
 
 	// Regression test for GitHub issue #877: level 9 compaction fails with
@@ -841,7 +842,8 @@ type slowSnapshotClient struct {
 }
 
 func (c *slowSnapshotClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
-	if level != litestream.SnapshotLevel {
+	_, staged := r.(*os.File)
+	if level != litestream.SnapshotLevel || staged {
 		return c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
 	}
 	c.started <- struct{}{}
