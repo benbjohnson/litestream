@@ -117,20 +117,19 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		}
 	})
 
-	t.Run("NoSnapshotDefers", func(t *testing.T) {
+	t.Run("NoSnapshotCompactsLegacyBase", func(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// No snapshot exists yet. An empty destination must DEFER (ErrNoCompaction)
-		// rather than seek from TXID 1, which would pull the DB-sized base into
-		// the ladder's first compaction. The snapshot and ladder levels run in
-		// independent monitors with no ordering guarantee, so a ladder level can
-		// reach Compact before the snapshot lands; it should wait.
 		createTestLTXFile(t, client, 0, 1, 1)
 		createTestLTXFile(t, client, 0, 2, 2)
 
-		if _, err := compactor.Compact(context.Background(), 1); err != litestream.ErrNoCompaction {
-			t.Errorf("err=%v, want ErrNoCompaction", err)
+		info, err := compactor.Compact(context.Background(), 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.MinTXID != 1 || info.MaxTXID != 2 {
+			t.Errorf("TXID range=%d-%d, want 1-2", info.MinTXID, info.MaxTXID)
 		}
 	})
 
@@ -138,9 +137,6 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// L0 base + increment, but no snapshot yet: the first compaction defers.
-		createTestLTXFile(t, client, 0, 1, 1)
-		createTestLTXFile(t, client, 0, 2, 2)
 		if _, err := compactor.Compact(context.Background(), 1); err != litestream.ErrNoCompaction {
 			t.Fatalf("err=%v, want ErrNoCompaction before snapshot exists", err)
 		}
@@ -148,6 +144,7 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		// Once the snapshot lands (covering the base at TXID 1), the same empty
 		// destination proceeds, skipping the snapshot-covered base.
 		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+		createTestLTXFile(t, client, 0, 2, 2)
 		info, err := compactor.Compact(context.Background(), 1)
 		if err != nil {
 			t.Fatal(err)
@@ -161,8 +158,6 @@ func TestCompactor_Compact_SeeksFromSnapshot(t *testing.T) {
 		client := file.NewReplicaClient(t.TempDir())
 		compactor := litestream.NewCompactor(client, slog.Default())
 
-		// A base snapshot must exist for the empty-destination first compaction to
-		// proceed (an empty destination defers until the snapshot lands).
 		createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
 
 		// L1 already has files up through TXID 3 (the base [1,1] is skipped).
