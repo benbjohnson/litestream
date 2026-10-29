@@ -116,6 +116,53 @@ func TestReplica_ApplyNewLTXFiles_LevelZeroEmptyFallsBackToCompaction(t *testing
 	}
 }
 
+func TestReplica_ApplyNewLTXFiles_IdleSkipsHigherLevels(t *testing.T) {
+	// The follower is caught up: level 0 still holds the file it applied last
+	// and nothing newer. Higher levels must not be listed on such a tick.
+	l0Info := &ltx.FileInfo{Level: 0, MinTXID: 10, MaxTXID: 10}
+	compactedInfo := &ltx.FileInfo{Level: 1, MinTXID: 1, MaxTXID: 10}
+
+	listed := make(map[int]int)
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		listed[level]++
+
+		var all []*ltx.FileInfo
+		switch level {
+		case 0:
+			all = []*ltx.FileInfo{l0Info}
+		case 1:
+			all = []*ltx.FileInfo{compactedInfo}
+		}
+
+		infos := make([]*ltx.FileInfo, 0, len(all))
+		for _, info := range all {
+			if info.MinTXID >= seek {
+				infos = append(infos, info)
+			}
+		}
+		return ltx.NewFileInfoSliceIterator(infos), nil
+	}
+	client.OpenLTXFileFunc = func(_ context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+		return nil, fmt.Errorf("unexpected open")
+	}
+
+	r := NewReplicaWithClient(nil, client)
+	f := mustCreateWritableDBFile(t)
+	defer func() { _ = f.Close() }()
+
+	got, err := r.applyNewLTXFiles(context.Background(), f, 10, 4096)
+	if err != nil {
+		t.Fatalf("apply new ltx files: %v", err)
+	}
+	if got != 10 {
+		t.Fatalf("txid=%s, want %s", got, ltx.TXID(10))
+	}
+	if len(listed) != 1 || listed[0] != 1 {
+		t.Fatalf("listings per level=%v, want only level 0 once", listed)
+	}
+}
+
 func TestReplica_ApplyNewLTXFiles_IteratorCloseError(t *testing.T) {
 	client := &followTestReplicaClient{}
 	client.LTXFilesFunc = func(_ context.Context, level int, seek ltx.TXID, _ bool) (ltx.FileIterator, error) {
