@@ -667,6 +667,10 @@ type Hydrator struct {
 	pageSize   uint32         // Page size of the database
 	client     ReplicaClient
 	logger     *slog.Logger
+
+	snapshot      *os.File
+	snapshotPages map[uint32]struct{}
+	snapshotPageN uint32
 }
 
 // NewHydrator creates a new Hydrator instance.
@@ -882,7 +886,7 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 // ReadAt reads data from the hydrated local file.
 func (h *Hydrator) ReadAt(p []byte, off int64) (int, error) {
 	h.mu.Lock()
-	n, err := h.file.ReadAt(p, off)
+	n, err := h.readSnapshotAt(p, off)
 	h.mu.Unlock()
 
 	if err != nil && err != io.EOF {
@@ -898,6 +902,76 @@ func (h *Hydrator) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
+func (h *Hydrator) readSnapshotAt(p []byte, off int64) (int, error) {
+	if len(h.snapshotPages) == 0 || off < 0 {
+		return h.file.ReadAt(p, off)
+	}
+	var n int
+	for n < len(p) {
+		pageOffset := (off + int64(n)) % int64(h.pageSize)
+		pageN := min(len(p)-n, int(h.pageSize)-int(pageOffset))
+		file := h.file
+		if _, ok := h.snapshotPages[uint32((off+int64(n))/int64(h.pageSize))+1]; ok {
+			file = h.snapshot
+		}
+		readN, err := file.ReadAt(p[n:n+pageN], off+int64(n))
+		n += readN
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
+}
+
+func (h *Hydrator) beginSnapshot(pageN uint32) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.snapshotPages = make(map[uint32]struct{})
+	h.snapshotPageN = pageN
+}
+
+func (h *Hydrator) endSnapshot() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.snapshotPages = nil
+	h.snapshotPageN = 0
+	if h.snapshot == nil {
+		return nil
+	}
+	file := h.snapshot
+	h.snapshot = nil
+	if err := errors.Join(file.Close(), os.Remove(file.Name())); err != nil {
+		return fmt.Errorf("remove hydration snapshot: %w", err)
+	}
+	return nil
+}
+
+func (h *Hydrator) preserveSnapshotPage(pgno uint32) error {
+	if h.snapshotPages == nil || pgno > h.snapshotPageN {
+		return nil
+	}
+	if _, ok := h.snapshotPages[pgno]; ok {
+		return nil
+	}
+	if h.snapshot == nil {
+		file, err := os.CreateTemp(filepath.Dir(h.path), ".litestream-snapshot-*")
+		if err != nil {
+			return fmt.Errorf("create hydration snapshot: %w", err)
+		}
+		h.snapshot = file
+	}
+	data := make([]byte, h.pageSize)
+	off := int64(pgno-1) * int64(h.pageSize)
+	if _, err := h.file.ReadAt(data, off); err != nil {
+		return fmt.Errorf("read snapshot page %d: %w", pgno, err)
+	}
+	if _, err := h.snapshot.WriteAt(data, off); err != nil {
+		return fmt.Errorf("write snapshot page %d: %w", pgno, err)
+	}
+	h.snapshotPages[pgno] = struct{}{}
+	return nil
+}
+
 // ApplyUpdates fetches updated pages and writes them to the hydration file.
 func (h *Hydrator) ApplyUpdates(ctx context.Context, updates map[uint32]ltx.PageIndexElem) error {
 	h.mu.Lock()
@@ -909,6 +983,9 @@ func (h *Hydrator) ApplyUpdates(ctx context.Context, updates map[uint32]ltx.Page
 			return fmt.Errorf("fetch updated page %d: %w", pgno, err)
 		}
 
+		if err := h.preserveSnapshotPage(pgno); err != nil {
+			return err
+		}
 		off := int64(pgno-1) * int64(h.pageSize)
 		if _, err := h.file.WriteAt(data, off); err != nil {
 			return fmt.Errorf("write updated page %d: %w", pgno, err)
@@ -927,6 +1004,7 @@ func (h *Hydrator) WritePage(pgno uint32, data []byte) error {
 	if _, err := h.file.WriteAt(data, off); err != nil {
 		return fmt.Errorf("write page %d to hydrated file: %w", pgno, err)
 	}
+	delete(h.snapshotPages, pgno)
 	return nil
 }
 
@@ -939,7 +1017,8 @@ func (h *Hydrator) Truncate(size int64) error {
 
 // Close closes the hydration file. For persistent hydrators, the file and a
 // companion .meta file are preserved so hydration can resume on the next open.
-func (h *Hydrator) Close() error {
+func (h *Hydrator) Close() (err error) {
+	defer func() { err = errors.Join(err, h.endSnapshot()) }()
 	if h.file == nil {
 		return nil
 	}
@@ -1515,10 +1594,9 @@ func (f *VFSFile) Close() error {
 	}
 
 	// Close and remove hydration file
+	var hydrationErr error
 	if f.hydrator != nil {
-		if err := f.hydrator.Close(); err != nil {
-			f.logger.Warn("failed to close hydration file", "error", err)
-		}
+		hydrationErr = f.hydrator.Close()
 	}
 
 	if f.writeEnabled && f.vfs != nil {
@@ -1537,7 +1615,7 @@ func (f *VFSFile) Close() error {
 		}
 	}
 
-	return nil
+	return hydrationErr
 }
 
 func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
@@ -2369,6 +2447,9 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		f.logger.Debug("transaction started", "expectedTXID", f.expectedTXID)
 	}
 
+	if f.lockType == sqlite3vfs.LockNone && elock >= sqlite3vfs.LockShared && f.hydrator != nil {
+		f.hydrator.beginSnapshot(f.commit)
+	}
 	f.lockType = elock
 	return nil
 }
@@ -2402,11 +2483,8 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	}
 
 	var hydrationErr error
-	if f.hydrator != nil && f.hydrator.Complete() && len(f.pending) > 0 {
-		if err := f.hydrator.ApplyUpdates(f.ctx, f.pending); err != nil {
-			f.hydrator.Disable()
-			hydrationErr = fmt.Errorf("apply pending hydration updates: %w", err)
-		}
+	if f.hydrator != nil {
+		hydrationErr = f.hydrator.endSnapshot()
 	}
 
 	// Copy pending index to main index and invalidate affected pages in cache.
@@ -2778,7 +2856,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	// Apply updates to hydrated file if hydration is complete
-	if targetIsMain && f.hydrator != nil && f.hydrator.Complete() && len(applied) > 0 {
+	if f.hydrator != nil && f.hydrator.Complete() && len(applied) > 0 {
 		if err := f.hydrator.ApplyUpdates(ctx, applied); err != nil {
 			f.hydrator.Disable()
 			return fmt.Errorf("apply hydration updates: %w", err)
