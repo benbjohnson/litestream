@@ -896,3 +896,37 @@ func TestStore_Close_StopsMonitorsBeforeClosingDBs(t *testing.T) {
 		require.ErrorIs(t, err, context.Canceled)
 	}
 }
+
+func TestStore_CompactDB_CheckpointBoundary(t *testing.T) {
+	db, sqlDB := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqlDB)
+	sync := func() {
+		t.Helper()
+		require.NoError(t, db.Sync(t.Context()))
+		require.NoError(t, db.Replica.Sync(t.Context()))
+	}
+	_, err := sqlDB.Exec("CREATE TABLE t (x INTEGER)")
+	require.NoError(t, err)
+	sync()
+	_, err = sqlDB.Exec("INSERT INTO t VALUES (1)")
+	require.NoError(t, err)
+	sync()
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.DefaultCompactionLevels)
+	level := &litestream.CompactionLevel{Level: 1, Interval: time.Nanosecond}
+	before, err := store.CompactDB(t.Context(), db, level)
+	require.NoError(t, err)
+	require.NoError(t, db.Checkpoint(t.Context(), litestream.CheckpointModeTruncate))
+	require.NoError(t, db.Replica.Sync(t.Context()))
+	remote, err := db.Replica.MaxLTXFileInfo(t.Context(), 0)
+	require.NoError(t, err)
+	require.Greater(t, remote.MaxTXID, before.MaxTXID)
+	cached, err := db.MaxLTXFileInfo(t.Context(), 0)
+	require.NoError(t, err)
+	if remote.MaxTXID != cached.MaxTXID {
+		t.Errorf("cached L0=%s, remote L0=%s", cached.MaxTXID, remote.MaxTXID)
+	}
+	after, err := store.CompactDB(t.Context(), db, level)
+	require.NoError(t, err)
+	require.Equal(t, remote.MaxTXID, after.MaxTXID)
+	require.Equal(t, before.MaxTXID+1, after.MinTXID)
+}
