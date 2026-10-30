@@ -108,6 +108,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	if err != nil {
 		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
 	}
+
 	seekTXID := prevMaxInfo.MaxTXID + 1
 
 	itr, err := c.client.LTXFiles(ctx, srcLevel, seekTXID, false)
@@ -128,6 +129,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
+		if maxTXID != 0 && info.MinTXID > maxTXID+1 {
+			break
+		}
 
 		if minTXID == 0 || info.MinTXID < minTXID {
 			minTXID = info.MinTXID
@@ -201,6 +205,31 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 	}
 	defer itr.Close()
 
+	snapshots := make(map[ltx.TXID]struct{})
+	snapshotsLoaded := false
+	gapCoveredBySnapshot := func(g0, g1 ltx.TXID) (bool, error) {
+		if !snapshotsLoaded {
+			sitr, err := c.client.LTXFiles(ctx, SnapshotLevel, 0, false)
+			if err != nil {
+				return false, fmt.Errorf("fetch snapshot ltx files: %w", err)
+			}
+			for sitr.Next() {
+				snapshots[sitr.Item().MaxTXID] = struct{}{}
+			}
+			if err := sitr.Close(); err != nil {
+				return false, fmt.Errorf("close snapshot iterator: %w", err)
+			}
+			snapshotsLoaded = true
+		}
+		var covered ltx.TXID
+		for txid := range snapshots {
+			if g0 <= txid && txid <= g1 {
+				covered++
+			}
+		}
+		return covered == g1-g0+1, nil
+	}
+
 	var prevInfo *ltx.FileInfo
 	for itr.Next() {
 		info := itr.Item()
@@ -215,11 +244,18 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 		expectedMinTXID := prevInfo.MaxTXID + 1
 		if info.MinTXID != expectedMinTXID {
 			if info.MinTXID > expectedMinTXID {
-				return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
-					prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
+				covered, err := gapCoveredBySnapshot(expectedMinTXID, info.MinTXID-1)
+				if err != nil {
+					return err
+				}
+				if !covered {
+					return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
+						prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
+				}
+			} else {
+				return fmt.Errorf("TXID overlap detected: prev.MaxTXID=%s, next.MinTXID=%s",
+					prevInfo.MaxTXID, info.MinTXID)
 			}
-			return fmt.Errorf("TXID overlap detected: prev.MaxTXID=%s, next.MinTXID=%s",
-				prevInfo.MaxTXID, info.MinTXID)
 		}
 
 		prevInfo = info

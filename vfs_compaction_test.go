@@ -190,3 +190,22 @@ func TestVFS_CompactionConfig(t *testing.T) {
 		}
 	})
 }
+
+func TestVFSFile_SnapshotCompactionHistoricalRestore(t *testing.T) {
+	client, origin := newSnapshotCompactionReplica(t)
+	if err := litestream.NewCompactor(client, slog.Default()).EnforceL0Retention(t.Context(), 5*time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	f := litestream.NewVFSFile(client, "historical.db", slog.Default())
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := f.SetTargetTime(t.Context(), origin.Add(4*time.Minute+30*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if got := f.Pos().TXID; got != 4 {
+		t.Fatalf("historical VFS TXID=%d, want 4", got)
+	}
+}
