@@ -916,8 +916,11 @@ func (r *Replica) follow(ctx context.Context, outputPath string, lastTXID ltx.TX
 func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID ltx.TXID, pageSize uint32) (ltx.TXID, error) {
 	currentTXID := afterTXID
 
-	// Poll level 0 for the most recent incremental files.
-	itr, err := r.Client.LTXFiles(ctx, 0, currentTXID+1, false)
+	// Poll level 0 for the most recent incremental files. Level 0 files hold
+	// a single TXID, so seeking from currentTXID also returns the last applied
+	// file while it still exists. Seeing it means level 0 has not been
+	// compacted past us, so an idle tick doesn't need to search higher levels.
+	itr, err := r.Client.LTXFiles(ctx, 0, currentTXID, false)
 	if err != nil {
 		return currentTXID, fmt.Errorf("list level 0 ltx files: %w", err)
 	}
