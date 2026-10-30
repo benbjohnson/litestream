@@ -3044,3 +3044,119 @@ func TestNewReplicaClientFromURL_NeonExplicitEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestTransportRetryer_Throttling(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		status    int
+		code      string
+		retryable bool
+	}{
+		{name: "R2", status: http.StatusTooManyRequests, code: "ServiceUnavailable", retryable: true},
+		{name: "Bare429", status: http.StatusTooManyRequests, retryable: true},
+		{name: "SlowDown", status: http.StatusServiceUnavailable, code: "SlowDown", retryable: true},
+		{name: "AccessDenied", status: http.StatusForbidden, code: "AccessDenied"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			retryer := newTransportRetryer()
+			err := &smithy.OperationError{ServiceID: "S3", OperationName: "ListObjectsV2", Err: &smithyhttp.ResponseError{
+				Response: &smithyhttp.Response{Response: &http.Response{StatusCode: tt.status}},
+				Err:      &smithy.GenericAPIError{Code: tt.code, Message: "Reduce your request rate"},
+			}}
+			if got := retryer.IsErrorRetryable(err); got != tt.retryable {
+				t.Fatalf("IsErrorRetryable() = %v, want %v", got, tt.retryable)
+			}
+			if !tt.retryable {
+				return
+			}
+			if retryer.IsErrorRetryable(&smithy.CanceledError{Err: err}) {
+				t.Fatal("canceled throttled request must not be retried")
+			}
+			if got := retryer.MaxAttempts(); got < 2 || got > 8 {
+				t.Errorf("MaxAttempts() = %d, want between 2 and 8", got)
+			}
+			var total time.Duration
+			for attempt := 1; attempt < retryer.MaxAttempts(); attempt++ {
+				delay, delayErr := retryer.RetryDelay(attempt, err)
+				if delayErr != nil {
+					t.Fatal(delayErr)
+				}
+				if delay < 0 || delay > time.Second {
+					t.Errorf("attempt %d delay = %s, want between zero and one second", attempt, delay)
+				}
+				total += delay
+			}
+			if total > 7*time.Second {
+				t.Errorf("total backoff = %s, want at most seven seconds", total)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_RetriesThrottledList(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		status int
+		code   string
+	}{
+		{name: "R2", status: http.StatusTooManyRequests, code: "ServiceUnavailable"},
+		{name: "SlowDown", status: http.StatusServiceUnavailable, code: "SlowDown"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var attempts atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/xml")
+				if r.Method == http.MethodHead {
+					w.Header().Set("X-Amz-Meta-Litestream-Timestamp", "2026-10-29T00:00:00Z")
+					w.Header().Set("Content-Length", "100")
+					return
+				}
+				if attempts.Add(1) == 1 {
+					w.WriteHeader(tt.status)
+					if _, err := fmt.Fprintf(w, "<Error><Code>%s</Code><Message>Reduce your request rate</Message></Error>", tt.code); err != nil {
+						t.Error(err)
+					}
+					return
+				}
+				if _, err := fmt.Fprint(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated><Contents><Key>replica/0000/0000000000000001-0000000000000002.ltx</Key><Size>100</Size><LastModified>2026-10-30T00:00:00Z</LastModified></Contents></ListBucketResult>`); err != nil {
+					t.Error(err)
+				}
+			}))
+			defer server.Close()
+			client := NewReplicaClient()
+			client.Bucket = "test-bucket"
+			client.Region = "us-east-1"
+			client.Endpoint = server.URL
+			client.ForcePathStyle = true
+			client.AccessKeyID = "test-access-key"
+			client.SecretAccessKey = "test-secret-key"
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := client.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			client.Path = "replica"
+			itr, err := client.LTXFiles(ctx, 0, 0, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := itr.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			if !itr.Next() {
+				t.Fatalf("expected LTX file after retry: %v", itr.Err())
+			}
+			if info := itr.Item(); info.MinTXID != 1 || info.MaxTXID != 2 || info.Size != 100 || !info.CreatedAt.Equal(time.Date(2026, 10, 29, 0, 0, 0, 0, time.UTC)) {
+				t.Fatalf("unexpected file: %+v", info)
+			}
+			if itr.Next() || itr.Err() != nil {
+				t.Fatalf("unexpected iterator result: %v", itr.Err())
+			}
+			if got := attempts.Load(); got != 2 {
+				t.Fatalf("attempts = %d, want 2", got)
+			}
+		})
+	}
+}
