@@ -1293,16 +1293,17 @@ func addExternalLTXFile(t *testing.T, client litestream.ReplicaClient, replicaDi
 	t.Helper()
 
 	// Get current max TXID
-	itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-	require.NoError(t, err)
-
 	var maxTXID ltx.TXID
-	for itr.Next() {
-		if itr.Item().MaxTXID > maxTXID {
-			maxTXID = itr.Item().MaxTXID
+	for _, level := range []int{0, litestream.SnapshotLevel} {
+		itr, err := client.LTXFiles(context.Background(), level, 0, false)
+		require.NoError(t, err)
+		for itr.Next() {
+			if itr.Item().MaxTXID > maxTXID {
+				maxTXID = itr.Item().MaxTXID
+			}
 		}
+		require.NoError(t, itr.Close())
 	}
-	itr.Close()
 
 	// Create a new LTX file with next TXID
 	nextTXID := maxTXID + 1

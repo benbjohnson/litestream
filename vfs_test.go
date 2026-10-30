@@ -1982,3 +1982,69 @@ func TestVFSFile_HydrationUpdateFailureDisablesHydration(t *testing.T) {
 		t.Fatalf("read remote fallback = %q, want 'b'", buf[0])
 	}
 }
+
+func TestVFSFile_SnapshotCompactionCatchUp(t *testing.T) {
+	client := newWriteTestReplicaClient()
+	write := func(level int, min, max ltx.TXID) {
+		var buf bytes.Buffer
+		enc, err := ltx.NewEncoder(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 4096, Commit: 1, MinTXID: min, MaxTXID: max, Timestamp: time.Now().UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, bytes.Repeat([]byte{byte(max)}, 4096)); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.WriteLTXFile(t.Context(), level, min, max, &buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := NewCompactor(client, slog.Default())
+	compact := func() {
+		if _, err := c.Compact(t.Context(), 1); err != nil && !errors.Is(err, ErrNoCompaction) {
+			t.Fatal(err)
+		}
+	}
+	write(SnapshotLevel, 1, 1)
+	write(0, 2, 2)
+	write(0, 3, 3)
+	compact()
+	f := NewVFSFile(client, "replica.db", slog.Default())
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if got := f.Pos().TXID; got != 3 {
+		t.Fatalf("initial pos=%d", got)
+	}
+	write(0, 4, 4)
+	write(SnapshotLevel, 1, 5)
+	compact()
+	write(0, 5, 5)
+	write(0, 6, 6)
+	compact()
+	client.mu.Lock()
+	client.ltxFiles[0] = client.ltxFiles[0][len(client.ltxFiles[0])-1:]
+	client.mu.Unlock()
+	if err := f.pollReplicaClient(t.Context()); err != nil {
+		t.Errorf("poll after L0 retention: %v", err)
+	}
+	if got := f.Pos().TXID; got != 6 {
+		t.Errorf("live pos=%d, want 6", got)
+	}
+	fresh := NewVFSFile(client, "fresh.db", slog.Default())
+	fresh.PollInterval = time.Hour
+	if err := fresh.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if got := fresh.Pos().TXID; got != 6 {
+		t.Errorf("fresh pos=%d, want 6", got)
+	}
+}

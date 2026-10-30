@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -2759,4 +2760,158 @@ func (c *rendezvousOpenClient) OpenLTXFile(ctx context.Context, level int, minTX
 		time.Sleep(time.Millisecond)
 	}
 	return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+}
+
+func newSnapshotCompactionReplica(t *testing.T) (*file.ReplicaClient, time.Time) {
+	t.Helper()
+	ctx := t.Context()
+	client := file.NewReplicaClient(t.TempDir())
+	origin := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+	path := filepath.Join(t.TempDir(), "source.db")
+	states := make(map[ltx.TXID][]byte)
+	for txid := ltx.TXID(1); txid <= 6; txid++ {
+		db, err := sql.Open("sqlite", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if txid == 1 {
+			if _, err := db.Exec("CREATE TABLE state(value INTEGER); INSERT INTO state VALUES(1)"); err != nil {
+				t.Fatal(err)
+			}
+		} else if _, err := db.Exec("UPDATE state SET value=?", int(txid)); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		states[txid], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	write := func(level int, min, max ltx.TXID) {
+		var buf bytes.Buffer
+		enc, err := ltx.NewEncoder(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data := states[max]
+		if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 4096, Commit: uint32(len(data) / 4096), MinTXID: min, MaxTXID: max, Timestamp: origin.Add(time.Duration(max) * time.Minute).UnixMilli()}); err != nil {
+			t.Fatal(err)
+		}
+		for offset := 0; offset < len(data); offset += 4096 {
+			if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(offset/4096 + 1)}, data[offset:offset+4096]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := client.WriteLTXFile(ctx, level, min, max, &buf); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c := litestream.NewCompactor(client, slog.Default())
+	compact := func() {
+		for level := 1; level <= 3; level++ {
+			info, err := c.Compact(ctx, level)
+			if err != nil && !errors.Is(err, litestream.ErrNoCompaction) {
+				t.Fatal(err)
+			}
+			if info != nil {
+				t.Logf("L%d output %d-%d", level, info.MinTXID, info.MaxTXID)
+			} else {
+				t.Logf("L%d: %v", level, err)
+			}
+		}
+	}
+	write(litestream.SnapshotLevel, 1, 1)
+	write(0, 2, 2)
+	write(0, 3, 3)
+	compact()
+	write(0, 4, 4)
+	write(litestream.SnapshotLevel, 1, 5)
+	compact()
+	write(0, 5, 5)
+	write(0, 6, 6)
+	compact()
+	for level := 1; level <= 3; level++ {
+		if err := c.VerifyLevelConsistency(ctx, level); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return client, origin
+}
+
+func assertSnapshotCompactionRestore(t *testing.T, client litestream.ReplicaClient, txid ltx.TXID, timestamp time.Time, want int) {
+	t.Helper()
+	infos, err := litestream.CalcRestorePlan(t.Context(), client, txid, timestamp, slog.Default())
+	if err != nil {
+		t.Errorf("plan target=%d timestamp=%v: %v", txid, timestamp, err)
+		return
+	}
+	var end ltx.TXID
+	for _, info := range infos {
+		t.Logf("plan L%d %d-%d", info.Level, info.MinTXID, info.MaxTXID)
+		end = info.MaxTXID
+	}
+	if end != ltx.TXID(want) {
+		t.Errorf("plan ends at %d, want %d", end, want)
+	}
+	output := filepath.Join(t.TempDir(), "restored.db")
+	r := litestream.NewReplicaWithClient(nil, client)
+	if err := r.Restore(t.Context(), litestream.RestoreOptions{OutputPath: output, TXID: txid, Timestamp: timestamp}); err != nil {
+		t.Errorf("restore: %v", err)
+		return
+	}
+	db, err := sql.Open("sqlite", output)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var value int
+	if err := db.QueryRow("SELECT value FROM state").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != want {
+		t.Errorf("restored value=%d, want %d", value, want)
+	}
+}
+
+func TestReplica_Restore_SnapshotCompactionRetention(t *testing.T) {
+	for _, retention := range []string{"DB", "Compactor"} {
+		t.Run(retention, func(t *testing.T) {
+			client, origin := newSnapshotCompactionReplica(t)
+			timestamp := origin.Add(4*time.Minute + 30*time.Second)
+			t.Run("PinnedBefore", func(t *testing.T) { assertSnapshotCompactionRestore(t, client, 4, time.Time{}, 4) })
+			t.Run("TimestampBefore", func(t *testing.T) { assertSnapshotCompactionRestore(t, client, 0, timestamp, 4) })
+			if retention == "DB" {
+				db := litestream.NewDB(filepath.Join(t.TempDir(), "unused.db"))
+				db.Replica = litestream.NewReplicaWithClient(db, client)
+				db.L0Retention = 5 * time.Minute
+				if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := litestream.NewCompactor(client, slog.Default()).EnforceL0Retention(t.Context(), 5*time.Minute); err != nil {
+				t.Fatal(err)
+			}
+			itr, err := client.LTXFiles(t.Context(), 0, 0, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for itr.Next() {
+				i := itr.Item()
+				t.Logf("retained L0 %d-%d", i.MinTXID, i.MaxTXID)
+				if i.MaxTXID == 4 {
+					t.Fatal("target L0 was not aged out")
+				}
+			}
+			if err := itr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			t.Run("PinnedAfter", func(t *testing.T) { assertSnapshotCompactionRestore(t, client, 4, time.Time{}, 4) })
+			t.Run("TimestampAfter", func(t *testing.T) { assertSnapshotCompactionRestore(t, client, 0, timestamp, 4) })
+			t.Run("LatestAfter", func(t *testing.T) { assertSnapshotCompactionRestore(t, client, 0, time.Time{}, 6) })
+		})
+	}
 }

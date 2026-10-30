@@ -109,22 +109,6 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		return nil, fmt.Errorf("cannot determine max ltx file for destination level: %w", err)
 	}
 
-	snapInfo, err := c.MaxLTXFileInfo(ctx, SnapshotLevel)
-	if err != nil {
-		return nil, fmt.Errorf("cannot determine snapshot max ltx file: %w", err)
-	}
-
-	// Snapshots are uploaded directly to the L9 SnapshotLevel, so the ladder
-	// only needs the source files that extend past the newest snapshot.
-	//
-	// Seek from the destination's own progress, which is always a source file
-	// boundary because the destination is built from whole source files, and
-	// skip the source files the snapshot wholly covers. A source file that
-	// straddles the snapshot (compacted before the snapshot landed) is kept, so
-	// its transactions after the snapshot reach this level; the output then
-	// overlaps the snapshot, which restore applies correctly. Seeking from
-	// snapMax+1 instead would skip such a file and leave a hole in this level
-	// that only the source level covers.
 	seekTXID := prevMaxInfo.MaxTXID + 1
 
 	itr, err := c.client.LTXFiles(ctx, srcLevel, seekTXID, false)
@@ -145,8 +129,8 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	var minTXID, maxTXID ltx.TXID
 	for itr.Next() {
 		info := itr.Item()
-		if info.MaxTXID <= snapInfo.MaxTXID {
-			continue // wholly covered by the snapshot
+		if maxTXID != 0 && info.MinTXID > maxTXID+1 {
+			break
 		}
 
 		if minTXID == 0 || info.MinTXID < minTXID {
@@ -221,10 +205,6 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 	}
 	defer itr.Close()
 
-	// A ladder level skips TXIDs covered by a snapshot (Compact skips source
-	// files the latest snapshot wholly covers), so a gap is valid when a
-	// SnapshotLevel file spans the missing range. Loaded lazily on the first gap so the common (gapless)
-	// path makes no extra request.
 	var snapshots []*ltx.FileInfo
 	snapshotsLoaded := false
 	gapCoveredBySnapshot := func(g0, g1 ltx.TXID) (bool, error) {
