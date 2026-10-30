@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc64"
 	"io"
@@ -2170,5 +2171,130 @@ func TestDB_Monitor_LogsContextErrorFromReplicaClient(t *testing.T) {
 			t.Fatalf("expected sync error to be logged; logs:\n%s", logs.String())
 		}
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestDB_SnapshotBoundaryPreservesIncrementalCoverage(t *testing.T) {
+	for _, checkpoint := range []bool{false, true} {
+		for _, uploadFirst := range []bool{false, true} {
+			t.Run(fmt.Sprintf("Checkpoint=%t/UploadBeforeSnapshot=%t", checkpoint, uploadFirst), func(t *testing.T) {
+				db, sqlDB := testingutil.MustOpenDBs(t)
+				defer testingutil.MustCloseDBs(t, db, sqlDB)
+				ctx := t.Context()
+				sync := func() {
+					t.Helper()
+					if err := db.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+					if err := db.Replica.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				compact := func() {
+					t.Helper()
+					if _, err := db.Compact(ctx, 1); err != nil && !errors.Is(err, litestream.ErrNoCompaction) {
+						t.Fatal(err)
+					}
+				}
+				if _, err := sqlDB.Exec("CREATE TABLE t (x INTEGER)"); err != nil {
+					t.Fatal(err)
+				}
+				sync()
+				if _, err := sqlDB.Exec("INSERT INTO t VALUES (1)"); err != nil {
+					t.Fatal(err)
+				}
+				sync()
+				compact()
+				wantCount := 1
+				if checkpoint {
+					if err := db.Checkpoint(ctx, litestream.CheckpointModeTruncate); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if _, err := sqlDB.Exec("INSERT INTO t VALUES (2)"); err != nil {
+						t.Fatal(err)
+					}
+					if err := db.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+					wantCount = 2
+				}
+				boundary, err := db.Pos()
+				if err != nil {
+					t.Fatal(err)
+				}
+				if uploadFirst {
+					if err := db.Replica.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				snapshot, err := db.Snapshot(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if snapshot.MaxTXID != boundary.TXID {
+					t.Fatalf("snapshot=%s, boundary=%s", snapshot.MaxTXID, boundary.TXID)
+				}
+				if !uploadFirst {
+					if err := db.Replica.Sync(ctx); err != nil {
+						t.Fatal(err)
+					}
+				}
+				info, err := db.Replica.MaxLTXFileInfo(ctx, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if info.MinTXID != boundary.TXID || info.MaxTXID != boundary.TXID {
+					t.Errorf("boundary increment missing: L0=%s-%s, want %s", info.MinTXID, info.MaxTXID, boundary.TXID)
+				}
+				compact()
+				if _, err := sqlDB.Exec("INSERT INTO t VALUES (2)"); err != nil {
+					t.Fatal(err)
+				}
+				sync()
+				compact()
+				if _, err := db.Snapshot(ctx); err != nil {
+					t.Fatal(err)
+				}
+				db.L0Retention = time.Nanosecond
+				if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+					t.Fatal(err)
+				}
+				if err := db.Replica.Client.DeleteLTXFiles(ctx, []*ltx.FileInfo{snapshot}); err != nil {
+					t.Fatal(err)
+				}
+				itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+				if err != nil {
+					t.Fatal(err)
+				}
+				next := ltx.TXID(2)
+				for itr.Next() {
+					info := itr.Item()
+					if info.MinTXID != next {
+						t.Errorf("L1 gap: next=%s, file=%s-%s", next, info.MinTXID, info.MaxTXID)
+					}
+					next = info.MaxTXID + 1
+				}
+				if err := itr.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if next <= boundary.TXID {
+					t.Fatal("L1 did not advance past boundary")
+				}
+				output := filepath.Join(t.TempDir(), "restored.db")
+				if err := db.Replica.Restore(ctx, litestream.RestoreOptions{OutputPath: output, TXID: boundary.TXID}); err != nil {
+					t.Fatal(err)
+				}
+				restored := testingutil.MustOpenSQLDB(t, output)
+				defer restored.Close()
+				var count int
+				if err := restored.QueryRow("SELECT COUNT(*) FROM t").Scan(&count); err != nil {
+					t.Fatal(err)
+				}
+				if count != wantCount {
+					t.Fatalf("restored rows=%d, want %d", count, wantCount)
+				}
+			})
+		}
 	}
 }

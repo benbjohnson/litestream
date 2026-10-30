@@ -205,7 +205,7 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 	}
 	defer itr.Close()
 
-	var snapshots []*ltx.FileInfo
+	snapshots := make(map[ltx.TXID]struct{})
 	snapshotsLoaded := false
 	gapCoveredBySnapshot := func(g0, g1 ltx.TXID) (bool, error) {
 		if !snapshotsLoaded {
@@ -214,20 +214,20 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 				return false, fmt.Errorf("fetch snapshot ltx files: %w", err)
 			}
 			for sitr.Next() {
-				s := *sitr.Item()
-				snapshots = append(snapshots, &s)
+				snapshots[sitr.Item().MaxTXID] = struct{}{}
 			}
 			if err := sitr.Close(); err != nil {
 				return false, fmt.Errorf("close snapshot iterator: %w", err)
 			}
 			snapshotsLoaded = true
 		}
-		for _, s := range snapshots {
-			if s.MinTXID <= g0 && s.MaxTXID >= g1 {
-				return true, nil
+		var covered ltx.TXID
+		for txid := range snapshots {
+			if g0 <= txid && txid <= g1 {
+				covered++
 			}
 		}
-		return false, nil
+		return covered == g1-g0+1, nil
 	}
 
 	var prevInfo *ltx.FileInfo
@@ -252,8 +252,6 @@ func (c *Compactor) VerifyLevelConsistency(ctx context.Context, level int) error
 					return fmt.Errorf("TXID gap detected: prev.MaxTXID=%s, next.MinTXID=%s (expected %s)",
 						prevInfo.MaxTXID, info.MinTXID, expectedMinTXID)
 				}
-				// Gap is spanned by a snapshot; restore seeds from it and
-				// extends contiguously. Accept and continue.
 			} else {
 				return fmt.Errorf("TXID overlap detected: prev.MaxTXID=%s, next.MinTXID=%s",
 					prevInfo.MaxTXID, info.MinTXID)
