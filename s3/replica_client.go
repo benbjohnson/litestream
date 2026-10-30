@@ -587,7 +587,7 @@ func (c *ReplicaClient) validateSSEConfig() error {
 
 // transportRetryMaxAttempts caps total attempts per operation; exponential
 // backoff between attempts still bounds request rate during outages.
-const transportRetryMaxAttempts = 10
+const transportRetryMaxAttempts = 8
 
 // newTransportRetryer returns a retryer that keeps retrying through sustained
 // object-store transport flaps. The SDK's default token bucket (and the
@@ -598,6 +598,7 @@ const transportRetryMaxAttempts = 10
 func newTransportRetryer() aws.Retryer {
 	return retry.NewStandard(func(o *retry.StandardOptions) {
 		o.MaxAttempts = transportRetryMaxAttempts
+		o.MaxBackoff = time.Second
 		o.RateLimiter = ratelimit.None
 		// S3-compatible providers (observed: Tigris) load-shed with HTTP 408
 		// and api error code "RequestCanceled", neither of which the SDK
@@ -606,7 +607,8 @@ func newTransportRetryer() aws.Retryer {
 		// canceled-context check, which runs before these.
 		o.Retryables = append(o.Retryables,
 			retry.RetryableHTTPStatusCode{Codes: map[int]struct{}{
-				http.StatusRequestTimeout: {},
+				http.StatusRequestTimeout:  {},
+				http.StatusTooManyRequests: {},
 			}},
 			retry.RetryableErrorCode{Codes: map[string]struct{}{
 				"RequestCanceled": {},
