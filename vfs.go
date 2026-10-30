@@ -2656,7 +2656,33 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	newCommit := baseCommit
 	replaceIndex := false
 
-	level0, err := f.pollLevel(ctx, 0, pos.TXID, baseCommit, true, 0)
+	pollTXID := pos.TXID
+	snapshots, err := FindLTXFiles(ctx, f.client, SnapshotLevel, false, func(info *ltx.FileInfo) (bool, error) {
+		return info.MaxTXID > pos.TXID, nil
+	})
+	if err != nil {
+		return fmt.Errorf("poll snapshots: %w", err)
+	}
+	if len(snapshots) > 0 {
+		snapshot := snapshots[len(snapshots)-1]
+		index, err := FetchPageIndex(ctx, f.client, snapshot)
+		if err != nil {
+			return fmt.Errorf("fetch snapshot index: %w", err)
+		}
+		hdr, err := FetchLTXHeader(ctx, f.client, snapshot)
+		if err != nil {
+			return fmt.Errorf("fetch snapshot header: %w", err)
+		}
+		combined = index
+		newCommit, baseCommit = hdr.Commit, hdr.Commit
+		replaceIndex = true
+		pollTXID = snapshot.MaxTXID
+		maxTXID1Snapshot = snapshot.MaxTXID
+		maxTXID1AnchoredSnapshot = false
+		maxTXID1CoveredSnapshot = snapshot.MaxTXID
+	}
+
+	level0, err := f.pollLevel(ctx, 0, pollTXID, baseCommit, true, 0)
 	if err != nil {
 		return fmt.Errorf("poll L0: %w", err)
 	}
@@ -2704,6 +2730,10 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		// Skip applying updates while time travel is active to avoid
 		// overwriting the historical snapshot state.
 		return nil
+	}
+
+	if len(snapshots) > 0 {
+		f.latestLTXTime = latestTime(f.latestLTXTime, snapshots[len(snapshots)-1].CreatedAt)
 	}
 
 	// Apply updates and invalidate cache entries for updated pages

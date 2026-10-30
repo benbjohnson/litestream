@@ -1098,3 +1098,27 @@ func countCompactorPipeWriters() int {
 	n := runtime.Stack(buf, true)
 	return strings.Count(string(buf[:n]), "github.com/benbjohnson/litestream.(*Compactor).Compact.func")
 }
+
+func TestCompactor_VerifyLevelConsistency_SnapshotEndpoints(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		endpoints []ltx.TXID
+		wantErr   bool
+	}{
+		{"MissingHistory", []ltx.TXID{5}, true},
+		{"EveryEndpoint", []ltx.TXID{4, 5}, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			client := file.NewReplicaClient(t.TempDir())
+			for _, txid := range tt.endpoints {
+				createTestLTXFile(t, client, litestream.SnapshotLevel, 1, txid)
+			}
+			createTestLTXFile(t, client, 1, 2, 3)
+			createTestLTXFile(t, client, 1, 6, 7)
+			err := litestream.NewCompactor(client, slog.Default()).VerifyLevelConsistency(t.Context(), 1)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("VerifyLevelConsistency() = %v, want error: %v", err, tt.wantErr)
+			}
+		})
+	}
+}

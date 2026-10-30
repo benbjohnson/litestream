@@ -2023,10 +2023,12 @@ func TestVFSFile_SnapshotCompactionCatchUp(t *testing.T) {
 	if got := f.Pos().TXID; got != 3 {
 		t.Fatalf("initial pos=%d", got)
 	}
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
 	write(0, 4, 4)
 	write(SnapshotLevel, 1, 5)
 	compact()
-	write(0, 5, 5)
 	write(0, 6, 6)
 	compact()
 	client.mu.Lock()
@@ -2037,6 +2039,22 @@ func TestVFSFile_SnapshotCompactionCatchUp(t *testing.T) {
 	}
 	if got := f.Pos().TXID; got != 6 {
 		t.Errorf("live pos=%d, want 6", got)
+	}
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 3 {
+		t.Fatalf("active reader changed to %d, want 3", buf[0])
+	}
+	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if buf[0] != 6 {
+		t.Fatalf("page after catch-up = %d, want 6", buf[0])
 	}
 	fresh := NewVFSFile(client, "fresh.db", slog.Default())
 	fresh.PollInterval = time.Hour

@@ -2915,3 +2915,95 @@ func TestReplica_Restore_SnapshotCompactionRetention(t *testing.T) {
 		})
 	}
 }
+
+type lostAckReplicaClient struct {
+	litestream.ReplicaClient
+	fail bool
+}
+
+func (c *lostAckReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+	info, err := c.ReplicaClient.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+	if err == nil && c.fail {
+		c.fail = false
+		return nil, errors.New("upload committed but response lost")
+	}
+	return info, err
+}
+
+func TestReplica_Sync_SnapshotCleanupAfterLostAck(t *testing.T) {
+	db, sqlDB := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqlDB)
+	c := &lostAckReplicaClient{ReplicaClient: db.Replica.Client}
+	db.Replica.Client = c
+	if _, err := sqlDB.Exec("CREATE TABLE t (x INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	c.fail = true
+	if _, err := sqlDB.Exec("INSERT INTO t VALUES (2)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(t.Context()); err == nil {
+		t.Fatal("expected upload error")
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec("INSERT INTO t VALUES (3)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Compact(t.Context(), 1); err != nil {
+		t.Fatal(err)
+	}
+	db.L0Retention = time.Nanosecond
+	if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(db.LTXPath(0, 1, 1)); !os.IsNotExist(err) {
+		t.Fatalf("superseded snapshot still on disk after retry and retention: %v", err)
+	}
+}
+
+func TestReplica_Sync_DetachedReplicaPreservesStagingSnapshot(t *testing.T) {
+	db, sqlDB := testingutil.MustOpenDBs(t)
+	defer testingutil.MustCloseDBs(t, db, sqlDB)
+	replica := litestream.NewReplicaWithClient(db, file.NewReplicaClient(t.TempDir()))
+	if _, err := sqlDB.Exec("CREATE TABLE t (x INTEGER)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sqlDB.Exec("INSERT INTO t VALUES (1)"); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(db.LTXPath(0, 1, 1)); err != nil {
+		t.Fatalf("configured replica still needs staging snapshot: %v", err)
+	}
+	if err := db.Replica.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(db.LTXPath(0, 1, 1)); !os.IsNotExist(err) {
+		t.Fatalf("configured replica did not clean up snapshot: %v", err)
+	}
+}
