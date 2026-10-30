@@ -807,7 +807,7 @@ func (c *ReplicaClient) uploadSizedLTX(ctx context.Context, key string, rs io.Re
 	input := c.putObjectInput(key, timestamp)
 	input.Body = rs
 
-	if size < partSize {
+	if size < partSize || (c.PutObjectContentMD5 && size == partSize) {
 		input.ContentLength = aws.Int64(size)
 		out, err := c.putObject(ctx, input)
 		if err != nil {

@@ -3059,7 +3059,10 @@ func TestReplicaClient_WriteLTXFile_PutObjectContentMD5(t *testing.T) {
 	data := mustLTXWithSize(t, 8192)
 	digest := md5.Sum(data)
 	checksum := base64.StdEncoding.EncodeToString(digest[:])
+	boundaryData := mustLTXWithSize(t, 5*1024*1024)
+	boundaryDigest := md5.Sum(boundaryData)
 	for _, tt := range []struct {
+		data   []byte
 		name   string
 		query  string
 		stream bool
@@ -3067,6 +3070,7 @@ func TestReplicaClient_WriteLTXFile_PutObjectContentMD5(t *testing.T) {
 		retry  bool
 		want   string
 	}{
+		{name: "PartSizeBoundary", query: "put-object-content-md5=true", data: boundaryData, want: base64.StdEncoding.EncodeToString(boundaryDigest[:])},
 		{name: "Default"},
 		{name: "Disabled", query: "put-object-content-md5=false"},
 		{name: "Enabled", query: "put-object-content-md5=true", want: checksum},
@@ -3078,6 +3082,10 @@ func TestReplicaClient_WriteLTXFile_PutObjectContentMD5(t *testing.T) {
 		{name: "Retry", query: "put-object-content-md5=true", retry: true, want: checksum},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			data := data
+			if tt.data != nil {
+				data = tt.data
+			}
 			var requests atomic.Int32
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				body, err := io.ReadAll(r.Body)

@@ -87,9 +87,11 @@ adds a signed `Content-MD5` header to single-part LTX uploads without enabling
 `require-content-md5`, which controls multi-object deletions.
 
 The checksum is computed only for known-length, seekable single-part bodies,
-including small streams buffered before upload. Objects at or above `part-size`
-use multipart uploads; this option does not add checksums to multipart requests
-or establish Object Lock compatibility for those uploads.
+including small streams buffered before upload. Known-length, seekable objects
+exactly equal to `part-size` also use a single-part upload with this option.
+Larger objects and streams that fill the part buffer use the multipart uploader;
+this option does not add checksums to multipart requests or establish Object Lock
+compatibility for those uploads.
 
 Related issues: #918, #894, #1607
 
