@@ -186,6 +186,11 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		if err != nil {
 			return result, fmt.Errorf("calc pos: %w", err)
 		}
+		if r == r.db.Replica {
+			if err := r.db.reconcileLocalSnapshots(pos.TXID); err != nil {
+				return result, fmt.Errorf("reconcile local snapshots: %w", err)
+			}
+		}
 		r.SetPos(pos)
 	}
 
@@ -233,10 +238,12 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		syncedFileN++
 
 		// Delete the local file of any sync-path snapshot we've now advanced past
-		// (the initial snapshot or a boundary snapshot). Its bytes are durably at
+		// (the initial snapshot or a legacy boundary snapshot). Its bytes are durably at
 		// remote L9; its local L0-dir copy is only staging + anchor state that no
 		// retention path owns.
-		r.db.deleteSupersededLocalSnapshot(prevTXID, minTXID, maxTXID)
+		if r == r.db.Replica {
+			r.db.deleteSupersededLocalSnapshot(prevTXID, minTXID, maxTXID)
+		}
 	}
 
 	// Record successful sync for heartbeat monitoring.
@@ -275,7 +282,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, localLevel, remoteLevel int
 		"maxTXID", info.MaxTXID,
 		"size", info.Size)
 
-	// Snapshot uploads (the base and boundary snapshots, routed to L9) must
+	// Snapshot uploads (the base and legacy boundary snapshots, routed to L9) must
 	// refresh the DB's cached snapshot-level max, consistent with db.Snapshot.
 	if remoteLevel == SnapshotLevel {
 		r.db.recordMaxLTXFile(SnapshotLevel, info)
@@ -319,7 +326,7 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, err error) {
 // remoteHead returns the LTX file at the highest TXID durably present in the
 // replica, along with the level it was found at. It considers both the
 // increment level (L0) and the snapshot level (L9): snapshotting writes -- the
-// base and boundary snapshots -- are stored only at L9, so a replica that has
+// base and legacy boundary snapshots -- are stored only at L9, so a replica that has
 // uploaded the base but no increments (or whose increments have aged out of L0)
 // still has its head there. A zero FileInfo (MaxTXID == 0) means the replica is
 // empty. This is the single L9-aware source of truth for how far the replica
