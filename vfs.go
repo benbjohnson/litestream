@@ -2397,6 +2397,17 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	}
 
 	f.lockType = elock
+	if elock != sqlite3vfs.LockNone {
+		return nil
+	}
+
+	var hydrationErr error
+	if f.hydrator != nil && f.hydrator.Complete() && len(f.pending) > 0 {
+		if err := f.hydrator.ApplyUpdates(f.ctx, f.pending); err != nil {
+			f.hydrator.Disable()
+			hydrationErr = fmt.Errorf("apply pending hydration updates: %w", err)
+		}
+	}
 
 	// Copy pending index to main index and invalidate affected pages in cache.
 	if f.pendingReplace {
@@ -2418,7 +2429,7 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
 
-	return nil
+	return hydrationErr
 }
 
 func (f *VFSFile) CheckReservedLock() (bool, error) {
@@ -2767,7 +2778,7 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	// Apply updates to hydrated file if hydration is complete
-	if f.hydrator != nil && f.hydrator.Complete() && len(applied) > 0 {
+	if targetIsMain && f.hydrator != nil && f.hydrator.Complete() && len(applied) > 0 {
 		if err := f.hydrator.ApplyUpdates(ctx, applied); err != nil {
 			f.hydrator.Disable()
 			return fmt.Errorf("apply hydration updates: %w", err)

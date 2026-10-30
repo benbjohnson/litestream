@@ -5,6 +5,7 @@ package litestream
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"io"
@@ -1981,4 +1982,214 @@ func TestVFSFile_HydrationUpdateFailureDisablesHydration(t *testing.T) {
 	if buf[0] != 'b' {
 		t.Fatalf("read remote fallback = %q, want 'b'", buf[0])
 	}
+}
+
+func TestVFSFile_Hydration_RepeatableReads(t *testing.T) {
+	for _, hydrated := range []bool{false, true} {
+		t.Run(fmt.Sprintf("hydrated=%t", hydrated), func(t *testing.T) {
+			client := newMockReplicaClient()
+			client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+			f := NewVFSFile(client, "repeatable.db", slog.Default())
+			f.PollInterval = time.Hour
+			if hydrated {
+				f.hydrationPath = filepath.Join(t.TempDir(), "hydrated.db")
+			}
+			if err := f.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := f.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			if hydrated {
+				waitForHydration(t, f)
+			}
+			read := func(want byte) {
+				t.Helper()
+				f.cache.Purge()
+				buf := make([]byte, 4096)
+				if _, err := f.ReadAt(buf, 0); err != nil {
+					t.Fatal(err)
+				}
+				if buf[100] != want {
+					t.Fatalf("read = %q, want %q", buf[100], want)
+				}
+			}
+			if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+				t.Fatal(err)
+			}
+			read('a')
+			for txid := ltx.TXID(2); txid <= 3; txid++ {
+				client.addFixture(t, buildLTXFixture(t, txid, byte('a'+txid-1)))
+				if err := f.pollReplicaClient(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+				read('a')
+			}
+			if err := f.Unlock(sqlite3vfs.LockShared); err != nil {
+				t.Fatal(err)
+			}
+			read('a')
+			if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+				t.Fatal(err)
+			}
+			read('c')
+			if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestVFSFile_Hydration_PendingUpdateFailure(t *testing.T) {
+	client := newFailingPageReplicaClient()
+	client.addFixture(t, buildLTXFixture(t, 1, 'a'))
+	f := NewVFSFile(client, "pending-failure.db", slog.Default())
+	f.PollInterval = time.Hour
+	f.hydrationPath = filepath.Join(t.TempDir(), "hydrated.db")
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	waitForHydration(t, f)
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+	client.addFixture(t, buildLTXFixture(t, 2, 'b'))
+	if err := f.pollReplicaClient(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	client.failPageReads.Store(true)
+	if err := f.Unlock(sqlite3vfs.LockNone); err == nil || !strings.Contains(err.Error(), "apply pending hydration updates") {
+		t.Fatalf("unlock error = %v, want hydration update failure", err)
+	}
+	if f.hydrator.Complete() {
+		t.Fatal("hydration remained enabled after update failure")
+	}
+	client.failPageReads.Store(false)
+	buf := make([]byte, 4096)
+	if _, err := f.ReadAt(buf, 0); err != nil {
+		t.Fatal(err)
+	}
+	if buf[100] != 'b' {
+		t.Fatalf("fallback read = %q, want 'b'", buf[100])
+	}
+}
+
+type snapshotTestVFS struct {
+	*VFS
+	file *VFSFile
+}
+
+func (v *snapshotTestVFS) Open(name string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	return v.OpenURI(name, nil, flags)
+}
+
+func (v *snapshotTestVFS) OpenURI(name string, params map[string]string, flags sqlite3vfs.OpenFlag) (sqlite3vfs.File, sqlite3vfs.OpenFlag, error) {
+	f, outFlags, err := v.VFS.OpenURI(name, params, flags)
+	if mainFile, ok := f.(*VFSFile); ok {
+		v.file = mainFile
+	}
+	return f, outFlags, err
+}
+
+func TestVFSFile_Hydration_SQLiteRepeatableReads(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.db")
+	source, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := source.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := source.Exec(`PRAGMA page_size=4096;
+		CREATE TABLE cache_probe (id INTEGER PRIMARY KEY, generation INTEGER NOT NULL, payload BLOB NOT NULL);
+		WITH RECURSIVE numbers(n) AS (VALUES(1) UNION ALL SELECT n+1 FROM numbers WHERE n<2048)
+		INSERT INTO cache_probe SELECT n, 0, zeroblob(3500) FROM numbers;`); err != nil {
+		t.Fatal(err)
+	}
+	client := newMockReplicaClient()
+	publish := func(txid ltx.TXID) {
+		t.Helper()
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var buf bytes.Buffer
+		enc, err := ltx.NewEncoder(&buf)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pages := uint32(len(data) / 4096)
+		if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, PageSize: 4096, Commit: pages, MinTXID: txid, MaxTXID: txid, Flags: ltx.HeaderFlagNoChecksum}); err != nil {
+			t.Fatal(err)
+		}
+		for pgno := uint32(1); pgno <= pages; pgno++ {
+			if err := enc.EncodePage(ltx.PageHeader{Pgno: pgno}, data[(pgno-1)*4096:pgno*4096]); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := enc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		client.addFixture(t, &ltxFixture{info: &ltx.FileInfo{Level: 0, MinTXID: txid, MaxTXID: txid, Size: int64(buf.Len()), CreatedAt: time.Now()}, data: buf.Bytes()})
+	}
+	publish(1)
+	vfs := &snapshotTestVFS{VFS: NewVFS(client, slog.Default())}
+	vfs.HydrationEnabled = true
+	vfs.PollInterval = time.Hour
+	name := fmt.Sprintf("repeatable-%d", time.Now().UnixNano())
+	if err := sqlite3vfs.RegisterVFS(name, vfs); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open("sqlite3", "file:replica.db?vfs="+name+"&mode=ro")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := reader.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	reader.SetMaxOpenConns(1)
+	if _, err := reader.Exec("PRAGMA cache_size=-1024; PRAGMA mmap_size=0;"); err != nil {
+		t.Fatal(err)
+	}
+	waitForHydration(t, vfs.file)
+	if _, err := reader.Exec("BEGIN"); err != nil {
+		t.Fatal(err)
+	}
+	query := func(want int) {
+		t.Helper()
+		var count, min, max int
+		if err := reader.QueryRow("SELECT count(*), min(generation), max(generation) FROM cache_probe NOT INDEXED").Scan(&count, &min, &max); err != nil {
+			t.Fatal(err)
+		}
+		if count != 2048 || min != want || max != want {
+			t.Fatalf("query = %d | %d | %d, want 2048 | %d | %d", count, min, max, want, want)
+		}
+	}
+	query(0)
+	if _, err := source.Exec("UPDATE cache_probe SET generation=1"); err != nil {
+		t.Fatal(err)
+	}
+	publish(2)
+	if err := vfs.file.pollReplicaClient(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	query(0)
+	if _, err := reader.Exec("COMMIT"); err != nil {
+		t.Fatal(err)
+	}
+	query(1)
 }
