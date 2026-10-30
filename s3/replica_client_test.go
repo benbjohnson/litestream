@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -30,6 +31,7 @@ import (
 	"github.com/aws/smithy-go"
 	"github.com/aws/smithy-go/middleware"
 	smithyhttp "github.com/aws/smithy-go/transport/http"
+	"github.com/pierrec/lz4/v4"
 	"github.com/superfly/ltx"
 
 	litestream "github.com/benbjohnson/litestream"
@@ -827,6 +829,9 @@ func TestReplicaClient_WriteLTXFile_StreamLargeMultipartRoundTrip(t *testing.T) 
 	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
+		if r.Header.Get("Content-MD5") != "" || r.Header.Get("X-Amz-Trailer") != "" || strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
+			t.Errorf("unexpected multipart checksum or encoding: %v", r.Header)
+		}
 		query := r.URL.Query()
 
 		if r.Method == http.MethodPost && query.Has("uploads") {
@@ -874,6 +879,7 @@ func TestReplicaClient_WriteLTXFile_StreamLargeMultipartRoundTrip(t *testing.T) 
 	defer server.Close()
 
 	client := newTestReplicaClient(t, server)
+	client.PutObjectContentMD5 = true
 	ctx := context.Background()
 	if err := client.Init(ctx); err != nil {
 		t.Fatalf("Init() error: %v", err)
@@ -965,6 +971,9 @@ func TestReplicaClient_WriteLTXFile_MultipartParamParity(t *testing.T) {
 	initiateHeaders := make(chan http.Header, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer r.Body.Close()
+		if r.Header.Get("Content-MD5") != "" || r.Header.Get("X-Amz-Trailer") != "" || strings.Contains(r.Header.Get("Content-Encoding"), "aws-chunked") {
+			t.Errorf("unexpected multipart checksum or encoding: %v", r.Header)
+		}
 		_, _ = io.Copy(io.Discard, r.Body)
 		query := r.URL.Query()
 
@@ -995,6 +1004,7 @@ func TestReplicaClient_WriteLTXFile_MultipartParamParity(t *testing.T) {
 	defer server.Close()
 
 	client := newTestReplicaClient(t, server)
+	client.PutObjectContentMD5 = true
 	client.StorageClass = "STANDARD_IA"
 	client.SSECustomerKey = validKey
 
@@ -3040,6 +3050,365 @@ func TestNewReplicaClientFromURL_NeonExplicitEndpoint(t *testing.T) {
 			client := rc.(*ReplicaClient)
 			if client.Bucket != bucket || client.Endpoint != tt.endpoint || client.Region != tt.region || client.Path != "path" || !client.ForcePathStyle {
 				t.Fatalf("Bucket=%q Endpoint=%q Region=%q Path=%q ForcePathStyle=%v", client.Bucket, client.Endpoint, client.Region, client.Path, client.ForcePathStyle)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_WriteLTXFile_PutObjectContentMD5(t *testing.T) {
+	data := mustLTXWithSize(t, 8192)
+	digest := md5.Sum(data)
+	checksum := base64.StdEncoding.EncodeToString(digest[:])
+	boundaryData := mustLTXWithSize(t, 5*1024*1024)
+	boundaryDigest := md5.Sum(boundaryData)
+	for _, tt := range []struct {
+		data   []byte
+		name   string
+		query  string
+		stream bool
+		offset bool
+		retry  bool
+		want   string
+	}{
+		{name: "PartSizeBoundary", query: "put-object-content-md5=true", data: boundaryData, want: base64.StdEncoding.EncodeToString(boundaryDigest[:])},
+		{name: "Default"},
+		{name: "Disabled", query: "put-object-content-md5=false"},
+		{name: "Enabled", query: "put-object-content-md5=true", want: checksum},
+		{name: "DeleteMD5Disabled", query: "put-object-content-md5=true&require-content-md5=false", want: checksum},
+		{name: "UnsignedPayload", query: "put-object-content-md5=true&sign-payload=false", want: checksum},
+		{name: "CamelCase", query: "putObjectContentMD5=true", want: checksum},
+		{name: "BufferedStream", query: "put-object-content-md5=true", stream: true, want: checksum},
+		{name: "NonzeroOffset", query: "put-object-content-md5=true", offset: true, want: checksum},
+		{name: "Retry", query: "put-object-content-md5=true", retry: true, want: checksum},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			data := data
+			if tt.data != nil {
+				data = tt.data
+			}
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("read body: %v", err)
+				}
+				if !bytes.Equal(body, data) {
+					t.Error("uploaded body differs from LTX data")
+				}
+				if got := r.Header.Get("Content-MD5"); got != tt.want {
+					t.Errorf("Content-MD5 = %q, want %q", got, tt.want)
+				}
+				if r.ContentLength != int64(len(data)) {
+					t.Errorf("Content-Length = %d, want %d", r.ContentLength, len(data))
+				}
+				if r.Header.Get("Content-Encoding") != "" || r.Header.Get("X-Amz-Trailer") != "" || len(r.TransferEncoding) != 0 {
+					t.Errorf("unexpected streaming encoding: headers=%v transfer=%v", r.Header, r.TransferEncoding)
+				}
+				if tt.want != "" && !strings.Contains(r.Header.Get("Authorization"), "content-md5;") {
+					t.Error("Content-MD5 missing from signed headers")
+				}
+				if requests.Add(1) == 1 && tt.retry {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				w.Header().Set("ETag", `"test-etag"`)
+			}))
+			defer server.Close()
+			query, err := url.ParseQuery(tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			query.Set("endpoint", server.URL)
+			query.Set("region", "us-east-1")
+			rc, err := NewReplicaClientFromURL("s3", "test-bucket", "replica", query, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := rc.(*ReplicaClient)
+			client.AccessKeyID = "test-access-key"
+			client.SecretAccessKey = "test-secret-key"
+			var body io.Reader = bytes.NewReader(data)
+			if tt.stream {
+				body = struct{ io.Reader }{body}
+			} else if tt.offset {
+				r := bytes.NewReader(append([]byte("prefix"), data...))
+				if _, err := r.Seek(6, io.SeekStart); err != nil {
+					t.Fatal(err)
+				}
+				body = r
+			}
+			if _, err := client.WriteLTXFile(context.Background(), 0, 2, 2, body); err != nil {
+				t.Fatal(err)
+			}
+			wantRequests := int32(1)
+			if tt.retry {
+				wantRequests = 2
+			}
+			if got := requests.Load(); got != wantRequests {
+				t.Errorf("requests = %d, want %d", got, wantRequests)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_PutObjectContentMD5Errors(t *testing.T) {
+	errBody := errors.New("body failure")
+	for _, tt := range []struct {
+		name string
+		body io.ReadSeeker
+		want error
+	}{
+		{name: "Position", body: &checksumErrorReader{seekWhence: io.SeekCurrent, err: errBody}, want: errBody},
+		{name: "Read", body: &checksumErrorReader{seekWhence: -1, err: errBody}, want: errBody},
+		{name: "Rewind", body: &checksumErrorReader{Reader: bytes.NewReader([]byte("data")), seekWhence: io.SeekStart, err: errBody}, want: errBody},
+		{name: "Truncated", body: bytes.NewReader([]byte("a")), want: io.EOF},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+			}))
+			defer server.Close()
+			client := newTestReplicaClient(t, server)
+			client.PutObjectContentMD5 = true
+			if err := client.Init(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			_, err := client.putObject(context.Background(), &s3.PutObjectInput{
+				Bucket: aws.String(client.Bucket), Key: aws.String("test.ltx"), Body: tt.body, ContentLength: aws.Int64(4),
+			})
+			if !errors.Is(err, tt.want) {
+				t.Fatalf("error = %v, want %v", err, tt.want)
+			}
+			if requests.Load() != 0 {
+				t.Fatal("checksum failure sent an upload request")
+			}
+		})
+	}
+}
+
+type checksumErrorReader struct {
+	*bytes.Reader
+	seekWhence int
+	err        error
+}
+
+func (r *checksumErrorReader) Read(p []byte) (int, error) {
+	if r.Reader == nil {
+		return 0, r.err
+	}
+	return r.Reader.Read(p)
+}
+
+func (r *checksumErrorReader) Seek(offset int64, whence int) (int64, error) {
+	if whence == r.seekWhence {
+		return 0, r.err
+	}
+	if r.Reader == nil {
+		return 0, nil
+	}
+	return r.Reader.Seek(offset, whence)
+}
+
+func TestReplicaClient_PutObjectContentMD5OtherOperations(t *testing.T) {
+	ctx := context.Background()
+	const generation = "0123456789abcdef"
+	const timestamp = "2026-10-30T12:00:00Z"
+	var compressed bytes.Buffer
+	zw := lz4.NewWriter(&compressed)
+	if _, err := zw.Write([]byte("restored data")); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, fail := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Failure=%v", fail), func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost && r.Header.Get("Content-MD5") != "" {
+					t.Errorf("unexpected Content-MD5 on %s", r.Method)
+				}
+				if fail {
+					w.WriteHeader(http.StatusForbidden)
+					if _, err := fmt.Fprint(w, `<Error><Code>AccessDenied</Code><Message>denied</Message></Error>`); err != nil {
+						t.Errorf("write response: %v", err)
+					}
+					return
+				}
+				if r.URL.Query().Has("location") {
+					if _, err := fmt.Fprint(w, `<LocationConstraint>us-west-2</LocationConstraint>`); err != nil {
+						t.Errorf("write response: %v", err)
+					}
+					return
+				}
+				if r.URL.Query().Has("delete") {
+					if r.Header.Get("Content-MD5") == "" {
+						t.Error("missing deletion checksum")
+					}
+					if _, err := fmt.Fprint(w, `<DeleteResult/>`); err != nil {
+						t.Errorf("write response: %v", err)
+					}
+					return
+				}
+				if r.Method == http.MethodHead {
+					w.Header().Set("X-Amz-Meta-Litestream-Timestamp", timestamp)
+					return
+				}
+				if r.URL.Query().Get("list-type") == "2" {
+					prefix := r.URL.Query().Get("prefix")
+					if _, err := fmt.Fprint(w, `<ListBucketResult><IsTruncated>false</IsTruncated>`); err != nil {
+						t.Errorf("write response: %v", err)
+					}
+					if r.URL.Query().Get("delimiter") == "/" {
+						if _, err := fmt.Fprintf(w, `<CommonPrefixes><Prefix>%s%s/</Prefix></CommonPrefixes>`, prefix, generation); err != nil {
+							t.Errorf("write response: %v", err)
+						}
+					} else {
+						name := "0000000000000002-0000000000000002.ltx"
+						if strings.HasSuffix(prefix, "/snapshots/") {
+							name = "00000002.snapshot.lz4"
+						} else if strings.HasSuffix(prefix, "/wal/") {
+							name = "00000002_0000000000000000.wal.lz4"
+						}
+						if _, err := fmt.Fprintf(w, `<Contents><Key>%s%s</Key><Size>13</Size><LastModified>%s</LastModified></Contents>`, prefix, name, timestamp); err != nil {
+							t.Errorf("write response: %v", err)
+						}
+					}
+					if _, err := fmt.Fprint(w, `</ListBucketResult>`); err != nil {
+						t.Errorf("write response: %v", err)
+					}
+					return
+				}
+				if _, err := w.Write(compressed.Bytes()); err != nil {
+					t.Errorf("write response: %v", err)
+				}
+			}))
+			defer server.Close()
+			client := newTestReplicaClient(t, server)
+			client.PutObjectContentMD5 = true
+			client.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+			if client.Type() != "s3" {
+				t.Fatalf("Type = %q", client.Type())
+			}
+			if err := client.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			t.Run("Region", func(t *testing.T) {
+				region, err := client.findBucketRegion(ctx, client.Bucket)
+				if fail {
+					if err == nil {
+						t.Fatal("expected region error")
+					}
+				} else if err != nil || region != "us-west-2" {
+					t.Fatalf("region = %q, error = %v", region, err)
+				}
+			})
+			for _, useMetadata := range []bool{false, true} {
+				t.Run(fmt.Sprintf("LTXMetadata=%v", useMetadata), func(t *testing.T) {
+					itr, err := client.LTXFiles(ctx, 0, 2, useMetadata)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if fail {
+						if itr.Next() || itr.Err() == nil || itr.Close() == nil {
+							t.Fatal("expected iterator error")
+						}
+						return
+					}
+					if !itr.Next() {
+						t.Fatalf("missing LTX file: %v", itr.Err())
+					}
+					info := itr.Item()
+					if info.MinTXID != 2 || info.MaxTXID != 2 || info.Size != 13 || info.CreatedAt.Format(time.RFC3339) != timestamp {
+						t.Fatalf("unexpected file info: %+v", info)
+					}
+					if itr.Next() || itr.Err() != nil {
+						t.Fatalf("unexpected next item or error: %v", itr.Err())
+					}
+					if err := itr.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if itr.Next() {
+						t.Fatal("closed iterator returned an item")
+					}
+				})
+			}
+			t.Run("DeleteAll", func(t *testing.T) {
+				if err := client.DeleteAll(ctx); (err != nil) != fail {
+					t.Fatalf("DeleteAll: %v", err)
+				}
+			})
+			t.Run("Generations", func(t *testing.T) {
+				items, err := client.GenerationsV3(ctx)
+				if (err != nil) != fail {
+					t.Fatalf("GenerationsV3: %v", err)
+				}
+				if !fail && (len(items) != 1 || items[0] != generation) {
+					t.Fatalf("generations = %v", items)
+				}
+			})
+			t.Run("Snapshots", func(t *testing.T) {
+				items, err := client.SnapshotsV3(ctx, generation)
+				if (err != nil) != fail {
+					t.Fatalf("SnapshotsV3: %v", err)
+				}
+				if !fail && (len(items) != 1 || items[0].Index != 2) {
+					t.Fatalf("snapshots = %v", items)
+				}
+			})
+			t.Run("WALSegments", func(t *testing.T) {
+				items, err := client.WALSegmentsV3(ctx, generation)
+				if (err != nil) != fail {
+					t.Fatalf("WALSegmentsV3: %v", err)
+				}
+				if !fail && (len(items) != 1 || items[0].Index != 2 || items[0].Offset != 0) {
+					t.Fatalf("segments = %v", items)
+				}
+			})
+			for _, name := range []string{"Snapshot", "WALSegment"} {
+				t.Run(name, func(t *testing.T) {
+					var r io.ReadCloser
+					var err error
+					if name == "Snapshot" {
+						r, err = client.OpenSnapshotV3(ctx, generation, 2)
+					} else {
+						r, err = client.OpenWALSegmentV3(ctx, generation, 2, 0)
+					}
+					if (err != nil) != fail {
+						t.Fatalf("open: %v", err)
+					}
+					if fail {
+						return
+					}
+					body, readErr := io.ReadAll(r)
+					closeErr := r.Close()
+					if readErr != nil || closeErr != nil || string(body) != "restored data" {
+						t.Fatalf("body=%q read=%v close=%v", body, readErr, closeErr)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestParseURL(t *testing.T) {
+	for _, tt := range []struct {
+		url, bucket, key string
+		wantErr          bool
+	}{
+		{url: "s3://bucket/path", bucket: "bucket", key: "path"},
+		{url: "s3://filebase.com/bucket/path", bucket: "bucket", key: "path"},
+		{url: "s3://bucket", bucket: "bucket"},
+		{url: "https://bucket/path", wantErr: true},
+		{url: "s3://%", wantErr: true},
+	} {
+		t.Run(tt.url, func(t *testing.T) {
+			bucket, _, key, err := ParseURL(tt.url, "")
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ParseURL: %v", err)
+			}
+			if !tt.wantErr && (bucket != tt.bucket || key != tt.key) {
+				t.Fatalf("bucket=%q key=%q", bucket, key)
 			}
 		})
 	}

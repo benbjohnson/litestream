@@ -80,7 +80,20 @@ replicas:
 - `force-path-style=true` - Required for bucket access
 - Endpoint format: `https://s3.REGION.backblazeb2.com`
 
-Related issues: #918, #894
+For buckets with Object Lock enabled, set `put-object-content-md5: true` on
+the replica, or add `put-object-content-md5=true` to its URL. This opt-in setting
+adds a signed `Content-MD5` header to single-part LTX uploads without enabling
+`aws-chunked` encoding. It is disabled by default and is independent of
+`require-content-md5`, which controls multi-object deletions.
+
+The checksum is computed only for known-length, seekable single-part bodies,
+including small streams buffered before upload. Known-length, seekable objects
+exactly equal to `part-size` also use a single-part upload with this option.
+Larger objects and streams that fill the part buffer use the multipart uploader;
+this option does not add checksums to multipart requests or establish Object Lock
+compatibility for those uploads.
+
+Related issues: #918, #894, #1607
 
 ### DigitalOcean Spaces
 
@@ -410,7 +423,8 @@ Parameters with an alias accept both camelCase and hyphenated forms
 | `skipVerify` | `skip-verify` | Skip TLS verification | `false` |
 | `signPayload` | `sign-payload` | Sign request payloads | `true` |
 | `signAcceptEncoding` | `sign-accept-encoding` | Include Accept-Encoding in SigV4 signatures | `true` |
-| `requireContentMD5` | `require-content-md5` | Require Content-MD5 header | `true` |
+| `requireContentMD5` | `require-content-md5` | Require Content-MD5 for multi-object deletions | `true` |
+| `putObjectContentMD5` | `put-object-content-md5` | Add Content-MD5 to single-part LTX uploads | `false` |
 | `concurrency` | | Multipart upload concurrency | `5` (`2` for R2/Tigris) |
 | `partSize` | `part-size` | Multipart upload part size | `5242880` (5MB) (`16MiB` for Tigris) |
 | `storageClass` | `storage-class` | Storage class for uploaded objects | None |
