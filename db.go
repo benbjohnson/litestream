@@ -2469,13 +2469,9 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	}
 
 	result.synced = true
-	// Only increments advance the L0 max used by the compaction ladder.
-	// Snapshotting writes are recorded at the snapshot level (via the remote
-	// L9 upload), not L0, so the ladder never sees a DB-sized image. Leaving
-	// l0FileInfo nil here keeps maxLTXFileInfos[0] pointing at the last
-	// increment (or empty at bootstrap); the anchor still resolves from the
-	// local L0 directory via MaxLTX/Pos.
-	if !info.snapshotting {
+	// The initial image goes directly to L9. All later files, including
+	// checkpoint-boundary images, advance the L0 compaction cache.
+	if txID > 1 {
 		result.l0FileInfo = &ltx.FileInfo{
 			Level:     0,
 			MinTXID:   txID,
