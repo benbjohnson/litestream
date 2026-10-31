@@ -24,8 +24,9 @@ type WALReader struct {
 	pageSize uint32
 	seq      uint32
 
-	salt1, salt2     uint32
-	chksum1, chksum2 uint32
+	salt1, salt2                 uint32
+	chksum1, chksum2             uint32
+	commitChksum1, commitChksum2 uint32
 
 	logger *slog.Logger
 }
@@ -74,12 +75,24 @@ func NewWALReaderWithOffset(ctx context.Context, rd io.ReaderAt, offset int64, s
 		}
 		return nil, &PrevFrameMismatchError{Err: err}
 	}
+	r.commitChksum1, r.commitChksum2 = r.chksum1, r.chksum2
 
 	return r, nil
 }
 
 // PageSize returns the page size from the header. Must call ReadHeader() first.
 func (r *WALReader) PageSize() uint32 { return r.pageSize }
+
+// CommitChecksum returns the cumulative WAL checksum after the last committed
+// frame read by pageMap.
+func (r *WALReader) CommitChecksum() (uint32, uint32) {
+	return r.commitChksum1, r.commitChksum2
+}
+
+// Checksum returns the cumulative checksum after the last frame read.
+func (r *WALReader) Checksum() (uint32, uint32) {
+	return r.chksum1, r.chksum2
+}
 
 // Offset returns the file offset of the last read frame.
 // Returns zero if no frames have been read.
@@ -128,6 +141,7 @@ func (r *WALReader) readHeader() error {
 	r.salt1 = binary.BigEndian.Uint32(hdr[16:])
 	r.salt2 = binary.BigEndian.Uint32(hdr[20:])
 	r.chksum1, r.chksum2 = chksum1, chksum2
+	r.commitChksum1, r.commitChksum2 = chksum1, chksum2
 
 	return nil
 }
@@ -225,6 +239,7 @@ func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]i
 
 		// For commit records, transfer offsets to full map and update db size.
 		if fcommit != 0 {
+			r.commitChksum1, r.commitChksum2 = r.chksum1, r.chksum2
 			for pgno, offset := range txMap {
 				m[pgno] = offset
 			}
