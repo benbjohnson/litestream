@@ -1106,19 +1106,20 @@ type ReplicaSettings struct {
 	AutoRecover *bool `yaml:"auto-recover"`
 
 	// S3 settings
-	AccessKeyID        string    `yaml:"access-key-id"`
-	SecretAccessKey    string    `yaml:"secret-access-key"`
-	Region             string    `yaml:"region"`
-	Bucket             string    `yaml:"bucket"`
-	Endpoint           string    `yaml:"endpoint"`
-	ForcePathStyle     *bool     `yaml:"force-path-style"`
-	SignPayload        *bool     `yaml:"sign-payload"`
-	SignAcceptEncoding *bool     `yaml:"sign-accept-encoding"`
-	RequireContentMD5  *bool     `yaml:"require-content-md5"`
-	SkipVerify         bool      `yaml:"skip-verify"`
-	StorageClass       string    `yaml:"storage-class"`
-	PartSize           *ByteSize `yaml:"part-size"`
-	Concurrency        *int      `yaml:"concurrency"`
+	AccessKeyID         string    `yaml:"access-key-id"`
+	SecretAccessKey     string    `yaml:"secret-access-key"`
+	Region              string    `yaml:"region"`
+	Bucket              string    `yaml:"bucket"`
+	Endpoint            string    `yaml:"endpoint"`
+	ForcePathStyle      *bool     `yaml:"force-path-style"`
+	SignPayload         *bool     `yaml:"sign-payload"`
+	SignAcceptEncoding  *bool     `yaml:"sign-accept-encoding"`
+	RequireContentMD5   *bool     `yaml:"require-content-md5"`
+	PutObjectContentMD5 *bool     `yaml:"put-object-content-md5"`
+	SkipVerify          bool      `yaml:"skip-verify"`
+	StorageClass        string    `yaml:"storage-class"`
+	PartSize            *ByteSize `yaml:"part-size"`
+	Concurrency         *int      `yaml:"concurrency"`
 
 	// S3 Server-Side Encryption (SSE-C: Customer-provided keys)
 	SSECustomerAlgorithm string `yaml:"sse-customer-algorithm"`
@@ -1218,6 +1219,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.RequireContentMD5 == nil {
 		rs.RequireContentMD5 = src.RequireContentMD5
+	}
+	if rs.PutObjectContentMD5 == nil {
+		rs.PutObjectContentMD5 = src.PutObjectContentMD5
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
@@ -1443,6 +1447,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
 	storageClass := c.StorageClass
+	putObjectContentMD5 := false
 	signSetting := newBoolSetting(true)
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
@@ -1538,6 +1543,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if v, ok := litestream.BoolQueryValue(query, "requireContentMD5", "require-content-md5"); ok {
 			urequireContentMD5 = v
 			urequireContentMD5Set = true
+		}
+		if v, ok := litestream.BoolQueryValue(query, "putObjectContentMD5", "put-object-content-md5"); ok {
+			putObjectContentMD5 = v
 		}
 		if v := query.Get("storageClass"); v != "" {
 			ustorageClass = v
@@ -1641,6 +1649,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.SignPayload = signSetting.value
 	client.SignAcceptEncoding = signAcceptEncodingSetting.value
 	client.RequireContentMD5 = requireSetting.value
+	client.PutObjectContentMD5 = putObjectContentMD5
+	if v := c.PutObjectContentMD5; v != nil {
+		client.PutObjectContentMD5 = *v
+	}
 
 	if isCloudflareR2 {
 		client.Concurrency = s3.DefaultR2Concurrency
