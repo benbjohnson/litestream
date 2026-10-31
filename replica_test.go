@@ -277,6 +277,207 @@ func TestReplica_RestoreRetriesInitialLTXOpenError(t *testing.T) {
 	}
 }
 
+func TestReplica_RestoreReplansDeletedFile(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		duringRead bool
+		txid       ltx.TXID
+		timestamp  time.Time
+	}{
+		{name: "initial_open"},
+		{name: "mid_read", duringRead: true},
+		{name: "txid", duringRead: true, txid: 2},
+		{name: "timestamp", duringRead: true, timestamp: time.Now().Add(time.Hour)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			client := &deletingRestoreClient{ReplicaClient: file.NewReplicaClient(t.TempDir()), duringRead: tc.duringRead}
+			snapshot := restoreReplanLTX(t, 1, 1, 1)
+			delta := restoreReplanLTX(t, 2, 2, 2)
+			later := restoreReplanLTX(t, 3, 3, 3)
+			if _, err := client.WriteLTXFile(ctx, litestream.SnapshotLevel, 1, 1, bytes.NewReader(snapshot)); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(delta)); err != nil {
+				t.Fatal(err)
+			}
+			client.promote = func() error {
+				if _, err := client.WriteLTXFile(ctx, 1, 2, 2, bytes.NewReader(delta)); err != nil {
+					return err
+				}
+				if _, err := client.WriteLTXFile(ctx, 0, 3, 3, bytes.NewReader(later)); err != nil {
+					return err
+				}
+				return client.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: 0, MinTXID: 2, MaxTXID: 2}})
+			}
+			r := litestream.NewReplicaWithClient(nil, client)
+			output := filepath.Join(t.TempDir(), "restore.db")
+			if err := r.Restore(ctx, litestream.RestoreOptions{OutputPath: output, TXID: tc.txid, Timestamp: tc.timestamp}); err != nil {
+				t.Fatal(err)
+			}
+			if !client.deleted || !client.openedHigher {
+				t.Fatalf("deletion=%t higher-level read=%t", client.deleted, client.openedHigher)
+			}
+			if client.openedLater {
+				t.Fatal("restore advanced beyond the original target")
+			}
+			if tc.duringRead && client.reopenOffset <= ltx.HeaderSize {
+				t.Fatalf("reopen offset=%d, expected a partial page read", client.reopenOffset)
+			}
+			data, err := os.ReadFile(output)
+			if err != nil || !bytes.Equal(data, bytes.Repeat([]byte{2}, 4096)) {
+				t.Fatalf("restored data mismatch: size=%d err=%v", len(data), err)
+			}
+		})
+	}
+}
+
+func restoreReplanLTX(t *testing.T, minTXID, maxTXID ltx.TXID, value byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 4096, Commit: 1, MinTXID: minTXID, MaxTXID: maxTXID, Timestamp: time.Now().UnixMilli()}); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, bytes.Repeat([]byte{value}, 4096)); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return buf.Bytes()
+}
+
+func TestReplica_RestoreReplanUnavailableTarget(t *testing.T) {
+	ctx := context.Background()
+	client := &deletingRestoreClient{ReplicaClient: file.NewReplicaClient(t.TempDir()), duringRead: true}
+	createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+	createTestLTXFile(t, client, 0, 2, 2)
+	compacted := restoreReplanLTX(t, 2, 3, 3)
+	client.promote = func() error {
+		if _, err := client.WriteLTXFile(ctx, 1, 2, 3, bytes.NewReader(compacted)); err != nil {
+			return err
+		}
+		return client.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: 0, MinTXID: 2, MaxTXID: 2}})
+	}
+	output := filepath.Join(t.TempDir(), "restore.db")
+	err := litestream.NewReplicaWithClient(nil, client).Restore(ctx, litestream.RestoreOptions{OutputPath: output, TXID: 2})
+	if !errors.Is(err, litestream.ErrTxNotAvailable) {
+		t.Fatalf("error=%v, want unavailable target", err)
+	}
+	for _, path := range []string{output, output + ".tmp"} {
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("partial output remains: %s: %v", path, err)
+		}
+	}
+}
+
+func TestReplica_RestoreReplanBounded(t *testing.T) {
+	for _, failure := range []error{os.ErrNotExist, context.Canceled, errors.New("invalid input")} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			client := file.NewReplicaClient(t.TempDir())
+			createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 1)
+			var c mock.ReplicaClient
+			c.LTXFilesFunc = client.LTXFiles
+			opens := 0
+			c.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+				opens++
+				if errors.Is(failure, os.ErrNotExist) || errors.Is(failure, context.Canceled) {
+					return nil, failure
+				}
+				return io.NopCloser(bytes.NewReader(bytes.Repeat([]byte{0xff}, ltx.HeaderSize))), nil
+			}
+			output := filepath.Join(t.TempDir(), "restore.db")
+			err := litestream.NewReplicaWithClient(nil, &c).Restore(context.Background(), litestream.RestoreOptions{OutputPath: output})
+			if err == nil {
+				t.Fatal("expected failure")
+			}
+			want := 1
+			if errors.Is(failure, os.ErrNotExist) {
+				want = 8
+			} else if errors.Is(failure, context.Canceled) {
+				want = 2
+			}
+			if opens != want {
+				t.Fatalf("opens=%d, want %d", opens, want)
+			}
+			if errors.Is(failure, os.ErrNotExist) && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("missing not-exist cause: %v", err)
+			}
+			for _, path := range []string{output, output + ".tmp"} {
+				if _, err := os.Stat(path); !os.IsNotExist(err) {
+					t.Fatalf("partial output remains: %s: %v", path, err)
+				}
+			}
+		})
+	}
+}
+
+type deletingRestoreClient struct {
+	litestream.ReplicaClient
+	duringRead   bool
+	deleted      bool
+	openedHigher bool
+	openedLater  bool
+	reopenOffset int64
+	promote      func() error
+}
+
+func (c *deletingRestoreClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+	if level == 1 {
+		c.openedHigher = true
+	}
+	if maxTXID > 2 {
+		c.openedLater = true
+	}
+	if level != 0 || minTXID != 2 {
+		return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	}
+	if offset > 0 {
+		c.reopenOffset = offset
+	}
+	if c.deleted {
+		return c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	}
+	if !c.duringRead {
+		c.deleted = true
+		if err := c.promote(); err != nil {
+			return nil, err
+		}
+		return nil, os.ErrNotExist
+	}
+	rc, err := c.ReplicaClient.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+	if err != nil {
+		return nil, err
+	}
+	return &deletingRestoreReader{ReadCloser: rc, remaining: ltx.HeaderSize + 16, client: c}, nil
+}
+
+type deletingRestoreReader struct {
+	io.ReadCloser
+	remaining int
+	client    *deletingRestoreClient
+}
+
+func (r *deletingRestoreReader) Read(p []byte) (int, error) {
+	if r.remaining == 0 {
+		r.client.deleted = true
+		if err := r.client.promote(); err != nil {
+			return 0, err
+		}
+		return 0, io.ErrUnexpectedEOF
+	}
+	if len(p) > r.remaining {
+		p = p[:r.remaining]
+	}
+	n, err := r.ReadCloser.Read(p)
+	r.remaining -= n
+	return n, err
+}
+
 type transientOpenFailureClient struct {
 	litestream.ReplicaClient
 	remainingFailures int
