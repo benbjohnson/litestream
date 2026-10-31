@@ -43,10 +43,14 @@ type Leaser struct {
 	s3     S3API
 	logger *slog.Logger
 
-	Bucket string
-	Path   string
-	TTL    time.Duration
-	Owner  string
+	Bucket               string
+	Path                 string
+	TTL                  time.Duration
+	Owner                string
+	SSECustomerAlgorithm string
+	SSECustomerKey       string
+	SSECustomerKeyMD5    string
+	SSEKMSKeyID          string
 }
 
 func NewLeaser() *Leaser {
@@ -202,10 +206,16 @@ func (l *Leaser) ReleaseLease(ctx context.Context, lease *litestream.Lease) erro
 func (l *Leaser) readLease(ctx context.Context) (*litestream.Lease, string, error) {
 	key := l.lockKey()
 
-	out, err := l.s3.GetObject(ctx, &s3.GetObjectInput{
+	input := &s3.GetObjectInput{
 		Bucket: aws.String(l.Bucket),
 		Key:    aws.String(key),
-	})
+	}
+	if l.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(l.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(l.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(l.SSECustomerKeyMD5)
+	}
+	out, err := l.s3.GetObject(ctx, input)
 	if err != nil {
 		if isNotExists(err) || isNotFoundError(err) {
 			return nil, "", os.ErrNotExist
@@ -247,6 +257,15 @@ func (l *Leaser) writeLease(ctx context.Context, lease *litestream.Lease, etag s
 		input.IfNoneMatch = aws.String("*")
 	} else {
 		input.IfMatch = aws.String(etag)
+	}
+	if l.SSECustomerKey != "" {
+		input.SSECustomerAlgorithm = aws.String(l.SSECustomerAlgorithm)
+		input.SSECustomerKey = aws.String(l.SSECustomerKey)
+		input.SSECustomerKeyMD5 = aws.String(l.SSECustomerKeyMD5)
+	}
+	if l.SSEKMSKeyID != "" {
+		input.ServerSideEncryption = types.ServerSideEncryptionAwsKms
+		input.SSEKMSKeyId = aws.String(l.SSEKMSKeyID)
 	}
 
 	out, err := l.s3.PutObject(ctx, input)
