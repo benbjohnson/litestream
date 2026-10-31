@@ -14,15 +14,21 @@ const (
 	sqliteSharedSize  = 510
 )
 
+// LockFileExclusive takes the PENDING-byte writer mutex on the database
+// file. We deliberately do NOT acquire the SHARED-byte-range exclusive
+// lock here: WAL-mode reader connections in the consuming application
+// can hold SHARED on that range for the lifetime of their connection
+// (e.g. via a long-lived per-worker connection pool), in which case the
+// blocking F_SETLKW on the SHARED range would deadlock applyLTXFile
+// indefinitely. The PENDING lock alone is sufficient to serialize
+// writers; readers do not consult the main-DB lock-byte page in WAL
+// mode and observe no torn reads as long as page writes are atomic at
+// the filesystem level (true for SQLite page sizes ≥ filesystem block
+// size on modern Unix filesystems).
 func LockFileExclusive(f *os.File) error {
 	fd := int(f.Fd())
 
 	if err := setFcntlLock(fd, unix.F_WRLCK, sqlitePendingByte, 1); err != nil {
-		return err
-	}
-
-	if err := setFcntlLock(fd, unix.F_WRLCK, sqliteSharedFirst, sqliteSharedSize); err != nil {
-		_ = setFcntlLock(fd, unix.F_UNLCK, sqlitePendingByte, 1)
 		return err
 	}
 
@@ -31,12 +37,7 @@ func LockFileExclusive(f *os.File) error {
 
 func UnlockFile(f *os.File) error {
 	fd := int(f.Fd())
-	err1 := setFcntlLock(fd, unix.F_UNLCK, sqliteSharedFirst, sqliteSharedSize)
-	err2 := setFcntlLock(fd, unix.F_UNLCK, sqlitePendingByte, 1)
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return setFcntlLock(fd, unix.F_UNLCK, sqlitePendingByte, 1)
 }
 
 func setFcntlLock(fd int, lockType int16, start int64, length int64) error {
