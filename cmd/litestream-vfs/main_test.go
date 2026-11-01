@@ -685,14 +685,7 @@ func TestVFS_OverlappingTransactionCommitStorm(t *testing.T) {
 	}
 
 	// Wait for LTX files to be created before opening VFS replica
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 	forceReplicaSync(t, db)
 
 	vfs := newVFS(t, client)
@@ -925,14 +918,7 @@ func TestVFS_ConcurrentConnectionScaling(t *testing.T) {
 	}
 
 	// Wait for LTX files to be created before forceReplicaSync
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 	forceReplicaSync(t, db)
 
 	const connCount = 32
@@ -997,14 +983,7 @@ func TestVFS_PRAGMAQueryBehavior(t *testing.T) {
 	}
 
 	// Wait for LTX files to be created before forceReplicaSync
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 	forceReplicaSync(t, db)
 
 	replica := openVFSReplicaDB(t, vfsName)
@@ -1387,14 +1366,7 @@ func TestVFS_StorageFailureInjection(t *testing.T) {
 				t.Fatalf("insert row: %v", err)
 			}
 			// Wait for LTX files to be written by background monitor
-			require.Eventually(t, func() bool {
-				itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-				if err != nil {
-					return false
-				}
-				defer itr.Close()
-				return itr.Next()
-			}, 5*time.Second, db.MonitorInterval, "LTX files should be created by background monitor")
+			waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 			forceReplicaSync(t, db)
 			if err := db.Replica.Stop(false); err != nil {
 				t.Fatalf("stop replica: %v", err)
@@ -1463,14 +1435,7 @@ func TestVFS_PartialLTXUpload(t *testing.T) {
 	}
 
 	// Wait for LTX files to be created before forceReplicaSync
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 	forceReplicaSync(t, db)
 
 	vfs := newVFS(t, client)
@@ -1899,14 +1864,7 @@ func TestVFS_PooledWriteNoFalseConflict(t *testing.T) {
 		t.Fatalf("insert seed: %v", err)
 	}
 
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 	forceReplicaSync(t, db)
 
 	vfs := newVFS(t, client)
@@ -1963,14 +1921,7 @@ func TestVFS_PooledWriteStress(t *testing.T) {
 		t.Fatalf("insert seed: %v", err)
 	}
 
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 5*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 5*time.Second, db.MonitorInterval)
 	forceReplicaSync(t, db)
 
 	vfs := newVFS(t, client)
@@ -2470,12 +2421,20 @@ func (h *hookedReadCloser) Close() error {
 func waitForLTXFiles(t *testing.T, client litestream.ReplicaClient, timeout, tick time.Duration) {
 	t.Helper()
 	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(context.Background(), 0, 0, false)
-		if err != nil {
-			return false
+		for _, level := range []int{0, litestream.SnapshotLevel} {
+			itr, err := client.LTXFiles(context.Background(), level, 0, false)
+			if err != nil {
+				return false
+			}
+			found := itr.Next()
+			if err := itr.Close(); err != nil {
+				return false
+			}
+			if found {
+				return true
+			}
 		}
-		defer itr.Close()
-		return itr.Next()
+		return false
 	}, timeout, tick, "LTX files should be available")
 }
 
