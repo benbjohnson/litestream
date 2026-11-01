@@ -636,6 +636,7 @@ type VFSFile struct {
 	hydrator            *Hydrator // Background hydration (nil if disabled)
 	hydrationPath       string    // Path for hydration file (set during Open)
 	hydrationPersistent bool      // True when using user-specified persistent path
+	hydrationReady      bool      // Restore finished; activation waits for the active reader.
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -662,6 +663,7 @@ type Hydrator struct {
 	complete   atomic.Bool    // True when restore completes
 	txid       ltx.TXID       // TXID the hydrated file is at
 	mu         sync.Mutex     // Protects hydration file writes
+	errMu      sync.Mutex     // Error state stays observable during file I/O.
 	err        error          // Stores fatal hydration error
 	compactor  *ltx.Compactor // Tracks compaction progress during restore
 	pageSize   uint32         // Page size of the database
@@ -742,15 +744,15 @@ func (h *Hydrator) SetTXID(txid ltx.TXID) {
 
 // Err returns any fatal hydration error.
 func (h *Hydrator) Err() error {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.errMu.Lock()
+	defer h.errMu.Unlock()
 	return h.err
 }
 
 // SetErr sets a fatal hydration error.
 func (h *Hydrator) SetErr(err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
+	h.errMu.Lock()
+	defer h.errMu.Unlock()
 	h.err = err
 }
 
@@ -823,10 +825,14 @@ func (h *Hydrator) CatchUp(ctx context.Context, fromTXID, toTXID ltx.TXID) error
 	}
 	defer itr.Close()
 
+	covered := fromTXID
 	for itr.Next() {
 		info := itr.Item()
 		if info.MaxTXID > toTXID {
 			break
+		}
+		if info.MinTXID != covered+1 {
+			return fmt.Errorf("hydration catch-up gap: expected %s, got %s", covered+1, info.MinTXID)
 		}
 
 		if err := h.ApplyLTX(ctx, info); err != nil {
@@ -836,6 +842,13 @@ func (h *Hydrator) CatchUp(ctx context.Context, fromTXID, toTXID ltx.TXID) error
 		h.mu.Lock()
 		h.txid = info.MaxTXID
 		h.mu.Unlock()
+		covered = info.MaxTXID
+	}
+	if err := itr.Err(); err != nil {
+		return fmt.Errorf("iterate hydration catch-up: %w", err)
+	}
+	if covered != toTXID {
+		return fmt.Errorf("hydration catch-up incomplete: covered %s, wanted %s", covered, toTXID)
 	}
 
 	return nil
@@ -1450,12 +1463,36 @@ func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
 		}
 	}
 
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := f.completeHydrationWithLock(); err != nil {
+		f.hydrator.SetErr(err)
+		f.logger.Error("hydration activation failed", "error", err)
+	}
+}
+
+// completeHydrationWithLock switches read sources only between transactions.
+// The restore may have run while the remote index advanced, so catch up to the
+// admitted point before publishing the local file. Must hold f.mu.
+func (f *VFSFile) completeHydrationWithLock() error {
+	if f.lockType >= sqlite3vfs.LockShared {
+		f.hydrationReady = true
+		return nil
+	}
+	current := f.hydrator.TXID()
+	if current > f.pos.TXID {
+		return fmt.Errorf("hydration is ahead of the admitted transaction")
+	}
+	if current < f.pos.TXID {
+		if err := f.hydrator.CatchUp(f.ctx, current, f.pos.TXID); err != nil {
+			return fmt.Errorf("catch up hydration before activation: %w", err)
+		}
+	}
 	f.hydrator.SetComplete()
-
-	// Clear cache since we'll now read from hydration file
+	f.hydrationReady = false
 	f.cache.Purge()
-
 	f.logger.Debug("hydration complete", "path", f.hydrationPath, "txid", f.hydrator.TXID().String())
+	return nil
 }
 
 // applySyncedPagesToHydratedFile writes synced dirty pages to the hydrated file.
@@ -1574,6 +1611,11 @@ func (f *VFSFile) ReadAt(p []byte, off int64) (n int, err error) {
 		}
 	}
 	f.mu.Unlock()
+
+	// A failed apply may have changed only part of the file. Do not read it.
+	if f.hydrator != nil && f.hydrator.Err() != nil {
+		return 0, fmt.Errorf("hydration is unusable: %w", f.hydrator.Err())
+	}
 
 	// If hydration complete, read from local file
 	if f.hydrator != nil && f.hydrator.Complete() {
@@ -2398,6 +2440,20 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 
 	f.lockType = elock
 
+	// Keep the hydrated snapshot pinned on a downgrade to SHARED.
+	if elock == sqlite3vfs.LockShared && f.hydrator != nil {
+		return nil
+	}
+
+	// Publish hydrated pages only after the reader releases its snapshot.
+	if f.hydrator != nil && f.hydrator.Complete() && len(f.pending) > 0 {
+		if err := f.hydrator.ApplyUpdates(f.ctx, f.pending); err != nil {
+			f.hydrator.SetErr(err)
+			f.hydrator.Disable()
+			return fmt.Errorf("apply pending hydration updates: %w", err)
+		}
+	}
+
 	// Copy pending index to main index and invalidate affected pages in cache.
 	if f.pendingReplace {
 		// Replace entire index
@@ -2417,6 +2473,18 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+
+	if f.hydrator != nil && f.hydrator.Complete() {
+		f.hydrator.SetTXID(f.pos.TXID)
+	}
+
+	if f.hydrationReady {
+		if err := f.completeHydrationWithLock(); err != nil {
+			f.hydrator.SetErr(err)
+			f.hydrator.Disable()
+			return err
+		}
+	}
 
 	return nil
 }
@@ -2528,6 +2596,23 @@ func (f *VFSFile) FileControl(op int, pragmaName string, pragmaValue *string) (*
 			return nil, err
 		}
 		return nil, nil
+
+	case "litestream_hydration_state":
+		if pragmaValue != nil {
+			return nil, fmt.Errorf("litestream_hydration_state is read-only")
+		}
+		result := "disabled"
+		if f.hydrator != nil {
+			switch {
+			case f.hydrator.Err() != nil:
+				result = "failed"
+			case f.hydrator.Complete():
+				result = "ready"
+			default:
+				result = "hydrating"
+			}
+		}
+		return &result, nil
 
 	case "litestream_hydration_progress":
 		if pragmaValue != nil {
@@ -2767,11 +2852,15 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	// Apply updates to hydrated file if hydration is complete
-	if f.hydrator != nil && f.hydrator.Complete() && len(applied) > 0 {
+	if f.hydrator != nil && f.hydrator.Complete() && targetIsMain && len(applied) > 0 {
 		if err := f.hydrator.ApplyUpdates(ctx, applied); err != nil {
+			f.hydrator.SetErr(err)
 			f.hydrator.Disable()
 			return fmt.Errorf("apply hydration updates: %w", err)
 		}
+	}
+	if f.hydrator != nil && f.hydrator.Complete() && targetIsMain {
+		f.hydrator.SetTXID(f.pos.TXID)
 	}
 
 	return nil
