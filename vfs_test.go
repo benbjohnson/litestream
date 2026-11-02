@@ -2445,3 +2445,90 @@ func TestHydrator_SnapshotLocalWrite(t *testing.T) {
 		t.Fatalf("local write hidden by snapshot: got %q, want 'b'", buf[100])
 	}
 }
+
+func TestVFSFile_Hydration_CompletionPreservesActiveRead(t *testing.T) {
+	for _, failUpdate := range []bool{false, true} {
+		t.Run(fmt.Sprintf("failUpdate=%t", failUpdate), func(t *testing.T) {
+			client := newFailingPageReplicaClient()
+			initial := buildLTXFixtureWithPages(t, 1, 4096, []uint32{1, 2}, 'a')
+			client.addFixture(t, initial)
+			f := NewVFSFile(client, "initial-read.db", slog.Default())
+			f.PollInterval = time.Hour
+			if err := f.Open(); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				if err := f.Close(); err != nil {
+					t.Error(err)
+				}
+			})
+			f.hydrator = NewHydrator(filepath.Join(t.TempDir(), "hydrated.db"), false, 4096, client, slog.Default())
+			if err := f.hydrator.Init(); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+				t.Fatal(err)
+			}
+			page := make([]byte, 4096)
+			if _, err := f.ReadAt(page, 0); err != nil {
+				t.Fatal(err)
+			}
+			if page[128] != 'a' {
+				t.Fatal("initial read is not the expected fixture")
+			}
+			client.addFixture(t, buildLTXFixtureWithPages(t, 2, 4096, []uint32{1, 2}, 'b'))
+			if err := f.pollReplicaClient(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			f.wg.Add(1)
+			f.runHydration([]*ltx.FileInfo{initial.info})
+			if _, err := f.ReadAt(page, 4096); err != nil {
+				t.Fatal(err)
+			}
+			if page[128] != 'a' {
+				t.Fatalf("hydration completion changed active snapshot to %q", page[128])
+			}
+			if f.hydrator.Complete() {
+				t.Fatal("hydration activated during shared read")
+			}
+			client.failPageReads.Store(failUpdate)
+			client.addFixture(t, buildLTXFixtureWithPages(t, 3, 4096, []uint32{1, 2}, 'c'))
+			err := f.pollReplicaClient(context.Background())
+			if failUpdate {
+				if err == nil || !strings.Contains(err.Error(), "apply hydration updates") {
+					t.Fatalf("poll error = %v, want hydration update failure", err)
+				}
+			} else if err != nil {
+				t.Fatal(err)
+			}
+			client.failPageReads.Store(false)
+			if err := f.Unlock(sqlite3vfs.LockShared); err != nil {
+				t.Fatal(err)
+			}
+			f.cache.Purge()
+			if _, err := f.ReadAt(page, 4096); err != nil {
+				t.Fatal(err)
+			}
+			if page[128] != 'a' {
+				t.Fatalf("shared unlock changed active snapshot to %q", page[128])
+			}
+			if f.hydrator.Complete() {
+				t.Fatal("shared unlock activated hydration")
+			}
+			client.failPageReads.Store(true)
+			if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+				t.Fatal(err)
+			}
+			if got := f.hydrator.Complete(); got != !failUpdate {
+				t.Fatalf("hydration active = %t, want %t", got, !failUpdate)
+			}
+			client.failPageReads.Store(false)
+			if _, err := f.ReadAt(page, 4096); err != nil {
+				t.Fatal(err)
+			}
+			if page[128] != 'c' {
+				t.Fatalf("released snapshot did not advance: %q", page[128])
+			}
+		})
+	}
+}

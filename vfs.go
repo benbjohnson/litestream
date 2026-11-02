@@ -634,8 +634,9 @@ type VFSFile struct {
 	perConnClient bool // True when client was created from config registry (close on file close)
 
 	hydrator            *Hydrator // Background hydration (nil if disabled)
-	hydrationPath       string    // Path for hydration file (set during Open)
-	hydrationPersistent bool      // True when using user-specified persistent path
+	hydrationReady      bool
+	hydrationPath       string // Path for hydration file (set during Open)
+	hydrationPersistent bool   // True when using user-specified persistent path
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -1385,6 +1386,7 @@ func (f *VFSFile) rebuildIndex(ctx context.Context, infos []*ltx.FileInfo, targe
 
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.hydrationReady = false
 	f.index = index
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
@@ -1520,17 +1522,31 @@ func (f *VFSFile) runHydration(infos []*ltx.FileInfo) {
 		hydrationTXID = f.hydrator.TXID()
 	}
 
-	if currentTXID > hydrationTXID {
+	for {
+		f.mu.Lock()
+		if f.targetTime != nil {
+			f.mu.Unlock()
+			return
+		}
+		currentTXID = f.pos.TXID
+		if currentTXID <= hydrationTXID {
+			break
+		}
+		f.mu.Unlock()
 		if err := f.hydrator.CatchUp(f.ctx, hydrationTXID, currentTXID); err != nil {
 			f.hydrator.SetErr(err)
 			f.logger.Error("hydration catch-up failed", "error", err)
 			return
 		}
+		hydrationTXID = currentTXID
 	}
+	defer f.mu.Unlock()
 
-	f.hydrator.SetComplete()
-
-	// Clear cache since we'll now read from hydration file
+	if f.lockType >= sqlite3vfs.LockShared {
+		f.hydrationReady = true
+	} else {
+		f.hydrator.SetComplete()
+	}
 	f.cache.Purge()
 
 	f.logger.Debug("hydration complete", "path", f.hydrationPath, "txid", f.hydrator.TXID().String())
@@ -2446,7 +2462,7 @@ func (f *VFSFile) Lock(elock sqlite3vfs.LockType) error {
 		f.logger.Debug("transaction started", "expectedTXID", f.expectedTXID)
 	}
 
-	if f.lockType == sqlite3vfs.LockNone && elock >= sqlite3vfs.LockShared && f.hydrator != nil {
+	if f.lockType == sqlite3vfs.LockNone && elock >= sqlite3vfs.LockShared && f.hydrator != nil && f.hydrator.Complete() {
 		f.hydrator.beginSnapshot(f.commit)
 	}
 	f.lockType = elock
@@ -2505,6 +2521,11 @@ func (f *VFSFile) Unlock(elock sqlite3vfs.LockType) error {
 	}
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pendingReplace = false
+
+	if f.hydrationReady {
+		f.hydrationReady = false
+		f.hydrator.SetComplete()
+	}
 
 	return hydrationErr
 }
@@ -2855,8 +2876,9 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.logger.Debug("txid updated", "txid", f.pos.TXID.String(), "maxTXID1", f.maxTXID1.String())
 
 	// Apply updates to hydrated file if hydration is complete
-	if f.hydrator != nil && f.hydrator.Complete() && len(applied) > 0 {
+	if f.hydrator != nil && (f.hydrator.Complete() || f.hydrationReady) && len(applied) > 0 {
 		if err := f.hydrator.ApplyUpdates(ctx, applied); err != nil {
+			f.hydrationReady = false
 			f.hydrator.Disable()
 			return fmt.Errorf("apply hydration updates: %w", err)
 		}
