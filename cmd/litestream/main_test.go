@@ -3392,16 +3392,7 @@ func createSQLiteDB(t *testing.T, path string) {
 		t.Fatalf("failed to create directory %s: %v", dir, err)
 	}
 
-	file, err := os.Create(path)
-	if err != nil {
-		t.Fatalf("failed to create file %s: %v", path, err)
-	}
-	defer file.Close()
-
-	// Write SQLite header
-	if _, err := file.Write([]byte("SQLite format 3\x00")); err != nil {
-		t.Fatalf("failed to write SQLite header: %v", err)
-	}
+	createWALSQLiteDB(t, path, "initial")
 }
 
 func TestNewS3ReplicaClientFromConfig(t *testing.T) {
