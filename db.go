@@ -81,6 +81,8 @@ type DB struct {
 
 	lastLTXPage *verifiedLTXPage
 
+	afterPassiveBarrierRelease func() // test hook
+
 	// last file info for each level
 	maxLTXFileInfos struct {
 		sync.Mutex
@@ -247,6 +249,10 @@ type syncState struct {
 	// a checkpoint. This prevents issue #997 where PASSIVE checkpoints
 	// trigger a feedback loop because stale file size exceeds threshold.
 	lastSyncedWALOffset int64
+
+	// backfilledWALOffset is our last synced offset when our own PASSIVE
+	// checkpoint backfilled the whole WAL under the write barrier.
+	backfilledWALOffset int64
 }
 
 type syncExecutor struct {
@@ -1783,6 +1789,9 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	frameSize := int64(db.pageSize + WALFrameHeaderSize)
 	info.snapshotting = true
 
+	backfilledWALOffset := exec.state.backfilledWALOffset
+	exec.state.backfilledWALOffset = 0
+
 	if exec.pos.TXID == 0 {
 		info.offset = WALHeaderSize
 		return info, nil // first sync
@@ -1851,6 +1860,15 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	saltMatch := salt1 == dec.Header().WALSalt1 && salt2 == dec.Header().WALSalt2
 	if !saltMatch {
 		exec.state.truncatePassiveFailed = false
+	}
+
+	// The fully backfilled WAL was restarted exactly once (SQLite increments
+	// salt-1 on each restart), so every frame in it is new.
+	if !saltMatch && backfilledWALOffset == info.offset && salt1 == dec.Header().WALSalt1+1 {
+		info.offset = WALHeaderSize
+		info.salt1, info.salt2 = salt1, salt2
+		info.snapshotting = false
+		return info, nil
 	}
 
 	// Handle edge case where we're at WAL header (WALOffset=32, WALSize=0).
@@ -2651,16 +2669,22 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 			s.checkpointMode = mode
 			s.lastSyncedWALOffset = exec.state.lastSyncedWALOffset
 		})
-	walFrameN, err := db.execCheckpoint(ctx, mode)
+	walFrameN, ckptFrameN, err := db.execCheckpoint(ctx, mode)
 	if err != nil {
 		return false, err
 	}
 
 	if barrierTx != nil {
+		if walFrameN == ckptFrameN && walFrameN == preCheckpointFrameN {
+			exec.state.backfilledWALOffset = exec.state.lastSyncedWALOffset
+		}
 		if err = rollback(barrierTx); err != nil {
 			return false, fmt.Errorf("rollback passive checkpoint barrier: %w", err)
 		}
 		barrierTx = nil
+		if db.afterPassiveBarrierRelease != nil {
+			db.afterPassiveBarrierRelease()
+		}
 	}
 
 	if err = db.bumpLitestreamSeq(ctx); err != nil {
@@ -2677,6 +2701,7 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 	if err != nil {
 		return false, err
 	} else if bytes.Equal(hdr, other) {
+		exec.state.backfilledWALOffset = 0
 		exec.state.syncedSinceCheckpoint = false
 		return false, nil
 	}
@@ -2760,10 +2785,10 @@ func (db *DB) checkpointWithExecutor(ctx context.Context, mode string, exec *syn
 
 // execCheckpoint issues a wal_checkpoint PRAGMA in the given mode and returns
 // the number of frames in the WAL as reported by the checkpoint.
-func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, err error) {
+func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN, ckptFrameN int, err error) {
 	// Ignore if there is no underlying database.
 	if db.db == nil {
-		return 0, nil
+		return 0, 0, nil
 	}
 
 	// Track checkpoint metrics.
@@ -2780,7 +2805,7 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 	// Ensure the read lock has been removed before issuing a checkpoint.
 	// We defer the re-acquire to ensure it occurs even on an early return.
 	if err := db.releaseReadLock(); err != nil {
-		return 0, fmt.Errorf("release read lock: %w", err)
+		return 0, 0, fmt.Errorf("release read lock: %w", err)
 	}
 	defer func() { _ = db.acquireReadLock(ctx) }()
 
@@ -2794,16 +2819,16 @@ func (db *DB) execCheckpoint(ctx context.Context, mode string) (walFrameN int, e
 
 	var row [3]int
 	if err := db.db.QueryRowContext(ctx, rawsql).Scan(&row[0], &row[1], &row[2]); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	db.Logger.Debug("checkpoint", "mode", mode, "result", fmt.Sprintf("%d,%d,%d", row[0], row[1], row[2]))
 
 	// Reacquire the read lock immediately after the checkpoint.
 	if err := db.acquireReadLock(ctx); err != nil {
-		return 0, fmt.Errorf("reacquire read lock: %w", err)
+		return 0, 0, fmt.Errorf("reacquire read lock: %w", err)
 	}
 
-	return row[1], nil
+	return row[1], row[2], nil
 }
 
 type snapshotReadPosition struct {
