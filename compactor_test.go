@@ -17,6 +17,7 @@ import (
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/file"
+	"github.com/benbjohnson/litestream/mock"
 )
 
 func TestCompactor_Compact(t *testing.T) {
@@ -898,4 +899,71 @@ func countCompactorPipeWriters() int {
 	buf := make([]byte, 2<<20)
 	n := runtime.Stack(buf, true)
 	return strings.Count(string(buf[:n]), "github.com/benbjohnson/litestream.(*Compactor).Compact.func")
+}
+
+func TestCompactor_CompactJoinsProducerOnWriteError(t *testing.T) {
+	started, closed, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	var releaseOnce sync.Once
+	releaseRead := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(releaseRead)
+	reader := &joiningCompactionReader{started: started, closed: closed, release: release}
+	client := &mock.ReplicaClient{
+		LTXFilesFunc: func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+			if level == 1 {
+				return ltx.NewFileInfoSliceIterator(nil), nil
+			}
+			return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}), nil
+		},
+		WriteLTXFileFunc: func(ctx context.Context, _ int, _, _ ltx.TXID, _ io.Reader) (*ltx.FileInfo, error) {
+			select {
+			case <-started:
+				return nil, fmt.Errorf("injected upload failure")
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		},
+	}
+	compactor := litestream.NewCompactor(client, nil)
+	compactor.LocalFileOpener = func(int, ltx.TXID, ltx.TXID) (io.ReadCloser, error) { return reader, nil }
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() { _, err := compactor.Compact(ctx, 1); result <- err }()
+	select {
+	case <-closed:
+	case <-ctx.Done():
+		t.Fatal("source was not closed")
+	}
+	select {
+	case err := <-result:
+		t.Fatalf("compaction returned before producer exited: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseRead()
+	select {
+	case err := <-result:
+		if err == nil || !strings.Contains(err.Error(), "injected upload failure") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("compaction did not join producer")
+	}
+}
+
+type joiningCompactionReader struct {
+	started chan struct{}
+	closed  chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (r *joiningCompactionReader) Read([]byte) (int, error) {
+	close(r.started)
+	<-r.release
+	return 0, io.EOF
+}
+
+func (r *joiningCompactionReader) Close() error {
+	r.once.Do(func() { close(r.closed) })
+	return nil
 }
