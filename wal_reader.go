@@ -200,17 +200,34 @@ func (r *WALReader) readFrame(ctx context.Context, data []byte, verifyChecksum b
 // map of pgno to offset of the latest version of each page. Also returns the
 // max offset of the wal segment read, and the final database size, in pages.
 func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset int64, commit uint32, err error) {
-	m, maxOffset, commit, _, err = r.pageMap(ctx, 0)
+	m, maxOffset, commit, _, err = r.pageMap(ctx, 0, 0)
 	return m, maxOffset, commit, err
 }
 
-func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
+// pageMap reads committed frames and returns a map of pgno to the offset of
+// the latest version of each page, along with the max offset read and the
+// final database size, in pages.
+//
+// maxBytes, when positive, soft-bounds the number of frame bytes read from
+// the reader's starting position: the scan stops at the first commit frame
+// at or past the bound, so a transaction that straddles the bound is still
+// read through to its commit and at least one transaction is consumed.
+//
+// endOffset, when positive, hard-bounds the scan to frames that end at or
+// before that WAL file offset: no frame past the bound is read, so a
+// transaction whose commit frame lies past the bound is discarded entirely.
+func (r *WALReader) pageMap(ctx context.Context, maxBytes, endOffset int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
 	frameSize := int64(WALFrameHeaderSize + r.pageSize)
 	startOffset := WALHeaderSize + int64(r.frameN)*frameSize
 	for {
+		if endOffset > 0 && WALHeaderSize+(int64(r.frameN)+1)*frameSize > endOffset {
+			limited = true
+			break
+		}
+
 		pgno, fcommit, err := r.ReadFrame(ctx, data)
 		if errors.Is(err, io.EOF) {
 			break
