@@ -4315,3 +4315,34 @@ func TestNewS3ReplicaClientFromConfig_NeonExplicitEndpoint(t *testing.T) {
 		})
 	}
 }
+
+func TestNewS3ReplicaFromConfig_PutObjectContentMD5(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		global  string
+		replica string
+		want    bool
+	}{
+		{name: "Default", replica: "url: s3://bucket/db"},
+		{name: "Query", replica: "url: s3://bucket/db?put-object-content-md5=true", want: true},
+		{name: "QueryAlias", replica: "url: s3://bucket/db?putObjectContentMD5=true", want: true},
+		{name: "Inherited", global: "put-object-content-md5: true", replica: "url: s3://bucket/db", want: true},
+		{name: "ReplicaOverridesGlobal", global: "put-object-content-md5: true", replica: "url: s3://bucket/db\n      put-object-content-md5: false"},
+		{name: "ConfigOverridesQuery", replica: "url: s3://bucket/db?put-object-content-md5=true\n      put-object-content-md5: false"},
+		{name: "EnabledInYAML", replica: "type: s3\n      bucket: bucket\n      put-object-content-md5: true", want: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config, err := main.ParseConfig(strings.NewReader(tt.global+"\ndbs:\n  - path: /tmp/checksum.db\n    replica:\n      "+tt.replica+"\n"), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := main.NewS3ReplicaClientFromConfig(config.DBs[0].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.PutObjectContentMD5 != tt.want {
+				t.Errorf("PutObjectContentMD5 = %v, want %v", client.PutObjectContentMD5, tt.want)
+			}
+		})
+	}
+}
