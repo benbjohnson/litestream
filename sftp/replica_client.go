@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -153,14 +154,8 @@ func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 		config.Auth = append(config.Auth, ssh.PublicKeys(signer))
 	}
 
-	// Append standard port, if necessary.
-	host := c.Host
-	if _, _, err := net.SplitHostPort(c.Host); err != nil {
-		host = net.JoinHostPort(c.Host, "22")
-	}
-
 	// Connect via SSH.
-	if c.sshClient, err = ssh.Dial("tcp", host, config); err != nil {
+	if c.sshClient, err = ssh.Dial("tcp", c.sshAddr(), config); err != nil {
 		return nil, err
 	}
 
@@ -178,6 +173,18 @@ func (c *ReplicaClient) init(ctx context.Context) (_ *sftp.Client, err error) {
 	}
 
 	return c.sftpClient, nil
+}
+
+// sshAddr returns the SSH address, adding the standard port when omitted.
+func (c *ReplicaClient) sshAddr() string {
+	if _, _, err := net.SplitHostPort(c.Host); err == nil {
+		return c.Host
+	}
+	host := c.Host
+	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, "22")
 }
 
 // DeleteAll deletes all LTX files.
