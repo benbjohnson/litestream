@@ -181,8 +181,10 @@ func (c *ReplicaClient) sshAddr() string {
 		return c.Host
 	}
 	host := c.Host
-	if strings.HasPrefix(host, "[") && strings.HasSuffix(host, "]") {
-		host = host[1 : len(host)-1]
+	if inner, ok := strings.CutPrefix(host, "["); ok {
+		if inner, ok := strings.CutSuffix(inner, "]"); ok {
+			host = inner
+		}
 	}
 	return net.JoinHostPort(host, "22")
 }
