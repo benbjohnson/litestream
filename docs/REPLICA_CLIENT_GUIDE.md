@@ -22,6 +22,9 @@ type ReplicaClient interface {
     // Returns the type identifier (e.g., "s3", "gcs", "file")
     Type() string
 
+    // Initializes the backend connection and validates configuration
+    Init(ctx context.Context) error
+
     // Returns iterator of LTX files at given level
     // seek: Start from this TXID (0 = beginning)
     // useMetadata: When true, fetch accurate timestamps from backend metadata (required for PIT restore)
@@ -40,8 +43,35 @@ type ReplicaClient interface {
 
     // Deletes all files for this database
     DeleteAll(ctx context.Context) error
+
+    // Sets the logger used by the backend
+    SetLogger(logger *slog.Logger)
 }
 ```
+
+Manifest-based listing is not part of the backend-neutral `ReplicaClient` interface. Restore detects support through a private optional capability:
+
+```go
+type manifestEnabler interface {
+    SetManifestEnabled(bool)
+}
+```
+
+The S3 client implements this capability so restore can enable manifest reads. Other backends do not need to implement it or provide a no-op method.
+
+S3 manifest-aware mutations use a conditional lease at `PATH/.manifest/lock.json`. Each mutation publishes an unsupported sentinel containing its ownership generation and token, retains the sentinel ETag, and publishes the valid manifest with `If-Match`. The ownership object retains a generation across releases, allowing one client to reuse a validated in-memory cache for consecutive uncontended mutations. A restart, generation gap, mutation failure, or uncertain storage outcome clears that cache; the next writer rebuilds from authoritative LIST results before publication. `DeleteAll` excludes the ownership object from batch deletion and releases it after deleting replica data. Readers use LIST when the manifest is missing, invalid, or unsupported.
+
+Manifest configuration is opt-in. An absent `manifest` key does not acquire ownership or perform cleanup. Explicit `manifest: false` removes stale manifest state before the next mutation. To disable an enabled manifest, set the key to false, allow one mutation to complete cleanup, then remove the key.
+
+### Manifest Limitations
+
+The sentinel and `If-Match` protocol is crash-safe for cooperative, manifest-aware clients on strongly consistent object storage. It is not an absolute reader snapshot: a reader that has already fetched a valid manifest holds a detached listing and may still receive `os.ErrNotExist` from `OpenLTXFile` if a writer deletes a referenced file before the reader opens it. This is the same time-of-check/time-of-use window as the LIST path.
+
+Only manifest-aware writers maintain the manifest. A writer without the manifest capability enabled, such as the `litestream-vfs` write path that builds its replica client with `NewReplicaClientFromURL` without enabling the manifest, mutates LTX files without invalidating an existing manifest and can leave readers trusting stale state. Do not run a non-manifest-aware writer against a replica whose manifest is enabled.
+
+The final manifest publication is fenced with `If-Match`, but the underlying LTX PUT and batch DELETE object operations are not server-side fenced. An expired lease owner whose object request is still in flight could theoretically commit after lease takeover; context cancellation reduces but does not eliminate this window.
+
+A manifest-reading follow poll performs one manifest GET per level queried. An active poll with contiguous L0 files performs one GET, while an idle or caught-up poll that scans levels 1–8 for gap-fill issues up to nine identical full-manifest GETs per tick.
 
 ## Implementation Checklist
 
