@@ -145,6 +145,8 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 	case "replicate":
 		return m.runReplicate(ctx, args)
 
+	case "monitor":
+		return (&MonitorCommand{}).Run(ctx, args)
 	case "start":
 		return (&StartCommand{}).Run(ctx, args)
 	case "stop":
@@ -200,6 +202,7 @@ The commands are:
 	info         show daemon information
 	list         list all managed databases
 	ltx          list available LTX files for a database
+	monitor      stream replication status in real-time
 	register     register a database for replication
 	replicate    runs a server to replicate databases
 	reset        reset local state for a database

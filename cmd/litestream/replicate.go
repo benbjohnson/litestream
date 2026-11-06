@@ -16,6 +16,7 @@ import (
 
 	"github.com/mattn/go-shellwords"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/superfly/ltx"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/abs"
@@ -400,6 +401,16 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		c.Server.Version = Version
 		if err := c.Server.Start(); err != nil {
 			slog.Warn("failed to start control server", "error", err)
+		}
+
+		// Wire up AfterSync callbacks for status monitoring
+		for _, db := range c.Store.DBs() {
+			if db.Replica != nil {
+				db := db // capture for closure
+				db.Replica.AfterSync = func(pos ltx.Pos) {
+					c.Server.StatusMonitor.NotifySync(db, pos)
+				}
+			}
 		}
 	}
 
