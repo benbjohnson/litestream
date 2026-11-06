@@ -27,10 +27,7 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 	}
 
 	// Load configuration.
-	if *configPath == "" {
-		*configPath = DefaultConfigPath()
-	}
-	config, err := ReadConfigFile(*configPath, !*noExpandEnv)
+	config, err := ReadConfig(*configPath, !*noExpandEnv)
 	if err != nil {
 		return err
 	}
@@ -140,7 +137,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-json
@@ -166,6 +163,7 @@ Examples:
 	$ litestream status
 	$ litestream status /path/to/db
 	$ litestream status -json
+	$ cat /path/to/litestream.yml | litestream status -config -
 
 `[1:],
 		DefaultConfigPath(),
