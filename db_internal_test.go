@@ -6447,3 +6447,115 @@ func TestDB_SequenceWriteFailureRestoresJournalLimit(t *testing.T) {
 		t.Fatalf("failed sequence write left journal_size_limit=%d", limit)
 	}
 }
+
+func TestDB_SnapshotRejectsResetAfterFailedCheckpoint(t *testing.T) {
+	db, app := newWALResetTestDB(t)
+	insertWALResetRows(t, app, 80)
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	before, err := db.Pos()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db.afterPassiveBarrierRelease = func() {
+		db.afterPassiveBarrierRelease = nil
+		mustExecApp(t, app, "UPDATE data SET value=x'1234' WHERE id=1")
+		cancel()
+	}
+	if err := db.Checkpoint(ctx, CheckpointModePassive); !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkpoint error=%v, want cancellation", err)
+	}
+	after, err := db.Pos()
+	if err != nil || after != before {
+		t.Fatalf("checkpoint position=%s, want %s: %v", after, before, err)
+	}
+	_, r, err := db.SnapshotReader(t.Context())
+	if r != nil {
+		_ = r.Close()
+	}
+	var notReady *DBNotReadyError
+	if !errors.As(err, &notReady) {
+		t.Fatalf("snapshot error=%v, want unverified boundary rejection", err)
+	}
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Snapshot(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	restored := assertWALResetRestore(t, db, 80)
+	var value string
+	if err := restored.QueryRow("SELECT hex(value) FROM data WHERE id=1").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "1234" {
+		t.Fatalf("restored value=%s, want 1234", value)
+	}
+}
+
+func TestDB_SnapshotRejectsMissingReadLock(t *testing.T) {
+	db, app := newWALResetTestDB(t)
+	insertWALResetRows(t, app, 80)
+	if err := db.Sync(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if _, _, err := db.execCheckpoint(ctx, CheckpointModePassive); !errors.Is(err, context.Canceled) {
+		t.Fatalf("checkpoint error=%v, want cancellation", err)
+	}
+	_, r, err := db.SnapshotReader(t.Context())
+	if r != nil {
+		_ = r.Close()
+	}
+	var notReady *DBNotReadyError
+	if !errors.As(err, &notReady) {
+		t.Fatalf("snapshot error=%v, want missing reader rejection", err)
+	}
+}
+
+func TestDB_SnapshotRejectsWALGenerationChange(t *testing.T) {
+	for _, phase := range []string{"before-copy", "during-copy"} {
+		t.Run(phase, func(t *testing.T) {
+			db, app := newWALResetTestDB(t)
+			insertWALResetRows(t, app, 80)
+			mustExecApp(t, app, "UPDATE data SET value=randomblob(3500)")
+			if err := db.Sync(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.releaseReadLock(); err != nil {
+				t.Fatal(err)
+			}
+			mustExecApp(t, app, "PRAGMA wal_checkpoint(PASSIVE)")
+			if err := db.acquireReadLock(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			pos, err := db.snapshotPosition(t.Context())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer pos.close()
+			if phase == "before-copy" {
+				mustExecApp(t, app, "UPDATE data SET value=randomblob(3500)")
+			}
+			r, err := db.snapshotReader(t.Context(), pos)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer r.Close()
+			if phase == "during-copy" {
+				hdr := make([]byte, ltx.HeaderSize)
+				if _, err := io.ReadFull(r, hdr); err != nil {
+					t.Fatal(err)
+				}
+				mustExecApp(t, app, "UPDATE data SET value=randomblob(3500)")
+			}
+			if _, err := io.Copy(io.Discard, r); err == nil || !strings.Contains(err.Error(), "wal changed") {
+				t.Fatalf("snapshot copy error=%v, want generation change rejection", err)
+			}
+		})
+	}
+}

@@ -2871,6 +2871,8 @@ type snapshotReadPosition struct {
 	pos          ltx.Pos
 	pageSize     int
 	walEndOffset int64
+	salt1        uint32
+	salt2        uint32
 	db           *DB
 	closeOnce    sync.Once
 }
@@ -2916,6 +2918,9 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 	if err := db.checkStartupReady(); err != nil {
 		return nil, err
 	}
+	if db.rtx == nil {
+		return nil, &DBNotReadyError{Reason: "snapshot requires a protecting read transaction"}
+	}
 
 	pageSize := db.PageSize()
 	pos, err := db.Pos()
@@ -2932,6 +2937,13 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 	if err != nil {
 		return nil, err
 	}
+	verified, err := db.verifyWithExecutor(ctx, &syncExecutor{pos: pos, state: db.syncState}, nil)
+	if err != nil {
+		return nil, fmt.Errorf("verify snapshot position: %w", err)
+	}
+	if verified.snapshotting {
+		return nil, &DBNotReadyError{Reason: "WAL reset requires sync before snapshot"}
+	}
 	if walEndOffset < WALHeaderSize {
 		walEndOffset = WALHeaderSize
 	}
@@ -2946,6 +2958,8 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 		pos:          pos,
 		pageSize:     pageSize,
 		walEndOffset: walEndOffset,
+		salt1:        verified.salt1,
+		salt2:        verified.salt2,
 		db:           db,
 	}, nil
 }
@@ -3019,6 +3033,10 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
 			return
 		}
+		if rd.salt1 != pos.salt1 || rd.salt2 != pos.salt2 {
+			pw.CloseWithError(errors.New("wal changed before snapshot page copy"))
+			return
+		}
 
 		// Build a mapping of changed page numbers and their latest content.
 		maxBytes := pos.walEndOffset - WALHeaderSize
@@ -3075,6 +3093,15 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
 			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
+			return
+		}
+		hdr, err := readWALHeader(db.WALPath())
+		if err != nil {
+			pw.CloseWithError(fmt.Errorf("verify wal after snapshot page copy: %w", err))
+			return
+		}
+		if binary.BigEndian.Uint32(hdr[16:]) != pos.salt1 || binary.BigEndian.Uint32(hdr[20:]) != pos.salt2 {
+			pw.CloseWithError(errors.New("wal changed during snapshot page copy"))
 			return
 		}
 
