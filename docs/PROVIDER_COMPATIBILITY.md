@@ -408,6 +408,11 @@ replicas:
     password: password  # or use key-path
 ```
 
+IPv6 addresses in URLs must be enclosed in brackets, for example
+`sftp://username@[2001:db8::1]/path`. Port 22 is used when omitted; specify a
+different port after the closing bracket, such as
+`sftp://username@[2001:db8::1]:2222/path`.
+
 ## Configuration Reference
 
 ### S3 Query Parameters

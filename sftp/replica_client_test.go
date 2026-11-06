@@ -23,6 +23,31 @@ const (
 	versionReply = "\x00\x00\x00\x1f\x02\x00\x00\x00\x03\x00\x00\x00\x11" + fsyncExt + "\x00\x00\x00\x011"
 )
 
+func TestReplicaClient_SSHAddr(t *testing.T) {
+	for _, tt := range []struct {
+		host string
+		want string
+	}{
+		{host: "example.com", want: "example.com:22"},
+		{host: "example.com:2222", want: "example.com:2222"},
+		{host: "127.0.0.1", want: "127.0.0.1:22"},
+		{host: "127.0.0.1:2222", want: "127.0.0.1:2222"},
+		{host: "::1", want: "[::1]:22"},
+		{host: "[::1]", want: "[::1]:22"},
+		{host: "[::1]:2222", want: "[::1]:2222"},
+		{host: "[fe80::1%eth0]", want: "[fe80::1%eth0]:22"},
+		{host: "[fe80::1%eth0]:2222", want: "[fe80::1%eth0]:2222"},
+	} {
+		t.Run(tt.host, func(t *testing.T) {
+			c := NewReplicaClient()
+			c.Host = tt.host
+			if got := c.sshAddr(); got != tt.want {
+				t.Fatalf("sshAddr()=%q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestReplicaClient_WriteLTXFile_Fsync(t *testing.T) {
 	hdr := ltx.Header{Version: ltx.Version, PageSize: 4096, Commit: 1, MinTXID: 1, MaxTXID: 1, Timestamp: time.Now().UnixMilli()}
 	data, _ := hdr.MarshalBinary()
