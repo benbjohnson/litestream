@@ -18,6 +18,15 @@ instructions and documentation.
 If you find this project interesting, please consider starring the project on
 GitHub.
 
+File replica URLs
+-----------------
+
+File replica URLs use URL path escaping. For example,
+`file:///backups/daily%20backup` refers to `/backups/daily backup`. Unicode paths
+are supported as well. Encode a literal percent sign as `%25`: a directory
+named `/backups/daily%20backup` is addressed by
+`file:///backups/daily%2520backup`.
+
 Source database changes
 -----------------------
 

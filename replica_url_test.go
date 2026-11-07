@@ -845,6 +845,45 @@ func TestCleanReplicaURLPath(t *testing.T) {
 	}
 }
 
+func TestParseReplicaURL_FilePath(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		url  string
+		path string
+	}{
+		{name: "Plain", url: "file:///backups/db", path: "/backups/db"},
+		{name: "Space", url: "file:///backups/daily backup", path: "/backups/daily backup"},
+		{name: "EscapedSpace", url: "file:///backups/daily%20backup", path: "/backups/daily backup"},
+		{name: "Unicode", url: "file:///backups/备份", path: "/backups/备份"},
+		{name: "EscapedUnicode", url: "file:///backups/%E5%A4%87%E4%BB%BD", path: "/backups/备份"},
+		{name: "ReservedCharacters", url: "file:///backups/db%23%3F%25", path: "/backups/db#?%"},
+		{name: "DecodeOnce", url: "file:///backups/db%2520", path: "/backups/db%20"},
+		{name: "Plus", url: "file:///backups/db+1", path: "/backups/db+1"},
+		{name: "EscapedSlash", url: "file:///backups/daily%2Fdb", path: "/backups/daily/db"},
+		{name: "Query", url: "file:///backups/daily%20backup?ignored=value", path: "/backups/daily backup"},
+		{name: "PlainHost", url: "file://backups/db", path: "/backups/db"},
+		{name: "Host", url: "file://backups/daily%20backup", path: "/backups/daily backup"},
+		{name: "Empty", url: "file://", path: "."},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme, host, path, query, userinfo, err := litestream.ParseReplicaURLWithQuery(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scheme != "file" || host != "" || path != tt.path || query != nil || userinfo != nil {
+				t.Fatalf("ParseReplicaURLWithQuery() = (%q, %q, %q, %v, %v), want (file, empty, %q, nil, nil)", scheme, host, path, query, userinfo, tt.path)
+			}
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.(*file.ReplicaClient).Path(); got != tt.path {
+				t.Fatalf("file replica path = %q, want %q", got, tt.path)
+			}
+		})
+	}
+}
+
 func TestParseS3AccessPointURL(t *testing.T) {
 	tests := []struct {
 		name       string

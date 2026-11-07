@@ -97,7 +97,13 @@ func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url
 		scheme, u.Scheme = u.Scheme, ""
 		// Remove query params from path for file URLs
 		u.RawQuery = ""
-		return scheme, "", path.Clean(u.String()), nil, nil, nil
+		// String re-escapes the filesystem path, so decode it before passing it
+		// to the file replica client. Decode once to preserve literal escapes.
+		urlPath, err := url.PathUnescape(u.String())
+		if err != nil {
+			return "", "", "", nil, nil, err
+		}
+		return scheme, "", path.Clean(urlPath), nil, nil, nil
 
 	case "":
 		return u.Scheme, u.Host, u.Path, nil, nil, fmt.Errorf("replica url scheme required: %s", s)
