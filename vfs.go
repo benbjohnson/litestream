@@ -2168,7 +2168,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 
 	// Apply synced pages to hydrated file if hydration is complete
 	// Must be done before clearing f.dirty since we need the page offsets
-	if f.hydrator != nil && f.hydrator.Complete() {
+	if f.hydrator != nil && (f.hydrator.Complete() || f.hydrationReady) {
 		if err := f.applySyncedPagesToHydratedFile(); err != nil {
 			f.logger.Error("failed to apply synced pages to hydrated file", "error", err)
 			// Don't fail the sync - hydration will catch up on next poll
