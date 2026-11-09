@@ -50,6 +50,8 @@ archives:
     files:
       - etc/litestream.yml
       - etc/litestream.service
+      - etc/litestream-hardening.conf.example
+      - docs/SYSTEMD.md
       - README.md
       - LICENSE
 
@@ -69,6 +71,10 @@ nfpms:
       - src: etc/litestream.service
         dst: /lib/systemd/system/litestream.service
         type: config
+      - src: etc/litestream-hardening.conf.example
+        dst: /usr/share/doc/litestream/examples/litestream-hardening.conf.example
+      - src: docs/SYSTEMD.md
+        dst: /usr/share/doc/litestream/SYSTEMD.md
     bindir: /usr/bin
     file_name_template: >-
       {{ .ProjectName }}-
