@@ -623,10 +623,8 @@ const stdinConfigPath = "-"
 // default config path is used. If configPath is "-" then config is read from STDIN.
 // If expandEnv is true then environment variables are expanded in the config.
 func ReadConfig(configPath string, expandEnv bool) (Config, error) {
-	switch configPath {
-	case "":
-		configPath = DefaultConfigPath()
-	case stdinConfigPath:
+	configPath, _ = resolveConfigPath(configPath)
+	if configPath == stdinConfigPath {
 		return ParseConfig(os.Stdin, expandEnv)
 	}
 	return ReadConfigFile(configPath, expandEnv)

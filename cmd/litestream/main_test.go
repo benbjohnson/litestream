@@ -126,6 +126,20 @@ dbs:
 		}
 	})
 
+	t.Run("ReadsFromStdinSelectedByEnv", func(t *testing.T) {
+		t.Setenv("LITESTREAM_CONFIG", "-")
+		withStdin(t, "dbs:\n  - path: /tmp/env-stdin-db\n")
+
+		config, err := main.ReadConfig("", true)
+		if err != nil {
+			t.Fatal(err)
+		} else if got, want := len(config.DBs), 1; got != want {
+			t.Fatalf("len(DBs)=%v, want %v", got, want)
+		} else if got, want := config.DBs[0].Path, "/tmp/env-stdin-db"; got != want {
+			t.Fatalf("DB.Path=%v, want %v", got, want)
+		}
+	})
+
 	t.Run("ReadsFromFile", func(t *testing.T) {
 		configPath := filepath.Join(t.TempDir(), "litestream.yml")
 		if err := os.WriteFile(configPath, []byte("dbs:\n  - path: /tmp/db\n"), 0o600); err != nil {
