@@ -241,8 +241,6 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 	if v := os.Getenv("AWS_SESSION_TOKEN"); v != "" {
 		client.SessionToken = v
-	} else if v := os.Getenv("LITESTREAM_SESSION_TOKEN"); v != "" {
-		client.SessionToken = v
 	}
 
 	if endpoint == "" {

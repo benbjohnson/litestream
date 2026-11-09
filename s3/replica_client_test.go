@@ -2848,6 +2848,60 @@ func TestNewReplicaClientFromURL_InvalidUploadParams(t *testing.T) {
 	}
 }
 
+func TestNewReplicaClientFromURL_SessionToken(t *testing.T) {
+	for _, tt := range []struct {
+		name       string
+		awsToken   string
+		otherToken string
+		want       string
+	}{
+		{name: "Standard", awsToken: "aws-token", want: "aws-token"},
+		{name: "UnsupportedAlias", otherToken: "other-token"},
+		{name: "StandardWithAlias", awsToken: "aws-token", otherToken: "other-token", want: "aws-token"},
+		{name: "NoToken"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("AWS_ACCESS_KEY_ID", "test-access-key")
+			t.Setenv("AWS_SECRET_ACCESS_KEY", "test-secret-key")
+			t.Setenv("AWS_SESSION_TOKEN", tt.awsToken)
+			t.Setenv("LITESTREAM_SESSION_TOKEN", tt.otherToken)
+
+			headers := make(chan http.Header, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				defer r.Body.Close()
+				_, _ = io.Copy(io.Discard, r.Body)
+				headers <- r.Header.Clone()
+				w.Header().Set("ETag", `"test-etag"`)
+			}))
+			defer server.Close()
+
+			replica, err := litestream.NewReplicaClientFromURL("s3://test-bucket/replica")
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := replica.(*ReplicaClient)
+			if client.SessionToken != tt.want {
+				t.Fatalf("SessionToken = %q, want %q", client.SessionToken, tt.want)
+			}
+			client.Region = "us-east-1"
+			client.Endpoint = server.URL
+			client.ForcePathStyle = true
+			ctx := context.Background()
+			if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(mustLTX(t))); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case hdr := <-headers:
+				if got := hdr.Get("X-Amz-Security-Token"); got != tt.want {
+					t.Fatalf("X-Amz-Security-Token = %q, want %q", got, tt.want)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("timeout waiting for upload")
+			}
+		})
+	}
+}
+
 func TestNewReplicaClientFromURL_EndpointEnvVar(t *testing.T) {
 	tests := []struct {
 		name               string
