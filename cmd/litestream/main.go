@@ -139,49 +139,72 @@ func (m *Main) Run(ctx context.Context, args []string) (err error) {
 		cmd, args = args[0], args[1:]
 	}
 
-	switch cmd {
-	case "databases":
+	switch {
+	case cmd == "":
+		m.Usage()
+		return flag.ErrHelp
+	case cmd == "databases":
 		return (&DatabasesCommand{}).Run(ctx, args)
-	case "replicate":
+	case cmd == "replicate":
 		return m.runReplicate(ctx, args)
 
-	case "start":
+	case cmd == "start":
 		return (&StartCommand{}).Run(ctx, args)
-	case "stop":
+	case cmd == "stop":
 		return (&StopCommand{}).Run(ctx, args)
-	case "register":
+	case cmd == "register":
 		return (&RegisterCommand{}).Run(ctx, args)
-	case "unregister":
+	case cmd == "unregister":
 		return (&UnregisterCommand{}).Run(ctx, args)
-	case "reset":
+	case cmd == "reset":
 		return (&ResetCommand{}).Run(ctx, args)
-	case "restore":
+	case cmd == "restore":
 		return (&RestoreCommand{}).Run(ctx, args)
-	case "status":
+	case cmd == "status":
 		return (&StatusCommand{}).Run(ctx, args)
-	case "sync":
+	case cmd == "sync":
 		return (&SyncCommand{}).Run(ctx, args)
-	case "list":
+	case cmd == "list":
 		return (&ListCommand{}).Run(ctx, args)
-	case "info":
+	case cmd == "info":
 		return (&InfoCommand{}).Run(ctx, args)
-	case "version":
+	case cmd == "version":
 		return (&VersionCommand{}).Run(ctx, args)
-	case "ltx":
+	case cmd == "ltx":
 		return (&LTXCommand{}).Run(ctx, args)
-	case "wal":
+	case cmd == "wal":
 		// Deprecated: Keep for backward compatibility
 		fmt.Fprintln(os.Stderr, "Warning: 'wal' command is deprecated, please use 'ltx' instead")
 		return (&LTXCommand{}).Run(ctx, args)
+
+	// Handle help and invalid input after dispatching commands.
+	case cmd == "help", cmd == "-h", cmd == "-help", cmd == "--help":
+		m.Usage()
+		return nil
+	case strings.HasPrefix(cmd, "-"):
+		return misplacedFlagError(cmd)
 	default:
-		if cmd == "help" || cmd == "-h" || cmd == "-help" || cmd == "--help" {
-			m.Usage()
-			return nil
-		} else if cmd == "" || strings.HasPrefix(cmd, "-") {
-			m.Usage()
-			return flag.ErrHelp
-		}
 		return fmt.Errorf("litestream %s: unknown command", cmd)
+	}
+}
+
+// misplacedFlagError returns a usage error for a flag that appears before the
+// subcommand, e.g. "litestream -config c.yml databases". Only the subcommands
+// parse flags, so the hint shows where the flag belongs rather than guessing
+// the intended command. Shell aliases that lead with -config are pointed at
+// LITESTREAM_CONFIG, which works in any position.
+func misplacedFlagError(arg string) error {
+	name := strings.TrimLeft(strings.SplitN(arg, "=", 2)[0], "-")
+	if name == "config" {
+		return &usageError{
+			message: "flags must come after the subcommand",
+			hint: "litestream <command> -config PATH\n" +
+				" or: LITESTREAM_CONFIG=PATH litestream <command>",
+		}
+	}
+	return &usageError{
+		message: "flags must come after the subcommand",
+		hint:    "litestream <command> [flags]",
 	}
 }
 
