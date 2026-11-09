@@ -1,0 +1,9 @@
+[Service]
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/myapp /var/lib/litestream
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictRealtime=true

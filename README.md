@@ -15,6 +15,8 @@ If you need support or have ideas for improving Litestream, please visit
 Please visit the [Litestream web site](https://litestream.io) for installation
 instructions and documentation.
 
+For optional service confinement, see the [systemd hardening guide](docs/SYSTEMD.md).
+
 If you find this project interesting, please consider starring the project on
 GitHub.
 
