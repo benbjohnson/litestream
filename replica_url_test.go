@@ -1,6 +1,12 @@
 package litestream_test
 
 import (
+	"bytes"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -843,6 +849,128 @@ func TestCleanReplicaURLPath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestParseReplicaURL_FilePath(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		url  string
+		path string
+	}{
+		{name: "Plain", url: "file:///backups/db", path: "/backups/db"},
+		{name: "Space", url: "file:///backups/daily backup", path: "/backups/daily backup"},
+		{name: "EscapedSpace", url: "file:///backups/daily%20backup", path: "/backups/daily backup"},
+		{name: "Unicode", url: "file:///backups/备份", path: "/backups/备份"},
+		{name: "EscapedUnicode", url: "file:///backups/%E5%A4%87%E4%BB%BD", path: "/backups/备份"},
+		{name: "ReservedCharacters", url: "file:///backups/db%23%3F%25", path: "/backups/db#?%"},
+		{name: "DecodeOnce", url: "file:///backups/db%2520", path: "/backups/db%20"},
+		{name: "Plus", url: "file:///backups/db+1", path: "/backups/db+1"},
+		{name: "EscapedSlash", url: "file:///backups/daily%2Fdb", path: "/backups/daily/db"},
+		{name: "Query", url: "file:///backups/daily%20backup?ignored=value", path: "/backups/daily backup"},
+		{name: "PlainHost", url: "file://backups/db", path: "/backups/db"},
+		{name: "Host", url: "file://backups/daily%20backup", path: "/backups/daily backup"},
+		{name: "Empty", url: "file://", path: "."},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme, host, path, query, userinfo, err := litestream.ParseReplicaURLWithQuery(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scheme != "file" || host != "" || path != tt.path || query != nil || userinfo != nil {
+				t.Fatalf("ParseReplicaURLWithQuery() = (%q, %q, %q, %v, %v), want (file, empty, %q, nil, nil)", scheme, host, path, query, userinfo, tt.path)
+			}
+			client, err := litestream.NewReplicaClientFromURL(tt.url)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := client.(*file.ReplicaClient).Path(); got != tt.path {
+				t.Fatalf("file replica path = %q, want %q", got, tt.path)
+			}
+		})
+	}
+}
+
+func TestResolveLegacyFileReplicaPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file URLs in this test use POSIX paths")
+	}
+
+	setup := func(t *testing.T, createLegacy, createDecoded bool) (rawURL, decoded, legacy string) {
+		t.Helper()
+		dir := t.TempDir()
+		decoded = filepath.Join(dir, "daily backup")
+		legacy = filepath.Join(dir, "daily%20backup")
+		for _, tt := range []struct {
+			create bool
+			path   string
+		}{{createLegacy, legacy}, {createDecoded, decoded}} {
+			if tt.create {
+				if err := os.Mkdir(tt.path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return "file://" + decoded, decoded, legacy
+	}
+
+	t.Run("NeitherExists", func(t *testing.T) {
+		_, decoded, legacy := setup(t, false, false)
+		if got, err := litestream.ResolveLegacyFileReplicaPath(nil, decoded, legacy); err != nil {
+			t.Fatal(err)
+		} else if got != decoded {
+			t.Fatalf("path = %q, want %q", got, decoded)
+		}
+	})
+
+	t.Run("DecodedExists", func(t *testing.T) {
+		_, decoded, legacy := setup(t, false, true)
+		if got, err := litestream.ResolveLegacyFileReplicaPath(nil, decoded, legacy); err != nil {
+			t.Fatal(err)
+		} else if got != decoded {
+			t.Fatalf("path = %q, want %q", got, decoded)
+		}
+	})
+
+	t.Run("LegacyExists", func(t *testing.T) {
+		rawURL, decoded, legacy := setup(t, true, false)
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		if got, err := litestream.ResolveLegacyFileReplicaPath(logger, decoded, legacy); err != nil {
+			t.Fatal(err)
+		} else if got != legacy {
+			t.Fatalf("path = %q, want %q", got, legacy)
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"level=WARN",
+			"legacy file replica path detected",
+			"path=" + legacy,
+			`expected="` + decoded + `"`,
+			`command="mv '` + legacy + `' '` + decoded + `'"`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("log output missing %q:\n%s", want, out)
+			}
+		}
+
+		client, err := litestream.NewReplicaClientFromURL(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		} else if got := client.(*file.ReplicaClient).Path(); got != legacy {
+			t.Fatalf("file replica path = %q, want %q", got, legacy)
+		}
+	})
+
+	t.Run("BothExist", func(t *testing.T) {
+		rawURL, decoded, legacy := setup(t, true, true)
+		_, err := litestream.ResolveLegacyFileReplicaPath(nil, decoded, legacy)
+		if err == nil || !strings.Contains(err.Error(), "both exist") {
+			t.Fatalf("expected both-exist error, got %v", err)
+		}
+		if _, err := litestream.NewReplicaClientFromURL(rawURL); err == nil {
+			t.Fatal("expected NewReplicaClientFromURL error")
+		}
+	})
 }
 
 func TestParseS3AccessPointURL(t *testing.T) {
