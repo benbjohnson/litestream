@@ -1,7 +1,9 @@
 package litestream
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/url"
 	"os"
@@ -109,18 +111,21 @@ func ResolveLegacyFileReplicaPath(logger *slog.Logger, filePath, legacyPath stri
 		return filePath, nil
 	}
 
-	legacyExists, err := pathExists(legacyPath)
-	if err != nil {
-		return "", err
-	} else if !legacyExists {
+	if _, err := os.Stat(legacyPath); errors.Is(err, fs.ErrNotExist) {
 		return filePath, nil
+	} else if err != nil {
+		return "", err
 	}
 
-	exists, err := pathExists(filePath)
-	if err != nil {
-		return "", err
-	} else if exists {
+	if _, err := os.Stat(filePath); err == nil {
 		return "", fmt.Errorf("file replica directories %q and %q both exist: earlier versions of litestream wrote to %q; merge or remove one of them", filePath, legacyPath, legacyPath)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", err
+	}
+
+	command := fmt.Sprintf(`move "%s" "%s"`, legacyPath, filePath)
+	if runtime.GOOS != "windows" {
+		command = fmt.Sprintf("mv '%s' '%s'", strings.ReplaceAll(legacyPath, "'", `'\''`), strings.ReplaceAll(filePath, "'", `'\''`))
 	}
 
 	if logger == nil {
@@ -129,28 +134,8 @@ func ResolveLegacyFileReplicaPath(logger *slog.Logger, filePath, legacyPath stri
 	logger.Warn("legacy file replica path detected; rename it to remove this warning",
 		slog.String("path", legacyPath),
 		slog.String("expected", filePath),
-		slog.String("command", renameCommand(legacyPath, filePath)))
+		slog.String("command", command))
 	return legacyPath, nil
-}
-
-func pathExists(name string) (bool, error) {
-	if _, err := os.Stat(name); os.IsNotExist(err) {
-		return false, nil
-	} else if err != nil {
-		return false, err
-	}
-	return true, nil
-}
-
-func renameCommand(from, to string) string {
-	if runtime.GOOS == "windows" {
-		return fmt.Sprintf(`move "%s" "%s"`, from, to)
-	}
-	return fmt.Sprintf("mv %s %s", shellQuote(from), shellQuote(to))
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // ReplicaTypeFromURL returns the replica type from a URL string.
