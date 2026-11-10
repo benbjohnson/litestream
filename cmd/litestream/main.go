@@ -1472,7 +1472,12 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 		if legacyPath, err = expand(legacyPath); err != nil {
 			return nil, err
 		}
-		if configPath, err = litestream.ResolveLegacyFileReplicaPath(configPath, legacyPath); err != nil {
+		logger := slog.Default()
+		if r != nil && r.DB() != nil {
+			logger = r.DB().Logger
+		}
+		logger = logger.With("replica", file.ReplicaClientType)
+		if configPath, err = litestream.ResolveLegacyFileReplicaPath(logger, configPath, legacyPath); err != nil {
 			return nil, err
 		}
 	}

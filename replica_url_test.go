@@ -1,6 +1,8 @@
 package litestream_test
 
 import (
+	"bytes"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -913,7 +915,7 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 
 	t.Run("NeitherExists", func(t *testing.T) {
 		rawURL, decoded, _ := setup(t, false, false)
-		if got, err := litestream.ResolveFileReplicaURLPath(rawURL); err != nil {
+		if got, err := litestream.ResolveFileReplicaURLPath(nil, rawURL); err != nil {
 			t.Fatal(err)
 		} else if got != decoded {
 			t.Fatalf("path = %q, want %q", got, decoded)
@@ -922,7 +924,7 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 
 	t.Run("DecodedExists", func(t *testing.T) {
 		rawURL, decoded, _ := setup(t, false, true)
-		if got, err := litestream.ResolveFileReplicaURLPath(rawURL); err != nil {
+		if got, err := litestream.ResolveFileReplicaURLPath(nil, rawURL); err != nil {
 			t.Fatal(err)
 		} else if got != decoded {
 			t.Fatalf("path = %q, want %q", got, decoded)
@@ -930,11 +932,25 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 	})
 
 	t.Run("LegacyExists", func(t *testing.T) {
-		rawURL, _, legacy := setup(t, true, false)
-		if got, err := litestream.ResolveFileReplicaURLPath(rawURL); err != nil {
+		rawURL, decoded, legacy := setup(t, true, false)
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, nil))
+		if got, err := litestream.ResolveFileReplicaURLPath(logger, rawURL); err != nil {
 			t.Fatal(err)
 		} else if got != legacy {
 			t.Fatalf("path = %q, want %q", got, legacy)
+		}
+		out := buf.String()
+		for _, want := range []string{
+			"level=WARN",
+			"legacy file replica path detected",
+			"path=" + legacy,
+			`expected="` + decoded + `"`,
+			`command="mv '` + legacy + `' '` + decoded + `'"`,
+		} {
+			if !strings.Contains(out, want) {
+				t.Fatalf("log output missing %q:\n%s", want, out)
+			}
 		}
 
 		client, err := litestream.NewReplicaClientFromURL(rawURL)
@@ -947,7 +963,7 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 
 	t.Run("BothExist", func(t *testing.T) {
 		rawURL, _, _ := setup(t, true, true)
-		_, err := litestream.ResolveFileReplicaURLPath(rawURL)
+		_, err := litestream.ResolveFileReplicaURLPath(nil, rawURL)
 		if err == nil || !strings.Contains(err.Error(), "both exist") {
 			t.Fatalf("expected both-exist error, got %v", err)
 		}

@@ -53,7 +53,7 @@ func NewReplicaClientFromURL(rawURL string) (ReplicaClient, error) {
 	}
 
 	if scheme == "file" {
-		if urlPath, err = ResolveFileReplicaURLPath(rawURL); err != nil {
+		if urlPath, err = ResolveFileReplicaURLPath(slog.Default(), rawURL); err != nil {
 			return nil, err
 		}
 	}
@@ -90,20 +90,21 @@ func fileReplicaURLPaths(u *url.URL) (filePath, legacyPath string, err error) {
 
 // ResolveFileReplicaURLPath returns the filesystem path for a file replica URL.
 // Earlier versions wrote to the escaped form of the path, so an existing
-// directory at that location is still used, with a warning, until it is renamed.
-func ResolveFileReplicaURLPath(s string) (string, error) {
+// directory at that location is still used, with a warning logged to logger,
+// until it is renamed.
+func ResolveFileReplicaURLPath(logger *slog.Logger, s string) (string, error) {
 	filePath, legacyPath, err := ParseFileReplicaURL(s)
 	if err != nil {
 		return "", err
 	}
-	return ResolveLegacyFileReplicaPath(filePath, legacyPath)
+	return ResolveLegacyFileReplicaPath(logger, filePath, legacyPath)
 }
 
 // ResolveLegacyFileReplicaPath chooses between the decoded file replica path
 // and the escaped path used by earlier versions. The legacy path is returned,
 // with a warning describing how to rename it, only when it exists and the
 // decoded path does not. Both existing is an error.
-func ResolveLegacyFileReplicaPath(filePath, legacyPath string) (string, error) {
+func ResolveLegacyFileReplicaPath(logger *slog.Logger, filePath, legacyPath string) (string, error) {
 	if filePath == legacyPath {
 		return filePath, nil
 	}
@@ -122,10 +123,13 @@ func ResolveLegacyFileReplicaPath(filePath, legacyPath string) (string, error) {
 		return "", fmt.Errorf("file replica directories %q and %q both exist: earlier versions of litestream wrote to %q; merge or remove one of them", filePath, legacyPath, legacyPath)
 	}
 
-	slog.Warn("file replica uses directory name from earlier litestream version; rename it to remove this warning",
-		"path", legacyPath,
-		"expected", filePath,
-		"command", renameCommand(legacyPath, filePath))
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Warn("legacy file replica path detected; rename it to remove this warning",
+		slog.String("path", legacyPath),
+		slog.String("expected", filePath),
+		slog.String("command", renameCommand(legacyPath, filePath)))
 	return legacyPath, nil
 }
 
