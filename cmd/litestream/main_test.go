@@ -429,6 +429,36 @@ func TestNewFileReplicaFromConfig(t *testing.T) {
 	}
 }
 
+func TestNewFileReplicaFromConfig_LegacyEscapedURLPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file URLs in this test use POSIX paths")
+	}
+
+	dir := t.TempDir()
+	decoded := filepath.Join(dir, "daily backup")
+	legacy := filepath.Join(dir, "daily%20backup")
+	if err := os.Mkdir(legacy, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "file://" + decoded}, nil)
+	if err != nil {
+		t.Fatal(err)
+	} else if got := r.Client.(*file.ReplicaClient).Path(); got != legacy {
+		t.Fatalf("Path=%s, want %s", got, legacy)
+	}
+
+	if err := os.Rename(legacy, decoded); err != nil {
+		t.Fatal(err)
+	}
+	r, err = main.NewReplicaFromConfig(&main.ReplicaConfig{URL: "file://" + decoded}, nil)
+	if err != nil {
+		t.Fatal(err)
+	} else if got := r.Client.(*file.ReplicaClient).Path(); got != decoded {
+		t.Fatalf("Path=%s, want %s", got, decoded)
+	}
+}
+
 func TestNewS3ReplicaFromConfig(t *testing.T) {
 	t.Run("ExplicitTypeWithEndpointLikeURL", func(t *testing.T) {
 		c := &main.ReplicaConfig{

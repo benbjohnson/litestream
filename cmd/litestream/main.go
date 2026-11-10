@@ -1451,9 +1451,9 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	}
 
 	// Parse configPath from URL, if specified.
-	configPath := c.Path
+	configPath, legacyPath := c.Path, ""
 	if c.URL != "" {
-		if _, _, configPath, err = litestream.ParseReplicaURL(c.URL); err != nil {
+		if configPath, legacyPath, err = litestream.ParseFileReplicaURL(c.URL); err != nil {
 			return nil, err
 		}
 	}
@@ -1466,6 +1466,15 @@ func newFileReplicaClientFromConfig(c *ReplicaConfig, r *litestream.Replica) (_ 
 	// Expand home prefix and return absolute path.
 	if configPath, err = expand(configPath); err != nil {
 		return nil, err
+	}
+
+	if legacyPath != "" {
+		if legacyPath, err = expand(legacyPath); err != nil {
+			return nil, err
+		}
+		if configPath, err = litestream.ResolveLegacyFileReplicaPath(configPath, legacyPath); err != nil {
+			return nil, err
+		}
 	}
 
 	// Instantiate replica and apply time fields, if set.

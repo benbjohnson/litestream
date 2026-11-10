@@ -2,9 +2,12 @@ package litestream
 
 import (
 	"fmt"
+	"log/slog"
 	"net/url"
+	"os"
 	"path"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -49,7 +52,101 @@ func NewReplicaClientFromURL(rawURL string) (ReplicaClient, error) {
 		return nil, fmt.Errorf("unsupported replica URL scheme: %q", scheme)
 	}
 
+	if scheme == "file" {
+		if urlPath, err = ResolveFileReplicaURLPath(rawURL); err != nil {
+			return nil, err
+		}
+	}
+
 	return factory(scheme, host, urlPath, query, userinfo)
+}
+
+// ParseFileReplicaURL returns the filesystem path for a file replica URL and
+// the path that versions before URL decoding used for the same URL. The two
+// differ only when the URL contains characters that require escaping.
+func ParseFileReplicaURL(s string) (filePath, legacyPath string, err error) {
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", "", err
+	}
+	if u.Scheme != "file" {
+		return "", "", fmt.Errorf("file replica url required: %s", s)
+	}
+	return fileReplicaURLPaths(u)
+}
+
+func fileReplicaURLPaths(u *url.URL) (filePath, legacyPath string, err error) {
+	u.Scheme = ""
+	u.RawQuery = ""
+	// String re-escapes the filesystem path, so decode it before passing it
+	// to the file replica client. Decode once to preserve literal escapes.
+	escaped := u.String()
+	decoded, err := url.PathUnescape(escaped)
+	if err != nil {
+		return "", "", err
+	}
+	return path.Clean(decoded), path.Clean(escaped), nil
+}
+
+// ResolveFileReplicaURLPath returns the filesystem path for a file replica URL.
+// Earlier versions wrote to the escaped form of the path, so an existing
+// directory at that location is still used, with a warning, until it is renamed.
+func ResolveFileReplicaURLPath(s string) (string, error) {
+	filePath, legacyPath, err := ParseFileReplicaURL(s)
+	if err != nil {
+		return "", err
+	}
+	return ResolveLegacyFileReplicaPath(filePath, legacyPath)
+}
+
+// ResolveLegacyFileReplicaPath chooses between the decoded file replica path
+// and the escaped path used by earlier versions. The legacy path is returned,
+// with a warning describing how to rename it, only when it exists and the
+// decoded path does not. Both existing is an error.
+func ResolveLegacyFileReplicaPath(filePath, legacyPath string) (string, error) {
+	if filePath == legacyPath {
+		return filePath, nil
+	}
+
+	legacyExists, err := pathExists(legacyPath)
+	if err != nil {
+		return "", err
+	} else if !legacyExists {
+		return filePath, nil
+	}
+
+	exists, err := pathExists(filePath)
+	if err != nil {
+		return "", err
+	} else if exists {
+		return "", fmt.Errorf("file replica directories %q and %q both exist: earlier versions of litestream wrote to %q; merge or remove one of them", filePath, legacyPath, legacyPath)
+	}
+
+	slog.Warn("file replica uses directory name from earlier litestream version; rename it to remove this warning",
+		"path", legacyPath,
+		"expected", filePath,
+		"command", renameCommand(legacyPath, filePath))
+	return legacyPath, nil
+}
+
+func pathExists(name string) (bool, error) {
+	if _, err := os.Stat(name); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func renameCommand(from, to string) string {
+	if runtime.GOOS == "windows" {
+		return fmt.Sprintf(`move "%s" "%s"`, from, to)
+	}
+	return fmt.Sprintf("mv %s %s", shellQuote(from), shellQuote(to))
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // ReplicaTypeFromURL returns the replica type from a URL string.
@@ -94,16 +191,11 @@ func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url
 
 	switch u.Scheme {
 	case "file":
-		scheme, u.Scheme = u.Scheme, ""
-		// Remove query params from path for file URLs
-		u.RawQuery = ""
-		// String re-escapes the filesystem path, so decode it before passing it
-		// to the file replica client. Decode once to preserve literal escapes.
-		urlPath, err := url.PathUnescape(u.String())
+		filePath, _, err := fileReplicaURLPaths(u)
 		if err != nil {
 			return "", "", "", nil, nil, err
 		}
-		return scheme, "", path.Clean(urlPath), nil, nil, nil
+		return "file", "", filePath, nil, nil, nil
 
 	case "":
 		return u.Scheme, u.Host, u.Path, nil, nil, fmt.Errorf("replica url scheme required: %s", s)

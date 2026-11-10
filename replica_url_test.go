@@ -1,6 +1,10 @@
 package litestream_test
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/benbjohnson/litestream"
@@ -882,6 +886,75 @@ func TestParseReplicaURL_FilePath(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestResolveFileReplicaURLPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file URLs in this test use POSIX paths")
+	}
+
+	setup := func(t *testing.T, createLegacy, createDecoded bool) (rawURL, decoded, legacy string) {
+		t.Helper()
+		dir := t.TempDir()
+		decoded = filepath.Join(dir, "daily backup")
+		legacy = filepath.Join(dir, "daily%20backup")
+		for _, tt := range []struct {
+			create bool
+			path   string
+		}{{createLegacy, legacy}, {createDecoded, decoded}} {
+			if tt.create {
+				if err := os.Mkdir(tt.path, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		return "file://" + decoded, decoded, legacy
+	}
+
+	t.Run("NeitherExists", func(t *testing.T) {
+		rawURL, decoded, _ := setup(t, false, false)
+		if got, err := litestream.ResolveFileReplicaURLPath(rawURL); err != nil {
+			t.Fatal(err)
+		} else if got != decoded {
+			t.Fatalf("path = %q, want %q", got, decoded)
+		}
+	})
+
+	t.Run("DecodedExists", func(t *testing.T) {
+		rawURL, decoded, _ := setup(t, false, true)
+		if got, err := litestream.ResolveFileReplicaURLPath(rawURL); err != nil {
+			t.Fatal(err)
+		} else if got != decoded {
+			t.Fatalf("path = %q, want %q", got, decoded)
+		}
+	})
+
+	t.Run("LegacyExists", func(t *testing.T) {
+		rawURL, _, legacy := setup(t, true, false)
+		if got, err := litestream.ResolveFileReplicaURLPath(rawURL); err != nil {
+			t.Fatal(err)
+		} else if got != legacy {
+			t.Fatalf("path = %q, want %q", got, legacy)
+		}
+
+		client, err := litestream.NewReplicaClientFromURL(rawURL)
+		if err != nil {
+			t.Fatal(err)
+		} else if got := client.(*file.ReplicaClient).Path(); got != legacy {
+			t.Fatalf("file replica path = %q, want %q", got, legacy)
+		}
+	})
+
+	t.Run("BothExist", func(t *testing.T) {
+		rawURL, _, _ := setup(t, true, true)
+		_, err := litestream.ResolveFileReplicaURLPath(rawURL)
+		if err == nil || !strings.Contains(err.Error(), "both exist") {
+			t.Fatalf("expected both-exist error, got %v", err)
+		}
+		if _, err := litestream.NewReplicaClientFromURL(rawURL); err == nil {
+			t.Fatal("expected NewReplicaClientFromURL error")
+		}
+	})
 }
 
 func TestParseS3AccessPointURL(t *testing.T) {
