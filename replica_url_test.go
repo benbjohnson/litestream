@@ -890,7 +890,7 @@ func TestParseReplicaURL_FilePath(t *testing.T) {
 	}
 }
 
-func TestResolveFileReplicaURLPath(t *testing.T) {
+func TestResolveLegacyFileReplicaPath(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("file URLs in this test use POSIX paths")
 	}
@@ -914,8 +914,8 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 	}
 
 	t.Run("NeitherExists", func(t *testing.T) {
-		rawURL, decoded, _ := setup(t, false, false)
-		if got, err := litestream.ResolveFileReplicaURLPath(nil, rawURL); err != nil {
+		_, decoded, legacy := setup(t, false, false)
+		if got, err := litestream.ResolveLegacyFileReplicaPath(nil, decoded, legacy); err != nil {
 			t.Fatal(err)
 		} else if got != decoded {
 			t.Fatalf("path = %q, want %q", got, decoded)
@@ -923,8 +923,8 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 	})
 
 	t.Run("DecodedExists", func(t *testing.T) {
-		rawURL, decoded, _ := setup(t, false, true)
-		if got, err := litestream.ResolveFileReplicaURLPath(nil, rawURL); err != nil {
+		_, decoded, legacy := setup(t, false, true)
+		if got, err := litestream.ResolveLegacyFileReplicaPath(nil, decoded, legacy); err != nil {
 			t.Fatal(err)
 		} else if got != decoded {
 			t.Fatalf("path = %q, want %q", got, decoded)
@@ -935,7 +935,7 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 		rawURL, decoded, legacy := setup(t, true, false)
 		var buf bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&buf, nil))
-		if got, err := litestream.ResolveFileReplicaURLPath(logger, rawURL); err != nil {
+		if got, err := litestream.ResolveLegacyFileReplicaPath(logger, decoded, legacy); err != nil {
 			t.Fatal(err)
 		} else if got != legacy {
 			t.Fatalf("path = %q, want %q", got, legacy)
@@ -962,8 +962,8 @@ func TestResolveFileReplicaURLPath(t *testing.T) {
 	})
 
 	t.Run("BothExist", func(t *testing.T) {
-		rawURL, _, _ := setup(t, true, true)
-		_, err := litestream.ResolveFileReplicaURLPath(nil, rawURL)
+		rawURL, decoded, legacy := setup(t, true, true)
+		_, err := litestream.ResolveLegacyFileReplicaPath(nil, decoded, legacy)
 		if err == nil || !strings.Contains(err.Error(), "both exist") {
 			t.Fatalf("expected both-exist error, got %v", err)
 		}
