@@ -83,7 +83,7 @@ func TestLTXBehavior_NoExcessiveSnapshots(t *testing.T) {
 	t.Logf("Snapshot-on-Checkpoint Regression Test")
 	t.Logf("================================================")
 	t.Logf("Duration: %v", duration)
-	t.Logf("Snapshot interval: %v (should see 0-1 snapshots)", snapshotInterval)
+	t.Logf("Snapshot interval: %v", snapshotInterval)
 	t.Logf("Write rate: %d writes/sec (moderate)", profile.WriteRate)
 	t.Log("")
 

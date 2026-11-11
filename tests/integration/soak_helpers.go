@@ -371,13 +371,12 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 
 	var config strings.Builder
 
-	snapshotInterval := "10m"
-	snapshotRetention := "20m"
+	snapshotInterval := ProfileSnapshotInterval(shortMode).String()
+	snapshotRetention := "1m"
 	retentionCheckInterval := "5m"
 	levelIntervals := []string{"30s", "1m", "5m", "15m", "30m"}
 
 	if shortMode {
-		snapshotInterval = "30s"
 		snapshotRetention = "10m"
 		retentionCheckInterval = "2m"
 		levelIntervals = []string{"15s", "30s", "1m"}
@@ -391,6 +390,9 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	}
 
 	// Aggressive snapshot settings for testing
+	if !shortMode {
+		config.WriteString("l0-retention: 30s\n\n")
+	}
 	config.WriteString("snapshot:\n")
 	config.WriteString(fmt.Sprintf("  interval: %s\n", snapshotInterval))
 	config.WriteString(fmt.Sprintf("  retention: %s\n", snapshotRetention))

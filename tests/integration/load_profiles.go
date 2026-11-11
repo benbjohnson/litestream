@@ -148,7 +148,7 @@ func ProfileSnapshotInterval(shortMode bool) time.Duration {
 	if shortMode {
 		return 30 * time.Second
 	}
-	return 10 * time.Minute
+	return time.Minute
 }
 
 // ProfileCompactionIntervals returns compaction level intervals for test configs.
