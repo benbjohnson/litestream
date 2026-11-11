@@ -2,8 +2,8 @@ package litestream
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1047,8 +1047,8 @@ func (r *Replica) applyNewLTXFiles(ctx context.Context, f *os.File, afterTXID lt
 // To prevent concurrent SQLite readers from seeing partial updates, we acquire
 // an exclusive file lock before writing. We also rewrite the SQLite header
 // (bytes 18-19) to indicate DELETE journal mode instead of WAL mode, and
-// randomize the schema change counter (bytes 24-27) to invalidate cached
-// schemas in other connections.
+// increment the file change counter (bytes 24-27) to invalidate cached
+// pages in other connections.
 func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileInfo, pageSize uint32) error {
 	rc, err := r.Client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 	if err != nil {
@@ -1068,6 +1068,12 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 	defer internal.UnlockFile(f)
 
+	var counter [4]byte
+	if n, err := f.ReadAt(counter[:], 24); err != nil && !(err == io.EOF && n == 0) {
+		return fmt.Errorf("read change counter: %w", err)
+	}
+	binary.BigEndian.PutUint32(counter[:], binary.BigEndian.Uint32(counter[:])+1)
+
 	for {
 		var phdr ltx.PageHeader
 		data := make([]byte, pageSize)
@@ -1079,7 +1085,6 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 
 		if phdr.Pgno == 1 && len(data) >= 28 {
 			data[18], data[19] = 0x01, 0x01
-			_, _ = rand.Read(data[24:28])
 		}
 
 		off := int64(phdr.Pgno-1) * int64(pageSize)
@@ -1089,6 +1094,18 @@ func (r *Replica) applyLTXFile(ctx context.Context, f *os.File, info *ltx.FileIn
 	}
 
 	if hdr.Commit > 0 {
+		var size [4]byte
+		binary.BigEndian.PutUint32(size[:], hdr.Commit)
+		if _, err := f.WriteAt(size[:], 28); err != nil {
+			return fmt.Errorf("write database size: %w", err)
+		}
+		if _, err := f.WriteAt(counter[:], 24); err != nil {
+			return fmt.Errorf("write change counter: %w", err)
+		}
+		if _, err := f.WriteAt(counter[:], 92); err != nil {
+			return fmt.Errorf("write version-valid-for: %w", err)
+		}
+
 		if err := f.Sync(); err != nil {
 			return fmt.Errorf("sync before truncate: %w", err)
 		}

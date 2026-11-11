@@ -458,6 +458,149 @@ func TestCheckIntegrity_CorruptDB(t *testing.T) {
 	}
 }
 
+func TestApplyLTXFile_ChangeCounter(t *testing.T) {
+	const pageSize = 4096
+	for _, withPage1 := range []bool{false, true} {
+		for _, counter := range []uint32{41, ^uint32(0)} {
+			t.Run(fmt.Sprintf("page1=%t/counter=%d", withPage1, counter), func(t *testing.T) {
+				header := newSQLiteHeaderPage(pageSize)
+				binary.BigEndian.PutUint32(header[24:28], counter)
+				f := mustCreateWritableDBFile(t)
+				defer f.Close()
+				if _, err := f.WriteAt(header, 0); err != nil {
+					t.Fatal(err)
+				}
+				info := &ltx.FileInfo{Level: 0, MinTXID: 2, MaxTXID: 2}
+				data := mustBuildIncrementalLTX(t, 2, 2, pageSize, 2, 0xCD)
+				if withPage1 {
+					incoming := newSQLiteHeaderPage(pageSize)
+					incoming[18], incoming[19] = 2, 2
+					binary.BigEndian.PutUint32(incoming[24:28], counter-1)
+					data = mustBuildSnapshotLTX(t, 2, 2, pageSize, [][]byte{incoming, make([]byte, pageSize)})
+				}
+				client := &followTestReplicaClient{}
+				client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+					return io.NopCloser(bytes.NewReader(data)), nil
+				}
+				r := NewReplicaWithClient(nil, client)
+				for i := uint32(1); i <= 2; i++ {
+					if err := r.applyLTXFile(context.Background(), f, info, pageSize); err != nil {
+						t.Fatal(err)
+					}
+					if _, err := f.ReadAt(header, 0); err != nil {
+						t.Fatal(err)
+					}
+					if got := binary.BigEndian.Uint32(header[24:28]); got != counter+i {
+						t.Fatalf("change counter=%d, want %d", got, counter+i)
+					}
+					if got := binary.BigEndian.Uint32(header[92:96]); got != counter+i {
+						t.Fatalf("version-valid-for=%d, want %d", got, counter+i)
+					}
+					if got := binary.BigEndian.Uint32(header[28:32]); got != 2 {
+						t.Fatalf("database size=%d, want 2", got)
+					}
+					if header[18] != 1 || header[19] != 1 {
+						t.Fatal("expected DELETE journal mode")
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestApplyLTXFile_OpenConnection(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "source.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	if _, err := db.Exec(`PRAGMA page_size=4096; PRAGMA journal_mode=WAL; CREATE TABLE test (value TEXT); INSERT INTO test VALUES ('before'); PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := mustCreateWritableDBFile(t)
+	defer f.Close()
+	replicaData := bytes.Clone(before)
+	replicaData[18], replicaData[19] = 1, 1
+	if _, err := f.WriteAt(replicaData, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(int64(len(replicaData))); err != nil {
+		t.Fatal(err)
+	}
+	reader, err := sql.Open("sqlite", f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reader.Close()
+	conn, err := reader.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	var value string
+	if err := conn.QueryRowContext(ctx, "SELECT value FROM test").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "before" {
+		t.Fatalf("value=%q, want before", value)
+	}
+	if _, err := db.Exec(`UPDATE test SET value='after!'; PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before[:4096], after[:4096]) {
+		t.Fatal("update unexpectedly changed page 1")
+	}
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 4096, Commit: uint32(len(after) / 4096), MinTXID: 2, MaxTXID: 2}); err != nil {
+		t.Fatal(err)
+	}
+	var changed int
+	for off := 4096; off < len(after); off += 4096 {
+		if bytes.Equal(before[off:off+4096], after[off:off+4096]) {
+			continue
+		}
+		changed++
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(off/4096 + 1)}, after[off:off+4096]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if changed == 0 {
+		t.Fatal("update did not change any pages")
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	client := &followTestReplicaClient{}
+	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+		return io.NopCloser(bytes.NewReader(buf.Bytes())), nil
+	}
+	r := NewReplicaWithClient(nil, client)
+	if err := r.applyLTXFile(ctx, f, &ltx.FileInfo{MinTXID: 2, MaxTXID: 2}, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.QueryRowContext(ctx, "SELECT value FROM test").Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "after!" {
+		t.Fatalf("value=%q, want after!", value)
+	}
+}
+
 func TestApplyLTXFile_TruncatesAfterWrite(t *testing.T) {
 	const pageSize = 4096
 
