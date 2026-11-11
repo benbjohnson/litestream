@@ -372,7 +372,7 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	var config strings.Builder
 
 	snapshotInterval := "10m"
-	snapshotRetention := "1h"
+	snapshotRetention := "20m"
 	retentionCheckInterval := "5m"
 	levelIntervals := []string{"30s", "1m", "5m", "15m", "30m"}
 
