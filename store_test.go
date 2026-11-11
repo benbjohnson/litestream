@@ -79,6 +79,123 @@ func TestStore_Open_InitErrorDoesNotOpenDBs(t *testing.T) {
 	}
 }
 
+func TestStore_OpenDefersReplicaRecovery(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db")
+	sqldb := testingutil.MustOpenSQLDB(t, path)
+	defer testingutil.MustCloseSQLDB(t, sqldb)
+	_, err := sqldb.Exec(`CREATE TABLE t (v TEXT)`)
+	require.NoError(t, err)
+
+	client := file.NewReplicaClient(t.TempDir())
+	db := litestream.NewDB(path)
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	s := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}})
+	s.CompactionMonitorEnabled = false
+	s.L0RetentionCheckInterval = 0
+	defer func() {
+		db.Replica.Client = client
+		require.NoError(t, s.Close(context.Background()))
+	}()
+
+	listCalls := 0
+	syncCtx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db.Replica.Client = &mock.ReplicaClient{
+		LTXFilesFunc: func(ctx context.Context, _ int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+			listCalls++
+			cancel()
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			default:
+				return nil, errors.New("recovery did not receive the sync context")
+			}
+		},
+	}
+	require.NoError(t, s.Open(t.Context()))
+	require.Zero(t, listCalls, "Open must not list remote LTX files")
+	require.Positive(t, db.PageSize(), "Open must attach to the local WAL")
+
+	require.ErrorIs(t, db.Sync(syncCtx), context.Canceled)
+	require.Equal(t, 1, listCalls)
+	_, err = s.CompactDB(t.Context(), db, s.SnapshotLevel())
+	require.ErrorIs(t, err, litestream.ErrDBNotReady)
+
+	db.Replica.Client = client
+	require.NoError(t, db.Sync(t.Context()))
+	_, err = s.CompactDB(t.Context(), db, s.SnapshotLevel())
+	require.NoError(t, err)
+}
+
+func TestStore_CompactDBWaitsForStartupSync(t *testing.T) {
+	for _, reuse := range []bool{false, true} {
+		t.Run(fmt.Sprintf("ReuseDB=%v", reuse), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db")
+			sqldb := testingutil.MustOpenSQLDB(t, path)
+			_, err := sqldb.Exec(`CREATE TABLE t (v TEXT); INSERT INTO t VALUES ('original')`)
+			require.NoError(t, err)
+			client := file.NewReplicaClient(t.TempDir())
+			newDB := func() *litestream.DB {
+				db := litestream.NewDB(path)
+				db.MonitorInterval = 0
+				db.CheckpointInterval = 0
+				db.ShutdownSyncTimeout = 0
+				db.Replica = litestream.NewReplicaWithClient(db, client)
+				db.Replica.MonitorEnabled = false
+				return db
+			}
+			db := newDB()
+			require.NoError(t, db.Open())
+			require.NoError(t, db.Sync(t.Context()))
+			testingutil.MustCloseSQLDB(t, sqldb)
+			require.NoError(t, db.Close(t.Context()))
+
+			sqldb = testingutil.MustOpenSQLDB(t, path)
+			_, err = sqldb.Exec(`UPDATE t SET v = 'changed while stopped'`)
+			require.NoError(t, err)
+			testingutil.MustCloseSQLDB(t, sqldb)
+			if !reuse {
+				db = newDB()
+			}
+			s := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{
+				{Level: 0}, {Level: 1, Interval: time.Second},
+			})
+			s.CompactionMonitorEnabled = false
+			s.L0RetentionCheckInterval = 0
+			require.NoError(t, s.Open(t.Context()))
+			defer func() { require.NoError(t, s.Close(context.Background())) }()
+			pos, err := db.Pos()
+			require.NoError(t, err)
+			require.NotZero(t, pos.TXID)
+
+			for _, level := range []*litestream.CompactionLevel{s.SnapshotLevel(), {Level: 1, Interval: time.Second}} {
+				_, err := s.CompactDB(t.Context(), db, level)
+				require.ErrorIs(t, err, litestream.ErrDBNotReady, "level %d", level.Level)
+			}
+			_, reader, err := db.SnapshotReader(t.Context())
+			if reader != nil {
+				require.NoError(t, reader.Close())
+			}
+			require.ErrorIs(t, err, litestream.ErrDBNotReady)
+			_, err = db.Compact(t.Context(), 1)
+			require.ErrorIs(t, err, litestream.ErrDBNotReady)
+
+			require.NoError(t, db.Sync(t.Context()))
+			verifiedPos, err := db.Pos()
+			require.NoError(t, err)
+			require.Greater(t, verifiedPos.TXID, pos.TXID)
+			require.NoError(t, db.Replica.Sync(t.Context()))
+			for _, level := range []*litestream.CompactionLevel{s.SnapshotLevel(), {Level: 1, Interval: time.Second}} {
+				_, err := s.CompactDB(t.Context(), db, level)
+				require.NoError(t, err, "level %d", level.Level)
+			}
+		})
+	}
+}
+
 func TestStore_CompactDB(t *testing.T) {
 	t.Run("L1", func(t *testing.T) {
 		db0, sqldb0 := testingutil.MustOpenDBs(t)
@@ -288,6 +405,42 @@ func TestStore_CompactDB(t *testing.T) {
 		// immediately at startup before db.Sync() has been called.
 		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrDBNotReady) {
 			t.Fatalf("expected ErrDBNotReady, got: %v", err)
+		}
+	})
+
+	// Open initializes an existing database, so the page size is known before
+	// the first sync. A snapshot attempted in that window must wait for a
+	// transaction instead of failing to encode a snapshot with TXID 0.
+	t.Run("DBNotReadyBeforeFirstSync", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "db")
+		sqldb := testingutil.MustOpenSQLDB(t, path)
+		defer testingutil.MustCloseSQLDB(t, sqldb)
+		if _, err := sqldb.Exec(`CREATE TABLE t (x)`); err != nil {
+			t.Fatal(err)
+		}
+
+		db0 := testingutil.MustOpenDBAt(t, path)
+		defer testingutil.MustCloseDB(t, db0)
+		if db0.PageSize() == 0 {
+			t.Fatal("expected Open to initialize an existing database")
+		}
+
+		s := litestream.NewStore([]*litestream.DB{db0}, litestream.CompactionLevels{{Level: 0}})
+		s.CompactionMonitorEnabled = false
+		if err := s.Open(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		defer s.Close(t.Context())
+
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); !errors.Is(err, litestream.ErrDBNotReady) {
+			t.Fatalf("expected ErrDBNotReady, got: %v", err)
+		}
+
+		if err := db0.Sync(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := s.CompactDB(t.Context(), db0, s.SnapshotLevel()); err != nil {
+			t.Fatalf("snapshot after first sync: %v", err)
 		}
 	})
 }
