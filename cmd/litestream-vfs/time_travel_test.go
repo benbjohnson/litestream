@@ -52,14 +52,7 @@ func TestVFS_TimeTravelFunctions(t *testing.T) {
 	}
 
 	// Wait for LTX files to be created
-	require.Eventually(t, func() bool {
-		itr, err := client.LTXFiles(ctx, 0, 0, false)
-		if err != nil {
-			return false
-		}
-		defer itr.Close()
-		return itr.Next()
-	}, 10*time.Second, db.MonitorInterval, "LTX files should be created")
+	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
 	firstCreatedAt := fetchLTXCreatedAt(t, ctx, client)
 
@@ -325,18 +318,20 @@ func TestVFS_PragmaRelativeTime(t *testing.T) {
 func fetchLTXCreatedAt(tb testing.TB, ctx context.Context, client litestream.ReplicaClient) time.Time {
 	tb.Helper()
 
-	itr, err := client.LTXFiles(ctx, 0, 0, true)
-	if err != nil {
-		tb.Fatalf("ltx files: %v", err)
-	}
-	defer itr.Close()
-
 	var ts time.Time
-	for itr.Next() {
-		ts = itr.Item().CreatedAt
-	}
-	if err := itr.Close(); err != nil {
-		tb.Fatalf("close iterator: %v", err)
+	for _, level := range []int{0, litestream.SnapshotLevel} {
+		itr, err := client.LTXFiles(ctx, level, 0, true)
+		if err != nil {
+			tb.Fatalf("ltx files: %v", err)
+		}
+		for itr.Next() {
+			if createdAt := itr.Item().CreatedAt; createdAt.After(ts) {
+				ts = createdAt
+			}
+		}
+		if err := itr.Close(); err != nil {
+			tb.Fatalf("close iterator: %v", err)
+		}
 	}
 	if ts.IsZero() {
 		tb.Fatalf("no ltx files found")
