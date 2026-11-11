@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -2244,5 +2245,58 @@ func TestVFS_CloseReleasesWriteSlot(t *testing.T) {
 	}
 	if err := f2.Unlock(sqlite3vfs.LockShared); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestVFSFile_Hydration_SyncBeforeDeferredActivation(t *testing.T) {
+	const pageSize = 4096
+	client := newWriteTestReplicaClient()
+	createTestLTXFile(t, client, 1, pageSize, 2, map[uint32][]byte{
+		1: bytes.Repeat([]byte{'a'}, pageSize),
+		2: bytes.Repeat([]byte{'a'}, pageSize),
+	})
+	f := setupWriteableVFSFile(t, client)
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	f.hydrator = NewHydrator(filepath.Join(t.TempDir(), "hydrated.db"), false, pageSize, client, slog.Default())
+	if err := f.hydrator.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Lock(sqlite3vfs.LockShared); err != nil {
+		t.Fatal(err)
+	}
+	f.wg.Add(1)
+	f.runHydration([]*ltx.FileInfo{client.ltxFiles[0][0]})
+	if f.hydrator.Complete() {
+		t.Fatal("hydration activated during shared read")
+	}
+	if _, err := f.WriteAt(bytes.Repeat([]byte{'b'}, pageSize), pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.dirty) != 0 {
+		t.Fatalf("dirty pages after sync = %d, want 0", len(f.dirty))
+	}
+	if err := f.Unlock(sqlite3vfs.LockNone); err != nil {
+		t.Fatal(err)
+	}
+	if !f.hydrator.Complete() {
+		t.Fatal("hydration not activated after unlock")
+	}
+	page := make([]byte, pageSize)
+	if _, err := f.ReadAt(page, pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if page[100] != 'b' {
+		t.Fatalf("hydrated read after sync = %q, want 'b'", page[100])
 	}
 }
