@@ -256,6 +256,40 @@ func TestRestoreCommand_RunRequiresForceForExistingJournal(t *testing.T) {
 	}
 }
 
+func TestRestoreCommand_RunOrphanedSidecars(t *testing.T) {
+	for _, suffix := range []string{"-wal", "-shm", "-journal"} {
+		t.Run(suffix, func(t *testing.T) {
+			ctx := t.Context()
+			replicaPath, restorePath := createRestoreCommandTestData(t, ctx)
+			sidecarPath := restorePath + suffix
+			if err := os.WriteFile(sidecarPath, []byte("existing"), 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := &RestoreCommand{}
+			err := cmd.Run(ctx, []string{"-o", restorePath, "file://" + replicaPath})
+			want := "cannot restore, SQLite sidecar path already exists: " + sidecarPath + ". Use -force to overwrite"
+			if err == nil || err.Error() != want {
+				t.Fatalf("restore without -force: got %v, want %q", err, want)
+			}
+			if _, err := os.Stat(restorePath); !os.IsNotExist(err) {
+				t.Fatalf("expected no restored database, stat err=%v", err)
+			}
+			if buf, err := os.ReadFile(sidecarPath); err != nil || string(buf) != "existing" {
+				t.Fatalf("sidecar was changed: content=%q, err=%v", buf, err)
+			}
+
+			if err := cmd.Run(ctx, []string{"-force", "-o", restorePath, "file://" + replicaPath}); err != nil {
+				t.Fatalf("restore with -force: %v", err)
+			}
+			if _, err := os.Stat(sidecarPath); !os.IsNotExist(err) {
+				t.Fatalf("expected orphaned sidecar to be removed, stat err=%v", err)
+			}
+			assertRestoreCommandDB(t, restorePath)
+		})
+	}
+}
+
 func TestRestoreCommand_RunAllowsEmptyOutput(t *testing.T) {
 	ctx := context.Background()
 	replicaPath, restorePath := createRestoreCommandTestData(t, ctx)

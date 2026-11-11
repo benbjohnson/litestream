@@ -267,29 +267,33 @@ func (c *RestoreCommand) restore(ctx context.Context, r *litestream.Replica, opt
 }
 
 func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
+	var removePaths []string
 	info, err := os.Stat(path)
-	if os.IsNotExist(err) {
-		return nil
-	} else if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("cannot access output path: %w", err)
 	}
-	if info.IsDir() {
-		return fmt.Errorf("cannot restore, output path is a directory: %s", path)
-	}
-
-	if info.Size() > 0 && !force {
-		return fmt.Errorf("cannot restore, output path already exists and is not empty: %s. Use -force to overwrite", path)
+	if info != nil {
+		if info.IsDir() {
+			return fmt.Errorf("cannot restore, output path is a directory: %s", path)
+		}
+		if info.Size() > 0 && !force {
+			return fmt.Errorf("cannot restore, output path already exists and is not empty: %s. Use -force to overwrite", path)
+		}
+		removePaths = append(removePaths, path)
 	}
 
 	for _, sidecarPath := range []string{path + "-wal", path + "-shm", path + "-journal"} {
-		if _, err := os.Stat(sidecarPath); err == nil && !force {
-			return fmt.Errorf("cannot restore, SQLite sidecar path already exists: %s. Use -force to overwrite", sidecarPath)
-		} else if err != nil && !os.IsNotExist(err) {
+		if _, err := os.Lstat(sidecarPath); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
 			return fmt.Errorf("cannot access SQLite sidecar path: %w", err)
+		} else if !force {
+			return fmt.Errorf("cannot restore, SQLite sidecar path already exists: %s. Use -force to overwrite", sidecarPath)
 		}
+		removePaths = append(removePaths, sidecarPath)
 	}
 
-	for _, removePath := range []string{path, path + "-wal", path + "-shm", path + "-journal"} {
+	for _, removePath := range removePaths {
 		if err := os.Remove(removePath); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove existing output path: %w", err)
 		}
@@ -402,6 +406,7 @@ Arguments:
 
 	-force
 	    Overwrite an existing output database and SQLite sidecar files.
+	    Required to remove sidecar files even when the output database is absent.
 
 	-json
 	    Output raw JSON summary on successful restore.
