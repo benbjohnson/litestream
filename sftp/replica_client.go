@@ -308,10 +308,12 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	defer func() {
 		if f != nil {
-			_ = f.Close()
+			err = errors.Join(err, f.Close())
 		}
 		if err != nil {
-			_ = sftpClient.Remove(tmpFilename)
+			if removeErr := sftpClient.Remove(tmpFilename); removeErr != nil && !os.IsNotExist(removeErr) {
+				err = errors.Join(err, fmt.Errorf("sftp: cannot remove temporary ltx file %q: %w", tmpFilename, removeErr))
+			}
 		}
 	}()
 
@@ -456,9 +458,13 @@ type fullChunkReader struct {
 }
 
 func (c fullChunkReader) Read(p []byte) (int, error) {
-	n, err := io.ReadFull(c.r, p)
-	if err == io.ErrUnexpectedEOF {
-		err = io.EOF
+	var n int
+	for n < len(p) {
+		nn, err := c.r.Read(p[n:])
+		n += nn
+		if err != nil {
+			return n, err
+		}
 	}
-	return n, err
+	return n, nil
 }

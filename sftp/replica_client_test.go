@@ -5,18 +5,22 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path"
 	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/benbjohnson/litestream"
 	"github.com/pkg/sftp"
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream"
 )
 
 const (
@@ -201,6 +205,12 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 				t.Fatalf("uploaded %d bytes differ from the %d bytes written", len(uploaded), len(data))
 			}
 
+			server.mu.Lock()
+			pipelined := server.pipelined
+			server.mu.Unlock()
+			if concurrent && !pipelined {
+				t.Fatal("second write was not sent before the first write response")
+			}
 			limit := (len(data) + sftpPacketSize - 1) / sftpPacketSize
 			if n := server.writeRequests(); n > limit {
 				t.Fatalf("upload took %d write requests, want at most %d", n, limit)
@@ -274,8 +284,11 @@ func testLTXFile(t *testing.T, size int) []byte {
 type recordingServer struct {
 	client *sftp.Client
 
-	mu     sync.Mutex
-	writes int
+	mu        sync.Mutex
+	writes    int
+	writeErr  error
+	closeErr  error
+	pipelined bool
 }
 
 func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
@@ -284,7 +297,59 @@ func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
 	handlers := sftp.InMemHandler()
 	handlers.FilePut = &countingFileWriter{FileWriter: handlers.FilePut, server: s}
 
-	clientConn, serverConn := net.Pipe()
+	clientConn, clientProxy := net.Pipe()
+	serverProxy, serverConn := net.Pipe()
+	secondWrite := make(chan struct{})
+	firstWrite := make(chan struct{})
+	go func() {
+		defer serverProxy.Close()
+		writes := 0
+		for {
+			pkt, err := readPacket(clientProxy)
+			if err != nil {
+				return
+			}
+			if pkt[4] == 6 {
+				writes++
+				if writes == 1 {
+					close(firstWrite)
+				}
+				if writes == 2 {
+					close(secondWrite)
+				}
+			}
+			if _, err := serverProxy.Write(pkt); err != nil {
+				return
+			}
+		}
+	}()
+	go func() {
+		defer clientProxy.Close()
+		gated := false
+		for {
+			pkt, err := readPacket(serverProxy)
+			if err != nil {
+				return
+			}
+			if concurrentWrites && !gated && pkt[4] == 101 {
+				select {
+				case <-firstWrite:
+					gated = true
+					select {
+					case <-secondWrite:
+						s.mu.Lock()
+						s.pipelined = true
+						s.mu.Unlock()
+					case <-time.After(2 * time.Second):
+					}
+				default:
+				}
+			}
+			if _, err := clientProxy.Write(pkt); err != nil {
+				return
+			}
+		}
+	}()
 	server := sftp.NewRequestServer(serverConn, handlers)
 	go func() { _ = server.Serve() }()
 
@@ -328,5 +393,72 @@ func (w *countingWriterAt) WriteAt(p []byte, off int64) (int, error) {
 	w.server.mu.Lock()
 	w.server.writes++
 	w.server.mu.Unlock()
+	if w.server.writeErr != nil {
+		n, _ := w.WriterAt.WriteAt(p[:len(p)/2], off)
+		return n, w.server.writeErr
+	}
 	return w.WriterAt.WriteAt(p, off)
+}
+
+func (w *countingWriterAt) Close() error {
+	var err error
+	if closer, ok := w.WriterAt.(io.Closer); ok {
+		err = closer.Close()
+	}
+	return errors.Join(err, w.server.closeErr)
+}
+
+func TestReplicaClient_WriteLTXFile_Abort(t *testing.T) {
+	for _, concurrent := range []bool{true, false} {
+		for _, failure := range []string{"unexpected-eof", "reader", "short-write", "close"} {
+			t.Run(fmt.Sprintf("ConcurrentWrites=%t/%s", concurrent, failure), func(t *testing.T) {
+				server := newRecordingServer(t, concurrent)
+				c := NewReplicaClient()
+				c.Path = "/replica"
+				c.ConcurrentWrites = concurrent
+				c.sftpClient = server.client
+				data := testLTXFile(t, 3*sftpPacketSize+1234)
+				pr, pw := io.Pipe()
+				defer pr.Close()
+				sourceErr := errors.New("source failed")
+				switch failure {
+				case "unexpected-eof":
+					sourceErr = io.ErrUnexpectedEOF
+				case "short-write":
+					server.writeErr = io.ErrShortWrite
+				case "close":
+					server.closeErr = errors.New("close failed")
+				}
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					_, err := pw.Write(data)
+					if failure == "reader" || failure == "unexpected-eof" {
+						err = sourceErr
+					}
+					_ = pw.CloseWithError(err)
+				}()
+				info, err := c.WriteLTXFile(context.Background(), 1, 1, 1, pr)
+				_ = pr.Close()
+				<-done
+				if err == nil || info != nil {
+					t.Fatalf("published failed upload: info=%v err=%v", info, err)
+				}
+				if (failure == "reader" || failure == "unexpected-eof") && !errors.Is(err, sourceErr) {
+					t.Fatalf("error=%v, want %v", err, sourceErr)
+				}
+				filename := litestream.LTXFilePath(c.Path, 1, 1, 1)
+				if _, err := server.client.Stat(filename); !os.IsNotExist(err) {
+					t.Fatalf("final file exists or stat failed: %v", err)
+				}
+				entries, err := server.client.ReadDir(path.Dir(filename))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(entries) != 0 {
+					t.Fatalf("temporary files remain: %v", entries)
+				}
+			})
+		}
+	}
 }
