@@ -5520,7 +5520,9 @@ func TestDB_EnforceL0RetentionByTime_Cancellation(t *testing.T) {
 				t.Error(err)
 			}
 			if !returned {
-				<-done
+				if err := <-done; !errors.Is(err, context.Canceled) {
+					t.Errorf("canceled %s returned %v after releasing retention", operation, err)
+				}
 			}
 			if client.listCounts != [2]int{1, 1} {
 				t.Fatalf("canceled operation changed retention state: counts=%v", client.listCounts)
