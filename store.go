@@ -709,34 +709,15 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 		} else {
 			busyStreak = 0
 		}
-		timer.Reset(busyRetryDelay(nextDelay, busyStreak, s.MaintenanceBusyRetryInterval))
-	}
-}
-
-// busyRetryDelay returns the delay before the next monitor pass. While a
-// database keeps reporting ErrMaintenanceBusy (busyStreak > 0) the delay is
-// capped at an exponential backoff from maintenanceBusyRetryBase up to
-// maxRetry, so the refused operation is reattempted soon after the in-flight
-// one finishes rather than after the level's full interval (a snapshot losing
-// startup contention to L1 would otherwise wait until the next snapshot
-// boundary), and a momentary collision between levels costs about a second.
-func busyRetryDelay(nextDelay time.Duration, busyStreak int, maxRetry time.Duration) time.Duration {
-	if busyStreak > 0 && maxRetry > 0 {
-		retry := maintenanceBusyRetryBase
-		for i := 1; i < busyStreak && retry < maxRetry; i++ {
-			retry *= 2
+		if busyStreak > 0 && s.MaintenanceBusyRetryInterval > 0 {
+			retry := maintenanceBusyRetryBase
+			for i := 1; i < busyStreak && retry < s.MaintenanceBusyRetryInterval; i++ {
+				retry *= 2
+			}
+			nextDelay = min(nextDelay, min(retry, s.MaintenanceBusyRetryInterval))
 		}
-		if retry > maxRetry {
-			retry = maxRetry
-		}
-		if nextDelay > retry {
-			nextDelay = retry
-		}
+		timer.Reset(max(nextDelay, 0))
 	}
-	if nextDelay < 0 {
-		nextDelay = 0
-	}
-	return nextDelay
 }
 
 func (s *Store) monitorL0Retention(ctx context.Context) {
