@@ -87,6 +87,11 @@ type DB struct {
 		m map[int]*ltx.FileInfo
 	}
 
+	l0Retention struct {
+		sem         *semaphore.Weighted
+		nextCheckAt time.Time
+	}
+
 	// Cached position from the latest L0 LTX file.
 	// nil means cache is invalid; non-nil is the cached position.
 	pos struct {
@@ -355,6 +360,7 @@ func NewDB(path string) *DB {
 		ShutdownSyncInterval: DefaultShutdownSyncInterval,
 		Logger:               slog.With(LogKeyDB, filepath.Base(path)),
 	}
+	db.l0Retention.sem = semaphore.NewWeighted(1)
 	db.maxLTXFileInfos.m = make(map[int]*ltx.FileInfo)
 	db.openLTXFile = defaultOpenLTXFile
 
@@ -605,6 +611,12 @@ func (db *DB) LTXDir() string {
 // This is useful for recovering from corrupted or missing LTX files.
 // The database file itself is not modified.
 func (db *DB) ResetLocalState(ctx context.Context) error {
+	if err := db.l0Retention.sem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer db.l0Retention.sem.Release(1)
+	db.l0Retention.nextCheckAt = time.Time{}
+
 	db.Logger.Info("resetting local litestream state",
 		"meta_path", db.metaPath,
 		"ltx_dir", db.LTXDir())
@@ -3043,10 +3055,7 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 	// If this is L1, clean up L0 files using the time-based retention policy.
 	if dstLevel == 1 {
 		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-			// Don't log context cancellation errors during shutdown
-			if !isShutdownError(ctx, err) {
-				db.Logger.Error("enforce L0 time retention", "error", err)
-			}
+			return info, fmt.Errorf("enforce l0 retention: %w", err)
 		}
 	}
 
@@ -3141,9 +3150,33 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	return minSnapshotTXID, nil
 }
 
+const l0RetentionIdleInterval = 5 * time.Minute
+
 // EnforceL0RetentionByTime retains L0 files until they have been compacted into
 // L1 and have existed for at least L0Retention.
 func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
+	return db.enforceL0Retention(ctx, true)
+}
+
+func (db *DB) enforceL0Retention(ctx context.Context, force bool) (err error) {
+	if err := db.l0Retention.sem.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer db.l0Retention.sem.Release(1)
+
+	now := time.Now()
+	if !force && now.Before(db.l0Retention.nextCheckAt) {
+		return nil
+	}
+
+	nextCheckAt := now.Add(l0RetentionIdleInterval)
+	defer func() {
+		if err != nil {
+			db.l0Retention.nextCheckAt = time.Time{}
+		} else {
+			db.l0Retention.nextCheckAt = nextCheckAt
+		}
+	}()
 	if db.L0Retention <= 0 {
 		return nil
 	}
@@ -3153,20 +3186,11 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	dbName := filepath.Base(db.Path())
 
 	// Determine the highest TXID that has been compacted into L1.
-	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	info, err := db.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
 		return fmt.Errorf("fetch l1 files: %w", err)
 	}
-	var maxL1TXID ltx.TXID
-	for itr.Next() {
-		info := itr.Item()
-		if info.MaxTXID > maxL1TXID {
-			maxL1TXID = info.MaxTXID
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return fmt.Errorf("close l1 iterator: %w", err)
-	}
+	maxL1TXID := info.MaxTXID
 	if maxL1TXID == 0 {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
@@ -3174,12 +3198,16 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
-	threshold := time.Now().Add(-db.L0Retention)
-	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	threshold := now.Add(-db.L0Retention)
+	itr, err := db.Replica.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch l0 files: %w", err)
 	}
-	defer itr.Close()
+	defer func() {
+		if itr != nil {
+			err = errors.Join(err, itr.Close())
+		}
+	}()
 
 	var (
 		deleted           []*ltx.FileInfo
@@ -3198,8 +3226,10 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		if createdAt.IsZero() {
 			if fi, err := os.Stat(db.LTXPath(0, info.MinTXID, info.MaxTXID)); err == nil {
 				createdAt = fi.ModTime().UTC()
-			} else {
+			} else if os.IsNotExist(err) {
 				createdAt = threshold
+			} else {
+				return fmt.Errorf("stat local l0 file: %w", err)
 			}
 		}
 
@@ -3208,6 +3238,9 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 			// create gaps between retained files. VFS expects contiguous coverage.
 			processedAll = false
 			tooRecentCount++
+			if eligibleAt := createdAt.Add(db.L0Retention); eligibleAt.Before(nextCheckAt) {
+				nextCheckAt = eligibleAt
+			}
 			break
 		}
 
@@ -3223,6 +3256,12 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		for itr.Next() {
 			tooRecentCount++
 		}
+	}
+
+	iterErr := errors.Join(itr.Err(), itr.Close())
+	itr = nil
+	if iterErr != nil {
+		return fmt.Errorf("iterate l0 files: %w", iterErr)
 	}
 
 	// Ensure we do not delete the newest L0 file only if we processed the entire level.
@@ -3245,21 +3284,16 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 		return nil
 	}
 
+	for _, info := range deleted {
+		if err := db.deleteLocalLTXFile(0, info.MinTXID, info.MaxTXID); err != nil {
+			return fmt.Errorf("remove expired local l0 file %s: %w", ltx.FormatFilename(info.MinTXID, info.MaxTXID), err)
+		}
+	}
+
 	if !db.RetentionEnabled {
 		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
-	}
-
-	for _, info := range deleted {
-		localPath := db.LTXPath(0, info.MinTXID, info.MaxTXID)
-		db.Logger.Debug("deleting expired local l0 file", "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
-		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
-			db.Logger.Error("failed to remove local l0 file", "path", localPath, "error", err)
-		}
-	}
-	if len(deleted) > 0 {
-		db.invalidatePosCache()
 	}
 
 	db.Logger.Info("l0 retention enforced", "deleted_count", len(deleted), "max_l1_txid", maxL1TXID)

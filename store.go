@@ -665,7 +665,7 @@ LOOP:
 			if !db.IsOpen() {
 				continue // skip disabled DBs
 			}
-			if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+			if err := db.enforceL0Retention(ctx, false); err != nil {
 				if isShutdownError(ctx, err) {
 					continue
 				}

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -5189,5 +5190,431 @@ func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
 			}
 			assertCached()
 		})
+	}
+}
+
+type retentionTestClient struct {
+	sync.Mutex
+	*testReplicaClient
+	l1MaxTXID     ltx.TXID
+	listCounts    [2]int
+	iteratorErr   error
+	failedLevel   int
+	createdAt     time.Time
+	deleteErr     error
+	deleted       []*ltx.FileInfo
+	listStarted   chan struct{}
+	listResume    <-chan struct{}
+	useFiles      bool
+	omitCreatedAt bool
+	nextErr       error
+}
+
+func (c *retentionTestClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	c.Lock()
+	defer c.Unlock()
+	if c.useFiles {
+		return c.testReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+	}
+	c.listCounts[level]++
+	if level == 0 && c.listStarted != nil {
+		c.listStarted <- struct{}{}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-c.listResume:
+		}
+	}
+	var files []*ltx.FileInfo
+	if level == 1 {
+		if c.l1MaxTXID != 0 {
+			files = []*ltx.FileInfo{{Level: 1, MinTXID: 1, MaxTXID: c.l1MaxTXID}}
+		}
+	} else {
+		for txid := ltx.TXID(2); txid <= 3; txid++ {
+			files = append(files, &ltx.FileInfo{
+				Level: 0, MinTXID: txid, MaxTXID: txid,
+				CreatedAt: c.createdAt,
+			})
+		}
+	}
+	for _, info := range files {
+		if info.CreatedAt.IsZero() && !c.omitCreatedAt {
+			info.CreatedAt = time.Now().Add(-2 * time.Hour)
+		}
+	}
+	itr := ltx.NewFileInfoSliceIterator(files)
+	if (c.iteratorErr != nil || c.nextErr != nil) && level == c.failedLevel {
+		return &retentionErrorIterator{FileIterator: itr, err: c.nextErr, closeErr: c.iteratorErr}, nil
+	}
+	return itr, nil
+}
+
+func (c *retentionTestClient) DeleteLTXFiles(ctx context.Context, files []*ltx.FileInfo) error {
+	c.Lock()
+	defer c.Unlock()
+	if c.deleteErr != nil {
+		return c.deleteErr
+	}
+	if c.useFiles {
+		return c.testReplicaClient.DeleteLTXFiles(ctx, files)
+	}
+	c.deleted = append(c.deleted, files...)
+	return nil
+}
+
+type retentionErrorIterator struct {
+	ltx.FileIterator
+	err      error
+	closeErr error
+}
+
+func (itr *retentionErrorIterator) Close() error {
+	return errors.Join(itr.FileIterator.Close(), itr.closeErr)
+}
+func (itr *retentionErrorIterator) Err() error { return itr.err }
+
+func TestDB_EnforceL0RetentionByTime_CachedL1(t *testing.T) {
+	for _, maxTXID := range []ltx.TXID{0, 1} {
+		t.Run(maxTXID.String(), func(t *testing.T) {
+			db := NewDB(filepath.Join(t.TempDir(), "db"))
+			db.L0Retention = time.Hour
+			client := &retentionTestClient{testReplicaClient: &testReplicaClient{}, l1MaxTXID: maxTXID}
+			db.Replica = NewReplicaWithClient(db, client)
+			for i := 0; i < 2; i++ {
+				if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			wantL0Lists := 2
+			if maxTXID == 0 {
+				wantL0Lists = 0
+			}
+			if client.listCounts != [2]int{wantL0Lists, 1} {
+				t.Fatalf("LIST counts=%v, want [%d 1]", client.listCounts, wantL0Lists)
+			}
+			if len(client.deleted) != 0 {
+				t.Fatal("deleted L0 files before compaction")
+			}
+
+			db.compactor.CacheSetter(1, &ltx.FileInfo{Level: 1, MinTXID: 1, MaxTXID: 3})
+			if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if client.listCounts != [2]int{wantL0Lists + 1, 1} {
+				t.Fatalf("LIST counts after compaction=%v, want [%d 1]", client.listCounts, wantL0Lists+1)
+			}
+			if len(client.deleted) != 1 || client.deleted[0].MaxTXID != 2 {
+				t.Fatalf("deleted=%v, want only TXID 2, preserving newest L0", client.deleted)
+			}
+		})
+	}
+}
+
+func TestDB_EnforceL0RetentionByTime_IteratorError(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		level int
+		close bool
+	}{{"L0Close", 0, true}, {"L1Close", 1, true}, {"L0Next", 0, false}, {"L1Next", 1, false}} {
+		level := tt.level
+		t.Run(tt.name, func(t *testing.T) {
+			db := NewDB(filepath.Join(t.TempDir(), "db"))
+			db.L0Retention = time.Hour
+			failure := errors.New("listing failed")
+			client := &retentionTestClient{
+				testReplicaClient: &testReplicaClient{}, l1MaxTXID: 3,
+				failedLevel: level,
+			}
+			if tt.close {
+				client.iteratorErr = failure
+			} else {
+				client.nextErr = failure
+			}
+			db.Replica = NewReplicaWithClient(db, client)
+			if err := db.EnforceL0RetentionByTime(t.Context()); !errors.Is(err, failure) {
+				t.Fatalf("error=%v, want %v", err, failure)
+			}
+			if len(client.deleted) != 0 {
+				t.Fatal("deleted files after failed listing")
+			}
+			client.iteratorErr, client.nextErr = nil, nil
+			if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if client.listCounts[level] != 2 {
+				t.Fatalf("failed L%d listing was not retried: counts=%v", level, client.listCounts)
+			}
+			if len(client.deleted) != 1 || client.deleted[0].MaxTXID != 2 {
+				t.Fatalf("deleted=%v, want only TXID 2 after retry", client.deleted)
+			}
+			l1Lists := client.listCounts[1]
+			if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			if client.listCounts[1] != l1Lists {
+				t.Fatal("successful L1 retry was not cached")
+			}
+		})
+	}
+}
+
+func testL0RetentionMonitor(t *testing.T, run func(*testing.T, *DB, *retentionTestClient, func(time.Duration))) {
+	t.Helper()
+	synctest.Test(t, func(t *testing.T) {
+		db := NewDB(filepath.Join(t.TempDir(), "db"))
+		db.opened = true
+		client := &retentionTestClient{testReplicaClient: &testReplicaClient{}, l1MaxTXID: 1}
+		db.Replica = NewReplicaWithClient(db, client)
+		store := NewStore([]*DB{db}, nil)
+		store.L0RetentionCheckInterval = 15 * time.Second
+		db.L0Retention = time.Hour
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		go store.monitorL0Retention(ctx)
+		synctest.Wait()
+		advance := func(d time.Duration) {
+			client.Lock()
+			timer := time.NewTimer(d)
+			client.Unlock()
+			<-timer.C
+			synctest.Wait()
+		}
+		run(t, db, client, advance)
+	})
+}
+
+func TestStore_L0RetentionMonitor_IdleBound(t *testing.T) {
+	for _, recent := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Recent=%t", recent), func(t *testing.T) {
+			testL0RetentionMonitor(t, func(t *testing.T, db *DB, client *retentionTestClient, advance func(time.Duration)) {
+				if recent {
+					client.createdAt = time.Now()
+				}
+				advance(15 * time.Second)
+				if client.listCounts != [2]int{1, 1} {
+					t.Fatalf("initial LIST counts=%v, want [1 1]", client.listCounts)
+				}
+				advance(5*time.Minute - 15*time.Second)
+				if client.listCounts[0] != 1 {
+					t.Fatalf("idle LIST count=%d, want 1", client.listCounts[0])
+				}
+				advance(15 * time.Second)
+				if client.listCounts != [2]int{2, 1} {
+					t.Fatalf("bounded retry LIST counts=%v, want [2 1]", client.listCounts)
+				}
+			})
+		})
+	}
+}
+
+func TestStore_L0RetentionMonitor_Expiry(t *testing.T) {
+	testL0RetentionMonitor(t, func(t *testing.T, db *DB, client *retentionTestClient, advance func(time.Duration)) {
+		client.l1MaxTXID = 3
+		client.createdAt = time.Now().Add(-time.Hour + 45*time.Second)
+		advance(30 * time.Second)
+		if client.listCounts[0] != 1 || len(client.deleted) != 0 {
+			t.Fatalf("before expiry: LISTs=%v deleted=%v", client.listCounts, client.deleted)
+		}
+		advance(15 * time.Second)
+		if client.listCounts[0] != 2 || len(client.deleted) != 1 || client.deleted[0].MaxTXID != 2 {
+			t.Fatalf("at expiry: LISTs=%v deleted=%v, want second scan deleting only TXID 2", client.listCounts, client.deleted)
+		}
+		advance(15 * time.Second)
+		if client.listCounts[0] != 2 {
+			t.Fatal("monitor did not resume idle delay after cleanup")
+		}
+	})
+}
+
+func TestStore_L0RetentionMonitor_ExplicitSweep(t *testing.T) {
+	testL0RetentionMonitor(t, func(t *testing.T, db *DB, client *retentionTestClient, advance func(time.Duration)) {
+		advance(15 * time.Second)
+		db.compactor.CacheSetter(1, &ltx.FileInfo{Level: 1, MinTXID: 1, MaxTXID: 3})
+		if err := db.EnforceL0RetentionByTime(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		if client.listCounts[0] != 2 || len(client.deleted) != 1 {
+			t.Fatalf("explicit sweep did not bypass delay: LISTs=%v deleted=%v", client.listCounts, client.deleted)
+		}
+		advance(15 * time.Second)
+		if client.listCounts[0] != 2 {
+			t.Fatal("monitor ignored the successful explicit sweep")
+		}
+	})
+}
+
+func TestStore_L0RetentionMonitor_RetryFailure(t *testing.T) {
+	for _, operation := range []string{"list", "delete"} {
+		t.Run(operation, func(t *testing.T) {
+			testL0RetentionMonitor(t, func(t *testing.T, db *DB, client *retentionTestClient, advance func(time.Duration)) {
+				advance(15 * time.Second)
+				db.compactor.CacheSetter(1, &ltx.FileInfo{Level: 1, MinTXID: 1, MaxTXID: 3})
+				failure := errors.New("retention failed")
+				if operation == "list" {
+					client.iteratorErr = failure
+				} else {
+					client.deleteErr = failure
+				}
+				if err := db.EnforceL0RetentionByTime(t.Context()); !errors.Is(err, failure) {
+					t.Fatalf("error=%v, want %v", err, failure)
+				}
+				client.iteratorErr, client.deleteErr = nil, nil
+				advance(15 * time.Second)
+				if client.listCounts[0] != 3 || len(client.deleted) != 1 {
+					t.Fatalf("failure not retried on next tick: LISTs=%v deleted=%v", client.listCounts, client.deleted)
+				}
+			})
+		})
+	}
+}
+
+func TestStore_L0RetentionMonitor_Reset(t *testing.T) {
+	testL0RetentionMonitor(t, func(t *testing.T, db *DB, client *retentionTestClient, advance func(time.Duration)) {
+		advance(30 * time.Second)
+		if client.listCounts != [2]int{1, 1} {
+			t.Fatalf("idle counts=%v, want [1 1]", client.listCounts)
+		}
+		if err := db.ResetLocalState(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		advance(15 * time.Second)
+		if client.listCounts != [2]int{2, 2} {
+			t.Fatalf("LIST counts after reset=%v, want [2 2]", client.listCounts)
+		}
+	})
+}
+
+func TestDB_EnforceL0RetentionByTime_Cancellation(t *testing.T) {
+	for _, operation := range []string{"sweep", "reset"} {
+		t.Run(operation, func(t *testing.T) {
+			db := NewDB(filepath.Join(t.TempDir(), "db"))
+			resume := make(chan struct{})
+			client := &retentionTestClient{testReplicaClient: &testReplicaClient{}, l1MaxTXID: 1, listStarted: make(chan struct{}, 2), listResume: resume}
+			db.Replica = NewReplicaWithClient(db, client)
+			first := make(chan error, 1)
+			go func() { first <- db.EnforceL0RetentionByTime(t.Context()) }()
+			<-client.listStarted
+			ctx, cancel := context.WithCancel(t.Context())
+			done := make(chan error, 1)
+			go func() {
+				if operation == "reset" {
+					done <- db.ResetLocalState(ctx)
+				} else {
+					done <- db.EnforceL0RetentionByTime(ctx)
+				}
+			}()
+			cancel()
+			returned := false
+			select {
+			case err := <-done:
+				returned = true
+				if !errors.Is(err, context.Canceled) {
+					t.Errorf("canceled %s returned %v", operation, err)
+				}
+			case <-time.After(time.Second):
+				t.Errorf("canceled %s blocked behind active retention", operation)
+			}
+			close(resume)
+			if err := <-first; err != nil {
+				t.Error(err)
+			}
+			if !returned {
+				if err := <-done; !errors.Is(err, context.Canceled) {
+					t.Errorf("canceled %s returned %v after releasing retention", operation, err)
+				}
+			}
+			if client.listCounts != [2]int{1, 1} {
+				t.Fatalf("canceled operation changed retention state: counts=%v", client.listCounts)
+			}
+		})
+	}
+}
+
+func TestStore_L0RetentionMonitor_LocalError(t *testing.T) {
+	for _, operation := range []string{"stat", "remove"} {
+		t.Run(operation, func(t *testing.T) {
+			testL0RetentionMonitor(t, func(t *testing.T, db *DB, client *retentionTestClient, advance func(time.Duration)) {
+				advance(15 * time.Second)
+				db.compactor.CacheSetter(1, &ltx.FileInfo{Level: 1, MinTXID: 1, MaxTXID: 3})
+				localPath := db.LTXPath(0, 2, 2)
+				metaPath := db.metaPath
+				if operation == "stat" {
+					client.omitCreatedAt = true
+					db.metaPath += "\x00"
+				} else {
+					if err := os.MkdirAll(localPath, 0700); err != nil {
+						t.Fatal(err)
+					}
+					if err := os.WriteFile(filepath.Join(localPath, "blocked"), []byte("blocked"), 0600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				if err := db.EnforceL0RetentionByTime(t.Context()); err == nil {
+					t.Fatal("local error was not returned")
+				}
+				if len(client.deleted) != 0 {
+					t.Fatal("remote files removed before local cleanup succeeded")
+				}
+				if operation == "stat" {
+					db.metaPath = metaPath
+				} else if err := os.Rename(localPath, localPath+".blocked"); err != nil {
+					t.Fatal(err)
+				}
+				advance(15 * time.Second)
+				if client.listCounts[0] != 3 || len(client.deleted) != 1 || client.deleted[0].MaxTXID != 2 {
+					t.Fatalf("local failure was not retried: counts=%v deleted=%v", client.listCounts, client.deleted)
+				}
+				advance(15 * time.Second)
+				if client.listCounts[0] != 3 {
+					t.Fatal("successful retry did not resume idle delay")
+				}
+			})
+		})
+	}
+}
+
+func TestDB_Compact_ReturnsL0RetentionError(t *testing.T) {
+	ctx := t.Context()
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.MonitorInterval = 0
+	db.L0Retention = time.Nanosecond
+	failure := errors.New("remote deletion failed")
+	client := &retentionTestClient{testReplicaClient: &testReplicaClient{dir: t.TempDir()}, useFiles: true, deleteErr: failure}
+	db.Replica = NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	sqldb, err := sql.Open("sqlite", db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := sqldb.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if _, err := sqldb.Exec(`CREATE TABLE t (id INTEGER)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 3 {
+		if _, err := sqldb.Exec(`INSERT INTO t VALUES (?)`, i); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if err := db.Replica.Sync(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Compact(ctx, 1); !errors.Is(err, failure) {
+		t.Fatalf("compaction error=%v, want %v", err, failure)
 	}
 }

@@ -287,7 +287,6 @@ func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileI
 	if err != nil {
 		return info, err
 	}
-	defer itr.Close()
 
 	for itr.Next() {
 		item := itr.Item()
@@ -295,7 +294,7 @@ func (r *Replica) MaxLTXFileInfo(ctx context.Context, level int) (info ltx.FileI
 			info = *item
 		}
 	}
-	return info, itr.Close()
+	return info, errors.Join(itr.Err(), itr.Close())
 }
 
 // Pos returns the current replicated position.
