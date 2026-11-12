@@ -2707,7 +2707,7 @@ func TestHydrator_ApplyLTX_VerifiesFile(t *testing.T) {
 		firstFrame := ltx.HeaderSize
 		firstSize := int(binary.BigEndian.Uint32(fx.data[firstFrame+ltx.PageHeaderSize:]))
 		second := firstFrame + ltx.PageHeaderSize + 4 + firstSize
-		fx.data[second] ^= 0xFF
+		fx.data[second+4] = 0xFF
 		client.addFixture(t, fx)
 		path := filepath.Join(t.TempDir(), "hydration.db")
 		h := NewHydrator(path, true, 4096, client, slog.Default())
@@ -2715,8 +2715,8 @@ func TestHydrator_ApplyLTX_VerifiesFile(t *testing.T) {
 			t.Fatalf("init: %v", err)
 		}
 		h.SetTXID(1)
-		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
-			t.Fatal("expected apply to fail on the corrupted page")
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil || !strings.Contains(err.Error(), "decode page: invalid page header flags") {
+			t.Fatalf("expected page decoding failure, got %v", err)
 		}
 		if !h.tainted.Load() {
 			t.Fatal("expected hydrator to be tainted after a mid-file failure")
