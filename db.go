@@ -2255,10 +2255,11 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		"salt2", rd.salt2)
 
 	timestamp := time.Now()
-	enc, err := ltx.NewEncoder(ltxFile)
+	enc, err := db.newEncoder(ltxFile)
 	if err != nil {
 		return result, fmt.Errorf("new ltx encoder: %w", err)
 	}
+	defer func() { _ = enc.Cleanup() }()
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
 		Flags:     ltx.HeaderFlagNoChecksum,
@@ -3006,7 +3007,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			"salt1", rd.salt1,
 			"salt2", rd.salt2)
 
-		enc, err := ltx.NewEncoder(pw)
+		enc, err := db.newEncoder(pw)
 		if err != nil {
 			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
 			return
@@ -3014,7 +3015,6 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		// Very large snapshots spill their page index into the meta
 		// directory rather than holding it in memory; Cleanup covers the
 		// cancellation paths that never reach enc.Close.
-		enc.SetSpillDir(db.MetaPath())
 		defer func() { _ = enc.Cleanup() }()
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
@@ -3567,3 +3567,12 @@ var (
 		Help: "Number of post-compaction verification failures",
 	}, []string{"db"})
 )
+
+func (db *DB) newEncoder(w io.Writer) (*ltx.Encoder, error) {
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return nil, err
+	}
+	enc.SetSpillDir(db.MetaPath())
+	return enc, nil
+}
