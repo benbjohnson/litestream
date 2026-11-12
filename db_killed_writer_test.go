@@ -1,6 +1,7 @@
 package litestream_test
 
 import (
+	"encoding/binary"
 	"os"
 	"path/filepath"
 	"testing"
@@ -21,7 +22,7 @@ func TestDB_WriterKilledBeforeWALIndexUpdate(t *testing.T) {
 }
 
 func TestDB_WriterKilledBeforeWALIndexUpdate_UnusableHeader(t *testing.T) {
-	for _, name := range []string{"copies differ", "uninitialized"} {
+	for _, name := range []string{"copies differ", "uninitialized", "invalid checksum"} {
 		t.Run(name, func(t *testing.T) {
 			testDBWriterKilledBeforeWALIndexUpdate(t, name)
 		})
@@ -48,7 +49,11 @@ func testDBWriterKilledBeforeWALIndexUpdate(t *testing.T, unusableHeader string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = shm.Close() })
+	t.Cleanup(func() {
+		if err := shm.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	hdr := make([]byte, 96) // both copies of the wal-index header
 	if _, err := shm.ReadAt(hdr, 0); err != nil {
 		t.Fatal(err)
@@ -72,6 +77,9 @@ func testDBWriterKilledBeforeWALIndexUpdate(t *testing.T, unusableHeader string)
 		}
 		unstable := append([]byte(nil), hdr...)
 		switch unusableHeader {
+		case "invalid checksum":
+			binary.NativeEndian.PutUint32(unstable[16:], binary.NativeEndian.Uint32(hdr[16:])+1)
+			copy(unstable[48:], unstable[:48])
 		case "copies differ":
 			unstable[56] ^= 1
 		case "uninitialized":

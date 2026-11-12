@@ -1164,7 +1164,7 @@ func (db *DB) init(ctx context.Context) (err error) {
 			db.db.Close()
 			db.f.Close()
 			if db.shm != nil {
-				db.shm.Close()
+				err = errors.Join(err, db.shm.Close())
 			}
 			db.db, db.f, db.shm = nil, nil, nil
 		}
@@ -1970,6 +1970,12 @@ func (db *DB) walIndexMaxFrame(salt1, salt2 uint32) (int, error) {
 			continue
 		} else if hdr[12] == 0 {
 			err = fmt.Errorf("wal-index header is not initialized")
+			continue
+		}
+
+		checksum1, checksum2 := WALChecksum(binary.NativeEndian, 0, 0, hdr[:40])
+		if checksum1 != binary.NativeEndian.Uint32(hdr[40:]) || checksum2 != binary.NativeEndian.Uint32(hdr[44:]) {
+			err = fmt.Errorf("wal-index header checksum mismatch")
 			continue
 		}
 
