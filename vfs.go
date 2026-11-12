@@ -768,13 +768,17 @@ func (h *Hydrator) Status() ltx.CompactorStatus {
 }
 
 // Restore restores the database from LTX files to the hydration file.
-func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
+func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) (retErr error) {
+	ctx, cancel := context.WithCancel(ctx)
 	// Open all LTX files as readers
 	rdrs := make([]io.Reader, 0, len(infos))
 	defer func() {
+		cancel()
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
+				if err := closer.Close(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("close hydration input: %w", err))
+				}
 			}
 		}
 	}()
@@ -794,22 +798,36 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 
 	// Compact and decode using io.Pipe pattern
 	pr, pw := io.Pipe()
-	c, err := newRestoreCompactor(pw, rdrs)
+	c, err := newRestoreCompactor(pw, rdrs, filepath.Dir(h.path))
 	if err != nil {
 		return fmt.Errorf("new ltx compactor: %w", err)
 	}
 	h.compactor = c
 
+	compactionDone := make(chan error, 1)
 	go func() {
-		_ = pw.CloseWithError(c.Compact(ctx))
+		err := c.Compact(ctx)
+		if cleanupErr := c.Cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleanup compactor: %w", cleanupErr))
+		}
+		_ = pw.CloseWithError(err)
+		compactionDone <- err
 	}()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	dec := ltx.NewDecoder(pr)
-	if err := dec.DecodeDatabaseTo(h.file); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+	dec := newRestoreDecoder(pr)
+	decodeErr := dec.DecodeDatabaseTo(h.file)
+	_ = pr.CloseWithError(decodeErr)
+	if decodeErr != nil {
+		cancel()
+	}
+	compactErr := <-compactionDone
+	if decodeErr != nil {
+		return fmt.Errorf("decode database: %w", errors.Join(decodeErr, compactErr))
+	} else if compactErr != nil {
+		return fmt.Errorf("compact hydration: %w", compactErr)
 	}
 
 	h.txid = infos[len(infos)-1].MaxTXID

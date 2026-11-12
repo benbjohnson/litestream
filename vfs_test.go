@@ -2532,3 +2532,66 @@ func TestVFSFile_Hydration_CompletionPreservesActiveRead(t *testing.T) {
 		})
 	}
 }
+
+func TestHydrator_Restore_CancelsSourceOnWriteError(t *testing.T) {
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 512, Commit: 2, MinTXID: 1, MaxTXID: 1}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, make([]byte, 512)); err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("close hydration source")
+	client := &cancelledHydrationClient{ReplicaClient: newMockReplicaClient(), data: buf.Bytes(), closeErr: closeErr}
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 512, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.Restore(ctx, []*ltx.FileInfo{{MinTXID: 1, MaxTXID: 1, Size: int64(buf.Len())}}) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrClosed) || !errors.Is(err, closeErr) {
+			t.Fatalf("want destination and source close errors, got %v", err)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("hydration did not cancel its source after destination failure")
+	}
+}
+
+type cancelledHydrationClient struct {
+	ReplicaClient
+	data     []byte
+	closeErr error
+}
+
+func (c *cancelledHydrationClient) OpenLTXFile(ctx context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+	return &cancelledHydrationReader{Reader: bytes.NewReader(c.data), ctx: ctx, closeErr: c.closeErr}, nil
+}
+
+type cancelledHydrationReader struct {
+	*bytes.Reader
+	ctx      context.Context
+	closeErr error
+}
+
+func (r *cancelledHydrationReader) Read(p []byte) (int, error) {
+	if r.Len() == 0 {
+		<-r.ctx.Done()
+		return 0, r.ctx.Err()
+	}
+	return r.Reader.Read(p)
+}
+func (r *cancelledHydrationReader) Close() error { <-r.ctx.Done(); return r.closeErr }
