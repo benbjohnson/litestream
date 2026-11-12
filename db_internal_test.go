@@ -5192,34 +5192,62 @@ func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
 	}
 }
 
-func TestDB_WALIndexMaxFrame_ReadError(t *testing.T) {
-	for _, tt := range []struct {
-		name   string
-		closed bool
-		want   error
-	}{
-		{name: "short header", want: io.EOF},
-		{name: "closed file", closed: true, want: os.ErrClosed},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			f, err := os.CreateTemp(t.TempDir(), "shm")
+func TestDB_WALIndexMaxFrame(t *testing.T) {
+	for _, name := range []string{"committed", "canceled", "closed", "no WAL", "generation changed", "missing WAL"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			path := filepath.Join(t.TempDir(), "db")
+			sqldb, err := sql.Open("sqlite", path)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if tt.closed {
-				if err := f.Close(); err != nil {
+			defer func() {
+				if err := sqldb.Close(); err != nil {
+					t.Error(err)
+				}
+			}()
+			db := &DB{db: sqldb, path: path}
+			if name == "no WAL" {
+				if _, err := db.walIndexMaxFrame(ctx, 0, 0); err == nil {
+					t.Fatal("expected unavailable boundary error")
+				}
+				return
+			}
+			if _, err := sqldb.ExecContext(ctx, `PRAGMA journal_mode=WAL; CREATE TABLE t (id INTEGER PRIMARY KEY); INSERT INTO t VALUES (1)`); err != nil {
+				t.Fatal(err)
+			}
+			hdr, err := readWALHeader(path + "-wal")
+			if err != nil {
+				t.Fatal(err)
+			}
+			salt1, salt2 := binary.BigEndian.Uint32(hdr[16:]), binary.BigEndian.Uint32(hdr[20:])
+			switch name {
+			case "canceled":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			case "closed":
+				if err := sqldb.Close(); err != nil {
 					t.Fatal(err)
 				}
-			} else {
-				t.Cleanup(func() {
-					if err := f.Close(); err != nil {
-						t.Error(err)
-					}
-				})
+			case "generation changed":
+				salt1++
+			case "missing WAL":
+				db.path = filepath.Join(t.TempDir(), "missing")
 			}
-			db := &DB{shm: f}
-			if _, err := db.walIndexMaxFrame(1, 2); !errors.Is(err, tt.want) {
-				t.Fatalf("got error %v, want %v", err, tt.want)
+			n, err := db.walIndexMaxFrame(ctx, salt1, salt2)
+			if name == "committed" {
+				if err != nil || n != 3 {
+					t.Fatalf("frames=%d, error=%v; want 3, nil", n, err)
+				}
+			} else if err == nil {
+				t.Fatal("expected boundary error")
+			}
+			if name == "canceled" && !errors.Is(err, context.Canceled) {
+				t.Fatalf("got %v, want context.Canceled", err)
+			}
+			if name == "missing WAL" && !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("got %v, want os.ErrNotExist", err)
 			}
 		})
 	}

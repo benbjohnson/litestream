@@ -1,10 +1,17 @@
 package litestream_test
 
 import (
+	"context"
+	"database/sql"
 	"encoding/binary"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	"modernc.org/sqlite"
 
 	"github.com/benbjohnson/litestream"
 	"github.com/benbjohnson/litestream/internal/testingutil"
@@ -18,6 +25,39 @@ import (
 // Putting back the wal-index header from before the commit leaves the same
 // state. Litestream must not replicate the killed writer's transaction.
 func TestDB_WriterKilledBeforeWALIndexUpdate(t *testing.T) {
+	if args := os.Args; len(args) >= 5 && args[len(args)-4] == "--" {
+		action, shmPath, headerPath := args[len(args)-3], args[len(args)-2], args[len(args)-1]
+		shm, err := os.OpenFile(shmPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer func() {
+			if err := shm.Close(); err != nil {
+				t.Error(err)
+			}
+		}()
+		switch action {
+		case "save":
+			hdr := make([]byte, 96)
+			if _, err := shm.ReadAt(hdr, 0); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(headerPath, hdr, 0600); err != nil {
+				t.Fatal(err)
+			}
+		case "restore":
+			hdr, err := os.ReadFile(headerPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := shm.WriteAt(hdr, 0); err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatalf("unknown SHM action %q", action)
+		}
+		return
+	}
 	testDBWriterKilledBeforeWALIndexUpdate(t, "")
 }
 
@@ -43,24 +83,17 @@ func testDBWriterKilledBeforeWALIndexUpdate(t *testing.T, unusableHeader string)
 		t.Fatal(err)
 	}
 
-	// Close it only after the connections: closing a descriptor drops this
-	// process's non-OFD locks on the -shm file, which they rely on.
-	shm, err := os.OpenFile(db.Path()+"-shm", os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		if err := shm.Close(); err != nil {
-			t.Error(err)
+	headerPath := filepath.Join(t.TempDir(), "header")
+	for _, action := range []string{"save", "restore"} {
+		if action == "restore" {
+			if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (v) VALUES ('killed')`); err != nil {
+				t.Fatal(err)
+			}
 		}
-	})
-	hdr := make([]byte, 96) // both copies of the wal-index header
-	if _, err := shm.ReadAt(hdr, 0); err != nil {
-		t.Fatal(err)
-	} else if _, err := sqldb.ExecContext(ctx, `INSERT INTO t (v) VALUES ('killed')`); err != nil {
-		t.Fatal(err)
-	} else if _, err := shm.WriteAt(hdr, 0); err != nil {
-		t.Fatal(err)
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDB_WriterKilledBeforeWALIndexUpdate$", "--", action, db.Path()+"-shm", headerPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("SHM %s: %v\n%s", action, err, output)
+		}
 	}
 
 	var n int
@@ -70,35 +103,36 @@ func testDBWriterKilledBeforeWALIndexUpdate(t *testing.T, unusableHeader string)
 		t.Fatalf("database has %d rows after the simulated kill, want 1", n)
 	}
 
+	want := 1
 	if unusableHeader != "" {
-		pos, err := db.Pos()
+		hdr, err := os.ReadFile(headerPath)
 		if err != nil {
 			t.Fatal(err)
 		}
-		unstable := append([]byte(nil), hdr...)
 		switch unusableHeader {
 		case "invalid checksum":
-			binary.NativeEndian.PutUint32(unstable[16:], binary.NativeEndian.Uint32(hdr[16:])+1)
-			copy(unstable[48:], unstable[:48])
+			binary.NativeEndian.PutUint32(hdr[16:], binary.NativeEndian.Uint32(hdr[16:])+1)
+			copy(hdr[48:], hdr[:48])
 		case "copies differ":
-			unstable[56] ^= 1
+			hdr[56] ^= 1
 		case "uninitialized":
-			unstable[12], unstable[60] = 0, 0
+			hdr[12], hdr[60] = 0, 0
 		}
-		if _, err := shm.WriteAt(unstable, 0); err != nil {
+		if err := os.WriteFile(headerPath, hdr, 0600); err != nil {
 			t.Fatal(err)
 		}
-		syncErr := db.Sync(ctx)
-		if _, err := shm.WriteAt(hdr, 0); err != nil {
+		cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDB_WriterKilledBeforeWALIndexUpdate$", "--", "restore", db.Path()+"-shm", headerPath)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("SHM restore: %v\n%s", err, output)
+		}
+		if err := db.Sync(ctx); err != nil {
 			t.Fatal(err)
 		}
-		if syncErr == nil {
-			t.Error("expected sync to reject unusable wal-index header")
-		}
-		if got, err := db.Pos(); err != nil {
+		want = 2
+		if err := sqldb.QueryRowContext(ctx, `SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
 			t.Fatal(err)
-		} else if got != pos {
-			t.Errorf("position advanced with unusable wal-index header: got %v, want %v", got, pos)
+		} else if n != want {
+			t.Fatalf("SQLite recovered %d rows, want %d", n, want)
 		}
 	}
 
@@ -117,7 +151,111 @@ func testDBWriterKilledBeforeWALIndexUpdate(t *testing.T, unusableHeader string)
 	defer testingutil.MustCloseSQLDB(t, restored)
 	if err := restored.QueryRowContext(ctx, `SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
 		t.Fatal(err)
-	} else if n != 1 {
-		t.Fatalf("restored %d rows, want 1: the killed writer's uncommitted transaction was replicated", n)
+	} else if n != want {
+		t.Fatalf("restored %d rows, want %d to match SQLite", n, want)
+	}
+}
+
+func TestDB_ClosePreservesWALLocks(t *testing.T) {
+	if args := os.Args; len(args) >= 3 && args[len(args)-2] == "--" {
+		sqldb, err := sql.Open("sqlite", args[len(args)-1]+"?_pragma=busy_timeout(25)")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer testingutil.MustCloseSQLDB(t, sqldb)
+		if _, err := sqldb.Exec(`INSERT INTO t (id) VALUES (200)`); err != nil {
+			var sqliteErr *sqlite.Error
+			if errors.As(err, &sqliteErr) && sqliteErr.Code()&0xff == 5 {
+				t.Log("writer-busy")
+				return
+			}
+			t.Fatal(err)
+		}
+		t.Log("writer-committed")
+		return
+	}
+
+	for _, canceled := range []bool{false, true} {
+		name := "normal"
+		if canceled {
+			name = "canceled"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			db, sqldb := testingutil.MustOpenDBs(t)
+			defer testingutil.MustCloseDBs(t, db, sqldb)
+			if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+				t.Fatal(err)
+			}
+			if err := db.Sync(ctx); err != nil {
+				t.Fatal(err)
+			}
+			tx, err := sqldb.BeginTx(ctx, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := tx.Rollback(); err != nil && !errors.Is(err, sql.ErrTxDone) {
+					t.Error(err)
+				}
+			}()
+			if _, err := tx.ExecContext(ctx, `INSERT INTO t (id) VALUES (100)`); err != nil {
+				t.Fatal(err)
+			}
+
+			var committedBeforeRelease bool
+			for attempt := range 3 {
+				if attempt == 1 {
+					closeCtx, cancel := context.WithCancel(ctx)
+					if canceled {
+						cancel()
+					}
+					err := db.Close(closeCtx)
+					cancel()
+					if err != nil && !(canceled && errors.Is(err, context.Canceled)) {
+						t.Fatal(err)
+					}
+				} else if attempt == 2 {
+					if err := tx.Commit(); err != nil {
+						t.Fatal(err)
+					}
+					if committedBeforeRelease {
+						break
+					}
+				}
+
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDB_ClosePreservesWALLocks$", "-test.v", "--", db.Path())
+				output, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("writer: %v\n%s", err, output)
+				}
+				committed := strings.Contains(string(output), "writer-committed")
+				busy := strings.Contains(string(output), "writer-busy")
+				if committed == busy {
+					t.Fatalf("unexpected writer result: %s", output)
+				}
+				switch attempt {
+				case 0:
+					if !busy {
+						t.Fatal("external writer acquired the lock before Close")
+					}
+				case 1:
+					committedBeforeRelease = committed
+				case 2:
+					if !committed {
+						t.Fatal("external writer could not commit after the first writer committed")
+					}
+				}
+			}
+			var n int
+			if err := sqldb.QueryRowContext(ctx, `SELECT COUNT(*) FROM t`).Scan(&n); err != nil {
+				t.Fatal(err)
+			} else if n != 2 {
+				t.Fatalf("both writers acknowledged commits but only %d rows remain", n)
+			}
+			if committedBeforeRelease {
+				t.Fatal("external writer committed while the first writer still held its transaction")
+			}
+		})
 	}
 }
