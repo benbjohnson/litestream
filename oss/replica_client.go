@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"os"
 	"path"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss"
 	"github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/credentials"
+	osstransport "github.com/aliyun/alibabacloud-oss-go-sdk-v2/oss/transport"
 	"github.com/superfly/ltx"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sync/semaphore"
@@ -47,13 +49,15 @@ const DefaultRegion = "cn-hangzhou"
 const DefaultMetadataConcurrency = 50
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
+var _ litestream.ReplicaClientCloser = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Alibaba Cloud OSS.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	client   *oss.Client
-	uploader *oss.Uploader
-	logger   *slog.Logger
+	mu        sync.Mutex
+	client    *oss.Client
+	uploader  *oss.Uploader
+	transport *http.Transport
+	logger    *slog.Logger
 
 	// Alibaba Cloud authentication keys.
 	AccessKeyID     string
@@ -131,6 +135,12 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 
 	// Build configuration
 	cfg := oss.LoadDefaultConfig()
+	httpClient := osstransport.NewHttpClient(&osstransport.Config{})
+	transport, ok := httpClient.Transport.(*http.Transport)
+	if !ok {
+		return fmt.Errorf("oss: unexpected http transport type %T", httpClient.Transport)
+	}
+	cfg = cfg.WithHttpClient(httpClient)
 
 	// Configure credentials
 	if c.AccessKeyID != "" && c.AccessKeySecret != "" {
@@ -173,7 +183,21 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		})
 	}
 	c.uploader = c.client.NewUploader(uploaderOpts...)
+	c.transport = transport
 
+	return nil
+}
+
+func (c *ReplicaClient) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.transport != nil {
+		c.transport.CloseIdleConnections()
+		c.transport = nil
+	}
+	c.client = nil
+	c.uploader = nil
 	return nil
 }
 

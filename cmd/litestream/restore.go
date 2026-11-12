@@ -308,8 +308,10 @@ func (c *RestoreCommand) loadFromURL(ctx context.Context, replicaURL string, ifD
 	}
 
 	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+	if _, err := os.Stat(opt.OutputPath); err == nil && ifDBNotExists {
 		return nil, errSkipDBExists
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 
 	syncInterval := litestream.DefaultSyncInterval
@@ -353,8 +355,10 @@ func (c *RestoreCommand) loadFromConfig(_ context.Context, dbPath, configPath st
 	}
 
 	// Exit successfully if the output file already exists.
-	if _, err := os.Stat(opt.OutputPath); !os.IsNotExist(err) && ifDBNotExists {
+	if _, err := os.Stat(opt.OutputPath); err == nil && ifDBNotExists {
 		return nil, errSkipDBExists
+	} else if err != nil && !os.IsNotExist(err) {
+		return nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 
 	return db.Replica, nil

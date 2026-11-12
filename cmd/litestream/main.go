@@ -607,13 +607,17 @@ func OpenConfigFile(filename string) (io.ReadCloser, error) {
 // ReadConfigFile unmarshals config from filename. Expands path if needed.
 // If expandEnv is true then environment variables are expanded in the config.
 func ReadConfigFile(filename string, expandEnv bool) (Config, error) {
+	return readConfigFile(filename, expandEnv, true)
+}
+
+func readConfigFile(filename string, expandEnv, configureLogging bool) (_ Config, err error) {
 	f, err := OpenConfigFile(filename)
 	if err != nil {
 		return DefaultConfig(), err
 	}
-	defer f.Close()
+	defer func() { err = errors.Join(err, f.Close()) }()
 
-	return ParseConfig(f, expandEnv)
+	return parseConfig(f, expandEnv, configureLogging)
 }
 
 // stdinConfigPath is the -config value that reads the configuration from STDIN.
@@ -633,6 +637,10 @@ func ReadConfig(configPath string, expandEnv bool) (Config, error) {
 // ParseConfig unmarshals config from a reader.
 // If expandEnv is true then environment variables are expanded in the config.
 func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
+	return parseConfig(r, expandEnv, true)
+}
+
+func parseConfig(r io.Reader, expandEnv, configureLogging bool) (_ Config, err error) {
 	config := DefaultConfig()
 
 	// Read configuration.
@@ -706,7 +714,6 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 		return config, err
 	}
 
-	// Configure logging.
 	logOutput := os.Stdout
 	if config.Logging.Stderr {
 		logOutput = os.Stderr
@@ -714,18 +721,22 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
-	internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
-	config.warnSnapshotRetention()
+	if configureLogging {
+		internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+		config.warnSnapshotRetention()
+	}
 	if raw.ShutdownTimeout != nil {
 		value, ok := raw.ShutdownTimeout.(string)
 		timeout, err := time.ParseDuration(value)
 		if !ok || err != nil || timeout <= 0 {
-			slog.Warn("invalid shutdown-timeout; using default", "value", raw.ShutdownTimeout, "default", config.ShutdownTimeout)
+			if configureLogging {
+				slog.Warn("invalid shutdown-timeout; using default", "value", raw.ShutdownTimeout, "default", config.ShutdownTimeout)
+			}
 		} else {
 			config.ShutdownTimeout = timeout
 		}
 	}
-	if logOutput != os.Stderr {
+	if configureLogging && logOutput != os.Stderr {
 		internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 	}
 
@@ -735,17 +746,19 @@ func ParseConfig(r io.Reader, expandEnv bool) (_ Config, err error) {
 	// yaml.UnmarshalStrict reports both unrecognized and duplicate mapping keys.
 	// These are warnings rather than errors so that existing deployments with a
 	// stray key keep starting.
-	var strictConfig Config
-	if err := yaml.UnmarshalStrict(buf, &strictConfig); err != nil {
-		var typeErr *yaml.TypeError
-		if !errors.As(err, &typeErr) {
-			return config, fmt.Errorf("strictly decode config: %w", err)
+	if configureLogging {
+		var strictConfig Config
+		if err := yaml.UnmarshalStrict(buf, &strictConfig); err != nil {
+			var typeErr *yaml.TypeError
+			if !errors.As(err, &typeErr) {
+				return config, fmt.Errorf("strictly decode config: %w", err)
+			}
+			for _, detail := range typeErr.Errors {
+				slog.Warn("configuration contains unrecognized or duplicate key", "detail", detail)
+			}
 		}
-		for _, detail := range typeErr.Errors {
-			slog.Warn("configuration contains unrecognized or duplicate key", "detail", detail)
-		}
-	}
 
+	}
 	return config, nil
 }
 
