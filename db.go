@@ -1924,6 +1924,41 @@ func (db *DB) verifyWithExecutor(ctx context.Context, exec *syncExecutor) (info 
 	return info, nil
 }
 
+func (db *DB) walIndexMaxFrame(ctx context.Context, salt1, salt2 uint32) (int, error) {
+	const maxAttempts = 10
+	var err error
+	for attempt := range maxAttempts {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, ctx.Err()
+			case <-time.After(time.Millisecond):
+			}
+		}
+		var busy, n, backfill int
+		err = db.db.QueryRowContext(ctx, `PRAGMA main.wal_checkpoint(NOOP)`).Scan(&busy, &n, &backfill)
+		if err != nil {
+			if isSQLiteBusyError(err) {
+				continue
+			}
+			return 0, fmt.Errorf("query committed WAL frames: %w", err)
+		} else if busy != 0 {
+			err = fmt.Errorf("SQLITE_BUSY: committed WAL boundary unavailable")
+			continue
+		} else if n < 0 {
+			return 0, fmt.Errorf("committed WAL boundary unavailable: frames=%d", n)
+		}
+		hdr, err := readWALHeader(db.WALPath())
+		if err != nil {
+			return 0, fmt.Errorf("verify WAL generation: %w", err)
+		} else if binary.BigEndian.Uint32(hdr[16:]) != salt1 || binary.BigEndian.Uint32(hdr[20:]) != salt2 {
+			return 0, fmt.Errorf("WAL generation changed while reading committed boundary")
+		}
+		return n, nil
+	}
+	return 0, fmt.Errorf("query committed WAL frames after %d attempts: %w", maxAttempts, err)
+}
+
 // lastPageMatch checks if the last page read in the WAL exists in the last LTX file.
 func (db *DB) lastPageMatch(ctx context.Context, dec *ltx.Decoder, prevWALOffset, frameSize int64) (bool, error) {
 	if prevWALOffset <= WALHeaderSize {
@@ -2177,6 +2212,13 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 			return result, fmt.Errorf("new wal reader with offset: %w", err)
 		}
 	}
+
+	// Never read past the last frame committed to the wal-index.
+	n, err := db.walIndexMaxFrame(ctx, rd.salt1, rd.salt2)
+	if err != nil {
+		return result, fmt.Errorf("read committed wal boundary: %w", err)
+	}
+	rd.SetEnd(WALHeaderSize + int64(n)*int64(db.pageSize+WALFrameHeaderSize))
 
 	// Build a mapping of changed page numbers and their latest content.
 	db.setSyncDiagPhase(diagPhaseSyncPageMap,
