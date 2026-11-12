@@ -330,7 +330,7 @@ func TestLTXBehavior_ProfileConfigIsolation(t *testing.T) {
 		{name: "minio", s3: &S3Config{}, interval: 10 * time.Minute, retention: time.Hour},
 		{name: "low volume", profile: &low, interval: 10 * time.Minute, retention: time.Hour},
 		{name: "burst volume", profile: &burst, interval: 10 * time.Minute, retention: time.Hour},
-		{name: "high volume", profile: &high, interval: time.Minute, retention: time.Minute, l0: 30 * time.Second},
+		{name: "high volume", profile: &high, interval: 2 * time.Minute, retention: 2 * time.Minute, l0: 30 * time.Second},
 		{name: "short high volume", profile: &high, short: true, interval: 30 * time.Second, retention: 10 * time.Minute},
 	}
 	for _, tt := range tests {
