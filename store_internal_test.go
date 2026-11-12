@@ -1,31 +1,74 @@
 package litestream
 
 import (
+	"bufio"
+	"context"
+	"io"
+	"log/slog"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/superfly/ltx"
 )
 
-func TestBusyRetryDelay(t *testing.T) {
-	for _, tt := range []struct {
-		name      string
-		nextDelay time.Duration
-		streak    int
-		maxRetry  time.Duration
-		want      time.Duration
-	}{
-		{"not busy keeps interval", time.Hour, 0, 10 * time.Second, time.Hour},
-		{"first busy pass retries after base", time.Hour, 1, 10 * time.Second, time.Second},
-		{"second busy pass doubles", time.Hour, 2, 10 * time.Second, 2 * time.Second},
-		{"fourth busy pass doubles again", time.Hour, 4, 10 * time.Second, 8 * time.Second},
-		{"backoff is capped", time.Hour, 20, 10 * time.Second, 10 * time.Second},
-		{"busy keeps shorter interval", 500 * time.Millisecond, 3, 10 * time.Second, 500 * time.Millisecond},
-		{"busy with retry disabled", time.Hour, 1, 0, time.Hour},
-		{"negative clamps to zero", -time.Second, 0, 10 * time.Second, 0},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := busyRetryDelay(tt.nextDelay, tt.streak, tt.maxRetry); got != tt.want {
-				t.Fatalf("busyRetryDelay()=%s, want %s", got, tt.want)
+func TestStore_MonitorCompactionRetriesBusyDB(t *testing.T) {
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.opened = true
+	db.pageSize = 4096
+	db.maxLTXFileInfos.m[0] = &ltx.FileInfo{}
+	db.maxLTXFileInfos.m[1] = &ltx.FileInfo{}
+	pr, pw := io.Pipe()
+	events := make(chan string, 16)
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		scanner := bufio.NewScanner(pr)
+		for scanner.Scan() {
+			select {
+			case events <- scanner.Text():
+			default:
 			}
-		})
+		}
+	}()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	s := NewStore([]*DB{db}, CompactionLevels{{Level: 0}, {Level: 1, Interval: 24 * time.Hour}})
+	db.Logger = slog.New(slog.NewTextHandler(pw, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	s.MaintenanceBusyRetryInterval = 10 * time.Millisecond
+	db.maintenanceMu.Lock()
+	locked := true
+	t.Cleanup(func() {
+		if locked {
+			db.maintenanceMu.Unlock()
+		}
+		cancel()
+		<-done
+		if err := pw.Close(); err != nil {
+			t.Error(err)
+		}
+		<-scanDone
+		if err := pr.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	go func() { defer close(done); s.monitorCompactionLevel(ctx, s.levels[1]) }()
+	for _, message := range []string{"maintenance busy", "no compaction"} {
+		deadline := time.NewTimer(2 * time.Second)
+		found := false
+		for !found {
+			select {
+			case event := <-events:
+				found = strings.Contains(event, message)
+			case <-deadline.C:
+				t.Fatalf("monitor did not report %q", message)
+			}
+		}
+		deadline.Stop()
+		if locked {
+			db.maintenanceMu.Unlock()
+			locked = false
+		}
 	}
 }

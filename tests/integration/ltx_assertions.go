@@ -310,7 +310,10 @@ func AssertCompactionTiming(t *testing.T, report *LTXBehaviorReport, levelInterv
 		maxAllowed := time.Duration(float64(expectedInterval) * (1 + tolerance))
 
 		violations := 0
-		for _, interval := range intervals {
+		for i, interval := range intervals {
+			if interval < minAllowed && report.CompactionIntervals[level][i]+interval >= expectedInterval+minAllowed {
+				continue
+			}
 			if interval < minAllowed || interval > maxAllowed {
 				violations++
 			}

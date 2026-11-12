@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -836,9 +837,10 @@ func (vfsTestLogger) SetLogger(*slog.Logger) {}
 // mockReplicaClient implements ReplicaClient for deterministic LTX fixtures.
 type mockReplicaClient struct {
 	vfsTestLogger
-	mu    sync.Mutex
-	files []*ltx.FileInfo
-	data  map[string][]byte
+	mu       sync.Mutex
+	files    []*ltx.FileInfo
+	data     map[string][]byte
+	closeErr error
 }
 
 type blockingReplicaClient struct {
@@ -938,6 +940,9 @@ func (c *mockReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID,
 	slice := data[offset:]
 	if size > 0 && size < int64(len(slice)) {
 		slice = slice[:size]
+	}
+	if c.closeErr != nil {
+		return &hydrationTestReader{Reader: bytes.NewReader(slice), err: c.closeErr}, nil
 	}
 	return io.NopCloser(bytes.NewReader(slice)), nil
 }
@@ -1420,7 +1425,10 @@ func TestHydrator_Close_Persistent(t *testing.T) {
 }
 
 func TestHydrator_Restore_WriteFailure(t *testing.T) {
+	stack := make([]byte, 1<<20)
+	before := strings.Count(string(stack[:runtime.Stack(stack, true)]), "(*Hydrator).Restore.func")
 	client := newMockReplicaClient()
+	client.closeErr = errors.New("injected hydration input close failure")
 	pgnos := make([]uint32, 100)
 	for i := range pgnos {
 		pgnos[i] = uint32(i + 1)
@@ -1435,9 +1443,20 @@ func TestHydrator_Restore_WriteFailure(t *testing.T) {
 	if err := h.file.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if err := h.Restore(context.Background(), []*ltx.FileInfo{fixture.info}); err == nil || !strings.Contains(err.Error(), "write page") {
+	if err := h.Restore(context.Background(), []*ltx.FileInfo{fixture.info}); !errors.Is(err, client.closeErr) || !strings.Contains(err.Error(), "write page") {
 		t.Fatalf("expected hydration write error, got %v", err)
 	}
+	for deadline := time.Now().Add(time.Second); ; {
+		after := strings.Count(string(stack[:runtime.Stack(stack, true)]), "(*Hydrator).Restore.func")
+		if after <= before {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hydration compactor outlived failed restore")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 }
 
 func TestHydrator_Init_Resume(t *testing.T) {

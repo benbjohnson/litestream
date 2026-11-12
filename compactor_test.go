@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -906,7 +907,8 @@ func TestCompactor_CompactJoinsProducerOnWriteError(t *testing.T) {
 	var releaseOnce sync.Once
 	releaseRead := func() { releaseOnce.Do(func() { close(release) }) }
 	t.Cleanup(releaseRead)
-	reader := &joiningCompactionReader{started: started, closed: closed, release: release}
+	closeErr := errors.New("injected input close failure")
+	reader := &joiningCompactionReader{started: started, closed: closed, release: release, err: closeErr}
 	client := &mock.ReplicaClient{
 		LTXFilesFunc: func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
 			if level == 1 {
@@ -942,7 +944,7 @@ func TestCompactor_CompactJoinsProducerOnWriteError(t *testing.T) {
 	releaseRead()
 	select {
 	case err := <-result:
-		if err == nil || !strings.Contains(err.Error(), "injected upload failure") {
+		if !errors.Is(err, closeErr) || !strings.Contains(err.Error(), "injected upload failure") {
 			t.Fatalf("unexpected error: %v", err)
 		}
 	case <-ctx.Done():
@@ -955,6 +957,7 @@ type joiningCompactionReader struct {
 	closed  chan struct{}
 	release chan struct{}
 	once    sync.Once
+	err     error
 }
 
 func (r *joiningCompactionReader) Read([]byte) (int, error) {
@@ -965,5 +968,5 @@ func (r *joiningCompactionReader) Read([]byte) (int, error) {
 
 func (r *joiningCompactionReader) Close() error {
 	r.once.Do(func() { close(r.closed) })
-	return nil
+	return r.err
 }
