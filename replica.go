@@ -220,7 +220,8 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		if err := ctx.Err(); err != nil {
 			return result, context.Cause(ctx)
 		}
-		if containsL0TXID(r.remoteL0Files, txID) {
+		i := sort.Search(len(r.remoteL0Files), func(i int) bool { return r.remoteL0Files[i].MinTXID > txID })
+		if i > 0 && r.remoteL0Files[i-1].MaxTXID >= txID {
 			r.SetPos(ltx.Pos{TXID: txID})
 			continue
 		}
@@ -326,11 +327,6 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 		txID = info.MaxTXID
 	}
 	return ltx.Pos{TXID: txID}, l0Files, nil
-}
-
-func containsL0TXID(files []ltx.FileInfo, txID ltx.TXID) bool {
-	i := sort.Search(len(files), func(i int) bool { return files[i].MinTXID > txID })
-	return i > 0 && files[i-1].MaxTXID >= txID
 }
 
 // InvalidatePos marks the replica position for recalculation on the next
