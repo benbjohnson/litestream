@@ -65,19 +65,23 @@ const (
 // with indefinite write blocking (issue #724). All checkpoints now use either
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
-	mu        sync.RWMutex
-	execSem   *semaphore.Weighted
-	path      string        // part to database
-	metaPath  string        // Path to the database metadata.
-	db        *sql.DB       // target database
-	f         *os.File      // long-running db file descriptor
-	rtx       *sql.Tx       // long running read transaction
-	pageSize  int           // page size, in bytes
-	notify    chan struct{} // closes on WAL change
-	chkMu     sync.RWMutex  // checkpoint lock
-	opened    bool          // true if Open() was called and Close() not yet called
-	syncState syncState
-	syncDiag  diagState
+	mu       sync.RWMutex
+	execSem  *semaphore.Weighted
+	path     string        // part to database
+	metaPath string        // Path to the database metadata.
+	db       *sql.DB       // target database
+	f        *os.File      // long-running db file descriptor
+	rtx      *sql.Tx       // long running read transaction
+	pageSize int           // page size, in bytes
+	notify   chan struct{} // closes on WAL change
+	chkMu    sync.RWMutex  // checkpoint lock
+	// maintenanceMu serializes snapshots & compactions per database; held via
+	// TryLock by Store.CompactDB so overlapping maintenance is refused with
+	// ErrMaintenanceBusy rather than queued (issue #1477).
+	maintenanceMu sync.Mutex
+	opened        bool // true if Open() was called and Close() not yet called
+	syncState     syncState
+	syncDiag      diagState
 
 	lastLTXPage *verifiedLTXPage
 
@@ -882,6 +886,7 @@ func (db *DB) Open() (err error) {
 	db.compactor.VerifyCompaction = db.VerifyCompaction
 	db.compactor.RetentionEnabled = db.RetentionEnabled
 	db.compactor.client = db.Replica.Client
+	db.compactor.SpillDir = db.metaPath
 
 	// Start monitoring SQLite database in a separate goroutine.
 	if db.MonitorInterval > 0 {
@@ -2250,10 +2255,15 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 		"salt2", rd.salt2)
 
 	timestamp := time.Now()
-	enc, err := ltx.NewEncoder(ltxFile)
+	enc, err := db.newEncoder(ltxFile)
 	if err != nil {
 		return result, fmt.Errorf("new ltx encoder: %w", err)
 	}
+	defer func() {
+		if cleanupErr := enc.Cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleanup ltx encoder: %w", cleanupErr))
+		}
+	}()
 	if err := enc.EncodeHeader(ltx.Header{
 		Version:   ltx.Version,
 		Flags:     ltx.HeaderFlagNoChecksum,
@@ -2820,12 +2830,24 @@ func (p *snapshotReadPosition) close() {
 
 type snapshotReadCloser struct {
 	*io.PipeReader
-	pos *snapshotReadPosition
+	pos        *snapshotReadPosition
+	cancel     context.CancelFunc // stops the producing goroutine
+	done       <-chan struct{}    // closed when the producing goroutine has exited
+	cleanupErr *error
 }
 
+// Close stops the producing goroutine and waits for it to exit, so that no
+// snapshot state (WAL page map, LTX encoder page index) outlives the reader.
+// Cancelling the producer's context interrupts the WAL scan that runs before
+// the first pipe write; closing the pipe interrupts any write in progress.
+// Store.CompactDB relies on this to keep a failed snapshot's memory from
+// overlapping the next maintenance operation.
 func (r *snapshotReadCloser) Close() error {
-	defer r.pos.close()
-	return r.PipeReader.Close()
+	r.cancel()
+	err := r.PipeReader.Close()
+	<-r.done
+	r.pos.close()
+	return errors.Join(err, *r.cleanupErr)
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
@@ -2939,19 +2961,26 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 
 	// Execute encoding in a separate goroutine so the caller can initialize before reading.
 	pr, pw := io.Pipe()
+	ctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	var cleanupErr error
 	go func() {
+		defer close(done)
+		var snapshotErr error
+		defer func() { _ = pw.CloseWithError(snapshotErr) }()
 		defer pos.close()
+		defer cancel() // release the derived context even if the reader is never closed
 
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
-			pw.CloseWithError(err)
+			snapshotErr = err
 			return
 		}
 		defer walFile.Close()
 
 		rd, err := NewWALReader(walFile, db.Logger.With(LogKeySubsystem, LogSubsystemWALReader))
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new wal reader: %w", err))
+			snapshotErr = fmt.Errorf("new wal reader: %w", err)
 			return
 		}
 
@@ -2963,7 +2992,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		if maxBytes > 0 {
 			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
 			if err != nil {
-				pw.CloseWithError(fmt.Errorf("page map: %w", err))
+				snapshotErr = fmt.Errorf("page map: %w", err)
 				return
 			}
 		}
@@ -2972,7 +3001,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		}
 
 		if maxOffset > pos.walEndOffset {
-			pw.CloseWithError(fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset))
+			snapshotErr = fmt.Errorf("snapshot wal read exceeded bound: max offset %d > end offset %d", maxOffset, pos.walEndOffset)
 			return
 		}
 		walOffset, walSize := snapshotHeaderWALRange(maxOffset, int64(WALFrameHeaderSize+pos.pageSize))
@@ -2986,11 +3015,20 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			"salt1", rd.salt1,
 			"salt2", rd.salt2)
 
-		enc, err := ltx.NewEncoder(pw)
+		enc, err := db.newEncoder(pw)
 		if err != nil {
-			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
+			snapshotErr = fmt.Errorf("new ltx encoder: %w", err)
 			return
 		}
+		// Very large snapshots spill their page index into the meta
+		// directory rather than holding it in memory; Cleanup covers the
+		// cancellation paths that never reach enc.Close.
+		defer func() {
+			if err := enc.Cleanup(); err != nil {
+				cleanupErr = fmt.Errorf("cleanup snapshot encoder: %w", err)
+				snapshotErr = errors.Join(snapshotErr, cleanupErr)
+			}
+		}()
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,
@@ -3004,23 +3042,22 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			WALSalt1:  rd.salt1,
 			WALSalt2:  rd.salt2,
 		}); err != nil {
-			pw.CloseWithError(fmt.Errorf("encode ltx snapshot header: %w", err))
+			snapshotErr = fmt.Errorf("encode ltx snapshot header: %w", err)
 			return
 		}
 
 		if err := db.writeLTXFromDB(ctx, enc, walFile, commit, pageMap); err != nil {
-			pw.CloseWithError(fmt.Errorf("write snapshot ltx: %w", err))
+			snapshotErr = fmt.Errorf("write snapshot ltx: %w", err)
 			return
 		}
 
 		if err := enc.Close(); err != nil {
-			pw.CloseWithError(fmt.Errorf("close ltx snapshot encoder: %w", err))
+			snapshotErr = fmt.Errorf("close ltx snapshot encoder: %w", err)
 			return
 		}
-		_ = pw.Close()
 	}()
 
-	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
+	return &snapshotReadCloser{PipeReader: pr, pos: pos, cancel: cancel, done: done, cleanupErr: &cleanupErr}, nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
@@ -3057,14 +3094,14 @@ func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) 
 // It always writes, even when a snapshot already exists at the current
 // position, so operators can force a re-upload (replicate -force-snapshot).
 // Callers that want to skip duplicates check first, as Store.CompactDB does.
-func (db *DB) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
+func (db *DB) Snapshot(ctx context.Context) (info *ltx.FileInfo, err error) {
 	pos, r, err := db.SnapshotReader(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = r.Close() }()
+	defer func() { err = errors.Join(err, r.Close()) }()
 
-	info, err := db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
+	info, err = db.Replica.Client.WriteLTXFile(ctx, SnapshotLevel, 1, pos.TXID, r)
 	if err != nil {
 		return info, err
 	}
@@ -3542,3 +3579,12 @@ var (
 		Help: "Number of post-compaction verification failures",
 	}, []string{"db"})
 )
+
+func (db *DB) newEncoder(w io.Writer) (*ltx.Encoder, error) {
+	enc, err := ltx.NewEncoder(w)
+	if err != nil {
+		return nil, err
+	}
+	enc.SetSpillDir(db.MetaPath())
+	return enc, nil
+}

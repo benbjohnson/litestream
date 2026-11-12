@@ -800,16 +800,36 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	}
 	h.compactor = c
 
+	compactionDone := make(chan error, 1)
 	go func() {
-		_ = pw.CloseWithError(c.Compact(ctx))
+		err := c.Compact(ctx)
+		if cleanupErr := c.Cleanup(); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("cleanup compactor: %w", cleanupErr))
+		}
+		_ = pw.CloseWithError(err)
+		compactionDone <- err
 	}()
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
 	dec := ltx.NewDecoder(pr)
-	if err := dec.DecodeDatabaseTo(h.file); err != nil {
-		return fmt.Errorf("decode database: %w", err)
+	decodeErr := dec.DecodeDatabaseTo(h.file)
+	_ = pr.CloseWithError(decodeErr)
+	if decodeErr != nil {
+		for _, rd := range rdrs {
+			if closer, ok := rd.(io.Closer); ok {
+				if err := closer.Close(); err != nil {
+					decodeErr = errors.Join(decodeErr, fmt.Errorf("close hydration input: %w", err))
+				}
+			}
+		}
+	}
+	compactErr := <-compactionDone
+	if decodeErr != nil {
+		return errors.Join(fmt.Errorf("decode database: %w", decodeErr), compactErr)
+	} else if compactErr != nil {
+		return fmt.Errorf("compact hydration: %w", compactErr)
 	}
 
 	h.txid = infos[len(infos)-1].MaxTXID
