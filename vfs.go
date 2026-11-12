@@ -865,7 +865,7 @@ func (h *Hydrator) CatchUp(ctx context.Context, fromTXID, toTXID ltx.TXID) error
 }
 
 // ApplyLTX fetches an entire LTX file and applies its pages to the hydration file.
-func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
+func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) (err error) {
 	h.logger.Debug("applying ltx to hydration file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 	// Fetch entire LTX file
@@ -873,7 +873,7 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("open ltx file: %w", err)
 	}
-	defer rc.Close()
+	defer func() { err = errors.Join(err, rc.Close()) }()
 
 	dec := ltx.NewDecoder(rc)
 	dec.SetRetainPageIndex(false) // pages are streamed; the index is validated, not kept
@@ -885,12 +885,11 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	defer h.mu.Unlock()
 
 	if h.persistent {
-		if err := os.Remove(h.metaPath()); err == nil {
-			if err := syncDir(filepath.Dir(h.metaPath())); err != nil {
-				return fmt.Errorf("sync hydration meta directory: %w", err)
-			}
-		} else if !os.IsNotExist(err) {
+		if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("remove hydration meta before applying ltx: %w", err)
+		}
+		if err := syncDir(filepath.Dir(h.metaPath())); err != nil {
+			return fmt.Errorf("sync hydration meta directory: %w", err)
 		}
 	}
 
@@ -900,6 +899,10 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	// instead of persisting it for a resume on the next start.
 	data := make([]byte, h.pageSize)
 	for {
+		if err := ctx.Err(); err != nil {
+			h.tainted.Store(true)
+			return err
+		}
 		var phdr ltx.PageHeader
 		if err := dec.DecodePage(&phdr, data); err == io.EOF {
 			break
@@ -922,12 +925,6 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	}
 
 	return nil
-}
-
-// Tainted reports whether an applied LTX file failed verification, in which
-// case the hydration file's content cannot be trusted.
-func (h *Hydrator) Tainted() bool {
-	return h.tainted.Load()
 }
 
 // ReadAt reads data from the hydrated local file.
@@ -1070,19 +1067,17 @@ func (h *Hydrator) Close() (err error) {
 		return nil
 	}
 
+	var errs []error
 	if h.persistent && h.txid > 0 && !h.tainted.Load() {
 		if err := h.file.Sync(); err != nil {
-			h.logger.Warn("failed to sync hydration file", "error", err)
+			errs = append(errs, fmt.Errorf("sync hydration file: %w", err))
+		} else if err := h.saveMeta(); err != nil {
+			errs = append(errs, err)
+		} else {
+			return h.file.Close()
 		}
-		if err := h.saveMeta(); err != nil {
-			h.logger.Warn("failed to save hydration meta", "error", err)
-		}
-		return h.file.Close()
 	}
 
-	// Discard: remove the meta first so a restart can never resume from
-	// this file, then the file itself; report every failure, not the first.
-	var errs []error
 	if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
 		errs = append(errs, err)
 	}
