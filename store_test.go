@@ -20,6 +20,134 @@ import (
 	"github.com/benbjohnson/litestream/mock"
 )
 
+func TestStore_EnforceSnapshotRetention_PreservesCompactionInputs(t *testing.T) {
+	for _, level := range []int{4, 5} {
+		t.Run(fmt.Sprintf("L%d", level), func(t *testing.T) {
+			ctx := t.Context()
+			dir := t.TempDir()
+			db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+			db.MonitorInterval = 0
+			db.ShutdownSyncTimeout = 0
+			client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+			db.Replica = litestream.NewReplicaWithClient(db, client)
+			db.Replica.MonitorEnabled = false
+			require.NoError(t, db.Open())
+			defer testingutil.MustCloseDB(t, db)
+
+			var levels litestream.CompactionLevels
+			for i := 0; i <= level; i++ {
+				levels = append(levels, &litestream.CompactionLevel{Level: i, Interval: time.Duration(i) * time.Minute})
+			}
+			store := litestream.NewStore([]*litestream.DB{db}, levels)
+			store.SnapshotRetention = time.Minute
+
+			createTestLTXFile(t, client, level-2, 1, 10)
+			_, err := db.Compact(ctx, level-1)
+			require.NoError(t, err)
+			createTestLTXFile(t, client, level-2, 11, 20)
+			createTestLTXFile(t, client, level-2, 21, 30)
+			createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, 100, time.Now().Add(-time.Hour))
+			createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 200)
+
+			require.NoError(t, store.EnforceSnapshotRetention(ctx, db))
+			_, err = db.Compact(ctx, level-1)
+			require.NoError(t, err)
+			info, err := db.Compact(ctx, level)
+			require.NoError(t, err)
+			require.Equal(t, ltx.TXID(1), info.MinTXID)
+			require.Equal(t, ltx.TXID(30), info.MaxTXID)
+		})
+	}
+}
+
+func TestStore_EnforceSnapshotRetention_ConsumedBoundary(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		consumed ltx.TXID
+		floor    ltx.TXID
+		topLevel bool
+		want     []ltx.TXID
+	}{
+		{name: "EmptyNextLevel", want: []ltx.TXID{10, 20, 30}},
+		{name: "ConsumedFile", consumed: 10, want: []ltx.TXID{20, 30}},
+		{name: "PartiallyConsumedFile", consumed: 15, want: []ltx.TXID{20, 30}},
+		{name: "CaughtUp", consumed: 30, want: []ltx.TXID{30}},
+		{name: "SnapshotBoundary", consumed: 30, floor: 15, want: []ltx.TXID{20, 30}},
+		{name: "HighestLevel", topLevel: true, want: []ltx.TXID{30}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			dir := t.TempDir()
+			db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+			db.MonitorInterval = 0
+			db.ShutdownSyncTimeout = 0
+			client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+			db.Replica = litestream.NewReplicaWithClient(db, client)
+			db.Replica.MonitorEnabled = false
+			require.NoError(t, db.Open())
+			defer testingutil.MustCloseDB(t, db)
+			levels := litestream.CompactionLevels{{Level: 0}, {Level: 1, Interval: time.Minute}}
+			if !tt.topLevel {
+				levels = append(levels, &litestream.CompactionLevel{Level: 2, Interval: time.Hour})
+			}
+			store := litestream.NewStore([]*litestream.DB{db}, levels)
+			store.SnapshotRetention = time.Minute
+			for minTXID := ltx.TXID(1); minTXID < 30; minTXID += 10 {
+				createTestLTXFile(t, client, 1, minTXID, minTXID+9)
+			}
+			if tt.consumed > 0 {
+				createTestLTXFile(t, client, 2, 1, tt.consumed)
+			}
+			floor := tt.floor
+			if floor == 0 {
+				floor = 100
+			}
+			createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, floor, time.Now().Add(-time.Hour))
+			createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 200)
+			require.NoError(t, store.EnforceSnapshotRetention(ctx, db))
+			itr, err := client.LTXFiles(ctx, 1, 0, false)
+			require.NoError(t, err)
+			var got []ltx.TXID
+			for itr.Next() {
+				got = append(got, itr.Item().MaxTXID)
+			}
+			require.NoError(t, itr.Close())
+			require.Equal(t, tt.want, got)
+		})
+	}
+}
+
+func TestStore_EnforceSnapshotRetention_ProgressError(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	client := file.NewReplicaClient(filepath.Join(dir, "replica"))
+	want := errors.New("progress unavailable")
+	var fail bool
+	db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+		LTXFilesFunc: func(ctx context.Context, level int, seek ltx.TXID, metadata bool) (ltx.FileIterator, error) {
+			if fail && level == 2 {
+				return nil, want
+			}
+			return client.LTXFiles(ctx, level, seek, metadata)
+		},
+		DeleteLTXFilesFunc: client.DeleteLTXFiles,
+	})
+	db.Replica.MonitorEnabled = false
+	require.NoError(t, db.Open())
+	defer testingutil.MustCloseDB(t, db)
+	store := litestream.NewStore([]*litestream.DB{db}, litestream.CompactionLevels{{Level: 0}, {Level: 1, Interval: time.Minute}, {Level: 2, Interval: time.Hour}})
+	createTestLTXFile(t, client, 1, 1, 10)
+	createTestLTXFile(t, client, 1, 11, 20)
+	fail = true
+	require.ErrorIs(t, store.EnforceSnapshotRetention(ctx, db), want)
+	r, err := client.OpenLTXFile(ctx, 1, 1, 10, 0, 0)
+	require.NoError(t, err)
+	require.NoError(t, r.Close())
+}
+
 func TestStore_Open_InitError(t *testing.T) {
 	want := errors.New("init error")
 	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))

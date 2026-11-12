@@ -866,7 +866,18 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 			continue
 		}
 
-		if err := db.EnforceRetentionByTXID(ctx, lvl.Level, minSnapshotTXID); err != nil {
+		minTXID := minSnapshotTXID
+		if nextLevel := s.levels.NextLevel(lvl.Level); nextLevel != SnapshotLevel {
+			info, err := db.MaxLTXFileInfo(ctx, nextLevel)
+			if err != nil {
+				return fmt.Errorf("fetch L%d compaction progress: %w", nextLevel, err)
+			}
+			if info.MaxTXID < minTXID {
+				minTXID = info.MaxTXID + 1
+			}
+		}
+
+		if err := db.EnforceRetentionByTXID(ctx, lvl.Level, minTXID); err != nil {
 			return fmt.Errorf("enforce L%d retention: %w", lvl.Level, err)
 		}
 	}
