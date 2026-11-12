@@ -308,14 +308,27 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	defer func() {
 		if f != nil {
-			_ = f.Close()
+			err = errors.Join(err, f.Close())
 		}
 		if err != nil {
-			_ = sftpClient.Remove(tmpFilename)
+			if removeErr := sftpClient.Remove(tmpFilename); removeErr != nil && !os.IsNotExist(removeErr) {
+				err = errors.Join(err, fmt.Errorf("sftp: cannot remove temporary ltx file %q: %w", tmpFilename, removeErr))
+			}
 		}
 	}()
 
-	n, err := io.Copy(f, fullReader)
+	// Compaction streams its output through an io.Pipe in small writes, and
+	// pkg/sftp cannot tell the size of such a reader: io.Copy then sends every
+	// read as its own request and waits for the reply before the next one, so
+	// over a link with tens of milliseconds of latency a snapshot of a large
+	// database takes days. Fill each read up to the SFTP packet size and, when
+	// concurrent writes are enabled, keep several packets in flight.
+	var n int64
+	if c.ConcurrentWrites {
+		n, err = f.ReadFromWithConcurrency(fullChunkReader{fullReader}, 0)
+	} else {
+		n, err = io.Copy(f, fullChunkReader{fullReader})
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -436,4 +449,22 @@ func (c *ReplicaClient) resetOnConnError(err error) {
 		c.sshClient.Close()
 		c.sshClient = nil
 	}
+}
+
+// fullChunkReader fills every read completely, except at the end of the stream,
+// so that each SFTP write request carries a full packet.
+type fullChunkReader struct {
+	r io.Reader
+}
+
+func (c fullChunkReader) Read(p []byte) (int, error) {
+	var n int
+	for n < len(p) {
+		nn, err := c.r.Read(p[n:])
+		n += nn
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
