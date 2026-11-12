@@ -265,6 +265,11 @@ func TestMain_Run_ForwardsSignal(t *testing.T) {
 
 func TestProcessHarness(t *testing.T) {
 	switch os.Getenv("S3LEASE_TEST_PROCESS") {
+	case "exit-on-input":
+		if _, err := io.Copy(io.Discard, os.Stdin); err != nil {
+			os.Exit(2)
+		}
+		os.Exit(0)
 	case "exit":
 		fmt.Println("exited")
 		os.Exit(0)
@@ -495,5 +500,58 @@ func TestMain_Run_ProcessGroup(t *testing.T) {
 				t.Fatal("lease was not released")
 			}
 		})
+	}
+}
+
+func TestRenewLease_Shutdown(t *testing.T) {
+	for _, mode := range []string{"success", "error"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				lease := &litestream.Lease{ETag: "initial", ExpiresAt: time.Now().Add(time.Minute)}
+				next := &litestream.Lease{ETag: "renewed", ExpiresAt: time.Now().Add(2 * time.Minute)}
+				failure := errors.New("renewal failed")
+				leaser := newTestLeaser()
+				leaser.renewFunc = func(context.Context, *litestream.Lease) (*litestream.Lease, error) {
+					cancel()
+					if mode == "error" {
+						return nil, failure
+					}
+					return next, nil
+				}
+				got, err := renewLease(ctx, leaser, lease, time.Second)
+				if mode == "error" {
+					if !errors.Is(err, failure) {
+						t.Fatalf("error=%v, want renewal failure", err)
+					}
+				} else if err != nil || got != next {
+					t.Fatalf("lease=%+v, error=%v; want renewed lease", got, err)
+				}
+			})
+		})
+	}
+}
+
+func TestMain_Run_RenewErrorOnExit(t *testing.T) {
+	t.Setenv("S3LEASE_TEST_PROCESS", "exit-on-input")
+	reader, writer := io.Pipe()
+	defer reader.Close()
+	defer writer.Close()
+	failure := errors.New("renewal failed during shutdown")
+	leaser := newTestLeaser()
+	leaser.renewFunc = func(ctx context.Context, lease *litestream.Lease) (*litestream.Lease, error) {
+		if err := writer.Close(); err != nil {
+			t.Error(err)
+		}
+		<-ctx.Done()
+		return nil, failure
+	}
+	m := newTestMain(leaser)
+	m.Stdin = reader
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.Run(ctx, testCommandArgs()); !errors.Is(err, failure) {
+		t.Fatalf("Run() error=%v, want renewal failure", err)
 	}
 }

@@ -210,6 +210,7 @@ jobs:
       - run: go test -v ./s3
       - run: go test -v ./sftp
       - run: go test -v ./cmd/litestream
+      - run: go test -race -count=1 ./cmd/s3lease
 
       - name: Test v0.3 WAL ordering on 32-bit
         run: CGO_ENABLED=0 GOOS=linux GOARCH=386 go test -v ./file ./s3 -run '^TestReplicaClient_WALSegmentsV3$'

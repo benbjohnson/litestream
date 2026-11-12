@@ -139,6 +139,11 @@ func (m *Main) Run(ctx context.Context, args []string) error {
 	}
 	cancelRenew()
 	<-renewDone
+	select {
+	case renewErr := <-renewErrCh:
+		err = errors.Join(err, renewErr)
+	default:
+	}
 
 	return errors.Join(err, releaseLease(leaser, lease))
 }
@@ -314,7 +319,13 @@ func renewLease(ctx context.Context, leaser litestream.Leaser, lease *litestream
 		expired := !time.Now().Before(lease.ExpiresAt)
 		cancel()
 		if ctx.Err() != nil {
-			return lease, nil
+			if err == nil {
+				return nextLease, nil
+			}
+			if errors.Is(err, ctx.Err()) {
+				return lease, nil
+			}
+			return lease, fmt.Errorf("renew lease: %w", err)
 		}
 		if expired {
 			return lease, fmt.Errorf("renew lease: %w", litestream.ErrLeaseNotHeld)
