@@ -1069,3 +1069,17 @@ func TestReplica_CalcPos(t *testing.T) {
 		}
 	})
 }
+
+func TestCompactor_Compact_SourceListingError(t *testing.T) {
+	want := errors.New("source listing failed")
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(_ context.Context, level int, _ ltx.TXID, _ bool) (ltx.FileIterator, error) {
+		if level == 0 {
+			return &errorFileIterator{closeErr: want}, nil
+		}
+		return ltx.NewFileInfoSliceIterator(nil), nil
+	}
+	if _, err := NewCompactor(client, nil).Compact(t.Context(), 1); !errors.Is(err, want) {
+		t.Fatalf("compaction error=%v, want %v", err, want)
+	}
+}

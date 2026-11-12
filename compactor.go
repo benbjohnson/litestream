@@ -187,6 +187,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
 		expectedMinTXID = info.MaxTXID + 1
 	}
+	if err := itr.Close(); err != nil {
+		return nil, fmt.Errorf("close source iterator: %w", err)
+	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction
 	}
