@@ -65,23 +65,19 @@ const (
 // with indefinite write blocking (issue #724). All checkpoints now use either
 // PASSIVE (non-blocking) or TRUNCATE (emergency only) modes.
 type DB struct {
-	mu       sync.RWMutex
-	execSem  *semaphore.Weighted
-	path     string        // part to database
-	metaPath string        // Path to the database metadata.
-	db       *sql.DB       // target database
-	f        *os.File      // long-running db file descriptor
-	rtx      *sql.Tx       // long running read transaction
-	pageSize int           // page size, in bytes
-	notify   chan struct{} // closes on WAL change
-	chkMu    sync.RWMutex  // checkpoint lock
-	// maintenanceMu serializes snapshots & compactions per database; held via
-	// TryLock by Store.CompactDB so overlapping maintenance is refused with
-	// ErrMaintenanceBusy rather than queued (issue #1477).
-	maintenanceMu sync.Mutex
-	opened        bool // true if Open() was called and Close() not yet called
-	syncState     syncState
-	syncDiag      diagState
+	mu        sync.RWMutex
+	execSem   *semaphore.Weighted
+	path      string        // part to database
+	metaPath  string        // Path to the database metadata.
+	db        *sql.DB       // target database
+	f         *os.File      // long-running db file descriptor
+	rtx       *sql.Tx       // long running read transaction
+	pageSize  int           // page size, in bytes
+	notify    chan struct{} // closes on WAL change
+	chkMu     sync.RWMutex  // checkpoint lock
+	opened    bool          // true if Open() was called and Close() not yet called
+	syncState syncState
+	syncDiag  diagState
 
 	lastLTXPage *verifiedLTXPage
 
@@ -1202,7 +1198,6 @@ func (db *DB) init(ctx context.Context) (err error) {
 	if err := internal.MkdirAll(db.metaPath, db.dirInfo); err != nil {
 		return err
 	}
-	db.compactor.SpillDir = db.metaPath
 
 	// Ensure WAL has at least one frame in it.
 	if err := db.ensureWALExists(ctx); err != nil {
@@ -2825,23 +2820,12 @@ func (p *snapshotReadPosition) close() {
 
 type snapshotReadCloser struct {
 	*io.PipeReader
-	pos    *snapshotReadPosition
-	cancel context.CancelFunc // stops the producing goroutine
-	done   <-chan struct{}    // closed when the producing goroutine has exited
+	pos *snapshotReadPosition
 }
 
-// Close stops the producing goroutine and waits for it to exit, so that no
-// snapshot state (WAL page map, LTX encoder page index) outlives the reader.
-// Cancelling the producer's context interrupts the WAL scan that runs before
-// the first pipe write; closing the pipe interrupts any write in progress.
-// Store.CompactDB relies on this to keep a failed snapshot's memory from
-// overlapping the next maintenance operation.
 func (r *snapshotReadCloser) Close() error {
-	r.cancel()
-	err := r.PipeReader.Close()
-	<-r.done
-	r.pos.close()
-	return err
+	defer r.pos.close()
+	return r.PipeReader.Close()
 }
 
 // SnapshotReader returns the current position of the database & a reader that contains a full database snapshot.
@@ -2955,12 +2939,8 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 
 	// Execute encoding in a separate goroutine so the caller can initialize before reading.
 	pr, pw := io.Pipe()
-	ctx, cancel := context.WithCancel(ctx)
-	done := make(chan struct{})
 	go func() {
-		defer close(done)
 		defer pos.close()
-		defer cancel() // release the derived context even if the reader is never closed
 
 		walFile, err := os.Open(db.WALPath())
 		if err != nil {
@@ -3011,11 +2991,6 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			pw.CloseWithError(fmt.Errorf("new ltx encoder: %w", err))
 			return
 		}
-		// Very large snapshots spill their page index into the meta
-		// directory rather than holding it in memory; Cleanup covers the
-		// cancellation paths that never reach enc.Close.
-		enc.SetSpillDir(db.MetaPath())
-		defer func() { _ = enc.Cleanup() }()
 		if err := enc.EncodeHeader(ltx.Header{
 			Version:   ltx.Version,
 			Flags:     ltx.HeaderFlagNoChecksum,
@@ -3045,7 +3020,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 		_ = pw.Close()
 	}()
 
-	return &snapshotReadCloser{PipeReader: pr, pos: pos, cancel: cancel, done: done}, nil
+	return &snapshotReadCloser{PipeReader: pr, pos: pos}, nil
 }
 
 func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
