@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -5193,7 +5194,7 @@ func TestDB_CheckpointPassive_CachesLastLTXPage(t *testing.T) {
 }
 
 func TestDB_WALIndexMaxFrame(t *testing.T) {
-	for _, name := range []string{"committed", "canceled", "closed", "no WAL", "generation changed", "missing WAL"} {
+	for _, name := range []string{"committed", "canceled", "closed", "no WAL", "generation changed", "missing WAL", "busy"} {
 		t.Run(name, func(t *testing.T) {
 			ctx := t.Context()
 			path := filepath.Join(t.TempDir(), "db")
@@ -5234,6 +5235,47 @@ func TestDB_WALIndexMaxFrame(t *testing.T) {
 				salt1++
 			case "missing WAL":
 				db.path = filepath.Join(t.TempDir(), "missing")
+			case "busy":
+				conn, err := sqldb.Conn(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var busy, frames, backfill int
+				queryErr := sqldb.QueryRowContext(ctx, `PRAGMA main.wal_checkpoint(NOOP)`).Scan(&busy, &frames, &backfill)
+				if err := errors.Join(queryErr, conn.Close()); err != nil {
+					t.Fatal(err)
+				}
+				tx, err := sqldb.BeginTx(ctx, nil)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() {
+					if err := tx.Rollback(); err != nil {
+						t.Error(err)
+					}
+				}()
+				if _, err := tx.ExecContext(ctx, `INSERT INTO t VALUES (2)`); err != nil {
+					t.Fatal(err)
+				}
+				headerPath := filepath.Join(t.TempDir(), "header")
+				cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDB_WriterKilledBeforeWALIndexUpdate$", "--", "save", path+"-shm", headerPath)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("save SHM: %v\n%s", err, output)
+				}
+				defer func() {
+					cmd := exec.CommandContext(context.Background(), os.Args[0], "-test.run=^TestDB_WriterKilledBeforeWALIndexUpdate$", "--", "restore", path+"-shm", headerPath)
+					if output, err := cmd.CombinedOutput(); err != nil {
+						t.Errorf("restore SHM: %v\n%s", err, output)
+					}
+				}()
+				invalidPath := filepath.Join(t.TempDir(), "invalid")
+				if err := os.WriteFile(invalidPath, make([]byte, 96), 0600); err != nil {
+					t.Fatal(err)
+				}
+				cmd = exec.CommandContext(ctx, os.Args[0], "-test.run=^TestDB_WriterKilledBeforeWALIndexUpdate$", "--", "restore", path+"-shm", invalidPath)
+				if output, err := cmd.CombinedOutput(); err != nil {
+					t.Fatalf("invalidate SHM: %v\n%s", err, output)
+				}
 			}
 			n, err := db.walIndexMaxFrame(ctx, salt1, salt2)
 			if name == "committed" {
@@ -5242,6 +5284,9 @@ func TestDB_WALIndexMaxFrame(t *testing.T) {
 				}
 			} else if err == nil {
 				t.Fatal("expected boundary error")
+			}
+			if name == "busy" && !isSQLiteBusyError(err) {
+				t.Fatalf("got %v, want recognizable SQLITE_BUSY", err)
 			}
 			if name == "canceled" && !errors.Is(err, context.Canceled) {
 				t.Fatalf("got %v, want context.Canceled", err)
