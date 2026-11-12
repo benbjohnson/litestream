@@ -412,6 +412,9 @@ Arguments:
 	    Follow mode. After restoring, continuously poll for and apply
 	    new changes. Similar to tail -f. The restored database should
 	    only be opened in read-only mode by consumers.
+	    Applies wait at most 5s for database locks, then return an error.
+	    Keep read transactions short and use DELETE journal mode on the replica.
+	    WAL connections can retain locks until closed, even between queries.
 	    Cannot be used with -txid or -timestamp.
 
 	-follow-interval DURATION

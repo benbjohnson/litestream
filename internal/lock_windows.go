@@ -3,7 +3,11 @@
 package internal
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"time"
 
 	"golang.org/x/sys/windows"
 )
@@ -14,20 +18,37 @@ const (
 	sqliteSharedSize  = 510
 )
 
-func LockFileExclusive(f *os.File) error {
+func LockFileExclusive(ctx context.Context, f *os.File) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	h := windows.Handle(f.Fd())
-
-	pendingOL := windows.Overlapped{Offset: sqlitePendingByte}
-	if err := windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &pendingOL); err != nil {
-		return err
+	for _, region := range []struct{ start, size uint32 }{{sqlitePendingByte, 1}, {sqliteSharedFirst, sqliteSharedSize}} {
+		ol := windows.Overlapped{Offset: region.start}
+		for {
+			err := ctx.Err()
+			if err == nil {
+				err = windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK|windows.LOCKFILE_FAIL_IMMEDIATELY, 0, region.size, 0, &ol)
+			}
+			if err == nil {
+				break
+			}
+			if errors.Is(err, windows.ERROR_LOCK_VIOLATION) {
+				select {
+				case <-ctx.Done():
+					err = ctx.Err()
+				case <-ticker.C:
+					continue
+				}
+			}
+			if region.start == sqliteSharedFirst {
+				pendingOL := windows.Overlapped{Offset: sqlitePendingByte}
+				err = errors.Join(err, windows.UnlockFileEx(h, 0, 1, 0, &pendingOL))
+			}
+			return fmt.Errorf("lock database byte range %d..%d: %w", region.start, region.start+region.size-1, err)
+		}
 	}
-
-	sharedOL := windows.Overlapped{Offset: sqliteSharedFirst}
-	if err := windows.LockFileEx(h, windows.LOCKFILE_EXCLUSIVE_LOCK, 0, sqliteSharedSize, 0, &sharedOL); err != nil {
-		_ = windows.UnlockFileEx(h, 0, 1, 0, &pendingOL)
-		return err
-	}
-
 	return nil
 }
 
@@ -40,8 +61,5 @@ func UnlockFile(f *os.File) error {
 	pendingOL := windows.Overlapped{Offset: sqlitePendingByte}
 	err2 := windows.UnlockFileEx(h, 0, 1, 0, &pendingOL)
 
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return errors.Join(err1, err2)
 }
