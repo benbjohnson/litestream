@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -107,7 +108,7 @@ func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo
 
 // Compact compacts source level files into the destination level.
 // Returns ErrNoCompaction if there are no files to compact.
-func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
+func (c *Compactor) Compact(ctx context.Context, dstLevel int) (info *ltx.FileInfo, err error) {
 	srcLevel := dstLevel - 1
 	producerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -130,7 +131,9 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 		cancel()
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
+				if closeErr := closer.Close(); closeErr != nil {
+					err = errors.Join(err, fmt.Errorf("close compaction input: %w", closeErr))
+				}
 			}
 		}
 		if done != nil {
@@ -177,13 +180,12 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
-		defer func() { _ = comp.Cleanup() }()
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
 		comp.SetSpillDir(c.SpillDir)
 		_ = pw.CloseWithError(comp.Compact(producerCtx))
 	}()
 
-	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	info, err = c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
 	_ = pr.CloseWithError(err)
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)

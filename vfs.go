@@ -819,13 +819,15 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) error {
 	if decodeErr != nil {
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
+				if err := closer.Close(); err != nil {
+					decodeErr = errors.Join(decodeErr, fmt.Errorf("close hydration input: %w", err))
+				}
 			}
 		}
 	}
 	compactErr := <-compactionDone
 	if decodeErr != nil {
-		return fmt.Errorf("decode database: %w", decodeErr)
+		return errors.Join(fmt.Errorf("decode database: %w", decodeErr), compactErr)
 	} else if compactErr != nil {
 		return fmt.Errorf("compact hydration: %w", compactErr)
 	}

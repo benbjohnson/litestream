@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -5197,6 +5198,21 @@ func TestDB_NewEncoderSpills(t *testing.T) {
 	if err := os.MkdirAll(db.MetaPath(), 0700); err != nil {
 		t.Fatal(err)
 	}
+	db.MonitorInterval = 0
+	db.Replica = NewReplica(db)
+	db.Replica.Client = &testReplicaClient{dir: t.TempDir()}
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := db.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
+	if db.compactor.SpillDir != db.MetaPath() {
+		t.Fatal("compaction spill directory must be configured before the first sync")
+	}
 	enc, err := db.newEncoder(io.Discard)
 	if err != nil {
 		t.Fatal(err)
@@ -5232,4 +5248,83 @@ func TestDB_NewEncoderSpills(t *testing.T) {
 	if len(entries) != 0 {
 		t.Fatalf("encoder left %d spill files after close", len(entries))
 	}
+}
+
+func TestDB_SnapshotReaderSpillCleanupError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("fault injection renames an open spill file")
+	}
+	db := NewDB(filepath.Join(t.TempDir(), "db"))
+	db.pageSize = 512
+	if err := os.MkdirAll(db.MetaPath(), 0700); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(db.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := f.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	db.f = f
+	if err := f.Truncate(int64(ltx.DefaultSpillThreshold+64) * 512); err != nil {
+		t.Fatal(err)
+	}
+	hdr := make([]byte, WALHeaderSize)
+	binary.BigEndian.PutUint32(hdr, 0x377f0682)
+	binary.BigEndian.PutUint32(hdr[4:], 3007000)
+	binary.BigEndian.PutUint32(hdr[8:], 512)
+	c1, c2 := WALChecksum(binary.LittleEndian, 0, 0, hdr[:24])
+	binary.BigEndian.PutUint32(hdr[24:], c1)
+	binary.BigEndian.PutUint32(hdr[28:], c2)
+	if err := os.WriteFile(db.WALPath(), hdr, 0600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	db.chkMu.RLock()
+	r, err := db.snapshotReader(ctx, &snapshotReadPosition{db: db, pageSize: 512, walEndOffset: WALHeaderSize, pos: ltx.Pos{TXID: 1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := r.Close(); err != nil && !strings.Contains(err.Error(), "cleanup snapshot encoder") {
+			t.Error(err)
+		}
+	}()
+	dec := ltx.NewDecoder(r)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 512)
+	for i := 0; i < ltx.DefaultSpillThreshold+1; i++ {
+		var ph ltx.PageHeader
+		if err := dec.DecodePage(&ph, data); err != nil {
+			t.Fatal(err)
+		}
+	}
+	entries, err := filepath.Glob(filepath.Join(db.MetaPath(), ".ltx-page-index-*.tmp"))
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("expected spill file: %v %v", entries, err)
+	}
+	if err := os.Rename(entries[0], entries[0]+".saved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(entries[0], 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(entries[0], "block-removal"), nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	_, err = io.Copy(io.Discard, r)
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "cleanup") {
+		t.Fatalf("expected cancellation and spill cleanup error, got %v", err)
+	}
+	if err := r.Close(); err == nil || !strings.Contains(err.Error(), "cleanup snapshot encoder") {
+		t.Fatalf("reader close hid spill cleanup error: %v", err)
+	}
+
 }

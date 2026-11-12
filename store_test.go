@@ -804,7 +804,11 @@ func TestStore_CompactDB_SerializesPerDBMaintenance(t *testing.T) {
 	if err := s.Open(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = s.Close(context.Background()) })
+	t.Cleanup(func() {
+		if err := s.Close(context.Background()); err != nil {
+			t.Error(err)
+		}
+	})
 
 	for _, tt := range []struct {
 		sqldb *sql.DB

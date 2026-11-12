@@ -12,14 +12,6 @@ import (
 )
 
 func TestAssertSnapshotCadenceAllowsScheduledCatchUp(t *testing.T) {
-	report := &LTXBehaviorReport{
-		SnapshotCount:     6,
-		SnapshotIntervals: []time.Duration{11 * time.Second, 28 * time.Second, 56 * time.Second, 5 * time.Second, 36 * time.Second},
-	}
-	AssertSnapshotCadence(t, report, 30*time.Second, 15*time.Second)
-}
-
-func TestAssertSnapshotCadenceRejectsExtraSnapshot(t *testing.T) {
 	if os.Getenv("LITESTREAM_ASSERT_EXTRA_SNAPSHOT") != "" {
 		report := &LTXBehaviorReport{
 			SnapshotCount:     6,
@@ -29,7 +21,12 @@ func TestAssertSnapshotCadenceRejectsExtraSnapshot(t *testing.T) {
 		return
 	}
 
-	cmd := exec.Command(os.Args[0], "-test.run=^TestAssertSnapshotCadenceRejectsExtraSnapshot$")
+	report := &LTXBehaviorReport{
+		SnapshotCount:     6,
+		SnapshotIntervals: []time.Duration{11 * time.Second, 28 * time.Second, 56 * time.Second, 5 * time.Second, 36 * time.Second},
+	}
+	AssertSnapshotCadence(t, report, 30*time.Second, 15*time.Second)
+	cmd := exec.Command(os.Args[0], "-test.run=^TestAssertSnapshotCadenceAllowsScheduledCatchUp$")
 	cmd.Env = append(os.Environ(), "LITESTREAM_ASSERT_EXTRA_SNAPSHOT=1")
 	output, err := cmd.CombinedOutput()
 	if err == nil || !strings.Contains(string(output), "[snapshot-cadence] FAIL") {
@@ -38,28 +35,35 @@ func TestAssertSnapshotCadenceRejectsExtraSnapshot(t *testing.T) {
 }
 
 func TestAssertCompactionTimingAllowsStartupInterval(t *testing.T) {
-	report := &LTXBehaviorReport{
-		CompactionCounts:    map[int]int{3: 4},
-		CompactionIntervals: map[int][]time.Duration{3: {24 * time.Second, 60 * time.Second, 61 * time.Second}},
-	}
-	AssertCompactionTiming(t, report, map[int]time.Duration{3: time.Minute}, 0.5)
-}
-
-func TestAssertCompactionTimingRejectsLateSteadyInterval(t *testing.T) {
-	if os.Getenv("LITESTREAM_ASSERT_LATE_COMPACTION") != "" {
+	if mode := os.Getenv("LITESTREAM_ASSERT_LATE_COMPACTION"); mode != "" {
+		intervals := []time.Duration{24 * time.Second, 100 * time.Second, 60 * time.Second}
+		if mode == "early" {
+			intervals = []time.Duration{24 * time.Second, 60 * time.Second, 5 * time.Second, 60 * time.Second}
+		}
 		report := &LTXBehaviorReport{
-			CompactionCounts:    map[int]int{3: 4},
-			CompactionIntervals: map[int][]time.Duration{3: {24 * time.Second, 100 * time.Second, 60 * time.Second}},
+			CompactionCounts:    map[int]int{3: len(intervals) + 1},
+			CompactionIntervals: map[int][]time.Duration{3: intervals},
 		}
 		AssertCompactionTiming(t, report, map[int]time.Duration{3: time.Minute}, 0.5)
 		return
 	}
-
-	cmd := exec.Command(os.Args[0], "-test.run=^TestAssertCompactionTimingRejectsLateSteadyInterval$")
-	cmd.Env = append(os.Environ(), "LITESTREAM_ASSERT_LATE_COMPACTION=1")
-	output, err := cmd.CombinedOutput()
-	if err == nil || !strings.Contains(string(output), "[compaction-timing-L3] FAIL") {
-		t.Fatalf("expected late compaction to fail timing assertion: %v\n%s", err, output)
+	for _, intervals := range [][]time.Duration{
+		{24 * time.Second, 60 * time.Second, 61 * time.Second},
+		{24 * time.Second, 80 * time.Second, 20 * time.Second, 60 * time.Second},
+	} {
+		report := &LTXBehaviorReport{
+			CompactionCounts:    map[int]int{3: len(intervals) + 1},
+			CompactionIntervals: map[int][]time.Duration{3: intervals},
+		}
+		AssertCompactionTiming(t, report, map[int]time.Duration{3: time.Minute}, 0.5)
+	}
+	for _, mode := range []string{"late", "early"} {
+		cmd := exec.Command(os.Args[0], "-test.run=^TestAssertCompactionTimingAllowsStartupInterval$")
+		cmd.Env = append(os.Environ(), "LITESTREAM_ASSERT_LATE_COMPACTION="+mode)
+		output, err := cmd.CombinedOutput()
+		if err == nil || !strings.Contains(string(output), "[compaction-timing-L3] FAIL") {
+			t.Fatalf("expected %s compaction to fail timing assertion: %v\n%s", mode, err, output)
+		}
 	}
 }
 
