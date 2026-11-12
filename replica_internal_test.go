@@ -1,20 +1,27 @@
 package litestream
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"database/sql"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"testing"
 	"time"
 
 	"github.com/superfly/ltx"
+
+	"github.com/benbjohnson/litestream/internal"
 
 	_ "modernc.org/sqlite"
 )
@@ -731,5 +738,294 @@ func TestApplyLTXFile_MultiplePages(t *testing.T) {
 		if i > 0 && !bytes.Equal(readBuf, pages[i]) {
 			t.Fatalf("page %d data mismatch", i+1)
 		}
+	}
+}
+
+func TestApplyLTXFile_Readers(t *testing.T) {
+	if i := slices.Index(os.Args, "--follow-reader"); i >= 0 {
+		db, err := sql.Open("sqlite", os.Args[i+1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer db.Close()
+		conns := make([]*sql.Conn, 2)
+		for j := range conns {
+			conns[j], err = db.Conn(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer conns[j].Close()
+			if _, err := conns[j].ExecContext(context.Background(), "PRAGMA cache_size=2; PRAGMA mmap_size=0; PRAGMA busy_timeout=0"); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var lockFile *os.File
+		defer func() {
+			if lockFile != nil {
+				if err := lockFile.Close(); err != nil {
+					t.Error(err)
+				}
+			}
+		}()
+		scanner := bufio.NewScanner(os.Stdin)
+		for scanner.Scan() {
+			var index int
+			var command string
+			if _, err := fmt.Sscanf(scanner.Text(), "%s %d", &command, &index); err != nil {
+				t.Fatal(err)
+			}
+			conn := conns[index]
+			var lo, hi int
+			var err error
+			switch command {
+			case "begin":
+				_, err = conn.ExecContext(context.Background(), "BEGIN")
+				if err == nil {
+					err = conn.QueryRowContext(context.Background(), "SELECT min(generation), max(generation) FROM test").Scan(&lo, &hi)
+				}
+			case "read":
+				err = conn.QueryRowContext(context.Background(), "SELECT min(generation), max(generation) FROM test").Scan(&lo, &hi)
+			case "end":
+				_, err = conn.ExecContext(context.Background(), "ROLLBACK")
+			case "lock":
+				lockFile, err = os.OpenFile(os.Args[i+1], os.O_RDWR, 0)
+				if err == nil {
+					err = internal.LockFileExclusive(context.Background(), lockFile)
+				}
+			case "unlock":
+				err = internal.UnlockFile(lockFile)
+			case "wal":
+				_, err = conn.ExecContext(context.Background(), "PRAGMA journal_mode=WAL")
+			default:
+				t.Fatalf("unknown command: %s", command)
+			}
+			message := ""
+			if err != nil {
+				message = err.Error()
+			}
+			if err := json.NewEncoder(os.Stdout).Encode(struct {
+				Lo, Hi int
+				Error  string
+			}{lo, hi, message}); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := scanner.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	for _, mode := range []string{"drain", "timeout", "cancel", "pool", "wal", "pending", "deadline"} {
+		t.Run(mode, func(t *testing.T) {
+			if mode == "pool" && runtime.GOOS == "windows" {
+				t.Skip("Unix process-wide shared-lock reuse")
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			defer cancel()
+			path := filepath.Join(t.TempDir(), "source.db")
+			source, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer source.Close()
+			source.SetMaxOpenConns(1)
+			if _, err := source.Exec("PRAGMA page_size=4096; CREATE TABLE test (id INTEGER PRIMARY KEY, generation INTEGER, padding BLOB); WITH RECURSIVE n(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<128) INSERT INTO test SELECT x, 0, zeroblob(3000) FROM n"); err != nil {
+				t.Fatal(err)
+			}
+			before, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f := mustCreateWritableDBFile(t)
+			defer f.Close()
+			if _, err := f.WriteAt(before, 0); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := source.Exec("UPDATE test SET generation=1"); err != nil {
+				t.Fatal(err)
+			}
+			after, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var pages [][]byte
+			for off := 0; off < len(after); off += 4096 {
+				pages = append(pages, after[off:off+4096])
+			}
+			data := mustBuildSnapshotLTX(t, 2, 2, 4096, pages)
+			client := &followTestReplicaClient{}
+			client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) {
+				return io.NopCloser(bytes.NewReader(data)), nil
+			}
+			r := NewReplicaWithClient(nil, client)
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestApplyLTXFile_Readers$", "--", "--follow-reader", f.Name())
+			input, err := cmd.StdinPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := cmd.StdoutPipe()
+			if err != nil {
+				t.Fatal(err)
+			}
+			var stderr bytes.Buffer
+			cmd.Stderr = &stderr
+			if err := cmd.Start(); err != nil {
+				t.Fatal(err)
+			}
+			defer func() {
+				if err := input.Close(); err != nil {
+					t.Error(err)
+				}
+				if err := cmd.Wait(); err != nil {
+					t.Errorf("reader: %v: %s", err, stderr.String())
+				}
+			}()
+			decoder := json.NewDecoder(output)
+			request := func(command string, index, generation int) {
+				t.Helper()
+				if _, err := fmt.Fprintf(input, "%s %d\n", command, index); err != nil {
+					t.Fatal(err)
+				}
+				var reply struct {
+					Lo, Hi int
+					Error  string
+				}
+				if err := decoder.Decode(&reply); err != nil {
+					t.Fatal(err)
+				}
+				if reply.Error != "" {
+					t.Fatalf("%s: %s", command, reply.Error)
+				}
+				if reply.Lo != generation || reply.Hi != generation {
+					t.Fatalf("%s: generations %d..%d, want %d", command, reply.Lo, reply.Hi, generation)
+				}
+			}
+			if mode == "wal" {
+				request("wal", 0, 0)
+			}
+			if mode == "pending" {
+				request("lock", 0, 0)
+			} else {
+				request("begin", 0, 0)
+			}
+			if mode == "pool" {
+				request("begin", 1, 0)
+			}
+			if mode == "wal" {
+				request("end", 0, 0)
+			}
+			applyCtx, cancelApply := context.WithCancel(ctx)
+			defer cancelApply()
+			if mode == "deadline" {
+				var cancelDeadline context.CancelFunc
+				applyCtx, cancelDeadline = context.WithTimeout(applyCtx, 200*time.Millisecond)
+				defer cancelDeadline()
+			}
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() { done <- r.applyLTXFile(applyCtx, f, &ltx.FileInfo{MinTXID: 2, MaxTXID: 2}, 4096) }()
+			time.Sleep(100 * time.Millisecond)
+			if mode == "drain" {
+				request("read", 0, 0)
+				select {
+				case err := <-done:
+					t.Fatalf("apply completed inside read transaction: %v", err)
+				default:
+				}
+				request("end", 0, 0)
+				select {
+				case err := <-done:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-ctx.Done():
+					t.Fatal("apply did not finish after reader drained")
+				}
+				request("read", 0, 1)
+				return
+			}
+			if mode == "cancel" {
+				cancelApply()
+			}
+			var applyErr error
+			if mode == "pool" {
+				ticker := time.NewTicker(20 * time.Millisecond)
+				defer ticker.Stop()
+				cycles := 0
+			loop:
+				for {
+					select {
+					case applyErr = <-done:
+						break loop
+					case <-ctx.Done():
+						t.Fatal("overlapping pool stalled apply")
+					case <-ticker.C:
+						index := cycles % 2
+						request("end", index, 0)
+						request("begin", index, 0)
+						cycles++
+					}
+				}
+				if cycles < 5 {
+					t.Fatalf("only %d reader turnovers", cycles)
+				}
+				request("end", 1, 0)
+			} else {
+				select {
+				case applyErr = <-done:
+				case <-ctx.Done():
+					t.Fatal("apply ignored its wait bound")
+				}
+			}
+			want := context.DeadlineExceeded
+			if mode == "cancel" {
+				want = context.Canceled
+			}
+			if !errors.Is(applyErr, want) {
+				t.Fatalf("apply error=%v, want %v", applyErr, want)
+			}
+			elapsed := time.Since(start)
+			if (mode == "cancel" || mode == "deadline") && elapsed > time.Second {
+				t.Fatalf("cancellation took %s", elapsed)
+			}
+			if mode != "cancel" && mode != "deadline" && (elapsed < 4*time.Second || elapsed > 7*time.Second) {
+				t.Fatalf("lock timeout took %s", elapsed)
+			}
+			if mode == "pending" {
+				request("unlock", 0, 0)
+			}
+			request("read", 0, 0)
+			if mode != "wal" && mode != "pending" {
+				request("end", 0, 0)
+			}
+			request("begin", 0, 0)
+			request("end", 0, 0)
+			if mode != "wal" {
+				if err := r.applyLTXFile(ctx, f, &ltx.FileInfo{MinTXID: 2, MaxTXID: 2}, 4096); err != nil {
+					t.Fatalf("retry after releasing readers: %v", err)
+				}
+				request("read", 0, 1)
+			}
+		})
+	}
+}
+
+func TestReplica_Follow_ApplyError(t *testing.T) {
+	f := mustCreateWritableDBFile(t)
+	defer f.Close()
+	if _, err := f.WriteAt(newSQLiteHeaderPage(4096), 0); err != nil {
+		t.Fatal(err)
+	}
+	want := errors.New("apply failure")
+	client := &followTestReplicaClient{}
+	client.LTXFilesFunc = func(context.Context, int, ltx.TXID, bool) (ltx.FileIterator, error) {
+		return ltx.NewFileInfoSliceIterator([]*ltx.FileInfo{{MinTXID: 2, MaxTXID: 2}}), nil
+	}
+	client.OpenLTXFileFunc = func(context.Context, int, ltx.TXID, ltx.TXID, int64, int64) (io.ReadCloser, error) { return nil, want }
+	r := NewReplicaWithClient(nil, client)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := r.follow(ctx, f.Name(), 1, time.Millisecond); !errors.Is(err, want) {
+		t.Fatalf("follow error=%v, want %v", err, want)
 	}
 }

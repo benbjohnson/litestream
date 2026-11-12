@@ -3,7 +3,11 @@
 package internal
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -14,18 +18,35 @@ const (
 	sqliteSharedSize  = 510
 )
 
-func LockFileExclusive(f *os.File) error {
+func LockFileExclusive(ctx context.Context, f *os.File) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
 	fd := int(f.Fd())
-
-	if err := setFcntlLock(fd, unix.F_WRLCK, sqlitePendingByte, 1); err != nil {
-		return err
+	for _, region := range []struct{ start, size int64 }{{sqlitePendingByte, 1}, {sqliteSharedFirst, sqliteSharedSize}} {
+		for {
+			err := ctx.Err()
+			if err == nil {
+				err = setFcntlLock(fd, unix.F_WRLCK, region.start, region.size)
+			}
+			if err == nil {
+				break
+			}
+			if errors.Is(err, unix.EACCES) || errors.Is(err, unix.EAGAIN) || errors.Is(err, unix.EINTR) {
+				select {
+				case <-ctx.Done():
+					err = ctx.Err()
+				case <-ticker.C:
+					continue
+				}
+			}
+			if region.start == sqliteSharedFirst {
+				err = errors.Join(err, setFcntlLock(fd, unix.F_UNLCK, sqlitePendingByte, 1))
+			}
+			return fmt.Errorf("lock database byte range %d..%d: %w", region.start, region.start+region.size-1, err)
+		}
 	}
-
-	if err := setFcntlLock(fd, unix.F_WRLCK, sqliteSharedFirst, sqliteSharedSize); err != nil {
-		_ = setFcntlLock(fd, unix.F_UNLCK, sqlitePendingByte, 1)
-		return err
-	}
-
 	return nil
 }
 
@@ -33,10 +54,7 @@ func UnlockFile(f *os.File) error {
 	fd := int(f.Fd())
 	err1 := setFcntlLock(fd, unix.F_UNLCK, sqliteSharedFirst, sqliteSharedSize)
 	err2 := setFcntlLock(fd, unix.F_UNLCK, sqlitePendingByte, 1)
-	if err1 != nil {
-		return err1
-	}
-	return err2
+	return errors.Join(err1, err2)
 }
 
 func setFcntlLock(fd int, lockType int16, start int64, length int64) error {
@@ -46,5 +64,5 @@ func setFcntlLock(fd int, lockType int16, start int64, length int64) error {
 		Start:  start,
 		Len:    length,
 	}
-	return unix.FcntlFlock(uintptr(fd), unix.F_SETLKW, &flock)
+	return unix.FcntlFlock(uintptr(fd), unix.F_SETLK, &flock)
 }
