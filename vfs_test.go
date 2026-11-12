@@ -1822,12 +1822,16 @@ func TestVFSFile_PollIdleSnapshot(t *testing.T) {
 	f, client := openVFSFileAtSnapshot(t, 2, 'a')
 	snapshot := buildLTXFixtureRange(t, 1, 6, 'b')
 	snapshot.info.Level = SnapshotLevel
+	snapshot.info.CreatedAt = f.LatestLTXTime().Add(time.Hour)
 	client.addFixture(t, snapshot)
 	if err := f.pollReplicaClient(t.Context()); err != nil {
 		t.Fatal(err)
 	}
 	if f.Pos().TXID != 6 {
 		t.Fatalf("idle reader at %s", f.Pos().TXID)
+	}
+	if got := f.LatestLTXTime(); !got.Equal(snapshot.info.CreatedAt) {
+		t.Fatalf("latest LTX time=%v, want snapshot time %v", got, snapshot.info.CreatedAt)
 	}
 	buf := make([]byte, 4096)
 	if _, err := f.ReadAt(buf, 0); err != nil {

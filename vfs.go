@@ -2829,6 +2829,8 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 				return fmt.Errorf("poll L0 after snapshot: %w", err)
 			}
 			level1, err = f.pollLevel(ctx, 1, snapshot.MaxTXID, level0.commit, false, snapshot.MaxTXID)
+			level0.createdAt = latestTime(level0.createdAt, snapshot.CreatedAt)
+			level1.createdAt = latestTime(level1.createdAt, snapshot.CreatedAt)
 			combined = idx
 			newCommit = hdr.Commit
 			replaceIndex = true

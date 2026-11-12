@@ -240,12 +240,13 @@ func (r *Replica) syncOnce(ctx context.Context, maxSyncLTXFiles int) (result rep
 		}
 		if err := r.uploadLTXFile(ctx, 0, txID, txID); err != nil {
 			var ltxErr *LTXError
-			gapMaxTXID, gapExists := findL0GapMaxTXID(r.remoteL0Files, txID)
+			next := sort.Search(len(r.remoteL0Files), func(i int) bool { return r.remoteL0Files[i].MinTXID > txID })
 			if !errors.As(err, &ltxErr) || ltxErr.Op != "open" ||
-				ltxErr.Path != r.db.LTXPath(0, txID, txID) || !errors.Is(ltxErr.Err, fs.ErrNotExist) || !gapExists {
+				ltxErr.Path != r.db.LTXPath(0, txID, txID) || !errors.Is(ltxErr.Err, fs.ErrNotExist) || next == len(r.remoteL0Files) {
 				return result, err
 			}
 
+			gapMaxTXID := r.remoteL0Files[next].MinTXID - 1
 			r.Logger().Warn("local L0 file missing during gap heal, forcing snapshot",
 				"gap_min_txid", txID.String(),
 				"gap_max_txid", gapMaxTXID.String())
@@ -367,15 +368,6 @@ func (r *Replica) calcPos(ctx context.Context) (pos ltx.Pos, l0Files []ltx.FileI
 		txID = info.MaxTXID
 	}
 	return ltx.Pos{TXID: txID}, l0Files, nil
-}
-
-func findL0GapMaxTXID(files []ltx.FileInfo, minTXID ltx.TXID) (ltx.TXID, bool) {
-	for _, info := range files {
-		if info.MinTXID > minTXID {
-			return info.MinTXID - 1, true
-		}
-	}
-	return 0, false
 }
 
 // InvalidatePos marks the replica position for recalculation on the next
