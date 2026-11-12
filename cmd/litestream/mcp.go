@@ -283,7 +283,7 @@ func RestorePlanTool(configPath string) (mcp.Tool, server.ToolHandlerFunc) {
 		cleanup := startMCPResourceCleanup(ctx, resources)
 		plan, opErr := (&RestoreCommand{}).dryRunPlan(ctx, path, resources.Replica, opt)
 		if errors.Is(opErr, litestream.ErrTxNotAvailable) {
-			opErr = fmt.Errorf("no matching backup files available")
+			opErr = fmt.Errorf("no matching backup files available: %w", opErr)
 		}
 		if err := closeMCPResources(opErr, cleanup); err != nil {
 			return mcpToolError(err)

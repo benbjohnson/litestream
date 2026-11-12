@@ -322,11 +322,13 @@ func TestRestorePlanTool(t *testing.T) {
 }
 
 func TestRestorePlanToolRejectsInvalidOptions(t *testing.T) {
+	fixture := newMCPTestFixture(t)
 	tests := []struct {
 		name      string
 		arguments map[string]any
 		contains  string
 	}{
+		{name: "unavailable txid", arguments: map[string]any{"path": "file://" + fixture.replicaPath, "txid": "0000000000000002"}, contains: "txid 0000000000000002 unavailable"},
 		{
 			name: "txid",
 			arguments: map[string]any{
