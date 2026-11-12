@@ -373,6 +373,7 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 
 	snapshotInterval := ProfileSnapshotInterval(shortMode, profile).String()
 	snapshotRetention := "1h"
+	truncatePageN := 5000
 	retentionCheckInterval := "5m"
 	levelIntervals := []string{"30s", "1m", "5m", "15m", "30m"}
 
@@ -382,6 +383,9 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 		levelIntervals = []string{"15s", "30s", "1m"}
 	} else if profile != nil && profile.SnapshotRetention > 0 {
 		snapshotRetention = profile.SnapshotRetention.String()
+	}
+	if !shortMode && profile != nil && profile.TruncatePageN > 0 {
+		truncatePageN = profile.TruncatePageN
 	}
 
 	// Add S3 credentials if provided
@@ -412,7 +416,7 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	config.WriteString(fmt.Sprintf("  - path: %s\n", filepath.ToSlash(dbPath)))
 	config.WriteString("    checkpoint-interval: 1m\n")
 	config.WriteString("    min-checkpoint-page-count: 100\n")
-	config.WriteString("    truncate-page-n: 5000\n")
+	config.WriteString(fmt.Sprintf("    truncate-page-n: %d\n", truncatePageN))
 	config.WriteString("\n")
 	config.WriteString("    replica:\n")
 	config.WriteString(fmt.Sprintf("      url: %s\n", replicaURL))

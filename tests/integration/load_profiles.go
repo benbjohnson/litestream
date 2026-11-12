@@ -22,6 +22,7 @@ type LoadProfile struct {
 	SnapshotInterval  time.Duration
 	SnapshotRetention time.Duration
 	L0Retention       time.Duration
+	TruncatePageN     int
 
 	// Expected behavioral bounds for LTX assertions
 	MaxL0Pages      int     // max pages per L0 file under normal sync
@@ -75,14 +76,15 @@ func LowVolumeProfile() LoadProfile {
 func HighVolumeProfile() LoadProfile {
 	return LoadProfile{
 		Name:              "high-volume",
-		Description:       "High traffic: 200 writes/sec, wave pattern. Catches performance regressions under sustained load.",
-		WriteRate:         200,
+		Description:       "High traffic: 500 writes/sec, wave pattern. Catches performance regressions under sustained load.",
+		WriteRate:         500,
 		Pattern:           "wave",
 		PayloadSize:       1024,
 		Workers:           8,
 		SnapshotInterval:  2 * time.Minute,
 		SnapshotRetention: 2 * time.Minute,
 		L0Retention:       30 * time.Second,
+		TruncatePageN:     50000,
 		MaxL0Pages:        500,
 		MaxWALSizeMB:      500,
 		SnapshotWindow:    2.0,

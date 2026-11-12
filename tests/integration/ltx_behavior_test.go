@@ -315,23 +315,27 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 
 func TestLTXBehavior_ProfileConfigIsolation(t *testing.T) {
 	high := HighVolumeProfile()
+	if high.WriteRate != 500 {
+		t.Fatalf("high-volume write rate=%d, want 500", high.WriteRate)
+	}
 	low := LowVolumeProfile()
 	burst := BurstVolumeProfile()
 	tests := []struct {
-		name      string
-		profile   *LoadProfile
-		s3        *S3Config
-		short     bool
-		interval  time.Duration
-		retention time.Duration
-		l0        time.Duration
+		name          string
+		profile       *LoadProfile
+		s3            *S3Config
+		short         bool
+		interval      time.Duration
+		retention     time.Duration
+		l0            time.Duration
+		truncatePageN int
 	}{
-		{name: "comprehensive", interval: 10 * time.Minute, retention: time.Hour},
-		{name: "minio", s3: &S3Config{}, interval: 10 * time.Minute, retention: time.Hour},
-		{name: "low volume", profile: &low, interval: 10 * time.Minute, retention: time.Hour},
-		{name: "burst volume", profile: &burst, interval: 10 * time.Minute, retention: time.Hour},
-		{name: "high volume", profile: &high, interval: 2 * time.Minute, retention: 2 * time.Minute, l0: 30 * time.Second},
-		{name: "short high volume", profile: &high, short: true, interval: 30 * time.Second, retention: 10 * time.Minute},
+		{name: "comprehensive", interval: 10 * time.Minute, retention: time.Hour, truncatePageN: 5000},
+		{name: "minio", s3: &S3Config{}, interval: 10 * time.Minute, retention: time.Hour, truncatePageN: 5000},
+		{name: "low volume", profile: &low, interval: 10 * time.Minute, retention: time.Hour, truncatePageN: 5000},
+		{name: "burst volume", profile: &burst, interval: 10 * time.Minute, retention: time.Hour, truncatePageN: 5000},
+		{name: "high volume", profile: &high, interval: 2 * time.Minute, retention: 2 * time.Minute, l0: 30 * time.Second, truncatePageN: 50000},
+		{name: "short high volume", profile: &high, short: true, interval: 30 * time.Second, retention: 10 * time.Minute, truncatePageN: 5000},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -346,6 +350,9 @@ func TestLTXBehavior_ProfileConfigIsolation(t *testing.T) {
 					Retention time.Duration `yaml:"retention"`
 				} `yaml:"snapshot"`
 				L0Retention time.Duration `yaml:"l0-retention"`
+				DBs         []struct {
+					TruncatePageN int `yaml:"truncate-page-n"`
+				} `yaml:"dbs"`
 			}
 			if err := yaml.Unmarshal(data, &config); err != nil {
 				t.Fatal(err)
@@ -355,6 +362,12 @@ func TestLTXBehavior_ProfileConfigIsolation(t *testing.T) {
 			}
 			if interval := ProfileSnapshotInterval(tt.short, tt.profile); interval != config.Snapshot.Interval {
 				t.Fatalf("assertion interval=%v differs from configured interval=%v", interval, config.Snapshot.Interval)
+			}
+			if len(config.DBs) != 1 {
+				t.Fatalf("database count=%d, want 1", len(config.DBs))
+			}
+			if got := config.DBs[0].TruncatePageN; got != tt.truncatePageN {
+				t.Fatalf("truncate page count=%d, want %d", got, tt.truncatePageN)
 			}
 		})
 	}
