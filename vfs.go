@@ -661,6 +661,7 @@ type Hydrator struct {
 	persistent bool           // True when file should survive across restarts
 	file       *os.File       // Local database file
 	complete   atomic.Bool    // True when restore completes
+	tainted    atomic.Bool    // True once an applied LTX file failed verification; never persisted
 	txid       ltx.TXID       // TXID the hydrated file is at
 	mu         sync.Mutex     // Protects hydration file writes
 	err        error          // Stores fatal hydration error
@@ -864,7 +865,7 @@ func (h *Hydrator) CatchUp(ctx context.Context, fromTXID, toTXID ltx.TXID) error
 }
 
 // ApplyLTX fetches an entire LTX file and applies its pages to the hydration file.
-func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
+func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) (err error) {
 	h.logger.Debug("applying ltx to hydration file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 	// Fetch entire LTX file
@@ -872,9 +873,10 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	if err != nil {
 		return fmt.Errorf("open ltx file: %w", err)
 	}
-	defer rc.Close()
+	defer func() { err = errors.Join(err, rc.Close()) }()
 
 	dec := ltx.NewDecoder(rc)
+	dec.SetRetainPageIndex(false) // pages are streamed; the index is validated, not kept
 	if err := dec.DecodeHeader(); err != nil {
 		return fmt.Errorf("decode header: %w", err)
 	}
@@ -882,20 +884,44 @@ func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	// Apply each page to the hydration file
+	if h.persistent {
+		if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove hydration meta before applying ltx: %w", err)
+		}
+		if err := syncDir(filepath.Dir(h.metaPath())); err != nil {
+			return fmt.Errorf("sync hydration meta directory: %w", err)
+		}
+	}
+
+	// Apply each page to the hydration file. Pages are applied as they
+	// stream, so any failure from here on leaves unverified or partial
+	// content in the hydration file: mark it tainted so Close discards it
+	// instead of persisting it for a resume on the next start.
+	data := make([]byte, h.pageSize)
 	for {
+		if err := ctx.Err(); err != nil {
+			h.tainted.Store(true)
+			return err
+		}
 		var phdr ltx.PageHeader
-		data := make([]byte, h.pageSize)
 		if err := dec.DecodePage(&phdr, data); err == io.EOF {
 			break
 		} else if err != nil {
+			h.tainted.Store(true)
 			return fmt.Errorf("decode page: %w", err)
 		}
 
 		off := int64(phdr.Pgno-1) * int64(h.pageSize)
 		if _, err := h.file.WriteAt(data, off); err != nil {
+			h.tainted.Store(true)
 			return fmt.Errorf("write page %d: %w", phdr.Pgno, err)
 		}
+	}
+
+	// Read the page index and trailer so the file checksum is verified.
+	if err := dec.Close(); err != nil {
+		h.tainted.Store(true)
+		return fmt.Errorf("verify ltx file: %w", err)
 	}
 
 	return nil
@@ -1041,27 +1067,27 @@ func (h *Hydrator) Close() (err error) {
 		return nil
 	}
 
-	if h.persistent && h.txid > 0 {
+	var errs []error
+	if h.persistent && h.txid > 0 && !h.tainted.Load() {
 		if err := h.file.Sync(); err != nil {
-			h.logger.Warn("failed to sync hydration file", "error", err)
+			errs = append(errs, fmt.Errorf("sync hydration file: %w", err))
+		} else if err := h.saveMeta(); err != nil {
+			errs = append(errs, err)
+		} else {
+			return h.file.Close()
 		}
-		if err := h.saveMeta(); err != nil {
-			h.logger.Warn("failed to save hydration meta", "error", err)
-		}
-		return h.file.Close()
 	}
 
-	if err := h.file.Close(); err != nil {
-		return err
-	}
-
-	if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
-		return err
-	}
 	if err := os.Remove(h.metaPath()); err != nil && !os.IsNotExist(err) {
-		return err
+		errs = append(errs, err)
 	}
-	return nil
+	if err := h.file.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	if err := os.Remove(h.path); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	return errors.Join(errs...)
 }
 
 func (h *Hydrator) metaPath() string {
