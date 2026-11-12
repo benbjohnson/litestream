@@ -313,7 +313,7 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	t.Log("================================================")
 }
 
-func TestCreateSoakConfig_ProfileIsolation(t *testing.T) {
+func TestLTXBehavior_ProfileConfigIsolation(t *testing.T) {
 	high := HighVolumeProfile()
 	low := LowVolumeProfile()
 	burst := BurstVolumeProfile()
