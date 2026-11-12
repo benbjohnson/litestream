@@ -483,39 +483,53 @@ func TestRestoreCommand_RunIfReplicaExists(t *testing.T) {
 }
 
 func TestRestoreCommand_RestoreReportsAdvancedTXID(t *testing.T) {
-	ctx := context.Background()
-	client := &advancingRestoreCommandClient{ReplicaClient: file.NewReplicaClient(t.TempDir())}
-	for _, txid := range []ltx.TXID{1, 2} {
-		client.writeLTX(t, ctx, 1, txid)
-	}
-	client.advance = func() {
-		client.writeLTX(t, ctx, 1, 3)
-		if err := client.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 2}}); err != nil {
-			t.Fatal(err)
-		}
-	}
-	path := filepath.Join(t.TempDir(), "restore.db")
-	result, err := (&RestoreCommand{}).restore(ctx, litestream.NewReplicaWithClient(nil, client), litestream.RestoreOptions{OutputPath: path}, "none")
-	if err != nil {
-		t.Fatal(err)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !bytes.Equal(data, bytes.Repeat([]byte{3}, 4096)) {
-		t.Fatal("restored database does not contain TXID 3 data")
-	}
-	output, err := json.Marshal(result)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var got RestoreResult
-	if err := json.Unmarshal(output, &got); err != nil {
-		t.Fatal(err)
-	}
-	if got.TXID != "0000000000000003" {
-		t.Fatalf("reported TXID=%s, want 0000000000000003", got.TXID)
+	for _, mcp := range []bool{false, true} {
+		t.Run(fmt.Sprint(mcp), func(t *testing.T) {
+			ctx := context.Background()
+			client := &advancingRestoreCommandClient{ReplicaClient: file.NewReplicaClient(t.TempDir())}
+			for _, txid := range []ltx.TXID{1, 2} {
+				client.writeLTX(t, ctx, 1, txid)
+			}
+			client.advance = func() {
+				client.writeLTX(t, ctx, 1, 3)
+				if err := client.DeleteLTXFiles(ctx, []*ltx.FileInfo{{Level: litestream.SnapshotLevel, MinTXID: 1, MaxTXID: 2}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "restore.db")
+			var result RestoreResult
+			var err error
+			if mcp {
+				var output string
+				output, err = restoreMCP(ctx, path, litestream.NewReplicaWithClient(nil, client), litestream.RestoreOptions{OutputPath: path}, false, false)
+				if err == nil {
+					err = json.Unmarshal([]byte(output), &result)
+				}
+			} else {
+				result, err = (&RestoreCommand{}).restore(ctx, litestream.NewReplicaWithClient(nil, client), litestream.RestoreOptions{OutputPath: path}, "none")
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(data, bytes.Repeat([]byte{3}, 4096)) {
+				t.Fatal("restored database does not contain TXID 3 data")
+			}
+			output, err := json.Marshal(result)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got RestoreResult
+			if err := json.Unmarshal(output, &got); err != nil {
+				t.Fatal(err)
+			}
+			if got.TXID != "0000000000000003" {
+				t.Fatalf("reported TXID=%s, want 0000000000000003", got.TXID)
+			}
+		})
 	}
 }
 

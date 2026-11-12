@@ -170,8 +170,8 @@ func TestRestoreToolRunWithoutLitestreamOnPATH(t *testing.T) {
 			if result.Replica != "file" {
 				t.Fatalf("replica=%q, want file", result.Replica)
 			}
-			if result.TXID != "" {
-				t.Fatalf("automatic file restore TXID=%q, want unknown", result.TXID)
+			if result.TXID != "0000000000000001" {
+				t.Fatalf("automatic file restore TXID=%q, want 0000000000000001", result.TXID)
 			}
 			assertRestoreCommandDB(t, outputPath)
 		})
@@ -321,7 +321,7 @@ func TestMCPReplicaClientCloseContractViolation(t *testing.T) {
 	}
 }
 
-func TestRestoreTXID(t *testing.T) {
+func TestMCPRestoreResult(t *testing.T) {
 	t.Run("returns plan error", func(t *testing.T) {
 		planErr := errors.New("list failed")
 		client := &mock.ReplicaClient{
@@ -332,13 +332,14 @@ func TestRestoreTXID(t *testing.T) {
 		r := litestream.NewReplica(nil)
 		r.Client = client
 		opt := litestream.NewRestoreOptions()
+		opt.OutputPath = filepath.Join(t.TempDir(), "restore.db")
 
-		if _, err := (&RestoreCommand{}).restoreTXID(t.Context(), r, &opt); !errors.Is(err, planErr) {
+		if _, err := restoreMCP(t.Context(), opt.OutputPath, r, opt, false, false); !errors.Is(err, planErr) {
 			t.Fatalf("error=%v, want %v", err, planErr)
 		}
 	})
 
-	t.Run("pins planned transaction", func(t *testing.T) {
+	t.Run("reports restored transaction", func(t *testing.T) {
 		fixture := newMCPTestFixture(t)
 		resources, err := loadMCPReplica("file://"+fixture.replicaPath, "")
 		if err != nil {
@@ -353,15 +354,17 @@ func TestRestoreTXID(t *testing.T) {
 		replica.Client = struct{ litestream.ReplicaClient }{resources.Replica.Client}
 		opt := litestream.NewRestoreOptions()
 
-		txID, err := (&RestoreCommand{}).restoreTXID(t.Context(), replica, &opt)
+		opt.OutputPath = filepath.Join(t.TempDir(), "restore.db")
+		output, err := restoreMCP(t.Context(), opt.OutputPath, replica, opt, false, false)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if txID != "0000000000000001" {
-			t.Fatalf("txid=%q, want 0000000000000001", txID)
+		var result RestoreResult
+		if err := json.Unmarshal([]byte(output), &result); err != nil {
+			t.Fatal(err)
 		}
-		if opt.TXID != 1 {
-			t.Fatalf("option txid=%s, want 0000000000000001", opt.TXID)
+		if result.TXID != "0000000000000001" {
+			t.Fatalf("txid=%q, want 0000000000000001", result.TXID)
 		}
 	})
 }

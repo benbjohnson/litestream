@@ -623,31 +623,15 @@ func restoreMCP(ctx context.Context, path string, r *litestream.Replica, opt lit
 		return "", err
 	}
 
-	txID, err := cmd.restoreTXID(ctx, r, &opt)
+	result, err := cmd.restore(ctx, r, opt, "none")
 	if errors.Is(err, litestream.ErrTxNotAvailable) && ifReplicaExists {
 		return "no matching backups found, skipping\n", nil
 	} else if errors.Is(err, litestream.ErrTxNotAvailable) {
-		return "", fmt.Errorf("no matching backup files available")
+		return "", fmt.Errorf("no matching backup files available: %w", err)
 	} else if err != nil {
 		return "", err
 	}
-
-	start := time.Now()
-	if err := r.Restore(ctx, opt); errors.Is(err, litestream.ErrTxNotAvailable) && ifReplicaExists {
-		return "no matching backups found, skipping\n", nil
-	} else if errors.Is(err, litestream.ErrTxNotAvailable) {
-		return "", fmt.Errorf("no matching backup files available")
-	} else if err != nil {
-		return "", err
-	}
-
-	output, err := json.MarshalIndent(RestoreResult{
-		DBPath:         opt.OutputPath,
-		Replica:        r.Client.Type(),
-		TXID:           txID,
-		DurationMS:     time.Since(start).Milliseconds(),
-		IntegrityCheck: "none",
-	}, "", "  ")
+	output, err := json.MarshalIndent(result, "", "  ")
 	if err != nil {
 		return "", fmt.Errorf("format response: %w", err)
 	}

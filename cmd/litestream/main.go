@@ -714,40 +714,16 @@ func parseConfig(r io.Reader, expandEnv, configureLogging bool) (_ Config, err e
 		return config, err
 	}
 
+	logOutput := os.Stdout
+	if config.Logging.Stderr {
+		logOutput = os.Stderr
+	}
 	if v := os.Getenv("LOG_LEVEL"); v != "" {
 		config.Logging.Level = v
 	}
 	if configureLogging {
-		logOutput := os.Stdout
-		if config.Logging.Stderr {
-			logOutput = os.Stderr
-		}
-		if v := os.Getenv("LOG_LEVEL"); v != "" {
-			config.Logging.Level = v
-		}
 		internal.InitLog(os.Stderr, config.Logging.Level, config.Logging.Type, config.Logging.Source)
 		config.warnSnapshotRetention()
-		if logOutput != os.Stderr {
-			internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
-		}
-
-		// The lenient decode above silently drops keys that do not map to a Config
-		// field, so a misspelled or nonexistent setting looks like it took effect.
-		// Decode again in strict mode into a scratch value purely for diagnostics:
-		// yaml.UnmarshalStrict reports both unrecognized and duplicate mapping keys.
-		// These are warnings rather than errors so that existing deployments with a
-		// stray key keep starting.
-		var strictConfig Config
-		if err := yaml.UnmarshalStrict(buf, &strictConfig); err != nil {
-			var typeErr *yaml.TypeError
-			if !errors.As(err, &typeErr) {
-				return config, fmt.Errorf("strictly decode config: %w", err)
-			}
-			for _, detail := range typeErr.Errors {
-				slog.Warn("configuration contains unrecognized or duplicate key", "detail", detail)
-			}
-		}
-
 	}
 	if raw.ShutdownTimeout != nil {
 		value, ok := raw.ShutdownTimeout.(string)
@@ -760,7 +736,29 @@ func parseConfig(r io.Reader, expandEnv, configureLogging bool) (_ Config, err e
 			config.ShutdownTimeout = timeout
 		}
 	}
+	if configureLogging && logOutput != os.Stderr {
+		internal.InitLog(logOutput, config.Logging.Level, config.Logging.Type, config.Logging.Source)
+	}
 
+	// The lenient decode above silently drops keys that do not map to a Config
+	// field, so a misspelled or nonexistent setting looks like it took effect.
+	// Decode again in strict mode into a scratch value purely for diagnostics:
+	// yaml.UnmarshalStrict reports both unrecognized and duplicate mapping keys.
+	// These are warnings rather than errors so that existing deployments with a
+	// stray key keep starting.
+	if configureLogging {
+		var strictConfig Config
+		if err := yaml.UnmarshalStrict(buf, &strictConfig); err != nil {
+			var typeErr *yaml.TypeError
+			if !errors.As(err, &typeErr) {
+				return config, fmt.Errorf("strictly decode config: %w", err)
+			}
+			for _, detail := range typeErr.Errors {
+				slog.Warn("configuration contains unrecognized or duplicate key", "detail", detail)
+			}
+		}
+
+	}
 	return config, nil
 }
 
