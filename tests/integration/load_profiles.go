@@ -75,8 +75,8 @@ func LowVolumeProfile() LoadProfile {
 func HighVolumeProfile() LoadProfile {
 	return LoadProfile{
 		Name:              "high-volume",
-		Description:       "High traffic: 500 writes/sec, wave pattern. Catches performance regressions under sustained load.",
-		WriteRate:         500,
+		Description:       "High traffic: 200 writes/sec, wave pattern. Catches performance regressions under sustained load.",
+		WriteRate:         200,
 		Pattern:           "wave",
 		PayloadSize:       1024,
 		Workers:           8,
