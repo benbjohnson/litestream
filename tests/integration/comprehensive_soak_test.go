@@ -47,7 +47,7 @@ func TestComprehensiveSoak(t *testing.T) {
 	t.Log("")
 	t.Log("This test uses aggressive settings to validate:")
 	t.Log("  - Continuous replication")
-	t.Logf("  - Snapshot generation (every %v)", ProfileSnapshotInterval(shortMode))
+	t.Logf("  - Snapshot generation (every %v)", ProfileSnapshotInterval(shortMode, nil))
 	t.Log("  - Compaction (30s/1m/5m intervals)")
 	t.Log("  - Checkpoint operations")
 	t.Log("  - Database restoration")
@@ -75,7 +75,7 @@ func TestComprehensiveSoak(t *testing.T) {
 	// Create aggressive configuration for testing
 	t.Log("Creating aggressive test configuration...")
 	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
-	configPath := CreateSoakConfig(db.Path, replicaURL, nil, shortMode)
+	configPath := CreateSoakConfig(db.Path, replicaURL, nil, shortMode, nil)
 	db.ConfigPath = configPath
 	t.Logf("✓ Configuration created: %s", configPath)
 	t.Log("")

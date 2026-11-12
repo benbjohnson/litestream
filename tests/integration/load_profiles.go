@@ -19,6 +19,10 @@ type LoadProfile struct {
 	PayloadSize int    // bytes per write (0 = default 4KB)
 	Workers     int    // concurrent writers
 
+	SnapshotInterval  time.Duration
+	SnapshotRetention time.Duration
+	L0Retention       time.Duration
+
 	// Expected behavioral bounds for LTX assertions
 	MaxL0Pages      int     // max pages per L0 file under normal sync
 	MaxWALSizeMB    float64 // max allowed WAL size
@@ -70,17 +74,20 @@ func LowVolumeProfile() LoadProfile {
 // and WAL growth issues.
 func HighVolumeProfile() LoadProfile {
 	return LoadProfile{
-		Name:            "high-volume",
-		Description:     "High traffic: 500 writes/sec, wave pattern. Catches performance regressions under sustained load.",
-		WriteRate:       500,
-		Pattern:         "wave",
-		PayloadSize:     1024,
-		Workers:         8,
-		MaxL0Pages:      500,
-		MaxWALSizeMB:    500,
-		SnapshotWindow:  2.0,
-		CompactionSlack: 0.5,
-		InitialSize:     "50MB",
+		Name:              "high-volume",
+		Description:       "High traffic: 500 writes/sec, wave pattern. Catches performance regressions under sustained load.",
+		WriteRate:         500,
+		Pattern:           "wave",
+		PayloadSize:       1024,
+		Workers:           8,
+		SnapshotInterval:  time.Minute,
+		SnapshotRetention: time.Minute,
+		L0Retention:       30 * time.Second,
+		MaxL0Pages:        500,
+		MaxWALSizeMB:      500,
+		SnapshotWindow:    2.0,
+		CompactionSlack:   0.5,
+		InitialSize:       "50MB",
 	}
 }
 
@@ -144,11 +151,14 @@ func ProfileDuration(shortMode bool) time.Duration {
 
 // ProfileSnapshotInterval returns the snapshot interval for test configs.
 // Must match the value written by CreateSoakConfig.
-func ProfileSnapshotInterval(shortMode bool) time.Duration {
+func ProfileSnapshotInterval(shortMode bool, profile *LoadProfile) time.Duration {
 	if shortMode {
 		return 30 * time.Second
 	}
-	return time.Minute
+	if profile != nil && profile.SnapshotInterval > 0 {
+		return profile.SnapshotInterval
+	}
+	return 10 * time.Minute
 }
 
 // ProfileCompactionIntervals returns compaction level intervals for test configs.

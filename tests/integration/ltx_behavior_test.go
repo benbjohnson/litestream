@@ -10,6 +10,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"gopkg.in/yaml.v2"
 )
 
 // TestLTXBehavior runs behavioral assertions against LTX output across all load profiles.
@@ -27,7 +29,7 @@ func TestLTXBehavior(t *testing.T) {
 	shortMode := testing.Short()
 	profiles := DefaultLoadProfiles(shortMode)
 	duration := ProfileDuration(shortMode)
-	snapshotInterval := ProfileSnapshotInterval(shortMode)
+	snapshotInterval := ProfileSnapshotInterval(shortMode, nil)
 	compactionIntervals := ProfileCompactionIntervals(shortMode)
 
 	t.Logf("================================================")
@@ -36,11 +38,12 @@ func TestLTXBehavior(t *testing.T) {
 	t.Logf("Mode: %s", modeString(shortMode))
 	t.Logf("Duration per profile: %v", duration)
 	t.Logf("Profiles: %d", len(profiles))
-	t.Logf("Snapshot interval: %v", snapshotInterval)
+	t.Logf("Default snapshot interval: %v", snapshotInterval)
 	t.Log("")
 
 	for _, profile := range profiles {
 		t.Run(profile.Name, func(t *testing.T) {
+			snapshotInterval := ProfileSnapshotInterval(shortMode, &profile)
 			runProfileBehaviorTest(t, profile, duration, snapshotInterval, compactionIntervals, shortMode)
 		})
 	}
@@ -61,7 +64,7 @@ func TestLTXBehavior_NoExcessiveSnapshots(t *testing.T) {
 	}
 
 	// Use the same snapshot interval as CreateSoakConfig to keep assertions aligned
-	snapshotInterval := ProfileSnapshotInterval(shortMode)
+	snapshotInterval := ProfileSnapshotInterval(shortMode, nil)
 
 	profile := LoadProfile{
 		Name:            "checkpoint-snapshot-regression",
@@ -114,7 +117,7 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 
 	// Create configuration with test intervals
 	replicaURL := fmt.Sprintf("file://%s", filepath.ToSlash(db.ReplicaPath))
-	configPath := CreateSoakConfig(db.Path, replicaURL, nil, shortMode)
+	configPath := CreateSoakConfig(db.Path, replicaURL, nil, shortMode, &profile)
 	db.ConfigPath = configPath
 
 	// Start Litestream (LOG_LEVEL=DEBUG is set automatically by StartLitestreamWithConfig)
@@ -308,6 +311,53 @@ func runProfileBehaviorTest(t *testing.T, profile LoadProfile, duration, snapsho
 	t.Log("")
 	t.Logf("Profile %s completed in %v", profile.Name, actualDuration.Round(time.Second))
 	t.Log("================================================")
+}
+
+func TestCreateSoakConfig_ProfileIsolation(t *testing.T) {
+	high := HighVolumeProfile()
+	low := LowVolumeProfile()
+	burst := BurstVolumeProfile()
+	tests := []struct {
+		name      string
+		profile   *LoadProfile
+		s3        *S3Config
+		short     bool
+		interval  time.Duration
+		retention time.Duration
+		l0        time.Duration
+	}{
+		{name: "comprehensive", interval: 10 * time.Minute, retention: time.Hour},
+		{name: "minio", s3: &S3Config{}, interval: 10 * time.Minute, retention: time.Hour},
+		{name: "low volume", profile: &low, interval: 10 * time.Minute, retention: time.Hour},
+		{name: "burst volume", profile: &burst, interval: 10 * time.Minute, retention: time.Hour},
+		{name: "high volume", profile: &high, interval: time.Minute, retention: time.Minute, l0: 30 * time.Second},
+		{name: "short high volume", profile: &high, short: true, interval: 30 * time.Second, retention: 10 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := CreateSoakConfig(filepath.Join(t.TempDir(), "test.db"), "file:///example", tt.s3, tt.short, tt.profile)
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var config struct {
+				Snapshot struct {
+					Interval  time.Duration `yaml:"interval"`
+					Retention time.Duration `yaml:"retention"`
+				} `yaml:"snapshot"`
+				L0Retention time.Duration `yaml:"l0-retention"`
+			}
+			if err := yaml.Unmarshal(data, &config); err != nil {
+				t.Fatal(err)
+			}
+			if config.Snapshot.Interval != tt.interval || config.Snapshot.Retention != tt.retention || config.L0Retention != tt.l0 {
+				t.Fatalf("snapshot interval=%v retention=%v l0=%v, want %v %v %v", config.Snapshot.Interval, config.Snapshot.Retention, config.L0Retention, tt.interval, tt.retention, tt.l0)
+			}
+			if interval := ProfileSnapshotInterval(tt.short, tt.profile); interval != config.Snapshot.Interval {
+				t.Fatalf("assertion interval=%v differs from configured interval=%v", interval, config.Snapshot.Interval)
+			}
+		})
+	}
 }
 
 func modeString(shortMode bool) string {
