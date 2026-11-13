@@ -29,7 +29,7 @@ All endpoints are HTTP over Unix socket (`server.go:74-87`):
 | `GET` | `/info` | — | `{version, pid, uptime_seconds, started_at, database_count}` |
 | `GET` | `/list` | — | `{databases: [{path, status, last_sync_at}]}` |
 | `GET` | `/txid?path=` | — | `{txid}` |
-| `POST` | `/register` | `{path, replica_url}` | `{status, path}` |
+| `POST` | `/register` | `{path, replica_url, monitor_interval?, checkpoint_interval?}` | `{status, path}` |
 | `POST` | `/unregister` | `{path, timeout?}` | `{status, path}` |
 | `POST` | `/start` | `{path, timeout?}` | `{status, path}` |
 | `POST` | `/stop` | `{path, timeout?}` | `{status, path}` |

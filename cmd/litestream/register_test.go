@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/benbjohnson/litestream"
 	main "github.com/benbjohnson/litestream/cmd/litestream"
@@ -97,6 +98,67 @@ func TestRegisterCommand_Run(t *testing.T) {
 		// Verify database was registered with store.
 		if len(store.DBs()) != 1 {
 			t.Errorf("expected 1 database in store, got %d", len(store.DBs()))
+		}
+	})
+
+	t.Run("Intervals", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		db, sqldb := testingutil.MustOpenDBs(t)
+		testingutil.MustCloseDBs(t, db, sqldb)
+		backupDir := filepath.Join(t.TempDir(), "backup")
+
+		cmd := &main.RegisterCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file://" + backupDir, "-monitor-interval", "0", "-checkpoint-interval", "30s", db.Path()})
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+
+		if len(store.DBs()) != 1 {
+			t.Fatalf("expected 1 database in store, got %d", len(store.DBs()))
+		}
+		if got := store.DBs()[0].MonitorInterval; got != 0 {
+			t.Errorf("MonitorInterval=%s, want 0", got)
+		}
+		if got := store.DBs()[0].CheckpointInterval; got != 30*time.Second {
+			t.Errorf("CheckpointInterval=%s, want 30s", got)
+		}
+	})
+
+	t.Run("InvalidInterval", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		if err := store.Open(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		defer store.Close(context.Background())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		if err := server.Start(); err != nil {
+			t.Fatal(err)
+		}
+		defer server.Close()
+
+		cmd := &main.RegisterCommand{}
+		err := cmd.Run(context.Background(), []string{"-socket", server.SocketPath, "-replica", "file:///tmp/backup", "-monitor-interval", "soon", "/tmp/test.db"})
+		if err == nil || !strings.Contains(err.Error(), "invalid monitor_interval") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if len(store.DBs()) != 0 {
+			t.Fatalf("expected no databases in store, got %d", len(store.DBs()))
 		}
 	})
 

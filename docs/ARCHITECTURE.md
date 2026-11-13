@@ -242,8 +242,10 @@ All endpoints are served over the Unix socket via Go's `net/http` mux:
 
 ```go
 type RegisterDatabaseRequest struct {
-    Path       string `json:"path"`
-    ReplicaURL string `json:"replica_url"`
+    Path               string `json:"path"`
+    ReplicaURL         string `json:"replica_url"`
+    MonitorInterval    string `json:"monitor_interval,omitempty"`    // Go duration; "0" disables the monitor
+    CheckpointInterval string `json:"checkpoint_interval,omitempty"` // Go duration; "0" disables time-based checkpoints
 }
 
 type UnregisterDatabaseRequest struct {

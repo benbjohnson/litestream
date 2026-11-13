@@ -550,6 +550,19 @@ type InfoResponse struct {
 type RegisterDatabaseRequest struct {
 	Path       string `json:"path"`
 	ReplicaURL string `json:"replica_url"`
+
+	// MonitorInterval overrides how often the WAL is checked for changes, as
+	// a Go duration such as "1s" or "10s". Empty keeps the default (1s), the
+	// same as monitor-interval in the config file. "0" disables the monitor:
+	// the database is then synced, and checkpointed, only when asked to
+	// (/sync, unregister, shutdown), and its WAL grows until then.
+	MonitorInterval string `json:"monitor_interval,omitempty"`
+
+	// CheckpointInterval overrides the time-based checkpoint interval, as a
+	// Go duration. Empty keeps the default (1m), the same as
+	// checkpoint-interval in the config file. "0" disables time-based
+	// checkpoints; the page-count thresholds still apply.
+	CheckpointInterval string `json:"checkpoint_interval,omitempty"`
 }
 
 // RegisterDatabaseResponse is the response body for the /register endpoint.
@@ -588,6 +601,17 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	monitorInterval, err := parseRegisterInterval(req.MonitorInterval)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid monitor_interval: %v", err), nil)
+		return
+	}
+	checkpointInterval, err := parseRegisterInterval(req.CheckpointInterval)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid checkpoint_interval: %v", err), nil)
+		return
+	}
+
 	expandedPath, err := s.expandPath(req.Path)
 	if err != nil {
 		writeJSONError(w, http.StatusBadRequest, fmt.Sprintf("invalid path: %v", err), nil)
@@ -612,6 +636,12 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 
 	// Create new database.
 	db := NewDB(expandedPath)
+	if monitorInterval != nil {
+		db.MonitorInterval = *monitorInterval
+	}
+	if checkpointInterval != nil {
+		db.CheckpointInterval = *checkpointInterval
+	}
 
 	// Create replica and attach client.
 	replica := NewReplica(db)
@@ -628,6 +658,21 @@ func (s *Server) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Status: "registered",
 		Path:   expandedPath,
 	})
+}
+
+// parseRegisterInterval parses an optional interval from a register request.
+// An empty string returns nil, which keeps the DB default.
+func parseRegisterInterval(v string) (*time.Duration, error) {
+	if v == "" {
+		return nil, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return nil, err
+	} else if d < 0 {
+		return nil, fmt.Errorf("must not be negative: %s", v)
+	}
+	return &d, nil
 }
 
 func (s *Server) handleUnregister(w http.ResponseWriter, r *http.Request) {

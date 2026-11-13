@@ -22,6 +22,8 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 	socketPath := fs.String("socket", "/var/run/litestream.sock", "control socket path")
 	replicaFlag := fs.String("replica", "", "replica URL (e.g., s3://bucket/prefix, file:///backup/path)")
 	jsonOutput := fs.Bool("json", false, "output raw JSON")
+	monitorInterval := fs.String("monitor-interval", "", "how often the WAL is checked for changes (default 1s; 0 disables)")
+	checkpointInterval := fs.String("checkpoint-interval", "", "time-based checkpoint interval (default 1m; 0 disables)")
 	fs.Usage = c.Usage
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -61,8 +63,10 @@ func (c *RegisterCommand) Run(ctx context.Context, args []string) error {
 	}
 
 	req := litestream.RegisterDatabaseRequest{
-		Path:       dbPath,
-		ReplicaURL: replicaURL,
+		Path:               dbPath,
+		ReplicaURL:         replicaURL,
+		MonitorInterval:    *monitorInterval,
+		CheckpointInterval: *checkpointInterval,
 	}
 	reqBody, err := json.Marshal(req)
 	if err != nil {
@@ -144,6 +148,16 @@ Options:
       Replica destination URL (e.g., s3://bucket/prefix, file:///backup/path).
       Required.
 
+  -monitor-interval DURATION
+      How often the WAL is checked for changes (default: 1s), as with
+      monitor-interval in the config file. 0 disables the monitor: the
+      database is synced, and checkpointed, only by "litestream sync" (and
+      on unregister or shutdown), and its WAL grows until then.
+
+  -checkpoint-interval DURATION
+      Time-based checkpoint interval (default: 1m), as with
+      checkpoint-interval in the config file. 0 disables it.
+
   -timeout SECONDS
       Maximum time to wait in seconds (default: 30).
 
@@ -159,6 +173,9 @@ Examples:
 
   # Register a database with a file replica.
   $ litestream register -replica file:///backup/path /path/to/db
+
+  # Register a database that is synced only by "litestream sync".
+  $ litestream register -monitor-interval 0 -replica s3://mybucket/db /path/to/db
 
   # Register using a non-default control socket.
   $ litestream register -socket /tmp/litestream.sock -replica s3://mybucket/db /path/to/db

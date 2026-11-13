@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -383,6 +384,133 @@ func TestServer_HandleRegister(t *testing.T) {
 		// Verify database was registered with store.
 		require.Len(t, store.DBs(), 1)
 		require.Equal(t, dbPath, store.DBs()[0].Path())
+	})
+
+	t.Run("Intervals", func(t *testing.T) {
+		for _, tt := range []struct {
+			name               string
+			fields             string
+			monitorInterval    time.Duration
+			checkpointInterval time.Duration
+		}{
+			{name: "Default", monitorInterval: litestream.DefaultMonitorInterval, checkpointInterval: litestream.DefaultCheckpointInterval},
+			{name: "Set", fields: `, "monitor_interval": "10s", "checkpoint_interval": "5m"`, monitorInterval: 10 * time.Second, checkpointInterval: 5 * time.Minute},
+			{name: "Zero", fields: `, "monitor_interval": "0", "checkpoint_interval": "0"`},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+				store.CompactionMonitorEnabled = false
+				require.NoError(t, store.Open(t.Context()))
+				defer store.Close(t.Context())
+
+				server := litestream.NewServer(store)
+				server.SocketPath = testSocketPath(t)
+				require.NoError(t, server.Start())
+				defer server.Close()
+
+				db, sqldb := testingutil.MustOpenDBs(t)
+				testingutil.MustCloseDBs(t, db, sqldb)
+
+				client := newSocketClient(t, server.SocketPath)
+				body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s"%s}`, db.Path(), t.TempDir(), tt.fields)
+				resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, http.StatusOK, resp.StatusCode)
+
+				require.Len(t, store.DBs(), 1)
+				require.Equal(t, tt.monitorInterval, store.DBs()[0].MonitorInterval)
+				require.Equal(t, tt.checkpointInterval, store.DBs()[0].CheckpointInterval)
+			})
+		}
+	})
+
+	t.Run("InvalidInterval", func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			fields string
+			err    string
+		}{
+			{name: "MonitorNotDuration", fields: `"monitor_interval": "soon"`, err: "invalid monitor_interval"},
+			{name: "MonitorNegative", fields: `"monitor_interval": "-1s"`, err: "invalid monitor_interval"},
+			{name: "CheckpointNotDuration", fields: `"checkpoint_interval": "10"`, err: "invalid checkpoint_interval"},
+			{name: "CheckpointNegative", fields: `"checkpoint_interval": "-1m"`, err: "invalid checkpoint_interval"},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+				store.CompactionMonitorEnabled = false
+				require.NoError(t, store.Open(t.Context()))
+				defer store.Close(t.Context())
+
+				server := litestream.NewServer(store)
+				server.SocketPath = testSocketPath(t)
+				require.NoError(t, server.Start())
+				defer server.Close()
+
+				client := newSocketClient(t, server.SocketPath)
+				body := fmt.Sprintf(`{"path": "/tmp/test.db", "replica_url": "file://%s", %s}`, t.TempDir(), tt.fields)
+				resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+				require.NoError(t, err)
+				defer resp.Body.Close()
+				require.Equal(t, http.StatusBadRequest, resp.StatusCode)
+
+				var result litestream.ErrorResponse
+				require.NoError(t, json.NewDecoder(resp.Body).Decode(&result))
+				require.Contains(t, result.Error, tt.err)
+				require.Empty(t, store.DBs())
+			})
+		}
+	})
+
+	// With the monitor disabled, writes reach the replica only through /sync.
+	t.Run("MonitorDisabled", func(t *testing.T) {
+		store := litestream.NewStore(nil, litestream.CompactionLevels{{Level: 0}})
+		store.CompactionMonitorEnabled = false
+		require.NoError(t, store.Open(t.Context()))
+		defer store.Close(t.Context())
+
+		server := litestream.NewServer(store)
+		server.SocketPath = testSocketPath(t)
+		require.NoError(t, server.Start())
+		defer server.Close()
+
+		dbPath := filepath.Join(t.TempDir(), "db")
+		sqldb := testingutil.MustOpenSQLDB(t, dbPath)
+		defer testingutil.MustCloseSQLDB(t, sqldb)
+		_, err := sqldb.ExecContext(t.Context(), `CREATE TABLE t (id INT)`)
+		require.NoError(t, err)
+
+		client := newSocketClient(t, server.SocketPath)
+		body := fmt.Sprintf(`{"path": %q, "replica_url": "file://%s", "monitor_interval": "0"}`, dbPath, t.TempDir())
+		resp, err := client.Post("http://localhost/register", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+		require.Len(t, store.DBs(), 1)
+		registered := store.DBs()[0]
+
+		before, err := registered.Pos()
+		require.NoError(t, err)
+		_, err = sqldb.ExecContext(t.Context(), `INSERT INTO t (id) VALUES (1)`)
+		require.NoError(t, err)
+
+		// The default monitor would have synced within one interval.
+		require.Never(t, func() bool {
+			pos, err := registered.Pos()
+			return err != nil || pos != before
+		}, 3*litestream.DefaultMonitorInterval, 50*time.Millisecond)
+
+		body = fmt.Sprintf(`{"path": %q, "wait": true, "timeout": 30}`, dbPath)
+		syncResp, err := client.Post("http://localhost/sync", "application/json", io.NopCloser(stringReader(body)))
+		require.NoError(t, err)
+		defer syncResp.Body.Close()
+		require.Equal(t, http.StatusOK, syncResp.StatusCode)
+
+		var result litestream.SyncResponse
+		require.NoError(t, json.NewDecoder(syncResp.Body).Decode(&result))
+		require.Equal(t, "synced", result.Status)
+		require.Greater(t, result.TXID, uint64(before.TXID))
+		require.Equal(t, result.TXID, result.ReplicatedTXID)
 	})
 
 	t.Run("AlreadyExists", func(t *testing.T) {
