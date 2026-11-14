@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -1192,7 +1193,11 @@ func TestHydrator_Restore_ChecksumTracked(t *testing.T) {
 	if err := h.Init(); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = h.Close() })
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 
 	if err := h.Restore(context.Background(), []*ltx.FileInfo{snapshot.info, incremental.info}); err != nil {
 		t.Fatal(err)
@@ -2530,5 +2535,309 @@ func TestVFSFile_Hydration_CompletionPreservesActiveRead(t *testing.T) {
 				t.Fatalf("released snapshot did not advance: %q", page[128])
 			}
 		})
+	}
+}
+
+func TestHydrator_Restore_CancelsSourceOnWriteError(t *testing.T) {
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hdr := ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 512, Commit: 2, MinTXID: 1, MaxTXID: 1}
+	if err := enc.EncodeHeader(hdr); err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodePage(ltx.PageHeader{Pgno: 1}, make([]byte, 512)); err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("close hydration source")
+	client := &cancelledHydrationClient{ReplicaClient: newMockReplicaClient(), data: buf.Bytes(), closeErr: closeErr}
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 512, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- h.Restore(ctx, []*ltx.FileInfo{{MinTXID: 1, MaxTXID: 1, Size: int64(buf.Len())}}) }()
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrClosed) || !errors.Is(err, closeErr) {
+			t.Fatalf("want destination and source close errors, got %v", err)
+		}
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("hydration did not cancel its source after destination failure")
+	}
+}
+
+type cancelledHydrationClient struct {
+	ReplicaClient
+	data     []byte
+	closeErr error
+}
+
+func (c *cancelledHydrationClient) OpenLTXFile(ctx context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
+	return &cancelledHydrationReader{Reader: bytes.NewReader(c.data), ctx: ctx, closeErr: c.closeErr}, nil
+}
+
+type cancelledHydrationReader struct {
+	*bytes.Reader
+	ctx      context.Context
+	closeErr error
+}
+
+func (r *cancelledHydrationReader) Read(p []byte) (int, error) {
+	if r.Len() == 0 {
+		<-r.ctx.Done()
+		return 0, r.ctx.Err()
+	}
+	return r.Reader.Read(p)
+}
+func (r *cancelledHydrationReader) Close() error { <-r.ctx.Done(); return r.closeErr }
+
+func TestHydrator_ApplyLTX_VerifiesFile(t *testing.T) {
+	newHydrator := func(t *testing.T, client ReplicaClient) *Hydrator {
+		t.Helper()
+		h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		t.Cleanup(func() {
+			if err := h.Close(); err != nil {
+				t.Error(err)
+			}
+		})
+		return h
+	}
+
+	t.Run("CorruptChecksumRejected", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		fx.data = bytes.Clone(fx.data)
+		fx.data[len(fx.data)-1] ^= 0xFF // flip a byte of the trailer's file checksum
+		client.addFixture(t, fx)
+		h := newHydrator(t, client)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected ApplyLTX to reject a file whose checksum does not verify")
+		}
+	})
+
+	t.Run("TaintedPersistentHydrationIsDiscarded", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		fx.data = bytes.Clone(fx.data)
+		fx.data[len(fx.data)-1] ^= 0xFF
+		client.addFixture(t, fx)
+		path := filepath.Join(t.TempDir(), "hydration.db")
+		h := NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		h.SetTXID(1)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected verification failure")
+		}
+		if !h.tainted.Load() {
+			t.Fatal("expected hydrator to be tainted")
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+			t.Fatalf("tainted persistent hydration must not save meta for resume (err=%v)", err)
+		}
+		if _, err := os.Stat(path); !os.IsNotExist(err) {
+			t.Fatalf("tainted persistent hydration file must be removed (err=%v)", err)
+		}
+	})
+
+	t.Run("PersistentMetaRemovedBeforePagesChange", func(t *testing.T) {
+		client := newMockReplicaClient()
+		valid := buildLTXFixture(t, 1, 'a')
+		client.addFixture(t, valid)
+		path := filepath.Join(t.TempDir(), "hydration.db")
+		h := NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		if err := h.ApplyLTX(context.Background(), valid.info); err != nil {
+			t.Fatalf("apply valid file: %v", err)
+		}
+		h.SetTXID(1)
+		if err := h.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+
+		corrupt := buildLTXFixtureWithPages(t, 2, 4096, []uint32{1}, 'b')
+		corrupt.data = bytes.Clone(corrupt.data)
+		corrupt.data[len(corrupt.data)-1] ^= 0xFF
+		client.addFixture(t, corrupt)
+		h = NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("resume: %v", err)
+		}
+		if got := h.TXID(); got != 1 {
+			t.Fatalf("expected to resume at TXID 1, got %d", got)
+		}
+		if err := h.ApplyLTX(context.Background(), corrupt.info); err == nil {
+			t.Fatal("expected verification failure")
+		}
+		if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+			t.Fatalf("meta must be removed before a changed file can be resumed (err=%v)", err)
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("close tainted hydrator: %v", err)
+		}
+	})
+
+	t.Run("MidFileCorruptionTaints", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixtureWithPages(t, 1, 4096, []uint32{1, 2}, 'a')
+		fx.data = bytes.Clone(fx.data)
+		// Corrupt the second page frame's header so decoding fails after
+		// page 1 has already been written to the hydration file. Frames are
+		// LZ4-compressed, so locate the second one from the first frame's
+		// size field rather than the page size.
+		firstFrame := ltx.HeaderSize
+		firstSize := int(binary.BigEndian.Uint32(fx.data[firstFrame+ltx.PageHeaderSize:]))
+		second := firstFrame + ltx.PageHeaderSize + 4 + firstSize
+		fx.data[second+4] = 0xFF
+		client.addFixture(t, fx)
+		path := filepath.Join(t.TempDir(), "hydration.db")
+		h := NewHydrator(path, true, 4096, client, slog.Default())
+		if err := h.Init(); err != nil {
+			t.Fatalf("init: %v", err)
+		}
+		h.SetTXID(1)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil || !strings.Contains(err.Error(), "decode page: invalid page header flags") {
+			t.Fatalf("expected page decoding failure, got %v", err)
+		}
+		if !h.tainted.Load() {
+			t.Fatal("expected hydrator to be tainted after a mid-file failure")
+		}
+		if err := h.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
+		if _, err := os.Stat(path + ".meta"); !os.IsNotExist(err) {
+			t.Fatalf("meta must not be saved for a tainted hydration (err=%v)", err)
+		}
+	})
+
+	t.Run("TruncatedIndexRejected", func(t *testing.T) {
+		client := newMockReplicaClient()
+		fx := buildLTXFixture(t, 1, 'a')
+		fx.data = bytes.Clone(fx.data[:len(fx.data)-ltx.TrailerSize-4])
+		client.addFixture(t, fx)
+		h := newHydrator(t, client)
+		if err := h.ApplyLTX(context.Background(), fx.info); err == nil {
+			t.Fatal("expected ApplyLTX to reject a truncated file")
+		}
+	})
+}
+
+func TestHydrator_ApplyLTX_Canceled(t *testing.T) {
+	client := newMockReplicaClient()
+	fx := buildLTXFixture(t, 1, 'a')
+	client.addFixture(t, fx)
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := h.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := h.ApplyLTX(ctx, fx.info); !errors.Is(err, context.Canceled) {
+		t.Fatalf("apply canceled: %v", err)
+	}
+	if !h.tainted.Load() {
+		t.Fatal("canceled apply must prevent persistence")
+	}
+}
+
+func TestHydrator_Close_PersistenceErrors(t *testing.T) {
+	for _, failure := range []string{"sync", "metadata"} {
+		t.Run(failure, func(t *testing.T) {
+			h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), true, 4096, newMockReplicaClient(), slog.Default())
+			if err := h.Init(); err != nil {
+				t.Fatal(err)
+			}
+			h.SetTXID(1)
+			if failure == "sync" {
+				if err := h.file.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if err := os.Mkdir(h.metaPath(), 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := h.Close(); err == nil {
+				t.Fatal("expected persistence error")
+			}
+			if _, err := os.Stat(h.metaPath()); !os.IsNotExist(err) {
+				t.Fatalf("failed persistence left resume metadata: %v", err)
+			}
+		})
+	}
+}
+
+func TestHydrator_ApplyLTX_CrashBeforeClose(t *testing.T) {
+	client := newMockReplicaClient()
+	fx := buildLTXFixture(t, 1, 'a')
+	client.addFixture(t, fx)
+	path := filepath.Join(t.TempDir(), "hydration.db")
+	h := NewHydrator(path, true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.ApplyLTX(t.Context(), fx.info); err != nil {
+		t.Fatal(err)
+	}
+	h.SetTXID(1)
+	if err := h.Close(); err != nil {
+		t.Fatal(err)
+	}
+	h = NewHydrator(path, true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	fx = buildLTXFixtureWithPages(t, 2, 4096, []uint32{1}, 'b')
+	fx.data[len(fx.data)-1] ^= 0xff
+	client.addFixture(t, fx)
+	applyErr := h.ApplyLTX(t.Context(), fx.info)
+	if err := h.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if applyErr == nil {
+		t.Fatal("expected corrupt file rejection")
+	}
+	restarted := NewHydrator(path, true, 4096, client, slog.Default())
+	if err := restarted.Init(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := restarted.Close(); err != nil {
+			t.Error(err)
+		}
+	}()
+	if restarted.TXID() != 0 {
+		t.Fatal("resumed partially applied hydration after crash")
+	}
+	fi, err := restarted.file.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() != 0 {
+		t.Fatal("restart retained unverified pages")
 	}
 }
