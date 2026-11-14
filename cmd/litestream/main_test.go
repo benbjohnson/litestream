@@ -7,7 +7,10 @@ import (
 	"database/sql"
 	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"os/user"
@@ -16,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -4517,6 +4521,194 @@ func TestNewS3ReplicaFromConfig_PutObjectContentMD5(t *testing.T) {
 			}
 			if client.PutObjectContentMD5 != tt.want {
 				t.Errorf("PutObjectContentMD5 = %v, want %v", client.PutObjectContentMD5, tt.want)
+			}
+		})
+	}
+}
+
+func TestNewS3ReplicaClientFromConfig_DirectoryParity(t *testing.T) {
+	const baseURL = "s3://test--usw2-az1--x-s3/replica"
+	awsFile := filepath.Join(t.TempDir(), "aws-config")
+	if err := os.WriteFile(awsFile, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"AWS_CONFIG_FILE": awsFile, "AWS_SHARED_CREDENTIALS_FILE": awsFile,
+		"AWS_PROFILE": "", "AWS_DEFAULT_PROFILE": "", "AWS_REGION": "", "AWS_DEFAULT_REGION": "",
+		"AWS_USE_FIPS_ENDPOINT": "", "AWS_USE_DUALSTACK_ENDPOINT": "", "AWS_S3_DISABLE_EXPRESS_SESSION_AUTH": "",
+		"AWS_ACCESS_KEY_ID": "test-access-key", "AWS_SECRET_ACCESS_KEY": "test-secret-key", "AWS_SESSION_TOKEN": "test-session-token",
+		"AWS_EC2_METADATA_DISABLED": "true", "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "false", "LITESTREAM_S3_ENDPOINT": "",
+	} {
+		t.Setenv(name, value)
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("explicit-region Init unexpectedly sent %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	t.Setenv("AWS_ENDPOINT_URL_S3", server.URL)
+	for _, tt := range []struct {
+		name, query, yaml, wantError string
+		wantPathStyle, wantMD5       bool
+	}{
+		{name: "URL", yaml: "url: " + baseURL + "?region=us-west-2"},
+		{name: "YAMLRegion", yaml: "url: " + baseURL + "\n      region: us-west-2"},
+		{name: "CustomVirtualHost", query: "&endpoint=https://objects.example.test&force-path-style=false", yaml: "url: " + baseURL + "\n      region: us-west-2\n      endpoint: https://objects.example.test\n      force-path-style: false"},
+		{name: "PathStyle", query: "&force-path-style=true", yaml: "url: " + baseURL + "\n      region: us-west-2\n      force-path-style: true", wantPathStyle: true, wantError: "path-style"},
+		{name: "PutObjectMD5", query: "&put-object-content-md5=true", yaml: "url: " + baseURL + "\n      region: us-west-2\n      put-object-content-md5: true", wantMD5: true, wantError: "put-object-content-md5"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			urlClient, err := litestream.NewReplicaClientFromURL(baseURL + "?region=us-west-2" + tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			config, err := main.ParseConfig(strings.NewReader("dbs:\n  - path: /tmp/listing-test.db\n    replica:\n      "+tt.yaml+"\n"), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configClient, err := main.NewS3ReplicaClientFromConfig(config.DBs[0].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, constructor := range []struct {
+				name   string
+				client *s3.ReplicaClient
+			}{{"URL", urlClient.(*s3.ReplicaClient)}, {"YAML", configClient}} {
+				t.Run(constructor.name, func(t *testing.T) {
+					c := constructor.client
+					if c.Bucket != "test--usw2-az1--x-s3" || c.Region != "us-west-2" || c.Path != "replica" || c.ForcePathStyle != tt.wantPathStyle || c.PutObjectContentMD5 != tt.wantMD5 {
+						t.Fatalf("unexpected constructor configuration: bucket=%q region=%q path=%q pathStyle=%v MD5=%v", c.Bucket, c.Region, c.Path, c.ForcePathStyle, c.PutObjectContentMD5)
+					}
+					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					err := c.Init(ctx)
+					if tt.wantError != "" {
+						if err == nil || !strings.Contains(strings.ToLower(err.Error()), "directory") || !strings.Contains(strings.ToLower(err.Error()), tt.wantError) {
+							t.Fatalf("Init error = %v, want directory-bucket %s rejection", err, tt.wantError)
+						}
+					} else if err != nil {
+						t.Fatal(err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNewS3ReplicaClientFromConfig_SortListings(t *testing.T) {
+	awsFile := filepath.Join(t.TempDir(), "aws-config")
+	if err := os.WriteFile(awsFile, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for name, value := range map[string]string{
+		"AWS_CONFIG_FILE": awsFile, "AWS_SHARED_CREDENTIALS_FILE": awsFile,
+		"AWS_PROFILE": "", "AWS_DEFAULT_PROFILE": "", "AWS_REGION": "", "AWS_DEFAULT_REGION": "",
+		"AWS_ENDPOINT_URL": "", "AWS_ENDPOINT_URL_S3": "", "LITESTREAM_S3_ENDPOINT": "", "LITESTREAM_S3_DEBUG": "",
+		"AWS_USE_FIPS_ENDPOINT": "", "AWS_USE_DUALSTACK_ENDPOINT": "", "AWS_S3_DISABLE_EXPRESS_SESSION_AUTH": "",
+		"AWS_ACCESS_KEY_ID": "test-access-key", "AWS_SECRET_ACCESS_KEY": "test-secret-key", "AWS_SESSION_TOKEN": "test-session-token",
+		"AWS_EC2_METADATA_DISABLED": "true", "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS": "true",
+	} {
+		t.Setenv(name, value)
+	}
+	for _, tt := range []struct {
+		name, query, global, yaml string
+		wantSorted                bool
+	}{
+		{name: "Default", wantSorted: true},
+		{name: "QueryEnabled", query: "&sort-listings=true", wantSorted: true},
+		{name: "QueryDisabled", query: "&sort-listings=false"},
+		{name: "QueryAlias", query: "&sortListings=false"},
+		{name: "YAMLEnabled", yaml: "sort-listings: true", wantSorted: true},
+		{name: "YAMLDisabled", yaml: "sort-listings: false"},
+		{name: "Inherited", global: "sort-listings: false"},
+		{name: "ReplicaOverridesGlobal", global: "sort-listings: false", yaml: "sort-listings: true", wantSorted: true},
+		{name: "YAMLDisablesQuery", query: "&sort-listings=true", yaml: "sort-listings: false"},
+		{name: "YAMLEnablesQuery", query: "&sort-listings=false", yaml: "sort-listings: true", wantSorted: true},
+		{name: "InheritedOverridesQuery", query: "&sort-listings=true", global: "sort-listings: false"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var lists atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("list-type") != "2" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				lists.Add(1)
+				first, second := []uint64{1, 2}, []uint64{3}
+				if tt.wantSorted {
+					first, second = []uint64{1, 3}, []uint64{2}
+				}
+				ids, next := first, "page-two"
+				if r.URL.Query().Get("continuation-token") == "page-two" {
+					ids, next = second, ""
+				}
+				w.Header().Set("Content-Type", "application/xml")
+				fmt.Fprintf(w, "<ListBucketResult><IsTruncated>%v</IsTruncated>", next != "")
+				if next != "" {
+					fmt.Fprintf(w, "<NextContinuationToken>%s</NextContinuationToken>", next)
+				}
+				for _, id := range ids {
+					fmt.Fprintf(w, "<Contents><Key>replica/0000/%016x-%016x.ltx</Key><Size>123</Size><LastModified>2026-11-01T00:00:00Z</LastModified></Contents>", id, id)
+				}
+				fmt.Fprint(w, "</ListBucketResult>")
+			}))
+			defer server.Close()
+			baseURL := "s3://test-bucket/replica?region=us-west-2&endpoint=" + server.URL
+			config, err := main.ParseConfig(strings.NewReader(tt.global+"\ndbs:\n  - path: /tmp/listing-test.db\n    replica:\n      url: "+baseURL+tt.query+"\n      "+tt.yaml+"\n"), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			configClient, err := main.NewS3ReplicaClientFromConfig(config.DBs[0].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			// Compare the YAML-resolved behavior to the equivalent library URL.
+			libraryQuery := ""
+			if tt.name != "Default" {
+				libraryQuery = "&sort-listings=" + strconv.FormatBool(tt.wantSorted)
+			}
+			urlClient, err := litestream.NewReplicaClientFromURL(baseURL + libraryQuery)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, constructor := range []struct {
+				name   string
+				client litestream.ReplicaClient
+			}{{"URL", urlClient}, {"YAML", configClient}} {
+				t.Run(constructor.name, func(t *testing.T) {
+					lists.Store(0)
+					ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+					defer cancel()
+					itr, err := constructor.client.LTXFiles(ctx, 0, 0, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer itr.Close()
+					if got := lists.Load(); got != 0 {
+						t.Fatalf("iterator construction fetched %d pages", got)
+					}
+					if !itr.Next() {
+						t.Fatalf("first Next: %v", itr.Err())
+					}
+					wantPages := int32(1)
+					if tt.wantSorted {
+						wantPages = 2
+					}
+					if got := lists.Load(); got != wantPages {
+						t.Errorf("first item fetched %d LIST pages, want %d", got, wantPages)
+					}
+					got := []uint64{uint64(itr.Item().MinTXID)}
+					for itr.Next() {
+						got = append(got, uint64(itr.Item().MinTXID))
+					}
+					if err := itr.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if !slices.Equal(got, []uint64{1, 2, 3}) {
+						t.Errorf("transaction order = %v, want [1 2 3]", got)
+					}
+				})
 			}
 		})
 	}

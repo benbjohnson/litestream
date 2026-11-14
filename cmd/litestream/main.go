@@ -1156,6 +1156,7 @@ type ReplicaSettings struct {
 	SignAcceptEncoding  *bool     `yaml:"sign-accept-encoding"`
 	RequireContentMD5   *bool     `yaml:"require-content-md5"`
 	PutObjectContentMD5 *bool     `yaml:"put-object-content-md5"`
+	SortListings        *bool     `yaml:"sort-listings"`
 	SkipVerify          bool      `yaml:"skip-verify"`
 	StorageClass        string    `yaml:"storage-class"`
 	PartSize            *ByteSize `yaml:"part-size"`
@@ -1262,6 +1263,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if rs.PutObjectContentMD5 == nil {
 		rs.PutObjectContentMD5 = src.PutObjectContentMD5
+	}
+	if rs.SortListings == nil {
+		rs.SortListings = src.SortListings
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
@@ -1502,6 +1506,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
 	storageClass := c.StorageClass
 	putObjectContentMD5 := false
+	sortListings := true
 	signSetting := newBoolSetting(true)
 	if v := c.SignPayload; v != nil {
 		signSetting.Set(*v)
@@ -1600,6 +1605,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 		if v, ok := litestream.BoolQueryValue(query, "putObjectContentMD5", "put-object-content-md5"); ok {
 			putObjectContentMD5 = v
+		}
+		if v, ok := litestream.BoolQueryValue(query, "sortListings", "sort-listings"); ok {
+			sortListings = v
 		}
 		if v := query.Get("storageClass"); v != "" {
 			ustorageClass = v
@@ -1706,6 +1714,10 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.PutObjectContentMD5 = putObjectContentMD5
 	if v := c.PutObjectContentMD5; v != nil {
 		client.PutObjectContentMD5 = *v
+	}
+	client.SortListings = sortListings
+	if v := c.SortListings; v != nil {
+		client.SortListings = *v
 	}
 
 	if isCloudflareR2 {

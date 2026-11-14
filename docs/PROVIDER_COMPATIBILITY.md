@@ -27,6 +27,123 @@ replicas:
 - All features fully supported
 - Checksum validation enabled by default
 
+### AWS S3 Express One Zone (Directory Buckets)
+
+**Status**: Supported with configuration; local regression/request tests only.
+End-to-end validation against real AWS has not been run.
+
+**Known Limitations**:
+
+- Directory buckets only. Express access-point ARNs and full zonal-host URL
+  parsing are not covered by this support.
+- `force-path-style: true`, SSE-C (`sse-customer-key`), and
+  `put-object-content-md5: true` are rejected. Leave `storage-class` unset or use
+  `EXPRESS_ONEZONE`.
+- Other directory-bucket storage products are not covered.
+- Directory listings are buffered and sorted; `sort-listings: false` is rejected.
+  See [Listing Order and Custom Endpoints](#listing-order-and-custom-endpoints).
+- **Single-AZ durability**: Express One Zone stores data in one Availability Zone.
+  It is not equivalent to multi-AZ S3 Standard for resilience to AZ loss.
+  Litestream supports one replica destination per database; this configuration
+  does not provide an additional cross-AZ backup.
+
+**Configuration**:
+
+Use the directory bucket's native name, including its zone ID and `--x-s3` suffix.
+No custom endpoint is needed; the AWS SDK constructs the zonal endpoint and
+manages Express session credentials.
+
+```yaml
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://example--usw2-az1--x-s3/db
+      region: us-west-2
+```
+
+**Required Settings**:
+
+- **Region**: An explicit `region` takes precedence. Otherwise the SDK uses
+  `AWS_REGION`, `AWS_DEFAULT_REGION`, or shared AWS configuration. Missing region
+  is an error; Litestream does not call `GetBucketLocation` for directory buckets
+  or infer a region from the zone ID. Standard S3 region discovery is unchanged.
+- **Virtual-hosted addressing**: Required for directory buckets and any custom
+  endpoint. A custom endpoint still requires a valid region; the ordinary
+  custom-provider `us-east-1` fallback does not apply.
+- **Permissions**: Grant `s3express:CreateSession` on the directory bucket, plus
+  permissions needed for the selected encryption and operations. The SDK uses the
+  configured AWS credential chain (including IAM session tokens) to acquire
+  Express sessions.
+
+**Important**:
+
+- SSE-KMS settings must match the bucket's encryption configuration and AWS
+  CreateSession encryption constraints. Initialization does not validate these
+  permissions or encryption settings against AWS.
+- `require-content-md5` controls multi-delete, not uploads. Both values remain
+  accepted: captured requests include an SDK CRC32 checksum even when this
+  option is false. This is request-construction evidence, not live AWS acceptance.
+
+Related issue: #1529
+
+### Listing Order and Custom Endpoints
+
+Directory buckets and explicitly configured custom S3 endpoints use globally sorted
+LTX listings by default, including providers that already return ordered results.
+No opt-in flag is required. Standard AWS general-purpose buckets without a custom
+endpoint retain streaming iteration regardless of the setting.
+
+For custom non-directory providers that guarantee ordered listings, opt out of
+buffering and sorting with `sort-listings: false`:
+
+```yaml
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path
+      endpoint: https://objects.example.com
+      sort-listings: false
+```
+
+| Custom non-directory setting | Behavior |
+| --- | --- |
+| Omitted | Buffer and sort (default). |
+| `sort-listings: true` | Buffer and sort. |
+| `sort-listings: false` | Stream, trusting the provider's ordering. |
+
+URLs also accept `sort-listings=false` (or `sortListings=false`). In the Go client,
+use `client := s3.NewReplicaClient()`, then `client.SortListings = false` to opt out.
+YAML settings, including inherited global defaults, override URL settings;
+per-replica YAML overrides global YAML defaults.
+
+**Warning**: Disabling sorting does not validate the provider's ordering. If it
+returns unordered results, restore, VFS polling, compaction, or retention may
+behave incorrectly. Leave sorting enabled unless the ordering guarantee is known.
+Directory buckets reject disabling sorting, even with a custom endpoint.
+
+With sorting enabled, Litestream fetches every listing page for a level before
+returning its first file, then sorts by minimum and maximum transaction ID. It
+buffers file descriptions and object keys, **not LTX contents**. Memory grows with
+the retained descriptions per active iterator; restores with several active levels
+can hold several buffers. Listing pagination is not an atomic snapshot of
+concurrent uploads/deletions.
+
+This increases first-file latency and memory use versus streaming. Full-list
+consumers already read every page, but early-exit restores now also need every
+page before reading their first file. Seek filtering remains local; it does not
+avoid listing earlier objects. Timestamp restores fetch metadata in bounded,
+concurrency-limited batches as sorted results are consumed. Normal iteration does
+not add HEAD requests. No universal memory or latency limit has been established.
+
+**Storj**: Unordered listings (including encrypted object-key listings) are sorted
+by default. Storj also documents ordered listings with object-key encryption
+disabled, which changes object-name privacy, not necessarily content encryption.
+Do not treat a credential change as a retroactive fix for existing encrypted-key
+backups or mix path-encryption settings; follow
+[Storj's listing guidance](https://storj.dev/dcs/lexicographically-sorted-object-listings).
+Already-ordered Storj custom endpoints use the buffered path by default; only opt
+out if their listing configuration guarantees order.
+
 ### Cloudflare R2
 
 **Status**: Supported with default configuration
