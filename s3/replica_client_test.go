@@ -7,6 +7,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -3581,5 +3583,895 @@ func TestReplicaClient_RetriesThrottledList(t *testing.T) {
 				t.Fatalf("attempts = %d, want 2", got)
 			}
 		})
+	}
+}
+
+// These tests initialize the SDK with an in-memory HTTP transport to isolate
+// listing behavior from region discovery (covered separately by Init tests).
+// The transport never contacts AWS, even when testing default AWS addressing.
+func newListingTestClient(t *testing.T, bucket, endpoint string, handler http.HandlerFunc) *ReplicaClient {
+	t.Helper()
+	c := NewReplicaClient()
+	c.Bucket, c.Path, c.Region, c.Endpoint = bucket, "replica", "us-west-2", endpoint
+	c.ForcePathStyle = endpoint != ""
+	c.SetLogger(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	c.s3 = s3.NewFromConfig(aws.Config{
+		Region:      c.Region,
+		Credentials: credentials.NewStaticCredentialsProvider("test-access-key", "test-secret-key", ""),
+		Retryer:     func() aws.Retryer { return aws.NopRetryer{} },
+		HTTPClient: smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+			if err := r.Context().Err(); err != nil {
+				return nil, err
+			}
+			w := httptest.NewRecorder()
+			if r.URL.Query().Has("session") {
+				// Allow the real SDK Express authentication path without live AWS.
+				w.Header().Set("Content-Type", "application/xml")
+				fmt.Fprint(w, `<CreateSessionResult><Credentials><AccessKeyId>express-access-key</AccessKeyId><SecretAccessKey>express-secret-key</SecretAccessKey><SessionToken>express-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></CreateSessionResult>`)
+			} else {
+				handler(w, r)
+			}
+			if err := r.Context().Err(); err != nil {
+				return nil, err
+			}
+			return w.Result(), nil
+		}),
+	}, func(o *s3.Options) {
+		o.UsePathStyle = c.ForcePathStyle
+		o.APIOptions = append(o.APIOptions, c.middlewareOption())
+		if endpoint != "" {
+			o.BaseEndpoint = aws.String(endpoint)
+		}
+	})
+	return c
+}
+
+type listingTestObject struct {
+	Key          string
+	Size         int64
+	LastModified time.Time
+}
+
+func newListingTestObject(level int, minTXID, maxTXID ltx.TXID) listingTestObject {
+	return listingTestObject{
+		Key:          fmt.Sprintf("replica/%04x/%s", level, ltx.FormatFilename(minTXID, maxTXID)),
+		Size:         123,
+		LastModified: time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC),
+	}
+}
+
+func writeListingTestResponse(t *testing.T, w http.ResponseWriter, objects []listingTestObject, nextToken string) {
+	t.Helper()
+	w.Header().Set("Content-Type", "application/xml")
+	response := struct {
+		XMLName               xml.Name            `xml:"ListBucketResult"`
+		IsTruncated           bool                `xml:"IsTruncated"`
+		NextContinuationToken string              `xml:"NextContinuationToken,omitempty"`
+		Contents              []listingTestObject `xml:"Contents"`
+	}{IsTruncated: nextToken != "", NextContinuationToken: nextToken, Contents: objects}
+	if err := xml.NewEncoder(w).Encode(response); err != nil {
+		t.Error(err)
+	}
+}
+
+func TestReplicaClient_StandardStreaming(t *testing.T) {
+	for _, useMetadata := range []bool{false, true} {
+		t.Run(fmt.Sprintf("Metadata=%v", useMetadata), func(t *testing.T) {
+			var lists, heads atomic.Int32
+			c := newListingTestClient(t, "test-bucket", "", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					heads.Add(1)
+					w.Header().Set("X-Amz-Meta-Litestream-Timestamp", "2026-10-31T00:00:00Z")
+					return
+				}
+				lists.Add(1)
+				switch r.URL.Query().Get("continuation-token") {
+				case "":
+					writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(0, 1, 1), newListingTestObject(0, 2, 2)}, "page-two")
+				case "page-two":
+					writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(0, 3, 3)}, "")
+				default:
+					t.Errorf("unexpected continuation token: %q", r.URL.RawQuery)
+					w.WriteHeader(http.StatusBadRequest)
+				}
+			})
+			itr, err := c.LTXFiles(t.Context(), 0, 2, useMetadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer itr.Close()
+			if lists.Load() != 0 || heads.Load() != 0 {
+				t.Fatal("constructing an iterator performed listing or metadata requests")
+			}
+			if !itr.Next() {
+				t.Fatalf("first Next: %v", itr.Err())
+			}
+			wantTime := newListingTestObject(0, 2, 2).LastModified
+			if useMetadata {
+				wantTime = time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+			}
+			info := itr.Item()
+			if info.Level != 0 || info.MinTXID != 2 || info.MaxTXID != 2 || info.Size != 123 || !info.CreatedAt.Equal(wantTime) {
+				t.Fatalf("unexpected first file: %+v", info)
+			}
+			if got := lists.Load(); got != 1 {
+				t.Fatalf("first item requested %d LIST pages, want 1", got)
+			}
+			if !itr.Next() || itr.Item().MinTXID != 3 {
+				t.Fatalf("missing second file: %v", itr.Err())
+			}
+			if itr.Next() || itr.Err() != nil {
+				t.Fatalf("unexpected final iterator result: %v", itr.Err())
+			}
+			if got := lists.Load(); got != 2 {
+				t.Errorf("LIST pages = %d, want 2", got)
+			}
+			if !useMetadata && heads.Load() != 0 {
+				t.Error("ordinary listing fetched timestamp metadata")
+			}
+			if err := itr.Close(); err != nil || itr.Next() {
+				t.Fatalf("closed iterator returned an error or item: %v", err)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_UnorderedListings(t *testing.T) {
+	for _, destination := range []struct{ name, bucket, endpoint string }{
+		{"CustomEndpoint", "test-bucket", "https://objects.example.test"},
+		{"DirectoryBucket", "test--usw2-az1--x-s3", ""},
+	} {
+		t.Run(destination.name, func(t *testing.T) {
+			for _, tt := range []struct {
+				name  string
+				level int
+				seek  ltx.TXID
+				pages [][]listingTestObject
+				want  [][2]ltx.TXID
+			}{
+				{name: "AcrossPages", pages: [][]listingTestObject{
+					{newListingTestObject(0, 1, 1), newListingTestObject(0, 3, 3)},
+					{newListingTestObject(0, 2, 2)},
+				}, want: [][2]ltx.TXID{{1, 1}, {2, 2}, {3, 3}}},
+				{name: "SeekAndInvalid", seek: 2, pages: [][]listingTestObject{
+					{newListingTestObject(0, 3, 3), {Key: "replica/0000/README"}, newListingTestObject(0, 1, 1)},
+					{newListingTestObject(0, 2, 2)},
+				}, want: [][2]ltx.TXID{{2, 2}, {3, 3}}},
+				{name: "SnapshotTies", level: litestream.SnapshotLevel, pages: [][]listingTestObject{
+					{newListingTestObject(9, 1, 3), newListingTestObject(9, 1, 1)},
+					{newListingTestObject(9, 1, 2)},
+				}, want: [][2]ltx.TXID{{1, 1}, {1, 2}, {1, 3}}},
+				{name: "Empty", pages: [][]listingTestObject{nil}},
+			} {
+				t.Run(tt.name, func(t *testing.T) {
+					var lists, heads atomic.Int32
+					c := newListingTestClient(t, destination.bucket, destination.endpoint, func(w http.ResponseWriter, r *http.Request) {
+						if r.Method == http.MethodHead {
+							heads.Add(1)
+							return
+						}
+						lists.Add(1)
+						page := 0
+						if r.URL.Query().Get("continuation-token") == "page-two" {
+							page = 1
+						}
+						next := ""
+						if page+1 < len(tt.pages) {
+							next = "page-two"
+						}
+						writeListingTestResponse(t, w, tt.pages[page], next)
+					})
+					itr, err := c.LTXFiles(t.Context(), tt.level, tt.seek, false)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer itr.Close()
+					if lists.Load() != 0 {
+						t.Error("listing started before iteration")
+					}
+					var got [][2]ltx.TXID
+					for itr.Next() {
+						info := itr.Item()
+						got = append(got, [2]ltx.TXID{info.MinTXID, info.MaxTXID})
+						if len(got) == 1 && int(lists.Load()) != len(tt.pages) {
+							t.Error("returned a buffered item before reading all listing pages")
+						}
+						if info.Level != tt.level || info.Size != 123 || !info.CreatedAt.Equal(newListingTestObject(0, 1, 1).LastModified) {
+							t.Errorf("file metadata changed: %+v", info)
+						}
+					}
+					if err := itr.Close(); err != nil {
+						t.Fatal(err)
+					}
+					if !slices.Equal(got, tt.want) {
+						t.Errorf("ranges = %v, want %v", got, tt.want)
+					}
+					if heads.Load() != 0 {
+						t.Error("ordinary listing fetched timestamp metadata")
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestReplicaClient_RestorePlan(t *testing.T) {
+	for _, missing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("MissingTransaction=%v", missing), func(t *testing.T) {
+			c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("prefix") != "replica/0000/" {
+					writeListingTestResponse(t, w, nil, "")
+				} else if r.URL.Query().Get("continuation-token") == "" {
+					writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(0, 1, 1), newListingTestObject(0, 3, 3)}, "page-two")
+				} else if missing {
+					writeListingTestResponse(t, w, nil, "")
+				} else {
+					writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(0, 2, 2)}, "")
+				}
+			})
+			plan, err := litestream.CalcRestorePlan(t.Context(), c, 0, time.Time{}, c.logger)
+			if missing {
+				if err == nil || !strings.Contains(err.Error(), "non-contiguous ltx files") {
+					t.Fatalf("real gap error = %v, want non-contiguous ltx files", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("complete chain rejected: %v", err)
+			}
+			var got []ltx.TXID
+			for _, info := range plan {
+				got = append(got, info.MaxTXID)
+			}
+			if !slices.Equal(got, []ltx.TXID{1, 2, 3}) {
+				t.Fatalf("restore plan = %v, want [1 2 3]", got)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_IteratorLifecycle(t *testing.T) {
+	t.Run("LaterPageFailure", func(t *testing.T) {
+		c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("continuation-token") == "" {
+				writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(0, 1, 1)}, "page-two")
+				return
+			}
+			w.WriteHeader(http.StatusForbidden)
+			fmt.Fprint(w, `<Error><Code>AccessDenied</Code><Message>listing failed</Message></Error>`)
+		})
+		itr, err := c.LTXFiles(t.Context(), 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var count int
+		for itr.Next() {
+			count++
+		}
+		var apiErr smithy.APIError
+		if !errors.As(itr.Err(), &apiErr) || apiErr.ErrorCode() != "AccessDenied" || itr.Close() == nil {
+			t.Fatalf("listing failure lost: %v", itr.Err())
+		}
+		if count != 0 {
+			t.Errorf("returned %d items from an incomplete buffered listing", count)
+		}
+		if itr.Next() {
+			t.Error("closed failed iterator returned an item")
+		}
+	})
+	t.Run("CancelInFlight", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		requested := make(chan struct{})
+		c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+			close(requested)
+			<-r.Context().Done()
+		})
+		itr, err := c.LTXFiles(ctx, 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		result := make(chan bool, 1)
+		go func() { result <- itr.Next() }()
+		select {
+		case <-requested:
+			cancel()
+		case <-ctx.Done():
+			t.Fatal("listing request did not start")
+		}
+		select {
+		case ok := <-result:
+			if ok || !errors.Is(itr.Err(), context.Canceled) || !errors.Is(itr.Close(), context.Canceled) {
+				t.Fatalf("canceled iteration: Next=%v Err=%v", ok, itr.Err())
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("cancellation did not unblock Next")
+		}
+	})
+	t.Run("CloseBeforeNext", func(t *testing.T) {
+		var requests atomic.Int32
+		c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+			requests.Add(1)
+		})
+		itr, err := c.LTXFiles(t.Context(), 0, 0, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := itr.Close(); err != nil || itr.Next() || requests.Load() != 0 {
+			t.Fatalf("closed iterator performed work: err=%v requests=%d", err, requests.Load())
+		}
+	})
+}
+
+func TestReplicaClient_Metadata(t *testing.T) {
+	var mu sync.Mutex
+	var headKeys []string
+	var active, peak atomic.Int32
+	// More than one LIST page worth of valid objects makes fetching the entire
+	// history eagerly observable, without fixing a new production batch-size API.
+	objects := make([]listingTestObject, 0, 2002)
+	objects = append(objects, newListingTestObject(0, 1, 1), listingTestObject{Key: "replica/0000/README"})
+	for txid := ltx.TXID(2); txid <= 2001; txid++ {
+		objects = append(objects, newListingTestObject(0, txid, txid))
+	}
+	c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			n := active.Add(1)
+			defer active.Add(-1)
+			for old := peak.Load(); n > old; old = peak.Load() {
+				if peak.CompareAndSwap(old, n) {
+					break
+				}
+			}
+			key := strings.TrimPrefix(r.URL.Path, "/test-bucket/")
+			mu.Lock()
+			headKeys = append(headKeys, key)
+			mu.Unlock()
+			if key == newListingTestObject(0, 2, 2).Key {
+				w.Header().Set("X-Amz-Meta-Litestream-Timestamp", "2026-10-31T00:00:00Z")
+			}
+			return // Other objects deliberately lack timestamp metadata.
+		}
+		page := 0
+		if token := r.URL.Query().Get("continuation-token"); token != "" {
+			var err error
+			page, err = strconv.Atoi(token)
+			if err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+		}
+		start, end := page*1000, min((page+1)*1000, len(objects))
+		next := ""
+		if end < len(objects) {
+			next = strconv.Itoa(page + 1)
+		}
+		writeListingTestResponse(t, w, objects[start:end], next)
+	})
+	c.MetadataConcurrency = 2
+	itr, err := c.LTXFiles(t.Context(), 0, 2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer itr.Close()
+	if len(headKeys) != 0 {
+		t.Error("constructing the iterator fetched metadata")
+	}
+	for _, wantTXID := range []ltx.TXID{2, 3} {
+		if !itr.Next() {
+			t.Fatalf("Next: %v", itr.Err())
+		}
+		info := itr.Item()
+		wantTime := objects[0].LastModified
+		if wantTXID == 2 {
+			wantTime = time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+		}
+		if info.MinTXID != wantTXID || !info.CreatedAt.Equal(wantTime) {
+			t.Errorf("timestamp/range mismatch: %+v, want TXID=%s time=%s", info, wantTXID, wantTime)
+		}
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(headKeys) == 0 || len(headKeys) >= 2000 {
+		t.Errorf("HEAD requests = %d; want a nonempty batch smaller than the full history", len(headKeys))
+	}
+	for _, key := range headKeys {
+		if key == objects[0].Key || key == objects[1].Key {
+			t.Errorf("fetched metadata for excluded object %q", key)
+		}
+	}
+	if got := peak.Load(); got > 2 {
+		t.Errorf("concurrent metadata requests = %d, want at most 2", got)
+	}
+}
+
+func TestReplicaClient_SnapshotRetention(t *testing.T) {
+	var deleted []string
+	c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("delete") {
+			var request struct {
+				Keys []string `xml:"Object>Key"`
+			}
+			if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			deleted = append(deleted, request.Keys...)
+			fmt.Fprint(w, `<DeleteResult/>`)
+			return
+		}
+		writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(9, 1, 3), newListingTestObject(9, 1, 1), newListingTestObject(9, 1, 2)}, "")
+	})
+	db := litestream.NewDB(filepath.Join(t.TempDir(), "db"))
+	db.Logger = c.logger
+	db.Replica = litestream.NewReplicaWithClient(db, c)
+	// All snapshots are expired. Retention must still preserve the newest TXID,
+	// not whichever object happened to be listed last.
+	floor, err := db.EnforceSnapshotRetention(t.Context(), time.Date(2026, 11, 2, 0, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{newListingTestObject(9, 1, 1).Key, newListingTestObject(9, 1, 2).Key}; !slices.Equal(deleted, want) {
+		t.Errorf("deleted = %v, want %v (preserve snapshot 3)", deleted, want)
+	}
+	if floor != 2 {
+		t.Errorf("retention floor = %s, want 2", floor)
+	}
+}
+
+// Keep region tests independent of the developer's AWS files, profile, endpoints,
+// and metadata service. Tests using real Init redirect SDK networking separately.
+func isolateAWSConfig(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "config")
+	credentialsPath := filepath.Join(dir, "credentials")
+	for _, name := range []string{configPath, credentialsPath} {
+		if err := os.WriteFile(name, nil, 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, name := range []string{
+		"AWS_REGION", "AWS_DEFAULT_REGION", "AWS_PROFILE", "AWS_DEFAULT_PROFILE",
+		"AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_S3", "AWS_USE_FIPS_ENDPOINT", "AWS_USE_DUALSTACK_ENDPOINT",
+		"AWS_S3_DISABLE_EXPRESS_SESSION_AUTH", "LITESTREAM_S3_ENDPOINT", "LITESTREAM_S3_DEBUG",
+	} {
+		t.Setenv(name, "")
+	}
+	t.Setenv("AWS_CONFIG_FILE", configPath)
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credentialsPath)
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	t.Setenv("AWS_IGNORE_CONFIGURED_ENDPOINT_URLS", "false")
+	return configPath
+}
+
+func TestReplicaClient_InitRegion(t *testing.T) {
+	const directory = "test--usw2-az1--x-s3"
+	for _, tt := range []struct {
+		name, bucket, region, envRegion, defaultRegion, sharedRegion, wantRegion string
+		customEndpoint, wantErr                                                  bool
+		wantLookups                                                              int32
+	}{
+		{name: "DirectoryExplicit", bucket: directory, region: "us-west-2", envRegion: "eu-west-1", wantRegion: "us-west-2"},
+		{name: "DirectoryAWSRegion", bucket: directory, envRegion: "us-west-2", defaultRegion: "eu-west-1", sharedRegion: "eu-central-1", wantRegion: "us-west-2"},
+		{name: "DirectoryAWSDefaultRegion", bucket: directory, defaultRegion: "us-west-2", sharedRegion: "eu-central-1", wantRegion: "us-west-2"},
+		{name: "DirectorySharedConfig", bucket: directory, sharedRegion: "us-west-2", wantRegion: "us-west-2"},
+		{name: "DirectoryMissingRegion", bucket: directory, wantErr: true},
+		{name: "DirectoryCustomExplicit", bucket: directory, customEndpoint: true, region: "us-west-2", wantRegion: "us-west-2"},
+		{name: "DirectoryCustomAWSRegion", bucket: directory, customEndpoint: true, envRegion: "us-west-2", wantRegion: "us-west-2"},
+		{name: "DirectoryCustomMissingRegion", bucket: directory, customEndpoint: true, wantErr: true},
+		{name: "StandardExplicit", bucket: "test-bucket", region: "us-west-2", envRegion: "eu-west-1", wantRegion: "us-west-2"},
+		{name: "StandardDiscoveryIgnoresEnvironmentRegion", bucket: "test-bucket", envRegion: "eu-west-1", wantRegion: "us-west-2", wantLookups: 1},
+		{name: "CustomProviderDefaultUnchanged", bucket: "test-bucket", customEndpoint: true, envRegion: "eu-west-1", wantRegion: DefaultRegion},
+		{name: "StandardAccessPointARN", bucket: "arn:aws:s3:us-west-2:123456789012:accesspoint/test-ap", region: "us-west-2", wantRegion: "us-west-2"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := isolateAWSConfig(t)
+			t.Setenv("AWS_REGION", tt.envRegion)
+			t.Setenv("AWS_DEFAULT_REGION", tt.defaultRegion)
+			if tt.sharedRegion != "" {
+				if err := os.WriteFile(configPath, []byte("[default]\nregion = "+tt.sharedRegion+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			var lookups, requests atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				w.Header().Set("Content-Type", "application/xml")
+				if r.URL.Query().Has("location") {
+					lookups.Add(1)
+					if r.Header.Get("X-Amz-Security-Token") != "test-session-token" {
+						t.Error("region discovery lost the configured session token")
+					}
+					if tt.bucket == "test-bucket" {
+						fmt.Fprint(w, `<LocationConstraint>us-west-2</LocationConstraint>`)
+						return
+					}
+				}
+				// Directory discovery must not make a request. Return a non-retryable
+				// error rather than accidentally contacting a real AWS service.
+				w.WriteHeader(http.StatusForbidden)
+				fmt.Fprint(w, `<Error><Code>AccessDenied</Code><Message>unexpected region lookup</Message></Error>`)
+			}))
+			defer server.Close()
+			t.Setenv("AWS_ENDPOINT_URL_S3", server.URL)
+			c := NewReplicaClient()
+			c.Bucket, c.Region = tt.bucket, tt.region
+			c.AccessKeyID, c.SecretAccessKey, c.SessionToken = "test-access-key", "test-secret-key", "test-session-token"
+			if tt.customEndpoint {
+				c.Endpoint = server.URL
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			err := c.Init(ctx)
+			if lookups.Load() != tt.wantLookups || requests.Load() != tt.wantLookups {
+				t.Errorf("Init requests=%d location lookups=%d, want %d", requests.Load(), lookups.Load(), tt.wantLookups)
+			}
+			if tt.wantErr {
+				if err == nil || !strings.Contains(strings.ToLower(err.Error()), "directory") || !strings.Contains(err.Error(), "region") {
+					t.Fatalf("missing region error = %v, want a directory-bucket region diagnostic", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := c.s3.Options().Region; got != tt.wantRegion {
+				t.Errorf("SDK region = %q, want %q", got, tt.wantRegion)
+			}
+			if err := c.Init(ctx); err != nil || requests.Load() != tt.wantLookups {
+				t.Errorf("repeated Init changed behavior: err=%v requests=%d", err, requests.Load())
+			}
+		})
+	}
+}
+
+func TestReplicaClient_DirectoryConfig(t *testing.T) {
+	isolateAWSConfig(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("explicit-region Init unexpectedly sent %s %s", r.Method, r.URL)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	t.Setenv("AWS_ENDPOINT_URL_S3", server.URL)
+	for _, tt := range []struct {
+		name, unsupportedOption string
+		configure               func(*ReplicaClient)
+	}{
+		{name: "Defaults", configure: func(c *ReplicaClient) {}},
+		{name: "ExpressStorageClass", configure: func(c *ReplicaClient) { c.StorageClass = "EXPRESS_ONEZONE" }},
+		{name: "SSEKMS", configure: func(c *ReplicaClient) { c.SSEKMSKeyID = "arn:aws:kms:us-west-2:123456789012:key/test" }},
+		{name: "SDKDeleteChecksum", configure: func(c *ReplicaClient) { c.RequireContentMD5 = false }},
+		{name: "PathStyle", unsupportedOption: "path-style", configure: func(c *ReplicaClient) { c.ForcePathStyle = true }},
+		{name: "SSEC", unsupportedOption: "sse-customer", configure: func(c *ReplicaClient) {
+			c.SSECustomerKey = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{1}, 32))
+		}},
+		{name: "PutObjectMD5", unsupportedOption: "put-object-content-md5", configure: func(c *ReplicaClient) { c.PutObjectContentMD5 = true }},
+		{name: "IncompatibleStorageClass", unsupportedOption: "storage-class", configure: func(c *ReplicaClient) { c.StorageClass = "STANDARD_IA" }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, directory := range []bool{false, true} {
+				t.Run(fmt.Sprintf("Directory=%v", directory), func(t *testing.T) {
+					c := NewReplicaClient()
+					c.Bucket, c.Region = "test-bucket", "us-west-2"
+					if directory {
+						c.Bucket = "test--usw2-az1--x-s3"
+					}
+					c.AccessKeyID, c.SecretAccessKey = "test-access-key", "test-secret-key"
+					tt.configure(c)
+					err := c.Init(t.Context())
+					if directory && tt.unsupportedOption != "" {
+						if err == nil || !strings.Contains(strings.ToLower(err.Error()), "directory") || !strings.Contains(strings.ToLower(err.Error()), tt.unsupportedOption) {
+							t.Fatalf("Init error = %v, want a directory-bucket %s diagnostic", err, tt.unsupportedOption)
+						}
+					} else if err != nil {
+						t.Fatalf("previously valid configuration rejected: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestReplicaClient_DirectoryRequests(t *testing.T) {
+	for _, requireMD5 := range []bool{true, false} {
+		t.Run(fmt.Sprintf("RequireContentMD5=%v", requireMD5), func(t *testing.T) {
+			isolateAWSConfig(t)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				t.Errorf("explicit-region Init unexpectedly sent %s %s", r.Method, r.URL)
+				w.WriteHeader(http.StatusForbidden)
+			}))
+			defer server.Close()
+			t.Setenv("AWS_ENDPOINT_URL_S3", server.URL)
+			c := NewReplicaClient()
+			c.Bucket, c.Path, c.Region = "test--usw2-az1--x-s3", "replica", "us-west-2"
+			c.AccessKeyID, c.SecretAccessKey, c.SessionToken = "test-access-key", "test-secret-key", "test-session-token"
+			c.RequireContentMD5 = requireMD5
+			if err := c.Init(t.Context()); err != nil {
+				t.Fatal(err)
+			}
+			// Preserve real Init's SDK options/middleware, replacing only networking
+			// and removing the local endpoint used to guard initialization above.
+			opts := c.s3.Options()
+			opts.BaseEndpoint = nil
+			var sessions, lists, deletes atomic.Int32
+			opts.HTTPClient = smithyhttp.ClientDoFunc(func(r *http.Request) (*http.Response, error) {
+				w := httptest.NewRecorder()
+				w.Header().Set("Content-Type", "application/xml")
+				wantHost := c.Bucket + ".s3express-usw2-az1.us-west-2.amazonaws.com"
+				if r.URL.Host != wantHost || !strings.Contains(r.Header.Get("Authorization"), "/us-west-2/s3express/") {
+					t.Errorf("wrong Express addressing/signing: host=%q authorization=%q", r.URL.Host, r.Header.Get("Authorization"))
+				}
+				if r.URL.Query().Has("session") {
+					sessions.Add(1)
+					if r.Header.Get("X-Amz-Security-Token") != "test-session-token" {
+						t.Error("CreateSession lost the configured IAM session token")
+					}
+					fmt.Fprint(w, `<CreateSessionResult><Credentials><AccessKeyId>express-access-key</AccessKeyId><SecretAccessKey>express-secret-key</SecretAccessKey><SessionToken>express-token</SessionToken><Expiration>2099-01-01T00:00:00Z</Expiration></Credentials></CreateSessionResult>`)
+				} else {
+					if r.Header.Get("X-Amz-S3session-Token") != "express-token" {
+						t.Error("object operation missing the SDK Express session token")
+					}
+					switch {
+					case r.URL.Query().Get("list-type") == "2":
+						lists.Add(1)
+						writeListingTestResponse(t, w, nil, "")
+					case r.URL.Query().Has("delete"):
+						deletes.Add(1)
+						t.Logf("delete checksum headers: Content-MD5=%v CRC32=%v", r.Header.Get("Content-MD5") != "", r.Header.Get("X-Amz-Checksum-Crc32") != "")
+						checksum := r.Header.Get("Content-MD5")
+						for _, algorithm := range []string{"crc32", "crc32c", "crc64nvme", "sha1", "sha256"} {
+							checksum += r.Header.Get("X-Amz-Checksum-" + algorithm)
+						}
+						if checksum == "" {
+							t.Error("directory multi-delete has neither Content-MD5 nor an additional checksum")
+						}
+						fmt.Fprint(w, `<DeleteResult/>`)
+					default:
+						t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+						w.WriteHeader(http.StatusForbidden)
+					}
+				}
+				return w.Result(), nil
+			})
+			c.s3 = s3.New(opts)
+			itr, err := c.LTXFiles(t.Context(), 0, 0, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if itr.Next() || itr.Close() != nil {
+				t.Fatalf("empty directory listing failed: %v", itr.Err())
+			}
+			if err := c.DeleteLTXFiles(t.Context(), []*ltx.FileInfo{{Level: 0, MinTXID: 1, MaxTXID: 1}}); err != nil {
+				t.Fatal(err)
+			}
+			if sessions.Load() < 1 || lists.Load() != 1 || deletes.Load() != 1 {
+				t.Errorf("requests: sessions=%d lists=%d deletes=%d", sessions.Load(), lists.Load(), deletes.Load())
+			}
+		})
+	}
+}
+
+func TestReplicaClient_SortListings(t *testing.T) {
+	isolateAWSConfig(t)
+	for _, tt := range []struct {
+		name, option                    string
+		custom, wantSorted, useMetadata bool
+	}{
+		{name: "CustomDefault", custom: true, wantSorted: true},
+		{name: "CustomEnabled", custom: true, option: "sort-listings=true", wantSorted: true},
+		{name: "CustomDisabled", custom: true, option: "sort-listings=false"},
+		{name: "CustomDisabledAliasMetadata", custom: true, option: "sortListings=false", useMetadata: true},
+		{name: "StandardEnabled", option: "sort-listings=true"},
+		{name: "StandardDisabled", option: "sort-listings=false"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			rawURL := "s3://test-bucket/replica?region=us-west-2"
+			endpoint := ""
+			if tt.custom {
+				endpoint = "https://objects.example.test"
+				rawURL += "&endpoint=" + endpoint
+			}
+			if tt.option != "" {
+				rawURL += "&" + tt.option
+			}
+			client, err := litestream.NewReplicaClientFromURL(rawURL)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := client.(*ReplicaClient)
+			var lists, heads atomic.Int32
+			// Replace networking only, keeping the constructor's listing policy.
+			c.s3 = newListingTestClient(t, c.Bucket, endpoint, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					heads.Add(1)
+					w.Header().Set("X-Amz-Meta-Litestream-Timestamp", "2026-10-31T00:00:00Z")
+					return
+				}
+				lists.Add(1)
+				first, second := []ltx.TXID{1, 2}, []ltx.TXID{3}
+				if tt.wantSorted {
+					first, second = []ltx.TXID{1, 3}, []ltx.TXID{2}
+				}
+				ids, next := first, "page-two"
+				if r.URL.Query().Get("continuation-token") == "page-two" {
+					ids, next = second, ""
+				}
+				var objects []listingTestObject
+				for _, id := range ids {
+					objects = append(objects, newListingTestObject(0, id, id))
+				}
+				writeListingTestResponse(t, w, objects, next)
+			}).s3
+			itr, err := c.LTXFiles(t.Context(), 0, 2, tt.useMetadata)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer itr.Close()
+			if lists.Load() != 0 || heads.Load() != 0 {
+				t.Fatal("iterator construction performed requests")
+			}
+			if !itr.Next() {
+				t.Fatalf("first Next: %v", itr.Err())
+			}
+			wantPages := int32(1)
+			if tt.wantSorted {
+				wantPages = 2
+			}
+			if got := lists.Load(); got != wantPages {
+				t.Errorf("first item fetched %d LIST pages, want %d", got, wantPages)
+			}
+			wantTime := newListingTestObject(0, 2, 2).LastModified
+			if tt.useMetadata {
+				wantTime = time.Date(2026, 10, 31, 0, 0, 0, 0, time.UTC)
+			}
+			if info := itr.Item(); info.MinTXID != 2 || info.Size != 123 || !info.CreatedAt.Equal(wantTime) {
+				t.Fatalf("seek/metadata changed: %+v", info)
+			}
+			if !itr.Next() || itr.Item().MinTXID != 3 || itr.Next() {
+				t.Fatalf("expected only transactions 2 and 3: %v", itr.Err())
+			}
+			if err := itr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !tt.useMetadata && heads.Load() != 0 {
+				t.Error("ordinary listing requested metadata")
+			}
+		})
+	}
+}
+
+func TestReplicaClient_SortListings_SDKEndpoint(t *testing.T) {
+	for _, tt := range []struct {
+		name, env   string
+		disableSort bool
+	}{
+		{name: "ServiceEnvironment", env: "AWS_ENDPOINT_URL_S3"},
+		{name: "GlobalEnvironment", env: "AWS_ENDPOINT_URL"},
+		{name: "SharedConfig"},
+		{name: "Disabled", env: "AWS_ENDPOINT_URL_S3", disableSort: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			configPath := isolateAWSConfig(t)
+			var lists atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Query().Get("list-type") != "2" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL)
+					w.WriteHeader(http.StatusBadRequest)
+					return
+				}
+				lists.Add(1)
+				first, second := []ltx.TXID{1, 3}, []ltx.TXID{2}
+				if tt.disableSort {
+					first, second = []ltx.TXID{1, 2}, []ltx.TXID{3}
+				}
+				ids, next := first, "page-two"
+				if r.URL.Query().Get("continuation-token") == "page-two" {
+					ids, next = second, ""
+				}
+				var objects []listingTestObject
+				for _, id := range ids {
+					objects = append(objects, newListingTestObject(0, id, id))
+				}
+				writeListingTestResponse(t, w, objects, next)
+			}))
+			defer server.Close()
+			if tt.env != "" {
+				t.Setenv(tt.env, server.URL)
+			} else if err := os.WriteFile(configPath, []byte("[default]\nservices = listing-test\n\n[services listing-test]\ns3 =\n  endpoint_url = "+server.URL+"\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+
+			c := NewReplicaClient()
+			c.Bucket, c.Path, c.Region = "test-bucket", "replica", "us-west-2"
+			c.AccessKeyID, c.SecretAccessKey = "test-access-key", "test-secret-key"
+			c.ForcePathStyle = true
+			if tt.disableSort {
+				c.SortListings = false
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+			defer cancel()
+			if err := c.Init(ctx); err != nil {
+				t.Fatal(err)
+			}
+			// Check fixture resolution before issuing requests so a setup failure
+			// cannot send the test to a real AWS endpoint.
+			if got := aws.ToString(c.s3.Options().BaseEndpoint); got != server.URL {
+				t.Fatalf("SDK endpoint = %q, want %q", got, server.URL)
+			}
+			itr, err := c.LTXFiles(ctx, 0, 0, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer itr.Close()
+			if !itr.Next() {
+				t.Fatalf("first Next: %v", itr.Err())
+			}
+			wantPages := int32(2)
+			if tt.disableSort {
+				wantPages = 1
+			}
+			if got := lists.Load(); got != wantPages {
+				t.Errorf("first item fetched %d LIST pages, want %d", got, wantPages)
+			}
+			got := []ltx.TXID{itr.Item().MinTXID}
+			for itr.Next() {
+				got = append(got, itr.Item().MinTXID)
+			}
+			if err := itr.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(got, []ltx.TXID{1, 2, 3}) {
+				t.Errorf("transaction order = %v, want [1 2 3]", got)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_DirectorySortListings(t *testing.T) {
+	isolateAWSConfig(t)
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer server.Close()
+	t.Setenv("AWS_ENDPOINT_URL_S3", server.URL)
+	for _, custom := range []bool{false, true} {
+		for _, setting := range []string{"", "true", "false"} {
+			t.Run(fmt.Sprintf("Custom=%v/Sort=%s", custom, setting), func(t *testing.T) {
+				rawURL := "s3://test--usw2-az1--x-s3/replica?region=us-west-2"
+				if custom {
+					rawURL += "&endpoint=" + server.URL + "&force-path-style=false"
+				}
+				if setting != "" {
+					rawURL += "&sort-listings=" + setting
+				}
+				client, err := litestream.NewReplicaClientFromURL(rawURL)
+				if err != nil {
+					t.Fatal(err)
+				}
+				c := client.(*ReplicaClient)
+				c.AccessKeyID, c.SecretAccessKey = "test-access-key", "test-secret-key"
+				ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+				defer cancel()
+				err = c.Init(ctx)
+				if setting == "false" {
+					if err == nil || !strings.Contains(strings.ToLower(err.Error()), "directory") || !strings.Contains(err.Error(), "sort-listings") {
+						t.Errorf("Init error = %v, want directory-bucket sort-listings rejection", err)
+					}
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				if got := requests.Load(); got != 0 {
+					t.Errorf("Init sent %d requests, want 0", got)
+				}
+			})
+		}
 	}
 }
