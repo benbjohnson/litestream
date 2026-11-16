@@ -41,17 +41,19 @@ func (c *StatusCommand) Run(ctx context.Context, args []string) (err error) {
 	statuses := make([]DBStatus, 0, len(config.DBs))
 
 	for _, dbConfig := range config.DBs {
-		db, err := NewDBFromConfig(dbConfig)
+		dbs, err := newDBsFromConfig(dbConfig)
 		if err != nil {
 			return err
 		}
 
-		// Filter if path specified.
-		if filterPath != "" && db.Path() != filterPath {
-			continue
-		}
+		for _, db := range dbs {
+			// Filter if path specified.
+			if filterPath != "" && db.Path() != filterPath {
+				continue
+			}
 
-		statuses = append(statuses, c.getDBStatus(db))
+			statuses = append(statuses, c.getDBStatus(db))
+		}
 	}
 
 	if *jsonOutput {
