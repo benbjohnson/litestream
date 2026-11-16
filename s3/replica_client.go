@@ -401,12 +401,16 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Always configure custom HTTP Transport with controlled keepalive settings
 	// to reduce idle CPU usage from default transport's aggressive keepalives.
 	// See: https://github.com/benbjohnson/litestream/issues/992
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	httpClient.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
-		DialContext: withWriteTimeout((&net.Dialer{
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext),
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &writeTimeoutConn{Conn: conn}, nil
+		},
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
