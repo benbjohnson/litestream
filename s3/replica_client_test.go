@@ -4475,3 +4475,75 @@ func TestReplicaClient_DirectorySortListings(t *testing.T) {
 		}
 	}
 }
+
+func TestReplicaClient_MetadataErrors(t *testing.T) {
+	for _, tt := range []struct {
+		name      string
+		status    int
+		timestamp string
+		want      string
+	}{
+		{name: "AccessDenied", status: http.StatusForbidden, want: "403"},
+		{name: "InvalidTimestamp", timestamp: "not-a-timestamp", want: "timestamp"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newListingTestClient(t, "test-bucket", "https://objects.example.test", func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodHead {
+					if tt.status != 0 {
+						w.WriteHeader(tt.status)
+					} else {
+						w.Header().Set("X-Amz-Meta-Litestream-Timestamp", tt.timestamp)
+					}
+					return
+				}
+				writeListingTestResponse(t, w, []listingTestObject{newListingTestObject(0, 1, 1)}, "")
+			})
+			itr, err := c.LTXFiles(t.Context(), 0, 0, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if itr.Next() {
+				t.Error("returned a timestamp after metadata failed")
+			}
+			if err := itr.Err(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("Err = %v, want %q", err, tt.want)
+			}
+			if err := itr.Close(); err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("Close = %v, want %q", err, tt.want)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_MetadataExcludesFilteredFiles(t *testing.T) {
+	var heads atomic.Int32
+	c := newListingTestClient(t, "test-bucket", "", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			heads.Add(1)
+			if r.URL.Path != "/"+newListingTestObject(0, 2, 2).Key {
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			w.Header().Set("X-Amz-Meta-Litestream-Timestamp", "2026-10-31T00:00:00Z")
+			return
+		}
+		writeListingTestResponse(t, w, []listingTestObject{
+			newListingTestObject(0, 1, 1),
+			{Key: "replica/0000/README"},
+			newListingTestObject(0, 2, 2),
+		}, "")
+	})
+	itr, err := c.LTXFiles(t.Context(), 0, 2, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !itr.Next() || itr.Item().MinTXID != 2 || itr.Next() {
+		t.Errorf("expected only transaction 2: %v", itr.Err())
+	}
+	if err := itr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := heads.Load(); got != 1 {
+		t.Errorf("HEAD requests = %d, want 1", got)
+	}
+}

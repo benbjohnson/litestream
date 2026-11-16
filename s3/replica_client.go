@@ -1681,17 +1681,18 @@ func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
 
 			head, err := itr.client.s3.HeadObject(ctx, headInput)
 			if err != nil {
-				// Non-fatal: file might not have metadata, use LastModified
-				return nil
+				return fmt.Errorf("s3: read timestamp metadata for %s: %w", key, err)
 			}
 
 			if head.Metadata != nil {
 				if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
-					if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-						mu.Lock()
-						results[key] = parsed
-						mu.Unlock()
+					parsed, err := time.Parse(time.RFC3339Nano, ts)
+					if err != nil {
+						return fmt.Errorf("s3: parse timestamp metadata for %s: %w", key, err)
 					}
+					mu.Lock()
+					results[key] = parsed
+					mu.Unlock()
 				}
 			}
 			return nil
@@ -1723,7 +1724,74 @@ func (itr *fileIterator) Next() bool {
 		return false
 	}
 	if itr.bufferListing {
-		return itr.nextBuffered()
+		if err := itr.ctx.Err(); err != nil {
+			itr.err = err
+			return false
+		}
+		if !itr.bufferLoaded {
+			var items []fileIteratorItem
+			for itr.paginator.HasMorePages() {
+				page, err := itr.paginator.NextPage(itr.ctx)
+				if err != nil {
+					itr.err = err
+					return false
+				}
+				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "objects", len(page.Contents))
+				for _, obj := range page.Contents {
+					key := aws.ToString(obj.Key)
+					minTXID, maxTXID, err := ltx.ParseFilename(path.Base(key))
+					if err != nil || minTXID < itr.seek {
+						continue
+					}
+					items = append(items, fileIteratorItem{
+						key: key,
+						info: &ltx.FileInfo{
+							Level:     itr.level,
+							MinTXID:   minTXID,
+							MaxTXID:   maxTXID,
+							Size:      aws.ToInt64(obj.Size),
+							CreatedAt: aws.ToTime(obj.LastModified).UTC(),
+						},
+					})
+				}
+			}
+			slices.SortFunc(items, func(a, b fileIteratorItem) int {
+				if v := cmp.Compare(a.info.MinTXID, b.info.MinTXID); v != 0 {
+					return v
+				}
+				return cmp.Compare(a.info.MaxTXID, b.info.MaxTXID)
+			})
+			itr.buffer = items
+			itr.bufferLoaded = true
+		}
+		if itr.bufferIndex >= len(itr.buffer) {
+			return false
+		}
+
+		if itr.useMetadata && itr.bufferIndex%MaxKeys == 0 {
+			batch := itr.buffer[itr.bufferIndex:min(itr.bufferIndex+MaxKeys, len(itr.buffer))]
+			keys := make([]string, len(batch))
+			for i := range batch {
+				keys[i] = batch[i].key
+			}
+			if err := itr.fetchMetadataBatch(keys); err != nil {
+				itr.err = err
+				return false
+			}
+			for _, item := range batch {
+				if ts, ok := itr.metadataCache[item.key]; ok {
+					item.info.CreatedAt = ts
+				}
+			}
+			clear(itr.metadataCache)
+		}
+		if err := itr.ctx.Err(); err != nil {
+			itr.err = err
+			return false
+		}
+		itr.info = itr.buffer[itr.bufferIndex].info
+		itr.bufferIndex++
+		return true
 	}
 
 	// Process objects until we find a valid LTX file
@@ -1751,13 +1819,15 @@ func (itr *fileIterator) Next() bool {
 				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "keys", keys)
 			}
 
-			// Batch fetch metadata for the entire page when useMetadata is true.
-			// This uses parallel HeadObject calls controlled by MetadataConcurrency
-			// to avoid the O(N) sequential calls that caused restore hangs (issue #930).
 			if itr.useMetadata && len(itr.page.Contents) > 0 {
 				keys := make([]string, 0, len(itr.page.Contents))
 				for _, obj := range itr.page.Contents {
-					keys = append(keys, aws.ToString(obj.Key))
+					key := aws.ToString(obj.Key)
+					minTXID, _, err := ltx.ParseFilename(path.Base(key))
+					if err != nil || minTXID < itr.seek {
+						continue
+					}
+					keys = append(keys, key)
 				}
 				if err := itr.fetchMetadataBatch(keys); err != nil {
 					itr.err = err
@@ -1815,88 +1885,6 @@ func (itr *fileIterator) Next() bool {
 			return true
 		}
 	}
-}
-
-// loadBuffer reads every page before exposing any files. Sorting individual
-// pages cannot handle an earlier TXID appearing on a later page.
-func (itr *fileIterator) loadBuffer() error {
-	var items []fileIteratorItem
-	for itr.paginator.HasMorePages() {
-		page, err := itr.paginator.NextPage(itr.ctx)
-		if err != nil {
-			return err
-		}
-		itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "objects", len(page.Contents))
-		for _, obj := range page.Contents {
-			key := aws.ToString(obj.Key)
-			minTXID, maxTXID, err := ltx.ParseFilename(path.Base(key))
-			if err != nil || minTXID < itr.seek {
-				continue
-			}
-			items = append(items, fileIteratorItem{
-				key: key,
-				info: &ltx.FileInfo{
-					Level:     itr.level,
-					MinTXID:   minTXID,
-					MaxTXID:   maxTXID,
-					Size:      aws.ToInt64(obj.Size),
-					CreatedAt: aws.ToTime(obj.LastModified).UTC(),
-				},
-			})
-		}
-	}
-	slices.SortFunc(items, func(a, b fileIteratorItem) int {
-		if v := cmp.Compare(a.info.MinTXID, b.info.MinTXID); v != 0 {
-			return v
-		}
-		return cmp.Compare(a.info.MaxTXID, b.info.MaxTXID)
-	})
-	itr.buffer = items
-	itr.bufferLoaded = true
-	return nil
-}
-
-func (itr *fileIterator) nextBuffered() bool {
-	if err := itr.ctx.Err(); err != nil {
-		itr.err = err
-		return false
-	}
-	if !itr.bufferLoaded {
-		if err := itr.loadBuffer(); err != nil {
-			itr.err = err
-			return false
-		}
-	}
-	if itr.bufferIndex >= len(itr.buffer) {
-		return false
-	}
-
-	// Sorting only needs LIST metadata. Fetch original timestamps on demand in
-	// batches no larger than an S3 listing page, after invalid/old keys are filtered.
-	if itr.useMetadata && itr.bufferIndex%MaxKeys == 0 {
-		batch := itr.buffer[itr.bufferIndex:min(itr.bufferIndex+MaxKeys, len(itr.buffer))]
-		keys := make([]string, len(batch))
-		for i := range batch {
-			keys[i] = batch[i].key
-		}
-		if err := itr.fetchMetadataBatch(keys); err != nil {
-			itr.err = err
-			return false
-		}
-		for _, item := range batch {
-			if ts, ok := itr.metadataCache[item.key]; ok {
-				item.info.CreatedAt = ts
-			}
-		}
-		clear(itr.metadataCache)
-	}
-	if err := itr.ctx.Err(); err != nil {
-		itr.err = err
-		return false
-	}
-	itr.info = itr.buffer[itr.bufferIndex].info
-	itr.bufferIndex++
-	return true
 }
 
 // Item returns the metadata for the current file.
