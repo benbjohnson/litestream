@@ -403,15 +403,16 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// See: https://github.com/benbjohnson/litestream/issues/992
 	httpClient.Transport = &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
-		DialContext: (&net.Dialer{
+		DialContext: withWriteTimeout((&net.Dialer{
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
-		}).DialContext,
+		}).DialContext),
 		ForceAttemptHTTP2:     true,
 		MaxIdleConns:          100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
 	}
 
 	// Configure TLS to skip verification if requested
