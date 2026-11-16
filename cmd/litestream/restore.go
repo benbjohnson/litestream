@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"text/tabwriter"
 	"time"
 
@@ -135,13 +136,7 @@ func (c *RestoreCommand) Run(ctx context.Context, args []string) (err error) {
 		return nil
 	}
 
-	if !opt.Follow {
-		if err := c.prepareOutputPath(opt.OutputPath, *force); err != nil {
-			return err
-		}
-	}
-
-	result, err := c.restore(ctx, r, opt, *integrityCheck)
+	result, err := c.restoreToOutput(ctx, r, opt, *integrityCheck, *force)
 	if errors.Is(err, litestream.ErrTxNotAvailable) {
 		if *ifReplicaExists {
 			slog.Info("no matching backups found")
@@ -263,39 +258,102 @@ func (c *RestoreCommand) restore(ctx context.Context, r *litestream.Replica, opt
 	return result, nil
 }
 
-func (c *RestoreCommand) prepareOutputPath(path string, force bool) error {
-	var removePaths []string
+func (c *RestoreCommand) restoreToOutput(ctx context.Context, r *litestream.Replica, opt litestream.RestoreOptions, integrityCheck string, force bool) (_ RestoreResult, err error) {
+	if opt.Follow {
+		return c.restore(ctx, r, opt, integrityCheck)
+	}
+	path := opt.OutputPath
+	exists, sidecars, err := checkRestoreOutput(path, force)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if !exists && len(sidecars) == 0 {
+		return c.restore(ctx, r, opt, integrityCheck)
+	}
+
+	// Stage beside the destination so the completed database can replace it by rename.
+	parent := filepath.Dir(path)
+	dir, err := os.MkdirTemp(parent, ".litestream-restore-*")
+	if err != nil {
+		return RestoreResult{}, fmt.Errorf("create restore staging directory: %w", err)
+	}
+	var movedSidecars []string
+	published := false
+	defer func() {
+		keepStaging := false
+		if !published {
+			for _, sidecar := range movedSidecars {
+				saved := filepath.Join(dir, "previous"+sidecar[len(path):])
+				if rollbackErr := os.Rename(saved, sidecar); rollbackErr != nil {
+					err = errors.Join(err, fmt.Errorf("put back original SQLite sidecar %q: %w", saved, rollbackErr))
+					keepStaging = true
+				}
+			}
+		}
+		if !keepStaging {
+			if cleanupErr := os.RemoveAll(dir); cleanupErr != nil {
+				err = errors.Join(err, fmt.Errorf("remove restore staging directory: %w", cleanupErr))
+			}
+		}
+	}()
+
+	opt.OutputPath = filepath.Join(dir, "restored.db")
+	result, err := c.restore(ctx, r, opt, integrityCheck)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return RestoreResult{}, err
+	}
+	// Recheck the destination after the download and integrity check.
+	_, sidecars, err = checkRestoreOutput(path, force)
+	if err != nil {
+		return RestoreResult{}, err
+	}
+	for _, sidecar := range sidecars {
+		if err := os.Rename(sidecar, filepath.Join(dir, "previous"+sidecar[len(path):])); err != nil {
+			return RestoreResult{}, fmt.Errorf("move existing SQLite sidecar: %w", err)
+		}
+		movedSidecars = append(movedSidecars, sidecar)
+	}
+	if err := os.Rename(opt.OutputPath, path); err != nil {
+		return RestoreResult{}, fmt.Errorf("replace restore output: %w", err)
+	}
+	published = true
+	if err := internal.FsyncDir(parent); err != nil {
+		return RestoreResult{}, fmt.Errorf("sync restore output dir: %w", err)
+	}
+	result.DBPath = path
+	return result, nil
+}
+
+func checkRestoreOutput(path string, force bool) (exists bool, sidecars []string, err error) {
 	info, err := os.Stat(path)
 	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("cannot access output path: %w", err)
+		return false, nil, fmt.Errorf("cannot access output path: %w", err)
 	}
 	if info != nil {
 		if info.IsDir() {
-			return fmt.Errorf("cannot restore, output path is a directory: %s", path)
+			return false, nil, fmt.Errorf("cannot restore, output path is a directory: %s", path)
 		}
 		if info.Size() > 0 && !force {
-			return fmt.Errorf("cannot restore, output path already exists and is not empty: %s. Use -force to overwrite", path)
+			return false, nil, fmt.Errorf("cannot restore, output path already exists and is not empty: %s. Use -force to overwrite", path)
 		}
-		removePaths = append(removePaths, path)
 	}
 
 	for _, sidecarPath := range []string{path + "-wal", path + "-shm", path + "-journal"} {
-		if _, err := os.Lstat(sidecarPath); os.IsNotExist(err) {
+		if info, err := os.Lstat(sidecarPath); os.IsNotExist(err) {
 			continue
 		} else if err != nil {
-			return fmt.Errorf("cannot access SQLite sidecar path: %w", err)
+			return false, nil, fmt.Errorf("cannot access SQLite sidecar path: %w", err)
+		} else if info.IsDir() {
+			return false, nil, fmt.Errorf("cannot restore, SQLite sidecar path is a directory: %s", sidecarPath)
 		} else if !force {
-			return fmt.Errorf("cannot restore, SQLite sidecar path already exists: %s. Use -force to overwrite", sidecarPath)
+			return false, nil, fmt.Errorf("cannot restore, SQLite sidecar path already exists: %s. Use -force to overwrite", sidecarPath)
 		}
-		removePaths = append(removePaths, sidecarPath)
+		sidecars = append(sidecars, sidecarPath)
 	}
-
-	for _, removePath := range removePaths {
-		if err := os.Remove(removePath); err != nil && !os.IsNotExist(err) {
-			return fmt.Errorf("remove existing output path: %w", err)
-		}
-	}
-	return nil
+	return info != nil, sidecars, nil
 }
 
 // loadFromURL creates a replica & updates the restore options from a replica URL.
@@ -402,7 +460,8 @@ Arguments:
 	    Print the restore plan and exit without writing a database.
 
 	-force
-	    Overwrite an existing output database and SQLite sidecar files.
+	    Replace an existing output database and clear its SQLite sidecar files
+	    after restoring and running any requested integrity check.
 	    Required to remove sidecar files even when the output database is absent.
 
 	-json
