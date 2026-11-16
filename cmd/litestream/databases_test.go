@@ -22,6 +22,47 @@ func TestDatabasesCommand_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("DirectoryConfig", func(t *testing.T) {
+		dir := t.TempDir()
+		dataDir := filepath.Join(dir, "data")
+		dbPath0 := filepath.Join(dataDir, "a.db")
+		dbPath1 := filepath.Join(dataDir, "sub", "b.db")
+		createSQLiteDB(t, dbPath0)
+		createSQLiteDB(t, dbPath1)
+
+		configPath := filepath.Join(dir, "litestream.yml")
+		config := `dbs:
+  - dir: ` + dataDir + `
+    pattern: "*.db"
+    recursive: true
+    replica:
+      url: file://` + filepath.Join(dir, "replica") + `
+`
+		if err := os.WriteFile(configPath, []byte(config), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		output := captureStdout(t, func() {
+			cmd := &main.DatabasesCommand{}
+			if err := cmd.Run(context.Background(), []string{"-config", configPath, "-json"}); err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+
+		var got []struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal([]byte(output), &got); err != nil {
+			t.Fatalf("failed to parse output: %v\n%s", err, output)
+		}
+		if len(got) != 2 {
+			t.Fatalf("expected 2 database rows, got %d: %s", len(got), output)
+		}
+		if got[0].Path != dbPath0 || got[1].Path != dbPath1 {
+			t.Fatalf("unexpected database paths: %s", output)
+		}
+	})
+
 	t.Run("JSONOutput", func(t *testing.T) {
 		dir := t.TempDir()
 		dbPath := filepath.Join(dir, "test.db")
