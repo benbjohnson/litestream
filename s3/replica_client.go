@@ -108,6 +108,11 @@ type ReplicaClient struct {
 	PutObjectContentMD5 bool
 	StorageClass        string
 
+	// SortListings buffers and sorts custom-endpoint listings. Defaults to true.
+	// Disable only if the provider guarantees ordered listings. Directory buckets
+	// require true; ordinary AWS general-purpose buckets always stream.
+	SortListings bool
+
 	// Upload configuration
 	PartSize    int64 // Part size for multipart uploads (default: 5MB)
 	Concurrency int   // Number of concurrent parts to upload (default: 5)
@@ -135,6 +140,7 @@ func NewReplicaClient() *ReplicaClient {
 		RequireContentMD5:  true,
 		SignPayload:        true,
 		SignAcceptEncoding: true,
+		SortListings:       true,
 	}
 }
 
@@ -209,6 +215,9 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 	if v, ok := litestream.BoolQueryValue(query, "putObjectContentMD5", "put-object-content-md5"); ok {
 		client.PutObjectContentMD5 = v
+	}
+	if v, ok := litestream.BoolQueryValue(query, "sortListings", "sort-listings"); ok {
+		client.SortListings = v
 	}
 	if v, ok, err := litestream.IntQueryValue(query, "concurrency"); err != nil {
 		return nil, err
@@ -374,16 +383,32 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return fmt.Errorf("s3: bucket name is required")
 	}
 
+	directoryBucket := strings.HasSuffix(c.Bucket, "--x-s3")
+	if directoryBucket {
+		switch {
+		case !c.SortListings:
+			return fmt.Errorf("s3: directory buckets require sort-listings because listing order is not guaranteed")
+		case c.ForcePathStyle:
+			return fmt.Errorf("s3: directory buckets require virtual-hosted addressing; force-path-style is not supported")
+		case c.SSECustomerKey != "":
+			return fmt.Errorf("s3: directory buckets do not support sse-customer-key (SSE-C)")
+		case c.PutObjectContentMD5:
+			return fmt.Errorf("s3: directory buckets do not support put-object-content-md5")
+		case c.StorageClass != "" && c.StorageClass != string(types.StorageClassExpressOnezone):
+			return fmt.Errorf("s3: directory buckets require storage-class EXPRESS_ONEZONE or the default, got %q", c.StorageClass)
+		}
+	}
+
 	// Validate SSE configuration
 	if err := c.validateSSEConfig(); err != nil {
 		return err
 	}
 
-	// Look up region if not specified and no endpoint is used.
-	// Endpoints are typically used for non-S3 object stores and do not
-	// necessarily require a region.
+	// Directory buckets do not support GetBucketLocation. Leave an unspecified
+	// directory region to the SDK's default sources when loading config below.
+	// Preserve standard AWS discovery and the custom-provider default region.
 	region := c.Region
-	if region == "" {
+	if region == "" && !directoryBucket {
 		if c.Endpoint == "" {
 			if region, err = c.findBucketRegion(ctx, c.Bucket); err != nil {
 				return fmt.Errorf("s3: cannot lookup bucket region: %w", err)
@@ -455,6 +480,9 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	cfg, err := config.LoadDefaultConfig(ctx, configOpts...)
 	if err != nil {
 		return fmt.Errorf("s3: cannot load aws config: %w", err)
+	}
+	if directoryBucket && cfg.Region == "" {
+		return fmt.Errorf("s3: directory bucket region is required; set region, AWS_REGION, AWS_DEFAULT_REGION, or a shared AWS config region")
 	}
 
 	// Create S3 client options
@@ -676,6 +704,9 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 // This uses parallel batched requests (controlled by MetadataConcurrency) to avoid hangs
 // with large backup histories (see issue #930).
 // When false, uses fast LastModified timestamps from LIST operation.
+// Custom-endpoint listings buffer and sort by default; disabling SortListings
+// trusts the provider's ordering and streams instead. Directory buckets always
+// buffer and sort; standard AWS general-purpose bucket listings always stream.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
 	if err := c.Init(ctx); err != nil {
 		return nil, err
@@ -1564,9 +1595,20 @@ type fileIterator struct {
 	page      *s3.ListObjectsV2Output
 	pageIndex int
 
+	// Directory buckets and custom endpoints may not list keys in filename order.
+	bufferListing bool
+	bufferLoaded  bool
+	buffer        []fileIteratorItem
+	bufferIndex   int
+
 	closed bool
 	err    error
 	info   *ltx.FileInfo
+}
+
+type fileIteratorItem struct {
+	key  string
+	info *ltx.FileInfo
 }
 
 func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
@@ -1582,6 +1624,7 @@ func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek
 		prefix:        prefix,
 		useMetadata:   useMetadata,
 		metadataCache: make(map[string]time.Time),
+		bufferListing: strings.HasSuffix(client.Bucket, "--x-s3") || (aws.ToString(client.s3.Options().BaseEndpoint) != "" && client.SortListings),
 	}
 
 	// Create paginator for listing objects with level prefix
@@ -1638,17 +1681,18 @@ func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
 
 			head, err := itr.client.s3.HeadObject(ctx, headInput)
 			if err != nil {
-				// Non-fatal: file might not have metadata, use LastModified
-				return nil
+				return fmt.Errorf("s3: read timestamp metadata for %s: %w", key, err)
 			}
 
 			if head.Metadata != nil {
 				if ts, ok := head.Metadata[MetadataKeyTimestamp]; ok {
-					if parsed, err := time.Parse(time.RFC3339Nano, ts); err == nil {
-						mu.Lock()
-						results[key] = parsed
-						mu.Unlock()
+					parsed, err := time.Parse(time.RFC3339Nano, ts)
+					if err != nil {
+						return fmt.Errorf("s3: parse timestamp metadata for %s: %w", key, err)
 					}
+					mu.Lock()
+					results[key] = parsed
+					mu.Unlock()
 				}
 			}
 			return nil
@@ -1670,6 +1714,7 @@ func (itr *fileIterator) fetchMetadataBatch(keys []string) error {
 func (itr *fileIterator) Close() (err error) {
 	itr.closed = true
 	itr.cancel()
+	itr.buffer = nil
 	return itr.err
 }
 
@@ -1677,6 +1722,76 @@ func (itr *fileIterator) Close() (err error) {
 func (itr *fileIterator) Next() bool {
 	if itr.closed || itr.err != nil {
 		return false
+	}
+	if itr.bufferListing {
+		if err := itr.ctx.Err(); err != nil {
+			itr.err = err
+			return false
+		}
+		if !itr.bufferLoaded {
+			var items []fileIteratorItem
+			for itr.paginator.HasMorePages() {
+				page, err := itr.paginator.NextPage(itr.ctx)
+				if err != nil {
+					itr.err = err
+					return false
+				}
+				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "objects", len(page.Contents))
+				for _, obj := range page.Contents {
+					key := aws.ToString(obj.Key)
+					minTXID, maxTXID, err := ltx.ParseFilename(path.Base(key))
+					if err != nil || minTXID < itr.seek {
+						continue
+					}
+					items = append(items, fileIteratorItem{
+						key: key,
+						info: &ltx.FileInfo{
+							Level:     itr.level,
+							MinTXID:   minTXID,
+							MaxTXID:   maxTXID,
+							Size:      aws.ToInt64(obj.Size),
+							CreatedAt: aws.ToTime(obj.LastModified).UTC(),
+						},
+					})
+				}
+			}
+			slices.SortFunc(items, func(a, b fileIteratorItem) int {
+				if v := cmp.Compare(a.info.MinTXID, b.info.MinTXID); v != 0 {
+					return v
+				}
+				return cmp.Compare(a.info.MaxTXID, b.info.MaxTXID)
+			})
+			itr.buffer = items
+			itr.bufferLoaded = true
+		}
+		if itr.bufferIndex >= len(itr.buffer) {
+			return false
+		}
+
+		if itr.useMetadata && itr.bufferIndex%MaxKeys == 0 {
+			batch := itr.buffer[itr.bufferIndex:min(itr.bufferIndex+MaxKeys, len(itr.buffer))]
+			keys := make([]string, len(batch))
+			for i := range batch {
+				keys[i] = batch[i].key
+			}
+			if err := itr.fetchMetadataBatch(keys); err != nil {
+				itr.err = err
+				return false
+			}
+			for _, item := range batch {
+				if ts, ok := itr.metadataCache[item.key]; ok {
+					item.info.CreatedAt = ts
+				}
+			}
+			clear(itr.metadataCache)
+		}
+		if err := itr.ctx.Err(); err != nil {
+			itr.err = err
+			return false
+		}
+		itr.info = itr.buffer[itr.bufferIndex].info
+		itr.bufferIndex++
+		return true
 	}
 
 	// Process objects until we find a valid LTX file
@@ -1704,13 +1819,15 @@ func (itr *fileIterator) Next() bool {
 				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "keys", keys)
 			}
 
-			// Batch fetch metadata for the entire page when useMetadata is true.
-			// This uses parallel HeadObject calls controlled by MetadataConcurrency
-			// to avoid the O(N) sequential calls that caused restore hangs (issue #930).
 			if itr.useMetadata && len(itr.page.Contents) > 0 {
 				keys := make([]string, 0, len(itr.page.Contents))
 				for _, obj := range itr.page.Contents {
-					keys = append(keys, aws.ToString(obj.Key))
+					key := aws.ToString(obj.Key)
+					minTXID, _, err := ltx.ParseFilename(path.Base(key))
+					if err != nil || minTXID < itr.seek {
+						continue
+					}
+					keys = append(keys, key)
 				}
 				if err := itr.fetchMetadataBatch(keys); err != nil {
 					itr.err = err
