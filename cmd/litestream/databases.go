@@ -32,15 +32,17 @@ func (c *DatabasesCommand) Run(_ context.Context, args []string) (err error) {
 
 	databases := make([]DatabaseInfo, 0, len(config.DBs))
 	for _, dbConfig := range config.DBs {
-		db, err := NewDBFromConfig(dbConfig)
+		dbs, err := newDBsFromConfig(dbConfig)
 		if err != nil {
 			return err
 		}
 
-		databases = append(databases, DatabaseInfo{
-			Path:    db.Path(),
-			Replica: db.Replica.Client.Type(),
-		})
+		for _, db := range dbs {
+			databases = append(databases, DatabaseInfo{
+				Path:    db.Path(),
+				Replica: db.Replica.Client.Type(),
+			})
+		}
 	}
 
 	if *jsonOutput {

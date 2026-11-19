@@ -847,6 +847,19 @@ func NewDBFromConfig(dbc *DBConfig) (*litestream.DB, error) {
 	return db, nil
 }
 
+// newDBsFromConfig instantiates the databases for a configuration entry. A
+// directory entry expands to every database found in the directory.
+func newDBsFromConfig(dbc *DBConfig) ([]*litestream.DB, error) {
+	if dbc.Dir != "" {
+		return NewDBsFromDirectoryConfig(dbc)
+	}
+	db, err := NewDBFromConfig(dbc)
+	if err != nil {
+		return nil, err
+	}
+	return []*litestream.DB{db}, nil
+}
+
 // NewDBsFromDirectoryConfig scans a directory and creates DB instances for all SQLite databases found.
 func NewDBsFromDirectoryConfig(dbc *DBConfig) ([]*litestream.DB, error) {
 	if dbc.Dir == "" {
