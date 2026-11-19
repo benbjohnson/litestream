@@ -14,7 +14,7 @@ such as `already_registered`, `already_running`, `already_stopped`, or
 
 ## `litestream databases -json`
 
-Outputs an array of databases loaded from the configuration file.
+Outputs an array of databases loaded from the selected configuration source.
 
 ```json
 [

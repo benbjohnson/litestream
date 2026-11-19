@@ -48,7 +48,7 @@ func (c *ResetCommand) Run(ctx context.Context, args []string) (err error) {
 	resolvedConfigPath, explicitConfig := resolveConfigPath(*configPath)
 
 	var dbConfig *DBConfig
-	config, configErr := ReadConfigFile(resolvedConfigPath, !*noExpandEnv)
+	config, configErr := ReadConfig(resolvedConfigPath, !*noExpandEnv)
 	if configErr != nil && (explicitConfig || !errors.Is(configErr, ErrConfigFileNotFound)) {
 		return fmt.Errorf("cannot read config: %w", configErr)
 	}
@@ -164,7 +164,7 @@ Usage:
 Arguments:
 
 	-config PATH
-	    Specifies the configuration file.
+	    Specifies the configuration file. Use "-" to read from standard input.
 	    Defaults to %s
 
 	-no-expand-env
@@ -183,6 +183,9 @@ Examples:
 
 	# Reset using a specific configuration file
 	litestream reset -config /etc/litestream.yml /path/to/database.db
+
+	# Reset using configuration from standard input
+	cat /etc/litestream.yml | litestream reset -config - /path/to/database.db
 
 `[1:],
 		DefaultConfigPath(),
