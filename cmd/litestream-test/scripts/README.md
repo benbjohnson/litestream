@@ -13,7 +13,7 @@ go build -o bin/litestream-test ./cmd/litestream-test
 
 ## Quick Reference
 
-> **Note:** Some tests have been migrated to Go integration tests in `tests/integration/`. See [tests/integration/README.md](../../tests/integration/README.md) for the Go-based test suite.
+> **Note:** Some tests have been migrated to Go integration tests in `tests/integration/`. See [tests/integration/README.md](../../../tests/integration/README.md) for the Go-based test suite.
 
 | Script | Purpose | Duration | Status |
 |--------|---------|----------|--------|
