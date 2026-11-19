@@ -563,3 +563,40 @@ This understanding is essential for:
 - Implementing new features
 - Optimizing performance
 - Handling edge cases correctly
+
+## WAL reset continuity and file retention
+
+Litestream takes a full main-database-plus-WAL snapshot when a reset cannot be
+proven to preserve every change since the last synced position. A retained frame
+from an older WAL generation, or an earlier sync reaching EOF, does not prove
+continuity: intermediate generations may have been checkpointed and overwritten.
+Reset snapshots hold a writer barrier while copying pages and publishing the LTX.
+This can block application writes and increase I/O for large databases.
+
+A controlled PASSIVE checkpoint can stay incremental when its writer barrier
+seals all committed frames and SQLite reports every sealed frame backfilled. The
+proof is local to that checkpoint and tied to the reader acquired immediately
+afterward. A reader on read mark zero permits the first WAL restart but prevents
+further backfill while it remains held. That allows an application write to
+replace the old frames without requiring a snapshot. Reader replacement, unknown
+generations, and process restarts invalidate this optimization. A separate,
+conservative sealed-frame proof checks retained source frames and their tail.
+
+Every Litestream pooled connection sets PERSIST_WAL. Startup attaches locally
+before returning from Open, and snapshots/compaction wait for successful startup
+sync. Failure to attach to an existing local database is returned to the caller;
+a database that does not exist yet remains eligible for later initialization.
+
+Litestream temporarily sets journal_size_limit on the connection performing its
+sequence write to the byte equivalent of truncate-page-n (including WAL headers).
+This lets a successful PASSIVE restart reclaim an oversized physical WAL without
+a blocking TRUNCATE and boundary snapshot. A negative truncate-page-n disables
+this limit; zero uses the default truncate threshold. The setting bounds retained
+space at Litestream's restart, not active WAL growth or restarts performed by an
+application connection with a different policy.
+
+The sequence connection restores journal_size_limit=-1 before returning to the
+pool, even when the write fails or its caller is canceled. This is necessary for
+clean restart behavior: SQLite truncates a persistent WAL to zero on last close
+when that connection has any nonnegative journal_size_limit. Application limits
+are connection-local and are never assumed to configure Litestream's connections.

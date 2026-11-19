@@ -787,6 +787,10 @@ func (s *Store) allDatabasesHealthy(since time.Time) bool {
 // CompactDB performs a compaction or snapshot for a given database on a single destination level.
 // This function will only proceed if a compaction has not occurred before the last compaction time.
 func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*ltx.FileInfo, error) {
+	if err := db.checkStartupReady(); err != nil {
+		return nil, err
+	}
+
 	// Skip if database is not yet initialized (page size unknown).
 	if db.PageSize() == 0 {
 		return nil, &DBNotReadyError{Reason: "page size not initialized"}
@@ -808,6 +812,9 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 		pos, err := db.Pos()
 		if err != nil {
 			return nil, fmt.Errorf("fetch db position: %w", err)
+		}
+		if pos.TXID == 0 {
+			return nil, &DBNotReadyError{Reason: "no transaction synced yet"}
 		}
 		if dstInfo.MaxTXID != 0 && dstInfo.MaxTXID >= pos.TXID {
 			return nil, ErrNoCompaction
