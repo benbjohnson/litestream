@@ -1,75 +1,17 @@
-Validate a ReplicaClient implementation in Litestream. This command helps ensure a replica client correctly implements the interface and handles edge cases.
+---
+description: Check a Litestream replica client against its storage contract.
+---
 
-First, identify what needs validation:
-- Which replica client implementation?
-- What storage backend specifics?
-- Any known issues or concerns?
+Read the `ReplicaClient` interface in `replica_client.go` and the [replica client guide](../../docs/REPLICA_CLIENT_GUIDE.md). Use the shared cases in `replica_client_test.go` and backend-specific cases for the implementation.
 
-Then validate the implementation:
+- Verify idempotent initialization, TXID seek, stable listing order, and iterator error and close handling.
+- Verify full, offset-only, and bounded reads. Close returned readers and check read errors. For a missing file, check `errors.Is(err, os.ErrNotExist)`.
+- Verify a known LTX header timestamp survives upload and metadata-enabled listing. When metadata is disabled, check the backend's fast listing path.
+- Exercise write failure and cancellation without leaving a partial committed object. Verify cleanup behavior, concurrency, and context cancellation on a disposable replica. Keep `DeleteAll` scoped to its configured prefix.
 
-1. **Interface compliance check**:
-
-   ```go
-   // Ensure all methods are implemented
-   var _ litestream.ReplicaClient = (*YourClient)(nil)
-   ```
-
-1. **Verify error types**:
-
-   ```go
-   // OpenLTXFile must return os.ErrNotExist for missing files
-   _, err := client.OpenLTXFile(ctx, 0, 999, 999, 0, 0)
-   if !errors.Is(err, os.ErrNotExist) {
-       t.Errorf("Expected os.ErrNotExist, got %v", err)
-   }
-   ```
-
-1. **Test partial reads**:
-
-   ```go
-   // Must support offset and size parameters
-   rc, err := client.OpenLTXFile(ctx, 0, 1, 100, 50, 25)
-   data, _ := io.ReadAll(rc)
-   if len(data) != 25 {
-       t.Errorf("Expected 25 bytes, got %d", len(data))
-   }
-   ```
-
-1. **Verify timestamp preservation**:
-
-   ```go
-   // CreatedAt should reflect remote object metadata (or upload time)
-   start := time.Now()
-   info, _ := client.WriteLTXFile(ctx, 0, 1, 100, reader)
-   if info.CreatedAt.IsZero() || info.CreatedAt.Before(start.Add(-time.Second)) {
-       t.Error("unexpected CreatedAt timestamp")
-   }
-   ```
-
-1. **Test eventual consistency handling**:
-   - Implement retry logic for transient failures
-   - Handle partial file availability
-   - Verify write-after-write consistency
-
-1. **Validate cleanup**:
-
-   ```go
-   // DeleteAll must remove everything
-   err := client.DeleteAll(ctx)
-   files, _ := client.LTXFiles(ctx, 0, 0, false)
-   if files.Next() {
-       t.Error("Files remain after DeleteAll")
-   }
-   ```
-
-Key validation points:
-- Proper error types (os.ErrNotExist, os.ErrPermission)
-- Context cancellation handling
-- Concurrent operation safety
-- Iterator doesn't load all files at once
-- Proper path construction for storage backend
-
-Run integration tests:
 ```bash
-go test -v ./replica_client_test.go -integration -replica-clients=[backend]
+go test -race -v ./file
+go test -v -run '^TestReplicaClient_' . -args -integration -replica-clients=file
 ```
+
+For another backend, select the corresponding package and registered test client. Configure the backend's test resources using `internal/testingutil/testingutil.go` and `.github/workflows/commit.yml`.

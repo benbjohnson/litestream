@@ -1,61 +1,11 @@
-Test Litestream compaction logic. This command helps test and debug compaction issues, especially with eventually consistent storage backends.
+---
+description: Test Litestream compaction, restore coverage, and failure handling.
+---
 
-First, understand the test scenario:
-- What storage backend needs testing?
-- What size database is involved?
-- Are there eventual consistency concerns?
+Identify the affected levels, restore target, backend, and failure mode. Use `store_test.go` for scheduling and the compaction entry point, `store_compaction_remote_test.go` for local preference, and `compactor_test.go` for interrupted remote streams and failed uploads. The compactor falls back to remote only when the local file is missing or a local opener is unavailable.
 
-Then create comprehensive tests:
-
-1. **Test basic compaction**:
-```go
-func TestCompaction_Basic(t *testing.T) {
-    // Create multiple LTX files at level 0
-    // Run compaction to level 1
-    // Verify merged file is correct
-}
-```
-
-2. **Test with eventual consistency**:
-```go
-func TestStore_CompactDB_RemotePartialRead(t *testing.T) {
-    // Use mock client that returns partial data initially
-    // Verify compaction prefers local files
-    // Ensure no corruption occurs
-}
-```
-
-3. **Test lock page handling during compaction**:
-```go
-func TestCompaction_LockPage(t *testing.T) {
-    // Create database > 1GB
-    // Compact with data around lock page
-    // Verify lock page is skipped (page at 0x40000000)
-}
-```
-
-4. **Test timestamp preservation**:
-```go
-func TestCompaction_PreserveTimestamps(t *testing.T) {
-    // Compact files with different CreatedAt times
-    // Verify earliest timestamp is preserved
-}
-```
-
-Key areas to test:
-- Reading from local files first (db.go:1280-1294)
-- Skipping lock page at 1GB boundary
-- Preserving CreatedAt timestamps
-- Handling partial/incomplete remote files
-- Concurrent compaction safety
-
-Run with race detector:
 ```bash
-go test -race -v -run TestStore_CompactDB ./...
+go test -race -v -run '^(TestStore_CompactDB(_RemotePartialRead)?|TestCompaction_PreservesLastTimestamp|TestCompactor_Compact(ClosesPipeOnWriteError|ResumesRemoteSourceAfterDisconnect|DoesNotReopenSourcesAfterClose)?)$' .
 ```
 
-Use the test harness for large databases:
-```bash
-./bin/litestream-test populate -db test.db -target-size 1.5GB
-./bin/litestream-test validate -source-db test.db -replica-url file:///tmp/replica
-```
+Assert that the output covers the expected TXIDs, retains the newest source header timestamp, skips the lock-byte page, and restores the expected database. For a failure regression, assert that retries and cleanup preserve the recoverable ranges. For page iteration, add the large-database cases in `tests/integration/boundary_test.go`. For core compaction changes, run the behavioral gate in [CONTRIBUTING.md](../../CONTRIBUTING.md).

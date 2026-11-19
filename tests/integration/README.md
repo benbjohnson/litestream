@@ -6,7 +6,7 @@ Go-based integration tests for Litestream. These tests replace the previous bash
 
 This package contains comprehensive integration tests organized by test type:
 
-- **scenario_test.go** - Core functionality scenarios (fresh start, integrity, deletion, failover)
+- **scenario_test.go** - Core functionality scenarios (fresh start, integrity, deletion)
 - **concurrent_test.go** - Concurrency and stress tests (rapid checkpoints, WAL growth, concurrent ops, busy timeout)
 - **quick_test.go** - Quick validation tests (30 minutes configurable)
 - **overnight_test.go** - Long-running stability tests (8+ hours)
@@ -53,18 +53,18 @@ go test -v -tags="integration,long" -timeout=10h ./tests/integration/... \
 
 ## Soak Tests
 
-Long-running soak tests live alongside the other integration tests and share the same helpers. They are excluded from CI by default and are intended for release validation or targeted debugging.
+Soak tests live alongside the other integration tests and share the same helpers. The PR workflow runs short LTX behavioral profiles; nightly CI runs longer behavioral profiles and selected file/MinIO soak tests. See [commit CI](../../.github/workflows/commit.yml) and [nightly stability CI](../../.github/workflows/nightly-stability.yml).
 
 ### Overview
 
 | Test | Tags | Defaults | Purpose | Extra Requirements |
 | --- | --- | --- | --- | --- |
 | `TestComprehensiveSoak` | `integration,soak` | 2h duration, 50 MB DB, 500 writes/s | File-backed end-to-end stress | Litestream binaries in `./bin` |
-| `TestMinIOSoak` | `integration,soak,docker` | 2h duration, 5 MB DB (short=2 m), 100 writes/s | S3-compatible replication via MinIO | Docker daemon, `docker` CLI |
+| `TestMinIOSoak` | `integration,soak,docker` | 2h duration, 50 MB DB, 500 writes/s (short: 2m, 5 MB, 100 writes/s) | S3-compatible replication via MinIO | Docker daemon, `docker` CLI |
 | `TestSoakReplicateRestore` | `integration,soak,docker` | 5m duration (short=1 m), 100 writes/s, restore every 30s | Issue #1164 repro: stop→restore→integrity_check cycles against MinIO | Docker daemon, `docker` CLI |
 | `TestOvernightS3Soak` | `integration,soak,aws` | 8h duration, 50 MB DB | Real S3 replication & restore | AWS credentials, `aws` CLI |
 
-All soak tests support `go test -test.short` to scale the default duration down to roughly two minutes for smoke verification.
+Short-mode durations differ by test: comprehensive and MinIO soaks use two minutes, replicate/restore uses one minute, and the AWS overnight soak uses ten minutes. Setup, final replication, and restore add runtime beyond the load duration.
 
 ### Environment Variables
 
@@ -140,7 +140,7 @@ Run abbreviated versions with `-short`:
 go test -v -tags=integration -short ./tests/integration/...
 ```
 
-This reduces test durations by 10x (e.g., 8 hours becomes 48 minutes).
+`-short` skips quick-validation, overnight, and boundary tests. Other tests either shorten their workload or use their own short-mode settings; it is not a uniform duration multiplier.
 
 ## Test Categories
 
@@ -185,7 +185,7 @@ Edge case and boundary condition tests:
 
 ### Automatic (Pull Requests)
 
-Quick tests run automatically on PRs modifying Go code:
+The integration workflow selects quick tests for relevant PR changes using [its path matcher](../../.github/scripts/integration-test-paths.js):
 
 ```yaml
 - Quick integration tests (TestFreshStart, TestDatabaseIntegrity, TestRapidCheckpoints)
@@ -251,7 +251,7 @@ Tests create temporary directories via `t.TempDir()`:
 └── *-restored.db      # Restored databases
 ```
 
-Artifacts are automatically cleaned up after tests complete.
+Artifacts are cleaned up after normal completion unless `SOAK_KEEP_TEMP` is set. Forced process termination can bypass cleanup.
 
 ## Debugging Tests
 
@@ -311,10 +311,10 @@ Three distinct test locations serve different purposes:
 ### Migration Status
 
 **Migrated from `scripts/` (5 scripts):**
-- `test-quick-validation.sh` → `quick_test.go::TestQuickValidation` (CI: ✅)
+- `test-quick-validation.sh` → `quick_test.go::TestQuickValidation` (manual all-scenarios workflow)
 - `test-overnight.sh` → `overnight_test.go::TestOvernightFile` (CI: ❌ too long)
-- `test-comprehensive.sh` → `comprehensive_soak_test.go::TestComprehensiveSoak` (CI: ❌ soak test)
-- `test-minio-s3.sh` → `minio_soak_test.go::TestMinIOSoak` (CI: ❌ soak test, requires Docker)
+- `test-comprehensive.sh` → `comprehensive_soak_test.go::TestComprehensiveSoak` (nightly CI)
+- `test-minio-s3.sh` → `minio_soak_test.go::TestMinIOSoak` (nightly CI, requires Docker)
 - `test-overnight-s3.sh` → `overnight_s3_soak_test.go::TestOvernightS3Soak` (CI: ❌ soak test, 8 hours)
 
 **Migrated from `cmd/litestream-test/scripts/` (9 scripts):**
@@ -342,16 +342,11 @@ _cmd/litestream-test/scripts/_ (16 scripts remaining):
 
 ### Why Some Tests Aren't in CI
 
-Per industry best practices, CI tests should complete in < 1 hour (ideally < 10 minutes):
-- ✅ **Quick tests** (< 5 min) - Run on every PR
-- ❌ **Soak tests** (2-8 hours) - Run locally before releases only
-- ❌ **Long-running tests** (> 30 min) - Too slow for CI feedback loop
-
-Soak tests are migrated to Go for maintainability but run **locally only**. See "Soak Tests" section below.
+PR CI uses focused checks and short behavioral profiles. Longer file and MinIO workloads run in nightly stability CI; real AWS soak runs require separately configured credentials. Use the workflow files for the current selectors, timeouts, and resource limits.
 
 ## Soak Tests (Long-Running Stability Tests)
 
-Soak tests run for 2-8 hours to validate long-term stability under sustained load. These tests are **NOT run in CI** per industry best practices (effective CI requires tests to complete in < 1 hour).
+Soak tests validate stability under sustained load. Run them locally for targeted debugging or use the configured nightly stability jobs.
 
 ### Purpose
 
@@ -404,7 +399,7 @@ go test -v -tags="integration,soak,docker,aws" -timeout=15h ./tests/integration/
 Tests respect the `-test.short` flag to run abbreviated versions:
 
 ```bash
-# Run comprehensive test for 30 minutes instead of 2 hours
+# Run comprehensive test with a two-minute load instead of two hours
 go test -v -tags="integration,soak" -timeout=1h -run=TestComprehensiveSoak ./tests/integration/ -test.short
 ```
 
@@ -472,5 +467,5 @@ When adding new integration tests:
 ## Related Documentation
 
 - [cmd/litestream-test README](../../cmd/litestream-test/README.md) - Testing harness CLI
-- [scripts/README.md](../../scripts/README.md) - Legacy bash test scripts
+- [scripts/README.md](../../scripts/README.md) - Analysis and packaging utilities
 - [GitHub Issue #798](https://github.com/benbjohnson/litestream/issues/798) - Migration tracking

@@ -11,7 +11,7 @@
 .claude/logs/
 .claude/hooks/
 .claude/settings.local.json
-# Keep CLAUDE.md ignored as it's auto-loaded by Claude Code
+# Project instructions belong in AGENTS.md; keep local Claude overrides untracked
 CLAUDE.md
 
 # Binary

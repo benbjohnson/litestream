@@ -1,57 +1,22 @@
-Analyze LTX file issues in Litestream. This command helps diagnose problems with LTX files, including corruption, missing files, and consistency issues.
+---
+description: Inspect Litestream LTX files and investigate missing ranges or corruption.
+---
 
-First, understand the context:
-- What error messages are being reported?
-- Which storage backend is being used?
-- Are there any eventual consistency issues?
+Record the database path, replica, Litestream version, target TXID or timestamp, and exact error. Use listings to compare available ranges with the restore target and distinguish files missing from the replica from files missing in the local metadata directory.
 
-Then perform the analysis:
-
-1. **Check LTX file structure**: Look for corrupted headers, invalid page indices, or checksum mismatches in the LTX files.
-
-2. **Verify file continuity**: Ensure there are no gaps in the TXID sequence that could prevent restoration.
-
-3. **Check compaction issues**: Look for problems during compaction that might corrupt files, especially with eventually consistent storage.
-
-4. **Analyze page sequences**: Verify that page numbers are sequential and the lock page at 1GB is properly skipped.
-
-5. **Review storage backend behavior**: Check if the storage backend has eventual consistency that might cause partial reads during compaction.
-
-Key files to examine:
-- `db.go`: WAL monitoring and LTX generation
-- `replica_client.go`: Storage interface
-- `store.go`: Compaction logic
-- Backend-specific client in `s3/`, `gs/`, etc.
-
-Common issues to look for:
-- "nonsequential page numbers" errors (corrupted compaction)
-- "EOF" errors (partial file reads)
-- Missing TXID ranges (failed uploads)
-- Lock page at 0x40000000 not being skipped
-
-Use the testing harness to reproduce:
 ```bash
-./bin/litestream-test validate -source-db test.db -replica-url [URL]
+litestream ltx -level all -json file:///path/to/replica
+litestream ltx -level all -json -config /path/to/litestream.yml /path/to/database.db
 ```
 
-## Recovery Options
+Both commands list replica metadata. For format or checksum errors, decode the affected file using the pinned LTX decoder. For a restore failure, check range coverage across available compaction levels, decode checksums, verify ascending page numbers while allowing gaps in incremental files, and check that page-copy loops exclude the lock-byte page. See [LTX format](../../docs/LTX_FORMAT.md), `compactor.go`, and the applicable replica client.
 
-When analysis reveals corrupted or missing LTX files, two recovery mechanisms are available:
+On a disposable fixture, build both binaries, then use the harness to restore and check a replica. Choose a fresh output path because the harness removes an existing file at `-restored-db`.
 
-**Manual recovery** with `litestream reset`:
 ```bash
-litestream reset /path/to/database.db
+go build -o bin/litestream ./cmd/litestream
+go build -o bin/litestream-test ./cmd/litestream-test
+PATH="$PWD/bin:$PATH" ./bin/litestream-test validate -source-db /path/to/source.db -replica-url file:///path/to/replica -restored-db /path/to/new-restored.db -check-type integrity
 ```
-Clears local LTX state from the metadata directory. The database file is not modified.
-Next sync creates a fresh snapshot. See `cmd/litestream/reset.go` for implementation.
 
-**Automatic recovery** with `auto-recover` config:
-```yaml
-dbs:
-  - path: /path/to/database.db
-    replicas:
-      - url: s3://bucket/path
-        auto-recover: true
-```
-When enabled, Litestream automatically resets local state when LTX errors are detected
-during sync. Disabled by default. See `replica.go` (auto-recover logic) for implementation.
+For local LTX damage, inspect the removals with `litestream reset -dry-run`. An authorized reset clears local LTX files and forces a fresh snapshot on the next sync. It does not repair missing or corrupted history in the replica. `auto-recover: true` under `dbs[].replica` enables automatic reset for eligible local LTX errors and is off by default. See `cmd/litestream/reset.go`, `replica.go`, and `LTXError.IsAutoRecoverable` in `litestream.go`.

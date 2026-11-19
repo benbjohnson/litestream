@@ -108,25 +108,25 @@ litestream-test validate [options]
 - `-replica-url` - Replica URL to validate (e.g., "file:///path", "s3://bucket/path")
 - `-restored-db` - Path for restored database (default: source-db + ".restored")
 - `-check-type` - Type of validation (default: "quick")
-  - `quick` - Fast row count comparison
+  - `quick` - SQLite `PRAGMA quick_check` on the restored database
   - `integrity` - SQLite PRAGMA integrity_check
   - `checksum` - Full database checksum comparison
   - `full` - All validation types
-- `-ltx-continuity` - Check LTX file continuity (default: false)
+- `-ltx-continuity` - Run the legacy LTX listing check (default: false); it counts output lines and does not validate TXID continuity
 - `-config` - Litestream config file path (alternative to replica-url)
 
 **Examples:**
 ```bash
 litestream-test validate -source-db /tmp/test.db -replica-url file:///tmp/replica
 litestream-test validate -source-db /tmp/test.db -replica-url s3://bucket/path -check-type full
-litestream-test validate -source-db /tmp/test.db -config /tmp/litestream.yml -ltx-continuity
+litestream-test validate -source-db /tmp/test.db -config /tmp/litestream.yml -check-type full
 ```
 
 **Use Cases:**
 - Verifying replication integrity after tests
 - Testing restore functionality
 - Validating data consistency across replicas
-- Checking LTX file continuity
+- Inspecting LTX listings; validate restore coverage separately
 
 ### version
 
@@ -135,6 +135,8 @@ Show version information.
 ```bash
 litestream-test version
 ```
+
+`populate` replaces its database path, and `validate` removes its restore destination before restoring. Use disposable paths. `validate` invokes `litestream` from `PATH`; stop writes and complete replication before comparing source and restored data. The `-ltx-continuity` check runs only with `-replica-url` and cannot establish a gap-free restore chain.
 
 ## Usage Patterns
 

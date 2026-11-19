@@ -115,7 +115,10 @@ defer store.Close(context.Background())
 dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(5000)&_pragma=journal_mode(wal)", "/path/to/db.sqlite")
 sqlDB, err := sql.Open("sqlite", dsn)
 if err != nil { ... }
+defer sqlDB.Close()
 ```
+
+The deferred application close runs before the deferred Store close. Use `Store.SetL0Retention` to propagate a retention setting to its databases.
 
 ## Restore Pattern
 
@@ -131,8 +134,9 @@ opt.OutputPath = "/path/to/restored.db"
 if err := replica.Restore(ctx, opt); err != nil {
     if errors.Is(err, litestream.ErrTxNotAvailable) || errors.Is(err, litestream.ErrNoSnapshots) {
         // No backup available, create fresh database
+    } else {
+        return err
     }
-    return err
 }
 ```
 
@@ -154,7 +158,7 @@ if err := replica.Restore(ctx, opt); err != nil {
 ```go
 store.SnapshotInterval  = 24 * time.Hour  // How often to create snapshots
 store.SnapshotRetention = 24 * time.Hour  // How long to keep snapshots
-store.L0Retention       = 5 * time.Minute // How long to keep L0 files after compaction
+store.SetL0Retention(5 * time.Minute)
 ```
 
 ### DB Settings

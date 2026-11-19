@@ -1,12 +1,15 @@
 # AGENTS.md - Litestream AI Agent Guide
 
-Litestream is a disaster recovery tool for SQLite that runs as a background process, monitors the WAL, converts changes to immutable LTX files, and replicates them to cloud storage. It uses `modernc.org/sqlite` (pure Go, no CGO required).
+Litestream is a disaster recovery tool for SQLite that runs as a background process, monitors the WAL, converts changes to immutable LTX files, and replicates them to cloud storage. The CLI and Go library use `modernc.org/sqlite` and can build without CGO. Race tests, `litestream-test`, and the tagged SQLite VFS tests require CGO and a C compiler.
+
+This file is the single source of project instructions for AI agents. `.cursorrules` and `.github/copilot-instructions.md` are links to it. Put rules here, not in a per-tool file.
 
 ## Before You Start
 
 1. Read [AI_PR_GUIDE.md](AI_PR_GUIDE.md) for contribution requirements
 2. Check [CONTRIBUTING.md](CONTRIBUTING.md) for what we accept (bug fixes welcome, features need discussion)
 3. Review recent PRs for current patterns
+4. For a manual PR, commit, or local review, ask your agent “Use litestream-review to review my changes.” If discovery is unavailable, open [.agents/skills/litestream-review/SKILL.md](.agents/skills/litestream-review/SKILL.md).
 
 ## Critical Rules
 

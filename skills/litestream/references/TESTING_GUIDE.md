@@ -1,188 +1,115 @@
-# Litestream Testing Reference
+# Litestream Testing Guide
 
-Condensed reference for agents writing and debugging Litestream tests.
+Mirrors `docs/TESTING_GUIDE.md` in the Litestream repository. Plain source paths are relative to the repository root; links between bundled guides stay relative to this directory. Update both copies together.
 
-## Testing Philosophy
+Use real SQLite databases and isolated replica directories. Give concurrency tests a way to observe progress, and use fixed seeds and timestamps when the assertions depend on them. Use the Go version in `go.mod`. Race detection, the `litestream-test` binary, and the tagged VFS package tests require CGO and a C compiler.
 
-1. Test at multiple levels: unit, integration, end-to-end
-2. Focus on edge cases: >1 GB databases, eventual consistency
-3. Use real SQLite: avoid mocking SQLite behavior
-4. Always run with `-race` flag
-5. Use fixed seeds and timestamps for deterministic tests
-
-## Essential Commands
+## Unit and race tests
 
 ```bash
-# Full test suite with race detection
+go test -v ./...
 go test -race -v ./...
-
-# Specific test areas
-go test -race -v -run TestReplica_Sync ./...
-go test -race -v -run TestDB_Sync ./...
-go test -race -v -run TestStore_CompactDB ./...
-
-# Coverage
-go test -coverprofile=coverage.out ./...
-go tool cover -html=coverage.out
-go tool cover -func=coverage.out | grep total
-
-# Integration tests (backend-specific)
-go test -v ./replica_client_test.go -integration -replica-clients=s3
-go test -v ./replica_client_test.go -integration -replica-clients=gs
+go test -race -count=1 -run '^(TestReplica_Sync|TestDB_Sync|TestStore_CompactDB)$' .
 ```
 
-## Lock Page Testing
-
-The lock page at 1 GB must be skipped. Test with databases spanning this
-boundary using multiple page sizes:
+Choose the assertions for the failure under review. The store sync test (`store_sync_test.go`) coordinates concurrent captures. Database tests (`db_internal_test.go`) cover checkpoints, WAL boundaries, cancellation, and snapshot consistency. Compactor tests (`compactor_test.go`) cover retention and partial remote reads. The VFS implementation and the SQLite integration have separate test entry points.
 
 ```bash
-./bin/litestream-test populate -db test.db -page-size 4096 -target-size 2GB
-./bin/litestream-test validate -source-db test.db -replica-url file:///tmp/replica
+go test -tags vfs -race -count=1 .
+CGO_ENABLED=1 go test -tags vfs -v ./cmd/litestream-vfs
 ```
 
-Test all page size variants:
+The first VFS command matches the race job in the commit workflow (`.github/workflows/commit.yml`). Some tests in the second command exercise the loadable extension and need the tools described in the VFS guide (`docs/VFS.md`). Check the verbose output for skipped tests.
 
-| Page Size | Lock Page | Test Target |
-|-----------|-----------|-------------|
-| 4 KB      | 262145    | >1.0 GB     |
-| 8 KB      | 131073    | >1.0 GB     |
-| 16 KB     | 65537     | >1.0 GB     |
-| 32 KB     | 32769     | >1.0 GB     |
+## Replica client integration
 
-Verify lock page is not present in any LTX file after replication.
+Pass `-integration` and select the backend with `-replica-clients`. The `file` backend uses a temporary directory and needs no service or credentials. The shared client tests (`replica_client_test.go`) exercise LTX writes, listing, timestamp preservation, and restore planning.
 
-## Race Condition Testing
-
-Race-prone areas (always run with `-race`):
-
-1. **Position updates**: Concurrent `SetPos()` + `Pos()` on Replica
-2. **WAL monitoring**: Concurrent writes + monitor + checkpoint
-3. **Compaction**: Concurrent compaction at different levels
-
-### Pattern: Concurrent Test
-
-```go
-func TestConcurrent(t *testing.T) {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-
-    var wg sync.WaitGroup
-    // Start writer, monitor, checkpoint goroutines
-    // Use ctx for shutdown, wg for cleanup
-    wg.Wait()
-}
+```bash
+go test -v -count=1 ./replica_client_test.go -integration -replica-clients=file
 ```
 
-## Common Test Failures
+Use the backend setup in CI (`.github/workflows/commit.yml`) and the test client configuration (`internal/testingutil/testingutil.go`) for provider-specific coverage. Remote test clients write and delete objects during their tests. Use a disposable test destination.
 
-### 1. Database Locked
+## CLI integration and the LTX behavioral gate
 
-```go
-// WRONG - WAL mode not enabled
-db, _ := sql.Open("sqlite", "test.db")
+From the repository root, build the binaries expected by `RequireBinaries` (`tests/integration/helpers.go`). Tests that use this helper skip if either binary is missing.
 
-// CORRECT
-db, _ := sql.Open("sqlite", "test.db?_journal=WAL")
+```bash
+go build -o bin/litestream ./cmd/litestream
+CGO_ENABLED=1 go build -o bin/litestream-test ./cmd/litestream-test
 ```
 
-### 2. Timing Issues
+Run the PR gate (`.github/workflows/commit.yml`) for changes to core replication, compaction, or WAL handling. It exercises low-volume, high-volume, and burst writes, and checks LTX sizes, snapshot frequency, compaction timing, and profile configuration isolation. The short mode configures two minutes of writes per profile. The integration test README (`tests/integration/README.md`) covers other test tags, backends, and longer-running workloads.
 
-```go
-// WRONG - Data may not be replicated yet
-WriteData(db)
-result := ReadReplica()
-
-// CORRECT - Explicit sync
-WriteData(db)
-db.Sync(context.Background())
-result := ReadReplica()
+```bash
+LOG_LEVEL=DEBUG CGO_ENABLED=1 go test -tags 'integration,soak' \
+  -run '^TestLTXBehavior($|_ProfileConfigIsolation$)' -short -v -timeout 15m ./tests/integration/
 ```
 
-### 3. Goroutine Leaks
+## Lock-page boundary
 
-```go
-// WRONG - Goroutine outlives test
-go func() {
-    time.Sleep(10 * time.Second)
-    doWork()
-}()
+SQLite reserves the page that contains byte offset `0x40000000`. The 1-based page number is `0x40000000 / pageSize + 1`. Litestream must skip it when reading, encoding, applying, or restoring database pages. See [SQLite internals](SQLITE_INTERNALS.md).
 
-// CORRECT - Use context + WaitGroup
-ctx, cancel := context.WithCancel(context.Background())
-defer cancel()
-var wg sync.WaitGroup
-wg.Add(1)
-go func() {
-    defer wg.Done()
-    select {
-    case <-ctx.Done():
-        return
-    case <-time.After(10 * time.Second):
-        doWork()
-    }
-}()
-cancel()
-wg.Wait()
+The boundary tests (`tests/integration/boundary_test.go`) use the binaries built above and a file replica. `Test1GBBoundary` populates a 1.5 GB target with 4096-byte pages, replicates and restores it, and checks restored database integrity. `TestLockPageWithDifferentPageSizes` exercises 4096-byte and 8192-byte pages with 1200 MB targets. Allow room for the source database, WAL, LTX files, and restored database. Both tests skip with `-short`.
+
+```bash
+CGO_ENABLED=1 go test -tags integration -count=1 -v -timeout 20m \
+  -run '^(Test1GBBoundary|TestLockPageWithDifferentPageSizes)$' ./tests/integration/
 ```
 
-### 4. File Handle Leaks
+For an independent fixture, `litestream-test populate` (`cmd/litestream-test/populate.go`) accepts the flags below. It replaces the database at `-db`, so put the fixture in a new directory. When validating a boundary change, check that `PRAGMA page_count` reaches the lock-page number and verify the restored data and integrity.
 
-```go
-// Always use defer for cleanup
-f, err := os.Open("test.db")
-require.NoError(t, err)
-defer f.Close()
+```bash
+boundary_dir=$(mktemp -d "${TMPDIR:-/tmp}/litestream-boundary.XXXXXXXX")
+./bin/litestream-test populate -db "$boundary_dir/test.db" -target-size 1.5GB -page-size 4096
 ```
 
-## Test Helper Patterns
+## Benchmark and profiles
 
-```go
-func NewTestDB(t testing.TB) *litestream.DB {
-    t.Helper()
-    path := filepath.Join(t.TempDir(), "test.db")
-    conn, err := sql.Open("sqlite", path+"?_journal=WAL")
-    require.NoError(t, err)
-    _, err = conn.Exec("CREATE TABLE test (id INTEGER PRIMARY KEY, data BLOB)")
-    require.NoError(t, err)
-    conn.Close()
+The review skill's performance reference (`.agents/skills/litestream-review/references/performance.md`) describes when to use these workloads in a review.
 
-    db := litestream.NewDB(path)
-    db.MonitorInterval = 10 * time.Millisecond
-    db.MinCheckpointPageN = 100
-    err = db.Open()
-    require.NoError(t, err)
-    t.Cleanup(func() { db.Close(context.Background()) })
-    return db
-}
+`BenchmarkVFS_LargeDatabase` (`cmd/litestream-vfs/main_test.go`) seeds 20,000 rows, syncs to a local file replica, and opens the database through the VFS. After setup and warm-up it measures a query that computes `COUNT(*)` and `SUM(LENGTH(value))`. The benchmark reports allocations and skips with `-short`. Use the same count, flags, and machine when comparing revisions.
+
+```bash
+CGO_ENABLED=1 go test -tags vfs -run '^$' -bench '^BenchmarkVFS_LargeDatabase$' \
+  -benchmem -benchtime=1s -count=1 -timeout 3m ./cmd/litestream-vfs
 ```
 
-## Coverage Requirements
+`TestIdleCPUProfile` (`tests/integration/profile_test.go`) starts SQLite databases with file replicas, seeds and syncs each once, then leaves their monitors idle for interactive profiling. It needs no credentials or CLI binaries. Run it on loopback and stop it with Ctrl+C when the captures finish.
 
-| Package            | Target |
-|--------------------|--------|
-| Core (db, replica) | >80%   |
-| Replica clients    | >70%   |
-| Utilities          | >60%   |
-
-## Table-Driven Tests
-
-```go
-func TestCheckpoint(t *testing.T) {
-    tests := []struct {
-        name    string
-        mode    string
-        wantErr bool
-    }{
-        {"Passive", "PASSIVE", false},
-        {"Full", "FULL", false},
-        {"Truncate", "TRUNCATE", false},
-        {"Invalid", "INVALID", true},
-    }
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            // ...
-        })
-    }
-}
+```bash
+PROFILE_ADDR=127.0.0.1:6060 PROFILE_DB_COUNT=10 go test -tags profile \
+  -run '^TestIdleCPUProfile$' -count=1 -timeout=0 -v ./tests/integration/
 ```
+
+Once the test reports that the databases have started, collect profiles from another terminal.
+
+```bash
+go tool pprof -top 'http://127.0.0.1:6060/debug/pprof/profile?seconds=30'
+go tool pprof -top http://127.0.0.1:6060/debug/pprof/heap
+```
+
+## Fuzzing and coverage
+
+Restore fuzzing tests the effect of a compacted file disappearing during restore. VFS fuzzing exercises reads and queries over a file replica. The harnesses live in the restore fuzz test (`restore_fuzz_test.go`) and the VFS fuzz test (`cmd/litestream-vfs/fuzz_test.go`).
+
+```bash
+go test -run '^$' -fuzz '^FuzzRestoreWithMissingCompactedFile$' -fuzztime 30s .
+CGO_ENABLED=1 go test -tags vfs -run '^$' \
+  -fuzz '^FuzzVFSReplicaReadPatterns$' -fuzztime 30s ./cmd/litestream-vfs
+```
+
+Use coverage output to find branches the chosen tests missed. Include the relevant build tags when measuring code behind a tag.
+
+```bash
+go test -coverprofile=coverage.out ./...
+go tool cover -func=coverage.out
+```
+
+## Test helpers and common failures
+
+- Use the shared test helpers (`internal/testingutil/testingutil.go`) to open SQLite databases, create temporary file replicas, and close resources. Give each test its own paths with `t.TempDir()`.
+- Configure WAL mode before writes and use a busy timeout for concurrent connections. The concurrent integration tests (`tests/integration/concurrent_test.go`) exercise contention, rapid checkpoints, and WAL growth.
+- Use channels when you need to coordinate a specific interleaving, and poll an observable result with a deadline when testing asynchronous replication. Close iterators, readers, and database handles, and cancel and wait for background work before cleanup.
+- Use `mock.ReplicaClient` (`mock/replica_client.go`) for controlled storage failures, with methods that match `ReplicaClient` (`replica_client.go`), or wrap a real file client and override the affected operation. The remote compaction tests (`store_compaction_remote_test.go`) show how to inject delayed and partial reads.

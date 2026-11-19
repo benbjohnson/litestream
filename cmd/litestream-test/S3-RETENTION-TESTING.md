@@ -313,7 +313,7 @@ go build -o bin/litestream-test ./cmd/litestream-test
 For more verbose output:
 ```bash
 # Enable debug logging
-export LITESTREAM_DEBUG=1
+export LOG_LEVEL=debug
 
 # Run with debug
 ./cmd/litestream-test/scripts/test-s3-retention-comprehensive.sh

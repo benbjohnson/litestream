@@ -20,6 +20,7 @@ gem "litestream-vfs"
 ## Usage
 
 ```ruby
+require "sqlite3"
 require "litestream_vfs"
 
 db = SQLite3::Database.new(":memory:")

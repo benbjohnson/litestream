@@ -16,43 +16,37 @@ Litestream's operation.
 **Status**: Fully supported (primary target)
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path
-    region: us-east-1
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path
+      region: us-east-1
 ```
 
 **Notes**:
 
-- No special configuration required
-- All features fully supported
-- Checksum validation enabled by default
+- The AWS SDK supplies its default checksum calculation and validation behavior for AWS endpoints.
 
 ### Cloudflare R2
 
 **Status**: Supported with default configuration
 
-**Known Limitations**:
-
-- Strict concurrent upload limit (2-3 concurrent uploads max)
-- Does not support `aws-chunked` content encoding
-- Does not support request/response checksums
-
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://ACCOUNT_ID.r2.cloudflarestorage.com
-    access-key-id: your-access-key-id
-    secret-access-key: your-secret-access-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://ACCOUNT_ID.r2.cloudflarestorage.com
+      access-key-id: your-access-key-id
+      secret-access-key: your-secret-access-key
 ```
 
 **Automatic Defaults** (applied when R2 endpoint detected):
 
 - `sign-payload=true` - Signed payloads required
 - `concurrency=2` - Limits concurrent multipart upload parts
-- Checksums disabled automatically
-
-**Important**: The endpoint must use `https://` scheme for R2 detection to work.
+- Like other custom endpoints, R2 uses SDK checksums only where required. Litestream disables the optional checksum trailer that can trigger `aws-chunked` encoding.
 
 Related issues: #948, #947, #940, #941
 
@@ -68,16 +62,18 @@ Related issues: #948, #947, #940, #941
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://s3.REGION.backblazeb2.com&sign-payload=true&force-path-style=true
-    access-key-id: your-key-id
-    secret-access-key: your-application-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://s3.REGION.backblazeb2.com&sign-payload=true&force-path-style=true
+      access-key-id: your-key-id
+      secret-access-key: your-application-key
 ```
 
 **Required Settings**:
 
 - `sign-payload=true` - Required for B2 authentication
-- `force-path-style=true` - Required for bucket access
+- `force-path-style=true` - Litestream's default when it detects the B2 endpoint
 - Endpoint format: `https://s3.REGION.backblazeb2.com`
 
 For buckets with Object Lock enabled, set `put-object-content-md5: true` on
@@ -107,16 +103,18 @@ Related issues: #918, #894, #1607
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://REGION.digitaloceanspaces.com&force-path-style=false
-    access-key-id: your-spaces-key
-    secret-access-key: your-spaces-secret
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://REGION.digitaloceanspaces.com&force-path-style=false
+      access-key-id: your-spaces-key
+      secret-access-key: your-spaces-secret
 ```
 
 **Notes**:
 
 - Use virtual-hosted style paths (force-path-style=false)
-- Checksum features disabled automatically for custom endpoints
+- Litestream uses SDK checksums only where required for custom endpoints
 
 Related issues: #943
 
@@ -127,10 +125,12 @@ Related issues: #943
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://your-minio-server:9000&force-path-style=true
-    access-key-id: your-access-key
-    secret-access-key: your-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://your-minio-server:9000&force-path-style=true
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
 ```
 
 **Notes**:
@@ -179,10 +179,12 @@ detected during signature validation. Reported by @ahgraber in #1424.
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://s3.REGION.scw.cloud&force-path-style=true
-    access-key-id: your-access-key
-    secret-access-key: your-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://s3.REGION.scw.cloud&force-path-style=true
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
 ```
 
 Related issues: #912
@@ -200,10 +202,12 @@ Related issues: #912
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://REGION.your-objectstorage.com&force-path-style=true
-    access-key-id: your-access-key
-    secret-access-key: your-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://REGION.your-objectstorage.com&force-path-style=true
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
 ```
 
 ### Filebase
@@ -217,10 +221,12 @@ replicas:
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://s3.filebase.com&force-path-style=true
-    access-key-id: your-access-key
-    secret-access-key: your-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://s3.filebase.com&force-path-style=true
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
 ```
 
 ### Tigris
@@ -230,10 +236,12 @@ replicas:
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://fly.storage.tigris.dev&force-path-style=true
-    access-key-id: your-access-key
-    secret-access-key: your-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://fly.storage.tigris.dev&force-path-style=true
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
 ```
 
 ### Supabase Storage (S3-Compatible API)
@@ -248,10 +256,12 @@ replicas:
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://PROJECT_REF.supabase.co/storage/v1/s3
-    access-key-id: your-s3-access-key
-    secret-access-key: your-s3-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://PROJECT_REF.supabase.co/storage/v1/s3
+      access-key-id: your-s3-access-key
+      secret-access-key: your-s3-secret-key
 ```
 
 **Automatic Defaults** (applied when Supabase endpoint detected):
@@ -278,19 +288,23 @@ Related issues: #1133
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name.BRANCH_ID.storage.CELL.REGION.CLOUD.neon.tech/path
-    access-key-id: your-access-key-id
-    secret-access-key: your-secret-access-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name.BRANCH_ID.storage.CELL.REGION.CLOUD.neon.tech/path
+      access-key-id: your-access-key-id
+      secret-access-key: your-secret-access-key
 ```
 
 Or pass the branch endpoint explicitly:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://BRANCH_ID.storage.CELL.REGION.CLOUD.neon.tech
-    access-key-id: your-access-key-id
-    secret-access-key: your-secret-access-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://BRANCH_ID.storage.CELL.REGION.CLOUD.neon.tech
+      access-key-id: your-access-key-id
+      secret-access-key: your-secret-access-key
 ```
 
 **Automatic Defaults** (applied when a Neon storage endpoint is detected):
@@ -313,10 +327,12 @@ replicas:
 **Configuration**:
 
 ```yaml
-replicas:
-  - url: s3://bucket-name/path?endpoint=https://s3.REGION.wasabisys.com
-    access-key-id: your-access-key
-    secret-access-key: your-secret-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: s3://bucket-name/path?endpoint=https://s3.REGION.wasabisys.com
+      access-key-id: your-access-key
+      secret-access-key: your-secret-key
 ```
 
 ## Google Cloud Storage (GCS)
@@ -324,8 +340,10 @@ replicas:
 **Status**: Fully supported (native client)
 
 ```yaml
-replicas:
-  - url: gcs://bucket-name/path
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: gs://bucket-name/path
 ```
 
 **Authentication**:
@@ -339,15 +357,17 @@ replicas:
 **Status**: Supported with HMAC keys
 
 ```yaml
-replicas:
-  - type: s3
-    bucket: bucket-name
-    path: database-name
-    endpoint: https://storage.googleapis.com
-    region: us-east-1
-    force-path-style: true
-    access-key-id: your-hmac-access-key
-    secret-access-key: your-hmac-secret
+dbs:
+  - path: /path/to/database.db
+    replica:
+      type: s3
+      bucket: bucket-name
+      path: database-name
+      endpoint: https://storage.googleapis.com
+      region: us-east-1
+      force-path-style: true
+      access-key-id: your-hmac-access-key
+      secret-access-key: your-hmac-secret
 ```
 
 Litestream automatically excludes `Accept-Encoding` from SigV4 signatures for
@@ -361,19 +381,23 @@ external lookalike domains.
 **Status**: Fully supported (native client)
 
 ```yaml
-replicas:
-  - url: abs://container-name/path
-    account-name: your-account-name
-    account-key: your-account-key
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: abs://container-name/path
+      account-name: your-account-name
+      account-key: your-account-key
 ```
 
 **Using SAS Token** (for granular container-level access):
 
 ```yaml
-replicas:
-  - url: abs://container-name/path
-    account-name: your-account-name
-    sas-token: "sv=2023-01-03&ss=b&srt=co&sp=rwdlacx..."
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: abs://container-name/path
+      account-name: your-account-name
+      sas-token: "sv=2023-01-03&ss=b&srt=co&sp=rwdlacx..."
 ```
 
 Or via environment variable: `LITESTREAM_AZURE_SAS_TOKEN`
@@ -391,10 +415,14 @@ Or via environment variable: `LITESTREAM_AZURE_SAS_TOKEN`
 **Status**: Supported (native client)
 
 ```yaml
-replicas:
-  - url: oss://bucket-name/path?endpoint=oss-REGION.aliyuncs.com
-    access-key-id: your-access-key-id
-    access-key-secret: your-access-key-secret
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: oss://bucket-name/path
+      region: REGION
+      endpoint: https://oss-REGION.aliyuncs.com
+      access-key-id: your-access-key-id
+      secret-access-key: your-access-key-secret
 ```
 
 ## SFTP
@@ -402,10 +430,12 @@ replicas:
 **Status**: Supported
 
 ```yaml
-replicas:
-  - url: sftp://hostname/path
-    user: username
-    password: password  # or use key-path
+dbs:
+  - path: /path/to/database.db
+    replica:
+      url: sftp://hostname/path
+      user: username
+      password: password  # or use key-path
 ```
 
 IPv6 addresses in URLs must be enclosed in brackets, for example
@@ -417,8 +447,7 @@ different port after the closing bracket, such as
 
 ### S3 Query Parameters
 
-Parameters with an alias accept both camelCase and hyphenated forms
-(e.g., `forcePathStyle` or `force-path-style`).
+The aliases below apply to replica URLs used by the VFS and other URL factory callers. The CLI accepts the same S3 query options except that it reads `skipVerify` only in the URL and takes server-side encryption settings from YAML fields on the replica. Custom endpoints use SDK request and response checksums only where required. `require-content-md5` governs multi-object deletions separately.
 
 | Parameter | Alias | Description | Default |
 |-----------|-------|-------------|---------|
@@ -450,7 +479,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 | DigitalOcean | `*.digitaloceanspaces.com` | `sign-payload=true` |
 | Scaleway | `*.scw.cloud` | `sign-payload=true` |
 | Filebase | `s3.filebase.com` | `sign-payload=true`, `force-path-style=true` |
-| Tigris | `*.tigris.dev` | `sign-payload=true`, `require-content-md5=false`, `concurrency=2`, `part-size=16MiB` |
+| Tigris | `fly.storage.tigris.dev` or `t3.storage.dev` | `sign-payload=true`, `require-content-md5=false`, `concurrency=2`, `part-size=16MiB` |
 | MinIO | host with port (not cloud provider) | `sign-payload=true`, `force-path-style=true` |
 | Supabase | `*.supabase.co` | `sign-payload=true`, `force-path-style=true` |
 | Neon | `*.storage.*.neon.tech` | `sign-payload=true`, `force-path-style=true` |
@@ -463,8 +492,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 **`InvalidArgument: Unsupported content encoding: aws-chunked`**
 
 - Provider doesn't support AWS SDK v2 chunked encoding
-- Use a custom endpoint with automatic checksum disabling
-- Or explicitly disable checksums
+- Configure the provider's custom endpoint so Litestream disables optional SDK checksums and removes the checksum trailer
 
 **`SignatureDoesNotMatch`**
 
@@ -481,7 +509,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 **`MissingContentLength`**
 
 - Provider requires Content-Length header
-- This is handled automatically for known providers
+- Litestream buffers small streaming uploads to send a known length. Larger streams use multipart upload.
 
 **`Too many concurrent uploads` or timeout errors**
 
@@ -499,7 +527,7 @@ Litestream automatically detects certain providers and applies appropriate defau
 Enable verbose logging to diagnose issues:
 
 ```bash
-LITESTREAM_DEBUG=1 litestream replicate ...
+LOG_LEVEL=debug litestream replicate
 ```
 
 Or in configuration:
@@ -509,16 +537,18 @@ logging:
   level: debug
 ```
 
+For AWS SDK diagnostics, set `LITESTREAM_S3_DEBUG=signing,retries`.
+
 ## Testing Your Configuration
 
 Test connectivity without starting replication:
 
 ```bash
 # List any existing backups
-litestream snapshots s3://bucket/path?endpoint=...
+litestream ltx -level 9 's3://bucket/path?endpoint=https://storage.example.com'
 
 # Perform a test restore (requires existing backup)
-litestream restore -o /tmp/test.db s3://bucket/path?endpoint=...
+litestream restore -o /tmp/test.db 's3://bucket/path?endpoint=https://storage.example.com'
 ```
 
 ## Version Compatibility
@@ -527,7 +557,7 @@ litestream restore -o /tmp/test.db s3://bucket/path?endpoint=...
 - **Litestream v0.4.x**: AWS SDK v1, different authentication handling
 - **Litestream v0.3.x**: Legacy format — v0.5.x can restore from v0.3.x backups via `ReplicaClientV3` interface
 
-When upgrading from v0.3.x, v0.5.x can automatically restore from v0.3.x backups if no v0.4.x+ backup exists. The S3 backend implements `ReplicaClientV3` to read the v0.3.x `generations/{id}/snapshots/` and `generations/{id}/wal/` directory structure. See [REPLICA_CLIENT_GUIDE.md](REPLICA_CLIENT_GUIDE.md#replicaclientv3-interface-v03x-restore) for details.
+File and S3 replicas can restore from v0.3.x backups. When both backup formats are present, Litestream chooses based on the requested restore timestamp or the latest available backup. See [Replica client guide](REPLICA_CLIENT_GUIDE.md#replicaclientv3-interface-v03x-restore).
 
 ### Validation Interval
 
@@ -538,9 +568,7 @@ validation:
   interval: "5m"  # How often to validate; 0 disables
 ```
 
-This runs `Store.Validate()` on a ticker, comparing local and remote positions. Can also be set per-replica via the `validation-interval` replica config key.
-and cannot restore backups created by v0.3.x. See the upgrade guide for migration
-instructions.
+The store periodically checks TXID ordering, gaps, and overlaps within each replica's non-snapshot levels. See [`store.go`](../store.go) and [`replica.go`](../replica.go).
 
 ## Reporting Issues
 

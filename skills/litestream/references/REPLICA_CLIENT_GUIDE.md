@@ -1,238 +1,69 @@
-# ReplicaClient Implementation Reference
+# ReplicaClient Implementation Guide
 
-Condensed reference for agents implementing or modifying Litestream storage backends.
+Mirrors `docs/REPLICA_CLIENT_GUIDE.md` in the Litestream repository. Plain source paths are relative to the repository root; links between bundled guides stay relative to this directory. Update both copies together.
+
+A replica backend implements the interface in `replica_client.go`. Start with the file backend (`file/replica_client.go`) for local I/O and the S3 backend (`s3/replica_client.go`) for a paginated cloud backend.
 
 ## Interface Contract
 
-From `replica_client.go`:
+| Method | Behavior |
+|--------|----------|
+| `Type()` | Returns the backend identifier, such as `s3`, `gs`, or `file`. |
+| `Init(ctx)` | Initializes the client. Calls after a successful initialization are safe. |
+| `SetLogger(logger)` | Sets the logger used by the backend. |
+| `LTXFiles(ctx, level, seek, useMetadata)` | Lists files at a level in TXID order, beginning at the requested minimum TXID or the next available one. Zero starts at the beginning. |
+| `OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)` | Opens an LTX byte range. A zero size reads from the offset through the end. A missing LTX file returns an error matching `os.ErrNotExist`. |
+| `WriteLTXFile(ctx, level, minTXID, maxTXID, r)` | Writes an LTX stream and returns its level, TXID range, size in bytes, and original timestamp. |
+| `DeleteLTXFiles(ctx, files)` | Deletes the specified files and surfaces failures, including errors for individual items in a batch response. |
+| `DeleteAll(ctx)` | Deletes files for this replica's database prefix or directory. |
 
-```go
-type ReplicaClient interface {
-    Type() string
-    Init(ctx context.Context) error
-    LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
-    OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error)
-    WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error)
-    DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) error
-    DeleteAll(ctx context.Context) error
-}
+The CLI builds clients from structured configuration. URL-based callers such as the VFS and control socket use registered replica client factories. Follow an existing backend for both construction paths. See `cmd/litestream/main.go`, `replica_url.go`, and `server.go`.
+
+## Storage Layout
+
+Keep the layout of an existing backend compatible with its prior backups. The file backend uses `LTXFilePath` to create `ltx/<level>/<minTXID>-<maxTXID>.ltx` under its configured root. The S3 backend uses four-digit hexadecimal level prefixes directly under its configured path, for example `0000/` for L0 and `0009/` for snapshots. Use `ltx.FormatFilename` and `ltx.ParseFilename` for transaction ranges. See `litestream.go`, `file/replica_client.go`, and `s3/replica_client.go`.
+
+## File Timestamps
+
+Preserve the timestamp encoded in the LTX header. Built-in clients inspect the header with `ltx.PeekHeader`, preserve the bytes for the upload, and report its timestamp as `FileInfo.CreatedAt`. File and SFTP clients set the file modification time. S3 and other object-store clients can store it in object metadata. See `file/replica_client.go`, `sftp/replica_client.go`, and `s3/replica_client.go`.
+
+For timestamp-based restore, `LTXFiles` receives `useMetadata=true` and must return the accurate timestamp. When `useMetadata=false`, clients may use cheaper listing metadata such as the object's last-modified time. A backend that already exposes the preserved time in its normal listing can use that for both modes. See `replica_client.go` and `s3/replica_client.go`.
+
+## Transfers and Errors
+
+Stream uploads and range reads where the backend allows. File and SFTP clients stage writes before renaming. S3 uses the AWS SDK v2 and chooses single-part or multipart upload according to object and part size. Check backend-specific listing, range, and consistency semantics before relying on them in restore or retention. See `file/replica_client.go`, `sftp/replica_client.go`, and `s3/replica_client.go`.
+
+Pass the caller's context to storage requests and preserve underlying errors with `%w`. Return an error matching `os.ErrNotExist` for a missing file. Surface iteration errors and release iterator resources. Paginate remote listings when supported and preserve TXID order across pages. See `replica_client.go` and `s3/replica_client.go`.
+
+Long restore and compaction streams can be interrupted midway. `ResumableReader` can reopen a stream at the current byte offset after a read failure or a premature EOF when the expected size is known. Correct byte-range behavior is required for the resumed stream to reconstruct the original data. See `internal/resumable_reader.go`, `replica.go`, and `compactor.go`.
+
+## Testing
+
+The shared `TestReplicaClient_*` tests exercise writes, ordered listings, partial reads, missing objects, timestamp preservation, and deletion. Use a valid LTX header in storage test data, as `createLTXDataWithTimestamp` does. Add a backend to the shared test harness in `internal/testingutil/testingutil.go` when applicable. Use the callback-based `mock.ReplicaClient` (`mock/replica_client.go`) for tests of callers. See `replica_client_test.go` for the shared tests.
+
+```bash
+go test -v . -run '^TestReplicaClient_' -args -integration -replica-clients=file
 ```
 
-### Method Contracts
-
-**Type()**: Return identifier string (e.g., "s3", "gcs", "file").
-
-**Init()**: Initialize connection. Must be idempotent (no-op if already initialized).
-
-**LTXFiles()**: Return iterator sorted by MinTXID. `seek` starts from given TXID.
-`useMetadata=true` fetches accurate timestamps (required for point-in-time restore).
-`useMetadata=false` uses fast timestamps for normal operations.
-
-**OpenLTXFile()**: Open file for reading. Must support partial reads via `offset`/`size`.
-Return `os.ErrNotExist` if file is missing.
-
-**WriteLTXFile()**: Write file to storage. Set `CreatedAt` from backend
-metadata or upload time.
-
-**DeleteLTXFiles()**: Delete one or more files. Batch if possible.
-
-**DeleteAll()**: Delete all files for this database.
+Set `-replica-clients` to the backend under test and configure its test credentials or connection settings as needed.
 
 ## Implementation Checklist
 
-### Required
+- Implement every `ReplicaClient` method and register both structured-config and URL construction where supported.
+- Preserve the backend's existing object layout, ordered listings, LTX header timestamps, and zero-size range-read semantics.
+- Propagate cancellation, upload/close errors, iterator errors, and per-object deletion failures; test missing objects and interrupted streams.
+- Add the client to the shared test harness and exercise writes, restore, listing, ranges, timestamps, and deletion against a disposable destination.
 
-- [ ] All interface methods implemented
-- [ ] `Init()` is idempotent
-- [ ] Partial reads supported (`offset`/`size` in `OpenLTXFile`)
-- [ ] `os.ErrNotExist` returned for missing files
-- [ ] Context cancellation handled in all methods
-- [ ] `CreatedAt` timestamps preserved in `WriteLTXFile`
-- [ ] Concurrent operations supported
-- [ ] Proper cleanup in `DeleteAll`
+## ReplicaClientV3 Interface (v0.3.x Restore)
 
-### Optional
+The optional `ReplicaClientV3` interface supports restoring from pre-LTX backups. The file and S3 backends implement it. Use the types and path helpers in `v3.go`.
 
-- [ ] Connection pooling
-- [ ] Retry logic with exponential backoff
-- [ ] Request batching for deletes
-- [ ] Compression / encryption at rest
-- [ ] Bandwidth throttling
+| Method | Behavior |
+|--------|----------|
+| `GenerationsV3(ctx)` | Lists generation IDs in ascending order. |
+| `SnapshotsV3(ctx, generation)` | Lists snapshots in ascending index order. |
+| `WALSegmentsV3(ctx, generation)` | Lists WAL segments ordered by index, then offset. |
+| `OpenSnapshotV3(ctx, generation, index)` | Opens an LZ4-decompressed snapshot stream. |
+| `OpenWALSegmentV3(ctx, generation, index, offset)` | Opens an LZ4-decompressed WAL segment stream. The offset identifies the segment in its filename. |
 
-## Eventual Consistency
-
-Many cloud backends (S3, R2, etc.) are eventually consistent:
-- Recently written files may not be immediately visible
-- Listed files may be only partially readable
-- Deletes may not take effect immediately
-
-### Pattern: Read Local First
-
-During compaction, always prefer local files:
-
-```go
-f, err := os.Open(db.LTXPath(info.Level, info.MinTXID, info.MaxTXID))
-if err == nil {
-    return f, nil
-}
-return replica.Client.OpenLTXFile(...)
-```
-
-### Pattern: Retry with Backoff
-
-```go
-backoff := 100 * time.Millisecond
-for i := 0; i < 5; i++ {
-    reader, err := c.openFile(ctx, path, offset, size)
-    if err == nil {
-        return reader, nil
-    }
-    if errors.Is(err, os.ErrNotExist) {
-        return nil, err // Don't retry definitive errors
-    }
-    select {
-    case <-ctx.Done():
-        return nil, ctx.Err()
-    case <-time.After(backoff):
-        backoff *= 2
-    }
-}
-```
-
-### Pattern: Lazy Iterator
-
-```go
-func (c *Client) LTXFiles(...) (ltx.FileIterator, error) {
-    return &lazyIterator{
-        client:   c,
-        level:    level,
-        seek:     seek,
-        pageSize: 1000, // Paginate, don't load all at once
-    }, nil
-}
-```
-
-## Error Handling
-
-### Standard Error Types
-
-```go
-// File not found
-return nil, os.ErrNotExist
-
-// Permission denied
-return nil, os.ErrPermission
-
-// Context cancelled
-return nil, ctx.Err()
-
-// Wrapped errors
-return nil, fmt.Errorf("s3 download failed: %w", err)
-```
-
-### Retryable Error Classification
-
-```go
-func isRetryable(err error) bool {
-    var netErr net.Error
-    if errors.As(err, &netErr) && netErr.Temporary() {
-        return true
-    }
-    // HTTP 429, 500, 502, 503, 504
-    if errors.Is(err, context.DeadlineExceeded) {
-        return true
-    }
-    return false
-}
-```
-
-## Common Mistakes
-
-### 1. Not Handling Partial Reads
-
-```go
-// WRONG - Ignores offset/size
-return c.storage.Download(path)
-
-// CORRECT
-if offset == 0 && size == 0 {
-    return c.storage.Download(path)
-}
-return c.storage.DownloadRange(path, offset, offset+size-1)
-```
-
-### 2. Not Preserving CreatedAt
-
-```go
-// WRONG
-return &ltx.FileInfo{CreatedAt: time.Now()}
-
-// CORRECT - Use backend metadata
-return &ltx.FileInfo{CreatedAt: modTime}
-```
-
-### 3. Wrong Error Types
-
-```go
-// WRONG
-return nil, fmt.Errorf("not found")
-
-// CORRECT
-if resp.StatusCode == 404 {
-    return nil, os.ErrNotExist
-}
-```
-
-### 4. Ignoring Context
-
-```go
-// WRONG - Could run forever
-for i := 0; i < 1000000; i++ {
-    doWork()
-}
-
-// CORRECT
-select {
-case <-ctx.Done():
-    return nil, ctx.Err()
-default:
-}
-```
-
-### 5. Loading All Files at Once
-
-```go
-// WRONG - Could be millions of files
-allFiles, _ := c.loadAllFiles(level)
-
-// CORRECT - Lazy pagination
-return &lazyIterator{pageSize: 1000}, nil
-```
-
-## Path Construction
-
-```go
-func (c *Client) ltxDir(level int) string {
-    if level == SnapshotLevel {
-        return path.Join(c.Path, "snapshots")
-    }
-    return path.Join(c.Path, "ltx", fmt.Sprintf("%04d", level))
-}
-```
-
-## Reference Implementations
-
-- **Simplest**: `file/replica_client.go` (direct file I/O, no network)
-- **Most complete**: `s3/replica_client.go` (multipart uploads, retries, signing)
-
-Start with the file backend for understanding, then study S3 for advanced
-patterns.
-
-## Testing Requirements
-
-- Unit tests with >80% coverage
-- Integration tests with build tag
-- Test partial reads, concurrent operations, missing files
-- Run with `-race` flag
-- Verify `os.ErrNotExist` for missing files
-- Test context cancellation
+Generation IDs contain 16 lowercase hexadecimal characters. Snapshots are stored at `generations/{generation}/snapshots/{index:08x}.snapshot.lz4`. WAL segments are stored at `generations/{generation}/wal/{index:08x}_{offset:08x}.wal.lz4`. The WAL offset field expands when needed.

@@ -1,191 +1,44 @@
-# LTX Format Reference
+# LTX format and Litestream integration
 
-Condensed reference for agents working with Litestream's LTX file format.
+Mirrors `docs/LTX_FORMAT.md` in the Litestream repository. Plain source paths are relative to the repository root; links between bundled guides stay relative to this directory. Update both copies together.
 
-## Overview
+The format authority is the `github.com/superfly/ltx` version pinned in `go.mod`. `Version` is 3, `Magic` is `LTX1`, `HeaderSize` is 100 bytes, `PageHeaderSize` is 6 bytes, and `TrailerSize` is 16 bytes. Use the dependency's encoder and decoder rather than hand-parsing copied layouts.
 
-LTX (Log Transaction) is Litestream's custom format for storing database changes.
-LTX files are:
-- **Immutable**: Once written, never modified
-- **Self-contained**: Each file is independent
-- **Indexed**: Contains page index for efficient seeks
-- **Checksummed**: CRC-64 ECMA integrity verification
+## File contents
 
-## File Structure
+An LTX file has a header, encoded pages, page-index metadata, and a trailer. Pages may be compressed; a fixed `pageCount * pageSize` formula does not describe encoded size. `ltx.PageHeader` contains `Pgno` and `Flags`; the size flag introduces the encoded payload length. The page index maps page numbers to encoded offsets and sizes, with a length footer. It is not a binary-search tree.
 
-```
-+---------------------+
-|      Header         |  100 bytes
-+---------------------+
-|    Page Frames      |  Variable (4-byte pgno + pageSize data per page)
-+---------------------+
-|    Page Index       |  Binary search index
-+---------------------+
-|      Trailer        |  16 bytes
-+---------------------+
+The header records page size, the final database page count (`Commit`), a TXID range, timestamp, pre-apply checksum, WAL provenance, flags, and node identity. `Commit` is not the number of pages present in an incremental file. A snapshot has `MinTXID == 1` and includes the database state through `MaxTXID`, excluding the reserved lock page. Incremental files require a compatible preceding state; they are not independently restorable snapshots.
 
-FileSize = HeaderSize + (PageCount * (4 + PageSize)) + PageIndexSize + TrailerSize
-```
+The trailer contains `PostApplyChecksum` and `FileChecksum`; it has no page-index offset fields. Database checksums combine page number and content using the dependency's checksum functions. The hasher is CRC64-ISO, not ECMA. `HeaderFlagNoChecksum` disables database checksum tracking, not the file checksum. Compression and structural metadata affect file validation; do not substitute a checksum over raw bytes for the decoder's validation.
 
-## Header (100 bytes)
+## Read, write, and close contracts
 
-```
-Offset  Size  Field
-0       4     Magic ("LTX1")
-4       4     Flags (bit 1 = NoChecksum)
-8       4     PageSize
-12      4     Commit (page count after applying)
-16      8     MinTXID
-24      8     MaxTXID
-32      8     Timestamp (ms since Unix epoch)
-40      8     PreApplyChecksum
-48      8     WALOffset (0 for snapshots)
-56      8     WALSize (0 for snapshots)
-64      4     WALSalt1
-68      4     WALSalt2
-72      8     NodeID
-80     20     Reserved (zeros)
-```
+Call `Decoder.DecodeHeader` before reading `Decoder.Header`. Read pages with `DecodePage` until `io.EOF` and check `Decoder.Close` to validate the trailer and file checksum. Streaming consumers that do not need random access can disable page-index retention; see the restore path and dependency compactor for current use.
 
-The version is implied by the magic string. `"LTX1"` → `ltx.Version == 2`.
+Write through `Encoder.EncodeHeader`, `EncodePage`, and `Close`. Supply the post-apply checksum when required. `Close` finishes index/trailer encoding and can fail; propagate that error before publishing output. Use encoder cleanup on failure. There are no public `EncodePageIndex` or `EncodeTrailer` methods to call separately.
 
-## Page Frames
+LTX files are immutable after publication. Create new output for compaction, keep only the latest applicable page, respect the final commit size after truncation, and always skip `ltx.LockPgno(pageSize)`. Compaction checks ordering and continuity; a map that merely overwrites duplicate page numbers is not a replacement for those checks. See `compactor.go`, `db.go`, and the dependency's `Compactor.Compact`.
 
-Each frame contains one database page:
+## Names and backend paths
 
-```
-Offset  Size      Field
-0       4         Page Number (1-based)
-4       PageSize  Page Data
-```
+A filename is `<MinTXID>-<MaxTXID>.ltx`, with each TXID represented by 16 lowercase hexadecimal digits. Use `ltx.FormatFilename` and `ltx.ParseFilename`.
 
-Constraints:
-- Pages written in sequential order during creation
-- Lock page at 1 GB boundary is never included
-- In compacted files, only the latest version of each page
+| Backend | Storage path |
+|---------|--------------|
+| File | `<root>/ltx/<decimal level>/<filename>.ltx` |
+| S3 | `<prefix>/<four-digit hexadecimal level>/<filename>.ltx` |
 
-## Page Index
+For level 9, file storage uses `ltx/9/`; S3 uses `0009/`. Preserve these existing layouts for compatibility. Neither backend writes a separate replica manifest or index object; discovery lists the level and each LTX contains its own page index. To migrate from file storage to S3, restore locally and replicate the restored database rather than copying raw backend contents.
 
-Binary search index for efficient random access to pages. Use
-`ltx.DecodePageIndex()` to parse into a map of page number to
-`ltx.PageIndexElem`:
+## Compaction, snapshots, and retention
 
-```go
-type PageIndexElem struct {
-    Level   int
-    MinTXID TXID
-    MaxTXID TXID
-    Offset  int64  // Byte offset of encoded payload
-    Size    int64  // Bytes occupied by encoded payload
-}
-```
+`compaction_level.go` defines defaults: L0 raw changes, L1 at 30 seconds, L2 at 5 minutes, and L3 at 1 hour. `Store.SnapshotLevel` uses level 9 with a default 24-hour interval. Snapshots use TXID filenames at level 9, not timestamp names in a separate snapshots directory.
 
-## Trailer (16 bytes)
+Compacted output takes the timestamp from the input with the highest TXID, matching the state it represents. Do not overwrite that timestamp with the earliest object creation time. `Compactor.Compact` reads local input when available and falls back to the replica on local not-exist errors; remote readers support resumption. It must return other local errors and close resources on all paths.
 
-```
-Offset  Size  Field
-0       8     PostApplyChecksum (database checksum after applying file)
-8       8     FileChecksum (CRC-64 of entire file)
-```
+Retention can delete files. Immutability does not promise indefinite history: evaluate available snapshots, contiguous TXID coverage, and configured retention together. Restoration and follow mode must handle gaps explicitly rather than assume every level is a complete history.
 
-The trailer is always at the end of the file. Read it by seeking
-`-TrailerSize` from `io.SeekEnd`.
+## Inspection and review
 
-## File Naming Convention
-
-```
-Format:  MMMMMMMMMMMMMMMM-NNNNNNNNNNNNNNNN.ltx
-         MinTXID (16 hex)  MaxTXID (16 hex)
-
-Example: 0000000000000001-0000000000000064.ltx  (TXID 1-100)
-         0000000000000065-00000000000000c8.ltx  (TXID 101-200)
-```
-
-Parse with `ltx.ParseFilename()`, format with `ltx.FormatFilename()`.
-
-## Compaction Levels
-
-LTX files are organized in levels for efficient storage:
-
-```
-Level 0: /ltx/0000/  Raw LTX files (no compaction)
-Level 1: /ltx/0001/  Compacted (default: every 30s)
-Level 2: /ltx/0002/  Compacted (default: every 5min)
-Level 3: /ltx/0003/  Compacted (default: every 1h)
-Snapshots:           Full database state (daily)
-```
-
-### Compaction Process
-
-1. Enumerate level L-1 files
-2. Build page map (newer pages overwrite older)
-3. Write merged file skipping lock page
-4. Preserve earliest `CreatedAt` from source files
-5. Delete old L0 files when promoting to L1
-
-```go
-// Page deduplication: latest version wins
-for _, file := range files {
-    for _, page := range file.Pages {
-        pageMap[page.Number] = page
-    }
-}
-```
-
-## Checksums
-
-LTX uses CRC-64 ECMA checksums (`hash/crc64` with `crc64.ECMA` table):
-
-- **PreApplyChecksum**: Database state before applying this file
-- **PostApplyChecksum**: Database state after applying this file
-- **FileChecksum**: Integrity of the entire LTX file
-
-## Reading LTX Files
-
-```go
-dec := ltx.NewDecoder(reader)
-header, err := dec.Header()
-for {
-    var hdr ltx.PageHeader
-    data := make([]byte, header.PageSize)
-    if err := dec.DecodePage(&hdr, data); err == io.EOF {
-        break
-    }
-    // Process hdr.Pgno and data
-}
-trailer := dec.Trailer()
-```
-
-## Writing LTX Files
-
-```go
-enc := ltx.NewEncoder(writer)
-enc.EncodeHeader(header)
-for _, page := range pages {
-    if page.Number == ltx.LockPgno(pageSize) {
-        continue // Skip lock page
-    }
-    enc.EncodePage(pageHeader, pageData)
-}
-enc.EncodePageIndex(index)
-enc.EncodeTrailer()
-enc.Close()
-```
-
-## CLI Inspection
-
-```bash
-litestream ltx /path/to/db.sqlite
-litestream ltx s3://bucket/db
-```
-
-For low-level inspection, use the Go API with `ltx.NewDecoder`.
-
-## WAL to LTX Conversion
-
-SQLite WAL frames are converted to LTX format during replication:
-1. Read WAL frames from the WAL file
-2. Skip the lock page
-3. Add checksums and build page index
-4. Write as immutable LTX file
-5. Upload to storage backend
+Use `litestream ltx -level all /path/to/db.sqlite` to list files across levels or `litestream ltx -level 9 s3://bucket/prefix` for snapshots. Use the pinned Go API for payload inspection and checksum validation. See [SQLite internals](SQLITE_INTERNALS.md), [architecture](ARCHITECTURE.md), and the shared review skill (`.agents/skills/litestream-review/SKILL.md`).

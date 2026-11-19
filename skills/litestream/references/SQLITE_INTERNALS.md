@@ -1,186 +1,70 @@
-# SQLite Internals Reference
+# SQLite internals for Litestream
 
-Condensed reference for agents working with SQLite internals in Litestream.
+Mirrors `docs/SQLITE_INTERNALS.md` in the Litestream repository. Plain source paths are relative to the repository root; links between bundled guides stay relative to this directory. Update both copies together.
 
-## SQLite File Structure
+Read this alongside `db.go`, `wal_reader.go`, and the SQLite sources linked below. The production driver is `modernc.org/sqlite`; its version and the supported Go version are pinned in `go.mod`.
 
-```
-database.db       Main database file (pages)
-database.db-wal   Write-ahead log
-database.db-shm   Shared memory file (coordination)
-```
+## Database, WAL, and shared memory
 
-## Write-Ahead Log (WAL)
+The database holds checkpointed pages. The WAL can hold both committed transactions and an incomplete tail. The `-shm` file contains the wal-index and coordination state. Copying only the database while a WAL is active can omit committed data. Do not unlink a live database's sidecars to recover disk space; inspect connection ownership and the recovery path first. See [SQLite WAL](https://sqlite.org/wal.html) and [file format](https://sqlite.org/fileformat.html#walformat).
 
-WAL is SQLite's method for atomic commits:
-- Changes written to WAL first, database unchanged until checkpoint
-- Readers merge WAL + database for consistent view
-- Litestream monitors WAL and converts frames to LTX format
+WAL headers are 32 bytes and frame headers are 24 bytes. A nonzero database-size field marks a commit frame. Stored multibyte header fields are big-endian; the WAL magic determines the byte order used to calculate checksums. Validating length alone is insufficient: check salts, checksum continuity, commit boundaries, and the readable end of the current generation. `WALReader.ReadFrame` validates salts and checksums and returns the commit field; `WALReader.PageMap` retains only committed frames within the readable boundary. See [WAL checksums](https://sqlite.org/fileformat.html#checksum_algorithm).
 
-### WAL File Structure
+A WAL can restart without changing its allocated file length. `DB.Sync`, `verifyAndSyncWithExecutor`, and `detectFullCheckpoint` handle generation changes; a file-size-only polling example would miss them. Inspect the wal-index helpers and fallback behavior before treating shared-memory hints as authoritative.
 
-```
-+------------------+
-| WAL Header       |  32 bytes
-+------------------+
-| Frame 1 Header   |  24 bytes
-| Frame 1 Data     |  PageSize bytes
-+------------------+
-| Frame 2 Header   |  24 bytes
-| Frame 2 Data     |  PageSize bytes
-+------------------+
-| ...              |
-```
+The WAL header fields below are four bytes each, except the two eight-byte pairs. Offsets are from the start of the WAL. See [SQLite's WAL header layout](https://sqlite.org/fileformat.html#walformat) and `WALReader.readHeader`.
 
-### WAL Header (32 bytes)
+| Offset | Bytes | Field |
+|--------|-------|-------|
+| 0 | 4 | Magic, `0x377f0682` or `0x377f0683` |
+| 4 | 4 | Format version, currently 3007000 |
+| 8 | 4 | Database page size |
+| 12 | 4 | Checkpoint sequence number |
+| 16 | 8 | Two salts |
+| 24 | 8 | Two checksum words over the first 24 bytes |
 
-```
-Magic (4B) | FileFormat (4B) | PageSize (4B) | Checkpoint (4B) |
-Salt1 (4B) | Salt2 (4B) | Checksum1 (4B) | Checksum2 (4B)
-```
+Each frame contains this 24-byte header followed by one page of data. Offsets are from the start of the frame header; see `WALReader.ReadFrame`.
 
-Magic: `0x377f0682` or `0x377f0683`
+| Offset | Bytes | Field |
+|--------|-------|-------|
+| 0 | 4 | Database page number |
+| 4 | 4 | Database size in pages after commit, or zero for a non-commit frame |
+| 8 | 8 | Salts matching the WAL header |
+| 16 | 8 | Cumulative checksum words |
 
-### WAL Frame Header (24 bytes)
+## Pages and the lock byte
 
-```
-PageNumber (4B) | DbSize (4B) | Salt1 (4B) | Salt2 (4B) |
-Checksum1 (4B) | Checksum2 (4B)
-```
+SQLite page numbers start at one; supported page sizes are powers of two from 512 through 65536 bytes. The page containing byte `0x40000000` is reserved. Its number is `uint32(0x40000000/pageSize) + 1`, or 262145 for 4096-byte pages. Use `ltx.LockPgno(uint32(pageSize))` and skip that page during database iteration, LTX encoding, and compaction. See [database pages](https://sqlite.org/fileformat.html#pages) and [lock-byte page](https://sqlite.org/fileformat.html#the_lock_byte_page).
 
-## The 1 GB Lock Page
+B-tree page headers describe only B-tree pages; they are not a universal header for freelist, overflow, or lock pages. Page one also begins with the database header. Tests for page iteration must include databases spanning the reserved page and supported page sizes; see `tests/integration/boundary_test.go`.
 
-SQLite reserves a page at exactly 0x40000000 bytes (1 GB) for locking. This is
-the single most important SQLite detail for Litestream development.
+## Transactions and Litestream's read lock
 
-```go
-const PENDING_BYTE = 0x40000000
+`DB.acquireReadLock` begins a long-lived transaction and reads `_litestream_seq` to establish the snapshot. A constant-only query does not replace that database read. The transaction's lifetime is deliberately detached from the requesting context; statement execution still uses the caller's context. `releaseReadLock`, checkpoint coordination, and shutdown own its cleanup. This pins checkpoint progress without preventing application writes. See [WAL concurrency](https://sqlite.org/wal.html#concurrency).
 
-func LockPgno(pageSize int) uint32 {
-    return uint32(PENDING_BYTE/pageSize) + 1
-}
-```
+Keep rollback-journal locking descriptions separate from WAL locking. In WAL mode, IMMEDIATE and EXCLUSIVE transactions have the same writer behavior; neither is a recipe for blocking all readers. See [SQLite transactions](https://sqlite.org/lang_transaction.html). Check transaction mode and busy handling against the actual driver's pinned implementation before changing them.
 
-| Page Size | Lock Page Number |
-|-----------|------------------|
-| 4 KB      | 262145           |
-| 8 KB      | 131073           |
-| 16 KB     | 65537            |
-| 32 KB     | 32769            |
-| 64 KB     | 16385            |
+## Checkpoints
 
-Rules:
-- Cannot contain data; SQLite never writes user data here
-- Must be skipped during replication and compaction
-- Only affects databases > 1 GB
-- Page number changes with page size
+| Mode | Behavior |
+|------|----------|
+| PASSIVE | Makes available progress without waiting for readers or writers; it may leave frames uncheckpointed. |
+| FULL | Waits through the busy handler for the writer and suitable reader snapshots, then checkpoints all frames; new readers remain allowed. |
+| RESTART | Adds a wait for readers to leave the WAL so the next writer can restart it. |
+| TRUNCATE | Adds truncation of the WAL to zero bytes after successful restart conditions. |
 
-Implementation in Litestream:
+These distinctions come from [SQLite's checkpoint API](https://sqlite.org/c3ref/wal_checkpoint_v2.html). A successful SQL statement alone does not prove the checkpoint finished; inspect returned busy/frame counts.
 
-```go
-for pgno := uint32(1); pgno <= maxPgno; pgno++ {
-    if pgno == ltx.LockPgno(db.pageSize) {
-        continue
-    }
-    processPage(pgno)
-}
-```
+`DB.checkpointIfNeeded` uses PASSIVE for routine thresholds and intervals. At the emergency truncate threshold it first attempts PASSIVE, then may use blocking TRUNCATE; the executor coordinates the required sync and snapshot boundary. Read that function and `checkpointWithExecutor` for current policy. The automatic policy does not use RESTART. The public `DB.Checkpoint` takes a context and mode.
 
-## Page Structure
+## Driver and pragma scope
 
-SQLite divides databases into fixed-size pages (typically 4096 bytes):
-- Page numbers are 1-based
-- Types: B-tree interior, B-tree leaf, overflow, freelist, lock byte page
+Production opens `database/sql` with driver name `sqlite`. `DB.init` uses repeated `_pragma` parameters for `busy_timeout(...)` and `wal_autocheckpoint(0)`, sets persistent WAL through the driver connection, enables WAL, and checks the returned mode. Tests and `litestream-test` also use the distinct mattn `sqlite3` driver. Their DSN options and error types are not interchangeable.
 
-## Transaction Types
+Connection-local pragmas must reach every connection that needs them. One pooled `Exec` does not initialize all future connections. Avoid importing mattn `_busy_timeout` or `_journal` options into a modernc DSN. Verify the pinned driver's `applyQueryParams` and transaction implementation before changing connection setup.
 
-1. **Deferred** (default): Lock acquired on first use
-2. **Immediate**: RESERVED lock acquired immediately
-3. **Exclusive**: EXCLUSIVE lock acquired immediately
+`PRAGMA synchronous=NORMAL` in WAL mode can lose recently committed transactions after a power failure; choose durability settings explicitly. `busy_timeout` installs a connection busy handler, while `wal_autocheckpoint` configures that connection's automatic checkpoint threshold. See [SQLite pragmas](https://sqlite.org/pragma.html#pragma_synchronous).
 
-### Lock Hierarchy
+## Review entry points
 
-UNLOCKED → SHARED → RESERVED → PENDING → EXCLUSIVE
-
-- SHARED: Multiple readers allowed
-- RESERVED: Signals intent to write
-- PENDING: Blocks new SHARED locks
-- EXCLUSIVE: Single writer, no readers
-
-## Long-Running Read Transaction
-
-Litestream maintains a read transaction for consistency:
-
-```go
-func (db *DB) initReadTx() error {
-    tx, err := db.db.BeginTx(context.Background(), &sql.TxOptions{ReadOnly: true})
-    if err != nil {
-        return err
-    }
-    var dummy string
-    err = tx.QueryRow("SELECT ''").Scan(&dummy)
-    if err != nil {
-        tx.Rollback()
-        return err
-    }
-    db.rtx = tx
-    return nil
-}
-```
-
-Purpose:
-- Prevents checkpoint past our read point
-- Ensures consistent database view
-- Allows reading historical pages from WAL
-
-## Checkpoint Modes
-
-| Mode     | Behavior                                      |
-|----------|-----------------------------------------------|
-| PASSIVE  | Non-blocking; fails if readers present         |
-| FULL     | Waits for readers; blocks new readers          |
-| RESTART  | Like FULL + resets WAL start (removed in #724) |
-| TRUNCATE | Like RESTART + truncates WAL to zero           |
-
-### Litestream Checkpoint Strategy
-
-```
-WAL pages > TruncatePageN    → TRUNCATE (emergency)
-WAL pages > MinCheckpointPageN → PASSIVE
-CheckpointInterval elapsed    → PASSIVE
-```
-
-Note: RESTART mode permanently removed due to issue #724 (write-blocking).
-
-## Important SQLite Pragmas
-
-```sql
-PRAGMA journal_mode = WAL;         -- Required for Litestream
-PRAGMA page_size;                  -- Get page size
-PRAGMA page_count;                 -- Total pages in database
-PRAGMA freelist_count;             -- Free pages
-PRAGMA wal_checkpoint(PASSIVE);    -- Non-blocking checkpoint
-PRAGMA wal_autocheckpoint = 10000; -- High threshold (prevent interference)
-PRAGMA busy_timeout = 5000;        -- Wait 5s for locks
-PRAGMA synchronous = NORMAL;       -- Safe with WAL
-PRAGMA cache_size = -64000;        -- 64 MB cache
-PRAGMA integrity_check;            -- Verify database integrity
-```
-
-## Critical SQLite Behaviors
-
-1. **Automatic checkpoint**: Default at 1000 WAL pages; set high threshold to
-   prevent interference with Litestream's control
-2. **Busy timeout**: Default is 0 (immediate failure); set a reasonable timeout
-3. **Synchronous mode**: NORMAL is safe with WAL mode
-4. **Page cache**: In-memory cache; configure with negative KB or positive pages
-
-## WAL to LTX Conversion
-
-Litestream converts WAL frames to LTX:
-
-1. Read WAL header and validate magic number
-2. Iterate frames, reading page number and data
-3. Skip lock page (`pgno == LockPgno(pageSize)`)
-4. Calculate checksums
-5. Write as immutable LTX file with page index
+Use the shared litestream-review skill (`.agents/skills/litestream-review/SKILL.md`) for a review. Follow `DB.Sync` through WAL verification, committed-frame selection, LTX creation, replica upload, and checkpoint coordination. Return correctness errors to callers; preserve documented best-effort fallbacks. Avoid reproducing these algorithms as unchecked illustrative code.
