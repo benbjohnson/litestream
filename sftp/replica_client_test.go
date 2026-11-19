@@ -219,7 +219,7 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 	}
 }
 
-func TestFullChunkReader(t *testing.T) {
+func TestFillReader(t *testing.T) {
 	data := bytes.Repeat([]byte("0123456789abcdef"), 5000)
 	pr, pw := io.Pipe()
 	go func() {
@@ -233,7 +233,7 @@ func TestFullChunkReader(t *testing.T) {
 		_ = pw.Close()
 	}()
 
-	r := fullChunkReader{pr}
+	r := fillReader{pr}
 	buf := make([]byte, sftpPacketSize)
 	var got []byte
 	var sizes []int
