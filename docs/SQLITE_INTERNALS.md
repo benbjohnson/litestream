@@ -6,7 +6,33 @@ Read this alongside `db.go`, `wal_reader.go`, and the SQLite sources linked belo
 
 The database holds checkpointed pages. The WAL can hold both committed transactions and an incomplete tail. The `-shm` file contains the wal-index and coordination state. Copying only the database while a WAL is active can omit committed data. Do not unlink a live database's sidecars to recover disk space; inspect connection ownership and the recovery path first. See [SQLite WAL](https://sqlite.org/wal.html) and [file format](https://sqlite.org/fileformat.html#walformat).
 
+```mermaid
+flowchart LR
+    Writer[Write transaction] -->|Append frames and commit record| WAL[WAL file]
+    WAL -->|Checkpoint eligible committed pages| DB[Main database]
+    Reader[Read transaction] -->|Fix snapshot at an end mark| View[Consistent page view]
+    WAL -->|Latest page version within snapshot| View
+    DB -->|Page absent from snapshot's WAL frames| View
+```
+
+The wal-index helps readers locate frames. A reader's end mark stays fixed for its transaction, so later commits do not change that reader's view. Checkpoints must preserve pages still needed by active readers. See [WAL concurrency](https://sqlite.org/wal.html#concurrency).
+
 WAL headers are 32 bytes and frame headers are 24 bytes. A nonzero database-size field marks a commit frame. Stored multibyte header fields are big-endian; the WAL magic determines the byte order used to calculate checksums. Validating length alone is insufficient: check salts, checksum continuity, commit boundaries, and the readable end of the current generation. `WALReader.ReadFrame` validates salts and checksums and returns the commit field; `WALReader.PageMap` retains only committed frames within the readable boundary. See [WAL checksums](https://sqlite.org/fileformat.html#checksum_algorithm).
+
+```text
+Increasing file offsets
++------------------------+
+| WAL header             | 32 bytes
++------------------------+
+| Frame 1 header         | 24 bytes
+| Frame 1 page data      | pageSize bytes
++------------------------+
+| Frame 2 header         | 24 bytes
+| Frame 2 page data      | pageSize bytes
++------------------------+
+| ...                    |
++------------------------+
+```
 
 A WAL can restart without changing its allocated file length. `DB.Sync`, `verifyAndSyncWithExecutor`, and `detectFullCheckpoint` handle generation changes; a file-size-only polling example would miss them. Inspect the wal-index helpers and fallback behavior before treating shared-memory hints as authoritative.
 
@@ -36,11 +62,47 @@ SQLite page numbers start at one; supported page sizes are powers of two from 51
 
 B-tree page headers describe only B-tree pages; they are not a universal header for freelist, overflow, or lock pages. Page one also begins with the database header. Tests for page iteration must include databases spanning the reserved page and supported page sizes; see `tests/integration/boundary_test.go`.
 
+The following layout applies to [B-tree pages](https://sqlite.org/fileformat.html#b_tree_pages). The cell content area can contain freeblocks and fragments; it is not necessarily packed. Cell pointers are ordered by key, while cells need not appear in that physical order.
+
+```text
+Increasing offsets within a B-tree page
++------------------------+
+| Database file header   | 100 bytes, page 1 only
++------------------------+
+| B-tree page header     | 8 bytes (leaf), 12 bytes (interior)
++------------------------+
+| Cell pointer array     | 2 bytes per cell
++------------------------+
+| Unallocated space      |
++------------------------+
+| Cell content area      | Cells placed toward the end of usable space
++------------------------+
+| Reserved region        | Size from database header; usually zero
++------------------------+
+```
+
 ## Transactions and Litestream's read lock
 
 `DB.acquireReadLock` begins a long-lived transaction and reads `_litestream_seq` to establish the snapshot. A constant-only query does not replace that database read. The transaction's lifetime is deliberately detached from the requesting context; statement execution still uses the caller's context. `releaseReadLock`, checkpoint coordination, and shutdown own its cleanup. This pins checkpoint progress without preventing application writes. See [WAL concurrency](https://sqlite.org/wal.html#concurrency).
 
 Keep rollback-journal locking descriptions separate from WAL locking. In WAL mode, IMMEDIATE and EXCLUSIVE transactions have the same writer behavior; neither is a recipe for blocking all readers. See [SQLite transactions](https://sqlite.org/lang_transaction.html). Check transaction mode and busy handling against the actual driver's pinned implementation before changing them.
+
+This WAL-mode example shows snapshot visibility, not a sequence of rollback-journal lock states. A and B are successive commit boundaries. SQLite allows multiple readers but only one writer at a time; an older reader can limit checkpoint progress while writes continue.
+
+```mermaid
+sequenceDiagram
+    participant R1 as Existing reader
+    participant W as Writer
+    participant WAL as WAL
+    participant R2 as New reader
+    R1->>WAL: Establish read snapshot at commit A
+    W->>WAL: Append changed pages and commit B
+    Note over R1,WAL: Existing reader still sees snapshot A
+    R2->>WAL: Establish read snapshot at commit B
+    Note over R1,R2: Both readers retain their own end marks
+    Note over R1,WAL: Checkpoint progress may be limited by the older reader
+    R1->>R1: End read transaction
+```
 
 ## Checkpoints
 
