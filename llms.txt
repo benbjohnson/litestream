@@ -9,6 +9,7 @@ Disaster recovery tool for SQLite. Replicates WAL changes to a local file or a s
 3. Check [CONTRIBUTING.md](CONTRIBUTING.md) - What we accept
 4. Show investigation evidence in PRs
 5. For a review of a PR, commits, or local changes, use the `litestream-review` skill in [.agents/skills/litestream-review/SKILL.md](.agents/skills/litestream-review/SKILL.md)
+6. For implementation, debugging, or testing, use the shared `litestream` workflows in [.agents/skills/litestream/SKILL.md](.agents/skills/litestream/SKILL.md)
 
 ## PR Checklist
 

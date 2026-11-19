@@ -40,7 +40,13 @@ We welcome AI-assisted contributions for bug fixes and small improvements. Wheth
 
 For an agent-assisted review, ask “Use litestream-review to review my changes.” It reviews PRs, commits, and local changes and applies fixes when requested. If automatic discovery is unavailable, load [.agents/skills/litestream-review/SKILL.md](.agents/skills/litestream-review/SKILL.md) directly. Benchmark execution requires approval.
 
-Codex, OpenCode, Gemini CLI, and Antigravity read `.agents/skills`; Claude Code uses the adapter in `.claude/skills`, which loads the same shared source. Project instructions live in `AGENTS.md`; Claude Code requires v2.1.277 or later to load it directly, with no project or ancestor `CLAUDE.md` override. See [Claude Code's instruction-loading rules](https://code.claude.com/docs/en/memory#agentsmd) for configuration exceptions.
+For implementation, debugging, and test design, ask “Use litestream to investigate the WAL growth” or load [.agents/skills/litestream/SKILL.md](.agents/skills/litestream/SKILL.md). This skill contains the shared specialist workflows and links to the maintained guides in `docs/`. Use it from a Litestream checkout; copying the skill alone does not include those guides or the source it needs.
+
+Antigravity, Codex, and OpenCode discover both skills in `.agents/skills`; Claude Code reads the same files through `.claude/skills`, a directory symlink. See the [Antigravity](https://antigravity.google/docs/skills), [Codex](https://developers.openai.com/codex/skills), [OpenCode](https://opencode.ai/docs/skills/), and [Claude Code](https://code.claude.com/docs/en/skills) discovery documentation. Maintain skill content only in `.agents/skills`.
+
+The shared `litestream` workflows replace the former five Claude-only specialist agents and nine command names. Ask for the task in ordinary language or invoke `litestream` explicitly. For delegation, pass a general-purpose worker the checkout, task, and canonical skill/workflow paths; named subagent registration is host-specific. If a Windows checkout has symlinks disabled, Claude's automatic discovery through `.claude/skills` is unavailable; load the canonical `SKILL.md` paths above directly.
+
+Project instructions live in `AGENTS.md`; Claude Code requires v2.1.277 or later to load it directly, with no project or ancestor `CLAUDE.md` override. See [Claude Code's instruction-loading rules](https://code.claude.com/docs/en/memory#agentsmd) for configuration exceptions.
 
 ## How to Contribute
 

@@ -4,6 +4,8 @@ Inspect every diff for added allocations, lock contention, syscalls and fsyncs, 
 
 Before running any benchmark or profiling workload, give the user the exact command, scope, expected runtime, and resource requirements, then wait for approval. Approval to review or fix code is not approval to benchmark. If a runtime is unknown, say so and propose a bounded run. Compare baseline and candidate under the same workload and settings. Go's [diagnostics guide](https://go.dev/doc/diagnostics) explains the different CPU, heap, block, and mutex profiles; choose one that addresses the suspected cost.
 
+For an implementation investigation, identify the backend, workload, baseline, and resource limits. Trace WAL capture and checkpoints in `db.go`, compaction in `compactor.go`, uploads in `replica.go` and the backend client, and page fetches in `vfs.go` and `replica_client.go`. Use `TestReplicaClient_WriteLTXFile_SmallUploadAllocations` in `s3/replica_client_test.go` for the existing S3 upload allocation check. Preserve cancellation and correctness when changing buffering, caching, or concurrency.
+
 ## Existing VFS benchmark
 
 `cmd/litestream-vfs/main_test.go` contains `BenchmarkVFS_LargeDatabase`. It requires the `vfs` tag, CGO, and a C compiler. It creates 20,000 rows with a local file replica, syncs and warms up the VFS, then measures `COUNT(*)` plus `SUM(LENGTH(value))`. It does not benchmark WAL capture or cloud uploads. Do not pass `-short`, which skips it.

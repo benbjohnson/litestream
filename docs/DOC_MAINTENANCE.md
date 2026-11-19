@@ -4,7 +4,7 @@ Document contracts, architecture, configuration defaults, and edge cases. Link t
 
 ## Find affected documentation
 
-Search for the symbol, configuration key, or command that changed. Include contributor guides, agent instructions, and the files under `skills/`, `.agents/`, and `.claude/`. Review behavior belongs in the [shared `litestream-review` skill](../.agents/skills/litestream-review/SKILL.md). The files in `skills/litestream/references/` mirror the guides of the same name in `docs/` with links flattened to repository paths; change both together. Agent instructions live only in [AGENTS.md](../AGENTS.md).
+Search for the symbol, configuration key, or command that changed. Include contributor guides, agent instructions, and `.agents/skills/`. Review behavior belongs in [litestream-review](../.agents/skills/litestream-review/SKILL.md); implementation and debugging workflows belong in [litestream](../.agents/skills/litestream/SKILL.md). Keep architecture and API facts in `docs/` and link to them from workflows. `.claude/skills` is a discovery symlink to the shared skills, so it needs no separate content updates. Agent instructions live only in [AGENTS.md](../AGENTS.md).
 
 ```bash
 rg --hidden -g '!.git' -g '!.local' -n -F -g '*.md' -- 'ReplicaClient' .

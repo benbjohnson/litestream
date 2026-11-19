@@ -10,6 +10,7 @@ This file is the single source of project instructions for AI agents. `.cursorru
 2. Check [CONTRIBUTING.md](CONTRIBUTING.md) for what we accept (bug fixes welcome, features need discussion)
 3. Review recent PRs for current patterns
 4. For a manual PR, commit, or local review, ask your agent “Use litestream-review to review my changes.” If discovery is unavailable, open [.agents/skills/litestream-review/SKILL.md](.agents/skills/litestream-review/SKILL.md).
+5. For implementation, debugging, or test design, use [litestream](.agents/skills/litestream/SKILL.md). Its shared workflows cover WAL, compaction, storage backends, testing, runtime diagnostics, and performance. When delegating, pass the checkout and relevant skill paths to the worker explicitly.
 
 ## Critical Rules
 
