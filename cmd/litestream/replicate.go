@@ -41,7 +41,8 @@ type ReplicateCommand struct {
 	Config Config
 
 	// MCP server
-	MCP *MCPServer
+	MCP      *MCPServer
+	mcpErrCh <-chan error
 
 	// Server for IPC control commands.
 	Server *litestream.Server
@@ -95,6 +96,8 @@ func (c *ReplicateCommand) runUntilStopped(ctx context.Context, signals <-chan o
 				} else {
 					slog.Info("replication complete, litestream shutting down")
 				}
+			case result = <-c.mcpErrCh:
+				sig = os.Interrupt
 			case sig = <-signals:
 			case <-ctx.Done():
 				result, sig = ctx.Err(), os.Interrupt
@@ -281,7 +284,10 @@ func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 		if err != nil {
 			return err
 		}
-		go c.MCP.Start(c.Config.MCPAddr)
+		if err := c.MCP.Start(c.Config.MCPAddr); err != nil {
+			return fmt.Errorf("start MCP server: %w", err)
+		}
+		c.mcpErrCh = c.MCP.errCh
 	}
 
 	// Setup databases.
