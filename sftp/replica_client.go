@@ -1,7 +1,6 @@
 package sftp
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -272,8 +271,8 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	return ltx.NewFileInfoSliceIterator(infos), nil
 }
 
-// WriteLTXFile writes a LTX file from rd into a remote file.
-func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, rd io.Reader) (info *ltx.FileInfo, err error) {
+// WriteLTXFile writes a LTX file from r into a remote file.
+func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (info *ltx.FileInfo, err error) {
 	defer func() { c.resetOnConnError(err) }()
 
 	sftpClient, err := c.init(ctx)
@@ -283,19 +282,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
-	// Use TeeReader to peek at LTX header while preserving data for upload
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(rd, &buf)
-
-	// Extract timestamp from LTX header
-	hdr, _, err := ltx.PeekHeader(teeReader)
+	hdr, src, err := ltx.PeekHeader(r)
 	if err != nil {
 		return nil, fmt.Errorf("extract timestamp from LTX header: %w", err)
 	}
 	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
-
-	// Combine buffered data with rest of reader
-	fullReader := io.MultiReader(&buf, rd)
 
 	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
 		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
@@ -308,14 +299,28 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	defer func() {
 		if f != nil {
-			_ = f.Close()
+			err = errors.Join(err, f.Close())
 		}
 		if err != nil {
-			_ = sftpClient.Remove(tmpFilename)
+			if removeErr := sftpClient.Remove(tmpFilename); removeErr != nil && !os.IsNotExist(removeErr) {
+				err = errors.Join(err, fmt.Errorf("sftp: cannot remove temporary ltx file %q: %w", tmpFilename, removeErr))
+			}
 		}
 	}()
 
-	n, err := io.Copy(f, fullReader)
+	// Compaction streams its output through an io.Pipe in small writes, and
+	// pkg/sftp cannot tell the size of such a reader: io.Copy then sends every
+	// read as its own request and waits for the reply before the next one, so
+	// over a link with tens of milliseconds of latency a snapshot of a large
+	// database takes days. Fill each read up to the SFTP packet size and, when
+	// concurrent writes are enabled, keep several packets in flight.
+	upload := fillReader{src}
+	var n int64
+	if c.ConcurrentWrites {
+		n, err = f.ReadFromWithConcurrency(upload, 0)
+	} else {
+		n, err = io.Copy(f, upload)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -436,4 +441,22 @@ func (c *ReplicaClient) resetOnConnError(err error) {
 		c.sshClient.Close()
 		c.sshClient = nil
 	}
+}
+
+// fillReader fills every read completely, except at the end of the stream,
+// so that each SFTP write request carries a full packet.
+type fillReader struct {
+	r io.Reader
+}
+
+func (c fillReader) Read(p []byte) (int, error) {
+	var n int
+	for n < len(p) {
+		nn, err := c.r.Read(p[n:])
+		n += nn
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, nil
 }
