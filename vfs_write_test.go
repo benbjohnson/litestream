@@ -510,6 +510,65 @@ func TestVFSFile_WriteModeCompactionPollKeepsNewerPage(t *testing.T) {
 	}
 }
 
+// A poll must compare a new L1 file's commit with the replica's commit, not
+// with f.commit, which counts pages the writer hasn't synced yet. Otherwise an
+// L1 file that holds only page 1 looks like a shrink, the poll replaces the
+// page index with that file's pages, and pages 2 and 3 read as zeros.
+func TestVFSFile_PollUnsyncedGrowthIsNotAShrink(t *testing.T) {
+	ctx := context.Background()
+	client := newWriteTestReplicaClient()
+	pageSize := uint32(4096)
+	pages := make(map[uint32][]byte)
+	for pgno := uint32(1); pgno <= 3; pgno++ {
+		pages[pgno] = bytes.Repeat([]byte{byte(pgno)}, int(pageSize))
+	}
+	createTestLTXFile(t, client, 1, pageSize, 3, pages)
+
+	compactor := NewCompactor(client, slog.Default())
+	if _, err := compactor.Compact(ctx, 1); err != nil {
+		t.Fatalf("compact L0 to L1: %v", err)
+	}
+
+	f := setupWriteableVFSFile(t, client)
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	// Rewrite page 1 and sync, then compact. L1 file 2 holds only page 1,
+	// with commit 3.
+	if _, err := f.WriteAt(bytes.Repeat([]byte{'x'}, int(pageSize)), 0); err != nil {
+		t.Fatalf("write page 1: %v", err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatalf("sync page 1: %v", err)
+	}
+	if _, err := compactor.Compact(ctx, 1); err != nil {
+		t.Fatalf("compact L0 to L1: %v", err)
+	}
+
+	// Grow the database to 4 pages without syncing, then poll.
+	if _, err := f.WriteAt(bytes.Repeat([]byte{'y'}, int(pageSize)), 3*int64(pageSize)); err != nil {
+		t.Fatalf("write page 4: %v", err)
+	}
+	if err := f.pollReplicaClient(ctx); err != nil {
+		t.Fatalf("poll compacted L1: %v", err)
+	}
+	f.cache.Purge()
+
+	buf := make([]byte, pageSize)
+	if _, err := f.ReadAt(buf, int64(pageSize)); err != nil {
+		t.Fatalf("read page 2: %v", err)
+	}
+	if !bytes.Equal(buf, pages[2]) {
+		t.Errorf("page 2 after poll: got %q..., want %q...", buf[:4], pages[2][:4])
+	}
+	if err := f.Sync(0); err != nil {
+		t.Errorf("sync page 4 after poll: %v", err)
+	}
+}
+
 func TestVFSFile_ConflictDetection(t *testing.T) {
 	client := newWriteTestReplicaClient()
 

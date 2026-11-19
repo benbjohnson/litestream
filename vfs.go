@@ -615,6 +615,7 @@ type VFSFile struct {
 	lockType         sqlite3vfs.LockType        // Current lock state
 	pageSize         uint32
 	commit           uint32
+	remoteCommit     uint32 // Commit of the last LTX file read or written; excludes dirty pages
 
 	// Write support fields (only used when writeEnabled is true)
 	writeEnabled  bool             // Whether write support is enabled
@@ -1342,6 +1343,7 @@ func (f *VFSFile) openNewDatabase() error {
 	f.pending = make(map[uint32]ltx.PageIndexElem)
 	f.pos = ltx.Pos{TXID: 0}
 	f.commit = 0
+	f.remoteCommit = 0
 
 	// Initialize write support for new database
 	f.expectedTXID = 0
@@ -1511,6 +1513,7 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 
 	f.mu.Lock()
 	f.commit = commit
+	f.remoteCommit = commit
 	f.mu.Unlock()
 
 	return index, nil
@@ -2190,6 +2193,7 @@ func (f *VFSFile) syncToRemoteWithLock() error {
 	f.expectedTXID = f.pendingTXID
 	f.pendingTXID++
 	f.pos = ltx.Pos{TXID: f.expectedTXID}
+	f.remoteCommit = f.commit
 
 	if f.vfs != nil {
 		f.vfs.writeMu.Lock()
@@ -2798,7 +2802,7 @@ func (f *VFSFile) monitorReplicaClient(ctx context.Context) {
 func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 	f.mu.Lock()
 	pos := f.pos
-	baseCommit := f.commit
+	baseCommit := f.remoteCommit
 	maxTXID1Snapshot := f.maxTXID1
 	maxTXID1AnchoredSnapshot := f.maxTXID1Anchored
 	maxTXID1CoveredSnapshot := f.maxTXID1Covered
@@ -2904,6 +2908,9 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		f.commit = newCommit
 	} else if len(combined) > 0 && newCommit > f.commit {
 		f.commit = newCommit
+	}
+	if replaceIndex || len(combined) > 0 {
+		f.remoteCommit = newCommit
 	}
 
 	if level0.maxTXID > level1.maxTXID {
