@@ -49,6 +49,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Record initial disk usage
+        run: df -Pk / /tmp "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+
       - uses: actions/setup-go@v5
         with:
           go-version-file: "go.mod"
@@ -72,13 +75,52 @@ jobs:
 
       - name: Run LTX behavioral test (${{ matrix.profile }})
         run: |
+          go_cache=$(go env GOCACHE)
+          go_mod_cache=$(go env GOMODCACHE)
           go test -tags 'integration,soak' \
             -run 'TestLTXBehavior$/${{ matrix.profile }}' \
             -v -timeout 170m \
-            ./tests/integration/
+            ./tests/integration/ &
+          test_pid=$!
+
+          while true; do
+            date -u '+Disk usage at %Y-%m-%dT%H:%M:%SZ'
+            df -Pk / /tmp "$RUNNER_TEMP" "$GITHUB_WORKSPACE"
+            for path in "$go_cache" "$go_mod_cache" "$GITHUB_WORKSPACE" "$RUNNER_TEMP"; do
+              if [[ -d "$path" ]]; then
+                if ! du -sk "$path"; then
+                  echo "::warning::Incomplete disk usage sample for $path"
+                fi
+              fi
+            done
+            if ! sudo du -sk /tmp; then
+              echo "::warning::Incomplete disk usage sample for /tmp"
+            fi
+            for test_dir in /tmp/litestream-ltx-behavior-*/; do
+              if [[ ! -d "$test_dir" ]]; then
+                continue
+              fi
+              if ! du -k --max-depth=3 "$test_dir"; then
+                echo "::warning::Incomplete disk usage sample for $test_dir"
+              fi
+              for db_file in "$test_dir"/*.db "$test_dir"/*-wal; do
+                if [[ -f "$db_file" ]]; then
+                  if ! du -k "$db_file"; then
+                    echo "::warning::Incomplete disk usage sample for $db_file"
+                  fi
+                fi
+              done
+            done
+            if ! kill -0 "$test_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 60
+          done
+          wait "$test_pid"
         env:
           SOAK_KEEP_TEMP: "1"
           SOAK_DURATION: ${{ steps.config.outputs.duration }}
+          SOAK_DEBUG: "1"
 
       - name: Upload test artifacts
         if: always()

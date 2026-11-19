@@ -365,22 +365,27 @@ func GetS3StorageSize(t *testing.T, s3URL string) int64 {
 }
 
 // CreateSoakConfig creates a litestream configuration file for soak tests
-func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode bool) string {
+func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode bool, profile *LoadProfile) string {
 	tempDir := filepath.Dir(dbPath)
 	configPath := filepath.Join(tempDir, "litestream.yml")
 
 	var config strings.Builder
 
-	snapshotInterval := "10m"
+	snapshotInterval := ProfileSnapshotInterval(shortMode, profile).String()
 	snapshotRetention := "1h"
+	truncatePageN := 5000
 	retentionCheckInterval := "5m"
 	levelIntervals := []string{"30s", "1m", "5m", "15m", "30m"}
 
 	if shortMode {
-		snapshotInterval = "30s"
 		snapshotRetention = "10m"
 		retentionCheckInterval = "2m"
 		levelIntervals = []string{"15s", "30s", "1m"}
+	} else if profile != nil && profile.SnapshotRetention > 0 {
+		snapshotRetention = profile.SnapshotRetention.String()
+	}
+	if !shortMode && profile != nil && profile.TruncatePageN > 0 {
+		truncatePageN = profile.TruncatePageN
 	}
 
 	// Add S3 credentials if provided
@@ -391,6 +396,9 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	}
 
 	// Aggressive snapshot settings for testing
+	if !shortMode && profile != nil && profile.L0Retention > 0 {
+		config.WriteString(fmt.Sprintf("l0-retention: %s\n\n", profile.L0Retention))
+	}
 	config.WriteString("snapshot:\n")
 	config.WriteString(fmt.Sprintf("  interval: %s\n", snapshotInterval))
 	config.WriteString(fmt.Sprintf("  retention: %s\n", snapshotRetention))
@@ -408,7 +416,7 @@ func CreateSoakConfig(dbPath, replicaURL string, s3Config *S3Config, shortMode b
 	config.WriteString(fmt.Sprintf("  - path: %s\n", filepath.ToSlash(dbPath)))
 	config.WriteString("    checkpoint-interval: 1m\n")
 	config.WriteString("    min-checkpoint-page-count: 100\n")
-	config.WriteString("    truncate-page-n: 5000\n")
+	config.WriteString(fmt.Sprintf("    truncate-page-n: %d\n", truncatePageN))
 	config.WriteString("\n")
 	config.WriteString("    replica:\n")
 	config.WriteString(fmt.Sprintf("      url: %s\n", replicaURL))

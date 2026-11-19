@@ -98,7 +98,7 @@ func TestMinIOSoak(t *testing.T) {
 		ForcePathStyle: true,
 		SkipVerify:     true,
 	}
-	configPath := CreateSoakConfig(db.Path, s3URL, s3Config, shortMode)
+	configPath := CreateSoakConfig(db.Path, s3URL, s3Config, shortMode, nil)
 	db.ConfigPath = configPath
 	t.Logf("✓ Configuration created: %s", configPath)
 	t.Logf("  S3 URL: %s", s3URL)
