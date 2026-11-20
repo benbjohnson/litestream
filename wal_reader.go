@@ -207,17 +207,32 @@ func (r *WALReader) readFrame(ctx context.Context, data []byte, verifyChecksum b
 // map of pgno to offset of the latest version of each page. Also returns the
 // max offset of the wal segment read, and the final database size, in pages.
 func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset int64, commit uint32, err error) {
-	m, maxOffset, commit, _, err = r.pageMap(ctx, 0)
+	m, maxOffset, commit, _, err = r.pageMap(ctx, 0, 0)
 	return m, maxOffset, commit, err
 }
 
-func (r *WALReader) pageMap(ctx context.Context, maxBytes int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
+// pageMap maps pages to their latest committed WAL offsets and returns
+// the committed end offset and database size in pages.
+//
+// Limits:
+//   - maxBytes caps bytes scanned from the starting position, allowing
+//     the current transaction to finish.
+//   - endOffset is an absolute WAL boundary; transactions committing
+//     beyond it are excluded.
+//
+// Zero disables the corresponding limit.
+func (r *WALReader) pageMap(ctx context.Context, maxBytes, endOffset int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
 	data := make([]byte, r.pageSize)
 	frameSize := int64(WALFrameHeaderSize + r.pageSize)
 	startOffset := WALHeaderSize + int64(r.frameN)*frameSize
 	for {
+		if endOffset > 0 && WALHeaderSize+(int64(r.frameN)+1)*frameSize > endOffset {
+			limited = true
+			break
+		}
+
 		pgno, fcommit, err := r.ReadFrame(ctx, data)
 		if errors.Is(err, io.EOF) {
 			break

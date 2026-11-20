@@ -2230,7 +2230,7 @@ func (db *DB) sync(ctx context.Context, checkpointing bool, exec *syncExecutor, 
 	if info.snapshotting {
 		maxSyncWALBytes = 0
 	}
-	pageMap, maxOffset, walCommit, limited, err := rd.pageMap(ctx, maxSyncWALBytes)
+	pageMap, maxOffset, walCommit, limited, err := rd.pageMap(ctx, maxSyncWALBytes, 0)
 	if err != nil {
 		return result, fmt.Errorf("page map: %w", err)
 	}
@@ -2928,12 +2928,8 @@ func (db *DB) snapshotPosition(ctx context.Context) (*snapshotReadPosition, erro
 }
 
 // snapshotWALEndOffset returns the WAL offset a snapshot may read up to for
-// the given position. db.syncState is read without db.mu because every writer
-// mutates it while holding execSem, which the caller also holds.
+// the given position.
 func (db *DB) snapshotWALEndOffset(pos ltx.Pos) (int64, error) {
-	if db.syncState.lastSyncedWALOffset > 0 {
-		return db.syncState.lastSyncedWALOffset, nil
-	}
 	if pos.TXID == 0 {
 		return WALHeaderSize, nil
 	}
@@ -2997,13 +2993,14 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			return
 		}
 
-		// Build a mapping of changed page numbers and their latest content.
-		maxBytes := pos.walEndOffset - WALHeaderSize
+		// Map each changed page to the WAL offset of its latest committed version.
+		// Only include transactions committed within the snapshot's advertised WAL
+		// range, so later writes cannot change the state represented by this snapshot.
 		pageMap := make(map[uint32]int64)
 		var maxOffset int64
 		var walCommit uint32
-		if maxBytes > 0 {
-			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, maxBytes)
+		if pos.walEndOffset > WALHeaderSize {
+			pageMap, maxOffset, walCommit, _, err = rd.pageMap(ctx, 0, pos.walEndOffset)
 			if err != nil {
 				pw.CloseWithError(fmt.Errorf("page map: %w", err))
 				return
