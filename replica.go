@@ -1775,14 +1775,58 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 		}
 	}
 
-	if len(infos) > 0 && txID == 0 && timestamp.IsZero() {
+	if len(infos) > 0 && txID == 0 {
+		var maxSkippedAfterTimestamp ltx.TXID
+		if !timestamp.IsZero() {
+			for _, cursor := range cursors {
+				if cursor.skippedAfterTimestampMax > maxSkippedAfterTimestamp {
+					maxSkippedAfterTimestamp = cursor.skippedAfterTimestampMax
+				}
+			}
+		}
+
+		// When a higher compaction level covers currentMax+1..maxSkippedAfterTimestamp
+		// with CreatedAt >= timestamp, retained lower-level files within that range do
+		// not indicate a missing TXID gap (e.g., after EnforceL0Retention purges older
+		// L0 files already compacted into L1). Files beyond coveredMax+1 still indicate
+		// a genuine gap.
+		coveredMax := currentMax
+		if maxSkippedAfterTimestamp > coveredMax {
+			coveredMax = maxSkippedAfterTimestamp
+		}
+
+		var nextGapTXID ltx.TXID
 		for _, cursor := range cursors {
 			if err := cursor.ensureCurrent(); err != nil {
 				return nil, err
 			}
-			if cursor.current != nil && cursor.current.MinTXID > currentMax+1 {
-				return nil, fmt.Errorf("non-contiguous ltx files: have up to %s but next file starts at %s", currentMax, cursor.current.MinTXID)
+			// Advance past files already covered by a skipped compacted range so we
+			// still inspect the first file beyond coveredMax without draining future pages.
+			if !timestamp.IsZero() && coveredMax > currentMax {
+				for cursor.current != nil && cursor.current.MinTXID <= coveredMax {
+					cursor.current = nil
+					if err := cursor.ensureCurrent(); err != nil {
+						return nil, err
+					}
+				}
 			}
+			if cursor.current == nil || cursor.current.MinTXID <= coveredMax+1 {
+				continue
+			}
+			// Plan selection uses strict Before(timestamp), whereas gap detection uses
+			// !After(timestamp) (<=): if the first file past a missing TXID was created at
+			// or before timestamp, the missing TXID(s) before it could have been created
+			// strictly before timestamp. We inspect only cursor.current (assuming monotonic
+			// timestamps within a level) to avoid scanning remaining remote storage pages.
+			if !timestamp.IsZero() && cursor.current.CreatedAt.After(timestamp) {
+				continue
+			}
+			if nextGapTXID == 0 || cursor.current.MinTXID < nextGapTXID {
+				nextGapTXID = cursor.current.MinTXID
+			}
+		}
+		if nextGapTXID != 0 {
+			return nil, fmt.Errorf("non-contiguous ltx files: have up to %s but next file starts at %s", coveredMax, nextGapTXID)
 		}
 	}
 
@@ -1810,6 +1854,9 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 type restoreLevelCursor struct {
 	nearestAfter ltx.TXID
+	// skippedAfterTimestampMax tracks the highest MaxTXID among contiguous files
+	// skipped solely because their CreatedAt was not before the target timestamp.
+	skippedAfterTimestampMax ltx.TXID
 	// itr streams LTX file infos for a single level in filename order.
 	itr ltx.FileIterator
 	// current holds the last item read from itr but not yet evaluated.
@@ -1854,6 +1901,9 @@ func (c *restoreLevelCursor) refresh(currentMax, txID ltx.TXID, timestamp time.T
 			continue
 		}
 		if !timestamp.IsZero() && !info.CreatedAt.Before(timestamp) {
+			if info.MaxTXID > c.skippedAfterTimestampMax {
+				c.skippedAfterTimestampMax = info.MaxTXID
+			}
 			continue
 		}
 
