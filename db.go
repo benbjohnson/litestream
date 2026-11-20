@@ -10,6 +10,7 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1109,6 +1110,10 @@ func (db *DB) setPersistWAL(ctx context.Context) error {
 	})
 }
 
+func sqliteFileURI(path string) string {
+	return "file:" + url.PathEscape(path)
+}
+
 // init initializes the connection to the database.
 // Skipped if already initialized or if the database file does not exist.
 func (db *DB) init(ctx context.Context) (err error) {
@@ -1132,8 +1137,8 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 	db.dirInfo = fi
 
-	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
-		db.path, db.BusyTimeout.Milliseconds())
+	dsn := fmt.Sprintf("%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
+		sqliteFileURI(db.path), db.BusyTimeout.Milliseconds())
 
 	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err

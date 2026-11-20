@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -463,6 +464,23 @@ func TestCheckIntegrity_Full_ValidDB(t *testing.T) {
 func TestCheckIntegrity_None_Skips(t *testing.T) {
 	if err := checkIntegrity(context.Background(), "/nonexistent/path.db", IntegrityCheckNone); err != nil {
 		t.Fatalf("expected nil for IntegrityCheckNone, got: %v", err)
+	}
+}
+
+func TestCheckIntegrity_LiteralFilename(t *testing.T) {
+	dir := t.TempDir()
+	filename := "restored#%23.db"
+	if runtime.GOOS != "windows" {
+		filename = "restored?#%23.db"
+	}
+	path := filepath.Join(dir, filename)
+	if err := os.WriteFile(path, []byte("invalid SQLite database"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, mode := range []IntegrityCheckMode{IntegrityCheckQuick, IntegrityCheckFull} {
+		if err := checkIntegrity(t.Context(), path, mode); err == nil {
+			t.Errorf("integrity check mode %d passed for corrupt database %q", mode, filename)
+		}
 	}
 }
 

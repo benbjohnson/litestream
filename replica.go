@@ -1481,7 +1481,7 @@ func (r *Replica) appendWALSegmentV3(ctx context.Context, client ReplicaClientV3
 
 // checkpointV3 checkpoints the WAL file into the database.
 func checkpointV3(dbPath string) error {
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", sqliteFileURI(dbPath))
 	if err != nil {
 		return err
 	}
@@ -1497,7 +1497,7 @@ func checkIntegrity(ctx context.Context, dbPath string, mode IntegrityCheckMode)
 		return nil
 	}
 
-	db, err := sql.Open("sqlite", dbPath)
+	db, err := sql.Open("sqlite", sqliteFileURI(dbPath))
 	if err != nil {
 		return fmt.Errorf("open database for integrity check: %w", err)
 	}
