@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"math/rand"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -118,6 +119,7 @@ func TestVFS_Updating(t *testing.T) {
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
+	defer func() { require.NoError(t, db.Close(context.Background())) }()
 	sqldb0 := testingutil.MustOpenSQLDB(t, db.Path())
 	defer testingutil.MustCloseSQLDB(t, sqldb0)
 
@@ -149,10 +151,6 @@ func TestVFS_Updating(t *testing.T) {
 	// Ensure replica has updated itself.
 	t.Log("ensuring replica has updated")
 	waitForReplicaValue(t, sqldb1, "SELECT * FROM t", 200, 10*time.Second, db.MonitorInterval)
-
-	if err := db.Replica.Stop(false); err != nil {
-		t.Fatalf("stop replica: %v", err)
-	}
 }
 
 func TestVFS_ActiveReadTransaction(t *testing.T) {
@@ -1227,7 +1225,12 @@ func TestVFS_MultiplePageSizes(t *testing.T) {
 		const monitorInterval = 50 * time.Millisecond
 		t.Run(fmt.Sprintf("page_%d", pageSize), func(t *testing.T) {
 			client := file.NewReplicaClient(t.TempDir())
-			_, primary := openReplicatedPrimary(t, client, monitorInterval, 50*time.Millisecond)
+			db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "primary.db"))
+			db.MonitorInterval = monitorInterval
+			db.Replica = litestream.NewReplica(db)
+			db.Replica.Client = client
+			db.Replica.SyncInterval = 50 * time.Millisecond
+			primary := testingutil.MustOpenSQLDB(t, db.Path())
 			defer testingutil.MustCloseSQLDB(t, primary)
 
 			if _, err := primary.Exec("PRAGMA journal_mode=DELETE"); err != nil {
@@ -1242,6 +1245,8 @@ func TestVFS_MultiplePageSizes(t *testing.T) {
 			if _, err := primary.Exec("PRAGMA journal_mode=WAL"); err != nil {
 				t.Fatalf("enable wal: %v", err)
 			}
+			require.NoError(t, db.Open())
+			t.Cleanup(func() { require.NoError(t, db.Close(context.Background())) })
 
 			if _, err := primary.Exec("CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT)"); err != nil {
 				t.Fatalf("create table: %v", err)
@@ -2108,7 +2113,10 @@ func registerTestVFS(tb testing.TB, vfs sqlite3vfs.VFS) string {
 
 func openReplicatedPrimary(tb testing.TB, client litestream.ReplicaClient, monitorInterval, syncInterval time.Duration) (*litestream.DB, *sql.DB) {
 	tb.Helper()
-	db := testingutil.NewDB(tb, filepath.Join(tb.TempDir(), "primary.db"))
+	dir, err := os.MkdirTemp("", "litestream-vfs-primary-")
+	require.NoError(tb, err)
+	tb.Cleanup(func() { require.NoError(tb, os.RemoveAll(dir)) })
+	db := testingutil.NewDB(tb, filepath.Join(dir, "primary.db"))
 	db.MonitorInterval = monitorInterval
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
@@ -2137,7 +2145,8 @@ func forceReplicaSync(tb testing.TB, db *litestream.DB) {
 
 func openVFSReplicaDB(tb testing.TB, vfsName string) *sql.DB {
 	tb.Helper()
-	dsn := fmt.Sprintf("file:%s?vfs=%s", filepath.ToSlash(filepath.Join(tb.TempDir(), vfsName+".db")), vfsName)
+	path := url.URL{Path: filepath.ToSlash(filepath.Join(tb.TempDir(), "replica.db"))}
+	dsn := fmt.Sprintf("file:%s?vfs=%s", path.EscapedPath(), url.QueryEscape(vfsName))
 	sqldb, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		tb.Fatalf("open replica db: %v", err)

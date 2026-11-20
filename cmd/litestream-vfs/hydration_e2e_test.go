@@ -88,7 +88,7 @@ func TestHydration_E2E_SQLiteCLI_TempFile(t *testing.T) {
 	}
 
 	output := runSQLiteCLI(t, extPath, env, "SELECT COUNT(*) FROM users;")
-	require.Contains(t, output, "1", "should read data via VFS with temp hydration file")
+	require.Regexp(t, `(?m)^1$`, output, "should read one row via VFS with temp hydration file")
 }
 
 // TestHydration_E2E_SQLiteCLI_Disabled tests that hydration is disabled by default.
@@ -156,7 +156,7 @@ SELECT name FROM users WHERE id = 1;
 SELECT name FROM users WHERE id = 5;
 `
 	output := runSQLiteCLI(t, extPath, env, queries)
-	require.Contains(t, output, "10", "should have 10 users")
+	require.Regexp(t, `(?m)^10$`, output, "should have 10 users")
 	require.Contains(t, output, "Alice", "should find Alice")
 	require.Contains(t, output, "User5", "should find User5")
 
@@ -248,10 +248,11 @@ func findProjectRoot(t *testing.T) string {
 func runSQLiteCLI(t *testing.T, extPath string, env []string, query string) string {
 	t.Helper()
 
-	// Build command: sqlite3 :memory: -cmd ".load <ext>" "<query>"
 	args := []string{
+		"-bail",
 		":memory:",
-		"-cmd", ".load " + extPath,
+		"-cmd", fmt.Sprintf(".load %q sqlite3_litestreamvfs_init", extPath),
+		"-cmd", ".open file:replica.db?vfs=litestream",
 		query,
 	}
 
@@ -296,7 +297,6 @@ func setupTestReplica(t *testing.T, client litestream.ReplicaClient) {
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }
@@ -328,7 +328,6 @@ func setupTestReplicaWithMoreData(t *testing.T, client litestream.ReplicaClient)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }

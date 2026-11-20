@@ -87,6 +87,14 @@ jobs:
 
       - run: go test -tags vfs -race -count=1 .
 
+      - name: Install SQLite CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Run VFS extension tests
+        run: go test -tags vfs -race -count=1 ./cmd/litestream-vfs
+
   build-windows:
     name: Build Windows
     runs-on: ubuntu-latest

@@ -52,7 +52,6 @@ func TestVFS_WriteAndSync_FileBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
 
@@ -953,7 +952,6 @@ func TestVFS_InvalidPageSize(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
 
@@ -1252,7 +1250,6 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
 	db.Replica.SyncInterval = 50 * time.Millisecond
-	require.NoError(t, db.Open())
 
 	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
 
@@ -1261,6 +1258,8 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	_, err = sqldb.Exec("INSERT INTO users (id, name) VALUES (1, 'Alice')")
 	require.NoError(t, err)
 
+	require.NoError(t, db.Open())
+
 	// Wait for initial LTX file
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
@@ -1268,7 +1267,6 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	require.NoError(t, db.Sync(context.Background()))
 	require.NoError(t, db.Replica.Sync(context.Background()))
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }
