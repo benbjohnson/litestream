@@ -52,7 +52,6 @@ func TestVFS_WriteAndSync_FileBackend(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
 
@@ -953,7 +952,6 @@ func TestVFS_InvalidPageSize(t *testing.T) {
 	require.NoError(t, err)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb0)
 	require.NoError(t, db.Close(context.Background()))
 
@@ -1268,7 +1266,6 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	require.NoError(t, db.Sync(context.Background()))
 	require.NoError(t, db.Replica.Sync(context.Background()))
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }

@@ -118,6 +118,7 @@ func TestVFS_Updating(t *testing.T) {
 	if err := db.Open(); err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { require.NoError(t, db.Close(context.Background())) })
 	sqldb0 := testingutil.MustOpenSQLDB(t, db.Path())
 	defer testingutil.MustCloseSQLDB(t, sqldb0)
 
@@ -149,10 +150,6 @@ func TestVFS_Updating(t *testing.T) {
 	// Ensure replica has updated itself.
 	t.Log("ensuring replica has updated")
 	waitForReplicaValue(t, sqldb1, "SELECT * FROM t", 200, 10*time.Second, db.MonitorInterval)
-
-	if err := db.Replica.Stop(false); err != nil {
-		t.Fatalf("stop replica: %v", err)
-	}
 }
 
 func TestVFS_ActiveReadTransaction(t *testing.T) {

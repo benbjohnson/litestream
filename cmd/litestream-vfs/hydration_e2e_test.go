@@ -248,10 +248,10 @@ func findProjectRoot(t *testing.T) string {
 func runSQLiteCLI(t *testing.T, extPath string, env []string, query string) string {
 	t.Helper()
 
-	// Build command: sqlite3 :memory: -cmd ".load <ext>" "<query>"
 	args := []string{
 		":memory:",
-		"-cmd", ".load " + extPath,
+		"-cmd", ".load " + extPath + " sqlite3_litestreamvfs_init",
+		"-cmd", ".open file:replica.db?vfs=litestream",
 		query,
 	}
 
@@ -296,7 +296,6 @@ func setupTestReplica(t *testing.T, client litestream.ReplicaClient) {
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }
@@ -328,7 +327,6 @@ func setupTestReplicaWithMoreData(t *testing.T, client litestream.ReplicaClient)
 
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
 
-	require.NoError(t, db.Replica.Stop(false))
 	testingutil.MustCloseSQLDB(t, sqldb)
 	require.NoError(t, db.Close(context.Background()))
 }
