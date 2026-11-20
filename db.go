@@ -2993,7 +2993,9 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			return
 		}
 
-		// Exclude transactions that commit beyond the snapshot's advertised position.
+		// Map each changed page to the WAL offset of its latest committed version.
+		// Only include transactions committed within the snapshot's advertised WAL
+		// range, so later writes cannot change the state represented by this snapshot.
 		pageMap := make(map[uint32]int64)
 		var maxOffset int64
 		var walCommit uint32

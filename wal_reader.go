@@ -211,9 +211,16 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	return m, maxOffset, commit, err
 }
 
-// maxBytes limits sync batches at commit boundaries so large transactions make progress.
-// endOffset is an absolute WAL boundary that snapshots must not cross.
-// Zero disables either limit.
+// pageMap maps pages to their latest committed WAL offsets and returns
+// the committed end offset and database size in pages.
+//
+// Limits:
+//   - maxBytes caps bytes scanned from the starting position, allowing
+//     the current transaction to finish.
+//   - endOffset is an absolute WAL boundary; transactions committing
+//     beyond it are excluded.
+//
+// Zero disables the corresponding limit.
 func (r *WALReader) pageMap(ctx context.Context, maxBytes, endOffset int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)
