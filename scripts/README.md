@@ -22,7 +22,7 @@ go build -o bin/litestream-test ./cmd/litestream-test
 Post-test analysis tool for examining overnight test results.
 
 ```bash
-./scripts/analyze-test-results.sh /tmp/litestream-overnight-<timestamp>
+./scripts/analyze-test-results.sh '/tmp/litestream-overnight-<timestamp>'
 ```
 
 **Analyzes:**
@@ -84,7 +84,7 @@ ls /tmp/litestream-overnight-* -dt | head -1
 |----------|----------|-----------|------------------|
 | 5 minutes | CI/CD smoke test | Go integration tests | Basic functionality |
 | 30 minutes | Short integration | Go integration tests | Pattern detection |
-| 2-8 hours | Soak testing | Go soak tests (local only) | Full validation |
+| 2-8 hours | Soak testing | Go soak tests | Full validation |
 
 > **Note:** All soak tests are now Go-based in `tests/integration/`. See [tests/integration/README.md](../tests/integration/README.md) for details on running comprehensive, MinIO, and overnight S3 soak tests.
 
@@ -92,7 +92,7 @@ ls /tmp/litestream-overnight-* -dt | head -1
 
 ### Real-time Monitoring
 
-All tests create timestamped directories in `/tmp/`:
+The legacy analysis script expects the layout shown below. Current Go tests use per-test temporary directories; run with `SOAK_KEEP_TEMP=1` and use the path printed by the test to preserve and inspect them. Their Litestream log is usually `<test-dir>/litestream.log`. For a legacy test directory:
 
 ```bash
 LATEST=$(ls /tmp/litestream-* -dt | head -1)
@@ -109,7 +109,7 @@ tail -f $LATEST/logs/litestream.log
 **Replica Statistics:**
 - Snapshot count should increase over time
 - LTX file count should grow then stabilize (compaction)
-- Replica size should be similar to database size
+- Replica size depends on snapshot history, write volume, compression, and retention
 
 **Operations:**
 - Compactions should occur at scheduled intervals
@@ -143,11 +143,9 @@ Verify credentials:
 aws s3 ls s3://$S3_BUCKET/
 ```
 
-Check environment variables:
+Check that the required variables are set without printing credentials:
 ```bash
-echo $AWS_ACCESS_KEY_ID
-echo $AWS_SECRET_ACCESS_KEY
-echo $S3_BUCKET
+test -n "$AWS_ACCESS_KEY_ID" && test -n "$AWS_SECRET_ACCESS_KEY" && test -n "$S3_BUCKET"
 ```
 
 #### High Error Counts
@@ -167,11 +165,11 @@ sqlite3 /tmp/litestream-*/restored.db "SELECT COUNT(*) FROM test_data"
 
 ### Stopping Tests Early
 
-Go tests can be interrupted with Ctrl+C. They will cleanup gracefully via defer statements.
+Ctrl+C can terminate a Go test without running its deferred cleanup. After interruption, inspect the test logs and check for child processes or containers before removing any artifacts.
 
 ## Test Artifacts
 
-All tests create timestamped directories with comprehensive artifacts:
+The analysis script accepts the following legacy directory layout. Current Go tests have their own layouts documented in [the integration guide](../tests/integration/README.md).
 
 ```
 /tmp/litestream-overnight-<timestamp>/

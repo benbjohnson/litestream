@@ -5,10 +5,7 @@ Litestream
 [![Docker Pulls](https://img.shields.io/docker/pulls/litestream/litestream.svg?maxAge=604800)](https://hub.docker.com/r/litestream/litestream/)
 ==========
 
-Litestream is a standalone disaster recovery tool for SQLite. It runs as a
-background process and safely replicates changes incrementally to another file
-or S3. Litestream only communicates with SQLite through the SQLite API so it
-will not corrupt your database.
+Litestream is a standalone disaster recovery tool for SQLite. It runs in the background, tracks changes in the SQLite write-ahead log, and replicates them incrementally to a local file or a supported remote storage backend.
 
 If you need support or have ideas for improving Litestream, please visit
 [GitHub Issues](https://github.com/benbjohnson/litestream/issues).

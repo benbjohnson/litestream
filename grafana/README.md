@@ -33,9 +33,9 @@ This directory contains a Grafana dashboard for monitoring Litestream metrics.
 The dashboard monitors the following key metrics:
 
 - **Database & WAL Size**: Current size of the database and Write-Ahead Log
-- **Total WAL Bytes Written**: Cumulative bytes written to shadow WAL
+- **Total WAL Bytes Written**: Cumulative WAL bytes processed during sync
 - **Sync Operations**: Rate of sync operations and any sync errors
-- **Sync Duration**: Time spent syncing shadow WAL
+- **Sync Duration**: Time spent capturing WAL changes into local LTX files
 - **Checkpoint Operations**: Rate of checkpoint operations by mode
 - **Checkpoint Errors**: Any checkpoint errors that occur
 - **Transaction ID**: Current transaction ID for each database

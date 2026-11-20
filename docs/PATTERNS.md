@@ -8,7 +8,7 @@ This document contains detailed code patterns, examples, and anti-patterns for w
 - [Atomic File Operations](#atomic-file-operations)
 - [Error Handling](#error-handling)
 - [Locking Patterns](#locking-patterns)
-- [Compaction and Eventual Consistency](#compaction-and-eventual-consistency)
+- [Compaction Inputs](#compaction-inputs)
 - [Resumable Reader Pattern](#resumable-reader-pattern)
 - [Retention Bypass Pattern](#retention-bypass-pattern)
 - [Conditional Write Pattern (Distributed Locking)](#conditional-write-pattern-distributed-locking)
@@ -26,53 +26,13 @@ Replica Layer (replica.go) → Replication mechanics only
 Storage Layer             → ReplicaClient implementations
 ```
 
-### DO: Handle database state in DB layer
+### Refresh local replication state in the DB layer
 
-Database restoration logic belongs in the DB layer, not the Replica layer.
-
-When the database is behind the replica (local TXID < remote TXID):
-
-1. **Clear local L0 cache**: Remove the entire L0 directory and recreate it
-2. **Fetch latest L0 file from replica**: Download the most recent L0 LTX file
-3. **Write using atomic file operations**: Prevent partial/corrupted files
-
-```go
-// CORRECT - DB layer handles database state
-func (db *DB) init() error {
-    // DB layer handles database state
-    if db.needsRestore() {
-        if err := db.restore(); err != nil {
-            return err
-        }
-    }
-    // Then start replica for replication only
-    return db.replica.Start()
-}
-
-func (r *Replica) Start() error {
-    // Replica focuses only on replication
-    return r.startSync()
-}
-```
-
-Reference: `DB.checkDatabaseBehindReplica()` in db.go:670-737
-
-### DON'T: Put database state logic in Replica layer
-
-```go
-// WRONG - Replica should only handle replication concerns
-func (r *Replica) Start() error {
-    // DON'T check database state here
-    if needsRestore() {  // Wrong layer!
-        restoreDatabase()  // Wrong layer!
-    }
-    // Replica should focus only on replication mechanics
-}
-```
+`DB.checkDatabaseBehindReplica` compares the latest local and remote L0 positions before replica monitoring starts. When the remote position is ahead, the DB clears its local L0 cache, invalidates the cached position, and downloads the newest remote L0 file using an atomic write. `Replica.Restore` handles reconstruction of a SQLite database from replica storage. See [`db.go`](../db.go) and [`replica.go`](../replica.go).
 
 ## Atomic File Operations
 
-Always use atomic writes to prevent partial/corrupted files.
+Publish completed files with an atomic rename. Use a temporary file in the destination directory and handle write, sync, and close errors before publishing. Atomic visibility does not by itself guarantee crash durability of the directory entry; that also requires syncing the containing directory where supported. See [`file/replica_client.go`](../file/replica_client.go).
 
 ### DO: Write to temp file, then rename
 
@@ -148,34 +108,9 @@ When you handle an error, ask: "Does the caller need to know about this failure?
 
 When in doubt, return the error. In a disaster recovery tool, silent failures are worse than noisy ones.
 
-### DO: Return errors immediately
+### Return errors to the caller
 
-```go
-// CORRECT - Return error for caller to handle
-func (db *DB) validatePosition() error {
-    dpos, err := db.Pos()
-    if err != nil {
-        return err
-    }
-    rpos := replica.Pos()
-    if dpos.TXID < rpos.TXID {
-        return fmt.Errorf("database position (%v) behind replica (%v)", dpos, rpos)
-    }
-    return nil
-}
-```
-
-### DON'T: Continue on critical errors
-
-```go
-// WRONG - Silently continuing can cause data corruption
-func (db *DB) validatePosition() {
-    if dpos, _ := db.Pos(); dpos.TXID < replica.Pos().TXID {
-        log.Printf("warning: position mismatch")  // Don't just log!
-        // Continuing here is dangerous
-    }
-}
-```
+`DB.SyncAndWait` returns local sync or replica sync failures with stage context. Background monitors report failures where they decide whether and when to retry. See [`db.go`](../db.go) and [`replica.go`](../replica.go).
 
 ### DON'T: Ignore errors and continue in loops
 
@@ -225,34 +160,9 @@ defer r.mu.RUnlock()
 r.pos = pos   // Writing with RLock!
 ```
 
-## Compaction and Eventual Consistency
+## Compaction Inputs
 
-Many storage backends (S3, R2, etc.) are eventually consistent:
-
-- A file you just wrote might not be immediately readable
-- A file might be listed but only partially available
-- Reads might return stale or incomplete data
-
-### DO: Read from local when available
-
-```go
-// CORRECT - Check local first during compaction
-// db.go:1280-1294 - ALWAYS read from local disk when available
-f, err := os.Open(db.LTXPath(info.Level, info.MinTXID, info.MaxTXID))
-if err == nil {
-    // Use local file - it's complete and consistent
-    return f, nil
-}
-// Only fall back to remote if local doesn't exist
-return replica.Client.OpenLTXFile(...)
-```
-
-### DON'T: Read from remote during compaction
-
-```go
-// WRONG - Can get partial/corrupt data from eventually consistent storage
-f, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, 0, 0)
-```
+`Compactor.Compact` prefers local copies when the DB has them. If a local file is missing, the compactor opens the remote LTX file and wraps it in a resumable reader. Other local open errors propagate. Source selection and merge behavior are in [`compactor.go`](../compactor.go).
 
 ## Resumable Reader Pattern
 
@@ -280,21 +190,9 @@ type LTXFileOpener interface {
 - Returns partial reads without error so callers like `io.ReadFull` naturally retry
 - Reopens from current offset using `OpenLTXFile(ctx, level, min, max, offset, 0)`
 
-### DO: Use ResumableReader for restore streams
+### Opening restore streams
 
-```go
-rc, _ := client.OpenLTXFile(ctx, level, min, max, 0, fileInfo.Size)
-rr := internal.NewResumableReader(ctx, client, level, min, max, fileInfo.Size, rc, logger)
-defer rr.Close()
-```
-
-### DON'T: Use raw OpenLTXFile during long restore operations
-
-```go
-rc, _ := client.OpenLTXFile(ctx, level, min, max, 0, 0)
-// Risk: connection may drop during idle periods in multi-file restore
-io.ReadFull(rc, buf) // unexpected EOF!
-```
+`Replica.openRestoreFiles` creates each resumable reader with its expected file size and calls `Open`. If an initial open fails, a subsequent read can retry it. When the reader owns the stream's request context, a stalled read is cancelled after 30 seconds so the reader can reconnect. Retries back off from 250 milliseconds. See [`replica.go`](../replica.go) and [`internal/resumable_reader.go`](../internal/resumable_reader.go).
 
 ## Retention Bypass Pattern
 
@@ -309,7 +207,7 @@ retention:
 
 1. `RetentionConfig{Enabled *bool}` in YAML config (`cmd/litestream/main.go`)
 2. `Store.SetRetentionEnabled(bool)` propagates to all DBs and their compactors (`store.go`)
-3. `Compactor.RetentionEnabled` guards 3 deletion points in `compactor.go`
+3. `Compactor.RetentionEnabled` guards three remote deletion points in `compactor.go`. Local cleanup still runs.
 
 ### DO: Disable retention when cloud lifecycle handles cleanup
 
@@ -352,73 +250,25 @@ _, err := l.s3.DeleteObject(ctx, &s3.DeleteObjectInput{
 
 ### Error Handling
 
-- **HTTP 412 (PreconditionFailed)**: Another instance acquired/renewed the lease
-- **HTTP 404 (NoSuchKey)**: Lease already released
+- Acquisition maps HTTP 412 to `LeaseExistsError`. Renewal and release map HTTP 412 to `ErrLeaseNotHeld`.
+- Release returns `s3.ErrLeaseAlreadyReleased` if the lease is missing.
 
 ## Timestamp Preservation
 
-During compaction, preserve the earliest CreatedAt timestamp from source files to maintain temporal granularity for point-in-time restoration.
-
-### DO: Preserve earliest timestamp
-
-```go
-// CORRECT - Preserve temporal information
-info, err := replica.Client.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
-if err != nil {
-    return fmt.Errorf("write ltx: %w", err)
-}
-info.CreatedAt = oldestSourceFile.CreatedAt
-```
-
-### DON'T: Ignore CreatedAt preservation
-
-```go
-// WRONG - Loses timestamp granularity for point-in-time restores
-info := &ltx.FileInfo{
-    CreatedAt: time.Now(), // Don't use current time during compaction
-}
-```
+Storage clients preserve the timestamp in the incoming LTX header. The file and SFTP clients record it as modification time. The S3 client records it as object metadata and retrieves it for `LTXFiles` calls with `useMetadata=true`. Compacted files get the timestamp of their final input in TXID order from `ltx.Compactor`. See [`compactor.go`](../compactor.go), [`file/replica_client.go`](../file/replica_client.go), and [`s3/replica_client.go`](../s3/replica_client.go).
 
 ## Common Pitfalls
 
-### 1. Mixing architectural concerns
+### Snapshot creation
 
-```go
-// WRONG - Database state logic in Replica layer
-func (r *Replica) Start() error {
-    if db.needsRestore() {  // Wrong layer for DB state!
-        r.restoreDatabase()  // Replica shouldn't manage DB state!
-    }
-    return r.sync()
-}
-```
+`DB.verify` checks WAL and LTX continuity. The sync path uses that result to decide how to capture changes. To write a full L9 snapshot explicitly, use `DB.Snapshot(ctx)`. See [`db.go`](../db.go).
 
-### 2. Recreating existing functionality
-
-```go
-// WRONG - Don't reimplement what already exists
-func customSnapshotTrigger() {
-    // Complex custom logic to trigger snapshots
-    // when db.verify() already does this!
-}
-```
-
-### DO: Leverage existing mechanisms
-
-```go
-// CORRECT - Use what's already there
-func triggerSnapshot() error {
-    return db.verify()  // Already handles snapshot logic correctly
-}
-```
-
-### 3. Skipping the lock page
+### Skipping the lock page
 
 The lock page at 1GB (0x40000000) must always be skipped:
 
 ```go
-// db.go:951-953 - Must skip lock page during replication
-lockPgno := ltx.LockPgno(pageSize)
+lockPgno := ltx.LockPgno(uint32(db.pageSize))
 if pgno == lockPgno {
     continue // Skip this page - it's reserved by SQLite
 }
@@ -457,13 +307,7 @@ type DB struct {
 }
 ```
 
-**Initialization Sequence:**
-
-1. Open database connection
-2. Read page size from database
-3. Initialize long-running read transaction
-4. Start monitor goroutine
-5. Initialize replicas
+**Initialization sequence:** `DB.Open` starts the monitor when configured. The first sync that finds the database opens SQLite, enables WAL, acquires the long-running read transaction, loads the page size and metadata state, and starts the replica monitor. See [`db.go`](../db.go).
 
 ### Replica Component (replica.go)
 
@@ -472,13 +316,11 @@ type DB struct {
 - Manages replication to a single destination (one replica per DB)
 - Tracks replication position (ltx.Pos)
 - Handles sync intervals
-- Manages encryption (if configured)
 
 **Key Operations:**
 
-- `Sync()`: Synchronizes pending changes
-- `SetPos()`: Updates replication position (must use Lock, not RLock!)
-- `Snapshot()`: Creates full database snapshot
+- `Sync(ctx)` uploads pending local L0 files.
+- `SetPos(pos)` updates its tracked replication position under a write lock.
 
 ### ReplicaClient Interface (replica_client.go)
 
@@ -486,7 +328,9 @@ type DB struct {
 
 ```go
 type ReplicaClient interface {
-    Type() string  // Client type identifier
+    Type() string
+    Init(ctx context.Context) error
+    SetLogger(logger *slog.Logger)
 
     // File operations
     LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
@@ -530,17 +374,7 @@ type Compactor struct {
 
 ### Store Component (store.go)
 
-**Default Compaction Levels:**
-
-```go
-var defaultLevels = CompactionLevels{
-    {Level: 0, Interval: 0},        // Raw LTX files (no compaction)
-    {Level: 1, Interval: 30*Second},
-    {Level: 2, Interval: 5*Minute},
-    {Level: 3, Interval: 1*Hour},
-    // Snapshots created daily (24h retention)
-}
-```
+The default compaction intervals are 30 seconds for L1, five minutes for L2, and one hour for L3. L0 stores raw changes. L9 snapshots default to an interval and retention of 24 hours each. See [`compaction_level.go`](../compaction_level.go) and [`store.go`](../store.go).
 
 ## Testing Patterns
 
@@ -558,6 +392,8 @@ go test -race -v -run TestStore_CompactDB ./...
 
 ### Lock Page Testing
 
+Populate a database larger than 1 GB, replicate it, and validate the restored copy against the source.
+
 ```bash
 # Test with various page sizes
 ./bin/litestream-test populate -db test.db -page-size 4096 -target-size 2GB
@@ -569,11 +405,8 @@ go test -race -v -run TestStore_CompactDB ./...
 
 ### Integration Testing
 
+Run the shared replica client tests from the root package. Select the backend and supply its test connection settings as needed.
+
 ```bash
-# Test specific backend
-go test -v ./replica_client_test.go -integration -replica-clients=s3
-go test -v ./replica_client_test.go -integration -replica-clients=gs
-go test -v ./replica_client_test.go -integration -replica-clients=abs
-go test -v ./replica_client_test.go -integration -replica-clients=oss
-go test -v ./replica_client_test.go -integration -replica-clients=sftp
+go test -v . -run '^TestReplicaClient_' -args -integration -replica-clients=file
 ```

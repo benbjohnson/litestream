@@ -1,8 +1,6 @@
 # Litestream VFS
 
-The Litestream VFS (Virtual File System) is a SQLite extension that allows applications to read directly
-from Litestream replica storage (S3, GCS, Azure Blob, etc.) without restoring to local disk. It also
-supports write mode for remote-first SQLite databases.
+The Litestream VFS (Virtual File System) is a SQLite extension that reads from Litestream replica storage on demand. It can also hydrate a local SQLite file in the background for subsequent reads or run in experimental write mode.
 
 ## Table of Contents
 
@@ -21,7 +19,8 @@ The VFS extension provides:
 
 - **Direct replica reading**: Read SQLite databases directly from cloud storage
 - **Automatic polling**: Background polling for new LTX files from the primary
-- **Page caching**: LRU cache for frequently accessed pages (default 10MB)
+- **Page caching**: LRU cache for frequently accessed pages (default 10 MiB)
+- **Hydration**: Build a local read copy in the background while serving reads from the replica
 - **Time travel**: Query historical database states at specific timestamps
 - **Write support**: Write changes that sync back to remote storage (experimental)
 
@@ -37,7 +36,7 @@ The VFS extension provides:
 ### Prerequisites
 
 - SQLite 3.31.0+ runtime
-- Go 1.21+
+- Go 1.26 or later. See [`go.mod`](../go.mod) for the pinned toolchain.
 - GCC (Linux) or Clang (macOS)
 - CGO enabled
 
@@ -81,15 +80,24 @@ make vfs-test
 
 ## Configuration
 
-The VFS is configured via environment variables:
+Environment variables supply defaults. Set the replica URL in the environment or the database URI.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
-| `LITESTREAM_REPLICA_URL` | Replica storage URL (required) | - |
-| `LITESTREAM_LOG_LEVEL` | Log level: `DEBUG` or `INFO` | `INFO` |
+| `LITESTREAM_REPLICA_URL` | Default replica storage URL | - |
+| `LITESTREAM_LOG_LEVEL` | Log level (`DEBUG` or `INFO`) | `INFO` |
+| `LITESTREAM_LOG_FILE` | Append logs to this file | Standard output |
 | `LITESTREAM_WRITE_ENABLED` | Enable write mode: `true` or `false` | `false` |
 | `LITESTREAM_SYNC_INTERVAL` | Write sync interval (e.g., `1s`, `500ms`) | `1s` |
-| `LITESTREAM_BUFFER_PATH` | Local write buffer file path | temp file |
+| `LITESTREAM_BUFFER_PATH` | Local write buffer file path | Temporary file |
+| `LITESTREAM_HYDRATION_ENABLED` | Enable background hydration | `false` |
+| `LITESTREAM_HYDRATION_PATH` | Persistent local hydration file path | Temporary file |
+
+The extension accepts per-database URI options `replica_url`, `write_enabled`, `sync_interval`, `buffer_path`, `hydration_enabled`, `hydration_path`, `poll_interval`, and `cache_size`. Percent-encode the replica URL when embedding it in the database URI. Polling defaults to one second and `cache_size` is measured in bytes. See [`vfs_config.go`](../vfs_config.go) and [`cmd/litestream-vfs/main.go`](../cmd/litestream-vfs/main.go).
+
+### Hydration
+
+When enabled, hydration builds a local SQLite file in the background. Reads continue through the remote page index and cache until the local copy catches up. After cutover, reads use the local file and polling applies new replica transactions. A configured hydration path supports reuse after reopening. `PRAGMA litestream_hydration_progress` and `PRAGMA litestream_hydration_file` report progress and path. See [`vfs.go`](../vfs.go).
 
 ### Replica URL Format
 
@@ -101,7 +109,7 @@ s3://bucket-name/path/to/db
 gs://bucket-name/path/to/db
 
 # Azure Blob Storage
-abs://container-name/path/to/db
+abs://account-name@container-name/path/to/db
 
 # Alibaba OSS
 oss://bucket-name/path/to/db
@@ -113,10 +121,10 @@ file:///path/to/replica
 sftp://user@host:port/path/to/db
 
 # NATS JetStream
-nats://host:port/bucket/path
+nats://host:port/bucket
 
-# WebDAV
-webdav://host:port/path/to/db
+# WebDAV over HTTPS
+webdavs://host:port/path/to/db
 ```
 
 ## Usage
@@ -130,7 +138,7 @@ webdav://host:port/path/to/db
 
 ### Opening a Database
 
-Before loading the extension, set the replica URL:
+To use the environment default, set the replica URL before loading the extension:
 
 ```bash
 export LITESTREAM_REPLICA_URL="s3://my-bucket/mydb"
@@ -144,6 +152,8 @@ Then in SQLite:
 SELECT * FROM my_table;
 ```
 
+To override the replica URL for a connection, use a SQLite URI such as `file:mydb.db?vfs=litestream&replica_url=s3%3A%2F%2Fmy-bucket%2Fmydb`.
+
 ### Python Example
 
 ```python
@@ -152,40 +162,24 @@ import sqlite3
 
 os.environ["LITESTREAM_REPLICA_URL"] = "s3://my-bucket/mydb"
 
-conn = sqlite3.connect(":memory:")
-conn.enable_load_extension(True)
-conn.load_extension("./dist/litestream-vfs.so")
+bootstrap = sqlite3.connect(":memory:")
+try:
+    bootstrap.enable_load_extension(True)
+    bootstrap.load_extension("./dist/litestream-vfs.so")
+finally:
+    bootstrap.close()
 
-# Open database using the litestream VFS
-conn = sqlite3.connect("file:mydb.db?vfs=litestream")
-cursor = conn.execute("SELECT * FROM users")
-for row in cursor:
-    print(row)
+conn = sqlite3.connect("file:mydb.db?vfs=litestream", uri=True)
+try:
+    for row in conn.execute("SELECT * FROM users"):
+        print(row)
+finally:
+    conn.close()
 ```
 
-### Go Example
+### Go Library Usage
 
-```go
-import (
-    "database/sql"
-    "os"
-
-    _ "github.com/mattn/go-sqlite3"
-)
-
-func main() {
-    os.Setenv("LITESTREAM_REPLICA_URL", "s3://my-bucket/mydb")
-
-    db, err := sql.Open("sqlite3", "file:mydb.db?vfs=litestream")
-    if err != nil {
-        panic(err)
-    }
-    defer db.Close()
-
-    rows, err := db.Query("SELECT * FROM users")
-    // ...
-}
-```
+The Go library provides `litestream.NewVFS` for registering with `sqlite3vfs.RegisterVFS`. The extension tests show registration, opening a connection with `vfs=litestream`, and querying a replica. See [`cmd/litestream-vfs/time_travel_test.go`](../cmd/litestream-vfs/time_travel_test.go).
 
 ## SQL Functions
 
@@ -202,7 +196,7 @@ SELECT litestream_txid();
 
 ### `litestream_time()`
 
-Returns the current view timestamp (RFC3339 format) or `"latest"`.
+Returns the requested historical timestamp or the latest observed LTX timestamp in RFC3339 format. Before a timestamp is known, it returns `"latest"`.
 
 ```sql
 SELECT litestream_time();
@@ -215,7 +209,7 @@ Returns seconds since the last successful poll for new LTX files. Returns `-1` i
 
 ```sql
 SELECT litestream_lag();
--- Returns: 2 (seconds behind primary)
+-- Returns: 2 (seconds since the last successful poll)
 ```
 
 ### `litestream_set_time(timestamp)`
@@ -262,9 +256,9 @@ SELECT litestream_set_time('LATEST');
 ### Time Travel Limitations
 
 - Time travel rebuilds the page index, which may take time for large databases
-- Historical data is only available if LTX files haven't been compacted away
-- L0 retention settings affect how far back you can travel
-- Time travel is read-only (writes are disabled while viewing historical state)
+- Available restore points depend on retained LTX files and their compaction levels
+- The connection pauses follower updates while viewing a historical state
+- Leave write mode disabled on connections used for historical queries
 
 ## Write Mode
 
@@ -280,19 +274,17 @@ export LITESTREAM_SYNC_INTERVAL="1s"
 
 ### How Write Mode Works
 
-1. Writes are captured to a local buffer file for durability
-2. Dirty pages are tracked in memory
-3. Periodically (or on close), dirty pages are packaged into an LTX file
-4. The LTX file is uploaded to remote storage
-5. Conflict detection prevents overwrites if the remote has newer transactions
+1. The VFS stages changed pages in a local buffer file and tracks their offsets in memory.
+2. On the sync interval or at close, the VFS checks the remote L0 TXID for conflicts.
+3. If the check passes, the VFS packages dirty pages into an LTX file and uploads it.
 
 ### Write Mode Considerations
 
 - **Connection pooling**: Multiple connections can be opened in write mode (for example, by `database/sql`)
-- **Single writer**: Write contention is enforced at lock acquisition. If another connection already holds write intent, SQLite returns `SQLITE_BUSY`
-- **Conflict detection**: If the remote has advanced unexpectedly, `ErrConflict` is returned
-- **Buffer durability**: The local buffer file provides crash recovery for uncommitted writes
-- **Sync interval**: Balance between durability (shorter) and performance (longer)
+- **Single writer**: Connections sharing a VFS instance acquire write intent one at a time. Contending connections receive `SQLITE_BUSY`.
+- **Conflict detection**: Sync returns `ErrConflict` if the remote L0 listing shows a newer TXID than expected. Configure one writer for a replica destination.
+- **Write buffer**: The buffer is cleared on open. A restart loses changes that were still waiting for upload.
+- **Sync interval**: A shorter interval reduces how long changes wait for remote upload.
 - **New databases**: Write mode can create new databases from scratch if no LTX files exist
 
 ### Creating a New Database
@@ -315,13 +307,13 @@ The VFS supports all Litestream storage backends:
 | Backend | URL Scheme | Notes |
 |---------|-----------|-------|
 | Amazon S3 | `s3://` | Supports S3-compatible services (MinIO, DigitalOcean Spaces, etc.) |
-| Google Cloud Storage | `gs://` | Requires `GOOGLE_APPLICATION_CREDENTIALS` |
-| Azure Blob Storage | `abs://` | Requires `AZURE_STORAGE_ACCOUNT` and credentials |
+| Google Cloud Storage | `gs://` | Uses Application Default Credentials |
+| Azure Blob Storage | `abs://` | Pass the account in the URL or specify an endpoint. Uses SAS, account key, or default credentials. |
 | Alibaba OSS | `oss://` | Object Storage Service |
 | Local filesystem | `file://` | Useful for testing and development |
 | SFTP | `sftp://` | SSH File Transfer Protocol |
 | NATS JetStream | `nats://` | Object store via NATS |
-| WebDAV | `webdav://` | Web Distributed Authoring and Versioning |
+| WebDAV | `webdav://`, `webdavs://` | HTTP or HTTPS |
 
 ### S3 Configuration
 
@@ -360,9 +352,9 @@ The VFS waits for LTX files to become available. Ensure:
 
 ### High latency reads
 
-- Increase `CacheSize` for larger page cache
-- Reduce `PollInterval` for more responsive updates
-- Consider using a closer storage region
+- Increase `cache_size` in the database URI to keep more pages in memory.
+- Use hydration for local reads after the replica copy catches up.
+- Reduce `poll_interval` in the database URI to check for updates more frequently.
 
 ### Debug logging
 

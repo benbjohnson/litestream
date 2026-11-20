@@ -32,10 +32,10 @@ if command -v go >/dev/null 2>&1; then
     GO_VERSION=$(go version | sed 's/.*go\([0-9]*\.[0-9]*\).*/\1/')
     GO_MAJOR=$(echo "$GO_VERSION" | cut -d. -f1)
     GO_MINOR=$(echo "$GO_VERSION" | cut -d. -f2)
-    if [ "$GO_MAJOR" -ge 1 ] && [ "$GO_MINOR" -ge 24 ]; then
-        pass "Go $(go version | sed 's/.*go/go/' | cut -d' ' -f1) installed (>= 1.24 required)"
+    if [ "$GO_MAJOR" -ge 1 ] && [ "$GO_MINOR" -ge 26 ]; then
+        pass "Go $(go version | sed 's/.*go/go/' | cut -d' ' -f1) installed (>= 1.26 required)"
     else
-        fail "Go $GO_VERSION found but >= 1.24 required"
+        fail "Go $GO_VERSION found but >= 1.26 required"
     fi
 else
     fail "Go not found in PATH"

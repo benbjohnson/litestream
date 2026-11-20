@@ -1,6 +1,6 @@
 # Litestream
 
-Disaster recovery tool for SQLite. Replicates WAL changes to S3, GCS, Azure, SFTP, or local filesystem.
+Disaster recovery tool for SQLite. Replicates WAL changes to a local file or a supported remote storage backend.
 
 ## Quick Start for AI Contributors
 
@@ -8,6 +8,8 @@ Disaster recovery tool for SQLite. Replicates WAL changes to S3, GCS, Azure, SFT
 2. Read [AGENTS.md](AGENTS.md) - Project overview and checklist
 3. Check [CONTRIBUTING.md](CONTRIBUTING.md) - What we accept
 4. Show investigation evidence in PRs
+5. For a review of a PR, commits, or local changes, use the `litestream-review` skill in [.agents/skills/litestream-review/SKILL.md](.agents/skills/litestream-review/SKILL.md)
+6. For implementation, debugging, or testing, use the shared `litestream` workflows in [.agents/skills/litestream/SKILL.md](.agents/skills/litestream/SKILL.md)
 
 ## PR Checklist
 
@@ -28,6 +30,8 @@ Disaster recovery tool for SQLite. Replicates WAL changes to S3, GCS, Azure, SFT
 | [docs/LTX_FORMAT.md](docs/LTX_FORMAT.md) | Replication format |
 | [docs/TESTING_GUIDE.md](docs/TESTING_GUIDE.md) | Test strategies |
 | [docs/REPLICA_CLIENT_GUIDE.md](docs/REPLICA_CLIENT_GUIDE.md) | Storage backends |
+| [docs/PROVIDER_COMPATIBILITY.md](docs/PROVIDER_COMPATIBILITY.md) | Provider-specific S3 and cloud configuration |
+| [docs/VFS.md](docs/VFS.md) | SQLite VFS extension |
 
 ## Core Files
 
@@ -46,6 +50,8 @@ Disaster recovery tool for SQLite. Replicates WAL changes to S3, GCS, Azure, SFT
 - `sftp/replica_client.go` - SFTP
 - `file/replica_client.go` - Local filesystem
 - `nats/replica_client.go` - NATS JetStream
+- `oss/replica_client.go` - Alibaba Cloud OSS
+- `webdav/replica_client.go` - WebDAV
 
 ## Critical Concepts
 

@@ -38,6 +38,16 @@ We welcome AI-assisted contributions for bug fixes and small improvements. Wheth
 - [AI_PR_GUIDE.md](AI_PR_GUIDE.md) - Detailed guide with templates and examples
 - [AGENTS.md](AGENTS.md) - Project overview for AI assistants
 
+For an agent-assisted review, ask “Use litestream-review to review my changes.” It reviews PRs, commits, and local changes and applies fixes when requested. If automatic discovery is unavailable, load [.agents/skills/litestream-review/SKILL.md](.agents/skills/litestream-review/SKILL.md) directly. Benchmark execution requires approval.
+
+For implementation, debugging, and test design, ask “Use litestream to investigate the WAL growth” or load [.agents/skills/litestream/SKILL.md](.agents/skills/litestream/SKILL.md). This skill contains the shared specialist workflows and links to the maintained guides in `docs/`. Use it from a Litestream checkout; copying the skill alone does not include those guides or the source it needs.
+
+Antigravity, Codex, and OpenCode discover both skills in `.agents/skills`; Claude Code reads the same files through `.claude/skills`, a directory symlink. See the [Antigravity](https://antigravity.google/docs/skills), [Codex](https://developers.openai.com/codex/skills), [OpenCode](https://opencode.ai/docs/skills/), and [Claude Code](https://code.claude.com/docs/en/skills) discovery documentation. Maintain skill content only in `.agents/skills`.
+
+The shared `litestream` workflows replace the former five Claude-only specialist agents and nine command names. Ask for the task in ordinary language or invoke `litestream` explicitly. For delegation, pass a general-purpose worker the checkout, task, and canonical skill/workflow paths; named subagent registration is host-specific. If a Windows checkout has symlinks disabled, Claude's automatic discovery through `.claude/skills` is unavailable; load the canonical `SKILL.md` paths above directly.
+
+Project instructions live in `AGENTS.md`; Claude Code requires v2.1.277 or later to load it directly, with no project or ancestor `CLAUDE.md` override. See [Claude Code's instruction-loading rules](https://code.claude.com/docs/en/memory#agentsmd) for configuration exceptions.
+
 ## How to Contribute
 
 ### Reporting Bugs
@@ -89,8 +99,8 @@ Your PR should:
 
 ### Prerequisites
 
-- Go 1.24 or later
-- CGO enabled (for SQLite integration)
+- Go 1.26.0 or later; see [go.mod](go.mod) for the selected toolchain
+- CGO and a C compiler for race tests, `litestream-test`, and SQLite VFS/integration tests
 - Git
 - Pre-commit (optional but recommended): `pip install pre-commit`
 
@@ -150,8 +160,8 @@ before merging:
 go build -o bin/litestream ./cmd/litestream
 go build -o bin/litestream-test ./cmd/litestream-test
 
-# Run the behavioral test suite (~11m15s with -short)
-go test -tags 'integration,soak' -run TestLTXBehavior -short -v -timeout 20m ./tests/integration/
+# Run the behavioral test suite
+LOG_LEVEL=DEBUG go test -tags 'integration,soak' -run '^TestLTXBehavior($|_ProfileConfigIsolation$)' -short -v -timeout 15m ./tests/integration/
 ```
 
 This verifies LTX files are the right size and frequency, snapshots aren't excessive,
@@ -162,7 +172,7 @@ and compaction timing is correct.
 If you discover a security vulnerability, please:
 
 1. **DO NOT** open a public issue
-2. Email the maintainers directly with details
+2. Use [GitHub private vulnerability reporting](https://github.com/benbjohnson/litestream/security/advisories/new), as described in [SECURITY.md](SECURITY.md)
 3. Allow time for the issue to be addressed before public disclosure
 
 ## Code of Conduct
