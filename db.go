@@ -10,6 +10,7 @@ import (
 	"hash/crc64"
 	"io"
 	"log/slog"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -1132,8 +1133,9 @@ func (db *DB) init(ctx context.Context) (err error) {
 	}
 	db.dirInfo = fi
 
+	path := url.URL{Path: db.path}
 	dsn := fmt.Sprintf("file:%s?_pragma=busy_timeout(%d)&_pragma=wal_autocheckpoint(0)",
-		db.path, db.BusyTimeout.Milliseconds())
+		path.EscapedPath(), db.BusyTimeout.Milliseconds())
 
 	if db.db, err = sql.Open("sqlite", dsn); err != nil {
 		return err
