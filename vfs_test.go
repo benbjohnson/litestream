@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -836,10 +837,18 @@ func (vfsTestLogger) SetLogger(*slog.Logger) {}
 // mockReplicaClient implements ReplicaClient for deterministic LTX fixtures.
 type mockReplicaClient struct {
 	vfsTestLogger
-	mu    sync.Mutex
-	files []*ltx.FileInfo
-	data  map[string][]byte
+	mu       sync.Mutex
+	files    []*ltx.FileInfo
+	data     map[string][]byte
+	closeErr error
 }
+
+type hydrationTestReader struct {
+	io.Reader
+	err error
+}
+
+func (r *hydrationTestReader) Close() error { return r.err }
 
 type blockingReplicaClient struct {
 	*mockReplicaClient
@@ -938,6 +947,9 @@ func (c *mockReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID,
 	slice := data[offset:]
 	if size > 0 && size < int64(len(slice)) {
 		slice = slice[:size]
+	}
+	if c.closeErr != nil {
+		return &hydrationTestReader{Reader: bytes.NewReader(slice), err: c.closeErr}, nil
 	}
 	return io.NopCloser(bytes.NewReader(slice)), nil
 }
@@ -1417,6 +1429,41 @@ func TestHydrator_Close_Persistent(t *testing.T) {
 	if got := strings.TrimSpace(string(data)); got != "5" {
 		t.Fatalf("expected meta TXID=5, got %q", got)
 	}
+}
+
+func TestHydrator_Restore_WriteFailure(t *testing.T) {
+	stack := make([]byte, 1<<20)
+	before := strings.Count(string(stack[:runtime.Stack(stack, true)]), "(*Hydrator).Restore.func")
+	client := newMockReplicaClient()
+	client.closeErr = errors.New("injected hydration input close failure")
+	pgnos := make([]uint32, 100)
+	for i := range pgnos {
+		pgnos[i] = uint32(i + 1)
+	}
+	fixture := buildLTXFixtureWithPages(t, 1, 4096, pgnos, 'a')
+	client.addFixture(t, fixture)
+
+	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), true, 4096, client, slog.Default())
+	if err := h.Init(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.Restore(context.Background(), []*ltx.FileInfo{fixture.info}); !errors.Is(err, client.closeErr) || !strings.Contains(err.Error(), "write page") {
+		t.Fatalf("expected hydration write error, got %v", err)
+	}
+	for deadline := time.Now().Add(time.Second); ; {
+		after := strings.Count(string(stack[:runtime.Stack(stack, true)]), "(*Hydrator).Restore.func")
+		if after <= before {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("hydration compactor outlived failed restore")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
 }
 
 func TestHydrator_Init_Resume(t *testing.T) {
@@ -2539,6 +2586,12 @@ func TestVFSFile_Hydration_CompletionPreservesActiveRead(t *testing.T) {
 }
 
 func TestHydrator_Restore_CancelsSourceOnWriteError(t *testing.T) {
+	t.Run("ContextUnblocksRead", func(t *testing.T) { testHydratorRestoreWriteError(t, false) })
+	t.Run("CloseUnblocksRead", func(t *testing.T) { testHydratorRestoreWriteError(t, true) })
+}
+
+func testHydratorRestoreWriteError(t *testing.T, closeUnblocksRead bool) {
+	t.Helper()
 	var buf bytes.Buffer
 	enc, err := ltx.NewEncoder(&buf)
 	if err != nil {
@@ -2553,6 +2606,11 @@ func TestHydrator_Restore_CancelsSourceOnWriteError(t *testing.T) {
 	}
 	closeErr := errors.New("close hydration source")
 	client := &cancelledHydrationClient{ReplicaClient: newMockReplicaClient(), data: buf.Bytes(), closeErr: closeErr}
+	var sourceWriter *io.PipeWriter
+	if closeUnblocksRead {
+		client.pipe, sourceWriter = io.Pipe()
+		defer sourceWriter.Close()
+	}
 	h := NewHydrator(filepath.Join(t.TempDir(), "hydration.db"), false, 512, client, slog.Default())
 	if err := h.Init(); err != nil {
 		t.Fatal(err)
@@ -2569,10 +2627,16 @@ func TestHydrator_Restore_CancelsSourceOnWriteError(t *testing.T) {
 		if !errors.Is(err, os.ErrClosed) || !errors.Is(err, closeErr) {
 			t.Fatalf("want destination and source close errors, got %v", err)
 		}
+		if got := client.closeN.Load(); got != 1 {
+			t.Fatalf("source closed %d times, want 1", got)
+		}
 	case <-time.After(time.Second):
 		cancel()
+		if sourceWriter != nil {
+			_ = sourceWriter.Close()
+		}
 		<-done
-		t.Fatal("hydration did not cancel its source after destination failure")
+		t.Fatal("hydration did not stop its source after destination failure")
 	}
 }
 
@@ -2580,26 +2644,39 @@ type cancelledHydrationClient struct {
 	ReplicaClient
 	data     []byte
 	closeErr error
+	pipe     *io.PipeReader
+	closeN   atomic.Int32
 }
 
 func (c *cancelledHydrationClient) OpenLTXFile(ctx context.Context, _ int, _, _ ltx.TXID, _, _ int64) (io.ReadCloser, error) {
-	return &cancelledHydrationReader{Reader: bytes.NewReader(c.data), ctx: ctx, closeErr: c.closeErr}, nil
+	return &cancelledHydrationReader{Reader: bytes.NewReader(c.data), ctx: ctx, client: c}, nil
 }
 
 type cancelledHydrationReader struct {
 	*bytes.Reader
-	ctx      context.Context
-	closeErr error
+	ctx    context.Context
+	client *cancelledHydrationClient
 }
 
 func (r *cancelledHydrationReader) Read(p []byte) (int, error) {
 	if r.Len() == 0 {
+		if r.client.pipe != nil {
+			return r.client.pipe.Read(p)
+		}
 		<-r.ctx.Done()
 		return 0, r.ctx.Err()
 	}
 	return r.Reader.Read(p)
 }
-func (r *cancelledHydrationReader) Close() error { <-r.ctx.Done(); return r.closeErr }
+
+func (r *cancelledHydrationReader) Close() error {
+	<-r.ctx.Done()
+	r.client.closeN.Add(1)
+	if r.client.pipe != nil {
+		_ = r.client.pipe.Close()
+	}
+	return r.client.closeErr
+}
 
 func TestHydrator_ApplyLTX_VerifiesFile(t *testing.T) {
 	newHydrator := func(t *testing.T, client ReplicaClient) *Hydrator {
