@@ -211,18 +211,9 @@ func (r *WALReader) PageMap(ctx context.Context) (m map[uint32]int64, maxOffset 
 	return m, maxOffset, commit, err
 }
 
-// pageMap reads committed frames and returns a map of pgno to the offset of
-// the latest version of each page, along with the max offset read and the
-// final database size, in pages.
-//
-// maxBytes, when positive, soft-bounds the number of frame bytes read from
-// the reader's starting position: the scan stops at the first commit frame
-// at or past the bound, so a transaction that straddles the bound is still
-// read through to its commit and at least one transaction is consumed.
-//
-// endOffset, when positive, hard-bounds the scan to frames that end at or
-// before that WAL file offset: no frame past the bound is read, so a
-// transaction whose commit frame lies past the bound is discarded entirely.
+// maxBytes limits sync batches at commit boundaries so large transactions make progress.
+// endOffset is an absolute WAL boundary that snapshots must not cross.
+// Zero disables either limit.
 func (r *WALReader) pageMap(ctx context.Context, maxBytes, endOffset int64) (m map[uint32]int64, maxOffset int64, commit uint32, limited bool, err error) {
 	m = make(map[uint32]int64)
 	txMap := make(map[uint32]int64)

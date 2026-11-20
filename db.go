@@ -2993,10 +2993,7 @@ func (db *DB) snapshotReader(ctx context.Context, pos *snapshotReadPosition) (io
 			return
 		}
 
-		// Build a mapping of changed page numbers and their latest content.
-		// The read is hard-bounded to the advertised WAL end so a transaction
-		// that straddles the bound is discarded rather than read through to a
-		// commit frame past the bound (#1490).
+		// Exclude transactions that commit beyond the snapshot's advertised position.
 		pageMap := make(map[uint32]int64)
 		var maxOffset int64
 		var walCommit uint32

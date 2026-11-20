@@ -1050,15 +1050,8 @@ func TestWALReaderPageMapLimitStopsAtCommittedFrame(t *testing.T) {
 	}
 }
 
-// TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction verifies that
-// a hard end offset is never read past, even when a transaction straddles it.
-// Regression test for #1490: the commit-frame break used to read a straddling
-// transaction through to its commit frame past the bound, which snapshotReader
-// then rejected with "snapshot wal read exceeded bound".
 func TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction(t *testing.T) {
-	// The fixture WAL holds two transactions: frames at offsets 32 and 4152
-	// committing at offset 8272, and one frame at offset 8272 committing at
-	// offset 12392.
+	// The fixture has two transactions ending at offsets 8272 and 12392.
 	b, err := os.ReadFile("testdata/wal-reader/ok/wal")
 	if err != nil {
 		t.Fatal(err)
@@ -1070,8 +1063,6 @@ func TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction(t *testing.T)
 			t.Fatal(err)
 		}
 
-		// Bound inside the first transaction: the partial transaction must be
-		// discarded, not read through to its commit frame at offset 8272.
 		pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 0, 4152)
 		if err != nil {
 			t.Fatal(err)
@@ -1096,8 +1087,6 @@ func TestWALReaderPageMapEndOffsetStopsBeforeStraddlingTransaction(t *testing.T)
 			t.Fatal(err)
 		}
 
-		// Bound exactly at the first transaction's commit frame end: the
-		// transaction must still be included.
 		pageMap, maxOffset, commit, limited, err := r.pageMap(context.Background(), 0, 8272)
 		if err != nil {
 			t.Fatal(err)
