@@ -3191,21 +3191,14 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 
 	dbName := filepath.Base(db.Path())
 
-	// Determine the highest TXID that has been compacted into L1.
-	itr, err := db.Replica.Client.LTXFiles(ctx, 1, 0, false)
+	// Determine the highest TXID that has been compacted into L1. The compactor
+	// caches this after each L1 write, so we avoid listing all of L1 on every
+	// check. L1 grows with snapshot retention, so a full listing gets costly.
+	l1Info, err := db.compactor.MaxLTXFileInfo(ctx, 1)
 	if err != nil {
 		return fmt.Errorf("fetch l1 files: %w", err)
 	}
-	var maxL1TXID ltx.TXID
-	for itr.Next() {
-		info := itr.Item()
-		if info.MaxTXID > maxL1TXID {
-			maxL1TXID = info.MaxTXID
-		}
-	}
-	if err := itr.Close(); err != nil {
-		return fmt.Errorf("close l1 iterator: %w", err)
-	}
+	maxL1TXID := l1Info.MaxTXID
 	if maxL1TXID == 0 {
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "eligible").Set(0)
 		internal.L0RetentionGaugeVec.WithLabelValues(dbName, "not_compacted").Set(0)
@@ -3214,7 +3207,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	}
 
 	threshold := time.Now().Add(-db.L0Retention)
-	itr, err = db.Replica.Client.LTXFiles(ctx, 0, 0, false)
+	itr, err := db.Replica.Client.LTXFiles(ctx, 0, 0, false)
 	if err != nil {
 		return fmt.Errorf("fetch l0 files: %w", err)
 	}
