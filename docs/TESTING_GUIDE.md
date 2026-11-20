@@ -14,10 +14,10 @@ Choose the assertions for the failure under review. [The store sync test](../sto
 
 ```bash
 go test -tags vfs -race -count=1 .
-CGO_ENABLED=1 go test -tags vfs -v ./cmd/litestream-vfs
+CGO_ENABLED=1 go test -tags vfs -race -count=1 -v ./cmd/litestream-vfs
 ```
 
-The first VFS command matches the race job in [the commit workflow](../.github/workflows/commit.yml). Some tests in the second command exercise the loadable extension and need the tools described in the [VFS guide](VFS.md). Check the verbose output for skipped tests.
+The VFS race job in [the commit workflow](../.github/workflows/commit.yml) runs both packages and installs the SQLite CLI for the loadable extension tests. For local runs, see the tool requirements in the [VFS guide](VFS.md) and check the verbose output for skipped tests.
 
 ## Replica client integration
 

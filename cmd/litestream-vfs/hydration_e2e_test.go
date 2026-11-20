@@ -88,7 +88,7 @@ func TestHydration_E2E_SQLiteCLI_TempFile(t *testing.T) {
 	}
 
 	output := runSQLiteCLI(t, extPath, env, "SELECT COUNT(*) FROM users;")
-	require.Contains(t, output, "1", "should read data via VFS with temp hydration file")
+	require.Regexp(t, `(?m)^1$`, output, "should read one row via VFS with temp hydration file")
 }
 
 // TestHydration_E2E_SQLiteCLI_Disabled tests that hydration is disabled by default.
@@ -156,7 +156,7 @@ SELECT name FROM users WHERE id = 1;
 SELECT name FROM users WHERE id = 5;
 `
 	output := runSQLiteCLI(t, extPath, env, queries)
-	require.Contains(t, output, "10", "should have 10 users")
+	require.Regexp(t, `(?m)^10$`, output, "should have 10 users")
 	require.Contains(t, output, "Alice", "should find Alice")
 	require.Contains(t, output, "User5", "should find User5")
 
