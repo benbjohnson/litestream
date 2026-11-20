@@ -1250,7 +1250,6 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	db.Replica = litestream.NewReplica(db)
 	db.Replica.Client = client
 	db.Replica.SyncInterval = 50 * time.Millisecond
-	require.NoError(t, db.Open())
 
 	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
 
@@ -1258,6 +1257,8 @@ func setupInitialDB(t *testing.T, client litestream.ReplicaClient) {
 	require.NoError(t, err)
 	_, err = sqldb.Exec("INSERT INTO users (id, name) VALUES (1, 'Alice')")
 	require.NoError(t, err)
+
+	require.NoError(t, db.Open())
 
 	// Wait for initial LTX file
 	waitForLTXFiles(t, client, 10*time.Second, db.MonitorInterval)
