@@ -3108,25 +3108,19 @@ func snapshotHeaderWALRange(maxOffset, frameSize int64) (offset, size int64) {
 }
 
 // Compact performs a compaction of the LTX file at the previous level into dstLevel.
-// Returns metadata for the newly written compaction file. Returns ErrNoCompaction
-// if no new files are available to be compacted.
+// Returns metadata for the published file even if cleanup fails. Returns
+// ErrNoCompaction if no new files are available to be compacted.
 func (db *DB) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
 	info, err := db.compactor.Compact(ctx, dstLevel)
-	if err != nil {
-		return nil, err
-	}
 
 	// If this is L1, clean up L0 files using the time-based retention policy.
-	if dstLevel == 1 {
-		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
-			// Don't log context cancellation errors during shutdown
-			if !isShutdownError(ctx, err) {
-				db.Logger.Error("enforce L0 time retention", "error", err)
-			}
+	if info != nil && dstLevel == 1 {
+		if retentionErr := db.EnforceL0RetentionByTime(ctx); retentionErr != nil {
+			err = errors.Join(err, fmt.Errorf("enforce L0 time retention: %w", retentionErr))
 		}
 	}
 
-	return info, nil
+	return info, err
 }
 
 // Snapshot writes a snapshot to the replica for the current database position.
