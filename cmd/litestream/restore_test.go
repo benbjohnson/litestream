@@ -481,6 +481,58 @@ func TestRestoreCommand_RunIfReplicaExists(t *testing.T) {
 	}
 }
 
+func TestRestoreCommand_RunForcePreservesOutputOnFailure(t *testing.T) {
+	for _, name := range []string{"missing backup", "missing backup skipped", "corrupt backup"} {
+		t.Run(name, func(t *testing.T) {
+			ctx := t.Context()
+			replicaPath := t.TempDir()
+			outputPath := filepath.Join(t.TempDir(), "restore.db")
+			args := []string{"-force", "-o", outputPath}
+			if name == "corrupt backup" {
+				path := litestream.LTXFilePath(replicaPath, 0, 1, 1)
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, []byte("invalid backup"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if name == "missing backup skipped" {
+				args = append(args, "-if-replica-exists")
+			}
+			suffixes := []string{"", "-wal", "-shm", "-journal"}
+			for _, suffix := range suffixes {
+				if err := os.WriteFile(outputPath+suffix, []byte("original"+suffix), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			err := (&RestoreCommand{}).Run(ctx, append(args, "file://"+replicaPath))
+			switch name {
+			case "missing backup skipped":
+				if err != nil {
+					t.Fatalf("expected skipped restore, got %v", err)
+				}
+			case "missing backup":
+				if !errors.Is(err, litestream.ErrTxNotAvailable) {
+					t.Fatalf("expected unavailable backup, got %v", err)
+				}
+			case "corrupt backup":
+				if err == nil || errors.Is(err, litestream.ErrTxNotAvailable) {
+					t.Fatalf("expected restore to fail reading the backup, got %v", err)
+				}
+			}
+			for _, suffix := range suffixes {
+				if got, err := os.ReadFile(outputPath + suffix); err != nil || string(got) != "original"+suffix {
+					t.Errorf("existing %q file was not preserved: %q, %v", suffix, got, err)
+				}
+			}
+			if dirs, err := filepath.Glob(filepath.Join(filepath.Dir(outputPath), ".litestream-restore-*")); err != nil || len(dirs) != 0 {
+				t.Fatalf("staging directories remain: %v, %v", dirs, err)
+			}
+		})
+	}
+}
+
 func TestRestoreCommand_RestoreReportsAdvancedTXID(t *testing.T) {
 	ctx := context.Background()
 	client := &advancingRestoreCommandClient{ReplicaClient: file.NewReplicaClient(t.TempDir())}
