@@ -25,8 +25,8 @@ type ReplicaClient interface {
 	// Implementations should be idempotent (no-op if already initialized).
 	Init(ctx context.Context) error
 
-	// LTXFiles returns an iterator of all LTX files on the replica for a given level.
-	// If seek is specified, the iterator start from the given TXID or the next available if not found.
+	// LTXFiles returns LTX files for a given level, sorted by MinTXID then MaxTXID.
+	// If seek is specified, files whose MinTXID is below seek are excluded.
 	// If useMetadata is true, the iterator fetches accurate timestamps from metadata for timestamp-based restore.
 	// When false, the iterator uses fast timestamps (LastModified/Created/ModTime) for normal operations.
 	LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error)
