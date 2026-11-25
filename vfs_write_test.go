@@ -569,6 +569,52 @@ func TestVFSFile_PollUnsyncedGrowthIsNotAShrink(t *testing.T) {
 	}
 }
 
+func TestVFSFile_PollOlderL1PreservesUnsyncedTruncate(t *testing.T) {
+	ctx := t.Context()
+	client := newWriteTestReplicaClient()
+	const pageSize = 4096
+	page := bytes.Repeat([]byte{'a'}, pageSize)
+	createTestLTXFile(t, client, 1, pageSize, 1, map[uint32][]byte{1: page})
+
+	f := setupWriteableVFSFile(t, client)
+	f.PollInterval = time.Hour
+	if err := f.Open(); err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	compactor := NewCompactor(client, slog.Default())
+	if _, err := compactor.Compact(ctx, 1); err != nil {
+		t.Fatalf("compact TXID 1: %v", err)
+	}
+	if _, err := f.WriteAt(page, pageSize); err != nil {
+		t.Fatalf("write page 2: %v", err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatalf("sync page 2: %v", err)
+	}
+
+	if _, err := f.WriteAt(bytes.Repeat([]byte{'b'}, pageSize), 0); err != nil {
+		t.Fatalf("rewrite page 1: %v", err)
+	}
+	if err := f.Truncate(pageSize); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.pollReplicaClient(ctx); err != nil {
+		t.Fatalf("poll compacted TXID 1: %v", err)
+	}
+	if err := f.Sync(0); err != nil {
+		t.Fatalf("sync truncate: %v", err)
+	}
+	hdr, err := FetchLTXHeader(ctx, client, &ltx.FileInfo{Level: 0, MinTXID: 3, MaxTXID: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hdr.Commit != 1 {
+		t.Fatalf("synced truncate has %d pages, want 1", hdr.Commit)
+	}
+}
+
 func TestVFSFile_ConflictDetection(t *testing.T) {
 	client := newWriteTestReplicaClient()
 

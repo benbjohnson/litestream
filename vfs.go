@@ -2904,20 +2904,17 @@ func (f *VFSFile) pollReplicaClient(ctx context.Context) error {
 		f.logger.Debug("cache invalidated pages due to new ltx files", "count", invalidateN)
 	}
 
-	if replaceIndex {
-		f.commit = newCommit
-	} else if len(combined) > 0 && newCommit > f.commit {
-		f.commit = newCommit
-	}
-	if replaceIndex || len(combined) > 0 {
+	f.pos.TXID = max(level0.maxTXID, level1.maxTXID)
+	if f.pos.TXID > pos.TXID && (replaceIndex || len(combined) > 0) {
+		if replaceIndex || newCommit > f.commit {
+			f.commit = newCommit
+		}
 		f.remoteCommit = newCommit
 	}
 
 	if level0.maxTXID > level1.maxTXID {
-		f.pos.TXID = level0.maxTXID
 		f.latestLTXTime = latestTime(f.latestLTXTime, level0.createdAt)
 	} else {
-		f.pos.TXID = level1.maxTXID
 		f.latestLTXTime = latestTime(f.latestLTXTime, level1.createdAt)
 	}
 
