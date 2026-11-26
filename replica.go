@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1776,7 +1777,7 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 	}
 
 	if len(infos) > 0 && txID == 0 {
-		if err := checkRestoreContiguity(cursors, currentMax, timestamp); err != nil {
+		if err := checkRestoreContiguity(ctx, client, cursors, currentMax, timestamp); err != nil {
 			return nil, err
 		}
 	}
@@ -1809,7 +1810,7 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 // is tracked separately from the selected plan (via coveredMax) so compacted files
 // excluded because CreatedAt >= timestamp still bridge retained lower-level files,
 // while real gaps at or before timestamp still fail.
-func checkRestoreContiguity(cursors []*restoreLevelCursor, currentMax ltx.TXID, timestamp time.Time) error {
+func checkRestoreContiguity(ctx context.Context, client ReplicaClient, cursors []*restoreLevelCursor, currentMax ltx.TXID, timestamp time.Time) error {
 	if timestamp.IsZero() {
 		var nextGapTXID ltx.TXID
 		for _, cursor := range cursors {
@@ -1829,6 +1830,7 @@ func checkRestoreContiguity(cursors []*restoreLevelCursor, currentMax ltx.TXID, 
 		return nil
 	}
 
+	var lookahead [SnapshotLevel]*restoreLevelCursor
 	coveredMax := currentMax
 	for _, cursor := range cursors {
 		coveredMax = max(coveredMax, cursor.skippedAfterTimestampMax)
@@ -1837,7 +1839,7 @@ func checkRestoreContiguity(cursors []*restoreLevelCursor, currentMax ltx.TXID, 
 	for {
 		// Extend physical coverage across any contiguous or overlapping files at or
 		// before timestamp. Stop each cursor as soon as CreatedAt > timestamp
-		// (assuming per-level monotonicity) to avoid draining future storage pages.
+		// to avoid draining future storage pages.
 		for {
 			advanced := false
 			for _, cursor := range cursors {
@@ -1860,20 +1862,39 @@ func checkRestoreContiguity(cursors []*restoreLevelCursor, currentMax ltx.TXID, 
 			}
 		}
 
-		// Plan selection uses strict Before(timestamp), whereas gap detection uses
-		// !After(timestamp) (<=): if a file past a missing TXID was created at or
-		// before timestamp, the missing TXID(s) before it could have been created
-		// strictly before timestamp.
+		canBridge := slices.ContainsFunc(cursors, func(c *restoreLevelCursor) bool {
+			return c.current != nil && c.current.MinTXID <= coveredMax+1
+		})
 		var nextGapTXID ltx.TXID
 		for _, cursor := range cursors {
 			if cursor.current == nil || cursor.current.MinTXID <= coveredMax+1 {
 				continue
 			}
-			if cursor.current.CreatedAt.After(timestamp) {
-				continue
+			scan := cursor
+			if canBridge && cursor.current.CreatedAt.After(timestamp) {
+				level := cursor.current.Level
+				if lookahead[level] == nil {
+					itr, err := client.LTXFiles(ctx, level, cursor.current.MinTXID, true)
+					if err != nil {
+						return err
+					}
+					defer itr.Close()
+					lookahead[level] = &restoreLevelCursor{itr: itr}
+				}
+				scan = lookahead[level]
 			}
-			if nextGapTXID == 0 || cursor.current.MinTXID < nextGapTXID {
-				nextGapTXID = cursor.current.MinTXID
+			for {
+				if err := scan.ensureCurrent(); err != nil {
+					return err
+				}
+				if scan.current == nil || (nextGapTXID != 0 && scan.current.MinTXID >= nextGapTXID) {
+					break
+				}
+				if scan.current.MinTXID > coveredMax+1 && !scan.current.CreatedAt.After(timestamp) {
+					nextGapTXID = scan.current.MinTXID
+					break
+				}
+				scan.current = nil
 			}
 		}
 		if nextGapTXID == 0 {

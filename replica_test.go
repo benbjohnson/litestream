@@ -1185,6 +1185,29 @@ func TestReplica_CalcRestorePlan(t *testing.T) {
 			wantErr  string
 		}{
 			{
+				name: "SkewedTimestampsAfterMissingTXID",
+				l0: []*ltx.FileInfo{
+					{Level: 0, MinTXID: 6, MaxTXID: 6, CreatedAt: base.Add(10 * time.Minute)},
+					{Level: 0, MinTXID: 7, MaxTXID: 7, CreatedAt: base.Add(6 * time.Minute)},
+					{Level: 0, MinTXID: 8, MaxTXID: 8, CreatedAt: base.Add(7 * time.Minute)},
+				},
+				targetTS: base.Add(7 * time.Minute),
+				wantErr:  "non-contiguous ltx files: have up to 0000000000000004 but next file starts at 0000000000000007",
+			},
+			{
+				name: "SkewedTimestampsAfterFutureCompactedBridge",
+				l1: []*ltx.FileInfo{
+					{Level: 1, MinTXID: 5, MaxTXID: 6, CreatedAt: base.Add(8 * time.Minute)},
+					{Level: 1, MinTXID: 7, MaxTXID: 8, CreatedAt: base.Add(9 * time.Minute)},
+				},
+				l0: []*ltx.FileInfo{
+					{Level: 0, MinTXID: 9, MaxTXID: 9, CreatedAt: base.Add(10 * time.Minute)},
+					{Level: 0, MinTXID: 11, MaxTXID: 11, CreatedAt: base.Add(7 * time.Minute)},
+				},
+				targetTS: base.Add(7 * time.Minute),
+				wantErr:  "non-contiguous ltx files: have up to 0000000000000009 but next file starts at 000000000000000b",
+			},
+			{
 				name: "FileAtExactTargetTimestamp",
 				l1: []*ltx.FileInfo{
 					{Level: 1, MinTXID: 5, MaxTXID: 8, CreatedAt: base.Add(8 * time.Minute)},
