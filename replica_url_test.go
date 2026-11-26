@@ -1573,3 +1573,54 @@ func TestS3ProviderDefaults_QueryParamOverrides(t *testing.T) {
 		}
 	})
 }
+
+func TestParseReplicaURL_BareBucketNoTrailingSlash(t *testing.T) {
+	tests := []struct {
+		name       string
+		rawURL     string
+		wantScheme string
+		wantHost   string
+		wantPath   string
+	}{
+		{name: "S3Bare", rawURL: "s3://mybucket", wantScheme: "s3", wantHost: "mybucket", wantPath: ""},
+		{name: "S3TrailingSlash", rawURL: "s3://mybucket/", wantScheme: "s3", wantHost: "mybucket", wantPath: ""},
+		{name: "S3DotPath", rawURL: "s3://mybucket/.", wantScheme: "s3", wantHost: "mybucket", wantPath: ""},
+		{name: "OSSBare", rawURL: "oss://mybucket", wantScheme: "oss", wantHost: "mybucket", wantPath: ""},
+		{name: "OSSTrailingSlash", rawURL: "oss://mybucket/", wantScheme: "oss", wantHost: "mybucket", wantPath: ""},
+		{name: "GSBareUnchanged", rawURL: "gs://mybucket", wantScheme: "gs", wantHost: "mybucket", wantPath: "."},
+		{name: "ABSBareUnchanged", rawURL: "abs://mycontainer", wantScheme: "abs", wantHost: "mycontainer", wantPath: "."},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			scheme, host, urlPath, err := litestream.ParseReplicaURL(tt.rawURL)
+			if err != nil {
+				t.Fatalf("ParseReplicaURL(%q) error = %v", tt.rawURL, err)
+			}
+			if scheme != tt.wantScheme || host != tt.wantHost || urlPath != tt.wantPath {
+				t.Fatalf("ParseReplicaURL(%q) = (%q, %q, %q), want (%q, %q, %q)",
+					tt.rawURL, scheme, host, urlPath, tt.wantScheme, tt.wantHost, tt.wantPath)
+			}
+		})
+	}
+
+	t.Run("S3BareClientHasEmptyPath", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("s3://mybucket")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := client.(*s3.ReplicaClient).Path; got != "" {
+			t.Fatalf("s3.ReplicaClient.Path = %q, want empty", got)
+		}
+	})
+
+	t.Run("OSSBareClientHasEmptyPath", func(t *testing.T) {
+		client, err := litestream.NewReplicaClientFromURL("oss://mybucket")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := client.(*oss.ReplicaClient).Path; got != "" {
+			t.Fatalf("oss.ReplicaClient.Path = %q, want empty", got)
+		}
+	})
+}

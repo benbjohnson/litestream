@@ -9,7 +9,6 @@ import (
 	"log/slog"
 	"net/url"
 	"os"
-	"path"
 	"regexp"
 	"strings"
 	"sync"
@@ -54,6 +53,10 @@ type ReplicaClient struct {
 	client   *oss.Client
 	uploader *oss.Uploader
 	logger   *slog.Logger
+
+	pathPrefix         string
+	pathPrefixResolved bool
+	pathPrefixCh       chan struct{}
 
 	// Alibaba Cloud authentication keys.
 	AccessKeyID     string
@@ -177,6 +180,102 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	return nil
 }
 
+func (c *ReplicaClient) isBareRootPath() bool {
+	return c.Path == ""
+}
+
+// resolvePathPrefix returns the object key prefix for LTX operations.
+// Explicit paths (including path: ".") always use "<path>/" without probing,
+// which also serves as an escape hatch for policies restricted to "./*".
+// Bare-bucket root configs (c.Path == "") probe the bucket once to preserve
+// legacy "./" or "/" layouts on upgrade while defaulting new/empty buckets
+// to "" (clean "0000/..." keys).
+// Concurrent callers wait cancellably without holding c.mu during remote I/O.
+func (c *ReplicaClient) resolvePathPrefix(ctx context.Context) (string, error) {
+	for {
+		c.mu.Lock()
+		if c.pathPrefixResolved {
+			prefix := c.pathPrefix
+			c.mu.Unlock()
+			return prefix, nil
+		}
+		if !c.isBareRootPath() {
+			c.pathPrefix = c.Path + "/"
+			c.pathPrefixResolved = true
+			prefix := c.pathPrefix
+			c.mu.Unlock()
+			return prefix, nil
+		}
+		if ch := c.pathPrefixCh; ch != nil {
+			c.mu.Unlock()
+			select {
+			case <-ch:
+				continue
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+
+		ch := make(chan struct{})
+		c.pathPrefixCh = ch
+		logger := c.logger
+		bucket := c.Bucket
+		c.mu.Unlock()
+
+		prefix, err := internal.ResolveRootPrefix(ctx, logger, ReplicaClientType, bucket, litestream.SnapshotLevel, c.listKeys)
+
+		c.mu.Lock()
+		if err == nil {
+			c.pathPrefix = prefix
+			c.pathPrefixResolved = true
+		}
+		c.pathPrefixCh = nil
+		close(ch)
+		c.mu.Unlock()
+
+		if err != nil {
+			return "", err
+		}
+		return prefix, nil
+	}
+}
+
+func (c *ReplicaClient) listKeys(ctx context.Context, prefix string, maxKeys int32, fn func(key string) bool) error {
+	if maxKeys > 0 {
+		out, err := c.client.ListObjectsV2(ctx, &oss.ListObjectsV2Request{
+			Bucket:  oss.Ptr(c.Bucket),
+			Prefix:  oss.Ptr(prefix),
+			MaxKeys: maxKeys,
+		})
+		if err != nil {
+			return fmt.Errorf("oss: list objects with prefix %q: %w", prefix, err)
+		}
+		for _, obj := range out.Contents {
+			if obj.Key != nil && !fn(*obj.Key) {
+				return nil
+			}
+		}
+		return nil
+	}
+
+	paginator := c.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
+		Bucket: oss.Ptr(c.Bucket),
+		Prefix: oss.Ptr(prefix),
+	})
+	for paginator.HasNext() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("oss: list objects with prefix %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			if obj.Key != nil && !fn(*obj.Key) {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
 // When useMetadata is true, fetches accurate timestamps from OSS metadata via HeadObject.
 // This uses parallel batched requests (controlled by MetadataConcurrency) to avoid hangs
@@ -186,7 +285,11 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newFileIterator(ctx, c, level, seek, useMetadata), nil
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newFileIterator(ctx, c, pathPrefix, level, seek, useMetadata), nil
 }
 
 // OpenLTXFile returns a reader for an LTX file.
@@ -195,10 +298,14 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Build the key from the file info
 	filename := ltx.FormatFilename(minTXID, maxTXID)
-	key := c.ltxPath(level, filename)
+	key := pathPrefix + fmt.Sprintf("%04x/%s", level, filename)
 
 	request := &oss.GetObjectRequest{
 		Bucket: oss.Ptr(c.Bucket),
@@ -234,6 +341,10 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	// Use TeeReader to peek at LTX header while preserving data for upload
 	var buf bytes.Buffer
@@ -250,7 +361,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	rc := internal.NewReadCounter(io.MultiReader(&buf, r))
 
 	filename := ltx.FormatFilename(minTXID, maxTXID)
-	key := c.ltxPath(level, filename)
+	key := pathPrefix + fmt.Sprintf("%04x/%s", level, filename)
 
 	// Store timestamp in OSS metadata for accurate timestamp retrieval
 	metadata := map[string]string{
@@ -297,11 +408,16 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		return nil
 	}
 
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Convert file infos to object identifiers
 	objects := make([]oss.DeleteObject, 0, len(a))
 	for _, info := range a {
 		filename := ltx.FormatFilename(info.MinTXID, info.MaxTXID)
-		key := c.ltxPath(info.Level, filename)
+		key := pathPrefix + fmt.Sprintf("%04x/%s", info.Level, filename)
 		objects = append(objects, oss.DeleteObject{Key: oss.Ptr(key)})
 
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
@@ -332,32 +448,60 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	return nil
 }
 
-// DeleteAll deletes all files.
+// DeleteAll deletes all files. Callers must ensure concurrent writers are stopped
+// before calling DeleteAll.
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	if err := c.Init(ctx); err != nil {
+		return err
+	}
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
 		return err
 	}
 
 	var objects []oss.DeleteObject
 
-	// Create paginator for listing objects
-	prefix := c.Path + "/"
-	paginator := c.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
-		Bucket: oss.Ptr(c.Bucket),
-		Prefix: oss.Ptr(prefix),
-	})
-
-	// Iterate through all pages
-	for paginator.HasNext() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("oss: list objects page: %w", err)
+	if c.isBareRootPath() || c.Path == "." {
+		// When replicating at a bare bucket root ("", "./", or "/") or explicit
+		// path ".", scope deletion to Litestream's direct LTX objects so
+		// unrelated objects in the bucket or under the same prefix are never touched.
+		for level := 0; level <= litestream.SnapshotLevel; level++ {
+			levelPrefix := pathPrefix + fmt.Sprintf("%04x/", level)
+			paginator := c.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
+				Bucket: oss.Ptr(c.Bucket),
+				Prefix: oss.Ptr(levelPrefix),
+			})
+			for paginator.HasNext() {
+				page, err := paginator.NextPage(ctx)
+				if err != nil {
+					return fmt.Errorf("oss: list objects page: %w", err)
+				}
+				for _, obj := range page.Contents {
+					if obj.Key != nil && internal.IsRootLTXKey(pathPrefix, *obj.Key, litestream.SnapshotLevel) {
+						objects = append(objects, oss.DeleteObject{Key: obj.Key})
+					}
+				}
+			}
 		}
+	} else {
+		// Create paginator for listing objects
+		paginator := c.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
+			Bucket: oss.Ptr(c.Bucket),
+			Prefix: oss.Ptr(pathPrefix),
+		})
 
-		// Collect object identifiers
-		for _, obj := range page.Contents {
-			if obj.Key != nil {
-				objects = append(objects, oss.DeleteObject{Key: obj.Key})
+		// Iterate through all pages
+		for paginator.HasNext() {
+			page, err := paginator.NextPage(ctx)
+			if err != nil {
+				return fmt.Errorf("oss: list objects page: %w", err)
+			}
+
+			// Collect object identifiers
+			for _, obj := range page.Contents {
+				if obj.Key != nil {
+					objects = append(objects, oss.DeleteObject{Key: obj.Key})
+				}
 			}
 		}
 	}
@@ -382,21 +526,43 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		objects = objects[n:]
 	}
 
+	// Invalidate cached root prefix so a reused bare-root client re-probes
+	// the now-empty bucket and writes to the canonical clean root.
+	if c.isBareRootPath() {
+		c.mu.Lock()
+		c.pathPrefix = ""
+		c.pathPrefixResolved = false
+		c.mu.Unlock()
+	}
+
 	return nil
 }
 
 // ltxPath returns the full path to an LTX file.
 func (c *ReplicaClient) ltxPath(level int, filename string) string {
-	return c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+	c.mu.Lock()
+	prefix := c.pathPrefix
+	resolved := c.pathPrefixResolved
+	c.mu.Unlock()
+	if !resolved {
+		if c.Path == "" {
+			prefix = ""
+		} else {
+			prefix = c.Path + "/"
+		}
+	}
+	return prefix + fmt.Sprintf("%04x/%s", level, filename)
 }
 
 // fileIterator represents an iterator over LTX files in OSS.
 type fileIterator struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	client *ReplicaClient
-	level  int
-	seek   ltx.TXID
+	ctx        context.Context
+	cancel     context.CancelFunc
+	client     *ReplicaClient
+	pathPrefix string
+	prefix     string
+	level      int
+	seek       ltx.TXID
 
 	useMetadata   bool                 // When true, fetch accurate timestamps from metadata
 	metadataCache map[string]time.Time // key -> timestamp cache for batch fetches
@@ -411,13 +577,14 @@ type fileIterator struct {
 	info   *ltx.FileInfo
 }
 
-func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
+func newFileIterator(ctx context.Context, client *ReplicaClient, pathPrefix string, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
 	itr := &fileIterator{
 		ctx:           ctx,
 		cancel:        cancel,
 		client:        client,
+		pathPrefix:    pathPrefix,
 		level:         level,
 		seek:          seek,
 		useMetadata:   useMetadata,
@@ -498,10 +665,10 @@ func (itr *fileIterator) initPaginator() {
 	itr.initialized = true
 
 	// Create paginator for listing objects with level prefix
-	prefix := itr.client.ltxPath(itr.level, "")
+	itr.prefix = itr.pathPrefix + fmt.Sprintf("%04x/", itr.level)
 	itr.paginator = itr.client.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
 		Bucket: oss.Ptr(itr.client.Bucket),
-		Prefix: oss.Ptr(prefix),
+		Prefix: oss.Ptr(itr.prefix),
 	})
 }
 
@@ -537,14 +704,18 @@ func (itr *fileIterator) Next() bool {
 			}
 			itr.pageIndex = 0
 
-			// Batch fetch metadata for the entire page when useMetadata is true.
+			// Batch fetch metadata for direct children on the page when useMetadata is true.
 			// This uses parallel HeadObject calls controlled by MetadataConcurrency
 			// to avoid the O(N) sequential calls that caused restore hangs (issue #930).
 			if itr.useMetadata && len(itr.page.Contents) > 0 {
 				keys := make([]string, 0, len(itr.page.Contents))
 				for _, obj := range itr.page.Contents {
-					if obj.Key != nil {
-						keys = append(keys, *obj.Key)
+					if obj.Key == nil {
+						continue
+					}
+					fullKey := *obj.Key
+					if rel, ok := strings.CutPrefix(fullKey, itr.prefix); ok && !strings.Contains(rel, "/") {
+						keys = append(keys, fullKey)
 					}
 				}
 				if err := itr.fetchMetadataBatch(keys); err != nil {
@@ -563,9 +734,13 @@ func (itr *fileIterator) Next() bool {
 				continue
 			}
 
-			// Extract file info from key
+			// Extract file info from direct child key only so nested prefixes
+			// (e.g. another replica under 0000/archive/...) are ignored.
 			fullKey := *obj.Key
-			key := path.Base(fullKey)
+			key, ok := strings.CutPrefix(fullKey, itr.prefix)
+			if !ok || strings.Contains(key, "/") {
+				continue
+			}
 			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
 				continue // Skip non-LTX files

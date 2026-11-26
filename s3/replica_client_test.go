@@ -3858,3 +3858,425 @@ func TestReplicaClient_TLSConfigDoesNotLeakToSTS(t *testing.T) {
 		t.Errorf("STS server handled %d requests; replica TLS config leaked into STS client", got)
 	}
 }
+
+func TestReplicaClient_BareBucketRootPrefix(t *testing.T) {
+	ltxData := mustLTX(t)
+
+	newMockS3 := func(t *testing.T, initial map[string][]byte) (*httptest.Server, *sync.Mutex, map[string][]byte, *[]string) {
+		t.Helper()
+		var mu sync.Mutex
+		objects := make(map[string][]byte, len(initial))
+		for k, v := range initial {
+			objects[k] = append([]byte(nil), v...)
+		}
+		var listPrefixes []string
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			defer r.Body.Close()
+
+			const bucketPrefix = "/test-bucket"
+			switch {
+			case r.Method == http.MethodGet && r.URL.Query().Get("list-type") == "2":
+				prefix := r.URL.Query().Get("prefix")
+				maxKeys, _ := strconv.Atoi(r.URL.Query().Get("max-keys"))
+
+				mu.Lock()
+				listPrefixes = append(listPrefixes, prefix)
+				var keys []string
+				for k := range objects {
+					if strings.HasPrefix(k, prefix) {
+						keys = append(keys, k)
+					}
+				}
+				mu.Unlock()
+
+				// Deterministic lexicographical ordering like S3.
+				for i := 0; i < len(keys); i++ {
+					for j := i + 1; j < len(keys); j++ {
+						if keys[j] < keys[i] {
+							keys[i], keys[j] = keys[j], keys[i]
+						}
+					}
+				}
+				if maxKeys > 0 && len(keys) > maxKeys {
+					keys = keys[:maxKeys]
+				}
+
+				var b strings.Builder
+				b.WriteString(`<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated>`)
+				for _, k := range keys {
+					mu.Lock()
+					sz := len(objects[k])
+					mu.Unlock()
+					fmt.Fprintf(&b, `<Contents><Key>%s</Key><Size>%d</Size><LastModified>2026-10-30T00:00:00Z</LastModified></Contents>`, k, sz)
+				}
+				b.WriteString(`</ListBucketResult>`)
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = io.WriteString(w, b.String())
+
+			case r.Method == http.MethodPut:
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusInternalServerError)
+					return
+				}
+				// Use RawPath when available so leading slashes or ./ are preserved verbatim.
+				reqPath := r.URL.EscapedPath()
+				key := strings.TrimPrefix(reqPath, bucketPrefix+"/")
+				if unesc, err := url.PathUnescape(key); err == nil {
+					key = unesc
+				}
+				mu.Lock()
+				objects[key] = body
+				mu.Unlock()
+				w.Header().Set("ETag", `"mock-etag"`)
+				w.WriteHeader(http.StatusOK)
+
+			case r.Method == http.MethodGet:
+				reqPath := r.URL.EscapedPath()
+				key := strings.TrimPrefix(reqPath, bucketPrefix+"/")
+				if unesc, err := url.PathUnescape(key); err == nil {
+					key = unesc
+				}
+				mu.Lock()
+				data, ok := objects[key]
+				mu.Unlock()
+				if !ok {
+					w.WriteHeader(http.StatusNotFound)
+					_, _ = io.WriteString(w, `<Error><Code>NoSuchKey</Code><Message>not found</Message></Error>`)
+					return
+				}
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write(data)
+
+			case r.Method == http.MethodPost && r.URL.Query().Has("delete"):
+				body, _ := io.ReadAll(r.Body)
+				s := string(body)
+				var deleted []string
+				for {
+					start := strings.Index(s, "<Key>")
+					if start == -1 {
+						break
+					}
+					s = s[start+len("<Key>"):]
+					end := strings.Index(s, "</Key>")
+					if end == -1 {
+						break
+					}
+					k := s[:end]
+					s = s[end+len("</Key>"):]
+					mu.Lock()
+					delete(objects, k)
+					mu.Unlock()
+					deleted = append(deleted, k)
+				}
+				var b strings.Builder
+				b.WriteString(`<DeleteResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+				for _, k := range deleted {
+					fmt.Fprintf(&b, `<Deleted><Key>%s</Key></Deleted>`, k)
+				}
+				b.WriteString(`</DeleteResult>`)
+				w.Header().Set("Content-Type", "application/xml")
+				_, _ = io.WriteString(w, b.String())
+
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(srv.Close)
+		return srv, &mu, objects, &listPrefixes
+	}
+
+	newClient := func(endpoint, p string, logger *slog.Logger) *ReplicaClient {
+		c := NewReplicaClient()
+		c.Bucket = "test-bucket"
+		c.Path = p
+		c.Region = "us-east-1"
+		c.Endpoint = endpoint
+		c.ForcePathStyle = true
+		c.AccessKeyID = "test-access-key"
+		c.SecretAccessKey = "test-secret-key"
+		if logger != nil {
+			c.SetLogger(logger)
+		}
+		return c
+	}
+
+	t.Run("FreshEmptyBucketUsesCleanRootKeys", func(t *testing.T) {
+		srv, mu, objects, _ := newMockS3(t, nil)
+		var logBuf bytes.Buffer
+		c := newClient(srv.URL, "", slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+		ctx := context.Background()
+		if _, err := c.WriteLTXFile(ctx, 0, 1, 1, bytes.NewReader(ltxData)); err != nil {
+			t.Fatalf("WriteLTXFile() error = %v", err)
+		}
+
+		wantKey := "0000/0000000000000001-0000000000000001.ltx"
+		mu.Lock()
+		_, exists := objects[wantKey]
+		mu.Unlock()
+		if !exists {
+			t.Fatalf("expected object %q, got keys %v", wantKey, objects)
+		}
+		if logBuf.Len() != 0 {
+			t.Fatalf("unexpected warning log: %s", logBuf.String())
+		}
+
+		rc, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
+		if err != nil {
+			t.Fatalf("OpenLTXFile() error = %v", err)
+		}
+		_ = rc.Close()
+
+		itr, err := c.LTXFiles(ctx, 0, 0, false)
+		if err != nil {
+			t.Fatalf("LTXFiles() error = %v", err)
+		}
+		defer itr.Close()
+		if !itr.Next() || itr.Item().MinTXID != 1 {
+			t.Fatalf("expected LTX file from iterator, err=%v", itr.Err())
+		}
+	})
+
+	t.Run("ExplicitDotPathBypassesDiscovery", func(t *testing.T) {
+		srv, mu, objects, listPrefixes := newMockS3(t, map[string][]byte{
+			"./notes.txt": []byte("keep"),
+		})
+		c := newClient(srv.URL, ".", nil)
+
+		ctx := context.Background()
+		if _, err := c.WriteLTXFile(ctx, 0, 1, 1, bytes.NewReader(ltxData)); err != nil {
+			t.Fatalf("WriteLTXFile() error = %v", err)
+		}
+		if len(*listPrefixes) != 0 {
+			t.Fatalf("expected zero list probes for explicit dot path, got %v", *listPrefixes)
+		}
+		wantKey := "./0000/0000000000000001-0000000000000001.ltx"
+		mu.Lock()
+		_, exists := objects[wantKey]
+		mu.Unlock()
+		if !exists {
+			t.Fatalf("expected explicit dot key %q, got keys %v", wantKey, objects)
+		}
+
+		if err := c.DeleteAll(ctx); err != nil {
+			t.Fatalf("DeleteAll() error = %v", err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := objects[wantKey]; ok {
+			t.Fatalf("expected %q to be deleted", wantKey)
+		}
+		if _, ok := objects["./notes.txt"]; !ok {
+			t.Fatal("expected ./notes.txt to be preserved during DeleteAll")
+		}
+	})
+
+	t.Run("LegacyDotLayoutPreservedOnUpgrade", func(t *testing.T) {
+		legacyKey := "./0000/0000000000000001-0000000000000001.ltx"
+		srv, mu, objects, _ := newMockS3(t, map[string][]byte{legacyKey: ltxData})
+		var logBuf bytes.Buffer
+		c := newClient(srv.URL, "", slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+		ctx := context.Background()
+		if _, err := c.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(ltxData)); err != nil {
+			t.Fatalf("WriteLTXFile() error = %v", err)
+		}
+
+		wantNewKey := "./0000/0000000000000002-0000000000000002.ltx"
+		mu.Lock()
+		_, exists := objects[wantNewKey]
+		mu.Unlock()
+		if !exists {
+			t.Fatalf("expected legacy write key %q, got keys %v", wantNewKey, objects)
+		}
+		if !strings.Contains(logBuf.String(), "legacy root replica prefix detected") {
+			t.Fatalf("expected warning log, got %q", logBuf.String())
+		}
+	})
+
+	t.Run("LegacySlashLayoutPreservedOnUpgrade", func(t *testing.T) {
+		legacyKey := "/0000/0000000000000001-0000000000000001.ltx"
+		srv, mu, objects, _ := newMockS3(t, map[string][]byte{legacyKey: ltxData})
+		var logBuf bytes.Buffer
+		c := newClient(srv.URL, "", slog.New(slog.NewTextHandler(&logBuf, nil)))
+
+		ctx := context.Background()
+		if _, err := c.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(ltxData)); err != nil {
+			t.Fatalf("WriteLTXFile() error = %v", err)
+		}
+
+		wantNewKey := "/0000/0000000000000002-0000000000000002.ltx"
+		mu.Lock()
+		_, exists := objects[wantNewKey]
+		mu.Unlock()
+		if !exists {
+			t.Fatalf("expected legacy write key %q, got keys %v", wantNewKey, objects)
+		}
+		if !strings.Contains(logBuf.String(), "legacy root replica prefix detected") {
+			t.Fatalf("expected warning log, got %q", logBuf.String())
+		}
+	})
+
+	t.Run("AmbiguousLayoutsReturnError", func(t *testing.T) {
+		srv, _, _, _ := newMockS3(t, map[string][]byte{
+			"0000/0000000000000001-0000000000000001.ltx":   ltxData,
+			"./0000/0000000000000001-0000000000000001.ltx": ltxData,
+		})
+		c := newClient(srv.URL, "", nil)
+
+		if _, err := c.LTXFiles(context.Background(), 0, 0, false); err == nil {
+			t.Fatal("expected error when multiple root layouts exist")
+		} else if !strings.Contains(err.Error(), "multiple root replica prefixes") {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("DeleteAllAtCleanRootPreservesUnrelatedObjects", func(t *testing.T) {
+		srv, mu, objects, _ := newMockS3(t, map[string][]byte{
+			"0000/0000000000000001-0000000000000001.ltx": ltxData,
+			"0009/0000000000000001-0000000000000001.ltx": ltxData,
+			"0000/keep.txt":  []byte("keep"),
+			"README.txt":     []byte("keep"),
+			"other/data.bin": []byte("keep"),
+		})
+		c := newClient(srv.URL, "", nil)
+
+		if err := c.DeleteAll(context.Background()); err != nil {
+			t.Fatalf("DeleteAll() error = %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := objects["0000/0000000000000001-0000000000000001.ltx"]; ok {
+			t.Fatal("expected L0 LTX file to be deleted")
+		}
+		if _, ok := objects["0009/0000000000000001-0000000000000001.ltx"]; ok {
+			t.Fatal("expected L9 LTX file to be deleted")
+		}
+		for _, keep := range []string{"0000/keep.txt", "README.txt", "other/data.bin"} {
+			if _, ok := objects[keep]; !ok {
+				t.Fatalf("expected unrelated object %q to be preserved", keep)
+			}
+		}
+	})
+
+	t.Run("NonRootPathSkipsRootProbing", func(t *testing.T) {
+		srv, _, _, listPrefixes := newMockS3(t, nil)
+		c := newClient(srv.URL, "replica", nil)
+
+		if _, err := c.WriteLTXFile(context.Background(), 0, 1, 1, bytes.NewReader(ltxData)); err != nil {
+			t.Fatalf("WriteLTXFile() error = %v", err)
+		}
+		if len(*listPrefixes) != 0 {
+			t.Fatalf("expected zero list probes for non-root path, got %v", *listPrefixes)
+		}
+	})
+
+	t.Run("DeleteAllAtLegacyRootPreservesUnrelatedObjectsAndResetsCache", func(t *testing.T) {
+		srv, mu, objects, _ := newMockS3(t, map[string][]byte{
+			"/0009/0000000000000001-0000000000000001.ltx": ltxData,
+			"/notes.txt": []byte("keep"),
+			"/other-db/0000/0000000000000001-0000000000000001.ltx": ltxData,
+		})
+		c := newClient(srv.URL, "", nil)
+
+		ctx := context.Background()
+		if err := c.DeleteAll(ctx); err != nil {
+			t.Fatalf("DeleteAll() error = %v", err)
+		}
+
+		mu.Lock()
+		if _, ok := objects["/0009/0000000000000001-0000000000000001.ltx"]; ok {
+			mu.Unlock()
+			t.Fatal("expected legacy L9 LTX file to be deleted")
+		}
+		for _, keep := range []string{"/notes.txt", "/other-db/0000/0000000000000001-0000000000000001.ltx"} {
+			if _, ok := objects[keep]; !ok {
+				mu.Unlock()
+				t.Fatalf("expected unrelated object %q to be preserved", keep)
+			}
+		}
+		mu.Unlock()
+
+		// Reusing the same client after DeleteAll should re-probe and use clean root.
+		if _, err := c.WriteLTXFile(ctx, 0, 1, 1, bytes.NewReader(ltxData)); err != nil {
+			t.Fatalf("WriteLTXFile() after DeleteAll error = %v", err)
+		}
+		wantKey := "0000/0000000000000001-0000000000000001.ltx"
+		mu.Lock()
+		_, exists := objects[wantKey]
+		mu.Unlock()
+		if !exists {
+			t.Fatalf("expected clean-root object %q after DeleteAll, got keys %v", wantKey, objects)
+		}
+	})
+
+	t.Run("LTXFilesIgnoresNestedSubdirectoryLTX", func(t *testing.T) {
+		srv, _, _, _ := newMockS3(t, map[string][]byte{
+			"0000/0000000000000001-0000000000000001.ltx":              ltxData,
+			"0000/archive/0000/0000000000000002-0000000000000002.ltx": ltxData,
+		})
+		c := newClient(srv.URL, "", nil)
+
+		itr, err := c.LTXFiles(context.Background(), 0, 0, false)
+		if err != nil {
+			t.Fatalf("LTXFiles() error = %v", err)
+		}
+		defer itr.Close()
+
+		var got []ltx.TXID
+		for itr.Next() {
+			got = append(got, itr.Item().MinTXID)
+		}
+		if err := itr.Err(); err != nil {
+			t.Fatalf("iterator error = %v", err)
+		}
+		if len(got) != 1 || got[0] != 1 {
+			t.Fatalf("got TXIDs %v, want [1]", got)
+		}
+	})
+
+	t.Run("ConcurrentProbeRespectsContextCancellation", func(t *testing.T) {
+		probeStarted := make(chan struct{})
+		releaseProbe := make(chan struct{})
+		var once sync.Once
+
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			once.Do(func() {
+				close(probeStarted)
+				<-releaseProbe
+			})
+			w.Header().Set("Content-Type", "application/xml")
+			_, _ = io.WriteString(w, `<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><IsTruncated>false</IsTruncated></ListBucketResult>`)
+		}))
+		defer srv.Close()
+
+		c := newClient(srv.URL, "", nil)
+		if err := c.Init(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+
+		firstDone := make(chan error, 1)
+		go func() {
+			_, err := c.resolvePathPrefix(context.Background())
+			firstDone <- err
+		}()
+
+		<-probeStarted
+
+		cancelCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		_, err := c.resolvePathPrefix(cancelCtx)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			close(releaseProbe)
+			t.Fatalf("second caller err = %v, want context.DeadlineExceeded", err)
+		}
+
+		close(releaseProbe)
+		if err := <-firstDone; err != nil {
+			t.Fatalf("first caller err = %v", err)
+		}
+	})
+}
