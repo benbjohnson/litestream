@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -1562,15 +1563,32 @@ func TestReplica_RestoreV3(t *testing.T) {
 		c := file.NewReplicaClient(replicaDir)
 		r := litestream.NewReplicaWithClient(nil, c)
 
-		outputPath := tmpDir + "/restored.db"
+		filename := "restored#%23.db"
+		if runtime.GOOS != "windows" {
+			filename = "restored?#%23.db"
+		}
+		outputPath := filepath.Join(tmpDir, filename)
 		err := r.RestoreV3(ctx, litestream.RestoreOptions{
-			OutputPath: outputPath,
+			OutputPath:     outputPath,
+			IntegrityCheck: litestream.IntegrityCheckFull,
 		})
 		if err != nil {
 			t.Fatalf("RestoreV3 failed: %v", err)
 		}
 
-		verifyRestoredDB(t, outputPath)
+		readPath := filepath.Join(tmpDir, "verify.db")
+		if err := os.Rename(outputPath, readPath); err != nil {
+			t.Fatal(err)
+		}
+		restored := testingutil.MustOpenSQLDB(t, readPath)
+		defer testingutil.MustCloseSQLDB(t, restored)
+		var count int
+		if err := restored.QueryRowContext(ctx, `SELECT count(DISTINCT value) FROM test WHERE value IN ('wal0','wal1')`).Scan(&count); err != nil {
+			t.Fatal(err)
+		}
+		if count != 2 {
+			t.Fatalf("restored %d distinct WAL rows, want 2", count)
+		}
 	})
 
 	t.Run("MissingWALIndex", func(t *testing.T) {

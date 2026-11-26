@@ -431,6 +431,43 @@ func TestDB_Sync(t *testing.T) {
 	})
 }
 
+func TestDB_SyncPathWithHash(t *testing.T) {
+	ctx := t.Context()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "app#1.db")
+	primary := testingutil.MustOpenSQLDB(t, path)
+	defer testingutil.MustCloseSQLDB(t, primary)
+	if _, err := primary.ExecContext(ctx, `CREATE TABLE marker AS SELECT 'from primary' AS value`); err != nil {
+		t.Fatal(err)
+	}
+
+	db := testingutil.MustOpenDBAt(t, path)
+	t.Cleanup(func() { testingutil.MustCloseDB(t, db) })
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "app")); !os.IsNotExist(err) {
+		t.Fatalf("expected no database at truncated path, stat returned %v", err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	restoredPath := filepath.Join(t.TempDir(), "restored.db")
+	if err := db.Replica.Restore(ctx, litestream.RestoreOptions{OutputPath: restoredPath}); err != nil {
+		t.Fatal(err)
+	}
+	restored := testingutil.MustOpenSQLDB(t, restoredPath)
+	defer testingutil.MustCloseSQLDB(t, restored)
+	var value string
+	if err := restored.QueryRowContext(ctx, `SELECT value FROM marker`).Scan(&value); err != nil {
+		t.Fatal(err)
+	}
+	if value != "from primary" {
+		t.Fatalf("restored value = %q, want %q", value, "from primary")
+	}
+}
+
 func TestDB_Compact(t *testing.T) {
 	// Ensure that raw L0 transactions can be compacted into the first level.
 	t.Run("L1", func(t *testing.T) {
