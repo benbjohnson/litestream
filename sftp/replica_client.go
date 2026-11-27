@@ -200,7 +200,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { c.resetOnConnError(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(sftpClient, err) }()
 
 	var dirs []string
 	walker := sftpClient.Walk(c.Path)
@@ -243,7 +243,7 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.resetOnConnError(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(sftpClient, err) }()
 
 	dir := litestream.LTXLevelDir(c.Path, level)
 	fis, err := sftpClient.ReadDir(dir)
@@ -281,7 +281,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.resetOnConnError(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(sftpClient, err) }()
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
@@ -369,7 +369,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.resetOnConnError(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(sftpClient, err) }()
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 	file, err := sftpClient.OpenFile(filename, os.O_RDONLY)
@@ -400,7 +400,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 	if err != nil {
 		return err
 	}
-	defer func() { c.resetOnConnError(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(sftpClient, err) }()
 
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
@@ -422,7 +422,7 @@ func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
-	defer func() { c.resetOnConnError(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(sftpClient, err) }()
 
 	if err := sftpClient.RemoveDirectory(c.Path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("sftp: cannot delete path: %w", err)
@@ -430,14 +430,13 @@ func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
 	return nil
 }
 
-// resetOnConnError closes & clears the client if a connection error occurs.
-func (c *ReplicaClient) resetOnConnError(conn *replicaConn, err error) {
+func (c *ReplicaClient) discardConnIfLost(conn *replicaConn, err error) {
 	if errors.Is(err, sftp.ErrSSHFxConnectionLost) {
-		c.resetConn(conn)
+		c.discardConn(conn)
 	}
 }
 
-func (c *ReplicaClient) resetConn(conn *replicaConn) {
+func (c *ReplicaClient) discardConn(conn *replicaConn) {
 	c.mu.Lock()
 	if c.conn != conn {
 		c.mu.Unlock()
@@ -484,7 +483,7 @@ func (f *ltxFile) cancelActiveIO() {
 	active := f.activeIO > 0
 	f.mu.Unlock()
 	if active {
-		f.client.resetConn(f.conn)
+		f.client.discardConn(f.conn)
 	}
 }
 
@@ -518,7 +517,7 @@ func (f *ltxFile) Close() error {
 	}
 	err := f.File.Close()
 	f.stop()
-	f.client.resetOnConnError(f.conn, err)
+	f.client.discardConnIfLost(f.conn, err)
 	return err
 }
 
