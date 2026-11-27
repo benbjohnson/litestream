@@ -882,6 +882,13 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 			}
 			if info.MaxTXID < minTXID {
 				minTXID = info.MaxTXID + 1
+				db.Logger.DebugContext(ctx, "intermediate retention cutoff clamped",
+					"ltx_level", lvl.Level,
+					"next_level", nextLevel,
+					"min_snapshot_txid", minSnapshotTXID,
+					"next_level_max_txid", info.MaxTXID,
+					"min_txid", minTXID,
+				)
 			}
 		}
 

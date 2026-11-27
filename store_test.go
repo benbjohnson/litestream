@@ -1,10 +1,12 @@
 package litestream_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -62,16 +64,18 @@ func TestStore_EnforceSnapshotRetention_PreservesCompactionInputs(t *testing.T) 
 
 func TestStore_EnforceSnapshotRetention_ConsumedBoundary(t *testing.T) {
 	for _, tt := range []struct {
-		name     string
-		consumed ltx.TXID
-		floor    ltx.TXID
-		topLevel bool
-		want     []ltx.TXID
+		name      string
+		consumed  ltx.TXID
+		floor     ltx.TXID
+		wantClamp bool
+		topLevel  bool
+		want      []ltx.TXID
 	}{
-		{name: "EmptyNextLevel", want: []ltx.TXID{10, 20, 30}},
-		{name: "ConsumedFile", consumed: 10, want: []ltx.TXID{20, 30}},
-		{name: "PartiallyConsumedFile", consumed: 15, want: []ltx.TXID{20, 30}},
-		{name: "CaughtUp", consumed: 30, want: []ltx.TXID{30}},
+		{name: "EmptyNextLevel", wantClamp: true, want: []ltx.TXID{10, 20, 30}},
+		{name: "ConsumedFile", consumed: 10, wantClamp: true, want: []ltx.TXID{20, 30}},
+		{name: "PartiallyConsumedFile", consumed: 15, wantClamp: true, want: []ltx.TXID{20, 30}},
+		{name: "ConsumedAllFiles", consumed: 30, wantClamp: true, want: []ltx.TXID{30}},
+		{name: "CaughtUp", consumed: 30, floor: 30, want: []ltx.TXID{30}},
 		{name: "SnapshotBoundary", consumed: 30, floor: 15, want: []ltx.TXID{20, 30}},
 		{name: "HighestLevel", topLevel: true, want: []ltx.TXID{30}},
 	} {
@@ -104,7 +108,16 @@ func TestStore_EnforceSnapshotRetention_ConsumedBoundary(t *testing.T) {
 			}
 			createTestLTXFileWithTimestamp(t, client, litestream.SnapshotLevel, 1, floor, time.Now().Add(-time.Hour))
 			createTestLTXFile(t, client, litestream.SnapshotLevel, 1, 200)
+			var logs bytes.Buffer
+			db.SetLogger(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug})))
 			require.NoError(t, store.EnforceSnapshotRetention(ctx, db))
+			const message = "intermediate retention cutoff clamped"
+			if tt.wantClamp {
+				wantLog := fmt.Sprintf("level=DEBUG msg=%q ltx_level=1 next_level=2 min_snapshot_txid=%s next_level_max_txid=%s min_txid=%s", message, floor, tt.consumed, tt.consumed+1)
+				require.Contains(t, logs.String(), wantLog)
+			} else {
+				require.NotContains(t, logs.String(), message)
+			}
 			itr, err := client.LTXFiles(ctx, 1, 0, false)
 			require.NoError(t, err)
 			var got []ltx.TXID
