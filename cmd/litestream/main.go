@@ -1184,6 +1184,7 @@ type ReplicaSettings struct {
 	RequireContentMD5   *bool     `yaml:"require-content-md5"`
 	PutObjectContentMD5 *bool     `yaml:"put-object-content-md5"`
 	SkipVerify          bool      `yaml:"skip-verify"`
+	CAFile              string    `yaml:"ca-file"`
 	StorageClass        string    `yaml:"storage-class"`
 	PartSize            *ByteSize `yaml:"part-size"`
 	Concurrency         *int      `yaml:"concurrency"`
@@ -1292,6 +1293,9 @@ func (rs *ReplicaSettings) SetDefaults(src *ReplicaSettings) {
 	}
 	if src.SkipVerify {
 		rs.SkipVerify = true
+	}
+	if rs.CAFile == "" {
+		rs.CAFile = src.CAFile
 	}
 	if rs.StorageClass == "" {
 		rs.StorageClass = src.StorageClass
@@ -1527,6 +1531,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 
 	bucket, configPath := c.Bucket, c.Path
 	region, endpoint, skipVerify := c.Region, c.Endpoint, c.SkipVerify
+	caFile := c.CAFile
 	storageClass := c.StorageClass
 	putObjectContentMD5 := false
 	signSetting := newBoolSetting(true)
@@ -1559,6 +1564,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		usignAcceptEncodingSet bool
 		urequireContentMD5     bool
 		urequireContentMD5Set  bool
+		ucaFile                string
 		ustorageClass          string
 		upartSize              int64
 		upartSizeSet           bool
@@ -1613,6 +1619,11 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		if qSkipVerify := query.Get("skipVerify"); qSkipVerify != "" {
 			skipVerify = qSkipVerify == "true"
 		}
+		if v := query.Get("caFile"); v != "" {
+			ucaFile = v
+		} else if v := query.Get("ca-file"); v != "" {
+			ucaFile = v
+		}
 		if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
 			usignPayload = v
 			usignPayloadSet = true
@@ -1658,6 +1669,9 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 		if endpoint == "" {
 			endpoint = uendpoint
+		}
+		if caFile == "" {
+			caFile = ucaFile
 		}
 		if storageClass == "" {
 			storageClass = ustorageClass
@@ -1715,6 +1729,14 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 		}
 	}
 
+	if caFile != "" {
+		expanded, err := expand(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("cannot expand ca-file path %q: %w", caFile, err)
+		}
+		caFile = expanded
+	}
+
 	// Build replica.
 	client := s3.NewReplicaClient()
 	client.AccessKeyID = c.AccessKeyID
@@ -1725,6 +1747,7 @@ func NewS3ReplicaClientFromConfig(c *ReplicaConfig, _ *litestream.Replica) (_ *s
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	client.CAFile = caFile
 	client.StorageClass = storageClass
 
 	client.SignPayload = signSetting.value
@@ -2207,8 +2230,8 @@ func expand(s string) (string, error) {
 	s = StripSQLitePrefix(s)
 
 	// Just expand to absolute path if there is no home directory prefix.
-	prefix := "~" + string(os.PathSeparator)
-	if s != "~" && !strings.HasPrefix(s, prefix) {
+	rest, ok := strings.CutPrefix(s, "~")
+	if !ok || (rest != "" && !os.IsPathSeparator(rest[0])) {
 		return filepath.Abs(s)
 	}
 
@@ -2221,10 +2244,10 @@ func expand(s string) (string, error) {
 	}
 
 	// Return path with tilde replaced by the home directory.
-	if s == "~" {
+	if rest == "" {
 		return u.HomeDir, nil
 	}
-	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
+	return filepath.Join(u.HomeDir, filepath.FromSlash(rest[1:])), nil
 }
 
 // StripSQLitePrefix removes SQLite connection string prefixes (sqlite://, sqlite3://)

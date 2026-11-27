@@ -455,6 +455,7 @@ The aliases below apply to replica URLs used by the VFS and other URL factory ca
 | `region` | | AWS region | Auto-detected |
 | `forcePathStyle` | `force-path-style` | Use path-style URLs | `false` (auto for custom endpoints) |
 | `skipVerify` | `skip-verify` | Skip TLS verification | `false` |
+| `caFile` | `ca-file` | Path to PEM-encoded CA certificate bundle | None |
 | `signPayload` | `sign-payload` | Sign request payloads | `true` |
 | `signAcceptEncoding` | `sign-accept-encoding` | Include Accept-Encoding in SigV4 signatures | `true` |
 | `requireContentMD5` | `require-content-md5` | Require Content-MD5 for multi-object deletions | `true` |
