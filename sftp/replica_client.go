@@ -36,7 +36,7 @@ const (
 
 var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
-// ReplicaClient is a client for writing LTX files over SFTP.
+// ReplicaClient stores and retrieves LTX files over SFTP.
 type ReplicaClient struct {
 	mu     sync.Mutex
 	conn   *replicaConn
@@ -57,8 +57,8 @@ type ReplicaClient struct {
 }
 
 type replicaConn struct {
-	*sftp.Client
-	ssh *ssh.Client
+	sftp *sftp.Client
+	ssh  *ssh.Client
 }
 
 // NewReplicaClient returns a new instance of ReplicaClient.
@@ -106,12 +106,12 @@ func (c *ReplicaClient) Type() string {
 
 // Init initializes the connection to SFTP. No-op if already initialized.
 func (c *ReplicaClient) Init(ctx context.Context) error {
-	_, err := c.init(ctx)
+	_, err := c.getConn(ctx)
 	return err
 }
 
-// init initializes the connection and returns the SFTP client.
-func (c *ReplicaClient) init(ctx context.Context) (*replicaConn, error) {
+// getConn returns the cached connection or opens one.
+func (c *ReplicaClient) getConn(ctx context.Context) (*replicaConn, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
@@ -176,7 +176,7 @@ func (c *ReplicaClient) init(ctx context.Context) (*replicaConn, error) {
 		return nil, err
 	}
 
-	c.conn = &replicaConn{Client: sftpClient, ssh: sshClient}
+	c.conn = &replicaConn{sftp: sftpClient, ssh: sshClient}
 	return c.conn, nil
 }
 
@@ -196,14 +196,14 @@ func (c *ReplicaClient) sshAddr() string {
 
 // DeleteAll deletes all LTX files.
 func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
-	sftpClient, err := c.init(ctx)
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { c.discardConnIfLost(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(conn, err) }()
 
 	var dirs []string
-	walker := sftpClient.Walk(c.Path)
+	walker := conn.sftp.Walk(c.Path)
 	for walker.Step() {
 		if err := walker.Err(); os.IsNotExist(err) {
 			continue
@@ -215,7 +215,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 			continue
 		}
 
-		if err := sftpClient.Remove(walker.Path()); err != nil && !os.IsNotExist(err) {
+		if err := conn.sftp.Remove(walker.Path()); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("sftp: cannot delete file %q: %w", walker.Path(), err)
 		}
 
@@ -225,7 +225,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 	// Remove directories in reverse order after they have been emptied.
 	for i := len(dirs) - 1; i >= 0; i-- {
 		filename := dirs[i]
-		if err := sftpClient.RemoveDirectory(filename); err != nil && !os.IsNotExist(err) {
+		if err := conn.sftp.RemoveDirectory(filename); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("sftp: cannot delete directory %q: %w", filename, err)
 		}
 	}
@@ -239,14 +239,14 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) (err error) {
 // SFTP uses file ModTime for timestamps, which is set via Chtimes() to preserve original timestamp.
 // The useMetadata parameter is ignored since ModTime always contains the accurate timestamp.
 func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, _ bool) (_ ltx.FileIterator, err error) {
-	sftpClient, err := c.init(ctx)
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.discardConnIfLost(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(conn, err) }()
 
 	dir := litestream.LTXLevelDir(c.Path, level)
-	fis, err := sftpClient.ReadDir(dir)
+	fis, err := conn.sftp.ReadDir(dir)
 	if os.IsNotExist(err) {
 		return ltx.NewFileInfoSliceIterator(nil), nil
 	} else if err != nil {
@@ -277,11 +277,11 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 
 // WriteLTXFile writes a LTX file from r into a remote file.
 func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (info *ltx.FileInfo, err error) {
-	sftpClient, err := c.init(ctx)
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.discardConnIfLost(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(conn, err) }()
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
 
@@ -291,12 +291,12 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	timestamp := time.UnixMilli(hdr.Timestamp).UTC()
 
-	if err := sftpClient.MkdirAll(path.Dir(filename)); err != nil {
+	if err := conn.sftp.MkdirAll(path.Dir(filename)); err != nil {
 		return nil, fmt.Errorf("sftp: cannot make parent snapshot directory %q: %w", path.Dir(filename), err)
 	}
 
 	tmpFilename := fmt.Sprintf("%s.%d.%d.tmp", filename, os.Getpid(), time.Now().UnixNano())
-	f, err := sftpClient.OpenFile(tmpFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
+	f, err := conn.sftp.OpenFile(tmpFilename, os.O_WRONLY|os.O_CREATE|os.O_TRUNC)
 	if err != nil {
 		return nil, fmt.Errorf("sftp: cannot open temporary snapshot file for writing: %w", err)
 	}
@@ -305,7 +305,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 			err = errors.Join(err, f.Close())
 		}
 		if err != nil {
-			if removeErr := sftpClient.Remove(tmpFilename); removeErr != nil && !os.IsNotExist(removeErr) {
+			if removeErr := conn.sftp.Remove(tmpFilename); removeErr != nil && !os.IsNotExist(removeErr) {
 				err = errors.Join(err, fmt.Errorf("sftp: cannot remove temporary ltx file %q: %w", tmpFilename, removeErr))
 			}
 		}
@@ -331,7 +331,7 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	// Flush the data to stable storage before the rename so a server crash
 	// cannot leave an empty file at the final path. Servers that do not
 	// advertise fsync@openssh.com are left to their own write-back policy.
-	if _, ok := sftpClient.HasExtension("fsync@openssh.com"); ok {
+	if _, ok := conn.sftp.HasExtension("fsync@openssh.com"); ok {
 		if err := f.Sync(); err != nil {
 			return nil, fmt.Errorf("sftp: cannot sync temporary ltx file %q: %w", tmpFilename, err)
 		}
@@ -342,11 +342,11 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	}
 	f = nil
 
-	if err := sftpClient.Chtimes(tmpFilename, timestamp, timestamp); err != nil {
+	if err := conn.sftp.Chtimes(tmpFilename, timestamp, timestamp); err != nil {
 		return nil, fmt.Errorf("sftp: cannot set file timestamps: %w", err)
 	}
 
-	if err := sftpClient.Rename(tmpFilename, filename); err != nil {
+	if err := conn.sftp.Rename(tmpFilename, filename); err != nil {
 		return nil, fmt.Errorf("sftp: cannot rename temporary ltx file %q to %q: %w", tmpFilename, filename, err)
 	}
 
@@ -365,19 +365,19 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 // OpenLTXFile returns a reader for an LTX file.
 // Returns os.ErrNotExist if no matching position is found.
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (_ io.ReadCloser, err error) {
-	sftpClient, err := c.init(ctx)
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return nil, err
 	}
-	defer func() { c.discardConnIfLost(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(conn, err) }()
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	file, err := sftpClient.OpenFile(filename, os.O_RDONLY)
+	file, err := conn.sftp.OpenFile(filename, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
-	f := &ltxFile{File: file, ctx: ctx, client: c, conn: sftpClient}
-	f.stop = context.AfterFunc(ctx, f.cancelActiveIO)
+	f := &ltxFile{File: file, ctx: ctx, client: c, conn: conn}
+	f.stopOnCancel = context.AfterFunc(ctx, f.discardConnIfActive)
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
@@ -396,18 +396,18 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
-	sftpClient, err := c.init(ctx)
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { c.discardConnIfLost(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(conn, err) }()
 
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
 
-		if err := sftpClient.Remove(filename); err != nil && !os.IsNotExist(err) {
+		if err := conn.sftp.Remove(filename); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("sftp: cannot delete ltx file %q: %w", filename, err)
 		}
 		internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "DELETE").Inc()
@@ -418,13 +418,13 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 
 // Cleanup deletes path & directories after empty.
 func (c *ReplicaClient) Cleanup(ctx context.Context) (err error) {
-	sftpClient, err := c.init(ctx)
+	conn, err := c.getConn(ctx)
 	if err != nil {
 		return err
 	}
-	defer func() { c.discardConnIfLost(sftpClient, err) }()
+	defer func() { c.discardConnIfLost(conn, err) }()
 
-	if err := sftpClient.RemoveDirectory(c.Path); err != nil && !os.IsNotExist(err) {
+	if err := conn.sftp.RemoveDirectory(c.Path); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("sftp: cannot delete path: %w", err)
 	}
 	return nil
@@ -448,18 +448,18 @@ func (c *ReplicaClient) discardConn(conn *replicaConn) {
 	if conn.ssh != nil {
 		_ = conn.ssh.Close()
 	}
-	_ = conn.Close()
+	_ = conn.sftp.Close()
 }
 
 type ltxFile struct {
 	*sftp.File
-	ctx    context.Context
-	client *ReplicaClient
-	conn   *replicaConn
-	stop   func() bool
+	ctx          context.Context
+	client       *ReplicaClient
+	conn         *replicaConn
+	stopOnCancel func() bool
 
 	mu       sync.Mutex
-	activeIO int
+	inFlight int
 }
 
 func (f *ltxFile) beginIO() error {
@@ -468,19 +468,19 @@ func (f *ltxFile) beginIO() error {
 	if err := f.ctx.Err(); err != nil {
 		return err
 	}
-	f.activeIO++
+	f.inFlight++
 	return nil
 }
 
 func (f *ltxFile) endIO() {
 	f.mu.Lock()
-	f.activeIO--
+	f.inFlight--
 	f.mu.Unlock()
 }
 
-func (f *ltxFile) cancelActiveIO() {
+func (f *ltxFile) discardConnIfActive() {
 	f.mu.Lock()
-	active := f.activeIO > 0
+	active := f.inFlight > 0
 	f.mu.Unlock()
 	if active {
 		f.client.discardConn(f.conn)
@@ -516,7 +516,7 @@ func (f *ltxFile) Close() error {
 		defer f.endIO()
 	}
 	err := f.File.Close()
-	f.stop()
+	f.stopOnCancel()
 	f.client.discardConnIfLost(f.conn, err)
 	return err
 }

@@ -146,7 +146,7 @@ func newFsyncClient(t *testing.T, status byte) (*ReplicaClient, func() []string)
 
 	c := NewReplicaClient()
 	c.Path = t.TempDir()
-	c.conn = &replicaConn{Client: sftpClient}
+	c.conn = &replicaConn{sftp: sftpClient}
 	return c, func() []string { return reqs }
 }
 
@@ -175,7 +175,7 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 			c := NewReplicaClient()
 			c.Path = "/replica"
 			c.ConcurrentWrites = concurrent
-			c.conn = &replicaConn{Client: server.client}
+			c.conn = &replicaConn{sftp: server.client}
 
 			data := testLTXFile(t, 3*sftpPacketSize+1234)
 			pr, pw := io.Pipe()
@@ -420,7 +420,7 @@ func TestReplicaClient_WriteLTXFile_Abort(t *testing.T) {
 				c := NewReplicaClient()
 				c.Path = "/replica"
 				c.ConcurrentWrites = concurrent
-				c.conn = &replicaConn{Client: server.client}
+				c.conn = &replicaConn{sftp: server.client}
 				data := testLTXFile(t, 3*sftpPacketSize+1234)
 				pr, pw := io.Pipe()
 				defer pr.Close()
@@ -518,7 +518,7 @@ func TestReplicaClient_OpenLTXFile_ContextCanceledWhileStalled(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	rc, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
+	stalledReader, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -527,7 +527,7 @@ func TestReplicaClient_OpenLTXFile_ContextCanceledWhileStalled(t *testing.T) {
 	// request too, which a stalled server would never answer.
 	errc := make(chan error, 1)
 	go func() {
-		_, err := io.ReadAll(rc)
+		_, err := io.ReadAll(stalledReader)
 		errc <- err
 	}()
 	select {
@@ -546,12 +546,12 @@ func TestReplicaClient_OpenLTXFile_ContextCanceledWhileStalled(t *testing.T) {
 		t.Fatal("read did not return after its context was canceled")
 	}
 
-	replacement, err := c.OpenLTXFile(t.Context(), 0, 1, 1, 0, 0)
+	reopenedReader, err := c.OpenLTXFile(t.Context(), 0, 1, 1, 0, 0)
 	if err != nil {
 		t.Fatalf("first open after cancellation: %v", err)
 	}
-	_ = rc.Close()
-	if err := replacement.Close(); err != nil {
+	_ = stalledReader.Close()
+	if err := reopenedReader.Close(); err != nil {
 		t.Fatalf("close replacement after closing stale file: %v", err)
 	}
 }
