@@ -382,8 +382,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			_ = f.Close()
-			return nil, err
+			return nil, errors.Join(err, f.Close())
 		}
 	}
 
@@ -394,18 +393,64 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	// its own request, so each would cost a round trip. Read through a buffer
 	// instead. The limit sits beneath the buffer so that read-ahead stays
 	// within the requested range.
-	var r io.Reader = f
-	bufSize := readBufferSize
+	var r io.Reader = packetAlignedReader{f}
+	remaining := size
 	if size > 0 {
-		r = io.LimitReader(f, size)
-		bufSize = int(min(size, readBufferSize))
+		r = io.LimitReader(r, size)
+	} else {
+		info, err := f.Stat()
+		if ctx.Err() != nil {
+			return nil, errors.Join(ctx.Err(), f.Close())
+		}
+		if err != nil {
+			slog.DebugContext(ctx, "cannot size SFTP read buffer", "path", filename, "error", err)
+			remaining = sftpPacketSize
+		} else {
+			remaining = max(0, info.Size()-max(offset, 0))
+		}
 	}
-	return internal.NewReadCloser(bufio.NewReaderSize(r, bufSize), f), nil
+	bufSize := int(min(remaining, maxReadBufferSize))
+	return &bufferedLTXFile{file: f, reader: bufio.NewReaderSize(r, bufSize)}, nil
 }
 
-// readBufferSize is the read-ahead applied to an opened LTX file. It spans
+// maxReadBufferSize is the read-ahead applied to an opened LTX file. It spans
 // several SFTP packets so that pkg/sftp can request them concurrently.
-const readBufferSize = 256 * 1024
+const maxReadBufferSize = 256 * 1024
+const sftpPacketSize = 32 * 1024
+
+type bufferedLTXFile struct {
+	file   *ltxFile
+	reader *bufio.Reader
+}
+
+func (f *bufferedLTXFile) Read(p []byte) (int, error) {
+	if err := f.file.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return f.reader.Read(p)
+}
+
+func (f *bufferedLTXFile) WriteTo(w io.Writer) (int64, error) {
+	if err := f.file.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return f.reader.WriteTo(w)
+}
+
+func (f *bufferedLTXFile) Close() error {
+	return f.file.Close()
+}
+
+type packetAlignedReader struct {
+	*ltxFile
+}
+
+func (r packetAlignedReader) Read(p []byte) (int, error) {
+	if len(p) > sftpPacketSize {
+		p = p[:len(p)-len(p)%sftpPacketSize]
+	}
+	return r.ltxFile.Read(p)
+}
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
@@ -498,6 +543,14 @@ func (f *ltxFile) discardConnIfActive() {
 	if active {
 		f.client.discardConn(f.conn)
 	}
+}
+
+func (f *ltxFile) Stat() (os.FileInfo, error) {
+	if err := f.beginIO(); err != nil {
+		return nil, err
+	}
+	defer f.endIO()
+	return f.File.Stat()
 }
 
 func (f *ltxFile) Read(p []byte) (int, error) {

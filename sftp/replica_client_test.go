@@ -161,9 +161,6 @@ func readPacket(r io.Reader) ([]byte, error) {
 	return pkt, err
 }
 
-// sftpPacketSize is the largest payload pkg/sftp puts in one write request by default.
-const sftpPacketSize = 32 * 1024
-
 // Compaction hands WriteLTXFile an io.Pipe fed by many small writes. The upload
 // must still go out in full packets: a request per small write costs a round
 // trip each, which makes large uploads over a real link crawl.
@@ -289,12 +286,14 @@ func testLTXFile(t *testing.T, size int) []byte {
 type recordingServer struct {
 	client *sftp.Client
 
-	mu        sync.Mutex
-	reads     int
-	writes    int
-	writeErr  error
-	closeErr  error
-	pipelined bool
+	mu         sync.Mutex
+	reads      int
+	maxReadEnd uint64
+	closes     int
+	writes     int
+	writeErr   error
+	closeErr   error
+	pipelined  bool
 }
 
 func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
@@ -315,9 +314,17 @@ func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
 			if err != nil {
 				return
 			}
+			if pkt[4] == 4 {
+				s.mu.Lock()
+				s.closes++
+				s.mu.Unlock()
+			}
 			if pkt[4] == 5 {
 				s.mu.Lock()
 				s.reads++
+				offset := binary.BigEndian.Uint64(pkt[len(pkt)-12:])
+				length := binary.BigEndian.Uint32(pkt[len(pkt)-4:])
+				s.maxReadEnd = max(s.maxReadEnd, offset+uint64(length))
 				s.mu.Unlock()
 			}
 			if pkt[4] == 6 {
@@ -458,17 +465,71 @@ func TestReplicaClient_OpenLTXFile_BufferedReads(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		got, err := io.ReadAll(rc)
-		_ = rc.Close()
+		var got bytes.Buffer
+		if _, err := io.CopyN(&got, rc, 1); err != nil {
+			t.Fatal(err)
+		}
+		_, err = io.Copy(&got, rc)
+		if closeErr := rc.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
 		end := int64(len(data))
 		if r.size > 0 {
 			end = r.offset + r.size
 		}
 		if err != nil {
 			t.Fatal(err)
-		} else if !bytes.Equal(got, data[r.offset:end]) {
-			t.Fatalf("offset=%d size=%d: read %d bytes that differ from the file", r.offset, r.size, len(got))
+		} else if !bytes.Equal(got.Bytes(), data[r.offset:end]) {
+			t.Fatalf("offset=%d size=%d: read %d bytes that differ from the file", r.offset, r.size, got.Len())
 		}
+	}
+}
+
+func TestReplicaClient_OpenLTXFile_WireRange(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		fileSize     int
+		offset, size int64
+	}{
+		{"SmallFile", 2048, 0, 0},
+		{"SmallTail", maxReadBufferSize + 500, maxReadBufferSize, 0},
+		{"PartialPacket", 3 * sftpPacketSize, 1000, sftpPacketSize + 1},
+		{"MultipleFills", 2 * maxReadBufferSize, 1000, maxReadBufferSize + 17},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newRecordingServer(t, false)
+			c := NewReplicaClient()
+			c.Path = "/replica"
+			c.conn = &replicaConn{sftp: server.client}
+			data := testLTXFile(t, tt.fileSize)
+			if _, err := c.WriteLTXFile(t.Context(), 1, 1, 1, bytes.NewReader(data)); err != nil {
+				t.Fatal(err)
+			}
+			rc, err := c.OpenLTXFile(t.Context(), 1, 1, 1, tt.offset, tt.size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rc.Close()
+			end := tt.offset + tt.size
+			if tt.size == 0 {
+				end = int64(tt.fileSize)
+			}
+			got := make([]byte, end-tt.offset)
+			if _, err := io.ReadFull(rc, got[:1]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(rc, got[1:]); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data[tt.offset:end]) {
+				t.Fatal("range contents differ")
+			}
+			server.mu.Lock()
+			defer server.mu.Unlock()
+			if server.maxReadEnd != uint64(end) {
+				t.Fatalf("furthest wire read ended at %d, want %d", server.maxReadEnd, end)
+			}
+		})
 	}
 }
 
@@ -596,6 +657,82 @@ func TestReplicaClient_OpenLTXFile_HealthyClosePreservesSibling(t *testing.T) {
 		t.Fatalf("read sibling: %v", err)
 	} else if !bytes.Equal(got, data) {
 		t.Fatal("sibling returned different LTX data")
+	}
+}
+
+func TestReplicaClient_OpenLTXFile_CancelWithBufferedData(t *testing.T) {
+	server := newRecordingServer(t, false)
+	c := NewReplicaClient()
+	c.Path = "/replica"
+	c.conn = &replicaConn{sftp: server.client}
+	data := testLTXFile(t, 1024)
+	if _, err := c.WriteLTXFile(t.Context(), 1, 1, 1, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	r, err := c.OpenLTXFile(ctx, 1, 1, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if n, err := r.Read(b[:]); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Errorf("read after cancellation = %d, %v", n, err)
+	}
+	if n, err := io.Copy(io.Discard, r); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Errorf("copy after cancellation = %d, %v", n, err)
+	}
+	server.mu.Lock()
+	closes := server.closes
+	server.mu.Unlock()
+	if err := r.Close(); err != nil {
+		t.Fatalf("close after idle cancellation: %v", err)
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if n := server.closes - closes; n != 1 {
+		t.Errorf("file close sent %d close requests, want 1", n)
+	}
+}
+
+func TestReplicaClient_OpenLTXFile_CancelStalledStat(t *testing.T) {
+	c := NewReplicaClient()
+	c.Path = t.TempDir()
+	stalled := startStallingServer(t, c, 8)
+	filename := litestream.LTXFilePath(c.Path, 0, 1, 1)
+	if err := os.MkdirAll(path.Dir(filename), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, testLTXFile(t, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		r, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
+		if r != nil {
+			_ = r.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file stat did not reach the server")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("open after cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("file stat remained blocked after cancellation")
 	}
 }
 
