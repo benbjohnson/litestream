@@ -183,6 +183,9 @@ func ParseReplicaURLWithQuery(s string) (scheme, host, urlPath string, query url
 	case "":
 		return u.Scheme, u.Host, u.Path, nil, nil, fmt.Errorf("replica url scheme required: %s", s)
 
+	case "s3", "oss":
+		return u.Scheme, u.Host, CleanReplicaURLPath(u.Path), u.Query(), u.User, nil
+
 	default:
 		return u.Scheme, u.Host, strings.TrimPrefix(path.Clean(u.Path), "/"), u.Query(), u.User, nil
 	}

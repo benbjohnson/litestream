@@ -88,10 +88,11 @@ var _ litestream.ReplicaClientV3 = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to S3.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	s3       *s3.Client // s3 service
-	uploader *manager.Uploader
-	logger   *slog.Logger
+	mu         sync.Mutex
+	s3         *s3.Client // s3 service
+	uploader   *manager.Uploader
+	logger     *slog.Logger
+	rootPrefix internal.RootPrefixResolver
 
 	// AWS authentication keys.
 	AccessKeyID     string
@@ -786,6 +787,46 @@ func (c *ReplicaClient) findBucketRegionWithHTTPClient(ctx context.Context, buck
 	return string(out.LocationConstraint), nil
 }
 
+func (c *ReplicaClient) resolvePathPrefix(ctx context.Context) (string, error) {
+	return c.rootPrefix.Resolve(ctx, c.Path, c.logger, ReplicaClientType, c.Bucket, litestream.SnapshotLevel, c.listKeys)
+}
+
+func (c *ReplicaClient) listKeys(ctx context.Context, prefix string, maxKeys int32, fn func(key string) bool) error {
+	if maxKeys > 0 {
+		out, err := c.s3.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:  aws.String(c.Bucket),
+			Prefix:  aws.String(prefix),
+			MaxKeys: aws.Int32(maxKeys),
+		})
+		if err != nil {
+			return fmt.Errorf("s3: list objects with prefix %q: %w", prefix, err)
+		}
+		for _, obj := range out.Contents {
+			if obj.Key != nil && !fn(*obj.Key) {
+				return nil
+			}
+		}
+		return nil
+	}
+
+	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
+		Bucket: aws.String(c.Bucket),
+		Prefix: aws.String(prefix),
+	})
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return fmt.Errorf("s3: list objects with prefix %q: %w", prefix, err)
+		}
+		for _, obj := range page.Contents {
+			if obj.Key != nil && !fn(*obj.Key) {
+				return nil
+			}
+		}
+	}
+	return nil
+}
+
 // LTXFiles returns an iterator over all LTX files on the replica for the given level.
 // When useMetadata is true, fetches accurate timestamps from S3 metadata via HeadObject.
 // This uses parallel batched requests (controlled by MetadataConcurrency) to avoid hangs
@@ -795,13 +836,21 @@ func (c *ReplicaClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, 
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
-	return newFileIterator(ctx, c, level, seek, useMetadata), nil
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return newFileIterator(ctx, c, pathPrefix, level, seek, useMetadata), nil
 }
 
 // OpenLTXFile returns a reader for an LTX file
 // Returns os.ErrNotExist if no matching index/offset is found.
 func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
 	if err := c.Init(ctx); err != nil {
+		return nil, err
+	}
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
 		return nil, err
 	}
 
@@ -814,7 +863,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	// Build the key from the file info
 	filename := ltx.FormatFilename(minTXID, maxTXID)
-	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+	key := pathPrefix + fmt.Sprintf("%04x/%s", level, filename)
 
 	input := &s3.GetObjectInput{
 		Bucket: aws.String(c.Bucket),
@@ -848,9 +897,13 @@ func (c *ReplicaClient) WriteLTXFile(ctx context.Context, level int, minTXID, ma
 	if err := c.Init(ctx); err != nil {
 		return nil, err
 	}
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return nil, err
+	}
 
 	filename := ltx.FormatFilename(minTXID, maxTXID)
-	key := c.Path + "/" + fmt.Sprintf("%04x/%s", level, filename)
+	key := pathPrefix + fmt.Sprintf("%04x/%s", level, filename)
 
 	partSize := int64(manager.DefaultUploadPartSize)
 	if c.PartSize > 0 {
@@ -1361,11 +1414,16 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		return nil
 	}
 
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return err
+	}
+
 	// Convert file infos to object identifiers
 	objIDs := make([]types.ObjectIdentifier, 0, len(a))
 	for _, info := range a {
 		filename := ltx.FormatFilename(info.MinTXID, info.MaxTXID)
-		key := c.Path + "/" + fmt.Sprintf("%04x/%s", info.Level, filename)
+		key := pathPrefix + fmt.Sprintf("%04x/%s", info.Level, filename)
 		objIDs = append(objIDs, types.ObjectIdentifier{Key: aws.String(key)})
 
 		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
@@ -1427,31 +1485,24 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	return nil
 }
 
-// DeleteAll deletes all files.
+// DeleteAll deletes all files. Callers must ensure concurrent writers are stopped
+// before calling DeleteAll.
 func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 	if err := c.Init(ctx); err != nil {
 		return err
 	}
+	pathPrefix, err := c.resolvePathPrefix(ctx)
+	if err != nil {
+		return err
+	}
 
-	var objIDs []types.ObjectIdentifier
-
-	// Create paginator for listing objects
-	paginator := s3.NewListObjectsV2Paginator(c.s3, &s3.ListObjectsV2Input{
-		Bucket: aws.String(c.Bucket),
-		Prefix: aws.String(c.Path + "/"),
-	})
-
-	// Iterate through all pages
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return fmt.Errorf("s3: list objects page: %w", err)
-		}
-
-		// Collect object identifiers
-		for _, obj := range page.Contents {
-			objIDs = append(objIDs, types.ObjectIdentifier{Key: obj.Key})
-		}
+	keys, err := internal.CollectDeleteAllKeys(ctx, c.Path, pathPrefix, litestream.SnapshotLevel, c.listKeys)
+	if err != nil {
+		return err
+	}
+	objIDs := make([]types.ObjectIdentifier, len(keys))
+	for i, key := range keys {
+		objIDs[i] = types.ObjectIdentifier{Key: aws.String(key)}
 	}
 
 	// Delete all collected objects in batches
@@ -1469,6 +1520,12 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		}
 
 		objIDs = objIDs[n:]
+	}
+
+	// Invalidate cached root prefix so a reused bare-root client re-probes
+	// the now-empty bucket and writes to the canonical clean root.
+	if c.Path == "" {
+		c.rootPrefix.Invalidate()
 	}
 
 	return nil
@@ -1684,10 +1741,10 @@ type fileIterator struct {
 	info   *ltx.FileInfo
 }
 
-func newFileIterator(ctx context.Context, client *ReplicaClient, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
+func newFileIterator(ctx context.Context, client *ReplicaClient, pathPrefix string, level int, seek ltx.TXID, useMetadata bool) *fileIterator {
 	ctx, cancel := context.WithCancel(ctx)
 
-	prefix := client.Path + "/" + fmt.Sprintf("%04x/", level)
+	prefix := pathPrefix + fmt.Sprintf("%04x/", level)
 	itr := &fileIterator{
 		ctx:           ctx,
 		cancel:        cancel,
@@ -1819,13 +1876,16 @@ func (itr *fileIterator) Next() bool {
 				itr.client.logger.Debug("s3 LIST page", "prefix", itr.prefix, "keys", keys)
 			}
 
-			// Batch fetch metadata for the entire page when useMetadata is true.
+			// Batch fetch metadata for direct children on the page when useMetadata is true.
 			// This uses parallel HeadObject calls controlled by MetadataConcurrency
 			// to avoid the O(N) sequential calls that caused restore hangs (issue #930).
 			if itr.useMetadata && len(itr.page.Contents) > 0 {
 				keys := make([]string, 0, len(itr.page.Contents))
 				for _, obj := range itr.page.Contents {
-					keys = append(keys, aws.ToString(obj.Key))
+					fullKey := aws.ToString(obj.Key)
+					if rel, ok := strings.CutPrefix(fullKey, itr.prefix); ok && !strings.Contains(rel, "/") {
+						keys = append(keys, fullKey)
+					}
 				}
 				if err := itr.fetchMetadataBatch(keys); err != nil {
 					itr.err = err
@@ -1839,9 +1899,13 @@ func (itr *fileIterator) Next() bool {
 			obj := itr.page.Contents[itr.pageIndex]
 			itr.pageIndex++
 
-			// Extract file info from key
+			// Extract file info from direct child key only so nested prefixes
+			// (e.g. another replica under 0000/archive/...) are ignored.
 			fullKey := aws.ToString(obj.Key)
-			key := path.Base(fullKey)
+			key, ok := strings.CutPrefix(fullKey, itr.prefix)
+			if !ok || strings.Contains(key, "/") {
+				continue
+			}
 			minTXID, maxTXID, err := ltx.ParseFilename(key)
 			if err != nil {
 				continue // Skip non-LTX files
