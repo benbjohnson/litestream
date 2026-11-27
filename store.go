@@ -589,7 +589,7 @@ func (s *Store) SnapshotLevel() *CompactionLevel {
 }
 
 func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel) {
-	s.Logger.Info("starting compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
+	s.Logger.Info("starting compaction monitor", "ltx_level", lvl.Level, "interval", lvl.Interval)
 
 	retryDeadline := time.Time{}
 	timer := time.NewTimer(time.Nanosecond)
@@ -615,12 +615,12 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 			_, err := s.CompactDB(ctx, db, lvl)
 			switch {
 			case errors.Is(err, ErrNoCompaction), errors.Is(err, ErrCompactionTooEarly):
-				db.Logger.Debug("no compaction", "level", lvl.Level, "path", db.Path())
+				db.Logger.Debug("no compaction", "ltx_level", lvl.Level, "path", db.Path())
 			case errors.Is(err, ErrDBNotReady):
-				db.Logger.Debug("db not ready, skipping", "level", lvl.Level, "path", db.Path(), "error", err)
+				db.Logger.Debug("db not ready, skipping", "ltx_level", lvl.Level, "path", db.Path(), "error", err)
 				notReadyDBs = append(notReadyDBs, db.Path())
 			case err != nil && !isShutdownError(ctx, err):
-				db.Logger.Error("compaction failed", "level", lvl.Level, "error", err)
+				db.Logger.Error("compaction failed", "ltx_level", lvl.Level, "error", err)
 			}
 
 			if lvl.Level == SnapshotLevel {
@@ -636,11 +636,11 @@ func (s *Store) monitorCompactionLevel(ctx context.Context, lvl *CompactionLevel
 				retryDeadline = now.Add(DefaultDBInitTimeout)
 			}
 			nextDelay = time.Second
-			s.Logger.Debug("scheduling retry for unready dbs", "level", lvl.Level)
+			s.Logger.Debug("scheduling retry for unready dbs", "ltx_level", lvl.Level)
 		} else {
 			if timedOut {
 				s.Logger.Warn("timeout waiting for db initialization",
-					"level", lvl.Level,
+					"ltx_level", lvl.Level,
 					"dbs", notReadyDBs,
 					"timeout", DefaultDBInitTimeout,
 					"hint", "database may have corrupted local state or blocked transactions; try removing -litestream directory and restarting")
@@ -847,7 +847,7 @@ func (s *Store) CompactDB(ctx context.Context, db *DB, lvl *CompactionLevel) (*l
 	}
 
 	db.Logger.InfoContext(ctx, "compaction complete",
-		"level", dstLevel,
+		"ltx_level", dstLevel,
 		slog.Group("txid",
 			"min", info.MinTXID.String(),
 			"max", info.MaxTXID.String(),
@@ -956,7 +956,7 @@ LOOP:
 		if !result.Valid {
 			for _, verr := range result.Errors {
 				s.Logger.Warn("validation error detected",
-					"level", verr.Level,
+					"ltx_level", verr.Level,
 					"type", verr.Type,
 					"message", verr.Message,
 				)

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"os/exec"
@@ -758,5 +759,95 @@ func TestReplicateCommandCloseReturnsError(t *testing.T) {
 	close(done)
 	if err := c.Close(context.Background()); !errors.Is(err, litestream.ErrShutdownInterrupted) {
 		t.Fatalf("Close error=%v, want shutdown interruption", err)
+	}
+}
+
+func TestReplicateCLI_StartupLogNoDuplicateLevelKey(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "")
+	for _, format := range []string{"json", "text"} {
+		t.Run(format, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			dbPath := filepath.Join(tmpDir, "test.db")
+			sqldb, err := sql.Open("sqlite", dbPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := sqldb.Exec(`PRAGMA journal_mode = wal; CREATE TABLE t (id INT); INSERT INTO t VALUES (1);`); err != nil {
+				_ = sqldb.Close()
+				t.Fatal(err)
+			}
+			if err := sqldb.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			replicaDir := filepath.Join(tmpDir, "replica")
+			configPath := filepath.Join(tmpDir, "litestream.yml")
+			configYAML := fmt.Sprintf("logging:\n  level: info\n  type: %s\ndbs:\n  - path: %q\n    replica:\n      path: %q\n", format, dbPath, replicaDir)
+			if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			stdout, stderr, exitCode := runLitestreamMain(t, "replicate", "-config", configPath, "-once")
+			if exitCode != 0 {
+				t.Fatalf("replicate -once exited %d\nstdout:\n%s\nstderr:\n%s", exitCode, stdout, stderr)
+			}
+
+			var sawStartup bool
+			for _, line := range strings.Split(strings.TrimSpace(stdout), "\n") {
+				if strings.TrimSpace(line) == "" {
+					continue
+				}
+				if format == "json" {
+					dec := json.NewDecoder(strings.NewReader(line))
+					tok, err := dec.Token()
+					if err != nil || tok != json.Delim('{') {
+						t.Fatalf("expected JSON object, got %v (%v) in %q", tok, err, line)
+					}
+					seen := make(map[string]int)
+					fields := make(map[string]any)
+					for dec.More() {
+						kTok, err := dec.Token()
+						if err != nil {
+							t.Fatalf("decode key: %v", err)
+						}
+						key := kTok.(string)
+						seen[key]++
+						if seen[key] > 1 {
+							t.Errorf("duplicate JSON key %q in line: %s", key, line)
+						}
+						var v any
+						if err := dec.Decode(&v); err != nil {
+							t.Fatalf("decode val: %v", err)
+						}
+						fields[key] = v
+					}
+					if _, err := dec.Token(); err != nil && err != io.EOF {
+						t.Fatalf("decode end: %v", err)
+					}
+					if fields[slog.MessageKey] == "litestream" {
+						sawStartup = true
+						if fields[slog.LevelKey] != "INFO" {
+							t.Errorf("expected level=INFO, got %v in %s", fields[slog.LevelKey], line)
+						}
+						if fields["log_level"] != "info" {
+							t.Errorf("expected log_level=info, got %v in %s", fields["log_level"], line)
+						}
+					}
+				} else {
+					if count := strings.Count(line, " level="); count != 1 {
+						t.Errorf("expected exactly 1 ' level=' attribute, got %d in line: %s", count, line)
+					}
+					if strings.Contains(line, "msg=litestream") {
+						sawStartup = true
+						if !strings.Contains(line, " log_level=info") {
+							t.Errorf("expected log_level=info in startup line: %s", line)
+						}
+					}
+				}
+			}
+			if !sawStartup {
+				t.Fatalf("did not observe startup 'litestream' log in stdout:\n%s\nstderr:\n%s", stdout, stderr)
+			}
+		})
 	}
 }

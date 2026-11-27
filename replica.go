@@ -259,7 +259,7 @@ func (r *Replica) uploadLTXFile(ctx context.Context, level int, minTXID, maxTXID
 		return fmt.Errorf("write ltx file: %w", err)
 	}
 	r.Logger().Debug("ltx file uploaded",
-		"level", info.Level,
+		"ltx_level", info.Level,
 		"minTXID", info.MinTXID,
 		"maxTXID", info.MaxTXID,
 		"size", info.Size)
@@ -845,9 +845,9 @@ func (r *Replica) openRestoreFiles(ctx context.Context, infos []*ltx.FileInfo) (
 		}
 		wg.Go(func() {
 			defer sem.Release(1)
-			r.Logger().Debug("opening ltx file for restore", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+			r.Logger().Debug("opening ltx file for restore", "ltx_level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 			if err := rd.Open(); err != nil {
-				r.Logger().Debug("open ltx file for restore failed; the reader retries it", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "error", err)
+				r.Logger().Debug("open ltx file for restore failed; the reader retries it", "ltx_level", info.Level, "min", info.MinTXID, "max", info.MaxTXID, "error", err)
 			}
 		})
 	}
@@ -1724,7 +1724,7 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 	cursors := make([]*restoreLevelCursor, 0, maxLevel+1)
 	for level := maxLevel; level >= 0; level-- {
-		logger.Debug("finding ltx files for level", "level", level)
+		logger.Debug("finding ltx files for level", "ltx_level", level)
 		itr, err := client.LTXFiles(ctx, level, 0, !timestamp.IsZero())
 		if err != nil {
 			return nil, err
@@ -1766,7 +1766,7 @@ func CalcRestorePlan(ctx context.Context, client ReplicaClient, txID ltx.TXID, t
 
 		logger.Debug("matching LTX file for restore",
 			"filename", ltx.FormatFilename(next.candidate.MinTXID, next.candidate.MaxTXID),
-			"level", next.candidate.Level)
+			"ltx_level", next.candidate.Level)
 		infos = append(infos, next.candidate)
 		currentMax = next.candidate.MaxTXID
 		next.candidate = nil

@@ -136,7 +136,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 					return 0, retryErr
 				}
 				r.logger.Debug("reopen ltx file failed, retrying",
-					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+					"ltx_level", r.level, "min", r.minTXID, "max", r.maxTXID,
 					"offset", r.offset, "error", err, "attempt", r.retryN)
 				continue
 			}
@@ -162,7 +162,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 			// and we haven't read it all, treat as a connection drop.
 			if r.size > 0 && r.offset < r.size {
 				r.logger.Debug("premature EOF on ltx file, reconnecting",
-					"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+					"ltx_level", r.level, "min", r.minTXID, "max", r.maxTXID,
 					"offset", r.offset, "size", r.size, "attempt", r.retryN+1)
 				r.dropStream()
 				if retryErr := r.retry(io.ErrUnexpectedEOF); retryErr != nil {
@@ -181,7 +181,7 @@ func (r *ResumableReader) Read(p []byte) (int, error) {
 		// Non-EOF error (connection reset, timeout, etc.). Close the dead
 		// stream so the next iteration reopens from the current offset.
 		r.logger.Debug("read error on ltx file, reconnecting",
-			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+			"ltx_level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"error", err, "offset", r.offset, "attempt", r.retryN+1)
 		r.dropStream()
 		if retryErr := r.retry(err); retryErr != nil {
@@ -215,7 +215,7 @@ func (r *ResumableReader) readStream(rc io.ReadCloser, cancel context.CancelFunc
 	timer := time.AfterFunc(timeout, func() {
 		stalled.Store(true)
 		r.logger.Debug("ltx file read stalled, cancelling stream",
-			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+			"ltx_level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"offset", offset, "timeout", timeout)
 		cancel()
 	})
@@ -297,7 +297,7 @@ func (r *ResumableReader) dropStream() {
 	}
 	if err := rc.Close(); err != nil {
 		r.logger.Debug("close ltx file",
-			"level", r.level, "min", r.minTXID, "max", r.maxTXID,
+			"ltx_level", r.level, "min", r.minTXID, "max", r.maxTXID,
 			"offset", r.offset, "error", err)
 	}
 }

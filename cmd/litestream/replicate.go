@@ -273,7 +273,7 @@ func (c *ReplicateCommand) ParseFlags(_ context.Context, args []string) (err err
 // Run loads all databases specified in the configuration.
 func (c *ReplicateCommand) Run(ctx context.Context) (err error) {
 	// Display version information.
-	slog.Info("litestream", "version", Version, "level", c.Config.Logging.Level)
+	slog.Info("litestream", "version", Version, "log_level", c.Config.Logging.Level)
 
 	// Start MCP server if enabled
 	if c.Config.MCPAddr != "" {

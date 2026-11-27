@@ -1003,15 +1003,9 @@ func parseLog(logPath string, analysis *SoakTestAnalysis) {
 		if strings.Contains(line, "compaction complete") {
 			analysis.TotalCompactions++
 
-			// Extract level
-			if idx := strings.Index(line, "level="); idx != -1 {
-				levelStr := line[idx+6:]
-				if spaceIdx := strings.Index(levelStr, " "); spaceIdx != -1 {
-					levelStr = levelStr[:spaceIdx]
-				}
-				if level, err := strconv.Atoi(levelStr); err == nil {
-					analysis.CompactionsByLevel[level]++
-				}
+			// Extract compaction level from either JSON or text log lines.
+			if level, ok := extractLogLTXLevel(line); ok {
+				analysis.CompactionsByLevel[level]++
 			}
 
 			// Extract transaction IDs
