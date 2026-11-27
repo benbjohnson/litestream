@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -3757,6 +3758,11 @@ func TestReplicaClient_TLSConfigAndCAFile(t *testing.T) {
 }
 
 func TestNewReplicaClientFromURL_CAFile(t *testing.T) {
+	u, err := user.Current()
+	if err != nil {
+		t.Fatalf("user.Current: %v", err)
+	}
+
 	for _, tt := range []struct {
 		name string
 		raw  string
@@ -3764,13 +3770,14 @@ func TestNewReplicaClientFromURL_CAFile(t *testing.T) {
 	}{
 		{name: "CamelCase", raw: "s3://mybucket/path?caFile=/etc/ssl/private-ca.pem", want: "/etc/ssl/private-ca.pem"},
 		{name: "Hyphenated", raw: "s3://mybucket/path?ca-file=/etc/ssl/private-ca.pem", want: "/etc/ssl/private-ca.pem"},
+		{name: "HomeDirExpansion", raw: "s3://mybucket/path?ca-file=~/certs/private-ca.pem", want: filepath.Join(u.HomeDir, "certs", "private-ca.pem")},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			u, err := url.Parse(tt.raw)
+			parsedURL, err := url.Parse(tt.raw)
 			if err != nil {
 				t.Fatal(err)
 			}
-			rc, err := NewReplicaClientFromURL(u.Scheme, u.Host, strings.TrimPrefix(u.Path, "/"), u.Query(), u.User)
+			rc, err := NewReplicaClientFromURL(parsedURL.Scheme, parsedURL.Host, strings.TrimPrefix(parsedURL.Path, "/"), parsedURL.Query(), parsedURL.User)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -3779,5 +3786,73 @@ func TestNewReplicaClientFromURL_CAFile(t *testing.T) {
 				t.Errorf("CAFile = %q, want %q", client.CAFile, tt.want)
 			}
 		})
+	}
+}
+
+func TestReplicaClient_TLSConfigDoesNotLeakToSTS(t *testing.T) {
+	var stsRequests atomic.Int32
+	stsServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		stsRequests.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer stsServer.Close()
+
+	s3Server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer s3Server.Close()
+
+	tokenPath := filepath.Join(t.TempDir(), "web-identity-token")
+	if err := os.WriteFile(tokenPath, []byte("test-jwt-token"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	// Isolate AWS credential chain to STS AssumeRoleWithWebIdentity against stsServer.
+	t.Setenv("AWS_ACCESS_KEY_ID", "")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "")
+	t.Setenv("AWS_SESSION_TOKEN", "")
+	t.Setenv("AWS_SHARED_CREDENTIALS_FILE", filepath.Join(t.TempDir(), "missing-creds"))
+	t.Setenv("AWS_CONFIG_FILE", filepath.Join(t.TempDir(), "missing-config"))
+	t.Setenv("AWS_ENDPOINT_URL_STS", stsServer.URL)
+	t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test-role")
+	t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenPath)
+	t.Setenv("AWS_REGION", "us-east-1")
+
+	pool := x509.NewCertPool()
+	pool.AddCert(stsServer.Certificate())
+	pool.AddCert(s3Server.Certificate())
+
+	client := NewReplicaClient()
+	client.Bucket = "test-bucket"
+	client.Path = "replica"
+	client.Region = "us-east-1"
+	client.Endpoint = s3Server.URL
+	client.ForcePathStyle = true
+	// Configure replica TLS to trust both servers and skip verification; if this
+	// leaked into the shared aws.Config, STS would accept stsServer's self-signed cert.
+	client.TLSConfig = &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	client.SkipVerify = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := client.Init(ctx); err != nil {
+		t.Fatalf("Init() error: %v", err)
+	}
+
+	// Retrieve credentials directly so we run a single STS retry cycle rather than
+	// nested S3 x STS retries.
+	_, err := client.s3.Options().Credentials.Retrieve(ctx)
+	if err == nil {
+		t.Fatal("expected STS TLS verification failure, got nil")
+	}
+	var unknownAuthErr x509.UnknownAuthorityError
+	if !errors.As(err, &unknownAuthErr) {
+		t.Errorf("expected x509.UnknownAuthorityError from STS default TLS, got %T: %v", err, err)
+	}
+	if got := stsRequests.Load(); got != 0 {
+		t.Errorf("STS server handled %d requests; replica TLS config leaked into STS client", got)
 	}
 }

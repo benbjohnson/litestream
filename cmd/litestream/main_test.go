@@ -4600,10 +4600,11 @@ func TestNewS3ReplicaFromConfig_PutObjectContentMD5(t *testing.T) {
 }
 
 func TestNewS3ReplicaFromConfig_CAFile(t *testing.T) {
-	homeDir, err := os.UserHomeDir()
+	u, err := user.Current()
 	if err != nil {
-		t.Fatalf("UserHomeDir: %v", err)
+		t.Fatalf("user.Current: %v", err)
 	}
+	homeDir := u.HomeDir
 
 	for _, tt := range []struct {
 		name    string

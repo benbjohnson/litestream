@@ -16,7 +16,9 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/user"
 	"path"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -319,6 +321,13 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	if caFile != "" {
+		expanded, err := expandHomePath(caFile)
+		if err != nil {
+			return nil, fmt.Errorf("cannot expand ca-file path %q: %w", caFile, err)
+		}
+		caFile = expanded
+	}
 	client.CAFile = caFile
 
 	if signPayloadSet {
@@ -409,14 +418,13 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		}
 	}
 
-	// Build configuration options
+	// Build configuration options. Do not attach the replica's custom HTTP/TLS
+	// client to the shared aws.Config so credential providers (STS/IMDS/SSO)
+	// keep default TLS verification while S3 service calls use the replica client.
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRegion(region),
 		config.WithRetryer(newTransportRetryer),
 	}
-
-	// Add HTTP client with proper timeout
-	configOpts = append(configOpts, config.WithHTTPClient(httpClient))
 
 	// Add static credentials if provided, otherwise use default credential chain
 	// Default credential chain includes:
@@ -448,6 +456,7 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	// Create S3 client options
 	s3Opts := []func(*s3.Options){
 		func(o *s3.Options) {
+			o.HTTPClient = httpClient
 			o.UsePathStyle = c.ForcePathStyle
 			o.UseARNRegion = true
 			// Add User-Agent and optional middleware.
@@ -629,7 +638,11 @@ func (c *ReplicaClient) buildTLSConfig() (*tls.Config, error) {
 	}
 
 	if c.CAFile != "" {
-		pemData, err := os.ReadFile(c.CAFile)
+		caFile, err := expandHomePath(c.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("s3: expand ca-file %q: %w", c.CAFile, err)
+		}
+		pemData, err := os.ReadFile(caFile)
 		if err != nil {
 			return nil, fmt.Errorf("s3: read ca-file %q: %w", c.CAFile, err)
 		}
@@ -693,6 +706,27 @@ func (c *ReplicaClient) newHTTPClient() (*http.Client, error) {
 	}, nil
 }
 
+// expandHomePath expands a leading "~" or "~/" using the current OS user's home
+// directory, matching CLI config path expansion.
+func expandHomePath(s string) (string, error) {
+	prefix := "~" + string(os.PathSeparator)
+	if s != "~" && !strings.HasPrefix(s, prefix) {
+		return s, nil
+	}
+
+	u, err := user.Current()
+	if err != nil {
+		return "", err
+	} else if u.HomeDir == "" {
+		return "", fmt.Errorf("cannot expand path %s, no home directory available", s)
+	}
+
+	if s == "~" {
+		return u.HomeDir, nil
+	}
+	return filepath.Join(u.HomeDir, strings.TrimPrefix(s, prefix)), nil
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
 	httpClient, err := c.newHTTPClient()
@@ -703,10 +737,10 @@ func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (st
 }
 
 func (c *ReplicaClient) findBucketRegionWithHTTPClient(ctx context.Context, bucket string, httpClient *http.Client) (string, error) {
-	// Build a config with credentials but no region
+	// Build a config with credentials but no region. Keep the replica's custom
+	// HTTP/TLS client scoped to S3 service options so STS/IMDS keep default TLS.
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRetryer(newTransportRetryer),
-		config.WithHTTPClient(httpClient),
 	}
 
 	// Add static credentials if provided
@@ -726,7 +760,11 @@ func (c *ReplicaClient) findBucketRegionWithHTTPClient(ctx context.Context, buck
 	cfg.Region = DefaultRegion
 
 	// Create S3 client options
-	s3Opts := []func(*s3.Options){}
+	s3Opts := []func(*s3.Options){
+		func(o *s3.Options) {
+			o.HTTPClient = httpClient
+		},
+	}
 
 	// Configure custom endpoint for region lookup
 	c.configureEndpoint(&s3Opts)
