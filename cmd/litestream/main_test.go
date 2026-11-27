@@ -4598,3 +4598,40 @@ func TestNewS3ReplicaFromConfig_PutObjectContentMD5(t *testing.T) {
 		})
 	}
 }
+
+func TestNewS3ReplicaFromConfig_CAFile(t *testing.T) {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+
+	for _, tt := range []struct {
+		name    string
+		global  string
+		replica string
+		want    string
+	}{
+		{name: "Default", replica: "url: s3://bucket/db"},
+		{name: "ReplicaYAML", replica: "type: s3\n      bucket: bucket\n      ca-file: /etc/ssl/private-ca.pem", want: "/etc/ssl/private-ca.pem"},
+		{name: "GlobalInherited", global: "ca-file: /etc/ssl/global-ca.pem", replica: "url: s3://bucket/db", want: "/etc/ssl/global-ca.pem"},
+		{name: "ReplicaOverridesGlobal", global: "ca-file: /etc/ssl/global-ca.pem", replica: "url: s3://bucket/db\n      ca-file: /etc/ssl/replica-ca.pem", want: "/etc/ssl/replica-ca.pem"},
+		{name: "QueryHyphenated", replica: "url: s3://bucket/db?ca-file=/etc/ssl/query-ca.pem", want: "/etc/ssl/query-ca.pem"},
+		{name: "QueryCamelCase", replica: "url: s3://bucket/db?caFile=/etc/ssl/query-ca.pem", want: "/etc/ssl/query-ca.pem"},
+		{name: "ConfigOverridesQuery", replica: "url: s3://bucket/db?ca-file=/etc/ssl/query-ca.pem\n      ca-file: /etc/ssl/config-ca.pem", want: "/etc/ssl/config-ca.pem"},
+		{name: "HomeDirExpansion", replica: "type: s3\n      bucket: bucket\n      ca-file: ~/certs/ca.pem", want: filepath.Join(homeDir, "certs", "ca.pem")},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			config, err := main.ParseConfig(strings.NewReader(tt.global+"\ndbs:\n  - path: /tmp/ca.db\n    replica:\n      "+tt.replica+"\n"), false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client, err := main.NewS3ReplicaClientFromConfig(config.DBs[0].Replica, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if client.CAFile != tt.want {
+				t.Errorf("CAFile = %q, want %q", client.CAFile, tt.want)
+			}
+		})
+	}
+}

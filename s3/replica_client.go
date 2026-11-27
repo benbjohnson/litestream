@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -102,6 +103,8 @@ type ReplicaClient struct {
 	Endpoint            string
 	ForcePathStyle      bool
 	SkipVerify          bool
+	CAFile              string      // Path to PEM-encoded CA certificate bundle
+	TLSConfig           *tls.Config // Optional custom TLS configuration (cloned on Init)
 	SignPayload         bool
 	SignAcceptEncoding  bool
 	RequireContentMD5   bool
@@ -153,6 +156,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 		endpoint              string
 		forcePathStyle        bool
 		skipVerify            bool
+		caFile                string
 		signPayload           bool
 		signPayloadSet        bool
 		signAcceptEncoding    bool
@@ -194,6 +198,11 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	}
 	if v, ok := litestream.BoolQueryValue(query, "skipVerify", "skip-verify"); ok {
 		skipVerify = v
+	}
+	if v := query.Get("caFile"); v != "" {
+		caFile = v
+	} else if v := query.Get("ca-file"); v != "" {
+		caFile = v
 	}
 	if v, ok := litestream.BoolQueryValue(query, "signPayload", "sign-payload"); ok {
 		signPayload = v
@@ -310,6 +319,7 @@ func NewReplicaClientFromURL(scheme, host, urlPath string, query url.Values, use
 	client.Endpoint = endpoint
 	client.ForcePathStyle = forcePathStyle
 	client.SkipVerify = skipVerify
+	client.CAFile = caFile
 
 	if signPayloadSet {
 		client.SignPayload = signPayload
@@ -379,50 +389,23 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 		return err
 	}
 
+	// Build HTTP client (including TLS/CA configuration) before any network calls.
+	httpClient, err := c.newHTTPClient()
+	if err != nil {
+		return err
+	}
+
 	// Look up region if not specified and no endpoint is used.
 	// Endpoints are typically used for non-S3 object stores and do not
 	// necessarily require a region.
 	region := c.Region
 	if region == "" {
 		if c.Endpoint == "" {
-			if region, err = c.findBucketRegion(ctx, c.Bucket); err != nil {
+			if region, err = c.findBucketRegionWithHTTPClient(ctx, c.Bucket, httpClient); err != nil {
 				return fmt.Errorf("s3: cannot lookup bucket region: %w", err)
 			}
 		} else {
 			region = DefaultRegion // default for non-S3 object stores
-		}
-	}
-
-	// Create HTTP client with 24 hour timeout for long-running operations
-	httpClient := &http.Client{
-		Timeout: 24 * time.Hour,
-	}
-
-	// Always configure custom HTTP Transport with controlled keepalive settings
-	// to reduce idle CPU usage from default transport's aggressive keepalives.
-	// See: https://github.com/benbjohnson/litestream/issues/992
-	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
-	httpClient.Transport = &http.Transport{
-		Proxy: http.ProxyFromEnvironment,
-		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, address)
-			if err != nil {
-				return nil, err
-			}
-			return &writeTimeoutConn{Conn: conn}, nil
-		},
-		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
-		IdleConnTimeout:       90 * time.Second,
-		TLSHandshakeTimeout:   10 * time.Second,
-		ExpectContinueTimeout: 1 * time.Second,
-		ResponseHeaderTimeout: responseHeaderTimeout,
-	}
-
-	// Configure TLS to skip verification if requested
-	if c.SkipVerify {
-		httpClient.Transport.(*http.Transport).TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
 		}
 	}
 
@@ -630,11 +613,100 @@ func newTransportRetryer() aws.Retryer {
 	})
 }
 
+// buildTLSConfig returns a cloned *tls.Config incorporating TLSConfig, CAFile,
+// and SkipVerify without mutating c.TLSConfig or its RootCAs pool.
+// Returns nil when none of those options are configured.
+func (c *ReplicaClient) buildTLSConfig() (*tls.Config, error) {
+	if c.TLSConfig == nil && c.CAFile == "" && !c.SkipVerify {
+		return nil, nil
+	}
+
+	var tlsCfg *tls.Config
+	if c.TLSConfig != nil {
+		tlsCfg = c.TLSConfig.Clone()
+	} else {
+		tlsCfg = &tls.Config{}
+	}
+
+	if c.CAFile != "" {
+		pemData, err := os.ReadFile(c.CAFile)
+		if err != nil {
+			return nil, fmt.Errorf("s3: read ca-file %q: %w", c.CAFile, err)
+		}
+
+		var pool *x509.CertPool
+		if tlsCfg.RootCAs != nil {
+			pool = tlsCfg.RootCAs.Clone()
+		} else {
+			pool, err = x509.SystemCertPool()
+			if err != nil || pool == nil {
+				pool = x509.NewCertPool()
+			}
+		}
+
+		if !pool.AppendCertsFromPEM(pemData) {
+			return nil, fmt.Errorf("s3: no valid PEM certificates found in ca-file %q", c.CAFile)
+		}
+		tlsCfg.RootCAs = pool
+	}
+
+	if c.SkipVerify {
+		tlsCfg.InsecureSkipVerify = true
+	}
+
+	return tlsCfg, nil
+}
+
+// newHTTPClient constructs the HTTP client used for S3 requests.
+func (c *ReplicaClient) newHTTPClient() (*http.Client, error) {
+	tlsCfg, err := c.buildTLSConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// Always configure custom HTTP Transport with controlled keepalive settings
+	// to reduce idle CPU usage from default transport's aggressive keepalives.
+	// See: https://github.com/benbjohnson/litestream/issues/992
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	transport := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(ctx context.Context, network, address string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, network, address)
+			if err != nil {
+				return nil, err
+			}
+			return &writeTimeoutConn{Conn: conn}, nil
+		},
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          100,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: responseHeaderTimeout,
+		TLSClientConfig:       tlsCfg,
+	}
+
+	// Create HTTP client with 24 hour timeout for long-running operations
+	return &http.Client{
+		Timeout:   24 * time.Hour,
+		Transport: transport,
+	}, nil
+}
+
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.
 func (c *ReplicaClient) findBucketRegion(ctx context.Context, bucket string) (string, error) {
+	httpClient, err := c.newHTTPClient()
+	if err != nil {
+		return "", err
+	}
+	return c.findBucketRegionWithHTTPClient(ctx, bucket, httpClient)
+}
+
+func (c *ReplicaClient) findBucketRegionWithHTTPClient(ctx context.Context, bucket string, httpClient *http.Client) (string, error) {
 	// Build a config with credentials but no region
 	configOpts := []func(*config.LoadOptions) error{
 		config.WithRetryer(newTransportRetryer),
+		config.WithHTTPClient(httpClient),
 	}
 
 	// Add static credentials if provided

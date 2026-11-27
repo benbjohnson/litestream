@@ -5,8 +5,11 @@ import (
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -3579,6 +3582,201 @@ func TestReplicaClient_RetriesThrottledList(t *testing.T) {
 			}
 			if got := attempts.Load(); got != 2 {
 				t.Fatalf("attempts = %d, want 2", got)
+			}
+		})
+	}
+}
+
+func TestReplicaClient_TLSConfigAndCAFile(t *testing.T) {
+	data := mustLTX(t)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer r.Body.Close()
+		_, _ = io.Copy(io.Discard, r.Body)
+		if r.Method == http.MethodPut {
+			w.Header().Set("ETag", `"test-etag"`)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	caPEM := pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE",
+		Bytes: server.Certificate().Raw,
+	})
+	caPath := filepath.Join(t.TempDir(), "private-ca.pem")
+	if err := os.WriteFile(caPath, caPEM, 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	t.Run("RejectedWithoutCAOrTLSConfig", func(t *testing.T) {
+		client := newTestReplicaClient(t, server)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+		_, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data))
+		if err == nil {
+			t.Fatal("expected TLS verification error without CA or TLSConfig, got nil")
+		}
+		var unknownAuthErr x509.UnknownAuthorityError
+		if !errors.As(err, &unknownAuthErr) {
+			t.Errorf("expected x509.UnknownAuthorityError, got %T: %v", err, err)
+		}
+	})
+
+	t.Run("AcceptedWithTLSConfig", func(t *testing.T) {
+		pool := x509.NewCertPool()
+		pool.AddCert(server.Certificate())
+
+		client := newTestReplicaClient(t, server)
+		client.TLSConfig = &tls.Config{
+			RootCAs:    pool,
+			MinVersion: tls.VersionTLS12,
+		}
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+		if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+			t.Fatalf("WriteLTXFile() error: %v", err)
+		}
+	})
+
+	t.Run("AcceptedWithCAFile", func(t *testing.T) {
+		client := newTestReplicaClient(t, server)
+		client.CAFile = caPath
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+		if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+			t.Fatalf("WriteLTXFile() error: %v", err)
+		}
+	})
+
+	t.Run("SkipVerifyOverlaysClonedTLSConfigWithoutMutation", func(t *testing.T) {
+		callerTLS := &tls.Config{
+			MinVersion: tls.VersionTLS12,
+		}
+
+		client := newTestReplicaClient(t, server)
+		client.TLSConfig = callerTLS
+		client.SkipVerify = true
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+		if callerTLS.InsecureSkipVerify {
+			t.Fatal("Init() mutated caller TLSConfig.InsecureSkipVerify")
+		}
+		if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+			t.Fatalf("WriteLTXFile() error: %v", err)
+		}
+	})
+
+	t.Run("CAFileMergedWithTLSConfigWithoutMutatingCallerPool", func(t *testing.T) {
+		callerPool := x509.NewCertPool()
+		callerTLS := &tls.Config{
+			RootCAs:    callerPool,
+			MinVersion: tls.VersionTLS12,
+		}
+
+		client := newTestReplicaClient(t, server)
+		client.TLSConfig = callerTLS
+		client.CAFile = caPath
+
+		ctx := context.Background()
+		if err := client.Init(ctx); err != nil {
+			t.Fatalf("Init() error: %v", err)
+		}
+		if callerTLS.RootCAs != callerPool {
+			t.Fatal("Init() replaced caller TLSConfig.RootCAs pointer")
+		}
+		if !callerPool.Equal(x509.NewCertPool()) {
+			t.Fatal("Init() mutated caller TLSConfig.RootCAs pool")
+		}
+		if _, err := client.WriteLTXFile(ctx, 0, 2, 2, bytes.NewReader(data)); err != nil {
+			t.Fatalf("WriteLTXFile() error: %v", err)
+		}
+	})
+
+	t.Run("MissingCAFileReturnsError", func(t *testing.T) {
+		client := newTestReplicaClient(t, server)
+		client.CAFile = filepath.Join(t.TempDir(), "does-not-exist.pem")
+
+		err := client.Init(context.Background())
+		if err == nil {
+			t.Fatal("expected error for missing ca-file, got nil")
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("expected os.ErrNotExist, got %v", err)
+		}
+	})
+
+	t.Run("InvalidPEMCAFileReturnsError", func(t *testing.T) {
+		badPath := filepath.Join(t.TempDir(), "invalid.pem")
+		if err := os.WriteFile(badPath, []byte("not a valid pem file"), 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		client := newTestReplicaClient(t, server)
+		client.CAFile = badPath
+
+		err := client.Init(context.Background())
+		if err == nil {
+			t.Fatal("expected error for invalid PEM ca-file, got nil")
+		}
+		if !strings.Contains(err.Error(), "no valid PEM certificates") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+
+	t.Run("EmptyCAFileReturnsError", func(t *testing.T) {
+		emptyPath := filepath.Join(t.TempDir(), "empty.pem")
+		if err := os.WriteFile(emptyPath, nil, 0o600); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+
+		client := newTestReplicaClient(t, server)
+		client.CAFile = emptyPath
+
+		err := client.Init(context.Background())
+		if err == nil {
+			t.Fatal("expected error for empty ca-file, got nil")
+		}
+		if !strings.Contains(err.Error(), "no valid PEM certificates") {
+			t.Errorf("unexpected error: %v", err)
+		}
+	})
+}
+
+func TestNewReplicaClientFromURL_CAFile(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		raw  string
+		want string
+	}{
+		{name: "CamelCase", raw: "s3://mybucket/path?caFile=/etc/ssl/private-ca.pem", want: "/etc/ssl/private-ca.pem"},
+		{name: "Hyphenated", raw: "s3://mybucket/path?ca-file=/etc/ssl/private-ca.pem", want: "/etc/ssl/private-ca.pem"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			u, err := url.Parse(tt.raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			rc, err := NewReplicaClientFromURL(u.Scheme, u.Host, strings.TrimPrefix(u.Path, "/"), u.Query(), u.User)
+			if err != nil {
+				t.Fatal(err)
+			}
+			client := rc.(*ReplicaClient)
+			if client.CAFile != tt.want {
+				t.Errorf("CAFile = %q, want %q", client.CAFile, tt.want)
 			}
 		})
 	}
