@@ -881,14 +881,16 @@ func (s *Store) EnforceSnapshotRetention(ctx context.Context, db *DB) error {
 				return fmt.Errorf("fetch L%d compaction progress: %w", nextLevel, err)
 			}
 			if info.MaxTXID < minTXID {
-				minTXID = info.MaxTXID + 1
-				db.Logger.DebugContext(ctx, "intermediate retention cutoff clamped",
-					"ltx_level", lvl.Level,
-					"next_level", nextLevel,
-					"min_snapshot_txid", minSnapshotTXID,
-					"next_level_max_txid", info.MaxTXID,
-					"min_txid", minTXID,
-				)
+				if clamped := info.MaxTXID + 1; clamped < minTXID {
+					minTXID = clamped
+					db.Logger.DebugContext(ctx, "intermediate retention cutoff clamped",
+						"ltx_level", lvl.Level,
+						"next_level", nextLevel,
+						"min_snapshot_txid", minSnapshotTXID,
+						"next_level_max_txid", info.MaxTXID,
+						"min_txid", minTXID,
+					)
+				}
 			}
 		}
 

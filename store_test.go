@@ -75,6 +75,7 @@ func TestStore_EnforceSnapshotRetention_ConsumedBoundary(t *testing.T) {
 		{name: "ConsumedFile", consumed: 10, wantClamp: true, want: []ltx.TXID{20, 30}},
 		{name: "PartiallyConsumedFile", consumed: 15, wantClamp: true, want: []ltx.TXID{20, 30}},
 		{name: "ConsumedAllFiles", consumed: 30, wantClamp: true, want: []ltx.TXID{30}},
+		{name: "ExactConsumedBoundary", consumed: 29, floor: 30, want: []ltx.TXID{30}},
 		{name: "CaughtUp", consumed: 30, floor: 30, want: []ltx.TXID{30}},
 		{name: "SnapshotBoundary", consumed: 30, floor: 15, want: []ltx.TXID{20, 30}},
 		{name: "HighestLevel", topLevel: true, want: []ltx.TXID{30}},
