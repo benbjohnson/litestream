@@ -400,7 +400,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 
-		c.logger.Debug("deleting ltx file", "ltx_level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
 
 		if err := client.Remove(filename); err != nil && !os.IsNotExist(err) && !gowebdav.IsErrNotFound(err) {
 			return fmt.Errorf("webdav: cannot delete ltx file %q: %w", filename, err)

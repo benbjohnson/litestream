@@ -248,12 +248,22 @@ func findReservedSlogKeys(fset *token.FileSet, file *ast.File) []reservedSlogKey
 		"Group":    true,
 	}
 
-	isLoggerExpr := func(expr ast.Expr) bool {
+	var groupedClientLogger bool
+	switch filepath.ToSlash(fset.Position(file.Pos()).Filename) {
+	case "abs/replica_client.go", "file/replica_client.go", "gs/replica_client.go", "nats/replica_client.go",
+		"oss/replica_client.go", "s3/replica_client.go", "sftp/replica_client.go", "webdav/replica_client.go":
+		groupedClientLogger = true
+	}
+
+	isTopLevelLogger := func(expr ast.Expr) bool {
 		switch e := expr.(type) {
 		case *ast.Ident:
 			name := strings.ToLower(e.Name)
 			return name == "slog" || strings.Contains(name, "log")
 		case *ast.SelectorExpr:
+			if client, ok := e.X.(*ast.Ident); ok && groupedClientLogger && client.Name == "c" && e.Sel.Name == "logger" {
+				return false
+			}
 			return strings.Contains(strings.ToLower(e.Sel.Name), "log")
 		case *ast.CallExpr:
 			if sel, ok := e.Fun.(*ast.SelectorExpr); ok {
@@ -336,7 +346,7 @@ func findReservedSlogKeys(fset *token.FileSet, file *ast.File) []reservedSlogKey
 			return true
 		}
 		attrStart, ok := methodAttrStart[sel.Sel.Name]
-		if !ok || !isLoggerExpr(sel.X) {
+		if !ok || !isTopLevelLogger(sel.X) {
 			return true
 		}
 
@@ -391,7 +401,7 @@ func findReservedSlogKeys(fset *token.FileSet, file *ast.File) []reservedSlogKey
 
 // TestLogCalls_NoReservedSlogKeys statically verifies that no non-test Go file
 // passes built-in slog attribute keys ("time", "level", "msg", "source") as
-// user attributes, preventing duplicate keys in JSON and text log output.
+// top-level user attributes, preventing duplicate keys in JSON and text log output.
 func TestLogCalls_NoReservedSlogKeys(t *testing.T) {
 	fset := token.NewFileSet()
 	err := filepath.WalkDir(".", func(path string, d fs.DirEntry, err error) error {
@@ -421,6 +431,23 @@ func TestLogCalls_NoReservedSlogKeys(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFindReservedSlogKeys_GroupedReplicaLogger(t *testing.T) {
+	const src = `package s3
+func (c *ReplicaClient) DeleteLTXFiles() {
+	c.logger.Debug("deleting", "level", 1)
+	slog.Debug("top-level", "level", 1)
+}`
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "s3/replica_client.go", src, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := findReservedSlogKeys(fset, file)
+	if len(got) != 1 || got[0].Line != 4 || got[0].Key != slog.LevelKey {
+		t.Fatalf("got violations %+v, want only the top-level level key on line 4", got)
 	}
 }
 

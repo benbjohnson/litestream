@@ -401,7 +401,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (
 	for _, info := range a {
 		filename := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 
-		c.logger.Debug("deleting ltx file", "ltx_level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", filename)
 
 		if err := sftpClient.Remove(filename); err != nil && !os.IsNotExist(err) {
 			return fmt.Errorf("sftp: cannot delete ltx file %q: %w", filename, err)

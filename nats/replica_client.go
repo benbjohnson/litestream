@@ -441,7 +441,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	for _, fileInfo := range a {
 		objectPath := c.ltxPath(fileInfo.Level, fileInfo.MinTXID, fileInfo.MaxTXID)
 
-		c.logger.Debug("deleting ltx file", "ltx_level", fileInfo.Level, "minTXID", fileInfo.MinTXID, "maxTXID", fileInfo.MaxTXID, "path", objectPath)
+		c.logger.Debug("deleting ltx file", "level", fileInfo.Level, "minTXID", fileInfo.MinTXID, "maxTXID", fileInfo.MaxTXID, "path", objectPath)
 
 		if err := c.objectStore.Delete(ctx, objectPath); err != nil {
 			if !isNotFoundError(err) {

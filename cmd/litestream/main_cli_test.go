@@ -782,7 +782,7 @@ func TestReplicateCLI_StartupLogNoDuplicateLevelKey(t *testing.T) {
 
 			replicaDir := filepath.Join(tmpDir, "replica")
 			configPath := filepath.Join(tmpDir, "litestream.yml")
-			configYAML := fmt.Sprintf("logging:\n  level: info\n  type: %s\ndbs:\n  - path: %q\n    replica:\n      url: %q\n", format, dbPath, "file://"+filepath.ToSlash(replicaDir))
+			configYAML := fmt.Sprintf("logging:\n  level: info\n  type: %s\ndbs:\n  - path: %q\n    replica:\n      path: %q\n", format, dbPath, replicaDir)
 			if err := os.WriteFile(configPath, []byte(configYAML), 0o600); err != nil {
 				t.Fatal(err)
 			}

@@ -304,7 +304,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 		key := c.ltxPath(info.Level, filename)
 		objects = append(objects, oss.DeleteObject{Key: oss.Ptr(key)})
 
-		c.logger.Debug("deleting ltx file", "ltx_level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
+		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 	}
 
 	// Delete in batches
