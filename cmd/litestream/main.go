@@ -541,11 +541,23 @@ func (c *Config) Validate() error {
 
 func (c *Config) warnSnapshotRetention() {
 	warn := func(field string, snapshot SnapshotConfig) {
-		if snapshot.Interval != nil && snapshot.Retention != nil && *snapshot.Retention < *snapshot.Interval {
+		if snapshot.Retention == nil {
+			return
+		}
+		if snapshot.Interval != nil && *snapshot.Retention < *snapshot.Interval {
 			slog.Warn("snapshot retention is shorter than snapshot interval",
 				"field", field,
 				"retention", *snapshot.Retention,
 				"interval", *snapshot.Interval)
+		}
+		for i, level := range c.Levels {
+			if *snapshot.Retention < level.Interval {
+				slog.Warn("snapshot retention is shorter than compaction level interval",
+					"field", field,
+					"retention", *snapshot.Retention,
+					"ltx_level", i+1,
+					"interval", level.Interval)
+			}
 		}
 	}
 	warn("snapshot.retention", c.Snapshot)

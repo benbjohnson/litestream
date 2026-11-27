@@ -917,6 +917,58 @@ func TestNewReplicaFromConfig_AgeEncryption(t *testing.T) {
 	})
 }
 
+func TestConfig_SnapshotRetentionCompactionWarnings(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "")
+	stderr, err := os.Create(filepath.Join(t.TempDir(), "stderr"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalStderr, originalLogger := os.Stderr, slog.Default()
+	t.Cleanup(func() {
+		os.Stderr = originalStderr
+		slog.SetDefault(originalLogger)
+		if err := stderr.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	os.Stderr = stderr
+
+	const config = `
+levels:
+  - interval: 1h
+  - interval: 2h
+  - interval: 3h
+snapshot:
+  interval: 1h
+  retention: 2h
+dbs:
+  - path: /tmp/test.db
+    snapshot:
+      retention: 1h
+`
+	if _, err := main.ParseConfig(strings.NewReader(config), false); err != nil {
+		t.Fatal(err)
+	}
+	output, err := os.ReadFile(stderr.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	wantFields := []string{
+		"field=snapshot.retention retention=2h0m0s ltx_level=3 interval=3h0m0s",
+		"field=dbs[/tmp/test.db].snapshot.retention retention=1h0m0s ltx_level=2 interval=2h0m0s",
+		"field=dbs[/tmp/test.db].snapshot.retention retention=1h0m0s ltx_level=3 interval=3h0m0s",
+	}
+	if len(lines) != len(wantFields) {
+		t.Fatalf("expected %d warnings, got %q", len(wantFields), output)
+	}
+	for i, fields := range wantFields {
+		if !strings.Contains(lines[i], `level=WARN msg="snapshot retention is shorter than compaction level interval" `+fields) {
+			t.Errorf("unexpected warning: %s", lines[i])
+		}
+	}
+}
+
 // TestConfig_Validate_SnapshotIntervals tests validation of snapshot intervals
 func TestConfig_Validate_SnapshotIntervals(t *testing.T) {
 	t.Run("ValidInterval", func(t *testing.T) {

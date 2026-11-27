@@ -665,9 +665,9 @@ func TestConfig_SnapshotWarningLogging(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			dir := t.TempDir()
 			configPath := filepath.Join(dir, "litestream.yml")
-			config := "snapshot:\n  interval: 1h\n  retention: 30m\nlogging:\n  type: json\n  stderr: true\n  level: " + tt.level + "\n"
-			if tt.defaultLogging {
-				config = "snapshot:\n  interval: 1h\n  retention: 30m\n"
+			config := "levels:\n  - interval: 5m\nsnapshot:\n  interval: 1h\n  retention: 30m\n"
+			if !tt.defaultLogging {
+				config += "logging:\n  type: json\n  stderr: true\n  level: " + tt.level + "\n"
 			}
 			if err := os.WriteFile(configPath, []byte(config), 0600); err != nil {
 				t.Fatal(err)
