@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1403,6 +1404,63 @@ func TestDB_EnforceL0RetentionByTime(t *testing.T) {
 		t.Fatalf("enforce aged retention: %v", err)
 	}
 	checkExists(true)
+}
+
+// l1ListCountingClient counts LTXFiles calls for level 1.
+type l1ListCountingClient struct {
+	litestream.ReplicaClient
+	l1Lists atomic.Int64
+}
+
+func (c *l1ListCountingClient) LTXFiles(ctx context.Context, level int, seek ltx.TXID, useMetadata bool) (ltx.FileIterator, error) {
+	if level == 1 {
+		c.l1Lists.Add(1)
+	}
+	return c.ReplicaClient.LTXFiles(ctx, level, seek, useMetadata)
+}
+
+// The L0 retention monitor runs every 15s. It should not list all of L1 on
+// each run once the highest L1 file is known. See issue #1633.
+func TestDB_EnforceL0RetentionByTime_UsesCachedL1Max(t *testing.T) {
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	db := testingutil.NewDB(t, filepath.Join(dir, "db"))
+	db.MonitorInterval = 0
+	db.ShutdownSyncTimeout = 0
+	client := &l1ListCountingClient{ReplicaClient: file.NewReplicaClient(filepath.Join(dir, "replica"))}
+	db.Replica = litestream.NewReplicaWithClient(db, client)
+	db.Replica.MonitorEnabled = false
+	if err := db.Open(); err != nil {
+		t.Fatal(err)
+	}
+	sqldb := testingutil.MustOpenSQLDB(t, db.Path())
+	defer testingutil.MustCloseDBs(t, db, sqldb)
+
+	db.L0Retention = 30 * time.Minute
+
+	if _, err := sqldb.ExecContext(ctx, `CREATE TABLE t (id INTEGER PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Replica.Sync(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Compact(ctx, 1); err != nil {
+		t.Fatalf("compact L0 -> L1: %v", err)
+	}
+
+	before := client.l1Lists.Load()
+	for i := 0; i < 5; i++ {
+		if err := db.EnforceL0RetentionByTime(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := client.l1Lists.Load() - before; n != 0 {
+		t.Fatalf("expected no L1 listings after compaction, got %d", n)
+	}
 }
 
 // TestDB_SyncAfterVacuum verifies that syncing works correctly after a database
