@@ -284,11 +284,13 @@ func testLTXFile(t *testing.T, size int) []byte {
 	return append(b, body...)
 }
 
-// recordingServer is an in-memory SFTP server that counts the write requests it receives.
+// recordingServer is an in-memory SFTP server that counts the read and write
+// requests it receives.
 type recordingServer struct {
 	client *sftp.Client
 
 	mu        sync.Mutex
+	reads     int
 	writes    int
 	writeErr  error
 	closeErr  error
@@ -312,6 +314,11 @@ func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
 			pkt, err := readPacket(clientProxy)
 			if err != nil {
 				return
+			}
+			if pkt[4] == 5 {
+				s.mu.Lock()
+				s.reads++
+				s.mu.Unlock()
 			}
 			if pkt[4] == 6 {
 				writes++
@@ -373,6 +380,96 @@ func (s *recordingServer) writeRequests() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.writes
+}
+
+func (s *recordingServer) readRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
+// The LTX decoder reads a 6-byte header before each page. Each of those reads
+// must not become its own read request, and buffering must not change the
+// bytes a caller sees, for a whole file or for a range of one.
+func TestReplicaClient_OpenLTXFile_BufferedReads(t *testing.T) {
+	server := newRecordingServer(t, false)
+	c := NewReplicaClient()
+	c.Path = "/replica"
+	c.conn = &replicaConn{sftp: server.client}
+
+	const pageN = 256
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 4096, Commit: pageN, MinTXID: 1, MaxTXID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	pages := make([][]byte, pageN)
+	for i := range pages {
+		pages[i] = make([]byte, 4096)
+		if _, err := rand.Read(pages[i][:512]); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(i + 1)}, pages[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := slices.Clone(buf.Bytes())
+	if _, err := c.WriteLTXFile(context.Background(), 1, 1, 1, &buf); err != nil {
+		t.Fatal(err)
+	}
+
+	reads := server.readRequests()
+	rc, err := c.OpenLTXFile(context.Background(), 1, 1, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := ltx.NewDecoder(rc)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	var hdr ltx.PageHeader
+	page := make([]byte, 4096)
+	for i := range pages {
+		if err := dec.DecodePage(&hdr, page); err != nil {
+			t.Fatal(err)
+		} else if hdr.Pgno != uint32(i+1) || !bytes.Equal(page, pages[i]) {
+			t.Fatalf("page %d differs from the page written", i+1)
+		}
+	}
+	if err := dec.DecodePage(&hdr, page); err != io.EOF {
+		t.Fatalf("expected end of pages, got %v", err)
+	} else if err := dec.Close(); err != nil {
+		t.Fatal(err)
+	} else if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, limit := server.readRequests()-reads, len(data)/sftpPacketSize+8; n > limit {
+		t.Fatalf("decoding %d pages took %d read requests, want at most %d", pageN, n, limit)
+	}
+
+	for _, r := range []struct{ offset, size int64 }{{0, ltx.HeaderSize}, {1000, 3 * sftpPacketSize}, {int64(len(data)) - 500, 0}} {
+		rc, err := c.OpenLTXFile(context.Background(), 1, 1, 1, r.offset, r.size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, err := io.ReadAll(rc)
+		_ = rc.Close()
+		end := int64(len(data))
+		if r.size > 0 {
+			end = r.offset + r.size
+		}
+		if err != nil {
+			t.Fatal(err)
+		} else if !bytes.Equal(got, data[r.offset:end]) {
+			t.Fatalf("offset=%d size=%d: read %d bytes that differ from the file", r.offset, r.size, len(got))
+		}
+	}
 }
 
 type countingFileWriter struct {

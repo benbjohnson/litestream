@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -388,11 +389,23 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
+	// The LTX decoder reads a few bytes at a time, such as the 6-byte header
+	// before each page, and pkg/sftp sends every read that fits in a packet as
+	// its own request, so each would cost a round trip. Read through a buffer
+	// instead. The limit sits beneath the buffer so that read-ahead stays
+	// within the requested range.
+	var r io.Reader = f
+	bufSize := readBufferSize
 	if size > 0 {
-		return internal.LimitReadCloser(f, size), nil
+		r = io.LimitReader(f, size)
+		bufSize = int(min(size, readBufferSize))
 	}
-	return f, nil
+	return internal.NewReadCloser(bufio.NewReaderSize(r, bufSize), f), nil
 }
+
+// readBufferSize is the read-ahead applied to an opened LTX file. It spans
+// several SFTP packets so that pkg/sftp can request them concurrently.
+const readBufferSize = 256 * 1024
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
 func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) (err error) {
