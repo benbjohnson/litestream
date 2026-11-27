@@ -161,9 +161,6 @@ func readPacket(r io.Reader) ([]byte, error) {
 	return pkt, err
 }
 
-// sftpPacketSize is the largest payload pkg/sftp puts in one write request by default.
-const sftpPacketSize = 32 * 1024
-
 // Compaction hands WriteLTXFile an io.Pipe fed by many small writes. The upload
 // must still go out in full packets: a request per small write costs a round
 // trip each, which makes large uploads over a real link crawl.
@@ -177,7 +174,7 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 			c.ConcurrentWrites = concurrent
 			c.conn = &replicaConn{sftp: server.client}
 
-			data := testLTXFile(t, 3*sftpPacketSize+1234)
+			data := testLTXFile(t, 3*packetSize+1234)
 			pr, pw := io.Pipe()
 			go func() {
 				for rest := data; len(rest) > 0; {
@@ -215,7 +212,7 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 			if concurrent && !pipelined {
 				t.Fatal("second write was not sent before the first write response")
 			}
-			limit := (len(data) + sftpPacketSize - 1) / sftpPacketSize
+			limit := (len(data) + packetSize - 1) / packetSize
 			if n := server.writeRequests(); n > limit {
 				t.Fatalf("upload took %d write requests, want at most %d", n, limit)
 			}
@@ -238,7 +235,7 @@ func TestFillReader(t *testing.T) {
 	}()
 
 	r := fillReader{pr}
-	buf := make([]byte, sftpPacketSize)
+	buf := make([]byte, packetSize)
 	var got []byte
 	var sizes []int
 	for {
@@ -255,7 +252,7 @@ func TestFillReader(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatalf("read %d bytes, want %d", len(got), len(data))
 	}
-	if want := []int{sftpPacketSize, sftpPacketSize, len(data) - 2*sftpPacketSize}; fmt.Sprint(sizes) != fmt.Sprint(want) {
+	if want := []int{packetSize, packetSize, len(data) - 2*packetSize}; fmt.Sprint(sizes) != fmt.Sprint(want) {
 		t.Fatalf("read sizes=%v, want %v", sizes, want)
 	}
 }
@@ -284,15 +281,19 @@ func testLTXFile(t *testing.T, size int) []byte {
 	return append(b, body...)
 }
 
-// recordingServer is an in-memory SFTP server that counts the write requests it receives.
+// recordingServer is an in-memory SFTP server that counts the read and write
+// requests it receives.
 type recordingServer struct {
 	client *sftp.Client
 
-	mu        sync.Mutex
-	writes    int
-	writeErr  error
-	closeErr  error
-	pipelined bool
+	mu         sync.Mutex
+	reads      int
+	maxReadEnd uint64
+	closes     int
+	writes     int
+	writeErr   error
+	closeErr   error
+	pipelined  bool
 }
 
 func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
@@ -313,7 +314,19 @@ func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
 			if err != nil {
 				return
 			}
-			if pkt[4] == 6 {
+			switch pkt[4] {
+			case 4:
+				s.mu.Lock()
+				s.closes++
+				s.mu.Unlock()
+			case 5:
+				s.mu.Lock()
+				s.reads++
+				offset := binary.BigEndian.Uint64(pkt[len(pkt)-12:])
+				length := binary.BigEndian.Uint32(pkt[len(pkt)-4:])
+				s.maxReadEnd = max(s.maxReadEnd, offset+uint64(length))
+				s.mu.Unlock()
+			case 6:
 				writes++
 				if writes == 1 {
 					close(firstWrite)
@@ -375,6 +388,150 @@ func (s *recordingServer) writeRequests() int {
 	return s.writes
 }
 
+func (s *recordingServer) readRequests() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
+// The LTX decoder reads a 6-byte header before each page. Each of those reads
+// must not become its own read request, and buffering must not change the
+// bytes a caller sees, for a whole file or for a range of one.
+func TestReplicaClient_OpenLTXFile_BufferedReads(t *testing.T) {
+	server := newRecordingServer(t, false)
+	c := NewReplicaClient()
+	c.Path = "/replica"
+	c.conn = &replicaConn{sftp: server.client}
+
+	const pageN = 256
+	var buf bytes.Buffer
+	enc, err := ltx.NewEncoder(&buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := enc.EncodeHeader(ltx.Header{Version: ltx.Version, Flags: ltx.HeaderFlagNoChecksum, PageSize: 4096, Commit: pageN, MinTXID: 1, MaxTXID: 1}); err != nil {
+		t.Fatal(err)
+	}
+	pages := make([][]byte, pageN)
+	for i := range pages {
+		pages[i] = make([]byte, 4096)
+		if _, err := rand.Read(pages[i][:512]); err != nil {
+			t.Fatal(err)
+		}
+		if err := enc.EncodePage(ltx.PageHeader{Pgno: uint32(i + 1)}, pages[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := enc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := slices.Clone(buf.Bytes())
+	if _, err := c.WriteLTXFile(context.Background(), 1, 1, 1, &buf); err != nil {
+		t.Fatal(err)
+	}
+
+	reads := server.readRequests()
+	rc, err := c.OpenLTXFile(context.Background(), 1, 1, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := ltx.NewDecoder(rc)
+	if err := dec.DecodeHeader(); err != nil {
+		t.Fatal(err)
+	}
+	var hdr ltx.PageHeader
+	page := make([]byte, 4096)
+	for i := range pages {
+		if err := dec.DecodePage(&hdr, page); err != nil {
+			t.Fatal(err)
+		} else if hdr.Pgno != uint32(i+1) || !bytes.Equal(page, pages[i]) {
+			t.Fatalf("page %d differs from the page written", i+1)
+		}
+	}
+	if err := dec.DecodePage(&hdr, page); err != io.EOF {
+		t.Fatalf("expected end of pages, got %v", err)
+	} else if err := dec.Close(); err != nil {
+		t.Fatal(err)
+	} else if err := rc.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if n, limit := server.readRequests()-reads, len(data)/packetSize+8; n > limit {
+		t.Fatalf("decoding %d pages took %d read requests, want at most %d", pageN, n, limit)
+	}
+
+	for _, r := range []struct{ offset, size int64 }{{0, ltx.HeaderSize}, {1000, 3 * packetSize}, {int64(len(data)) - 500, 0}} {
+		rc, err := c.OpenLTXFile(context.Background(), 1, 1, 1, r.offset, r.size)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got bytes.Buffer
+		if _, err := io.CopyN(&got, rc, 1); err != nil {
+			t.Fatal(err)
+		}
+		_, err = io.Copy(&got, rc)
+		if closeErr := rc.Close(); closeErr != nil {
+			t.Fatal(closeErr)
+		}
+		end := int64(len(data))
+		if r.size > 0 {
+			end = r.offset + r.size
+		}
+		if err != nil {
+			t.Fatal(err)
+		} else if !bytes.Equal(got.Bytes(), data[r.offset:end]) {
+			t.Fatalf("offset=%d size=%d: read %d bytes that differ from the file", r.offset, r.size, got.Len())
+		}
+	}
+}
+
+func TestReplicaClient_OpenLTXFile_WireRange(t *testing.T) {
+	for _, tt := range []struct {
+		name         string
+		fileSize     int
+		offset, size int64
+	}{
+		{"SmallFile", 2048, 0, 0},
+		{"SmallTail", 256*1024 + 500, 256 * 1024, 0},
+		{"PartialPacket", 96 * 1024, 1000, 32*1024 + 1},
+		{"MultipleFills", 512 * 1024, 1000, 256*1024 + 17},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			server := newRecordingServer(t, false)
+			c := NewReplicaClient()
+			c.Path = "/replica"
+			c.conn = &replicaConn{sftp: server.client}
+			data := testLTXFile(t, tt.fileSize)
+			if _, err := c.WriteLTXFile(t.Context(), 1, 1, 1, bytes.NewReader(data)); err != nil {
+				t.Fatal(err)
+			}
+			rc, err := c.OpenLTXFile(t.Context(), 1, 1, 1, tt.offset, tt.size)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer rc.Close()
+			end := tt.offset + tt.size
+			if tt.size == 0 {
+				end = int64(tt.fileSize)
+			}
+			got := make([]byte, end-tt.offset)
+			if _, err := io.ReadFull(rc, got[:1]); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := io.ReadFull(rc, got[1:]); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got, data[tt.offset:end]) {
+				t.Fatal("range contents differ")
+			}
+			server.mu.Lock()
+			defer server.mu.Unlock()
+			if server.maxReadEnd != uint64(end) {
+				t.Fatalf("furthest wire read ended at %d, want %d", server.maxReadEnd, end)
+			}
+		})
+	}
+}
+
 type countingFileWriter struct {
 	sftp.FileWriter
 	server *recordingServer
@@ -421,7 +578,7 @@ func TestReplicaClient_WriteLTXFile_Abort(t *testing.T) {
 				c.Path = "/replica"
 				c.ConcurrentWrites = concurrent
 				c.conn = &replicaConn{sftp: server.client}
-				data := testLTXFile(t, 3*sftpPacketSize+1234)
+				data := testLTXFile(t, 3*packetSize+1234)
 				pr, pw := io.Pipe()
 				defer pr.Close()
 				sourceErr := errors.New("source failed")
@@ -499,6 +656,82 @@ func TestReplicaClient_OpenLTXFile_HealthyClosePreservesSibling(t *testing.T) {
 		t.Fatalf("read sibling: %v", err)
 	} else if !bytes.Equal(got, data) {
 		t.Fatal("sibling returned different LTX data")
+	}
+}
+
+func TestReplicaClient_OpenLTXFile_CancelWithBufferedData(t *testing.T) {
+	server := newRecordingServer(t, false)
+	c := NewReplicaClient()
+	c.Path = "/replica"
+	c.conn = &replicaConn{sftp: server.client}
+	data := testLTXFile(t, 1024)
+	if _, err := c.WriteLTXFile(t.Context(), 1, 1, 1, bytes.NewReader(data)); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	r, err := c.OpenLTXFile(ctx, 1, 1, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b [1]byte
+	if _, err := io.ReadFull(r, b[:]); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if n, err := r.Read(b[:]); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Errorf("read after cancellation = %d, %v", n, err)
+	}
+	if n, err := io.Copy(io.Discard, r); n != 0 || !errors.Is(err, context.Canceled) {
+		t.Errorf("copy after cancellation = %d, %v", n, err)
+	}
+	server.mu.Lock()
+	closes := server.closes
+	server.mu.Unlock()
+	if err := r.Close(); err != nil {
+		t.Fatalf("close after idle cancellation: %v", err)
+	}
+	server.mu.Lock()
+	defer server.mu.Unlock()
+	if n := server.closes - closes; n != 1 {
+		t.Errorf("file close sent %d close requests, want 1", n)
+	}
+}
+
+func TestReplicaClient_OpenLTXFile_CancelStalledStat(t *testing.T) {
+	c := NewReplicaClient()
+	c.Path = t.TempDir()
+	stalled := startStallingServer(t, c, 8)
+	filename := litestream.LTXFilePath(c.Path, 0, 1, 1)
+	if err := os.MkdirAll(path.Dir(filename), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filename, testLTXFile(t, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		r, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
+		if r != nil {
+			_ = r.Close()
+		}
+		done <- err
+	}()
+	select {
+	case <-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("file stat did not reach the server")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("open after cancellation: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("file stat remained blocked after cancellation")
 	}
 }
 

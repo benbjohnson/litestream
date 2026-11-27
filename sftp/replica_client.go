@@ -1,6 +1,7 @@
 package sftp
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -381,17 +382,64 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
-			_ = f.Close()
-			return nil, err
+			return nil, errors.Join(err, f.Close())
 		}
 	}
 
 	internal.OperationTotalCounterVec.WithLabelValues(ReplicaClientType, "GET").Inc()
 
+	// The LTX decoder reads a few bytes at a time, such as the 6-byte header
+	// before each page, and pkg/sftp sends every read that fits in a packet as
+	// its own request, so each would cost a round trip. Read through a buffer
+	// instead. The limit sits beneath the buffer so that read-ahead stays
+	// within the requested range.
+	var r io.Reader = f
+	remaining := size
 	if size > 0 {
-		return internal.LimitReadCloser(f, size), nil
+		r = io.LimitReader(r, size)
+	} else {
+		info, err := f.Stat()
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(ctxErr, f.Close())
+		}
+		if err != nil {
+			c.logger.DebugContext(ctx, "cannot size SFTP read buffer", "path", filename, "error", err)
+			remaining = packetSize
+		} else {
+			remaining = max(0, info.Size()-max(offset, 0))
+		}
 	}
-	return f, nil
+
+	// maxReadBufferSize is the read-ahead applied to an opened LTX file. It spans
+	// several SFTP packets so that pkg/sftp can request them concurrently.
+	const maxReadBufferSize = 256 * 1024
+	bufSize := int(min(remaining, maxReadBufferSize))
+	return &bufferedLTXFile{file: f, reader: bufio.NewReaderSize(r, bufSize)}, nil
+}
+
+const packetSize = 32 * 1024
+
+type bufferedLTXFile struct {
+	file   *ltxFile
+	reader *bufio.Reader
+}
+
+func (f *bufferedLTXFile) Read(p []byte) (int, error) {
+	if err := f.file.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return f.reader.Read(p)
+}
+
+func (f *bufferedLTXFile) WriteTo(w io.Writer) (int64, error) {
+	if err := f.file.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return f.reader.WriteTo(w)
+}
+
+func (f *bufferedLTXFile) Close() error {
+	return f.file.Close()
 }
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
@@ -487,11 +535,22 @@ func (f *ltxFile) discardConnIfActive() {
 	}
 }
 
+func (f *ltxFile) Stat() (os.FileInfo, error) {
+	if err := f.beginIO(); err != nil {
+		return nil, err
+	}
+	defer f.endIO()
+	return f.File.Stat()
+}
+
 func (f *ltxFile) Read(p []byte) (int, error) {
 	if err := f.beginIO(); err != nil {
 		return 0, err
 	}
 	defer f.endIO()
+	if len(p) > packetSize {
+		p = p[:len(p)-len(p)%packetSize]
+	}
 	return f.File.Read(p)
 }
 
