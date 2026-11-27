@@ -49,14 +49,11 @@ var _ litestream.ReplicaClient = (*ReplicaClient)(nil)
 
 // ReplicaClient is a client for writing LTX files to Alibaba Cloud OSS.
 type ReplicaClient struct {
-	mu       sync.Mutex
-	client   *oss.Client
-	uploader *oss.Uploader
-	logger   *slog.Logger
-
-	pathPrefix         string
-	pathPrefixResolved bool
-	pathPrefixCh       chan struct{}
+	mu         sync.Mutex
+	client     *oss.Client
+	uploader   *oss.Uploader
+	logger     *slog.Logger
+	rootPrefix internal.RootPrefixResolver
 
 	// Alibaba Cloud authentication keys.
 	AccessKeyID     string
@@ -180,64 +177,8 @@ func (c *ReplicaClient) Init(ctx context.Context) (err error) {
 	return nil
 }
 
-func (c *ReplicaClient) isBareRootPath() bool {
-	return c.Path == ""
-}
-
-// resolvePathPrefix returns the object key prefix for LTX operations.
-// Explicit paths (including path: ".") always use "<path>/" without probing,
-// which also serves as an escape hatch for policies restricted to "./*".
-// Bare-bucket root configs (c.Path == "") probe the bucket once to preserve
-// legacy "./" or "/" layouts on upgrade while defaulting new/empty buckets
-// to "" (clean "0000/..." keys).
-// Concurrent callers wait cancellably without holding c.mu during remote I/O.
 func (c *ReplicaClient) resolvePathPrefix(ctx context.Context) (string, error) {
-	for {
-		c.mu.Lock()
-		if c.pathPrefixResolved {
-			prefix := c.pathPrefix
-			c.mu.Unlock()
-			return prefix, nil
-		}
-		if !c.isBareRootPath() {
-			c.pathPrefix = c.Path + "/"
-			c.pathPrefixResolved = true
-			prefix := c.pathPrefix
-			c.mu.Unlock()
-			return prefix, nil
-		}
-		if ch := c.pathPrefixCh; ch != nil {
-			c.mu.Unlock()
-			select {
-			case <-ch:
-				continue
-			case <-ctx.Done():
-				return "", ctx.Err()
-			}
-		}
-
-		ch := make(chan struct{})
-		c.pathPrefixCh = ch
-		logger := c.logger
-		bucket := c.Bucket
-		c.mu.Unlock()
-
-		prefix, err := internal.ResolveRootPrefix(ctx, logger, ReplicaClientType, bucket, litestream.SnapshotLevel, c.listKeys)
-
-		c.mu.Lock()
-		if err == nil {
-			c.pathPrefix = prefix
-			c.pathPrefixResolved = true
-		}
-		c.pathPrefixCh = nil
-		close(ch)
-		c.mu.Unlock()
-
-		if err != nil {
-			return "", err
-		}
-		return prefix, nil
-	}
+	return c.rootPrefix.Resolve(ctx, c.Path, c.logger, ReplicaClientType, c.Bucket, litestream.SnapshotLevel, c.listKeys)
 }
 
 func (c *ReplicaClient) listKeys(ctx context.Context, prefix string, maxKeys int32, fn func(key string) bool) error {
@@ -459,51 +400,13 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 		return err
 	}
 
-	var objects []oss.DeleteObject
-
-	if c.isBareRootPath() || c.Path == "." {
-		// When replicating at a bare bucket root ("", "./", or "/") or explicit
-		// path ".", scope deletion to Litestream's direct LTX objects so
-		// unrelated objects in the bucket or under the same prefix are never touched.
-		for level := 0; level <= litestream.SnapshotLevel; level++ {
-			levelPrefix := pathPrefix + fmt.Sprintf("%04x/", level)
-			paginator := c.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
-				Bucket: oss.Ptr(c.Bucket),
-				Prefix: oss.Ptr(levelPrefix),
-			})
-			for paginator.HasNext() {
-				page, err := paginator.NextPage(ctx)
-				if err != nil {
-					return fmt.Errorf("oss: list objects page: %w", err)
-				}
-				for _, obj := range page.Contents {
-					if obj.Key != nil && internal.IsRootLTXKey(pathPrefix, *obj.Key, litestream.SnapshotLevel) {
-						objects = append(objects, oss.DeleteObject{Key: obj.Key})
-					}
-				}
-			}
-		}
-	} else {
-		// Create paginator for listing objects
-		paginator := c.client.NewListObjectsV2Paginator(&oss.ListObjectsV2Request{
-			Bucket: oss.Ptr(c.Bucket),
-			Prefix: oss.Ptr(pathPrefix),
-		})
-
-		// Iterate through all pages
-		for paginator.HasNext() {
-			page, err := paginator.NextPage(ctx)
-			if err != nil {
-				return fmt.Errorf("oss: list objects page: %w", err)
-			}
-
-			// Collect object identifiers
-			for _, obj := range page.Contents {
-				if obj.Key != nil {
-					objects = append(objects, oss.DeleteObject{Key: obj.Key})
-				}
-			}
-		}
+	keys, err := internal.CollectDeleteAllKeys(ctx, c.Path, pathPrefix, litestream.SnapshotLevel, c.listKeys)
+	if err != nil {
+		return err
+	}
+	objects := make([]oss.DeleteObject, len(keys))
+	for i, key := range keys {
+		objects[i] = oss.DeleteObject{Key: oss.Ptr(key)}
 	}
 
 	// Delete all collected objects in batches
@@ -528,11 +431,8 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 	// Invalidate cached root prefix so a reused bare-root client re-probes
 	// the now-empty bucket and writes to the canonical clean root.
-	if c.isBareRootPath() {
-		c.mu.Lock()
-		c.pathPrefix = ""
-		c.pathPrefixResolved = false
-		c.mu.Unlock()
+	if c.Path == "" {
+		c.rootPrefix.Invalidate()
 	}
 
 	return nil
@@ -540,18 +440,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 // ltxPath returns the full path to an LTX file.
 func (c *ReplicaClient) ltxPath(level int, filename string) string {
-	c.mu.Lock()
-	prefix := c.pathPrefix
-	resolved := c.pathPrefixResolved
-	c.mu.Unlock()
-	if !resolved {
-		if c.Path == "" {
-			prefix = ""
-		} else {
-			prefix = c.Path + "/"
-		}
-	}
-	return prefix + fmt.Sprintf("%04x/%s", level, filename)
+	return c.rootPrefix.Peek(c.Path) + fmt.Sprintf("%04x/%s", level, filename)
 }
 
 // fileIterator represents an iterator over LTX files in OSS.
