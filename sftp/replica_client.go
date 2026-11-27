@@ -404,19 +404,20 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		}
 		if err != nil {
 			slog.DebugContext(ctx, "cannot size SFTP read buffer", "path", filename, "error", err)
-			remaining = sftpPacketSize
+			remaining = packetSize
 		} else {
 			remaining = max(0, info.Size()-max(offset, 0))
 		}
 	}
+
+	// maxReadBufferSize is the read-ahead applied to an opened LTX file. It spans
+	// several SFTP packets so that pkg/sftp can request them concurrently.
+	const maxReadBufferSize = 256 * 1024
 	bufSize := int(min(remaining, maxReadBufferSize))
 	return &bufferedLTXFile{file: f, reader: bufio.NewReaderSize(r, bufSize)}, nil
 }
 
-// maxReadBufferSize is the read-ahead applied to an opened LTX file. It spans
-// several SFTP packets so that pkg/sftp can request them concurrently.
-const maxReadBufferSize = 256 * 1024
-const sftpPacketSize = 32 * 1024
+const packetSize = 32 * 1024
 
 type bufferedLTXFile struct {
 	file   *ltxFile
@@ -547,8 +548,8 @@ func (f *ltxFile) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	defer f.endIO()
-	if len(p) > sftpPacketSize {
-		p = p[:len(p)-len(p)%sftpPacketSize]
+	if len(p) > packetSize {
+		p = p[:len(p)-len(p)%packetSize]
 	}
 	return f.File.Read(p)
 }

@@ -174,7 +174,7 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 			c.ConcurrentWrites = concurrent
 			c.conn = &replicaConn{sftp: server.client}
 
-			data := testLTXFile(t, 3*sftpPacketSize+1234)
+			data := testLTXFile(t, 3*packetSize+1234)
 			pr, pw := io.Pipe()
 			go func() {
 				for rest := data; len(rest) > 0; {
@@ -212,7 +212,7 @@ func TestReplicaClient_WriteLTXFile_FullPackets(t *testing.T) {
 			if concurrent && !pipelined {
 				t.Fatal("second write was not sent before the first write response")
 			}
-			limit := (len(data) + sftpPacketSize - 1) / sftpPacketSize
+			limit := (len(data) + packetSize - 1) / packetSize
 			if n := server.writeRequests(); n > limit {
 				t.Fatalf("upload took %d write requests, want at most %d", n, limit)
 			}
@@ -235,7 +235,7 @@ func TestFillReader(t *testing.T) {
 	}()
 
 	r := fillReader{pr}
-	buf := make([]byte, sftpPacketSize)
+	buf := make([]byte, packetSize)
 	var got []byte
 	var sizes []int
 	for {
@@ -252,7 +252,7 @@ func TestFillReader(t *testing.T) {
 	if !bytes.Equal(got, data) {
 		t.Fatalf("read %d bytes, want %d", len(got), len(data))
 	}
-	if want := []int{sftpPacketSize, sftpPacketSize, len(data) - 2*sftpPacketSize}; fmt.Sprint(sizes) != fmt.Sprint(want) {
+	if want := []int{packetSize, packetSize, len(data) - 2*packetSize}; fmt.Sprint(sizes) != fmt.Sprint(want) {
 		t.Fatalf("read sizes=%v, want %v", sizes, want)
 	}
 }
@@ -456,11 +456,11 @@ func TestReplicaClient_OpenLTXFile_BufferedReads(t *testing.T) {
 	} else if err := rc.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if n, limit := server.readRequests()-reads, len(data)/sftpPacketSize+8; n > limit {
+	if n, limit := server.readRequests()-reads, len(data)/packetSize+8; n > limit {
 		t.Fatalf("decoding %d pages took %d read requests, want at most %d", pageN, n, limit)
 	}
 
-	for _, r := range []struct{ offset, size int64 }{{0, ltx.HeaderSize}, {1000, 3 * sftpPacketSize}, {int64(len(data)) - 500, 0}} {
+	for _, r := range []struct{ offset, size int64 }{{0, ltx.HeaderSize}, {1000, 3 * packetSize}, {int64(len(data)) - 500, 0}} {
 		rc, err := c.OpenLTXFile(context.Background(), 1, 1, 1, r.offset, r.size)
 		if err != nil {
 			t.Fatal(err)
@@ -492,9 +492,9 @@ func TestReplicaClient_OpenLTXFile_WireRange(t *testing.T) {
 		offset, size int64
 	}{
 		{"SmallFile", 2048, 0, 0},
-		{"SmallTail", maxReadBufferSize + 500, maxReadBufferSize, 0},
-		{"PartialPacket", 3 * sftpPacketSize, 1000, sftpPacketSize + 1},
-		{"MultipleFills", 2 * maxReadBufferSize, 1000, maxReadBufferSize + 17},
+		{"SmallTail", 256*1024 + 500, 256 * 1024, 0},
+		{"PartialPacket", 96 * 1024, 1000, 32*1024 + 1},
+		{"MultipleFills", 512 * 1024, 1000, 256*1024 + 17},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			server := newRecordingServer(t, false)
@@ -579,7 +579,7 @@ func TestReplicaClient_WriteLTXFile_Abort(t *testing.T) {
 				c.Path = "/replica"
 				c.ConcurrentWrites = concurrent
 				c.conn = &replicaConn{sftp: server.client}
-				data := testLTXFile(t, 3*sftpPacketSize+1234)
+				data := testLTXFile(t, 3*packetSize+1234)
 				pr, pw := io.Pipe()
 				defer pr.Close()
 				sourceErr := errors.New("source failed")
