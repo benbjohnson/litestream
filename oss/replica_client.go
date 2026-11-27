@@ -440,7 +440,7 @@ func (c *ReplicaClient) DeleteAll(ctx context.Context) error {
 
 // ltxPath returns the full path to an LTX file.
 func (c *ReplicaClient) ltxPath(level int, filename string) string {
-	return c.rootPrefix.Peek(c.Path) + fmt.Sprintf("%04x/%s", level, filename)
+	return c.rootPrefix.Peek(c.Path, c.Bucket) + fmt.Sprintf("%04x/%s", level, filename)
 }
 
 // fileIterator represents an iterator over LTX files in OSS.

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io/fs"
 	"log/slog"
 	"slices"
 	"strings"
@@ -81,7 +82,7 @@ func TestResolveRootPrefix(t *testing.T) {
 		if buf.Len() != 0 {
 			t.Fatalf("unexpected warning: %s", buf.String())
 		}
-		if want := []string{"000", "./", "/"}; !slices.Equal(calls, want) {
+		if want := []string{"000", "./", "/000"}; !slices.Equal(calls, want) {
 			t.Fatalf("probe prefixes = %v, want %v", calls, want)
 		}
 	})
@@ -168,6 +169,57 @@ func TestResolveRootPrefix(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "multiple root replica prefixes") {
 			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+
+	for _, tt := range []struct {
+		name       string
+		keys       []string
+		allowed    []string
+		want       string
+		wantDenied bool
+	}{
+		{name: "SlashOnlyExisting", allowed: []string{"/"}, keys: []string{"/0009/0000000000000001-0000000000000001.ltx"}, want: "/"},
+		{name: "SlashOnlyEmpty", allowed: []string{"/"}, want: "/"},
+		{name: "AllDenied", wantDenied: true},
+		{name: "TwoEmptyLayoutsWithDeniedProbe", allowed: []string{"./", "/"}, wantDenied: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			list := makeListFunc(tt.keys, nil)
+			got, err := internal.ResolveRootPrefix(t.Context(), nil, "s3", "bucket", litestream.SnapshotLevel, func(ctx context.Context, prefix string, maxKeys int32, fn func(string) bool) error {
+				for _, allowed := range tt.allowed {
+					if strings.HasPrefix(prefix, allowed) {
+						return list(ctx, prefix, maxKeys, fn)
+					}
+				}
+				return fs.ErrPermission
+			})
+			if tt.wantDenied {
+				if !errors.Is(err, fs.ErrPermission) {
+					t.Fatalf("error = %v, want permission denied", err)
+				}
+			} else if err != nil || got != tt.want {
+				t.Fatalf("prefix = %q, err = %v, want %q", got, err, tt.want)
+			}
+		})
+	}
+
+	t.Run("CacheFollowsBucketAndExplicitPath", func(t *testing.T) {
+		var resolver internal.RootPrefixResolver
+		list := makeListFunc([]string{"/0000/0000000000000001-0000000000000001.ltx"}, nil)
+		for _, tt := range []struct {
+			bucket, path, want string
+			list               internal.ListKeysFunc
+		}{
+			{"first", "", "/", list},
+			{"first", "named", "named/", nil},
+			{"first", "", "/", nil},
+			{"second", "", "", makeListFunc(nil, nil)},
+		} {
+			got, err := resolver.Resolve(t.Context(), tt.path, nil, "s3", tt.bucket, litestream.SnapshotLevel, tt.list)
+			if got != tt.want || err != nil {
+				t.Fatalf("bucket %q path %q: prefix = %q, err = %v, want %q", tt.bucket, tt.path, got, err, tt.want)
+			}
 		}
 	})
 

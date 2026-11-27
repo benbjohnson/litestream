@@ -2,8 +2,11 @@ package internal
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +23,7 @@ type ListKeysFunc func(ctx context.Context, prefix string, maxKeys int32, fn fun
 // replica clients. Its zero value is ready for use.
 type RootPrefixResolver struct {
 	mu       sync.Mutex
+	bucket   string
 	prefix   string
 	resolved bool
 	ch       chan struct{}
@@ -31,16 +35,12 @@ type RootPrefixResolver struct {
 // layouts on upgrade while defaulting new/empty buckets to "" ("0000/...").
 // Concurrent callers wait cancellably without holding the lock during remote I/O.
 func (r *RootPrefixResolver) Resolve(ctx context.Context, clientPath string, logger *slog.Logger, backend, bucket string, maxLevel int, listKeys ListKeysFunc) (string, error) {
+	if clientPath != "" {
+		return clientPath + "/", nil
+	}
 	for {
 		r.mu.Lock()
-		if r.resolved {
-			prefix := r.prefix
-			r.mu.Unlock()
-			return prefix, nil
-		}
-		if clientPath != "" {
-			r.prefix = clientPath + "/"
-			r.resolved = true
+		if r.resolved && r.bucket == bucket {
 			prefix := r.prefix
 			r.mu.Unlock()
 			return prefix, nil
@@ -63,6 +63,7 @@ func (r *RootPrefixResolver) Resolve(ctx context.Context, clientPath string, log
 
 		r.mu.Lock()
 		if err == nil {
+			r.bucket = bucket
 			r.prefix = prefix
 			r.resolved = true
 		}
@@ -79,18 +80,16 @@ func (r *RootPrefixResolver) Resolve(ctx context.Context, clientPath string, log
 
 // Peek returns the cached prefix if already resolved, or the unprobed default
 // prefix for clientPath.
-func (r *RootPrefixResolver) Peek(clientPath string) string {
+func (r *RootPrefixResolver) Peek(clientPath, bucket string) string {
+	if clientPath != "" {
+		return clientPath + "/"
+	}
 	r.mu.Lock()
-	prefix := r.prefix
-	resolved := r.resolved
-	r.mu.Unlock()
-	if resolved {
-		return prefix
+	defer r.mu.Unlock()
+	if r.resolved && r.bucket == bucket {
+		return r.prefix
 	}
-	if clientPath == "" {
-		return ""
-	}
-	return clientPath + "/"
+	return ""
 }
 
 // Invalidate clears the cached prefix so the next Resolve re-probes the bucket.
@@ -169,15 +168,21 @@ func ResolveRootPrefix(ctx context.Context, logger *slog.Logger, backend, bucket
 	candidates := []candidate{
 		{rootPrefix: "", fastProbePrefix: "000", label: "(root)"},
 		{rootPrefix: "./", fastProbePrefix: "./", label: "./"},
-		{rootPrefix: "/", fastProbePrefix: "/", label: "/"},
+		{rootPrefix: "/", fastProbePrefix: "/000", label: "/"},
 	}
 
-	var found []candidate
+	var found, readable []candidate
+	var denied error
 	for _, cand := range candidates {
 		exists, err := rootPrefixHasLTX(ctx, cand.rootPrefix, cand.fastProbePrefix, maxLevel, listKeys)
 		if err != nil {
+			if isListPermissionError(err) {
+				denied = err
+				continue
+			}
 			return "", err
 		}
+		readable = append(readable, cand)
 		if exists {
 			found = append(found, cand)
 		}
@@ -185,6 +190,12 @@ func ResolveRootPrefix(ctx context.Context, logger *slog.Logger, backend, bucket
 
 	switch len(found) {
 	case 0:
+		if denied != nil {
+			if len(readable) == 1 {
+				return readable[0].rootPrefix, nil
+			}
+			return "", denied
+		}
 		return "", nil
 	case 1:
 		if found[0].rootPrefix != "" && logger != nil {
@@ -201,6 +212,14 @@ func ResolveRootPrefix(ctx context.Context, logger *slog.Logger, backend, bucket
 		}
 		return "", fmt.Errorf("%s: multiple root replica prefixes found in bucket %q (%s); migrate or remove unused prefixes to resolve ambiguity", backend, bucket, strings.Join(labels, ", "))
 	}
+}
+
+func isListPermissionError(err error) bool {
+	var service interface{ ErrorCode() string }
+	var response interface{ HTTPStatusCode() int }
+	return errors.Is(err, fs.ErrPermission) ||
+		(errors.As(err, &service) && service.ErrorCode() == "AccessDenied") ||
+		(errors.As(err, &response) && response.HTTPStatusCode() == http.StatusForbidden)
 }
 
 func rootPrefixHasLTX(ctx context.Context, rootPrefix, fastProbePrefix string, maxLevel int, listKeys ListKeysFunc) (bool, error) {

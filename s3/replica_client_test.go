@@ -4002,6 +4002,58 @@ func TestReplicaClient_BareBucketRootPrefix(t *testing.T) {
 		return c
 	}
 
+	t.Run("ChangedPathScopesDeleteAll", func(t *testing.T) {
+		srv, mu, objects, _ := newMockS3(t, map[string][]byte{"keep.txt": nil, "named/owned": nil})
+		c := newClient(srv.URL, "", nil)
+		if _, err := c.WriteLTXFile(t.Context(), 0, 1, 1, bytes.NewReader(ltxData)); err != nil {
+			t.Fatal(err)
+		}
+		c.Path = "named"
+		if err := c.DeleteAll(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := objects["named/owned"]; ok {
+			t.Fatal("DeleteAll left the named replica intact")
+		}
+		for _, key := range []string{"keep.txt", "0000/0000000000000001-0000000000000001.ltx"} {
+			if _, ok := objects[key]; !ok {
+				t.Fatalf("DeleteAll removed unrelated object %q", key)
+			}
+		}
+	})
+
+	t.Run("SlashOnlyListPermission", func(t *testing.T) {
+		const snapshot = "/0009/0000000000000001-0000000000000001.ltx"
+		srv, mu, objects, _ := newMockS3(t, map[string][]byte{snapshot: ltxData})
+		restricted := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Query().Get("list-type") == "2" && !strings.HasPrefix(r.URL.Query().Get("prefix"), "/") {
+				w.WriteHeader(http.StatusForbidden)
+				_, _ = io.WriteString(w, "<Error><Code>AccessDenied</Code></Error>")
+				return
+			}
+			srv.Config.Handler.ServeHTTP(w, r)
+		}))
+		t.Cleanup(restricted.Close)
+		c := newClient(restricted.URL, "", nil)
+		rc, err := c.OpenLTXFile(t.Context(), 9, 1, 1, 0, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := rc.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.WriteLTXFile(t.Context(), 0, 2, 2, bytes.NewReader(ltxData)); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if _, ok := objects["/0000/0000000000000002-0000000000000002.ltx"]; !ok {
+			t.Fatal("missing new LTX in legacy slash layout")
+		}
+	})
+
 	t.Run("FreshEmptyBucketUsesCleanRootKeys", func(t *testing.T) {
 		srv, mu, objects, _ := newMockS3(t, nil)
 		var logBuf bytes.Buffer
