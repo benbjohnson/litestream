@@ -370,13 +370,24 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	}
 
 	filename := litestream.LTXFilePath(c.Path, level, minTXID, maxTXID)
-	f, err := sftpClient.OpenFile(filename, os.O_RDONLY)
+	file, err := sftpClient.OpenFile(filename, os.O_RDONLY)
 	if err != nil {
 		return nil, err
 	}
+	f := &ltxFile{File: file, stop: func() bool { return true }}
+
+	// pkg/sftp reads cannot be canceled, so close the connection if ctx is done
+	// before the file is closed. Otherwise a read from a server that has stopped
+	// responding blocks for as long as the server stays silent.
+	c.mu.Lock()
+	if sshClient := c.sshClient; sshClient != nil {
+		f.stop = context.AfterFunc(ctx, func() { _ = sshClient.Close() })
+	}
+	c.mu.Unlock()
 
 	if offset > 0 {
 		if _, err := f.Seek(offset, io.SeekStart); err != nil {
+			_ = f.Close()
 			return nil, err
 		}
 	}
@@ -441,6 +452,19 @@ func (c *ReplicaClient) resetOnConnError(err error) {
 		c.sshClient.Close()
 		c.sshClient = nil
 	}
+}
+
+// ltxFile is an LTX file opened for reading that stops closing the connection
+// on cancellation once it is closed.
+type ltxFile struct {
+	*sftp.File
+	stop func() bool
+}
+
+func (f *ltxFile) Close() error {
+	err := f.File.Close()
+	f.stop()
+	return err
 }
 
 // fillReader fills every read completely, except at the end of the stream,

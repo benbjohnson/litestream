@@ -3,6 +3,7 @@ package sftp
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/pkg/sftp"
 	"github.com/superfly/ltx"
+	"golang.org/x/crypto/ssh"
 
 	"github.com/benbjohnson/litestream"
 )
@@ -461,4 +463,132 @@ func TestReplicaClient_WriteLTXFile_Abort(t *testing.T) {
 			})
 		}
 	}
+}
+
+// A read from a server that stops answering must return once the context the
+// file was opened with is done, so that a stalled restore can reconnect.
+func TestReplicaClient_OpenLTXFile_ContextCanceledWhileStalled(t *testing.T) {
+	c := NewReplicaClient()
+	c.Path = t.TempDir()
+	stalled := startStallingServer(t, c, 5) // SSH_FXP_READ
+
+	filename := litestream.LTXFilePath(c.Path, 0, 1, 1)
+	if err := os.MkdirAll(path.Dir(filename), 0o755); err != nil {
+		t.Fatal(err)
+	} else if err := os.WriteFile(filename, testLTXFile(t, 1024), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rc, err := c.OpenLTXFile(ctx, 0, 1, 1, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The file is closed only once the read has returned: closing it sends a
+	// request too, which a stalled server would never answer.
+	errc := make(chan error, 1)
+	go func() {
+		_, err := io.ReadAll(rc)
+		errc <- err
+	}()
+	select {
+	case <-stalled:
+	case <-time.After(5 * time.Second):
+		t.Fatal("server never stalled")
+	}
+
+	cancel()
+	select {
+	case err := <-errc:
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		_ = rc.Close()
+	case <-time.After(5 * time.Second):
+		t.Fatal("read did not return after its context was canceled")
+	}
+}
+
+// startStallingServer points c at an SSH server that serves SFTP from the local
+// filesystem until it receives a request of type stall, then stops answering
+// without closing the connection. The returned channel is closed once the
+// server has stalled.
+func startStallingServer(t *testing.T, c *ReplicaClient, stall byte) <-chan struct{} {
+	t.Helper()
+	_, key, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	signer, err := ssh.NewSignerFromKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	config := &ssh.ServerConfig{NoClientAuth: true}
+	config.AddHostKey(signer)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Host, c.User = ln.Addr().String(), "user"
+	c.HostKey = string(ssh.MarshalAuthorizedKey(signer.PublicKey()))
+
+	stalled, done := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	t.Cleanup(func() { close(done); _ = ln.Close() })
+	track := func(conn io.Closer) { go func() { <-done; _ = conn.Close() }() }
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			track(conn)
+			go func() {
+				_, chans, reqs, err := ssh.NewServerConn(conn, config)
+				if err != nil {
+					return
+				}
+				go ssh.DiscardRequests(reqs)
+				for newCh := range chans {
+					ch, chReqs, err := newCh.Accept()
+					if err != nil {
+						return
+					}
+					go func() {
+						for req := range chReqs {
+							_ = req.Reply(req.Type == "subsystem", nil)
+						}
+					}()
+
+					serverConn, proxyConn := net.Pipe()
+					track(serverConn)
+					server, err := sftp.NewServer(serverConn)
+					if err != nil {
+						return
+					}
+					go func() { _ = server.Serve() }()
+					go func() { _, _ = io.Copy(ch, proxyConn) }()
+					go func() {
+						for {
+							pkt, err := readPacket(ch)
+							if err != nil {
+								return
+							} else if pkt[4] == stall {
+								once.Do(func() { close(stalled) })
+								_, _ = io.Copy(io.Discard, ch)
+								return
+							} else if _, err := proxyConn.Write(pkt); err != nil {
+								return
+							}
+						}
+					}()
+				}
+			}()
+		}
+	}()
+	return stalled
 }
