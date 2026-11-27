@@ -393,7 +393,7 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 	// its own request, so each would cost a round trip. Read through a buffer
 	// instead. The limit sits beneath the buffer so that read-ahead stays
 	// within the requested range.
-	var r io.Reader = packetAlignedReader{f}
+	var r io.Reader = f
 	remaining := size
 	if size > 0 {
 		r = io.LimitReader(r, size)
@@ -439,17 +439,6 @@ func (f *bufferedLTXFile) WriteTo(w io.Writer) (int64, error) {
 
 func (f *bufferedLTXFile) Close() error {
 	return f.file.Close()
-}
-
-type packetAlignedReader struct {
-	*ltxFile
-}
-
-func (r packetAlignedReader) Read(p []byte) (int, error) {
-	if len(p) > sftpPacketSize {
-		p = p[:len(p)-len(p)%sftpPacketSize]
-	}
-	return r.ltxFile.Read(p)
 }
 
 // DeleteLTXFiles deletes LTX files with at the given positions.
@@ -558,6 +547,9 @@ func (f *ltxFile) Read(p []byte) (int, error) {
 		return 0, err
 	}
 	defer f.endIO()
+	if len(p) > sftpPacketSize {
+		p = p[:len(p)-len(p)%sftpPacketSize]
+	}
 	return f.File.Read(p)
 }
 
