@@ -786,7 +786,7 @@ func (h *Hydrator) Restore(ctx context.Context, infos []*ltx.FileInfo) (retErr e
 	}()
 
 	for _, info := range infos {
-		h.logger.Debug("opening ltx file for hydration", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+		h.logger.Debug("opening ltx file for hydration", "ltx_level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 		rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return fmt.Errorf("open ltx file: %w", err)
@@ -867,7 +867,7 @@ func (h *Hydrator) CatchUp(ctx context.Context, fromTXID, toTXID ltx.TXID) error
 
 // ApplyLTX fetches an entire LTX file and applies its pages to the hydration file.
 func (h *Hydrator) ApplyLTX(ctx context.Context, info *ltx.FileInfo) (err error) {
-	h.logger.Debug("applying ltx to hydration file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+	h.logger.Debug("applying ltx to hydration file", "ltx_level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 	// Fetch entire LTX file
 	rc, err := h.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
@@ -1491,7 +1491,7 @@ func (f *VFSFile) buildIndexMap(ctx context.Context, infos []*ltx.FileInfo) (map
 	index := make(map[uint32]ltx.PageIndexElem)
 	var commit uint32
 	for _, info := range infos {
-		f.logger.Debug("opening page index", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+		f.logger.Debug("opening page index", "ltx_level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 		// Read page index.
 		idx, err := FetchPageIndex(ctx, f.client, info)
@@ -3001,7 +3001,7 @@ func (f *VFSFile) pollLevel(ctx context.Context, level int, prevMaxTXID ltx.TXID
 				}
 			}
 
-			f.logger.Debug("new ltx file", "level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
+			f.logger.Debug("new ltx file", "ltx_level", info.Level, "min", info.MinTXID, "max", info.MaxTXID)
 
 			idx, err := FetchPageIndex(ctx, f.client, info)
 			if err != nil {
@@ -3407,7 +3407,7 @@ func (f *VFSFile) Snapshot(ctx context.Context) (*ltx.FileInfo, error) {
 
 // monitorCompaction runs periodic compaction for a level.
 func (f *VFSFile) monitorCompaction(ctx context.Context, lvl *CompactionLevel) {
-	f.logger.Info("starting VFS compaction monitor", "level", lvl.Level, "interval", lvl.Interval)
+	f.logger.Info("starting VFS compaction monitor", "ltx_level", lvl.Level, "interval", lvl.Interval)
 
 	ticker := time.NewTicker(lvl.Interval)
 	defer ticker.Stop()
@@ -3422,11 +3422,11 @@ func (f *VFSFile) monitorCompaction(ctx context.Context, lvl *CompactionLevel) {
 				if !errors.Is(err, ErrNoCompaction) &&
 					!errors.Is(err, context.Canceled) &&
 					!errors.Is(err, context.DeadlineExceeded) {
-					f.logger.Error("compaction failed", "level", lvl.Level, "error", err)
+					f.logger.Error("compaction failed", "ltx_level", lvl.Level, "error", err)
 				}
 			} else {
 				f.logger.Debug("compaction completed",
-					"level", lvl.Level,
+					"ltx_level", lvl.Level,
 					"minTXID", info.MinTXID,
 					"maxTXID", info.MaxTXID,
 					"size", info.Size)

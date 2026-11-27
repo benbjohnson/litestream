@@ -180,7 +180,7 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	if c.VerifyCompaction {
 		if err := c.VerifyLevelConsistency(ctx, dstLevel); err != nil {
 			c.logger.Warn("post-compaction verification failed",
-				"level", dstLevel,
+				"ltx_level", dstLevel,
 				"error", err)
 			if c.CompactionVerifyErrorCounter != nil {
 				c.CompactionVerifyErrorCounter.Inc()
@@ -268,7 +268,7 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 	}
 
 	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
+		c.logger.Debug("skipping remote deletion (retention disabled)", "ltx_level", SnapshotLevel, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
@@ -276,7 +276,7 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 	if c.LocalFileDeleter != nil {
 		for _, info := range deleted {
 			c.logger.Debug("deleting local ltx file",
-				"level", SnapshotLevel,
+				"ltx_level", SnapshotLevel,
 				"minTXID", info.MinTXID,
 				"maxTXID", info.MaxTXID)
 			if err := c.LocalFileDeleter(SnapshotLevel, info.MinTXID, info.MaxTXID); err != nil {
@@ -291,7 +291,7 @@ func (c *Compactor) EnforceSnapshotRetention(ctx context.Context, retention time
 // EnforceRetentionByTXID deletes files at the given level with maxTXID below the target.
 // Always keeps at least one file.
 func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID ltx.TXID) error {
-	c.logger.Debug("enforcing retention", "level", level, "txid", txID)
+	c.logger.Debug("enforcing retention", "ltx_level", level, "txid", txID)
 
 	itr, err := c.client.LTXFiles(ctx, level, 0, false)
 	if err != nil {
@@ -316,7 +316,7 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 	}
 
 	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", level, "count", len(deleted))
+		c.logger.Debug("skipping remote deletion (retention disabled)", "ltx_level", level, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove ltx files: %w", err)
 	}
@@ -324,7 +324,7 @@ func (c *Compactor) EnforceRetentionByTXID(ctx context.Context, level int, txID 
 	if c.LocalFileDeleter != nil {
 		for _, info := range deleted {
 			c.logger.Debug("deleting local ltx file",
-				"level", level,
+				"ltx_level", level,
 				"minTXID", info.MinTXID,
 				"maxTXID", info.MaxTXID)
 			if err := c.LocalFileDeleter(level, info.MinTXID, info.MaxTXID); err != nil {
@@ -404,7 +404,7 @@ func (c *Compactor) EnforceL0Retention(ctx context.Context, retention time.Durat
 	}
 
 	if !c.RetentionEnabled {
-		c.logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
+		c.logger.Debug("skipping remote deletion (retention disabled)", "ltx_level", 0, "count", len(deleted))
 	} else if err := c.client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}

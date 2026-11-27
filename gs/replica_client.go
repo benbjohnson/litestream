@@ -227,7 +227,7 @@ func (c *ReplicaClient) DeleteLTXFiles(ctx context.Context, a []*ltx.FileInfo) e
 	for _, info := range a {
 		key := litestream.LTXFilePath(c.Path, info.Level, info.MinTXID, info.MaxTXID)
 
-		c.logger.Debug("deleting ltx file", "level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
+		c.logger.Debug("deleting ltx file", "ltx_level", info.Level, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "key", key)
 
 		if err := c.bkt.Object(key).Delete(ctx); err != nil && !isNotExists(err) {
 			return fmt.Errorf("gs: cannot delete ltx file %q: %w", key, err)

@@ -3167,7 +3167,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 
 	// Remove files marked for deletion from remote storage (unless retention disabled).
 	if !db.RetentionEnabled {
-		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", SnapshotLevel, "count", len(deleted))
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "ltx_level", SnapshotLevel, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return 0, fmt.Errorf("remove ltx files: %w", err)
 	}
@@ -3175,7 +3175,7 @@ func (db *DB) EnforceSnapshotRetention(ctx context.Context, timestamp time.Time)
 	// Always clean up local files.
 	for _, info := range deleted {
 		localPath := db.LTXPath(SnapshotLevel, info.MinTXID, info.MaxTXID)
-		db.Logger.Debug("deleting local ltx file", "level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
+		db.Logger.Debug("deleting local ltx file", "ltx_level", SnapshotLevel, "minTXID", info.MinTXID, "maxTXID", info.MaxTXID, "path", localPath)
 
 		if err := os.Remove(localPath); err != nil && !os.IsNotExist(err) {
 			db.Logger.Error("failed to remove local ltx file", "path", localPath, "error", err)
@@ -3290,7 +3290,7 @@ func (db *DB) EnforceL0RetentionByTime(ctx context.Context) error {
 	}
 
 	if !db.RetentionEnabled {
-		db.Logger.Debug("skipping remote deletion (retention disabled)", "level", 0, "count", len(deleted))
+		db.Logger.Debug("skipping remote deletion (retention disabled)", "ltx_level", 0, "count", len(deleted))
 	} else if err := db.Replica.Client.DeleteLTXFiles(ctx, deleted); err != nil {
 		return fmt.Errorf("remove expired l0 files: %w", err)
 	}

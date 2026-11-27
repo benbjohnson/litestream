@@ -4,7 +4,9 @@ package integration
 
 import (
 	"bufio"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -650,13 +652,8 @@ func parseCompactionComplete(line string) (LTXEvent, bool) {
 		Type:     "compaction",
 	}
 
-	// Extract compaction level — skip past msg= to avoid matching log level=INFO
-	msgIdx := strings.Index(line, "compaction complete")
-	if msgIdx != -1 {
-		rest := line[msgIdx:]
-		if v := extractField(rest, "level="); v != "" {
-			ev.Level, _ = strconv.Atoi(v)
-		}
+	if level, ok := extractLogLTXLevel(line); ok {
+		ev.Level = level
 	}
 	if v := extractField(line, "txid.min="); v != "" {
 		ev.MinTXID = v
@@ -744,20 +741,8 @@ func parseLTXFileUploaded(line string) (LTXEvent, bool) {
 		Type:     "upload",
 	}
 
-	// Search for the replica level field AFTER the message text to avoid
-	// matching the slog severity field (e.g. "level=INFO").
-	// Try text format first, then JSON format.
-	if msgIdx := strings.Index(line, "ltx file uploaded"); msgIdx != -1 {
-		if v := extractField(line[msgIdx:], "level="); v != "" {
-			ev.Level, _ = strconv.Atoi(v)
-		}
-	}
-	if ev.Level == 0 {
-		// Try JSON format: "level":N (note: this is the replica level, not slog severity)
-		// Look for "level": followed by a number after the message marker
-		if v := extractJSONIntField(line, "level"); v > 0 {
-			ev.Level = v
-		}
+	if level, ok := extractLogLTXLevel(line); ok {
+		ev.Level = level
 	}
 	if v := extractField(line, "minTXID="); v != "" {
 		ev.MinTXID = v
@@ -814,17 +799,126 @@ func extractJSONField(line, key string) string {
 	return ""
 }
 
-// extractJSONIntField extracts an integer value from a JSON field like "key":123.
-func extractJSONIntField(line, key string) int {
-	// Match "key":123 or "key": 123
-	pattern := `"` + key + `"\s*:\s*(\d+)`
-	re := regexp.MustCompile(pattern)
-	m := re.FindStringSubmatch(line)
-	if len(m) > 1 {
-		v, _ := strconv.Atoi(m[1])
-		return v
+// extractLogLTXLevel extracts the LTX/compaction level attribute from either a
+// JSON or text slog line. It prefers the `ltx_level` attribute and falls back
+// to legacy integer `level` attributes emitted by older versions of Litestream
+// (ignoring the slog severity string).
+func extractLogLTXLevel(line string) (int, bool) {
+	trimmed := strings.TrimSpace(line)
+	if strings.HasPrefix(trimmed, "{") {
+		dec := json.NewDecoder(strings.NewReader(trimmed))
+		dec.UseNumber()
+		tok, err := dec.Token()
+		if err != nil || tok != json.Delim('{') {
+			return 0, false
+		}
+		var (
+			foundLegacy bool
+			legacyLevel int
+		)
+		for dec.More() {
+			kTok, err := dec.Token()
+			if err != nil {
+				break
+			}
+			key, ok := kTok.(string)
+			if !ok {
+				break
+			}
+			var val any
+			if err := dec.Decode(&val); err != nil {
+				break
+			}
+			switch key {
+			case "ltx_level":
+				if num, ok := val.(json.Number); ok {
+					if v, err := strconv.Atoi(num.String()); err == nil {
+						return v, true
+					}
+				}
+			case "level":
+				if num, ok := val.(json.Number); ok {
+					if v, err := strconv.Atoi(num.String()); err == nil {
+						legacyLevel = v
+						foundLegacy = true
+					}
+				}
+			}
+		}
+		if _, err := dec.Token(); err != nil && err != io.EOF {
+			return 0, false
+		}
+		return legacyLevel, foundLegacy
 	}
-	return 0
+
+	var (
+		sawMsg      bool
+		foundLegacy bool
+		legacyLevel int
+	)
+	for i := 0; i < len(line); {
+		for i < len(line) && (line[i] == ' ' || line[i] == '\t') {
+			i++
+		}
+		if i >= len(line) {
+			break
+		}
+		keyStart := i
+		for i < len(line) && line[i] != '=' && line[i] != ' ' && line[i] != '\t' {
+			i++
+		}
+		if i >= len(line) || line[i] != '=' {
+			for i < len(line) && line[i] != ' ' && line[i] != '\t' {
+				i++
+			}
+			continue
+		}
+		key := line[keyStart:i]
+		i++ // skip '='
+
+		var val string
+		if i < len(line) && line[i] == '"' {
+			i++ // skip opening quote
+			valStart := i
+			for i < len(line) {
+				if line[i] == '\\' && i+1 < len(line) {
+					i += 2
+					continue
+				}
+				if line[i] == '"' {
+					break
+				}
+				i++
+			}
+			val = line[valStart:i]
+			if i < len(line) && line[i] == '"' {
+				i++
+			}
+		} else {
+			valStart := i
+			for i < len(line) && line[i] != ' ' && line[i] != '\t' && line[i] != '\r' && line[i] != '\n' {
+				i++
+			}
+			val = line[valStart:i]
+		}
+
+		switch key {
+		case "msg":
+			sawMsg = true
+		case "ltx_level":
+			if v, err := strconv.Atoi(val); err == nil {
+				return v, true
+			}
+		case "level":
+			if sawMsg {
+				if v, err := strconv.Atoi(val); err == nil {
+					legacyLevel = v
+					foundLegacy = true
+				}
+			}
+		}
+	}
+	return legacyLevel, foundLegacy
 }
 
 // --- Utility helpers ---
