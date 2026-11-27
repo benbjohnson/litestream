@@ -314,20 +314,19 @@ func newRecordingServer(t *testing.T, concurrentWrites bool) *recordingServer {
 			if err != nil {
 				return
 			}
-			if pkt[4] == 4 {
+			switch pkt[4] {
+			case 4:
 				s.mu.Lock()
 				s.closes++
 				s.mu.Unlock()
-			}
-			if pkt[4] == 5 {
+			case 5:
 				s.mu.Lock()
 				s.reads++
 				offset := binary.BigEndian.Uint64(pkt[len(pkt)-12:])
 				length := binary.BigEndian.Uint32(pkt[len(pkt)-4:])
 				s.maxReadEnd = max(s.maxReadEnd, offset+uint64(length))
 				s.mu.Unlock()
-			}
-			if pkt[4] == 6 {
+			case 6:
 				writes++
 				if writes == 1 {
 					close(firstWrite)

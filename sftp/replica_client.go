@@ -399,11 +399,11 @@ func (c *ReplicaClient) OpenLTXFile(ctx context.Context, level int, minTXID, max
 		r = io.LimitReader(r, size)
 	} else {
 		info, err := f.Stat()
-		if ctx.Err() != nil {
-			return nil, errors.Join(ctx.Err(), f.Close())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(ctxErr, f.Close())
 		}
 		if err != nil {
-			slog.DebugContext(ctx, "cannot size SFTP read buffer", "path", filename, "error", err)
+			c.logger.DebugContext(ctx, "cannot size SFTP read buffer", "path", filename, "error", err)
 			remaining = packetSize
 		} else {
 			remaining = max(0, info.Size()-max(offset, 0))
