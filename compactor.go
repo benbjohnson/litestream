@@ -2,6 +2,7 @@ package litestream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -30,6 +31,12 @@ type Compactor struct {
 	// during retention enforcement. When false, cloud provider lifecycle
 	// policies handle retention instead. Local file cleanup still occurs.
 	RetentionEnabled bool
+
+	// SpillDir, when set, lets the ltx encoder spill the output page index of
+	// a very large compaction to a temp file in that directory instead of
+	// holding it in memory (ltx#96). DB sets it to the database meta
+	// directory, which is writable even in the hardened image.
+	SpillDir string
 
 	// CompactionVerifyErrorCounter is incremented when post-compaction
 	// verification fails. Optional; if nil, no metric is recorded.
@@ -101,8 +108,10 @@ func (c *Compactor) MaxLTXFileInfo(ctx context.Context, level int) (ltx.FileInfo
 
 // Compact compacts source level files into the destination level.
 // Returns ErrNoCompaction if there are no files to compact.
-func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, error) {
+func (c *Compactor) Compact(ctx context.Context, dstLevel int) (info *ltx.FileInfo, err error) {
 	srcLevel := dstLevel - 1
+	producerCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	prevMaxInfo, err := c.MaxLTXFileInfo(ctx, dstLevel)
 	if err != nil {
@@ -117,11 +126,18 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 	defer itr.Close()
 
 	var rdrs []io.Reader
+	var done chan struct{}
 	defer func() {
+		cancel()
 		for _, rd := range rdrs {
 			if closer, ok := rd.(io.Closer); ok {
-				_ = closer.Close()
+				if closeErr := closer.Close(); closeErr != nil {
+					err = errors.Join(err, fmt.Errorf("close compaction input: %w", closeErr))
+				}
 			}
+		}
+		if done != nil {
+			<-done
 		}
 	}()
 
@@ -145,28 +161,31 @@ func (c *Compactor) Compact(ctx context.Context, dstLevel int) (*ltx.FileInfo, e
 			}
 		}
 
-		f, err := c.client.OpenLTXFile(ctx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
+		f, err := c.client.OpenLTXFile(producerCtx, info.Level, info.MinTXID, info.MaxTXID, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("open ltx file: %w", err)
 		}
-		rdrs = append(rdrs, internal.NewResumableReader(ctx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
+		rdrs = append(rdrs, internal.NewResumableReader(producerCtx, c.client, info.Level, info.MinTXID, info.MaxTXID, info.Size, f, c.logger))
 	}
 	if len(rdrs) == 0 {
 		return nil, ErrNoCompaction
 	}
 
 	pr, pw := io.Pipe()
+	done = make(chan struct{})
 	go func() {
+		defer close(done)
 		comp, err := ltx.NewCompactor(pw, rdrs)
 		if err != nil {
 			_ = pw.CloseWithError(fmt.Errorf("new ltx compactor: %w", err))
 			return
 		}
 		comp.HeaderFlags = ltx.HeaderFlagNoChecksum
-		_ = pw.CloseWithError(comp.Compact(ctx))
+		comp.SetSpillDir(c.SpillDir)
+		_ = pw.CloseWithError(comp.Compact(producerCtx))
 	}()
 
-	info, err := c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
+	info, err = c.client.WriteLTXFile(ctx, dstLevel, minTXID, maxTXID, pr)
 	_ = pr.CloseWithError(err)
 	if err != nil {
 		return nil, fmt.Errorf("write ltx file: %w", err)

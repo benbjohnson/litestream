@@ -3,6 +3,7 @@ package litestream_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"hash/crc64"
 	"io"
@@ -569,6 +570,106 @@ func TestDB_Compact(t *testing.T) {
 			t.Fatalf("Filename=%s, want %s", got, want)
 		}
 	})
+}
+
+func TestDB_CompactInputCloseError(t *testing.T) {
+	closeErr := errors.New("injected input close failure")
+	writeErr := errors.New("injected publication failure")
+	deleteErr := errors.New("injected retention failure")
+
+	for _, tt := range []struct {
+		name      string
+		writeErr  error
+		deleteErr error
+	}{
+		{name: "Published"},
+		{name: "RetentionFailed", deleteErr: deleteErr},
+		{name: "PublicationFailed", writeErr: writeErr},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := t.Context()
+			client := file.NewReplicaClient(t.TempDir())
+			createTestLTXFile(t, client, 1, 1, 1)
+			old := time.Now().Add(-time.Hour)
+			for txid := ltx.TXID(1); txid <= 3; txid++ {
+				createTestLTXFile(t, client, 0, txid, txid)
+				if err := os.Chtimes(client.LTXFilePath(0, txid, txid), old, old); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			var retentionCalls int
+			db := testingutil.NewDB(t, filepath.Join(t.TempDir(), "db"))
+			db.MonitorInterval = 0
+			db.L0Retention = time.Minute
+			db.Replica = litestream.NewReplicaWithClient(db, &mock.ReplicaClient{
+				LTXFilesFunc: client.LTXFiles,
+				OpenLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, offset, size int64) (io.ReadCloser, error) {
+					r, err := client.OpenLTXFile(ctx, level, minTXID, maxTXID, offset, size)
+					if err != nil {
+						return nil, err
+					}
+					return &compactionInputCloser{ReadCloser: r, err: closeErr}, nil
+				},
+				WriteLTXFileFunc: func(ctx context.Context, level int, minTXID, maxTXID ltx.TXID, r io.Reader) (*ltx.FileInfo, error) {
+					if tt.writeErr != nil {
+						return nil, tt.writeErr
+					}
+					return client.WriteLTXFile(ctx, level, minTXID, maxTXID, r)
+				},
+				DeleteLTXFilesFunc: func(ctx context.Context, infos []*ltx.FileInfo) error {
+					retentionCalls++
+					if tt.deleteErr != nil {
+						return tt.deleteErr
+					}
+					return client.DeleteLTXFiles(ctx, infos)
+				},
+			})
+			if err := db.Open(); err != nil {
+				t.Fatal(err)
+			}
+			defer testingutil.MustCloseDB(t, db)
+
+			info, err := db.Compact(ctx, 1)
+			for _, want := range []error{closeErr, tt.writeErr, tt.deleteErr} {
+				if want != nil && !errors.Is(err, want) {
+					t.Errorf("Compact() error = %v, want %v", err, want)
+				}
+			}
+
+			if tt.writeErr != nil {
+				if info != nil || retentionCalls != 0 {
+					t.Errorf("Compact() info = %+v, retention calls = %d, want nil and 0", info, retentionCalls)
+				}
+				return
+			}
+			if info == nil || info.Level != 1 || info.MinTXID != 2 || info.MaxTXID != 3 || info.Size == 0 {
+				t.Errorf("Compact() info = %+v, want published L1 range 2-3 with nonzero size", info)
+			}
+			if retentionCalls != 1 {
+				t.Errorf("retention calls = %d, want 1", retentionCalls)
+			}
+			for txid := ltx.TXID(1); txid <= 3; txid++ {
+				_, err := os.Stat(client.LTXFilePath(0, txid, txid))
+				if tt.deleteErr == nil && txid < 3 {
+					if !errors.Is(err, os.ErrNotExist) {
+						t.Errorf("stat expired L0 TXID %d = %v, want file removed", txid, err)
+					}
+				} else if err != nil {
+					t.Errorf("stat retained L0 TXID %d = %v", txid, err)
+				}
+			}
+		})
+	}
+}
+
+type compactionInputCloser struct {
+	io.ReadCloser
+	err error
+}
+
+func (r *compactionInputCloser) Close() error {
+	return errors.Join(r.ReadCloser.Close(), r.err)
 }
 
 func walPageCountForTest(tb testing.TB, db *litestream.DB) int64 {
