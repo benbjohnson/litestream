@@ -709,7 +709,8 @@ func (c *ReplicaClient) newHTTPClient() (*http.Client, error) {
 // expandHomePath expands a leading "~", "~/", or "~\" using the current OS user's
 // home directory, matching CLI config path expansion across Unix and Windows.
 func expandHomePath(s string) (string, error) {
-	if s != "~" && (len(s) < 2 || s[0] != '~' || !os.IsPathSeparator(s[1])) {
+	rest, ok := strings.CutPrefix(s, "~")
+	if !ok || (rest != "" && !os.IsPathSeparator(rest[0])) {
 		return s, nil
 	}
 
@@ -720,10 +721,10 @@ func expandHomePath(s string) (string, error) {
 		return "", fmt.Errorf("cannot expand path %s, no home directory available", s)
 	}
 
-	if s == "~" {
+	if rest == "" {
 		return u.HomeDir, nil
 	}
-	return filepath.Join(u.HomeDir, filepath.FromSlash(s[2:])), nil
+	return filepath.Join(u.HomeDir, filepath.FromSlash(rest[1:])), nil
 }
 
 // findBucketRegion looks up the AWS region for a bucket. Returns blank if non-S3.

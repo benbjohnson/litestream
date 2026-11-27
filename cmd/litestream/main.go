@@ -2230,7 +2230,8 @@ func expand(s string) (string, error) {
 	s = StripSQLitePrefix(s)
 
 	// Just expand to absolute path if there is no home directory prefix.
-	if s != "~" && (len(s) < 2 || s[0] != '~' || !os.IsPathSeparator(s[1])) {
+	rest, ok := strings.CutPrefix(s, "~")
+	if !ok || (rest != "" && !os.IsPathSeparator(rest[0])) {
 		return filepath.Abs(s)
 	}
 
@@ -2243,10 +2244,10 @@ func expand(s string) (string, error) {
 	}
 
 	// Return path with tilde replaced by the home directory.
-	if s == "~" {
+	if rest == "" {
 		return u.HomeDir, nil
 	}
-	return filepath.Join(u.HomeDir, filepath.FromSlash(s[2:])), nil
+	return filepath.Join(u.HomeDir, filepath.FromSlash(rest[1:])), nil
 }
 
 // StripSQLitePrefix removes SQLite connection string prefixes (sqlite://, sqlite3://)
